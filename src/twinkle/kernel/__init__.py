@@ -1,11 +1,18 @@
+import re
+from types import MethodType
 from typing import Union, Callable, Any, List, Optional, Literal
 from ..utils import torch as torch_util, framework as framework_util
 from ..utils import exists
 
 
+kernel_mapping = {
+
+}
+
+
 def apply_kernel(module: Any,
                  mode: Literal['train', 'inference', 'compile', None] = 'train',
-                 kernel: Optional[Union[str, Callable[[*Any], Any]]]=None,
+                 kernel: "Optional[Union[str, Callable, 'torch.nn.Module']]"=None,
                  target_modules: Union[str, List[str]]=None,
                  device: Optional[Union[str, Any]] = None,
                 ) -> Any:
@@ -22,16 +29,40 @@ def apply_kernel(module: Any,
                 return kernelize(module, mode=kernel_mode, device=device)
 
         assert target_modules is not None and kernel is not None
-
-
+        return apply_kernel_torch(module, kernel, target_modules=target_modules)
     else:
         raise NotImplementedError(f'Unsupported applying kernels for: {module.__class__}')
 
 
 def apply_kernel_torch(module: Any,
-                             mode: Literal['train', 'inference', 'compile', None] = 'train',
-                             kernel: Optional[Union[str, Callable[[*Any], Any]]]=None,
-                             target_modules: Union[str, List[str]]=None,
-                             device: Optional[Union[str, Any]] = None,):
+                     kernel: "Optional[Union[str, Callable, 'torch.nn.Module']]",
+                     target_modules: Union[str, List[str]]):
+    if kernel in kernel_mapping:
+        kernel = kernel_mapping[kernel]
+
+    kernel_fn = kernel
+    import torch
+    if isinstance(kernel_fn, torch.nn.Module):
+        kernel_fn = kernel_fn.forward
+
+    if target_modules is None:
+        raise ValueError(f'Module patching needs a valid `target_modules` parameter,'
+                         f'but current is: {target_modules}')
+
+    if isinstance(target_modules, str):
+        pattern = re.compile(target_modules)
+        for name, submodule in module.named_modules():
+            if pattern.search(name):
+                if not hasattr(submodule, '__origin_forward__'):
+                    submodule.__origin_forward__ = submodule.forward
+                    submodule.forward = MethodType(kernel_fn, submodule)
+
+    elif isinstance(target_modules, list):
+        for name, submodule in module.named_modules():
+            if any(name.endswith(target) for target in target_modules):
+                if not hasattr(submodule, '__origin_forward__'):
+                    submodule.__origin_forward__ = submodule.forward
+                    submodule.forward = MethodType(kernel_fn, submodule)
+    return module
 
 
