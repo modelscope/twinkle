@@ -3,23 +3,27 @@ from typing import Literal, List, Optional
 from typing import Type, TypeVar, Tuple, overload
 
 from .device_group import DeviceGroup
-from .. import requires
+from ..utils import requires
 
-_mode: Optional[Literal['local', 'ray', 'remote']] = 'local'
+_mode: Optional[Literal['local', 'ray']] = 'local'
+
+_nproc_per_node: Optional[int] = 8
 
 _device_group: Optional[List[DeviceGroup]] = None
 
 _remote_components: dict = {}
 
 
-def initialize(mode: Literal['local', 'ray', 'remote'],
+def initialize(mode: Literal['local', 'ray'],
+               nproc_per_node: Optional[int] = 8,
                groups: Optional[List[DeviceGroup]] = None,):
-    global _mode, _device_group
-    assert mode in ('local', 'ray', 'remote')
+    global _mode, _device_group, _nproc_per_node
+    assert mode in ('local', 'ray')
     _mode = mode
     if _mode == 'ray':
         requires('ray')
-    _device_group = groups
+        _device_group = groups
+        _nproc_per_node = nproc_per_node
 
 
 def _get_remote_component(component):
@@ -67,26 +71,26 @@ def prepare_one(component: Type[T1], group_name: Optional[str]=None) -> Type[T1]
             elif _mode == 'ray':
                 import ray
                 from .ray import RayHelper
-                self._actor = RayHelper.create_workers(self._actor, group_name, *args, **kwargs)
+                RayHelper.initialize(_nproc_per_node, device_groups=_device_group)
+                self._actor = RayHelper.create_workers(_get_remote_component(self._actor), group_name, *args, **kwargs)
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 
         def __getattr__(self, name):
-            attr = getattr(self._actor, name)
-
-            if callable(attr):
-                @functools.wraps(attr)
-                def wrapper(*args, **kwargs):
-                    if _mode == 'local':
-                        return attr(*args, **kwargs)
-                    elif _mode == 'ray':
+            if _mode == 'local':
+                return getattr(self._actor, name)
+            elif _mode == 'ray':
+                attr = getattr(self._actor[0], name)
+                if callable(attr):
+                    @functools.wraps(attr)
+                    def wrapper(*args, **kwargs):
                         import ray
-                        return ray.get(attr.remote(*args, **kwargs))
-                    else:
-                        raise NotImplementedError(f'Unsupported mode {_mode}')
-
-                return wrapper
-            return attr
+                        from .ray import RayHelper
+                        return RayHelper.execute_all_sync(self._actor, dispatch=, execute=, method_name=name, *args, **kwargs)
+                    return wrapper
+                return attr
+            else:
+                raise NotImplementedError(f'Unsupported mode {_mode}')
 
         @property
         def actor(self):

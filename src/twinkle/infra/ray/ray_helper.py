@@ -1,15 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-import functools
-import inspect
 import os
 from typing import Callable, Dict, List, Literal, Optional, TypeVar, Union, Type
 
-from .. import DeviceGroup
-from ...utils import requires
 import numpy as np
 
 from .resource_manager import ResourceManager
+from .. import DeviceGroup
 from ...utils import Platform, find_node_ip, find_free_port
+from ...utils import requires
 
 T = TypeVar('T')
 
@@ -17,12 +15,6 @@ T = TypeVar('T')
 class RayHelper:
 
     resource_manager: Optional[ResourceManager] = None
-
-    worker_cls: Dict = {}
-
-    worker_instance: Dict = {}
-
-    initialized = False
 
     @staticmethod
     def initialize(nproc_per_node: int, device_groups: List[DeviceGroup]):
@@ -53,21 +45,6 @@ class RayHelper:
             RayHelper.resource_manager = None
 
     @staticmethod
-    def is_called_from_init():
-        """If some function called from __init__.
-
-        Ray functions perform different behaviors depending on whether they are called from __init__.
-
-        Returns:
-            Boolean.
-        """
-        stack = inspect.stack()
-        for frame_info in stack[1:]:
-            if frame_info.function == '__init__':
-                return True
-        return False
-
-    @staticmethod
     def ray_inited():
         try:
             import ray
@@ -80,36 +57,6 @@ class RayHelper:
     def is_worker():
         import ray
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
-
-    @staticmethod
-    def worker(group: Union[str, List[str]]):
-
-        def decorator(cls):
-            if not RayHelper.ray_inited():
-                return cls
-            if RayHelper.is_worker():
-                return cls
-            cls.decorated = True
-            groups = [group] if isinstance(group, str) else group
-            import ray
-            _cls = ray.remote(cls)
-            for g in groups:
-                RayHelper.worker_cls[g] = _cls
-
-            init_method = cls.__init__
-
-            @functools.wraps(init_method)
-            def new_init(self, *args, **kwargs):
-                if not RayHelper.is_worker():
-                    # Create remote workers
-                    RayHelper._create_workers(group, *args, **kwargs)
-                init_method(self, *args, **kwargs)
-
-            cls.__init__ = new_init
-
-            return cls
-
-        return decorator
 
     @staticmethod
     def collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
@@ -133,65 +80,12 @@ class RayHelper:
             raise ValueError(f'Unsupported collect method: {method}')
 
     @staticmethod
-    def function(group: str,
-                 dispatch: Union[Literal['slice', 'all'], Callable] = 'all',
-                 execute: Literal['first', 'all'] = 'all',
-                 collect: Union[Literal['none', 'flatten'], Callable] = 'none'):
-        """Remote execution function.
-
-        Args:
-            group: The group to execute.
-            dispatch: How to dispatch the arguments.
-                'slice': load balance
-                'all': all processes do the same thing
-            execute: How to execute
-                'first': Only first worker
-                'all': All processes
-            collect: How to collect the results.
-                'none': Return as-is
-                'flatten': Return a flattened list
-        Returns:
-            The execution result.
-        """
-
-        def decorator(func: Callable[..., T]) -> Callable[..., T]:
-
-            @functools.wraps(func)
-            def wrapper(self, *args, **kwargs) -> T:
-                if not RayHelper.ray_inited():
-                    return func(self, *args, **kwargs)
-                if RayHelper.is_worker():
-                    if not hasattr(self, 'group'):
-                        # pass through env
-                        self.group = os.environ['RAY_SWIFT_GROUP'].split(',')
-                    if group not in self.group:
-                        if RayHelper.is_called_from_init():
-                            # Functions in init of different group, do nothing
-                            return None
-                        else:
-                            # Should not happen
-                            raise ValueError()
-                    else:
-                        return func(self, *args, **kwargs)
-                else:
-                    if RayHelper.is_called_from_init():
-                        # each worker do its own init
-                        return None
-                    result = RayHelper.execute_all_sync(group, dispatch, execute, func.__name__, *args, **kwargs)
-                    return RayHelper.collect_func(collect, result)
-
-            return wrapper
-
-        return decorator
-
-    @staticmethod
-    def execute_all_sync(group, dispatch, execute, method_name: str, *args, **kwargs):
+    def execute_all_sync(workers, dispatch, execute, method_name: str, *args, **kwargs):
         import ray
-        return ray.get(RayHelper.execute_all_async(group, dispatch, execute, method_name, *args, **kwargs))
+        return ray.get(RayHelper.execute_all_async(workers, dispatch, execute, method_name, *args, **kwargs))
 
     @staticmethod
-    def execute_all_async(group, dispatch, execute, method_name: str, *args, **kwargs):
-        workers = RayHelper.worker_instance[group]
+    def execute_all_async( workers, dispatch, execute, method_name: str, *args, **kwargs):
         length = len(workers)
         if execute == 'first':
             return getattr(workers[0], method_name).remote(*args, **kwargs)
@@ -229,7 +123,7 @@ class RayHelper:
             raise ValueError(f'Invalid dispatch method: {dispatch}')
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, *args, **kwargs):
+    def create_workers(worker_cls: Type[T], group: str, *args, **kwargs) -> List[T]:
         import ray
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
