@@ -8,6 +8,8 @@ import numpy as np
 from .device_group import DeviceGroup
 from ..utils import requires, framework_util
 
+T1 = TypeVar('T1', bound=object)
+
 _mode: Optional[Literal['local', 'ray']] = 'local'
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
@@ -30,13 +32,6 @@ def initialize(mode: Literal['local', 'ray'],
         requires('ray')
         _device_group = groups
         _nproc_per_node = nproc_per_node
-
-
-def _get_remote_component(component):
-    if component not in _remote_components:
-        import ray
-        _remote_components[component] = ray.remote(component)
-    return _remote_components[component]
 
 
 def get_workers(workers, execute):
@@ -121,9 +116,6 @@ def dispatch_args(workers, dispatch, execute, args, kwargs):
         return result
     else:
         raise ValueError(f'Unsupported dispatch method: {dispatch}')
-
-
-T1 = TypeVar('T1', bound=object)
 
 
 def remote_class(group: Optional[str]=None):

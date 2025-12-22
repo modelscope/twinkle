@@ -1,12 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
-from typing import Callable, Dict, List, Literal, Optional, TypeVar, Union, Type, Tuple, Any
-
-import numpy as np
+from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any
 
 from .resource_manager import ResourceManager
 from .. import DeviceGroup
-from ...utils import Platform, find_node_ip, find_free_port, framework_util
+from ...utils import Platform, find_node_ip, find_free_port
 from ...utils import requires
 
 T = TypeVar('T')
@@ -17,6 +15,8 @@ class RayHelper:
     resource_manager: Optional[ResourceManager] = None
 
     _registry = None
+
+    _remote_components: Dict[str, Any] = {}
 
     @staticmethod
     def init_registry():
@@ -119,6 +119,13 @@ class RayHelper:
         return output
 
     @staticmethod
+    def _get_remote_component(component):
+        if component not in RayHelper._remote_components:
+            import ray
+            RayHelper._remote_components[component] = ray.remote(component)
+        return RayHelper._remote_components[component]
+
+    @staticmethod
     def create_workers(worker_cls: Type[T], group: str, *args, **kwargs) -> List[T]:
         import ray
         from ray.runtime_env import RuntimeEnv
@@ -130,6 +137,7 @@ class RayHelper:
             # TODO need to be sequential
             device_config = RayHelper.resource_manager.get_config(group)
             placement_groups = RayHelper.resource_manager.get_group(group)
+            worker_cls = RayHelper._get_remote_component(worker_cls)
             if device_config.device_type.upper() != 'CPU':
                 world_size = len(device_config.ranks)
                 ip, port = None, None
