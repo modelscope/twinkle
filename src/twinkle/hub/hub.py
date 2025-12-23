@@ -6,6 +6,7 @@ from typing import List, Literal, Optional, Union
 
 from requests.exceptions import HTTPError
 
+from ..infra import remote_class, remote_function
 from ..utils import requires
 
 
@@ -110,10 +111,12 @@ class HubOperation:
         raise NotImplementedError
 
 
+@remote_class()
 class MSHub(HubOperation):
     ms_token = None
 
     @staticmethod
+    @remote_function(dispatch='all', execute='first')
     def create_repo(repo_id: str,
                     *,
                     token: Optional[Union[str, bool]] = None,

@@ -23,12 +23,6 @@ device_groups = [
 twinkle.initialize(mode='local', groups=device_groups)
 
 
-def create_model(model_id):
-    from transformers import AutoModelForCausalLM
-    AutoModelForCausalLM = twinkle.prepare_one(AutoModelForCausalLM)
-    return AutoModelForCausalLM.from_pretrained(model_id)
-
-
 def train():
-    dataset =
-    rollout = twinkle.sampler.create()
+    dataset = twinkle.Dataset('ms://swift/self-cognition', remote_group='rollout')
+    dataset.map()

@@ -1,4 +1,5 @@
 import functools
+import inspect
 import os
 from typing import Literal, List, Optional, Union, Callable
 from typing import TypeVar
@@ -6,6 +7,7 @@ from typing import TypeVar
 import numpy as np
 
 from .device_group import DeviceGroup
+from .ray import RayHelper
 from ..utils import requires, framework_util
 
 T1 = TypeVar('T1', bound=object)
@@ -118,7 +120,7 @@ def dispatch_args(workers, dispatch, execute, args, kwargs):
         raise ValueError(f'Unsupported dispatch method: {dispatch}')
 
 
-def remote_class(group: Optional[str]=None):
+def remote_class():
 
     def decorator(cls):
         if _mode == 'local':
@@ -128,17 +130,23 @@ def remote_class(group: Optional[str]=None):
 
             cls.decorated = True
             init_method = cls.__init__
+            init_params = inspect.signature(init_method).parameters
+            has_remote_group = 'remote_group' in init_params
 
             @functools.wraps(init_method)
             def new_init(self, *args, **kwargs):
-                if os.environ.get('CLUSTER_NAME') == group:
+                if not has_remote_group:
+                    remote_group = kwargs.pop('remote_group', None)
+                else:
+                    remote_group = kwargs.get('remote_group', None)
+                if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     init_method(self, *args, **kwargs)
                 else:
                     # Create remote workers
-                    _actors = RayHelper.create_workers(cls, group, *args, **kwargs)
+                    _actors = RayHelper.create_workers(cls, remote_group, *args, **kwargs)
                     self._actors = _actors
-            cls.__init__ = new_init
 
+            cls.__init__ = new_init
             return cls
         else:
             raise ValueError(f'Unsupported mode: {_mode}')
@@ -175,7 +183,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             if _mode == 'local':
                 return func(*args, **kwargs)
             elif _mode == 'ray':
-                import ray
                 from .ray import RayHelper
                 _workers_and_args = dispatch_args(get_workers(self._actors, execute), dispatch,
                                                     execute, args, kwargs)
