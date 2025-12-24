@@ -1,11 +1,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
-from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any
+from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal
 
 from .resource_manager import ResourceManager
 from .. import DeviceGroup
 from ...utils import Platform, find_node_ip, find_free_port
-from ...utils import requires
+from ...utils import requires, framework_util
 
 T = TypeVar('T')
 
@@ -29,27 +29,33 @@ class RayHelper:
         class WorkerRegistry:
 
             def __init__(self):
-                self.workers = {}
+                self.config = {}
 
-            def register_workers(self, group: str, worker_handles: List):
-                self.workers[group] = worker_handles
+            def add_config(self, key: str, value: Any):
+                self.config[key] = value
 
-            def get_workers(self, group: str):
-                return self.workers.get(group, [])
+            def add_or_get(self, key: str, value: Any) -> Tuple[bool, Any]:
+                if key in self.config:
+                    return self.config[key]
+                self.config[key] = value
+                return value
+
+            def get_config(self, key: str):
+                return self.config.get(key)
 
             def clear(self):
-                self.workers.clear()
+                self.config.clear()
 
         try:
-            RayHelper._registry = ray.get_actor('worker_registry')
+            RayHelper._registry = ray.get_actor('config_registry')
         except ValueError:
             try:
                 RayHelper._registry = WorkerRegistry.options(
-                    name='worker_registry',
+                    name='config_registry',
                     lifetime='detached',
                 ).remote()
             except ValueError:
-                RayHelper._registry = ray.get_actor('worker_registry')
+                RayHelper._registry = ray.get_actor('config_registry')
         assert RayHelper._registry is not None
 
     @staticmethod
@@ -119,6 +125,21 @@ class RayHelper:
         return output
 
     @staticmethod
+    def add_or_get_config(key: str, value: Any):
+        import ray
+        return ray.get(RayHelper._registry.add_or_get.remote(key, value))
+
+    @staticmethod
+    def add_config(key: str, value: Any):
+        import ray
+        ray.get(RayHelper._registry.add_config.remote(key, value))
+
+    @staticmethod
+    def get_config(key: str):
+        import ray
+        return ray.get(RayHelper._registry.get_config.remote(key))
+
+    @staticmethod
     def _get_remote_component(component):
         if component not in RayHelper._remote_components:
             import ray
@@ -126,102 +147,112 @@ class RayHelper:
         return RayHelper._remote_components[component]
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, *args, **kwargs) -> List[T]:
+    def get_master_id_port(placement_group):
+        import ray
+        @ray.remote
+        def get_node_address():
+            return find_node_ip(), find_free_port()
+
+        ip, port = ray.get(
+            get_node_address.options(placement_group=placement_group).remote())
+        return ip, port
+
+    @staticmethod
+    def create_workers(worker_cls: Type[T], group: str, execute:Literal['all', 'peer'], instance_id, *args, **kwargs) -> List[T]:
         import ray
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+        workers = []
+        device_config = RayHelper.resource_manager.get_config(group)
+        placement_groups = RayHelper.resource_manager.get_group(group)
+        worker_cls = RayHelper._get_remote_component(worker_cls)
+        ranks = device_config.ranks
+        world_size = len(ranks)
+        assert len(placement_groups) == len(ranks)
+        if execute == 'peer':
+            _slice = framework_util.get_peer_index(len(ranks))
+            placement_groups = placement_groups[_slice]
+            ranks = ranks[_slice]
 
-        role = group + '-' + worker_cls.__name__
-        workers = ray.get(RayHelper._registry.get_workers.remote(role))
-        if not workers:
-            # TODO need to be sequential
-            device_config = RayHelper.resource_manager.get_config(group)
-            placement_groups = RayHelper.resource_manager.get_group(group)
-            worker_cls = RayHelper._get_remote_component(worker_cls)
-            if device_config.device_type.upper() != 'CPU':
-                world_size = len(device_config.ranks)
-                ip, port = None, None
-                for rank, (deploy_pg, gpu) in enumerate(zip(placement_groups, device_config.ranks)):
-                    deploy_pg: Dict
-                    cluster_name = group
-                    worker_name = cluster_name + '-' + str(rank)
-                    env_vars = os.environ.copy()
-                    env_vars.update({
-                        'WORLD_SIZE':
-                        str(world_size),
-                        'RANK':
-                        str(rank),
-                        'LOCAL_RANK':
-                        str(0),
-                        'CLUSTER_NAME':
-                        cluster_name,
-                        'WORKER_NAME':
-                        worker_name,
-                        Platform.get_platform(device_config.device_type.upper()):
-                        ','.join([str(r) for r in deploy_pg['gpu_rank']]),
-                        'TWINKLE_MODE': 'ray',
-                    })
+            key = f'{group}-{worker_cls.__name__}-{instance_id}'
+            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
+            ip = RayHelper.add_or_get_config(key, ip)
+            port = RayHelper.add_or_get_config(key, port)
+        else:
+            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
 
-                    @ray.remote
-                    def get_node_address():
-                        return find_node_ip(), find_free_port()
+        if device_config.device_type.upper() != 'CPU':
+            for rank, (deploy_pg, gpu) in enumerate(zip(placement_groups, ranks)):
+                deploy_pg: Dict
+                cluster_name = group
+                worker_name = cluster_name + '-' + str(rank)
+                env_vars = os.environ.copy()
+                env_vars.update({
+                    'WORLD_SIZE':
+                    str(world_size),
+                    'RANK':
+                    str(rank),
+                    'LOCAL_RANK':
+                    str(0),
+                    'CLUSTER_NAME':
+                    cluster_name,
+                    'WORKER_NAME':
+                    worker_name,
+                    Platform.get_platform(device_config.device_type.upper()):
+                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
+                    'TWINKLE_MODE': 'ray',
+                })
 
-                    if rank == 0:
-                        ip, port = ray.get(
-                            get_node_address.options(placement_group=deploy_pg['placement_group']).remote())
+                env_vars['MASTER_ADDR'] = ip
+                env_vars['MASTER_PORT'] = str(port)
 
-                    env_vars['MASTER_ADDR'] = ip
-                    env_vars['MASTER_PORT'] = str(port)
+                runtime_env = RuntimeEnv(env_vars=env_vars)
 
-                    runtime_env = RuntimeEnv(env_vars=env_vars)
+                worker_options = {
+                    'scheduling_strategy':
+                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
+                    'name':
+                    worker_name,
+                    'namespace':
+                    'default',
+                    'runtime_env':
+                    runtime_env,
+                    'num_cpus':
+                    0.01,
+                    'num_gpus':
+                    0.01,
+                }
 
-                    worker_options = {
-                        'scheduling_strategy':
-                        PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                        'name':
-                        worker_name,
-                        'namespace':
-                        'default',
-                        'runtime_env':
-                        runtime_env,
-                        'num_cpus':
-                        0.01,
-                        'num_gpus':
-                        0.01,
-                    }
+                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                workers.append(worker)
+        else:
+            world_size = len(ranks)
+            workers = []
+            for deploy_pg, index in zip(placement_groups, list(range(world_size))):
+                deploy_pg: Dict
+                cluster_name = group
+                worker_name = cluster_name + '-' + str(index)
+                env_vars = os.environ.copy()
+                env_vars.update({
+                    'CLUSTER_NAME': cluster_name,
+                    'WORKER_NAME': worker_name,
+                    Platform.get_platform(device_config.device_type.upper()): '',
+                })
+                runtime_env = RuntimeEnv(env_vars=env_vars)
 
-                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
-                    workers.append(worker)
-            else:
-                world_size = len(device_config.ranks)
-                workers = []
-                for deploy_pg, index in zip(placement_groups, list(range(world_size))):
-                    deploy_pg: Dict
-                    cluster_name = group
-                    worker_name = cluster_name + '-' + str(index)
-                    env_vars = os.environ.copy()
-                    env_vars.update({
-                        'CLUSTER_NAME': cluster_name,
-                        'WORKER_NAME': worker_name,
-                        Platform.get_platform(device_config.device_type.upper()): '',
-                    })
-                    runtime_env = RuntimeEnv(env_vars=env_vars)
+                worker_options = {
+                    'scheduling_strategy':
+                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
+                    'name':
+                    worker_name,
+                    'namespace':
+                    'default',
+                    'runtime_env':
+                    runtime_env,
+                    'num_cpus':
+                    0.01,
+                }
 
-                    worker_options = {
-                        'scheduling_strategy':
-                        PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                        'name':
-                        worker_name,
-                        'namespace':
-                        'default',
-                        'runtime_env':
-                        runtime_env,
-                        'num_cpus':
-                        0.01,
-                    }
-
-                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
-                    workers.append(worker)
-
-            ray.get(RayHelper._registry.register_workers.remote(role, workers))
+                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                workers.append(worker)
         return workers

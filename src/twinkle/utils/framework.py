@@ -97,6 +97,26 @@ class Framework(ABC):
             return Torch.get_library(module)
         return 'other'
 
+    @staticmethod
+    def get_peer_index(target_size, rank=None, world_size=None):
+        if rank is None:
+            rank = Framework.get_rank()
+        if rank < 0:
+            rank = 0
+        if world_size is None:
+            world_size = Framework.get_world_size()
+        if world_size <= 0:
+            world_size = 1
+
+        k, m = divmod(target_size, world_size)
+        start_idx = rank * k + min(rank, m)
+        end_idx = (rank + 1) * k + min(rank + 1, m)
+        if target_size < world_size:
+            start_idx = rank % target_size
+            end_idx = start_idx + 1
+
+        return slice(start_idx, end_idx)
+
 
 class Torch(Framework):
 

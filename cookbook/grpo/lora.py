@@ -1,5 +1,7 @@
 import twinkle
 from twinkle.infra import DeviceGroup
+from twinkle.model import Transformers
+from twinkle.dataset import Dataset
 
 device_groups = [
     DeviceGroup(
@@ -23,6 +25,12 @@ device_groups = [
 twinkle.initialize(mode='local', groups=device_groups)
 
 
+def preprocess(row):
+    return row
+
+
 def train():
-    dataset = twinkle.Dataset('ms://swift/self-cognition', remote_group='rollout')
-    dataset.map()
+    dataset = Dataset('ms://swift/self-cognition', remote_group='rollout')
+    dataset.map(preprocess)
+    model = Transformers(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct')
+    model.load_state_dict()

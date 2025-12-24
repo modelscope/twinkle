@@ -42,20 +42,7 @@ def get_workers(workers, execute):
     elif execute == 'all':
         return workers
     elif execute == 'peer':
-
-        def get_peer_index(target_size):
-            rank = framework_util.get_rank()
-            world_size = framework_util.get_world_size()
-
-            k, m = divmod(target_size, world_size)
-            start_idx = rank * k + min(rank, m)
-            end_idx = (rank + 1) * k + min(rank + 1, m)
-            if target_size < world_size:
-                start_idx = rank % target_size
-                end_idx = start_idx + 1
-
-            return slice(start_idx, end_idx)
-        return workers[get_peer_index(len(workers))]
+        return workers[framework_util.get_peer_index(len(workers))]
     else:
         raise ValueError(f'Unsupported execute method: {execute}')
 
@@ -130,21 +117,22 @@ def remote_class():
 
             cls.decorated = True
             init_method = cls.__init__
-            init_params = inspect.signature(init_method).parameters
-            has_remote_group = 'remote_group' in init_params
 
             @functools.wraps(init_method)
             def new_init(self, *args, **kwargs):
-                if not has_remote_group:
-                    remote_group = kwargs.pop('remote_group', None)
-                else:
-                    remote_group = kwargs.get('remote_group', None)
+                frame = inspect.currentframe().f_back
+                caller_file = frame.f_code.co_filename
+                caller_line = frame.f_lineno
+                instance_id = f"{caller_file}:{caller_line}"
+                remote_group = kwargs.pop('remote_group', None)
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     init_method(self, *args, **kwargs)
                 else:
                     # Create remote workers
-                    _actors = RayHelper.create_workers(cls, remote_group, *args, **kwargs)
+                    _actors = RayHelper.create_workers(cls, remote_group, 'peer', instance_id=instance_id, *args, **kwargs) # noqa
                     self._actors = _actors
+                self.remote_group = remote_group
+                self._instance_id = instance_id
 
             cls.__init__ = new_init
             return cls
@@ -188,6 +176,39 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                                                     execute, args, kwargs)
                 result = RayHelper.execute_all_sync(func.__name__, _workers_and_args)
                 return collect_func(collect, result)
+            else:
+                raise NotImplementedError(f'Unsupported mode {_mode}')
+
+        return wrapper
+
+    return decorator
+
+
+def remote_cls_constructor():
+
+    def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
+
+        @functools.wraps(func)
+        def wrapper(cls, *args, **kwargs) -> T1:
+            if _mode == 'local':
+                return func(*args, **kwargs)
+            elif _mode == 'ray':
+                from .ray import RayHelper
+                frame = inspect.currentframe().f_back
+                caller_file = frame.f_code.co_filename
+                caller_line = frame.f_lineno
+                instance_id = f"{caller_file}:{caller_line}"
+                remote_group = kwargs.pop('remote_group', None)
+                if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
+                    self = func(*args, **kwargs)
+                else:
+                    # Create remote workers
+                    _actors = RayHelper.create_workers(func, remote_group, 'peer', instance_id=instance_id, *args, **kwargs) # noqa
+                    self = cls.__new__(cls)
+                    self._actors = _actors
+                self.remote_group = remote_group
+                self._instance_id = instance_id
+                return self
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 
