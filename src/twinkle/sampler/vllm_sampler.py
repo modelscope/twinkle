@@ -8,7 +8,7 @@ from ..template import Template
 
 class VLLMSampler(Sampler):
 
-    def __init__(self, engine_args: 'vllm.EngineArgs', template_type: Type[Template], remote_group):
+    def __init__(self, engine_args: 'vllm.EngineArgs', template: Type[Template], remote_group):
         super().__init__()
         requires('vllm')
         from vllm import LLMEngine

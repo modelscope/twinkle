@@ -4,7 +4,7 @@ from twinkle.model import TransformersModel
 from twinkle.dataset import Dataset
 from twinkle.sampler import VLLMSampler
 from twinkle.dataloader import DataLoader
-from twinkle.template import Template
+from twinkle.template import Qwen3Template
 from twinkle.loss import GRPOLoss
 
 device_groups = [
@@ -33,19 +33,23 @@ def preprocess(row):
     return row
 
 
-def train():
-    dataset = Dataset('ms://swift/self-cognition', remote_group='rollout', reward=)
+def create_dataset():
+    dataset = Dataset('ms://swift/self-cognition')
     dataset.map(preprocess)
-    dataloader = DataLoader(dataset, remote_group='rollout')
+    return dataset
+
+
+def train():
+    dataloader = DataLoader(create_dataset, remote_group='rollout')
     from vllm import EngineArgs
     engine_args = EngineArgs()
-    sampler = VLLMSampler(engine_args, template_type='qwen2.5', remote_group='rollout')
+    sampler = VLLMSampler(engine_args, template=Qwen3Template, remote_group='rollout')
     model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='actor')
     ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
     model.set_loss(GRPOLoss)
     model.set_optimizer('AdamW')
     model.set_lr_scheduler('LinearDecay')
-    template = Template('qwen2.5')
+    template = Qwen3Template('qwen2.5')
     for batch in dataloader:
         trajectories = sampler.sample(batch)
         inputs = template.encode(trajectories)

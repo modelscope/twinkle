@@ -94,5 +94,3 @@ class TransformersModel(PreTrainedModel):
                 self.model = get_peft_model(self.model, config)
         else:
             self.model = config(self.model)
-
-    def add_loss_scale(self, loss_scale):
