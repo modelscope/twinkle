@@ -10,3 +10,5 @@ class Trajectory:
     messages: List[Message] = field(default_factory=list)
 
     generation_config: Dict[str, Any] = field(default_factory=dict)
+
+    export_information: Dict[str, Any] = field(default_factory=dict)
