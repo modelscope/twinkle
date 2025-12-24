@@ -1,4 +1,4 @@
-from typing import overload, Type, Optional, Union, Callable
+from typing import overload, Type, Optional, Union, Callable, Dict, Any
 
 from peft import PeftConfig, get_peft_model, PeftModel
 from torch.optim import Optimizer
@@ -6,6 +6,8 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
 
 from twinkle import remote_class, remote_function
+from twinkle.loss.base import Loss
+from twinkle.plugin.plugin import Plugin
 
 
 @remote_class()
@@ -30,27 +32,25 @@ class TransformersModel(PreTrainedModel):
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
         self.loss_instance = None
         self.loss_value = None
-        self.input = None
-        self.output = None
+        self.inputs = None
+        self.outputs = None
         self.optimizer = None
         self.lr_scheduler = None
 
     @remote_function()
-    def forward(self, *, input_ids, adapter_name: str, **kwargs):
-        kwargs['input_ids'] = input_ids
-        self.input = kwargs
-        output = self.model(**kwargs)
-        self.output = output
-        return output
+    def forward(self, *, inputs: Dict[str, Any], adapter_name: str = None):
+        self.inputs = inputs
+        self.outputs = self.model(**self.inputs)
 
     @remote_function()
-    def set_loss(self, loss: Union[Type, str, Callable]):
+    def set_loss(self, loss: Union[Type[Loss], str]):
+        if isinstance(loss, str):
+            loss = Plugin.load_plugin(loss, Loss)
         self.loss_instance = loss()
 
     @remote_function()
-    def loss(self, *, loss_func: Callable = None, **kwargs):
-        loss_instance = loss_func or self.loss_instance
-        self.loss_value = loss_instance(self.input, self.output, **kwargs)
+    def calculate_loss(self, **kwargs):
+        self.loss_value = self.loss_instance(self.input, self.output, **kwargs)
         return self.loss_value
 
     @remote_function()
@@ -60,7 +60,7 @@ class TransformersModel(PreTrainedModel):
     @remote_function()
     def forward_backward(self, *, input_ids, adapter_name: str, **kwargs):
         self.forward(input_ids=input_ids, **kwargs)
-        self.loss(**kwargs)
+        self.calculate_loss(**kwargs)
         self.backward()
 
     @remote_function()

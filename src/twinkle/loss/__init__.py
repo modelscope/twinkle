@@ -22,4 +22,5 @@ torch_loss_mapping = {
     'reranker': RerankerLoss,
     'listwise_reranker': ListwiseRerankerLoss,
     'listwise_generative_reranker': ListwiseGenerativeRerankerLoss,
+    'grpo': GRPOLoss,
 }

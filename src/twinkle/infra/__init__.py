@@ -127,10 +127,37 @@ def remote_class():
                 remote_group = kwargs.pop('remote_group', None)
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     init_method(self, *args, **kwargs)
+
+                    if remote_group and os.environ.get('CLUSTER_NAME') == remote_group:
+                        if hasattr(cls, '__iter__'):
+                            assert not hasattr(cls, '__next__')
+
+                            def __iter__(self):
+                                _iter = self.__iter_self__()
+                                assert _iter is not self
+                                self._iter = _iter
+                                return self
+
+                            def __next__(self):
+                                return next(self._iter)
+
+                            cls.__iter_self__ = cls.__iter__
+                            cls.__iter__ = remote_function()(__iter__)
+                            cls.__next__ = remote_function()(__next__)
                 else:
                     # Create remote workers
                     _actors = RayHelper.create_workers(cls, remote_group, 'peer', instance_id=instance_id, *args, **kwargs) # noqa
                     self._actors = _actors
+                    if hasattr(cls, '__iter__'):
+
+                        def __iter__(self):
+                            _workers_and_args = dispatch_args(get_workers(self._actors, 'all'), 'all',
+                                                              'all', (), {})
+                            RayHelper.execute_all_sync('__iter__', _workers_and_args)
+                            return self
+
+                        cls.__iter__ = __iter__
+
                 self.remote_group = remote_group
                 self._instance_id = instance_id
 

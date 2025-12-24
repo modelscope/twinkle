@@ -5,6 +5,7 @@ if TYPE_CHECKING:
     from .version import __version__, __release_datetime__
     from .utils import framework_util, torch_util, requires, exists
     from .infra import initialize, remote_class, remote_function
+    from .reward import Reward, MathReward
     from .dataset import Dataset
 
 else:
@@ -13,6 +14,7 @@ else:
         'utils': ['framework_util', 'torch_util', 'requires'],
         'infra': ['initialize', 'remote_class', 'remote_function'],
         'dataset': ['Dataset'],
+        'reward': ['Reward', 'MathReward'],
     }
 
     import sys

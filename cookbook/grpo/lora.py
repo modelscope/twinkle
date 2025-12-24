@@ -6,6 +6,7 @@ from twinkle.sampler import VLLMSampler
 from twinkle.dataloader import DataLoader
 from twinkle.template import Qwen3Template
 from twinkle.loss import GRPOLoss
+from twinkle.reward import MathReward
 
 device_groups = [
     DeviceGroup(
@@ -41,8 +42,9 @@ def create_dataset():
 
 def train():
     dataloader = DataLoader(create_dataset, remote_group='rollout')
-    from vllm import EngineArgs
-    engine_args = EngineArgs()
+    engine_args = {
+
+    }
     sampler = VLLMSampler(engine_args, template=Qwen3Template, remote_group='rollout')
     model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='actor')
     ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
@@ -50,15 +52,15 @@ def train():
     model.set_optimizer('AdamW')
     model.set_lr_scheduler('LinearDecay')
     template = Qwen3Template('qwen2.5')
+    reward = MathReward()
     for batch in dataloader:
         trajectories = sampler.sample(batch)
         inputs = template.encode(trajectories)
         logits = ref_model.forward(inputs)
-        trajectories = reward.calculate(trajectories)
-        #model.forward(inputs)
-        #model.loss(ref_logits=logits)
-        #model.backward()
-        model.forward_backward(inputs, ref_logits=logits, reward=reward)
+        rewards = reward.calculate(trajectories)
+        model.forward(inputs)
+        model.calculate_loss(ref_logits=logits, reward=rewards)
+        model.backward()
         model.step()
         model.zero_grad()
         model.lr_step()

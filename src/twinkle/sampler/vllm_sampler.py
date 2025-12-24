@@ -1,5 +1,5 @@
 import uuid
-from typing import List, Type
+from typing import List, Type, Dict, Any
 
 from .base import Sampler
 from ..trajectory import Trajectory, Message
@@ -8,16 +8,16 @@ from ..template import Template
 
 class VLLMSampler(Sampler):
 
-    def __init__(self, engine_args: 'vllm.EngineArgs', template: Type[Template], remote_group):
+    def __init__(self, engine_args: Dict[str, Any], template: Type[Template], remote_group):
         super().__init__()
         requires('vllm')
-        from vllm import LLMEngine
+        from vllm import LLMEngine, EngineArgs
+        engine_args = EngineArgs(**engine_args)
         vllm_config = engine_args.create_engine_config()
         self.engine = LLMEngine.from_vllm_config(
             vllm_config=vllm_config,
         )
         self.template = template_type()
-
 
     def sample(self, trajectories: List[Trajectory]) -> List[Trajectory]:
         request_ids = []

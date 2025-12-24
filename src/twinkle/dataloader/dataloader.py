@@ -16,6 +16,3 @@ class DataLoader(TorchDataLoader):
             self.dataset = dataset
         self.dataloader = TorchDataLoader(self.dataset, **dataloader_params)
         self.device_mesh = device_mesh
-
-    def prepare(self):
-
