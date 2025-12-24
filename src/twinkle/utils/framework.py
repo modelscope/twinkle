@@ -4,8 +4,6 @@ from abc import ABC, abstractmethod
 from typing import Literal, Union
 from functools import lru_cache
 
-from .platform import Platform
-
 
 class Framework(ABC):
 

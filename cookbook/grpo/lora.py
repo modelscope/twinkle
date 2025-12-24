@@ -34,7 +34,7 @@ def preprocess(row):
 
 
 def train():
-    dataset = Dataset('ms://swift/self-cognition', remote_group='rollout')
+    dataset = Dataset('ms://swift/self-cognition', remote_group='rollout', reward=)
     dataset.map(preprocess)
     dataloader = DataLoader(dataset, remote_group='rollout')
     from vllm import EngineArgs
@@ -42,7 +42,7 @@ def train():
     sampler = VLLMSampler(engine_args, template_type='qwen2.5', remote_group='rollout')
     model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='actor')
     ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
-    model.set_loss(NewLoss)
+    model.set_loss(GRPOLoss)
     model.set_optimizer('AdamW')
     model.set_lr_scheduler('LinearDecay')
     template = Template('qwen2.5')
@@ -50,7 +50,7 @@ def train():
         trajectories = sampler.sample(batch)
         inputs = template.encode(trajectories)
         logits = ref_model.forward(inputs)
-        reward = reward.calculate(trajectories)
+        trajectories = reward.calculate(trajectories)
         #model.forward(inputs)
         #model.loss(ref_logits=logits)
         #model.backward()

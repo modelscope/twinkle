@@ -12,3 +12,5 @@ class Trajectory:
     generation_config: Dict[str, Any] = field(default_factory=dict)
 
     export_information: Dict[str, Any] = field(default_factory=dict)
+
+    rewards: List[float] = field(default_factory=list)
