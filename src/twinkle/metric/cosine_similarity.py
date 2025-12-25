@@ -7,7 +7,10 @@ from .base import Metric
 
 class CosineSimilarityMetric(Metric):
 
-    def __call__(self, embeddings1, embeddings2, labels):
+    def __call__(self, inputs, outputs, **kwargs):
+        embeddings1 = outputs['sentence1']
+        embeddings2 = outputs['sentence2']
+        labels = inputs['labels']
         cosine_scores = 1 - (paired_cosine_distances(embeddings1, embeddings2))
         manhattan_distances = -paired_manhattan_distances(embeddings1, embeddings2)
         euclidean_distances = -paired_euclidean_distances(embeddings1, embeddings2)

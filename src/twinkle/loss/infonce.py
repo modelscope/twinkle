@@ -59,9 +59,9 @@ class InfoNCELoss(Loss):
             split_tensors.append(split_part)
         return split_tensors
 
-    def _gather_data(self, logits, labels):
+    @staticmethod
+    def gather_data(logits, labels):
         # gather all the logits and labels across the gpus when calculate loss across all batches of all gpus
-
         from accelerate.utils import gather_object
         rank = torch_util.get_rank()
         all_preds = gather_object(logits.unsqueeze(0))

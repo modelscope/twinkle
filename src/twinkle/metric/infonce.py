@@ -1,5 +1,6 @@
 import numpy as np
-from ..loss.infonce import InfoNCELoss
+from twinkle.loss.infonce import InfoNCELoss
+from twinkle.utils import torch_util
 from .base import Metric
 import torch
 
@@ -19,8 +20,13 @@ class InfoNCEMetric(Metric):
         self.cross_batch = cross_batch
         self.hard_negatives = hard_negatives
 
-    def __call__(self, embeddings, labels):
-        split_tensors = InfoNCELoss.parse_multi_negative_sentences(torch.tensor(embeddings), torch.tensor(labels), self.hard_negatives)
+    def __call__(self, inputs, outputs, **kwargs):
+        logits = outputs['logits']
+        labels = inputs['labels']
+        world_size = torch_util.get_world_size()
+        if world_size > 1 and self.cross_batch:
+            logits, labels = InfoNCELoss.gather_data(logits, labels)
+        split_tensors = InfoNCELoss.parse_multi_negative_sentences(torch.tensor(logits), torch.tensor(labels), self.hard_negatives)
         split_tensors = [t.numpy() for t in split_tensors]
         can_batched = self.hard_negatives is not None
         if self.hard_negatives is None and len(set([s.shape[0] for s in split_tensors])) == 1:

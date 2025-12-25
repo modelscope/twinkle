@@ -4,7 +4,7 @@ from .base import Metric
 
 class RerankerMetric(Metric):
 
-    def __call__(self, logits, labels):
+    def __call__(self, inputs, outputs, **kwargs):
         """
         Calculate MRR and NDCG metrics for reranker.
 
@@ -23,6 +23,8 @@ class RerankerMetric(Metric):
         Returns:
             dict: Dictionary containing MRR and NDCG metrics averaged across all queries
         """
+        logits = outputs['logits']
+        labels = inputs['labels']
         # Convert to numpy if needed
         if hasattr(logits, 'numpy'):
             logits = logits.numpy()

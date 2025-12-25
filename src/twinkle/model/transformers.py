@@ -5,14 +5,14 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
 import twinkle
-from twinkle import remote_class, remote_function, InputProcessor
+from twinkle import remote_class, remote_function
+from twinkle.processor import DataProcessorMixin
 from twinkle.loss.base import Loss
 from twinkle.utils.plugin import Plugin
-from twinkle.template import Template
 
 
 @remote_class()
-class TransformersModel(PreTrainedModel):
+class TransformersModel(PreTrainedModel, DataProcessorMixin):
 
     @overload
     def __init__(self, *, model_cls: Type[PreTrainedModel], config: PretrainedConfig, remote_group, **kwargs) -> None:
@@ -29,11 +29,11 @@ class TransformersModel(PreTrainedModel):
                  **kwargs):
         if pretrained_model_name_or_path is None:
             self.model = model_cls(config, **kwargs)
-        elif model_cls :
+        elif model_cls:
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
         self.loss_instance = None
         self.loss_value = None
-        self.inputs = None
+        self.inputs: Optional[Dict[str, Any]] = None
         self.outputs = None
         self.optimizer = None
         self.lr_scheduler = None
@@ -41,8 +41,15 @@ class TransformersModel(PreTrainedModel):
 
     @remote_function()
     def forward(self, *, inputs: Dict[str, Any], adapter_name: str = None):
-        self.inputs = self.processor(inputs)
+        self.inputs: Dict[str, Any] = self.processor(inputs)
         self.outputs = self.model(**self.inputs)
+
+    @remote_function()
+    def forward_only(self, *, inputs: Dict[str, Any], adapter_name: str = None):
+        import torch
+        with torch.no_grad():
+            self.inputs: Dict[str, Any] = self.processor(inputs)
+            self.outputs = self.model(**self.inputs)
 
     @remote_function()
     def calculate_loss(self, **kwargs):
@@ -54,8 +61,8 @@ class TransformersModel(PreTrainedModel):
         self.loss_value.backward()
 
     @remote_function()
-    def forward_backward(self, *, input_ids, adapter_name: str, **kwargs):
-        self.forward(input_ids=input_ids, **kwargs)
+    def forward_backward(self, *, inputs: Dict[str, Any], adapter_name: str, **kwargs):
+        self.forward(inputs, adapter_name=adapter_name)
         self.calculate_loss(**kwargs)
         self.backward()
 
@@ -71,40 +78,14 @@ class TransformersModel(PreTrainedModel):
     def lr_step(self):
         self.lr_scheduler.step()
 
-    def set_template(self, template: Union[Type[Template], str]):
-        if isinstance(template, str):
-            if hasattr(twinkle.template, template):
-                template = getattr(twinkle.template, template)
-            else:
-                template = Plugin.load_plugin(template, Template)
-        self.template = template(self.model_id)
-
     @remote_function()
-    def set_processor(self, processor: Union[Type[Loss], str]):
-        if isinstance(processor, str):
-            if hasattr(twinkle.processor, processor):
-                processor = getattr(twinkle.processor, processor)
+    def set_loss(self, loss_cls: Union[Type[Loss], str]):
+        if isinstance(loss_cls, str):
+            if hasattr(twinkle.loss, loss_cls):
+                loss_cls = getattr(twinkle.loss, loss_cls)
             else:
-                processor = Plugin.load_plugin(processor, InputProcessor)
-        self.processor = processor()
-
-    @remote_function()
-    def set_loss(self, loss: Union[Type[Loss], str]):
-        if isinstance(loss, str):
-            if hasattr(twinkle.loss, loss):
-                loss = getattr(twinkle.loss, loss)
-            else:
-                loss = Plugin.load_plugin(loss, Loss)
-        self.loss_instance = loss()
-
-    @remote_function()
-    def set_loss(self, loss: Union[Type[Loss], str]):
-        if isinstance(loss, str):
-            if hasattr(twinkle.loss, loss):
-                loss = getattr(twinkle.loss, loss)
-            else:
-                loss = Plugin.load_plugin(loss, Loss)
-        self.loss_instance = loss()
+                loss_cls = Plugin.load_plugin(loss_cls, Loss)
+        self.loss_instance = loss_cls()
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
@@ -114,7 +95,7 @@ class TransformersModel(PreTrainedModel):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        self.optimizer = optimizer_cls(self.model.parameters(), **kwargs)
+        self.optimizer = optimizer_cls(self.model.trainable_parameters(), **kwargs)
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
