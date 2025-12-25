@@ -8,6 +8,7 @@ import twinkle
 from twinkle import remote_class, remote_function, InputProcessor
 from twinkle.loss.base import Loss
 from twinkle.plugin.plugin import Plugin
+from twinkle.template import Template
 
 
 @remote_class()
@@ -69,6 +70,14 @@ class TransformersModel(PreTrainedModel):
     @remote_function()
     def lr_step(self):
         self.lr_scheduler.step()
+
+    def set_template(self, template: Union[Type[Template], str]):
+        if isinstance(template, str):
+            if hasattr(twinkle.template, template):
+                template = getattr(twinkle.template, template)
+            else:
+                template = Plugin.load_plugin(template, Template)
+        self.template = template(self.model_id)
 
     @remote_function()
     def set_input_processor(self, processor: Union[Type[Loss], str]):

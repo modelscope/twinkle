@@ -1,11 +1,15 @@
 import uuid
-from typing import List, Type, Dict, Any
+from typing import List, Type, Dict, Any, Union
 
+import twinkle
 from .base import Sampler
+from .. import remote_function, remote_class, InputProcessor
+from ..plugin.plugin import Plugin
 from ..trajectory import Trajectory, Message
 from ..utils import requires
 from ..template import Template
 
+@remote_class()
 class VLLMSampler(Sampler):
 
     def __init__(self, model_id: str, engine_args: Dict[str, Any], template: Type[Template], remote_group):
@@ -19,6 +23,24 @@ class VLLMSampler(Sampler):
         )
         self.template = template(model_id)
 
+    def set_template(self, template: Union[Type[Template], str]):
+        if isinstance(template, str):
+            if hasattr(twinkle.template, template):
+                template = getattr(twinkle.template, template)
+            else:
+                template = Plugin.load_plugin(template, Template)
+        self.template = template(self.model_id)
+
+    @remote_function()
+    def set_input_processor(self, processor: Union[Type[InputProcessor], str]):
+        if isinstance(processor, str):
+            if hasattr(twinkle.processor, processor):
+                processor = getattr(twinkle.processor, processor)
+            else:
+                processor = Plugin.load_plugin(processor, InputProcessor)
+        self.processor = processor()
+
+    @remote_function()
     def sample(self, trajectories: List[Trajectory]) -> List[Trajectory]:
         request_ids = []
         for trajectory in trajectories:

@@ -16,3 +16,11 @@ class DataLoader(TorchDataLoader):
             self.dataset = dataset
         self.dataloader = TorchDataLoader(self.dataset, **dataloader_params)
         self.device_mesh = device_mesh
+
+    def set_template(self, template: Union[Type[Template], str]):
+        if isinstance(template, str):
+            if hasattr(twinkle.template, template):
+                template = getattr(twinkle.template, template)
+            else:
+                template = Plugin.load_plugin(template, Template)
+        self.template = template(self.model_id)
