@@ -158,7 +158,7 @@ class RayHelper:
         return ip, port
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, execute:Literal['all', 'peer'], instance_id, *args, **kwargs) -> List[T]:
+    def create_workers(worker_cls: Type[T], group: str, execute:Literal['all', 'peer'], instance_id, seed=42, full_determinism=False, *args, **kwargs) -> List[T]:
         import ray
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -201,6 +201,8 @@ class RayHelper:
                     Platform.get_platform(device_config.device_type.upper()):
                     ','.join([str(r) for r in deploy_pg['gpu_rank']]),
                     'TWINKLE_MODE': 'ray',
+                    'TWINKLE_SEED': str(seed),
+                    'TWINKLE_FULL_DETERMINISM': str(full_determinism),
                 })
 
                 env_vars['MASTER_ADDR'] = ip
@@ -237,6 +239,8 @@ class RayHelper:
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     Platform.get_platform(device_config.device_type.upper()): '',
+                    'TWINKLE_SEED': str(seed),
+                    'TWINKLE_FULL_DETERMINISM': str(full_determinism),
                 })
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 

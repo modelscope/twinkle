@@ -1,2 +1,2 @@
-from .base import DataProcessor, DataFilter
+from .base import Preprocessor, DataFilter
 from .llm import CompetitionMathProcessor

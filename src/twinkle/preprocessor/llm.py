@@ -1,8 +1,8 @@
-from .base import DataProcessor
+from .base import Preprocessor
 from ..trajectory import Trajectory, Message
 
 
-class CompetitionMathProcessor(DataProcessor):
+class CompetitionMathProcessor(Preprocessor):
 
     def __call__(self, rows):
         trajectories = []

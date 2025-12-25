@@ -3,7 +3,7 @@ from typing import List
 from twinkle.trajectory import Trajectory
 
 
-class DataProcessor:
+class Preprocessor:
 
     def __call__(self, rows) -> List[Trajectory]:
         ...

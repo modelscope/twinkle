@@ -20,6 +20,10 @@ if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
 
 _nproc_per_node: Optional[int] = 8
 
+_seed = 42
+
+_full_determinism = False
+
 _device_group: Optional[List[DeviceGroup]] = None
 
 _remote_components: dict = {}
@@ -27,10 +31,16 @@ _remote_components: dict = {}
 
 def initialize(mode: Literal['local', 'ray'],
                nproc_per_node: Optional[int] = 8,
+               seed: int = 42,
+               full_determinism: bool = False,
                groups: Optional[List[DeviceGroup]] = None,):
-    global _mode, _device_group, _nproc_per_node
+    global _mode, _device_group, _nproc_per_node, _seed, _full_determinism
     assert mode in ('local', 'ray')
     _mode = mode
+    _full_determinism = full_determinism
+    if seed is not None:
+        _seed = seed
+        framework_util.seed_everything(seed, full_determinism)
     if _mode == 'ray':
         requires('ray')
         _device_group = groups
@@ -131,6 +141,8 @@ def remote_class():
                     init_method(self, *args, **kwargs)
 
                     if remote_group and os.environ.get('CLUSTER_NAME') == remote_group:
+                        framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
+                                                       bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
                         if hasattr(cls, '__iter__'):
                             assert not hasattr(cls, '__next__')
 
@@ -138,7 +150,6 @@ def remote_class():
                                 _iter = self.__iter_self__()
                                 assert _iter is not self
                                 self._iter = _iter
-                                return self
 
                             def __next__(self):
                                 return next(self._iter)
@@ -148,7 +159,13 @@ def remote_class():
                             cls.__next__ = remote_function()(__next__)
                 else:
                     # Create remote workers
-                    _actors = RayHelper.create_workers(cls, remote_group, 'peer', instance_id=instance_id, *args, **kwargs) # noqa
+                    _actors = RayHelper.create_workers(cls,
+                                                       remote_group,
+                                                       'peer',
+                                                       instance_id=instance_id,
+                                                       seed=_seed,
+                                                       full_determinism=_full_determinism,
+                                                       *args, **kwargs)
                     self._actors = _actors
                     if hasattr(cls, '__iter__'):
 

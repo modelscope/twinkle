@@ -4,7 +4,6 @@ from twinkle.model import TransformersModel
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.sampler import VLLMSampler
 from twinkle.dataloader import DataLoader
-from twinkle.template import Qwen3Template
 from twinkle.reward import MathReward
 
 device_groups = [
@@ -37,20 +36,21 @@ def create_dataset():
 
 def train():
     dataloader = DataLoader(create_dataset, remote_group='rollout')
+    dataloader.set_processor('GRPOInputProcessor')
     engine_args = {
 
     }
     sampler = VLLMSampler(engine_args, remote_group='rollout')
-    sampler.set_input_processor('GRPOInputProcessor')
+    sampler.set_processor('GRPOInputProcessor')
     sampler.set_template('Qwen3Template')
     model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='actor')
     ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
     model.set_loss('GRPOLoss')
     model.set_optimizer('AdamW')
     model.set_lr_scheduler('LinearDecay')
-    model.set_input_processor('GRPOInputProcessor')
+    model.set_processor('GRPOInputProcessor')
     model.set_template('Qwen3Template')
-    ref_model.set_input_processor('GRPOInputProcessor')
+    ref_model.set_processor('GRPOInputProcessor')
     ref_model.set_template('Qwen3Template')
     reward = MathReward()
     for batch in dataloader:

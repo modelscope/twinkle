@@ -4,7 +4,7 @@ from typing import List, Type, Dict, Any, Union
 import twinkle
 from .base import Sampler
 from .. import remote_function, remote_class, InputProcessor
-from ..plugin.plugin import Plugin
+from twinkle.utils.plugin import Plugin
 from ..trajectory import Trajectory, Message
 from ..utils import requires
 from ..template import Template
@@ -32,7 +32,7 @@ class VLLMSampler(Sampler):
         self.template = template(self.model_id)
 
     @remote_function()
-    def set_input_processor(self, processor: Union[Type[InputProcessor], str]):
+    def set_processor(self, processor: Union[Type[InputProcessor], str]):
         if isinstance(processor, str):
             if hasattr(twinkle.processor, processor):
                 processor = getattr(twinkle.processor, processor)

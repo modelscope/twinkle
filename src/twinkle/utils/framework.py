@@ -1,8 +1,11 @@
 import importlib
 import os
 from abc import ABC, abstractmethod
-from typing import Literal, Union
+import random
+from typing import Literal, Union, Optional
 from functools import lru_cache
+
+import numpy as np
 
 
 class Framework(ABC):
@@ -115,6 +118,10 @@ class Framework(ABC):
 
         return slice(start_idx, end_idx)
 
+    @staticmethod
+    def seed_everything(seed: Optional[int] = 42, full_determinism: bool = False):
+        Torch.seed_everything(seed, full_determinism)
+
 
 class Torch(Framework):
 
@@ -200,3 +207,29 @@ class Torch(Framework):
         elif Torch.is_npu_available():
             import torch_npu
             torch.npu.set_device(local_rank)
+
+    @staticmethod
+    def seed_everything(seed: Optional[int] = 42, deterministic: bool = False):
+        random.seed(seed)
+        np.random.seed(seed)
+        if Torch.is_gpu_available():
+            import torch
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            if Torch.is_npu_available():
+                import torch_npu
+                torch.npu.manual_seed_all(seed)
+
+            if deterministic:
+                torch.use_deterministic_algorithms(True)
+                os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+                os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+                os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+                torch.use_deterministic_algorithms(True, warn_only=True)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+
+                if Torch.is_npu_available():
+                    os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
+                    os.environ["HCCL_DETERMINISTIC"] = "1"

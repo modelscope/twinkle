@@ -28,6 +28,10 @@ def apply_kernel(module: Any,
                 return kernelize(module, mode=kernel_mode, device=device)
 
         assert target_modules is not None and kernel is not None
+
+        if torch_util.get_library(module) == 'megatron':
+            ...
+
         return apply_kernel_torch(module, kernel, target_modules=target_modules)
     else:
         raise NotImplementedError(f'Unsupported applying kernels for: {module.__class__}')
