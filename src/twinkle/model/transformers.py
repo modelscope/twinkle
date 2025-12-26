@@ -6,13 +6,16 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
 import twinkle
 from twinkle import remote_class, remote_function
-from twinkle.processor import DataProcessorMixin
+from twinkle.processor import DataProcessorMixin, InputProcessor
 from twinkle.loss.base import Loss
 from twinkle.utils.plugin import Plugin
+from .optimize import OptimizerGroup
 
 
 @remote_class()
 class TransformersModel(PreTrainedModel, DataProcessorMixin):
+
+    _default_adapter_name = ''
 
     @overload
     def __init__(self, *, model_cls: Type[PreTrainedModel], config: PretrainedConfig, remote_group, **kwargs) -> None:
@@ -31,86 +34,127 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             self.model = model_cls(config, **kwargs)
         elif model_cls:
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
-        self.loss_instance = None
-        self.loss_value = None
-        self.inputs: Optional[Dict[str, Any]] = None
-        self.outputs = None
-        self.optimizer = None
-        self.lr_scheduler = None
-        self.processor = None
+        self.optimizer_group: Dict[str, OptimizerGroup] = {self._default_adapter_name: OptimizerGroup()}
 
     @remote_function()
-    def forward(self, *, inputs: Dict[str, Any], adapter_names: List[str] = None):
-        self.inputs: Dict[str, Any] = self.processor(inputs)
-        self.outputs = self.model(**self.inputs, adapter_names=adapter_names)
+    def forward(self, *, inputs: Dict[str, Any], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        processor: InputProcessor = self.optimizer_group[adapter_name].processor
+        assert processor is not None
+        inputs: Dict[str, Any] = processor(inputs)
+        outputs = self.model(**inputs)
+        if adapter_name:
+            self.optimizer_group[adapter_name].inputs = inputs
+            self.optimizer_group[adapter_name].outputs = outputs
 
     @remote_function()
-    def forward_only(self, *, inputs: Dict[str, Any], adapter_names: List[str] = None):
+    def forward_only(self, *, inputs: Dict[str, Any], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
         import torch
         with torch.no_grad():
-            self.inputs: Dict[str, Any] = self.processor(inputs)
-            self.outputs = self.model(**self.inputs, adapter_names=adapter_names)
+            processor: InputProcessor = self.optimizer_group[adapter_name].processor
+            assert processor is not None
+            inputs: Dict[str, Any] = processor(inputs)
+            outputs = self.model(**inputs)
+        if adapter_name:
+            self.optimizer_group[adapter_name].inputs = inputs
+            self.optimizer_group[adapter_name].outputs = outputs
 
     @remote_function()
     def calculate_loss(self, **kwargs):
-        self.loss_value = self.loss_instance(self.input, self.output, **kwargs)
-        return self.loss_value
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        loss_instance = self.optimizer_group[adapter_name].loss_instance
+        assert loss_instance is not None
+        loss_value = loss_instance(self.input, self.output, **kwargs)
+        self.optimizer_group[adapter_name].loss_value = loss_value
+        return loss_value
 
     @remote_function()
-    def backward(self):
-        self.loss_value.backward()
+    def backward(self, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        loss_value = self.optimizer_group[adapter_name].loss_value
+        assert loss_value is not None
+        loss_value.backward()
 
     @remote_function()
-    def forward_backward(self, *, inputs: Dict[str, Any], adapter_names: List[str] = None, **kwargs):
-        self.forward(inputs, adapter_names=adapter_names)
+    def forward_backward(self, *, inputs: Dict[str, Any], **kwargs):
+        self.forward(inputs, **kwargs)
         self.calculate_loss(**kwargs)
-        self.backward()
+        self.backward(**kwargs)
 
     @remote_function()
-    def step(self):
-        self.optimizer.step()
+    def step(self, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        optimizer = self.optimizer_group[adapter_name].optimizer
+        assert optimizer is not None
+        optimizer.step()
 
     @remote_function()
-    def zero_grad(self):
-        self.optimizer.zero_grad()
+    def zero_grad(self, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        optimizer = self.optimizer_group[adapter_name].optimizer
+        assert optimizer is not None
+        optimizer.zero_grad()
 
     @remote_function()
-    def lr_step(self):
-        self.lr_scheduler.step()
+    def lr_step(self, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
+        lr_scheduler = self.optimizer_group[adapter_name].lr_scheduler
+        assert lr_scheduler is not None
+        lr_scheduler.step()
 
     @remote_function()
-    def set_loss(self, loss_cls: Union[Type[Loss], str]):
+    def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
         if isinstance(loss_cls, str):
             if hasattr(twinkle.loss, loss_cls):
                 loss_cls = getattr(twinkle.loss, loss_cls)
             else:
                 loss_cls = Plugin.load_plugin(loss_cls, Loss)
-        self.loss_instance = loss_cls()
+        self.optimizer_group[adapter_name].loss_instance = loss_cls()
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
         if isinstance(optimizer_cls, str):
             import torch
             if hasattr(torch.optim, optimizer_cls):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        self.optimizer = optimizer_cls(self.model.trainable_parameters(), **kwargs)
+        self.optimizer_group[adapter_name].optimizer = optimizer_cls(self.model.trainable_parameters(), **kwargs)
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group
         if isinstance(scheduler_cls, str):
             import torch
             if hasattr(torch.optim.lr_scheduler, scheduler_cls):
                 scheduler_cls = getattr(torch.optim.lr_scheduler, scheduler_cls)
             else:
                 scheduler_cls = Plugin.load_plugin(scheduler_cls, LRScheduler)
-        self.lr_scheduler = scheduler_cls(self.optimizer, **kwargs)
+        optimizer = self.optimizer_group[adapter_name].optimizer
+        assert isinstance(optimizer, Optimizer)
+        self.optimizer_group[adapter_name].lr_scheduler = scheduler_cls(optimizer, **kwargs)
 
     def save_state(self, adapter_name: str):
         pass
 
     def add_adapter_to_model(self, adapter_name: str, config: Union[PeftConfig, Callable]):
+        assert adapter_name not in self.optimizer_group
+        self.optimizer_group[adapter_name] = OptimizerGroup()
+        self.optimizer_group[adapter_name].adapter_name = adapter_name
+        self.optimizer_group[adapter_name].adapter_config = config
         if isinstance(config, PeftConfig):
             if isinstance(self.model, PeftModel):
                 self.model = self.model.add_adapter(adapter_name, config)
