@@ -143,13 +143,11 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        self.optimizer_group[adapter_name].optimizer = optimizer_cls(self._get_trainable_parameters(), **kwargs)
+        self.optimizer_group[adapter_name].optimizer = optimizer_cls(self._get_trainable_parameters(
+            adapter_name=adapter_name), **kwargs)
 
-    def _get_trainable_parameters(self, **kwargs):
-        adapter_name = kwargs.pop("adapter_name", '')
+    def _get_trainable_parameters(self, adapter_name=''):
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
-        if adapter_name:
-            self.model.set_current_adapter_name(adapter_name)
         is_default = adapter_name == self._default_adapter_name
         pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
         params = []
@@ -176,14 +174,15 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
         pass
 
     def add_adapter_to_model(self, adapter_name: str, config: Union[PeftConfig, Callable]):
-        assert adapter_name not in self.optimizer_group, f'{adapter_name} already exists'
+        assert adapter_name not in self.optimizer_group, f'{adapter_name} already exists.'
+        assert adapter_name, 'Use a different adapter_name, current is empty.'
         self.optimizer_group[adapter_name] = OptimizerGroup()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
         if isinstance(config, PeftConfig):
             if isinstance(self.model, PeftModel):
-                self.model = self.model.add_adapter(adapter_name, config)
+                self.model.add_adapter(adapter_name, config)
             else:
-                self.model = get_peft_model(self.model, config)
+                self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
         else:
             self.model = config(self.model)
