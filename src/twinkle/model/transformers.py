@@ -5,11 +5,13 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
 import twinkle
+import re
 from twinkle import remote_class, remote_function
 from twinkle.processor import DataProcessorMixin, InputProcessor
 from twinkle.loss.base import Loss
 from twinkle.utils.plugin import Plugin
 from .optimize import OptimizerGroup
+from twinkle.patch import MultiAdapter
 
 
 @remote_class()
@@ -34,6 +36,7 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             self.model = model_cls(config, **kwargs)
         elif model_cls:
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
+        self.model = MultiAdapter()(self.model) # patch multiple loras
         self.optimizer_group: Dict[str, OptimizerGroup] = {self._default_adapter_name: OptimizerGroup()}
 
     @remote_function()
@@ -43,6 +46,8 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
         processor: InputProcessor = self.optimizer_group[adapter_name].processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
+        if adapter_name:
+            self.model.set_current_adapter_name(adapter_name)
         outputs = self.model(**inputs)
         if adapter_name:
             self.optimizer_group[adapter_name].inputs = inputs
@@ -57,6 +62,8 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             processor: InputProcessor = self.optimizer_group[adapter_name].processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
+            if adapter_name:
+                self.model.set_current_adapter_name(adapter_name)
             outputs = self.model(**inputs)
         if adapter_name:
             self.optimizer_group[adapter_name].inputs = inputs
@@ -68,7 +75,10 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         assert isinstance(loss_instance, Loss), 'Set loss_instance correctly before forwarding'
-        loss_value = loss_instance(self.input, self.output, **kwargs)
+        inputs = self.optimizer_group[adapter_name].inputs
+        outputs = self.optimizer_group[adapter_name].outputs
+        assert inputs is not None and outputs is not None, 'Cannot calculate loss of null inputs and outputs'
+        loss_value = loss_instance(inputs, outputs, **kwargs)
         self.optimizer_group[adapter_name].loss_value = loss_value
         return loss_value
 
@@ -78,11 +88,13 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         loss_value = self.optimizer_group[adapter_name].loss_value
         assert loss_value is not None, 'Forward and calculate loss before backward pass.'
+        if adapter_name:
+            self.model.set_current_adapter_name(adapter_name)
         loss_value.backward()
 
     @remote_function()
     def forward_backward(self, *, inputs: Dict[str, Any], **kwargs):
-        self.forward(inputs, **kwargs)
+        self.forward(inputs=inputs, **kwargs)
         self.calculate_loss(**kwargs)
         self.backward(**kwargs)
 
@@ -131,7 +143,20 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        self.optimizer_group[adapter_name].optimizer = optimizer_cls(self.model.trainable_parameters(), **kwargs)
+        self.optimizer_group[adapter_name].optimizer = optimizer_cls(self._get_trainable_parameters(), **kwargs)
+
+    def _get_trainable_parameters(self, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if adapter_name:
+            self.model.set_current_adapter_name(adapter_name)
+        is_default = adapter_name == self._default_adapter_name
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        params = []
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and (pattern.search(name) or is_default):
+                params.append(param)
+        return params
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):

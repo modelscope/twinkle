@@ -23,4 +23,3 @@ class OptimizerGroup:
     loss_value: Any = None
     template: Template = None
     processor: InputProcessor = None
-
