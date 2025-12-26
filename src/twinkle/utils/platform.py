@@ -39,6 +39,34 @@ class DeviceMesh:
     def ep_rank(self) -> int:
         return 0
 
+    @property
+    def dp_world_size(self) -> int:
+        return 1
+
+    @property
+    def sp_world_size(self) -> int:
+        return 1
+
+    @property
+    def cp_world_size(self) -> int:
+        return 1
+
+    @property
+    def mp_world_size(self) -> int:
+        return 1
+
+    @property
+    def pp_world_size(self) -> int:
+        return 1
+
+    @property
+    def ep_world_size(self) -> int:
+        return 1
+
+    @property
+    def world_size(self) -> int:
+        return 1
+
 
 @dataclass
 class DeviceGroup:

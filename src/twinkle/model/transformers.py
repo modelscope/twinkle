@@ -61,7 +61,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {self._default_adapter_name: OptimizerGroup()}
 
     @remote_function()
-    def forward(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward(self, *, inputs: Any, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         processor: InputProcessor = self.optimizer_group[adapter_name].processor
@@ -75,7 +75,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             self.optimizer_group[adapter_name].outputs = outputs
 
     @remote_function()
-    def forward_only(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward_only(self, *, inputs: Any, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         import torch
@@ -237,4 +237,4 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 processor_cls = getattr(__file__.__module__, processor_cls)
             else:
                 processor_cls = Plugin.load_plugin(processor_cls, InputProcessor)
-        self.optimizer_group[adapter_name].processor = processor_cls(self.model_id, **kwargs)
+        self.optimizer_group[adapter_name].processor = processor_cls(self.model_id, template=template, **kwargs)

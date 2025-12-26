@@ -80,7 +80,7 @@ def train():
     engine_args = {
 
     }
-    actor_group = ActorGroup(engine_args)
+    actor_group = ActorGroup(engine_args, remote_group='rollout')
     ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
     ref_model.set_processor('GRPOInputProcessor')
     ref_model.set_template('Qwen3Template', 'Qwen/Qwen2.5-7B-Instruct')

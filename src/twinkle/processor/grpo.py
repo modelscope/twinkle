@@ -1,6 +1,6 @@
 from typing import Dict, Any
 
-from twinkle import InputProcessor
+from twinkle.processor import InputProcessor
 
 
 class GRPOInputProcessor(InputProcessor):
