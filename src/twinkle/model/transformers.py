@@ -1,21 +1,41 @@
-from typing import overload, Type, Optional, Union, Callable, Dict, Any, List
+import re
+from dataclasses import dataclass
+from typing import Dict, Any
+from typing import overload, Type, Optional, Union, Callable
 
-from peft import PeftConfig, get_peft_model, PeftModel
+from peft import PeftConfig
+from peft import get_peft_model, PeftModel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
+
 import twinkle
-import re
-from twinkle import remote_class, remote_function
-from twinkle.processor import DataProcessorMixin, InputProcessor
+from twinkle import remote_class, remote_function, template
 from twinkle.loss.base import Loss
-from twinkle.utils.plugin import Plugin
-from .optimize import OptimizerGroup
+from twinkle.loss.base import Loss
+from .base import TwinkleModel
 from twinkle.patch import MultiAdapter
+from twinkle.processor import InputProcessor
+from twinkle.template import Template
+from twinkle.utils.plugin import Plugin
+
+
+@dataclass
+class OptimizerGroup:
+    adapter_name: str = None
+    adapter_config: PeftConfig = None
+    optimizer: Optimizer = None
+    lr_scheduler: LRScheduler = None
+    inputs: Dict[str, Any] = None
+    outputs: Dict[str, Any] = None
+    loss_instance: Loss = None
+    loss_value: Any = None
+    template: Template = None
+    processor: InputProcessor = None
 
 
 @remote_class()
-class TransformersModel(PreTrainedModel, DataProcessorMixin):
+class TransformersModel(TwinkleModel, PreTrainedModel):
 
     _default_adapter_name = ''
 
@@ -36,7 +56,8 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             self.model = model_cls(config, **kwargs)
         elif model_cls:
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
-        self.model = MultiAdapter()(self.model) # patch multiple loras
+        self.model_id = pretrained_model_name_or_path
+        self.model: PreTrainedModel = MultiAdapter()(self.model) # patch multiple loras
         self.optimizer_group: Dict[str, OptimizerGroup] = {self._default_adapter_name: OptimizerGroup()}
 
     @remote_function()
@@ -144,16 +165,16 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
         self.optimizer_group[adapter_name].optimizer = optimizer_cls(self._get_trainable_parameters(
-            adapter_name=adapter_name), **kwargs)
+            adapter_name=adapter_name).values(), **kwargs)
 
     def _get_trainable_parameters(self, adapter_name=''):
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         is_default = adapter_name == self._default_adapter_name
         pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
-        params = []
+        params = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad and (pattern.search(name) or is_default):
-                params.append(param)
+                params[name] = param
         return params
 
     @remote_function()
@@ -170,19 +191,50 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         self.optimizer_group[adapter_name].lr_scheduler = scheduler_cls(optimizer, **kwargs)
 
-    def save_state(self, adapter_name: str):
-        pass
+    @remote_function(execute='first')
+    def save_state_dict(self, output_dir, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if not adapter_name:
+            self.model.save_pretrained(output_dir)
+        else:
+            state_dict = self.get_state_dict(adapter_name)
+            self.model.save_pretrained(output_dir, state_dict=state_dict)
 
-    def add_adapter_to_model(self, adapter_name: str, config: Union[PeftConfig, Callable]):
+    @remote_function(execute='first')
+    def get_state_dict(self, adapter_name: str = ''):
+        return self._get_trainable_parameters(adapter_name=adapter_name)
+
+    @remote_function()
+    def add_adapter_to_model(self, adapter_name: str, config: PeftConfig):
         assert adapter_name not in self.optimizer_group, f'{adapter_name} already exists.'
         assert adapter_name, 'Use a different adapter_name, current is empty.'
         self.optimizer_group[adapter_name] = OptimizerGroup()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
-        if isinstance(config, PeftConfig):
-            if isinstance(self.model, PeftModel):
-                self.model.add_adapter(adapter_name, config)
-            else:
-                self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
+        if isinstance(self.model, PeftModel):
+            self.model.add_adapter(adapter_name, config)
         else:
-            self.model = config(self.model)
+            self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
+
+    @remote_function()
+    def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if isinstance(template_cls, str):
+            if hasattr(template, template_cls):
+                template_cls = getattr(template, template_cls)
+            else:
+                template_cls = Plugin.load_plugin(template_cls, template.Template)
+        self.optimizer_group[adapter_name].template = template_cls(self.model_id, **kwargs)
+
+    @remote_function()
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
+        adapter_name = kwargs.pop("adapter_name", '')
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if isinstance(processor_cls, str):
+            if hasattr(__file__.__module__, processor_cls):
+                processor_cls = getattr(__file__.__module__, processor_cls)
+            else:
+                processor_cls = Plugin.load_plugin(processor_cls, InputProcessor)
+        self.optimizer_group[adapter_name].processor = processor_cls(self.model_id, **kwargs)
