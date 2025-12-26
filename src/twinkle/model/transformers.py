@@ -39,9 +39,9 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def forward(self, *, inputs: Dict[str, Any], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         processor: InputProcessor = self.optimizer_group[adapter_name].processor
-        assert processor is not None
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
         outputs = self.model(**inputs)
         if adapter_name:
@@ -51,11 +51,11 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def forward_only(self, *, inputs: Dict[str, Any], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         import torch
         with torch.no_grad():
             processor: InputProcessor = self.optimizer_group[adapter_name].processor
-            assert processor is not None
+            assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
             outputs = self.model(**inputs)
         if adapter_name:
@@ -65,9 +65,9 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def calculate_loss(self, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         loss_instance = self.optimizer_group[adapter_name].loss_instance
-        assert loss_instance is not None
+        assert isinstance(loss_instance, Loss), 'Set loss_instance correctly before forwarding'
         loss_value = loss_instance(self.input, self.output, **kwargs)
         self.optimizer_group[adapter_name].loss_value = loss_value
         return loss_value
@@ -75,9 +75,9 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def backward(self, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         loss_value = self.optimizer_group[adapter_name].loss_value
-        assert loss_value is not None
+        assert loss_value is not None, 'Forward and calculate loss before backward pass.'
         loss_value.backward()
 
     @remote_function()
@@ -89,31 +89,31 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def step(self, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         optimizer = self.optimizer_group[adapter_name].optimizer
-        assert optimizer is not None
+        assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before forwarding'
         optimizer.step()
 
     @remote_function()
     def zero_grad(self, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         optimizer = self.optimizer_group[adapter_name].optimizer
-        assert optimizer is not None
+        assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before forwarding'
         optimizer.zero_grad()
 
     @remote_function()
     def lr_step(self, **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         lr_scheduler = self.optimizer_group[adapter_name].lr_scheduler
-        assert lr_scheduler is not None
+        assert isinstance(lr_scheduler, LRScheduler), 'Set lr_scheduler correctly before forwarding'
         lr_scheduler.step()
 
     @remote_function()
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         if isinstance(loss_cls, str):
             if hasattr(twinkle.loss, loss_cls):
                 loss_cls = getattr(twinkle.loss, loss_cls)
@@ -124,7 +124,7 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         if isinstance(optimizer_cls, str):
             import torch
             if hasattr(torch.optim, optimizer_cls):
@@ -136,7 +136,7 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
-        assert adapter_name in self.optimizer_group
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         if isinstance(scheduler_cls, str):
             import torch
             if hasattr(torch.optim.lr_scheduler, scheduler_cls):
@@ -144,14 +144,14 @@ class TransformersModel(PreTrainedModel, DataProcessorMixin):
             else:
                 scheduler_cls = Plugin.load_plugin(scheduler_cls, LRScheduler)
         optimizer = self.optimizer_group[adapter_name].optimizer
-        assert isinstance(optimizer, Optimizer)
+        assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         self.optimizer_group[adapter_name].lr_scheduler = scheduler_cls(optimizer, **kwargs)
 
     def save_state(self, adapter_name: str):
         pass
 
     def add_adapter_to_model(self, adapter_name: str, config: Union[PeftConfig, Callable]):
-        assert adapter_name not in self.optimizer_group
+        assert adapter_name not in self.optimizer_group, f'{adapter_name} already exists'
         self.optimizer_group[adapter_name] = OptimizerGroup()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
