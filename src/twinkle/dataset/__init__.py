@@ -1,1 +1,1 @@
-from .dataset import Dataset, DatasetMeta
+from .base import Dataset, DatasetMeta

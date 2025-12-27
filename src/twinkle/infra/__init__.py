@@ -163,8 +163,12 @@ def remote_class():
                                 return next(self._iter)
 
                             cls.__iter_origin__ = cls.__iter__
-                            cls.__iter__ = remote_function()(__iter__)
-                            cls.__next__ = remote_function()(__next__)
+                            cls.__iter__ = remote_function(execute=cls.__iter_origin__._execute,
+                                                           dispatch=cls.__iter_origin__._dispatch,
+                                                           collect=cls.__iter_origin__._collect)(__iter__)
+                            cls.__next__ = remote_function(execute=cls.__iter_origin__._execute,
+                                                           dispatch=cls.__iter_origin__._dispatch,
+                                                           collect=cls.__iter_origin__._collect)(__next__)
                 else:
                     # Create remote workers
                     _actors = RayHelper.create_workers(cls,
@@ -242,6 +246,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     return RayHelper.do_get_and_collect_func(collect_func, collect, result)
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
+
+        wrapper._execute = func._execute = execute
+        wrapper._collect = func._collect = collect
+        wrapper._dispatch = func._dispatch = dispatch
 
         return wrapper
 

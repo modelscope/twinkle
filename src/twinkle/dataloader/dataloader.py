@@ -9,6 +9,28 @@ from twinkle.processor import DataProcessorMixin
 from twinkle.trajectory import Trajectory
 
 
+class RetrySampler:
+    def __init__(self, original_sampler, dataset, max_retries=50):
+        self.original_sampler = original_sampler
+        self.dataset = dataset
+        self.max_retries = max_retries
+
+    def __iter__(self):
+        for idx in self.original_sampler:
+            for _ in range(self.max_retries):
+                try:
+                    data = self.dataset[idx]
+                    if not data:
+                        raise ValueError('Data load failed.')
+                    yield idx
+                except Exception: # noqa
+                    continue
+            else:
+                raise ValueError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
+
+    def __len__(self):
+        return len(self.original_sampler)
+
 @remote_class()
 class DataLoader(TorchDataLoader, DataProcessorMixin):
 
@@ -36,35 +58,16 @@ class DataLoader(TorchDataLoader, DataProcessorMixin):
         worker_seed = num_workers * rank + init_seed + worker_id
         framework_util.seed_everything(worker_seed)
 
-    @remote_function()
+    @remote_function(execute='first')
     def __iter__(self):
         if self.dataloader is None:
             self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params,
                                               collate_fn=lambda x: x)
+            self._repeat_sample()
+        return self.dataloader.__iter__()
 
-        _iter = self.dataloader.__iter__()
-
-        def __next__(self):
-            while True:
-                next_element: Trajectory = self.__origin_next__()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    def _repeat_sample(self):
+        if self.dataloader.batch_sampler is not None and hasattr(self.dataloader.batch_sampler, 'sampler'):
+            self.dataloader.batch_sampler.sampler = RetrySampler(self.dataloader.batch_sampler.sampler, self.dataset)
+        elif self.dataloader.sampler is not None:
+            self.dataloader.sampler = RetrySampler(self.dataloader.sampler, self.dataset)
