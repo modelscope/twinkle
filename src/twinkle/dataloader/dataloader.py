@@ -5,34 +5,12 @@ from torch.utils.data import DataLoader as TorchDataLoader
 from twinkle import DeviceMesh, remote_function, framework_util
 from twinkle import remote_class
 from twinkle.dataset import Dataset
-from twinkle.processor import DataProcessorMixin
-from twinkle.trajectory import Trajectory
+from .retry_sampler import RetrySampler
+from .device_mesh_sampler import DeviceMeshSampler
 
-
-class RetrySampler:
-    def __init__(self, original_sampler, dataset, max_retries=50):
-        self.original_sampler = original_sampler
-        self.dataset = dataset
-        self.max_retries = max_retries
-
-    def __iter__(self):
-        for idx in self.original_sampler:
-            for _ in range(self.max_retries):
-                try:
-                    data = self.dataset[idx]
-                    if not data:
-                        raise ValueError('Data load failed.')
-                    yield idx
-                except Exception: # noqa
-                    continue
-            else:
-                raise ValueError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
-
-    def __len__(self):
-        return len(self.original_sampler)
 
 @remote_class()
-class DataLoader(TorchDataLoader, DataProcessorMixin):
+class DataLoader(TorchDataLoader):
 
     def __init__(self, dataset: Union[Dataset, Callable], device_mesh: Optional[DeviceMesh]=None,
                  **dataloader_params):
@@ -44,7 +22,7 @@ class DataLoader(TorchDataLoader, DataProcessorMixin):
         self.template = None
         self.dataloader = None
         self.dataloader_params = dataloader_params
-        super(TorchDataLoader, self).__init__(device_mesh)
+        self.device_mesh = device_mesh
 
     def set_work_init_fn(self):
         num_workers = self.dataloader_params.get('num_workers', 0)
@@ -58,7 +36,7 @@ class DataLoader(TorchDataLoader, DataProcessorMixin):
         worker_seed = num_workers * rank + init_seed + worker_id
         framework_util.seed_everything(worker_seed)
 
-    @remote_function(execute='first')
+    @remote_function()
     def __iter__(self):
         if self.dataloader is None:
             self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params,
@@ -69,5 +47,6 @@ class DataLoader(TorchDataLoader, DataProcessorMixin):
     def _repeat_sample(self):
         if self.dataloader.batch_sampler is not None and hasattr(self.dataloader.batch_sampler, 'sampler'):
             self.dataloader.batch_sampler.sampler = RetrySampler(self.dataloader.batch_sampler.sampler, self.dataset)
+            self.dataloader.batch_sampler = DeviceMeshSampler(self.dataloader.batch_sampler, self.device_mesh)
         elif self.dataloader.sampler is not None:
             self.dataloader.sampler = RetrySampler(self.dataloader.sampler, self.dataset)

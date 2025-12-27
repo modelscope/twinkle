@@ -67,6 +67,12 @@ class DeviceMesh:
     def world_size(self) -> int:
         return 1
 
+    def get_slice(self, total_length):
+        length = self.dp_world_size
+        dp_rank = self.dp_rank
+        k, m = divmod(total_length, length)
+        return slice(dp_rank * k + min(dp_rank, m), (dp_rank + 1) * k + min(dp_rank + 1, m))
+
 
 @dataclass
 class DeviceGroup:

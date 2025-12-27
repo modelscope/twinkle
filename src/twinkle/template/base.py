@@ -1,3 +1,5 @@
+from typing import List
+
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from twinkle.trajectory import Trajectory
@@ -9,6 +11,9 @@ class Template:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
 
     def encode(self, trajectory: Trajectory):
+        ...
+
+    def batch_encode(self, trajectories: List[Trajectory]):
         ...
 
     def check(self, trajectory: Trajectory):

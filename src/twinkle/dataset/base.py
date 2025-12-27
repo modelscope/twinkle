@@ -36,6 +36,7 @@ class Dataset(TorchDataset):
         self.dataset = dataset
         self.template = None
 
+    @remote_function(execute='first')
     def set_template(self, template_cls: Union[Type[template.Template], str], model_id: str, **template_params):
         if isinstance(template_cls, str):
             if hasattr(template, template_cls):
@@ -46,7 +47,7 @@ class Dataset(TorchDataset):
 
     @remote_function(execute='first')
     def encode(self, template_cls: Union[Type[template.Template], str], **kwargs):
-        self.dataset = self.dataset.map(self.template.encode, **kwargs)
+        self.dataset = self.dataset.map(self.template.encode, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @remote_function(execute='first')
     def check(self, template_cls: Union[Type[template.Template], str], **kwargs):
