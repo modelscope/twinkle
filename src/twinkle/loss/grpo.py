@@ -2,7 +2,7 @@ from typing import Dict, Optional, Tuple, Literal, List
 import torch
 
 from twinkle.loss.base import Loss
-from twinkle.trajectory import Trajectory
+from twinkle.data_format import Trajectory
 
 
 class GRPOLoss(Loss):

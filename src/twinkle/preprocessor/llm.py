@@ -1,10 +1,10 @@
 from .base import Preprocessor
-from ..trajectory import Trajectory, Message
+from ..data_format import Trajectory, Message
 
 
 class CompetitionMathProcessor(Preprocessor):
 
-    def __call__(self, row):
+    def __call__(self, row) -> Trajectory:
         problem = row['problem']
         solution = row['solution']
         messages = [

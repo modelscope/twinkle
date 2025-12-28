@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, List
 from typing import overload, Type, Optional, Union
 
 from peft import PeftConfig
@@ -18,6 +18,7 @@ from twinkle.patch import MultiAdapter
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
+from ..data_format import InputFeature, Trajectory
 
 
 @dataclass
@@ -71,7 +72,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {self._default_adapter_name: OptimizerGroup()}
 
     @remote_function()
-    def forward(self, *, inputs: Any, **kwargs):
+    def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
         Args:
@@ -83,6 +84,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop("adapter_name", '')
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if isinstance(inputs, list) and isinstance(inputs[0], Trajectory):
+            assert self.self.optimizer_group[adapter_name].template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = self.self.optimizer_group[adapter_name].template.batch_encode(inputs)
         processor: InputProcessor = self.optimizer_group[adapter_name].processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
@@ -94,9 +99,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             self.optimizer_group[adapter_name].outputs = outputs
 
     @remote_function()
-    def forward_only(self, *, inputs: Any, **kwargs):
+    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         adapter_name = kwargs.pop("adapter_name", '')
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        if isinstance(inputs, list) and isinstance(inputs[0], Trajectory):
+            assert self.self.optimizer_group[adapter_name].template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = self.self.optimizer_group[adapter_name].template.batch_encode(inputs)
         import torch
         with torch.no_grad():
             processor: InputProcessor = self.optimizer_group[adapter_name].processor
@@ -133,7 +142,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         loss_value.backward()
 
     @remote_function()
-    def forward_backward(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
         self.forward(inputs=inputs, **kwargs)
         self.calculate_loss(**kwargs)
         self.backward(**kwargs)

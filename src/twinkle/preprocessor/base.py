@@ -1,6 +1,6 @@
 from typing import List
 
-from twinkle.trajectory import Trajectory
+from twinkle.data_format import Trajectory
 
 
 class Preprocessor:

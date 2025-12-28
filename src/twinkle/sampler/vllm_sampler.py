@@ -1,14 +1,14 @@
 import os
 import uuid
 from dataclasses import dataclass, asdict
-from typing import List, Type, Dict, Any, Union, Callable
+from typing import List, Type, Dict, Any, Union
 
 from peft import PeftConfig
 
 from .base import Sampler
 from twinkle import remote_function, remote_class
 from twinkle.utils.plugin import Plugin
-from twinkle.trajectory import Trajectory, Message
+from twinkle.data_format import Trajectory, Message
 from twinkle import requires
 from twinkle import template
 from twinkle import processor
@@ -85,10 +85,10 @@ class VLLMSampler(Sampler):
 
         request_ids = []
         for trajectory in trajectories:
-            input_ids = self.template.encode(trajectory)
+            inputs = self.template.encode(trajectory)
             request_id = str(uuid.uuid4().hex)
             request_ids.append(request_id)
-            llm_inputs = {'prompt_token_ids': input_ids}
+            llm_inputs = {'prompt_token_ids': inputs.input_ids}
             self.engine.add_request(request_id, llm_inputs, generation_config=trajectory.generation_config, adapter_request=adapter_request)
         outputs = []
         while self.engine.has_unfinished_requests():

@@ -1,6 +1,6 @@
 from typing import List, Dict, Any
 
-from twinkle.trajectory import Trajectory
+from twinkle.data_format import Trajectory
 
 class Sampler:
 

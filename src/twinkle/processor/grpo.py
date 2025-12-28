@@ -1,9 +1,10 @@
-from typing import Dict, Any
+from typing import Union, List
 
+from twinkle.data_format import InputFeature
 from twinkle.processor import InputProcessor
 
 
 class GRPOInputProcessor(InputProcessor):
 
-    def __call__(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        return inputs
+    def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):
+        return super().prepare_inputs(inputs)

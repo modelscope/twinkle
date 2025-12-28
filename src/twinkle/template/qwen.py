@@ -1,7 +1,7 @@
 from typing import List
 
 from .base import Template
-from ..trajectory import Trajectory
+from ..data_format import Trajectory
 
 
 class Qwen3Template(Template):

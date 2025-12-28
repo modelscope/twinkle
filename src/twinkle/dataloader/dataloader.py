@@ -45,8 +45,9 @@ class DataLoader(TorchDataLoader):
     @remote_function()
     def __iter__(self):
         if self.dataloader is None:
-            self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params,
-                                              collate_fn=lambda x: x)
+            if 'collate_fn' not in self.dataloader_params:
+                self.dataloader_params['collate_fn'] = lambda x: x
+            self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params)
             self._repeat_sample_and_shard()
         return self.dataloader.__iter__()
 

@@ -218,6 +218,12 @@ class Platform(ABC):
 
         return slice(start_idx, end_idx)
 
+    @staticmethod
+    def get_local_device(idx: int = None, *, platform: str = None):
+        platform = Platform.get_platform(platform)
+        if idx is None:
+            idx = Platform.get_local_rank()
+        return platform.get_local_device(idx)
 
 class GPU(Platform):
 
@@ -229,6 +235,10 @@ class GPU(Platform):
     def device_prefix():
         return 'cuda'
 
+    @staticmethod
+    def get_local_device(idx: int, **kwargs) -> str:
+        return f'cuda:{idx}'
+
 
 class NPU(Platform):
 
@@ -238,4 +248,8 @@ class NPU(Platform):
 
     @staticmethod
     def device_prefix():
-        return 'npu:'
+        return 'npu'
+
+    @staticmethod
+    def get_local_device(idx: int, **kwargs) -> str:
+        return f'npu:{idx}'
