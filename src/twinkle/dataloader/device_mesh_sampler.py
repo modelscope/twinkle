@@ -4,8 +4,13 @@ from twinkle import DeviceMesh
 
 
 class DeviceMeshSampler(BatchSampler):
+    """A sampler returns the slice of the current dp rank.
 
-    def __init__(self, original_sampler, device_mesh: DeviceMesh):
+    Args:
+        original_sampler: The original BatchSampler.
+        device_mesh: The device mesh.
+    """
+    def __init__(self, original_sampler: BatchSampler, device_mesh: DeviceMesh):
         self.original_sampler = original_sampler
         self.device_mesh = device_mesh
 

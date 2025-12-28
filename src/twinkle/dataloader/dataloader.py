@@ -11,6 +11,13 @@ from .device_mesh_sampler import DeviceMeshSampler
 
 @remote_class()
 class DataLoader(TorchDataLoader):
+    """A DataLoader wrapper, will retry failed samples and return the data belongs to the current dp rank.
+
+    Args:
+        dataset: A dataset instance, or a callable to create a dataset.
+        device_mesh: The device_mesh of this dataloader.
+        dataloader_params: The dataloader creation parameters.
+    """
 
     def __init__(self, dataset: Union[Dataset, Callable], device_mesh: Optional[DeviceMesh]=None,
                  **dataloader_params):
@@ -18,8 +25,6 @@ class DataLoader(TorchDataLoader):
             self.dataset: Dataset = dataset()
         else:
             self.dataset: Dataset = dataset
-        self.model_id = None
-        self.template = None
         self.dataloader = None
         self.dataloader_params = dataloader_params
         self.device_mesh = device_mesh

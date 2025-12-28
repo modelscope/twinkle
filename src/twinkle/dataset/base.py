@@ -7,7 +7,8 @@ from datasets import interleave_datasets, concatenate_datasets
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
-from twinkle import template, Plugin
+from twinkle import template, Plugin, preprocessor
+from twinkle.template import Template
 from twinkle.hub import MSHub, HFHub
 from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import Preprocessor, DataFilter
@@ -15,10 +16,13 @@ from twinkle.preprocessor import Preprocessor, DataFilter
 
 @dataclass
 class DatasetMeta:
-
+    # The dataset id or local path
     dataset_id: str
+    # The subset name
     subset_name: str = 'default'
+    # The split
     split: str = 'train'
+    # Pick a data slice
     data_slice: Union[slice, Iterable] = slice(None)
 
     def get_id(self):
@@ -27,6 +31,11 @@ class DatasetMeta:
 
 @remote_class()
 class Dataset(TorchDataset):
+    """A dataset wrapper to load and map the dataset.
+
+    Args:
+        dataset_meta: A dataset meta information for loading the original dataset.
+    """
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
         dataset = self._load_dataset(dataset_meta, **kwargs)
@@ -37,23 +46,40 @@ class Dataset(TorchDataset):
         self.template = None
 
     @remote_function(execute='first')
-    def set_template(self, template_cls: Union[Type[template.Template], str], model_id: str, **template_params):
+    def set_template(self, template_cls: Union[Type[Template], str], **template_params):
+        """Set the template to encode/check the dataset.
+
+        Args:
+            template_cls: The template class, or the template plugin, or the template class name to load.
+            **template_params: The template init params.
+        """
+
         if isinstance(template_cls, str):
             if hasattr(template, template_cls):
                 template_cls = getattr(template, template_cls)
             else:
-                template_cls = Plugin.load_plugin(template_cls, template.Template)
-        self.template = template_cls(model_id, **template_params)
+                template_cls = Plugin.load_plugin(template_cls, Template)
+        self.template = template_cls(**template_params)
 
     @remote_function(execute='first')
-    def encode(self, template_cls: Union[Type[template.Template], str], **kwargs):
+    def encode(self, **kwargs):
+        """An inplace operation to encode the dataset.
+
+        Args:
+            **kwargs: The mapping and filter kwargs of the `datasets.map`.
+        """
         if kwargs.get('batched', True):
             self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda x: x is not None, **kwargs)
         else:
             self.dataset = self.dataset.map(self.template.encode, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @remote_function(execute='first')
-    def check(self, template_cls: Union[Type[template.Template], str], **kwargs):
+    def check(self, **kwargs):
+        """An inplace operation to check the dataset.
+
+        Args:
+            **kwargs: The mapping and filter kwargs of the `datasets.map`.
+        """
         self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @staticmethod
@@ -78,11 +104,19 @@ class Dataset(TorchDataset):
 
     @remote_function(execute='first')
     def map(self, preprocess_func: Union[Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, **kwargs) -> None:
+        """An inplace method to operate or transform the dataset.
+
+        Args:
+            preprocess_func: A preprocess function, or a `Preprocessor` class name, or a preprocessor plugin name.
+            dataset_meta: The dataset_meta information of the loaded dataset.
+            **kwargs: The kwargs of the `datasets.map`.
+        """
+
         if isinstance(preprocess_func, Preprocessor):
             preprocess_func = preprocess_func()
         elif isinstance(preprocess_func, str):
             if hasattr(twinkle.preprocessor, preprocess_func):
-                preprocess_func = getattr(twinkle.preprocessor, preprocess_func)()
+                preprocess_func = getattr(preprocessor, preprocess_func)()
             else:
                 raise ValueError(f'Preprocessor {preprocess_func} not found.')
         if dataset_meta is None:
@@ -94,6 +128,13 @@ class Dataset(TorchDataset):
 
     @remote_function(execute='first')
     def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None, **kwargs) -> None:
+        """An inplace method to operate or transform the dataset.
+
+        Args:
+            filter_func: A filter function, or a `DataFilter` class name, or a filter plugin name.
+            dataset_meta: The dataset_meta information of the loaded dataset.
+            **kwargs: The kwargs of the `datasets.map`.
+        """
         if isinstance(filter_func, DataFilter):
             filter_func = filter_func()
         elif isinstance(filter_func, str):
@@ -112,11 +153,21 @@ class Dataset(TorchDataset):
     def add_dataset(self,
                     dataset_meta: DatasetMeta,
                     **kwargs):
+        """Add a new dataset.
+
+        Args:
+            dataset_meta: The dataset_meta information of the loaded dataset.
+        """
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets[dataset_meta.get_id()] = dataset
 
     @remote_function(execute='first')
     def mix_dataset(self, interleave=True):
+        """Mix the datasets if `add_dataset` was called.
+
+        Args:
+            interleave: Whether to interleave the dataset, or concatenate the dataset.
+        """
         if interleave:
             self.dataset = interleave_datasets(list(self.datasets.values()))
         else:

@@ -1,11 +1,12 @@
 from typing import Type, Union
 
-from twinkle import template, Plugin
+from twinkle import template
 from .base import Dataset, DatasetMeta
 from .. import remote_function
 
 
 class LazyDataset(Dataset):
+    """A lazy encode dataset wrapper."""
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
         super().__init__(dataset_meta, **kwargs)

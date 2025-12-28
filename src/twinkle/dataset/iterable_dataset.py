@@ -1,10 +1,9 @@
-from types import MethodType
-
 from .base import Dataset
-from .. import remote_function
+from twinkle import remote_function
 
 
 class IterableDataset(Dataset):
+    """An Iterable dataset wrapper."""
 
     def __len__(self):
         raise NotImplementedError()
