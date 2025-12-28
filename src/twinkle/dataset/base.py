@@ -80,7 +80,10 @@ class Dataset(TorchDataset):
         Args:
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
-        self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
+        if kwargs.get('batched', True):
+            self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
+        else:
+            self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @staticmethod
     def _load_dataset(dataset_meta: DatasetMeta, **kwargs):

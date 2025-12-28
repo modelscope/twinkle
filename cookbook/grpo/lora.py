@@ -1,7 +1,8 @@
 import numpy as np
+from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, get_device_placement
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.infra import DeviceGroup, remote_function, remote_class
@@ -26,34 +27,34 @@ device_groups = [
 
 actor_device_mesh = DeviceMesh(
     device_type='cuda',
-    mesh=np.array([4]),
+    mesh=np.array([6]),
     mesh_dim_names=('data',)
 )
 
-sampler_device_Mesh = DeviceMesh(
+
+ref_device_mesh = DeviceMesh(
     device_type='cuda',
     mesh=np.array([2]),
     mesh_dim_names=('data',)
 )
 
-
-twinkle.initialize(mode='local', groups=device_groups)
+twinkle.initialize(mode='ray', groups=device_groups)
 
 
 @remote_class()
 class ActorGroup:
 
-    def __init__(self, engine_args, lora_config=None, adapter_name=None, device_mesh=None):
-        self.sampler = VLLMSampler(engine_args, device_mesh=sampler_device_Mesh)
-        self.sampler.set_processor('GRPOInputProcessor')
-        self.sampler.set_template('Qwen3Template')
+    def __init__(self, engine_args, lora_config=None, adapter_name=None, **kwargs):
+        self.sampler = VLLMSampler('Qwen/Qwen2.5-7B-Instruct', engine_args, device_mesh=actor_device_mesh)
+        self.sampler.set_processor('GRPOInputProcessor', adapter_name=adapter_name)
+        self.sampler.set_template('Qwen3Template', adapter_name=adapter_name)
 
         self.model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='actor', device_mesh=actor_device_mesh)
-        self.model.set_loss('GRPOLoss')
-        self.model.set_optimizer('AdamW')
-        self.model.set_lr_scheduler('LinearDecay')
-        self.model.set_processor('GRPOInputProcessor')
-        self.model.set_template('Qwen3Template', 'Qwen/Qwen2.5-7B-Instruct')
+        self.model.set_loss('GRPOLoss', adapter_name=adapter_name)
+        self.model.set_optimizer('AdamW', lr=1e-6, adapter_name=adapter_name)
+        self.model.set_lr_scheduler('LinearLR', adapter_name=adapter_name)
+        self.model.set_template('Qwen3Template', adapter_name=adapter_name)
+        self.model.set_processor('GRPOInputProcessor', adapter_name=adapter_name)
         self.model.add_adapter_to_model(adapter_name, lora_config)
         self.sampler.add_adapter_to_sampler(adapter_name, lora_config)
         self.weight_sync = VanillaSynchronizer()
@@ -88,6 +89,7 @@ def create_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/competition_math'))
     dataset.set_template('Qwen3Template')
     dataset.map('CompetitionMathProcessor')
+    dataset.check(batched=True)
     return dataset
 
 
@@ -96,16 +98,26 @@ def train():
     engine_args = {
 
     }
-    actor_group = ActorGroup(engine_args, remote_group='actor')
-    ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref')
+    lora_config = LoraConfig(
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']
+    )
+
+    actor_group = ActorGroup(engine_args,
+                             remote_group='actor',
+                             lora_config=lora_config,
+                             adapter_name='default',
+                             )
+    ref_model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', remote_group='ref', device_mesh=ref_device_mesh)
     ref_model.set_processor('GRPOInputProcessor')
-    ref_model.set_template('Qwen3Template', 'Qwen/Qwen2.5-7B-Instruct')
+    ref_model.set_template('Qwen3Template')
     reward = MathReward()
+    print(get_device_placement())
     for batch in dataloader:
         trajectories = actor_group.sample(batch)
-        logits = ref_model.forward(trajectories)
-        trajectories = reward.calculate(trajectories)
-        actor_group.forward_backward(batch, trajectories, logits)
+        old_logits = actor_group.forward(trajectories)
+        ref_logits = ref_model.forward(trajectories)
+        trajectories = reward.calculate(trajectories, batch)
+        actor_group.forward_backward(batch, trajectories, ref_logits)
         actor_group.step()
         actor_group.zero_grad()
         actor_group.lr_step()

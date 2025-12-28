@@ -6,7 +6,7 @@ from typing import List, Type, Dict, Any, Union
 from peft import PeftConfig
 
 from .base import Sampler
-from twinkle import remote_function, remote_class
+from twinkle import remote_function, remote_class, DeviceMesh
 from twinkle.utils.plugin import Plugin
 from twinkle.data_format import Trajectory, Message
 from twinkle import requires
@@ -15,10 +15,6 @@ from twinkle import processor
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
 from ..processor import InputProcessor
 from ..template import Template
-
-
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '86400'
 
 
 @dataclass
@@ -32,10 +28,18 @@ class SampleGroup:
 
 @remote_class()
 class VLLMSampler(Sampler):
+    """A vLLM sampler.
+
+    Args:
+        model_id: The model id for inference.
+        engine_args: Engine args in dict, which needed by `vllm.EngineArgs`.
+    """
 
     _default_adapter_name = ''
 
-    def __init__(self, model_id: str, engine_args: Dict[str, Any], template: Type[template.Template], remote_group):
+    def __init__(self, model_id: str, engine_args: Dict[str, Any], device_mesh: DeviceMesh=None, **kwargs):
+        os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+        os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '86400'
         super().__init__()
         requires('vllm')
         from vllm import LLMEngine, EngineArgs
@@ -45,12 +49,12 @@ class VLLMSampler(Sampler):
             vllm_config=vllm_config,
         )
         self.model_id = model_id
-        self.template = template(model_id)
+        self.device_mesh = device_mesh
         self.sample_group: Dict[str, SampleGroup] = {self._default_adapter_name: SampleGroup()}
         VLLMLoraWeights()(self)
 
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
-        adapter_name = kwargs.pop("adapter_name", '')
+        adapter_name = kwargs.pop("adapter_name", None) or ''
         assert adapter_name in self.sample_group, f'Add {adapter_name} first before training.'
         if isinstance(template_cls, str):
             if hasattr(template, template_cls):
@@ -60,14 +64,14 @@ class VLLMSampler(Sampler):
         self.sample_group[adapter_name].template = template_cls(self.model_id, **kwargs)
 
     def set_processor(self, processor_cls: Union[Type[processor.InputProcessor], str], **kwargs):
-        adapter_name = kwargs.pop("adapter_name", '')
+        adapter_name = kwargs.pop("adapter_name", None) or ''
         assert adapter_name in self.sample_group, f'Add {adapter_name} first before training.'
         if isinstance(processor_cls, str):
             if hasattr(__file__.__module__, processor_cls):
                 processor_cls = getattr(__file__.__module__, processor_cls)
             else:
                 processor_cls = Plugin.load_plugin(processor_cls, processor.InputProcessor)
-        self.sample_group[adapter_name].processor = processor_cls(self.model_id, **kwargs)
+        self.sample_group[adapter_name].processor = processor_cls(**kwargs)
 
     @remote_function()
     def sample(self, trajectories: List[Trajectory], adapter_name = '') -> List[Trajectory]:
@@ -84,8 +88,9 @@ class VLLMSampler(Sampler):
             adapter_request = None
 
         request_ids = []
+        template_ins = self.sample_group[adapter_name].template
         for trajectory in trajectories:
-            inputs = self.template.encode(trajectory)
+            inputs = template_ins.encode(trajectory)
             request_id = str(uuid.uuid4().hex)
             request_ids.append(request_id)
             llm_inputs = {'prompt_token_ids': inputs.input_ids}

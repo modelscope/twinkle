@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
@@ -26,7 +26,7 @@ class Template:
             output.append(self.encode(trajectory))
         return output
 
-    def check(self, trajectory: Trajectory):
+    def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None
         try:
             encoded = self.encode(trajectory)
@@ -39,3 +39,9 @@ class Template:
         finally:
             if encoded:
                 del encoded
+
+    def batch_check(self, trajectories: List[Trajectory]) -> List[Optional[Trajectory]]:
+        output = []
+        for trajectory in trajectories:
+            output.append(self.check(trajectory))
+        return output

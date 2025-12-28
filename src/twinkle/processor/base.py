@@ -1,16 +1,14 @@
 from dataclasses import fields
-from typing import Optional, Union, List
+from typing import Union, List
+
 import torch
 from torch.utils.data import default_collate
 
-from twinkle import DeviceMesh, Platform
+from twinkle import Platform
 from twinkle.data_format import InputFeature
 
 
 class InputProcessor:
-
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None):
-        self.device_mesh = device_mesh
 
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):
         if isinstance(inputs, list):
