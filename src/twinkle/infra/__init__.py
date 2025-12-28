@@ -27,7 +27,7 @@ _device_group: Optional[List[DeviceGroup]] = [
     DeviceGroup(
         name='local',
         ranks=list(range(Platform.get_world_size())),
-        device_type=Platform.get_platform().__name__,
+        device_type=Platform.get_platform().device_prefix(),
     )
 ]
 
@@ -57,10 +57,7 @@ def get_device_placement(device_group = None) -> str:
     if device_group is None:
         device_group = _device_group
 
-    lines = []
-    lines.append("=" * 80)
-    lines.append("                        DEVICE PLACEMENT TOPOLOGY")
-    lines.append("=" * 80)
+    lines = ["=" * 80, "                        DEVICE PLACEMENT TOPOLOGY", "=" * 80]
 
     for group_idx, group in enumerate(device_group):
         lines.append("")
@@ -171,8 +168,7 @@ def get_device_placement(device_group = None) -> str:
     return "\n".join(lines)
 
 
-
-def get_workers(workers, execute):
+def _get_workers(workers, execute):
     if execute == 'first':
         return [workers[0]]
     elif execute == 'all':
@@ -183,14 +179,14 @@ def get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
+def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
     if not result:
         return result
     if isinstance(result[0], tuple):
         output = []
         for i in range(len(result[0])):
             _single_result = [r[i] for r in result]
-            output.append(collect_func(method, _single_result))
+            output.append(_collect_func(method, _single_result))
         return output
     if method == 'none':
         return result
@@ -206,7 +202,7 @@ def collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
         raise ValueError(f'Unsupported collect method: {method}')
 
 
-def dispatch_args(workers, dispatch, execute, device_mesh: DeviceMesh, args, kwargs):
+def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh], args, kwargs):
     if execute == 'first':
         return [(workers[0], args, kwargs)]
     elif dispatch == 'all':
@@ -240,7 +236,6 @@ def dispatch_args(workers, dispatch, execute, device_mesh: DeviceMesh, args, kwa
 
         return result
     elif isinstance(dispatch, Callable):
-        # dispatch is Callable
         length = len(workers)
         result = []
         for i in range(length):
@@ -273,21 +268,25 @@ def _get_device_mesh_param(args, kwargs):
 def remote_class():
 
     def decorator(cls):
+        # Get device mesh parameter name
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
         if _mode == 'local':
             init_method = cls.__init__
 
             @functools.wraps(init_method)
             def new_init(self, *args, **kwargs):
+                # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name:
                     if device_mesh is None:
+                        # DeviceMesh not passed, create DDP by default
                         device_mesh = DeviceMesh(
                             device_type=Platform.get_platform().device_prefix(),
                             mesh=np.array([Platform.get_world_size()]),
                             mesh_dim_names=('data',)
                         )
                         kwargs[device_mesh_name] = device_mesh
+                    assert len(_device_group) == 1
                     _device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
                     init_method(*args, **kwargs)
                 else:
@@ -302,6 +301,7 @@ def remote_class():
 
             @functools.wraps(init_method)
             def new_init(self, *args, **kwargs):
+                # In case the same class created twice in the same device group
                 frame = inspect.currentframe().f_back
                 caller_file = frame.f_code.co_filename
                 caller_line = frame.f_lineno
@@ -311,9 +311,10 @@ def remote_class():
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh is None and device_mesh_name:
+                    # DeviceMesh not passed, create DDP by default
                     device_mesh = DeviceMesh(
                         device_type=Platform.get_platform().device_prefix(),
-                        mesh=np.array([framework_util.get_world_size()]),
+                        mesh=np.array([Platform.get_world_size()]),
                         mesh_dim_names=('data',)
                     )
                     kwargs[device_mesh_name] = device_mesh
@@ -326,18 +327,19 @@ def remote_class():
                     init_method(self, *args, **kwargs)
 
                     if remote_group and os.environ.get('CLUSTER_NAME') == remote_group:
+                        # Seed when a remote class is created.
                         framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
                                                        bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
                         if hasattr(cls, '__iter__'):
                             assert not hasattr(cls, '__next__')
 
-                            def __iter__(self):
-                                _iter = self.__iter_origin__()
-                                assert _iter is not self
-                                self._iter = _iter
+                            def __iter__(_self):
+                                _iter = _self.__iter_origin__()
+                                assert _iter is not _self
+                                _self._iter = _iter
 
-                            def __next__(self):
-                                return next(self._iter)
+                            def __next__(_self):
+                                return next(_self._iter)
 
                             cls.__iter_origin__ = cls.__iter__
                             cls.__iter__ = remote_function(execute=cls.__iter_origin__._execute,
@@ -363,7 +365,7 @@ def remote_class():
                     if hasattr(cls, '__iter__'):
 
                         def __iter__(self):
-                            _workers_and_args = dispatch_args(get_workers(self._actors, 'all'), 'all',
+                            _workers_and_args = _dispatch_args(_get_workers(self._actors, 'all'), 'all',
                                                               'all', None, (), {})
                             RayHelper.execute_all_sync('__iter__', _workers_and_args)
                             return self
@@ -417,10 +419,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                 else:
                     from .ray import RayHelper
                     args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                    _workers_and_args = dispatch_args(get_workers(self._actors, execute), dispatch,
+                    _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                         execute, device_mesh, args, kwargs)
                     result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
-                    return RayHelper.do_get_and_collect_func(collect_func, collect, result)
+                    return RayHelper.do_get_and_collect_func(_collect_func, collect, result)
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 

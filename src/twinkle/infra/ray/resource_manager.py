@@ -6,7 +6,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 
 from .. import DeviceGroup
-from ...utils import framework_util
+from ... import Platform
 
 
 class ResourceManager:
@@ -73,7 +73,7 @@ class ResourceManager:
         ray.get([pg.ready() for pg in self.cpu_placement_groups])
 
         self.node_ranks = ray.get(
-            [ray.remote(framework_util.get_node_rank).options(placement_group=pg).remote() for pg in self.placement_groups])
+            [ray.remote(Platform.get_node_rank).options(placement_group=pg).remote() for pg in self.placement_groups])
         if self.node_ranks.count(0) > 1:
             self.node_ranks = list(range(len(self.placement_groups)))
 

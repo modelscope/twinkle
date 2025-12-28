@@ -1,7 +1,7 @@
 import re
 from types import MethodType
 from typing import Union, Callable, Any, List, Optional, Literal
-from ..utils import torch as torch_util, framework as framework_util
+from ..utils import torch_util, framework_util
 from ..utils import exists
 
 

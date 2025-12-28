@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from typing import Dict, Any
-from typing import overload, Type, Optional, Union, Callable
+from typing import overload, Type, Optional, Union
 
 from peft import PeftConfig
 from peft import get_peft_model, PeftModel

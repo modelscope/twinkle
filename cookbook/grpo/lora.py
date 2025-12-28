@@ -14,12 +14,12 @@ device_groups = [
     DeviceGroup(
         name='actor',
         ranks=list(range(0, 6)),
-        device_type='GPU',
+        device_type='cuda',
     ),
     DeviceGroup(
         name='ref',
         ranks=list(range(6, 8)),
-        device_type='GPU',
+        device_type='cuda',
     ),
 ]
 

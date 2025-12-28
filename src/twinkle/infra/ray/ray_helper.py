@@ -1,4 +1,3 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
 import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
 
@@ -183,7 +182,7 @@ class RayHelper:
         new_kwargs = {}
         for key in kwargs.keys().copy():
             value = kwargs[key]
-            if isinstance(value, Callable) and getattr(arg, '_is_lazy_collect', False):
+            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
                 value = value()
             new_kwargs[key] = value
         return new_args, new_kwargs
@@ -203,7 +202,7 @@ class RayHelper:
         world_size = len(ranks)
         assert len(placement_groups) == len(ranks)
         if execute == 'peer':
-            _slice = framework_util.get_peer_index(len(ranks))
+            _slice = Platform.get_peer_index(len(ranks))
             placement_groups = placement_groups[_slice]
             ranks = ranks[_slice]
 
@@ -272,6 +271,7 @@ class RayHelper:
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     Platform.get_platform(device_config.device_type.upper()): '',
+                    'TWINKLE_MODE': 'ray',
                     'TWINKLE_SEED': str(seed),
                     'TWINKLE_FULL_DETERMINISM': str(full_determinism),
                 })

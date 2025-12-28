@@ -136,13 +136,13 @@ class Platform(ABC):
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
         if platform is None:
-            if shutil.which("nvidia-smi"):
-                return GPU
-            elif shutil.which("npu-smi"):
+            if shutil.which("npu-smi"):
                 return NPU
+            elif shutil.which("nvidia-smi"):
+                return GPU
             else:
                 return GPU
-        elif platform.upper() == "GPU":
+        elif platform.upper() in ("GPU", "CUDA"):
             return GPU
         elif platform.upper() == "NPU":
             return NPU
