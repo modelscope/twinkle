@@ -299,6 +299,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         else:
             state_dict = self.get_state_dict(adapter_name)
             self.model.save_pretrained(output_dir, state_dict=state_dict)
+        self._save_tokenizer(output_dir, adapter_name=adapter_name)
+
+    def _save_tokenizer(self, output_dir, **kwargs):
+        adapter_name = kwargs.pop("adapter_name", None) or ''
+        assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
+        template_ins = self.optimizer_group[adapter_name].template
+        template_ins.tokenizer.save_pretrained(output_dir)
 
     @remote_function(execute='first')
     def get_state_dict(self, adapter_name: str = ''):
