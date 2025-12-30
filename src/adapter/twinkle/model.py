@@ -7,7 +7,7 @@ from peft import LoraConfig
 from ray import serve
 
 import twinkle
-from adapter.twinkle.serve.validation import is_token_valid
+from adapter.twinkle.validation import is_token_valid
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.loss import Loss

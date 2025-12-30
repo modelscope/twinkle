@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from ray import serve
 
 import twinkle
-from adapter.twinkle.serve.validation import is_token_valid
+from adapter.twinkle.validation import is_token_valid
 from twinkle import DeviceGroup, DeviceMesh
 
 

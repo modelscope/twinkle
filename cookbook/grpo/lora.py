@@ -10,7 +10,7 @@ from twinkle.model import TransformersModel
 from twinkle.processor import GRPOLossProcessor
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler
-from twinkle.weight_syncronizer.vanilla_synchronizer import VanillaSynchronizer
+from twinkle.weight_loader import NativeLoader
 
 device_groups = [
     DeviceGroup(
@@ -74,7 +74,7 @@ class ActorGroup:
         self.model.set_processor('InputProcessor', adapter_name=adapter_name)
         self.model.add_adapter_to_model(adapter_name, lora_config)
         self.sampler.add_adapter_to_sampler(adapter_name, lora_config)
-        self.weight_sync = VanillaSynchronizer()
+        self.weight_loader = NativeLoader()
         self.adapter_name = adapter_name
         self.lora_config = lora_config
         
@@ -109,7 +109,7 @@ class ActorGroup:
 
     @remote_function()
     def sync_weights(self):
-        self.weight_sync(self.model, self.sampler, self.adapter_name)
+        self.weight_loader(self.model, self.sampler, self.adapter_name)
 
 def create_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/competition_math'))

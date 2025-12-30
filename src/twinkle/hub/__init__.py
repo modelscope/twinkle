@@ -1,1 +1,1 @@
-from .hub import MSHub, HFHub
+from .hub import MSHub, HFHub, HubOperation
