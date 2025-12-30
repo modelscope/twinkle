@@ -121,7 +121,7 @@ def generate_processors():
         code_lines = [
             f"from typing import Any, Optional",
             f"import uuid",
-            f"from client.http.http_utils import http_post\n",
+            f"from client.http.http_utils import http_post, _heartbeat_manager\n",
             f"\n",
             f"class {class_name}:",
             f"    \"\"\"Client wrapper for {class_name} that calls server HTTP endpoints.\"\"\"",
@@ -145,17 +145,29 @@ def generate_processors():
             f"        )",
             f"        response.raise_for_status()",
             f"        self.processor_id = response.json()",
+            f"        ",
+            f"        # Register for automatic heartbeat",
+            f"        _heartbeat_manager.register_processor(",
+            f"            self.processor_id,",
+            f"            self._send_heartbeat",
+            f"        )",
             f"    ",
-            f"    def heartbeat(self):",
-            f"        \"\"\"Send heartbeat to keep the processor alive.\"\"\"",
+            f"    def _send_heartbeat(self, processor_id_list: str):",
+            f"        \"\"\"Internal method to send heartbeat (called by heartbeat manager).\"\"\"",
             f"        response = http_post(",
             f"            url=f'{{self.server_url}}/heartbeat',",
             f"            request_id=self.request_id,",
             f"            authorization=self.authorization,",
-            f"            json_data={{'processor_id': self.processor_id}}",
+            f"            json_data={{'processor_id': processor_id_list}}",
             f"        )",
             f"        response.raise_for_status()",
-            f"        return response.json()",
+            f"    ",
+            f"    def __del__(self):",
+            f"        \"\"\"Cleanup: unregister from heartbeat manager.\"\"\"",
+            f"        try:",
+            f"            _heartbeat_manager.unregister_processor(self.processor_id)",
+            f"        except:",
+            f"            pass",
         ]
         
         # Generate methods
@@ -211,15 +223,19 @@ def generate_processors():
     # Generate client files
     print("\nGenerating client classes...")
     
+    # Track all classes per module for __init__.py generation
+    module_classes: Dict[str, List[str]] = {}
+    
     for base_class_name, modules in all_classes.items():
         for module_name, class_list in modules.items():
             client_module_path = src_client_path / module_name
+            
+            # Create package directory if it doesn't exist
             client_module_path.mkdir(parents=True, exist_ok=True)
             
-            # Create __init__.py if it doesn't exist
-            init_file = client_module_path / '__init__.py'
-            if not init_file.exists():
-                init_file.write_text('')
+            # Track classes for this module
+            if module_name not in module_classes:
+                module_classes[module_name] = []
             
             processor_type = processor_type_mapping.get(base_class_name, module_name)
             
@@ -231,15 +247,30 @@ def generate_processors():
                     class_name, base_class_name, methods, module_name, processor_type
                 )
                 
+                # Overwrite the file completely
                 with open(client_file, 'w', encoding='utf-8') as f:
                     f.write(client_code)
                 
-                # Update __init__.py to export the class
-                init_content = init_file.read_text()
-                import_line = f"from .{class_name.lower()} import {class_name}\n"
-                if import_line not in init_content:
-                    with open(init_file, 'a', encoding='utf-8') as f:
-                        f.write(import_line)
+                # Track class for __init__.py export
+                module_classes[module_name].append(class_name)
+    
+    # Generate __init__.py files for each module
+    print("\nGenerating __init__.py files...")
+    for module_name, class_names in module_classes.items():
+        client_module_path = src_client_path / module_name
+        init_file = client_module_path / '__init__.py'
+        
+        # Generate complete __init__.py content
+        init_lines = []
+        for class_name in sorted(class_names):
+            init_lines.append(f"from .{class_name.lower()} import {class_name}")
+        
+        init_content = '\n'.join(init_lines) + '\n'
+        
+        # Overwrite __init__.py completely
+        print(f"  Writing {init_file}...")
+        with open(init_file, 'w', encoding='utf-8') as f:
+            f.write(init_content)
     
     print("\nClient generation complete!")
     return all_classes
@@ -264,14 +295,14 @@ def generate_models():
     
     model_code = '''from typing import Any, Dict, List, Union, Optional
 import uuid
-from client.http.http_utils import http_post
+from client.http.http_utils import http_post, _heartbeat_manager
 
 
 class TwinkleModelClient:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
     
     This client manages adapters and sends training/inference requests to the model server.
-    Each adapter has its own lifecycle managed through heartbeats.
+    Each adapter has its own lifecycle managed through automatic heartbeats.
     """
     
     def __init__(self, server_url: str, adapter_name: str,
@@ -289,6 +320,7 @@ class TwinkleModelClient:
         self.adapter_name = adapter_name
         self.request_id = request_id or str(uuid.uuid4().hex)
         self.authorization = authorization or 'Bearer default_token'
+        self._adapter_key = f"model:{self.adapter_name}"
     
     def create(self, **kwargs):
         """Create the model instance on server."""
@@ -301,8 +333,8 @@ class TwinkleModelClient:
         response.raise_for_status()
         return response.json()
     
-    def heartbeat(self):
-        """Send heartbeat to keep the adapter alive."""
+    def _send_adapter_heartbeat(self):
+        """Internal method to send adapter heartbeat."""
         response = http_post(
             url=f'{self.server_url}/heartbeat',
             request_id=self.request_id,
@@ -310,7 +342,33 @@ class TwinkleModelClient:
             json_data={'adapter_name': self.adapter_name}
         )
         response.raise_for_status()
+    
+    def add_adapter(self, adapter_name: str, config: Dict[str, Any]):
+        """Add a new adapter to the model and start automatic heartbeat."""
+        response = http_post(
+            url=f'{self.server_url}/add_adapter',
+            request_id=self.request_id,
+            authorization=self.authorization,
+            json_data={'adapter_name': adapter_name, 'config': config}
+        )
+        response.raise_for_status()
+        
+        # Register adapter for automatic heartbeat after successful creation
+        self.adapter_name = adapter_name
+        self._adapter_key = f"model:{adapter_name}"
+        _heartbeat_manager.register_adapter(
+            self._adapter_key,
+            self._send_adapter_heartbeat
+        )
+        
         return response.json()
+    
+    def __del__(self):
+        """Cleanup: unregister adapter from heartbeat manager."""
+        try:
+            _heartbeat_manager.unregister_adapter(self._adapter_key)
+        except:
+            pass
     
     def forward(self, inputs: Any, **kwargs):
         """Execute forward pass on the model."""
@@ -444,17 +502,6 @@ class TwinkleModelClient:
         response.raise_for_status()
         return response.json()
     
-    def add_adapter(self, adapter_name: str, config: Dict[str, Any]):
-        """Add a new adapter to the model."""
-        response = http_post(
-            url=f'{self.server_url}/add_adapter',
-            request_id=self.request_id,
-            authorization=self.authorization,
-            json_data={'adapter_name': adapter_name, 'config': config}
-        )
-        response.raise_for_status()
-        return response.json()
-    
     def set_template(self, template_cls: str, **kwargs):
         """Set the template for data processing."""
         response = http_post(
@@ -478,22 +525,21 @@ class TwinkleModelClient:
         return response.json()
 '''
     
-    # Write the model client file
+    # Create package directory
+    client_module_path.mkdir(parents=True, exist_ok=True)
+    
+    # Write the model client file (overwrite if exists)
     client_file = client_module_path / 'twinklemodelclient.py'
     print(f"Generating {client_file}...")
     with open(client_file, 'w', encoding='utf-8') as f:
         f.write(model_code)
     
-    # Update __init__.py
+    # Create/overwrite __init__.py with exports
     init_file = client_module_path / '__init__.py'
-    if not init_file.exists():
-        init_file.write_text('')
-    
-    init_content = init_file.read_text()
-    import_line = "from .twinklemodelclient import TwinkleModelClient\n"
-    if import_line not in init_content:
-        with open(init_file, 'a', encoding='utf-8') as f:
-            f.write(import_line)
+    init_content = "from .twinklemodelclient import TwinkleModelClient\n"
+    print(f"Writing {init_file}...")
+    with open(init_file, 'w', encoding='utf-8') as f:
+        f.write(init_content)
     
     print("Model client generation complete!")
 
@@ -509,13 +555,14 @@ def generate_samplers():
     
     sampler_code = '''from typing import Any, Dict, List, Optional
 import uuid
-from client.http.http_utils import http_post
+from client.http.http_utils import http_post, _heartbeat_manager
 
 
 class SamplerClient:
     """Client wrapper for Sampler that calls server HTTP endpoints.
     
     This client manages sampling operations and adapter synchronization with the sampler server.
+    Each adapter has its own lifecycle managed through automatic heartbeats.
     """
     
     def __init__(self, server_url: str, adapter_name: str = '',
@@ -533,6 +580,7 @@ class SamplerClient:
         self.adapter_name = adapter_name
         self.request_id = request_id or str(uuid.uuid4().hex)
         self.authorization = authorization or 'Bearer default_token'
+        self._adapter_key = f"sampler:{self.adapter_name}" if adapter_name else None
     
     def create(self, **kwargs):
         """Create the sampler instance on server."""
@@ -545,10 +593,10 @@ class SamplerClient:
         response.raise_for_status()
         return response.json()
     
-    def heartbeat(self):
-        """Send heartbeat to keep the adapter alive."""
+    def _send_adapter_heartbeat(self):
+        """Internal method to send adapter heartbeat."""
         if not self.adapter_name:
-            raise ValueError("adapter_name must be set for heartbeat")
+            return
         response = http_post(
             url=f'{self.server_url}/heartbeat',
             request_id=self.request_id,
@@ -556,7 +604,39 @@ class SamplerClient:
             json_data={'adapter_name': self.adapter_name}
         )
         response.raise_for_status()
+    
+    def add_adapter_to_sampler(self, adapter_name: str, config: Dict[str, Any]):
+        """Add a new adapter to the sampler and start automatic heartbeat.
+        
+        Args:
+            adapter_name: Name of the adapter
+            config: LoRA configuration dictionary
+        """
+        response = http_post(
+            url=f'{self.server_url}/add_adapter_to_sampler',
+            request_id=self.request_id,
+            authorization=self.authorization,
+            json_data={'adapter_name': adapter_name, 'config': config}
+        )
+        response.raise_for_status()
+        
+        # Register adapter for automatic heartbeat after successful creation
+        self.adapter_name = adapter_name
+        self._adapter_key = f"sampler:{adapter_name}"
+        _heartbeat_manager.register_adapter(
+            self._adapter_key,
+            self._send_adapter_heartbeat
+        )
+        
         return response.json()
+    
+    def __del__(self):
+        """Cleanup: unregister adapter from heartbeat manager."""
+        try:
+            if self._adapter_key:
+                _heartbeat_manager.unregister_adapter(self._adapter_key)
+        except:
+            pass
     
     def sample(self, trajectories: List[Any], adapter_name: str = '') -> List[Any]:
         """Sample from the model using provided trajectories.
@@ -574,22 +654,6 @@ class SamplerClient:
             request_id=self.request_id,
             authorization=self.authorization,
             json_data={'trajectories': trajectories, 'adapter_name': adapter}
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    def add_adapter_to_sampler(self, adapter_name: str, config: Dict[str, Any]):
-        """Add a new adapter to the sampler.
-        
-        Args:
-            adapter_name: Name of the adapter
-            config: LoRA configuration dictionary
-        """
-        response = http_post(
-            url=f'{self.server_url}/add_adapter_to_sampler',
-            request_id=self.request_id,
-            authorization=self.authorization,
-            json_data={'adapter_name': adapter_name, 'config': config}
         )
         response.raise_for_status()
         return response.json()
@@ -612,22 +676,21 @@ class SamplerClient:
         return response.json()
 '''
     
-    # Write the sampler client file
+    # Create package directory
+    client_module_path.mkdir(parents=True, exist_ok=True)
+    
+    # Write the sampler client file (overwrite if exists)
     client_file = client_module_path / 'samplerclient.py'
     print(f"Generating {client_file}...")
     with open(client_file, 'w', encoding='utf-8') as f:
         f.write(sampler_code)
     
-    # Update __init__.py
+    # Create/overwrite __init__.py with exports
     init_file = client_module_path / '__init__.py'
-    if not init_file.exists():
-        init_file.write_text('')
-    
-    init_content = init_file.read_text()
-    import_line = "from .samplerclient import SamplerClient\n"
-    if import_line not in init_content:
-        with open(init_file, 'a', encoding='utf-8') as f:
-            f.write(import_line)
+    init_content = "from .samplerclient import SamplerClient\n"
+    print(f"Writing {init_file}...")
+    with open(init_file, 'w', encoding='utf-8') as f:
+        f.write(init_content)
     
     print("Sampler client generation complete!")
 

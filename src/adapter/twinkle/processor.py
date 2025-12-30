@@ -81,8 +81,10 @@ def build_processor_app(device_group: Dict[str, Any],
 
         @app.post("/heartbeat")
         def heartbeat(self, processor_id: str):
-            self.assert_processor_exists(processor_id=processor_id)
-            self.resource_records[processor_id] = 0
+            processor_id = processor_id.split(',')
+            for id in processor_id:
+                self.assert_processor_exists(processor_id=id)
+                self.resource_records[id] = 0
 
         @app.post("/call")
         def call(self, processor_id: str, function: str, **kwargs):
