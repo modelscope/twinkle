@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict
 from typing import Type
 from typing import Union, List
-
+import torch.distributed as dist
 import numpy as np
 
 
@@ -49,6 +49,13 @@ class DeviceMesh:
                     f"The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) "
                     f"does not match the shape of `mesh`: ({len(self.mesh.shape)})"
                 )
+
+    @property
+    def ddp_group(self):
+        if not hasattr(self, "_ddp_group"):
+            ddp_ranks = set(self.get_fsdp_group_ranks() + self.get_dp_group_ranks())
+            self._ddp_group = dist.new_group(ranks=ddp_ranks)
+        return self._ddp_group
 
     def to_torch_device_mesh(self):
         import torch

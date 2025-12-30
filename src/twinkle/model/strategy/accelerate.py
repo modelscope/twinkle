@@ -61,7 +61,7 @@ class AccelerateStrategy(TrainStrategy):
     def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any]):
         from accelerate import FullyShardedDataParallelPlugin
         from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
-        from torch.distributed.fsdp import BackwardPrefetch, CPUOffload
+        from torch.distributed.fsdp import BackwardPrefetch
 
         if device_mesh is None:
             return None

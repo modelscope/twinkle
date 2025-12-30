@@ -168,7 +168,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             import torch.distributed as dist
             for p in self._get_trainable_parameters(adapter_name):
                 if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=self.device_mesh.ddp_group)
 
     @remote_function()
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
