@@ -8,7 +8,7 @@ from peft import LoraConfig
 from ray import serve
 
 import twinkle
-from adapter.twinkle.validation import is_token_valid
+from adapter.twinkle.validation import is_token_valid, verify_request_token
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import Trajectory
 from twinkle.sampler import VLLMSampler, Sampler
@@ -28,21 +28,7 @@ def build_sampler_app(model_id: str,
 
     @app.middleware("http")
     async def verify_token(request: Request, call_next):
-        authorization = request.headers.get("Authorization")
-        token = authorization[7:] if authorization and authorization.startswith("Bearer ") else authorization
-        if not is_token_valid(token):
-            return JSONResponse(status_code=403, content={"detail": "Invalid token"})
-
-        request_id = request.headers.get("X-Ray-Serve-Request-Id")
-        if not request_id:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing X-Ray-Serve-Request-Id header, required for sticky session"}
-            )
-        request.state.request_id = request_id
-        request.state.token = token
-        response = await call_next(request)
-        return response
+        return await verify_request_token(request=request, call_next=call_next)
 
     @serve.deployment(name="SamplerManagement")
     @serve.ingress(app)
@@ -70,30 +56,40 @@ def build_sampler_app(model_id: str,
             assert adapter_name and adapter_name in self.adapter_records
 
         def assert_adapter_valid(self, adapter_name):
-            assert not adapter_name or adapter_name in self.adapter_records
+            assert adapter_name == '' or adapter_name in self.adapter_records
+
+        @staticmethod
+        def get_adapter_name(request, adapter_name):
+            return request.state.request_id + '-' + adapter_name
 
         @app.post("/create")
         def create(self, *args, **kwargs):
-            return self.sampler.__class__.__name__
+            return ''
 
         @app.post("/sample")
-        def sample(self, trajectories: List[Trajectory], adapter_name = '')-> List[Trajectory]:
+        def sample(self, request, *, trajectories: List[Trajectory], adapter_name: str = '')-> List[Trajectory]:
             self.assert_adapter_valid(adapter_name)
+            adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             return self.sampler.sample(trajectories, adapter_name)
 
         @app.post("/add_adapter_to_sampler")
-        def add_adapter_to_sampler(self, adapter_name: str, config):
-            assert adapter_name, 'You need to specify `adapter_name`'
+        def add_adapter_to_sampler(self, request, *, adapter_name: str, config):
+            assert adapter_name, 'You need to specify a valid `adapter_name`'
+            adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             config = LoraConfig(**config)
             return self.sampler.add_adapter_to_sampler(adapter_name, config)
 
         @app.post("/sync_weights")
-        def sync_weights(self, state_dict: Dict[str, Any], adapter_name=''):
+        def sync_weights(self, request, *, state_dict: Dict[str, Any], adapter_name: str):
+            # TODO this design is illness
+            self.assert_adapter_valid(adapter_name)
+            adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             return self.sampler.sync_weights(state_dict, adapter_name)
 
         @app.post("/heartbeat")
-        def heartbeat(self, adapter_name: str):
+        def heartbeat(self, request, *, adapter_name: str):
             self.assert_adapter_exists(adapter_name=adapter_name)
+            adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             self.adapter_records[adapter_name] = 0
 
     return SamplerManagement.bind()

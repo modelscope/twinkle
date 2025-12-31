@@ -4,11 +4,10 @@ from typing import Dict, Any
 
 from fastapi import FastAPI
 from fastapi import Request
-from fastapi.responses import JSONResponse
 from ray import serve
 
 import twinkle
-from adapter.twinkle.validation import is_token_valid
+from adapter.twinkle.validation import verify_request_token
 from twinkle import DeviceGroup, DeviceMesh
 
 
@@ -24,24 +23,10 @@ def build_processor_app(device_group: Dict[str, Any],
 
     @app.middleware("http")
     async def verify_token(request: Request, call_next):
-        authorization = request.headers.get("Authorization")
-        token = authorization[7:] if authorization and authorization.startswith("Bearer ") else authorization
-        if not is_token_valid(token):
-            return JSONResponse(status_code=403, content={"detail": "Invalid token"})
-
-        request_id = request.headers.get("X-Ray-Serve-Request-Id")
-        if not request_id:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing X-Ray-Serve-Request-Id header, required for sticky session"}
-            )
-        request.state.request_id = request_id
-        request.state.token = token
-        response = await call_next(request)
-        return response
+        return await verify_request_token(request=request, call_next=call_next)
 
     processors = ['dataset', 'gym', 'hub', 'preprocessor', 'processor',
-                  'reward', 'template', 'weight_synchronizer']
+                  'reward', 'template', 'weight_loader']
 
     @serve.deployment(name="ProcessorManagement")
     @serve.ingress(app)
@@ -82,16 +67,17 @@ def build_processor_app(device_group: Dict[str, Any],
         @app.post("/heartbeat")
         def heartbeat(self, processor_id: str):
             processor_id = processor_id.split(',')
-            for id in processor_id:
-                self.assert_processor_exists(processor_id=id)
-                self.resource_records[id] = 0
+            for _id in processor_id:
+                if _id and _id in self.resource_dict:
+                    self.resource_records[_id] = 0
 
         @app.post("/call")
         def call(self, processor_id: str, function: str, **kwargs):
             self.assert_processor_exists(processor_id=processor_id)
             processor = self.resource_dict.get(processor_id)
-            function = getattr(processor, function)
-            assert hasattr(function, '_execute')
+            function = getattr(processor, function, None)
+            assert function is not None, f'`function` not found in {processor.__class__}'
+            assert hasattr(function, '_execute'), f'Cannot call inner method of {processor.__class__}'
             return function(**kwargs)
 
     return ProcessorManagement.bind()
