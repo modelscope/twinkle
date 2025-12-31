@@ -1,13 +1,13 @@
 import numpy as np
-from sklearn.metrics.pairwise import (paired_cosine_distances, paired_euclidean_distances,
-                                      paired_manhattan_distances)
-from scipy.stats import pearsonr, spearmanr
 from .base import Metric
 
 
 class CosineSimilarityMetric(Metric):
 
     def __call__(self, inputs, outputs, **kwargs):
+        from sklearn.metrics.pairwise import (paired_cosine_distances, paired_euclidean_distances,
+                                              paired_manhattan_distances)
+        from scipy.stats import pearsonr, spearmanr
         embeddings1 = outputs['sentence1']
         embeddings2 = outputs['sentence2']
         labels = inputs['labels']

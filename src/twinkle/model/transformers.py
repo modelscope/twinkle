@@ -17,12 +17,11 @@ from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.loss.base import Loss
 from twinkle.loss.base import Loss
 from .base import TwinkleModel
-from twinkle.patch import MultiAdapter
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
 from .strategy import AccelerateStrategy
-from ..data_format import InputFeature, Trajectory
+from twinkle.data_format import InputFeature, Trajectory
 
 
 @dataclass
@@ -68,7 +67,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                  model_cls: Optional[Type[PreTrainedModel]] = None,
                  pretrained_model_name_or_path: Optional[str] = None,
                  config: Optional[PretrainedConfig] = None,
-                 device_mesh: DeviceMesh = None,
+                 device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: str = None,
                  ddp_config: Dict[str, Any] = None,
                  fsdp_config: Dict[str, Any] = None,
@@ -80,6 +79,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
         self.model_id = pretrained_model_name_or_path
         self.device_mesh = device_mesh
+        from twinkle.patch.multi_adapter import MultiAdapter
         self.model: PreTrainedModel = MultiAdapter()(self.model) # patch multiple loras
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
@@ -340,10 +340,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert adapter_name in self.optimizer_group, f'Add {adapter_name} first before training.'
         if isinstance(processor_cls, str):
             if hasattr(__file__.__module__, processor_cls):
-                processor_cls = getattr(__file__.__module__, processor_cls)
+                processor_cls: Type[InputProcessor] = getattr(__file__.__module__, processor_cls)
             else:
-                processor_cls = Plugin.load_plugin(processor_cls, InputProcessor)
-        self.optimizer_group[adapter_name].processor = processor_cls(**kwargs)
+                processor_cls: Type[InputProcessor] = Plugin.load_plugin(processor_cls, InputProcessor)
+        self.optimizer_group[adapter_name].processor = processor_cls(device_mesh=self.device_mesh, **kwargs)
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):

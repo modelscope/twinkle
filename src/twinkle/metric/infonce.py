@@ -1,8 +1,6 @@
 import numpy as np
-from twinkle.loss.infonce import InfoNCELoss
-from twinkle.utils import torch_util
+from twinkle import Platform
 from .base import Metric
-import torch
 
 
 class InfoNCEMetric(Metric):
@@ -21,9 +19,11 @@ class InfoNCEMetric(Metric):
         self.hard_negatives = hard_negatives
 
     def __call__(self, inputs, outputs, **kwargs):
+        import torch
+        from twinkle.loss.infonce import InfoNCELoss
         logits = outputs['logits']
         labels = inputs['labels']
-        world_size = torch_util.get_world_size()
+        world_size = Platform.get_world_size()
         if world_size > 1 and self.cross_batch:
             logits, labels = InfoNCELoss.gather_data(logits, labels)
         split_tensors = InfoNCELoss.parse_multi_negative_sentences(torch.tensor(logits), torch.tensor(labels), self.hard_negatives)

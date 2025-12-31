@@ -6,7 +6,7 @@ from twinkle.data_format import InputFeature
 
 class InputProcessor:
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None, **kwargs):
         self.device_mesh = device_mesh
 
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):

@@ -1,13 +1,13 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from .base import TrainStrategy
-from ... import DeviceMesh
+from twinkle import DeviceMesh
 
 
 class AccelerateStrategy(TrainStrategy):
 
     def __init__(self,
-                 device_mesh: DeviceMesh = None,
+                 device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: str = 'bf16',
                  ddp_config: Dict[str, Any] = None,
                  fsdp_config: Dict[str, Any] = None,
@@ -83,7 +83,9 @@ class AccelerateStrategy(TrainStrategy):
         elif sharding_strategy is None:
             sharding_strategy = FSDPShardingStrategy.NO_SHARD
 
+        fsdp_version = fsdp_config.pop('fsdp_config', 2)
         fsdp_plugin = FullyShardedDataParallelPlugin(
+            fsdp_version=fsdp_version,
             sharding_strategy=sharding_strategy,
             backward_prefetch=fsdp_config.pop("backward_prefetch", BackwardPrefetch.BACKWARD_PRE),
             mixed_precision_policy=self.mixed_precision,

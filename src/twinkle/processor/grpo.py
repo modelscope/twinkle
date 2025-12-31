@@ -19,7 +19,7 @@ class GRPOLossProcessor(InputProcessor):
     - labels != -100: completion tokens (used in loss)
     """
     
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, ignore_index: int = -100):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None, ignore_index: int = -100, **kwargs):
         super(GRPOLossProcessor, self).__init__(device_mesh)
         self.ignore_index = ignore_index
 
