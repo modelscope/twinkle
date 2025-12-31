@@ -17,4 +17,4 @@ class Trajectory:
 
     rewards: List[float] = field(default_factory=list)
 
-    issues: List[str] = field(default_factory=list)
+    user_data: Dict[str, Any] = field(default_factory=list)

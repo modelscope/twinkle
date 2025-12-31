@@ -5,12 +5,13 @@ import sys
 from typing import Type, TypeVar
 
 from twinkle.hub import MSHub, HFHub
-from twinkle.utils import trust_remote_code
+from twinkle import trust_remote_code
 
 T = TypeVar('T')
 
 
 class Plugin:
+    """A plugin class for loading plugins from hub."""
 
     @staticmethod
     def load_plugin(plugin_id: str, plugin_base: Type[T], **kwargs) -> Type[T]:
@@ -36,7 +37,7 @@ class Plugin:
             for name, plugin_cls in inspect.getmembers(plugin_module,
                                                       inspect.isclass)
         }
-
+        sys.path.remove(plugin_dir)
         for name, plugin_cls in module_classes.items():
             if plugin_base in plugin_cls.__mro__[
                         1:] and plugin_cls.__module__ == plugin_file:

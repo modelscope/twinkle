@@ -6,15 +6,12 @@ from typing import List, Type, Dict, Any, Union
 from peft import PeftConfig
 
 from .base import Sampler
-from twinkle import remote_function, remote_class, DeviceMesh
-from twinkle.utils.plugin import Plugin
+import twinkle
+from twinkle import remote_function, remote_class, DeviceMesh, Plugin, requires
 from twinkle.data_format import Trajectory, Message
-from twinkle import requires
-from twinkle import template
-from twinkle import processor
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
-from ..processor import InputProcessor
-from ..template import Template
+from twinkle.processor import InputProcessor
+from twinkle.template import Template
 
 
 @dataclass
@@ -32,7 +29,8 @@ class VLLMSampler(Sampler):
 
     Args:
         model_id: The model id for inference.
-        engine_args: Engine args in dict, which needed by `vllm.EngineArgs`.
+        engine_args: Engine args in dict, which is needed by `vllm.EngineArgs`.
+        device_mesh: vLLM device mesh
     """
 
     _default_adapter_name = ''
@@ -53,30 +51,33 @@ class VLLMSampler(Sampler):
         self.sample_group: Dict[str, SampleGroup] = {self._default_adapter_name: SampleGroup()}
         VLLMLoraWeights()(self)
 
-    def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
+    def _check_adapter_valid(self, adapter_name: str):
+        assert adapter_name in self.sample_group, f'Use a valid {adapter_name} first, current is: {adapter_name}'
+
+    def set_template(self, template_cls: Union[Type[twinkle.template.Template], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
-        assert adapter_name in self.sample_group, f'Add {adapter_name} first before training.'
+        self._check_adapter_valid(adapter_name)
         if isinstance(template_cls, str):
-            if hasattr(template, template_cls):
-                template_cls = getattr(template, template_cls)
+            if hasattr(twinkle.template, template_cls):
+                template_cls = getattr(twinkle.template, template_cls)
             else:
-                template_cls = Plugin.load_plugin(template_cls, template.Template)
+                template_cls = Plugin.load_plugin(template_cls, twinkle.template.Template)
         self.sample_group[adapter_name].template = template_cls(self.model_id, **kwargs)
 
-    def set_processor(self, processor_cls: Union[Type[processor.InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[Type[twinkle.processor.InputProcessor], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
-        assert adapter_name in self.sample_group, f'Add {adapter_name} first before training.'
+        self._check_adapter_valid(adapter_name)
         if isinstance(processor_cls, str):
-            if hasattr(__file__.__module__, processor_cls):
-                processor_cls = getattr(__file__.__module__, processor_cls)
+            if hasattr(twinkle.processor, processor_cls):
+                processor_cls = getattr(twinkle.processor, processor_cls)
             else:
-                processor_cls = Plugin.load_plugin(processor_cls, processor.InputProcessor)
+                processor_cls = Plugin.load_plugin(processor_cls, twinkle.processor.InputProcessor)
         self.sample_group[adapter_name].processor = processor_cls(**kwargs)
 
     @remote_function()
     def sample(self, trajectories: List[Trajectory], adapter_name = '') -> List[Trajectory]:
+        self._check_adapter_valid(adapter_name)
         if adapter_name:
-            assert adapter_name in self.sample_group, f'Add {adapter_name} first before sampling.'
             group = self.sample_group[adapter_name]
             from vllm.lora.request import LoRARequest
             adapter_request = LoRARequest(
@@ -103,12 +104,12 @@ class VLLMSampler(Sampler):
                     outputs[output.request_id] = output
         outputs = [outputs[request_id] for request_id in request_ids]
         for trajectory, output in zip(trajectories, outputs):
-            trajectory.messages.append(Message(role='assistant', content=output))
+            response = template_ins.decode(output.token_ids)
+            trajectory.messages.append(Message(role='assistant', content=response))
         return trajectories
 
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
         assert adapter_name not in self.sample_group, f'{adapter_name} already exists.'
-        assert adapter_name, 'Use a different adapter_name, current is empty.'
         self.sample_group[adapter_name] = SampleGroup()
         self.sample_group[adapter_name].adapter_name = adapter_name
         self.sample_group[adapter_name].adapter_config = config
@@ -118,7 +119,7 @@ class VLLMSampler(Sampler):
             llm_model = self.engine.inner_model
             llm_model.load_weights(state_dict.items())
         else:
-            assert adapter_name in self.sample_group, f'Add {adapter_name} first before sampling.'
+            self._check_adapter_valid(adapter_name)
             group = self.sample_group[adapter_name]
             lora_request = TensorLoRARequest(
                 lora_name=adapter_name,
@@ -130,5 +131,5 @@ class VLLMSampler(Sampler):
             self.engine.engine.add_lora(lora_request)
 
     def remove_adapter(self, adapter_name: str):
-        if adapter_name in self.sample_group:
+        if adapter_name and adapter_name in self.sample_group:
             self.sample_group.pop(adapter_name)

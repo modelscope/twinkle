@@ -1,8 +1,17 @@
+from abc import ABC, abstractmethod
+
 from twinkle.model.base import TwinkleModel
 from twinkle.sampler import Sampler
 
 
-class WeightLoader:
+class WeightLoader(ABC):
 
-    def __call__(self, module: TwinkleModel, sampler: Sampler):
+    @abstractmethod
+    def __call__(self, model: TwinkleModel, sampler: Sampler):
+        """Sync weights from model to sampler
+
+        Args:
+            model: The actor model instance
+            sampler: The sampler instance
+        """
         ...

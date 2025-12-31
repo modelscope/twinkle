@@ -1,7 +1,6 @@
 from typing import List, Optional
-import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
-
+import numpy as np
 from twinkle.data_format import Trajectory, InputFeature
 
 
@@ -12,12 +11,13 @@ class Template:
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
         conversation = [message.to_dict_clean() for message in trajectory.messages]
-        templated = self.tokenizer.apply_chat_template(conversation=conversation, tools=trajectory.tools)
-        encoded = self.tokenizer(templated, return_tensors="pt")
+        tools = [dict(tool) for tool in trajectory.tools]
+        templated = self.tokenizer.apply_chat_template(conversation=conversation, tools=tools)
+        encoded = self.tokenizer(templated, return_tensors="np")
         return InputFeature(
             input_ids=encoded['input_ids'],
-            attention_mask=torch.ones_like(encoded['input_ids']),
-            position_ids=torch.range(0, len(encoded['input_ids'])),
+            attention_mask=np.ones_like(encoded['input_ids']),
+            position_ids=np.arange(0, len(encoded['input_ids'])),
         )
 
     def batch_encode(self, trajectories: List[Trajectory]) -> List[InputFeature]:
@@ -45,3 +45,9 @@ class Template:
         for trajectory in trajectories:
             output.append(self.check(trajectory))
         return output
+
+    def decode(self, token_ids: List[int], **kwargs) -> str:
+        return self.tokenizer.decode(token_ids, **kwargs)
+
+    def batch_decode(self, token_ids: List[List[int]], **kwargs) -> List[str]:
+        return [self.tokenizer.decode(_ids, **kwargs) for _ids in token_ids]
