@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Literal
 
 from .base import TrainStrategy
 from twinkle import DeviceMesh
@@ -8,7 +8,7 @@ class AccelerateStrategy(TrainStrategy):
 
     def __init__(self,
                  device_mesh: Optional[DeviceMesh] = None,
-                 mixed_precision: str = 'bf16',
+                 mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  ddp_config: Dict[str, Any] = None,
                  fsdp_config: Dict[str, Any] = None,
                  ):
@@ -84,6 +84,7 @@ class AccelerateStrategy(TrainStrategy):
             sharding_strategy = FSDPShardingStrategy.NO_SHARD
 
         fsdp_version = fsdp_config.pop('fsdp_config', 2)
+        assert fsdp_version == 2, 'Currently only support fsdp_version = 2'
         fsdp_plugin = FullyShardedDataParallelPlugin(
             fsdp_version=fsdp_version,
             sharding_strategy=sharding_strategy,

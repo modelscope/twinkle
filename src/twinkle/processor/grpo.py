@@ -43,4 +43,4 @@ class GRPOLossProcessor(InputProcessor):
         inputs.logits_to_keep = logits_to_keep
         inputs.num_items_in_batch = num_items_in_batch
 
-        return inputs
+        return super().prepare_inputs(inputs)
