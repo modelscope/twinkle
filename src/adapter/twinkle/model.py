@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Dict, Any, Union, Type, List, Optional
 
@@ -11,7 +12,7 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.loss import Loss
 from twinkle.model import TransformersModel
 from twinkle.model.base import TwinkleModel
-from .validation import verify_request_token
+from .validation import verify_request_token, init_config_registry, ConfigRegistry
 
 
 def build_model_app(model_id: str,
@@ -40,6 +41,9 @@ def build_model_app(model_id: str,
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)
             self.hb_thread.start()
+            self.config_registry: ConfigRegistry = init_config_registry()
+            self.per_token_model_limit = os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 3)
+            self.key_token_dict = {}
 
         def countdown(self):
             for key in self.adapter_records.copy():
@@ -47,9 +51,26 @@ def build_model_app(model_id: str,
                 if self.adapter_records[key] > self.COUNT_DOWN:
                     self.model.remove_adapter(key)
                     self.adapter_records.pop(key)
+                    if key in self.key_token_dict:
+                        self.handle_adapter_count(self.key_token_dict[key], False)
+
+        def handle_adapter_count(self, token, add: bool):
+            user_key = token + '_' + 'model_adapter'
+            cur_count = self.config_registry.get_config(user_key) or 0
+            if add:
+                if cur_count < self.per_token_model_limit:
+                    self.config_registry.add_config(user_key, cur_count + 1)
+                else:
+                    raise RuntimeError(f'Model adapter count limitation reached: {self.per_token_model_limit}')
+            else:
+                if cur_count > 0:
+                    cur_count -= 1
+                    self.config_registry.add_config(user_key, cur_count)
+                if cur_count <= 0:
+                    self.config_registry.pop(user_key)
 
         @app.post("/create")
-        def create(self, *args, **kwargs):
+        def create(self, request, **kwargs):
             return ''
 
         def assert_adapter_exists(self, adapter_name):
@@ -150,11 +171,14 @@ def build_model_app(model_id: str,
             return self.model.save(output_dir, adapter_name=adapter_name, **kwargs)
 
         @app.post("/add_adapter")
-        def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any]):
+        def add_adapter_to_model(self, request, *, adapter_name: str, config: Dict[str, Any]):
             assert adapter_name, 'You need to specify a valid `adapter_name`'
+            adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
+            self.handle_adapter_count(request.state.token, True)
             config = LoraConfig(**config)
+            self.model.add_adapter_to_model(adapter_name, config)
             self.adapter_records[adapter_name] = 0
-            return self.model.add_adapter_to_model(adapter_name, config)
+            self.key_token_dict[adapter_name] = request.state.token
 
         @app.post("/set_template")
         def set_template(self, request, *, template_cls: str, adapter_name: str, **kwargs):

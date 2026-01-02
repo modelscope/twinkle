@@ -1,3 +1,4 @@
+import os
 import threading
 import uuid
 from typing import Dict, Any
@@ -7,7 +8,7 @@ from fastapi import Request
 from ray import serve
 
 import twinkle
-from adapter.twinkle.validation import verify_request_token
+from adapter.twinkle.validation import verify_request_token, ConfigRegistry, init_config_registry
 from twinkle import DeviceGroup, DeviceMesh
 
 
@@ -39,6 +40,9 @@ def build_processor_app(device_group: Dict[str, Any],
             self.resource_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)
             self.hb_thread.start()
+            self.config_registry: ConfigRegistry = init_config_registry()
+            self.per_token_processor_limit = os.environ.get("TWINKLE_PER_USER_PROCESSOR_LIMIT", 20)
+            self.key_token_dict = {}
 
         def countdown(self):
             for key in self.resource_records.copy():
@@ -46,16 +50,35 @@ def build_processor_app(device_group: Dict[str, Any],
                 if self.resource_records[key] > self.COUNT_DOWN:
                     self.resource_records.pop(key)
                     self.resource_dict.pop(key, None)
+                    if key in self.key_token_dict:
+                        self.handle_processor_count(self.key_token_dict[key], False)
 
         def assert_processor_exists(self, processor_id):
             assert processor_id and processor_id in self.resource_dict
 
+        def handle_processor_count(self, token, add: bool):
+            user_key = token + '_' + 'processor'
+            cur_count = self.config_registry.get_config(user_key) or 0
+            if add:
+                if cur_count < self.per_token_processor_limit:
+                    self.config_registry.add_config(user_key, cur_count + 1)
+                else:
+                    raise RuntimeError(f'Processor count limitation reached: {self.per_token_processor_limit}')
+            else:
+                if cur_count > 0:
+                    cur_count -= 1
+                    self.config_registry.add_config(user_key, cur_count)
+                if cur_count <= 0:
+                    self.config_registry.pop(user_key)
+
         @app.post("/create")
-        def create(self, processor_type, class_type, **kwargs):
+        def create(self, request, *, processor_type, class_type, **kwargs):
             assert processor_type in processors
             processor_type = getattr(twinkle, processor_type)
             assert hasattr(processor_type, class_type)
+            self.handle_processor_count(request.state.token, True)
             processor_id = str(uuid.uuid4().hex)
+            self.key_token_dict[processor_id] = request.state.token
             kwargs.pop('remote_group', None)
             kwargs.pop('device_mesh', None)
             processor = getattr(processor_type, class_type)(remote_group=device_group.name,

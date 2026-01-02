@@ -364,37 +364,15 @@ class TransformersModel(twinkle.model.TransformersModel):
     """
     
     def __init__(self, # noqa
-                 model_cls: Optional[Union[Type[PreTrainedModel], str]] = None,
-                 pretrained_model_name_or_path: Optional[str] = None,
-                 config: Optional[PretrainedConfig] = None,
-                 device_mesh: Optional[DeviceMesh] = None,
-                 mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
-                 ddp_config: Dict[str, Any] = None,
-                 fsdp_config: Dict[str, Any] = None,
-                 grad_scaler_config: Dict[str, Any] = None,
+                 pretrained_model_name_or_path: str,
                  **kwargs):
         """Initialize model client."""
         self.server_url = TWINKLE_SERVER_URL
         self.adapter_name = None
-        kwargs['pretrained_model_name_or_path'] = pretrained_model_name_or_path
-        if model_cls:
-            if not isinstance(model_cls, str):
-                model_cls = model_cls.__name__
-            kwargs['model_cls'] = model_cls
-        if config is not None:
-            kwargs['config'] = config.__dict__
-        if device_mesh is not None:
-            kwargs['device_mesh'] = device_mesh.__dict__
-        kwargs['mixed_precision'] = mixed_precision
-        kwargs['ddp_config'] = ddp_config
-        kwargs['fsdp_config'] = fsdp_config
-        kwargs['grad_scaler_config'] = grad_scaler_config
         response = http_post(
-            url=f'{self.server_url}/create',
-            json_data=kwargs
+            url=f'{self.server_url}/{pretrained_model_name_or_path}/create',
         )
         response.raise_for_status()
-        return response.json()
     
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""

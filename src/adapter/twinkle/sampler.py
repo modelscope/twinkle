@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Dict, Any, List
 
@@ -7,7 +8,7 @@ from peft import LoraConfig
 from ray import serve
 
 import twinkle
-from adapter.twinkle.validation import verify_request_token
+from adapter.twinkle.validation import verify_request_token, ConfigRegistry, init_config_registry
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import Trajectory
 from twinkle.sampler import VLLMSampler, Sampler
@@ -43,6 +44,9 @@ def build_sampler_app(model_id: str,
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)
             self.hb_thread.start()
+            self.config_registry: ConfigRegistry = init_config_registry()
+            self.per_token_sampler_limit = os.environ.get("TWINKLE_PER_USER_SAMPLER_LIMIT", 3)
+            self.key_token_dict = {}
 
         def countdown(self):
             for key in self.adapter_records.copy():
@@ -50,6 +54,23 @@ def build_sampler_app(model_id: str,
                 if self.adapter_records[key] > self.COUNT_DOWN:
                     self.sampler.remove_adapter(key)
                     self.adapter_records.pop(key)
+                    if key in self.key_token_dict:
+                        self.handle_adapter_count(self.key_token_dict[key], False)
+
+        def handle_adapter_count(self, token, add: bool):
+            user_key = token + '_' + 'sampler_adapter'
+            cur_count = self.config_registry.get_config(user_key) or 0
+            if add:
+                if cur_count < self.per_token_sampler_limit:
+                    self.config_registry.add_config(user_key, cur_count + 1)
+                else:
+                    raise RuntimeError(f'Model adapter count limitation reached: {self.per_token_sampler_limit}')
+            else:
+                if cur_count > 0:
+                    cur_count -= 1
+                    self.config_registry.add_config(user_key, cur_count)
+                if cur_count <= 0:
+                    self.config_registry.pop(user_key)
 
         def assert_adapter_exists(self, adapter_name):
             assert adapter_name and adapter_name in self.adapter_records
@@ -74,9 +95,11 @@ def build_sampler_app(model_id: str,
         @app.post("/add_adapter_to_sampler")
         def add_adapter_to_sampler(self, request, *, adapter_name: str, config):
             assert adapter_name, 'You need to specify a valid `adapter_name`'
+            self.handle_adapter_count(request.state.token, True)
             adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             config = LoraConfig(**config)
-            return self.sampler.add_adapter_to_sampler(adapter_name, config)
+            self.sampler.add_adapter_to_sampler(adapter_name, config)
+            self.adapter_records[adapter_name] = 0
 
         @app.post("/sync_weights")
         def sync_weights(self, request, *, state_dict: Dict[str, Any], adapter_name: str):
