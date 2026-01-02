@@ -44,11 +44,11 @@ def generate_processors():
     src_twinkle_path = project_root / 'src' / 'twinkle'
     src_client_path = project_root / 'src' / 'client'
     
-    def find_classes_in_file(file_path: Path) -> List[Tuple[str, str, List[str]]]:
+    def find_classes_in_file(file_path: Path) -> List[Tuple[str, str, List[Tuple[str, str]]]]:
         """Find classes that inherit from base classes.
-        
+            
         Returns:
-            List of tuples (class_name, base_class_name, method_names)
+            List of tuples (class_name, base_class_name, [(method_name, signature), ...])
         """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -56,9 +56,62 @@ def generate_processors():
         except Exception as e:
             print(f"Error parsing {file_path}: {e}")
             return []
-
+            
+        def get_method_signature(func_node: ast.FunctionDef) -> str:
+            """Extract method signature from AST node."""
+            args = []
+                
+            # Regular arguments
+            for i, arg in enumerate(func_node.args.args):
+                if arg.arg == 'self':
+                    continue
+                    
+                # Get argument name
+                arg_str = arg.arg
+                    
+                # Get type annotation if available
+                if arg.annotation:
+                    try:
+                        arg_str += f": {ast.unparse(arg.annotation)}"
+                    except:
+                        pass
+                    
+                # Get default value if available
+                defaults_offset = len(func_node.args.args) - len(func_node.args.defaults)
+                if i >= defaults_offset:
+                    default_idx = i - defaults_offset
+                    try:
+                        default_val = ast.unparse(func_node.args.defaults[default_idx])
+                        arg_str += f" = {default_val}"
+                    except:
+                        pass
+                    
+                args.append(arg_str)
+                
+            # *args
+            if func_node.args.vararg:
+                vararg_str = f"*{func_node.args.vararg.arg}"
+                if func_node.args.vararg.annotation:
+                    try:
+                        vararg_str += f": {ast.unparse(func_node.args.vararg.annotation)}"
+                    except:
+                        pass
+                args.append(vararg_str)
+                
+            # **kwargs
+            if func_node.args.kwarg:
+                kwarg_str = f"**{func_node.args.kwarg.arg}"
+                if func_node.args.kwarg.annotation:
+                    try:
+                        kwarg_str += f": {ast.unparse(func_node.args.kwarg.annotation)}"
+                    except:
+                        pass
+                args.append(kwarg_str)
+                
+            return ', '.join(args)
+            
         classes_found = []
-
+            
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 # Check if this class inherits from any base class
@@ -68,7 +121,7 @@ def generate_processors():
                         base_name = base.id
                     elif isinstance(base, ast.Attribute):
                         base_name = base.attr
-
+                        
                     if base_name in base_classes:
                         # Extract all methods decorated with @remote_function
                         methods = []
@@ -84,40 +137,46 @@ def generate_processors():
                                             has_remote_decorator = True
                                         elif isinstance(decorator.func, ast.Attribute) and decorator.func.attr == 'remote_function':
                                             has_remote_decorator = True
-
+                                    
                                 if has_remote_decorator and not item.name.startswith('_'):
-                                    methods.append(item.name)
-
+                                    signature = get_method_signature(item)
+                                    methods.append((item.name, signature))
+                            
                         classes_found.append((node.name, base_name, methods))
-
+            
         return classes_found
 
-    def scan_module(module_path: Path) -> Dict[str, List[Tuple[str, List[str]]]]:
+    def scan_module(module_path: Path) -> Dict[str, List[Tuple[str, List[Tuple[str, str]]]]]:
         """Scan a module directory for classes.
-
+            
         Returns:
-            Dict mapping base_class_name to a list of (class_name, methods)
+            Dict mapping base_class_name to list of (class_name, [(method_name, signature), ...])
         """
         result = {}
-
+            
         if not module_path.exists():
             return result
-
+            
         for py_file in module_path.glob('*.py'):
             if py_file.name.startswith('_'):
                 continue
-
+                
             classes = find_classes_in_file(py_file)
             for class_name, base_name, methods in classes:
                 if base_name not in result:
                     result[base_name] = []
                 result[base_name].append((class_name, methods))
-
+            
         return result
-
-    def generate_client_class(class_name: str, base_class_name: str, methods: List[str],
-                             module_name: str, processor_type: str) -> str:
-        """Generate client wrapper class code."""
+        
+    def generate_client_class(class_name: str, base_class_name: str, 
+                             methods: List[Tuple[str, str]], module_name: str, 
+                             processor_type: str) -> str:
+        """Generate client wrapper class code.
+            
+        Args:
+            methods: List of tuples (method_name, signature)
+        """
         code_lines = [f"""from typing import Any, Optional
 import uuid
 from client.http import TWINKLE_SERVER_URL
@@ -158,15 +217,35 @@ class {class_name}(twinkle.{module_name}.{base_class_name}):
 """]
 
         # Generate methods
-        for method_name in methods:
+        for method_name, signature in methods:
+            # Parse signature to extract parameter names for the JSON payload
+            param_names = []
+            if signature:
+                # Extract parameter names from signature
+                for param in signature.split(','):
+                    param = param.strip()
+                    if param.startswith('*'):
+                        continue  # Skip *args and **kwargs for now
+                    # Extract just the parameter name (before : or =)
+                    param_name = param.split(':')[0].split('=')[0].strip()
+                    if param_name and param_name not in ['self']:
+                        param_names.append(param_name)
+            
+            # Build kwargs dict from parameters
+            if param_names:
+                kwargs_items = ', '.join([f"'{p}': {p}" for p in param_names])
+                kwargs_dict = f"{{{kwargs_items}}}"
+            else:
+                kwargs_dict = "{}"
+            
             code_lines.extend([f"""    
-    def {method_name}(self, **kwargs):
+    def {method_name}(self{', ' + signature if signature else ''}):
         response = http_post(
             url=f'{{self.server_url}}/call',
             json_data={{
                 'processor_id': self.processor_id,
                 'function': '{method_name}',
-                **kwargs
+                **{kwargs_dict}
             }}
         )
         response.raise_for_status()
