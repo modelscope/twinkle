@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import numpy as np
 
-from twinkle import Platform
+from .platform import Platform
 
 
 class Framework(ABC):

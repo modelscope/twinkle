@@ -1,6 +1,6 @@
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Type, Union
 
 from datasets import interleave_datasets, concatenate_datasets
@@ -23,7 +23,7 @@ class DatasetMeta:
     # The split
     split: str = 'train'
     # Pick a data slice
-    data_slice: Union[slice, Iterable] = slice(None)
+    data_slice: Union[slice, Iterable] = field(default_factory=lambda: slice(None))
 
     def get_id(self):
         return self.dataset_id + ':' + self.subset_name + ':' + self.split

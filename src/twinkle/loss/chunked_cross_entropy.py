@@ -1,7 +1,7 @@
 import math
 from typing import Any
 
-from src.twinkle.loss.base import Loss
+from .base import Loss
 import torch
 
 class ChunkedCrossEntropyLossFunc(torch.autograd.Function):

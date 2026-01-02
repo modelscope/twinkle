@@ -4,8 +4,8 @@ import os
 import sys
 from typing import Type, TypeVar
 
-from twinkle.hub import MSHub, HFHub
-from twinkle import trust_remote_code
+from ..hub import MSHub, HFHub
+from .unsafe import trust_remote_code
 
 T = TypeVar('T')
 

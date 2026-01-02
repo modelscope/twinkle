@@ -1,4 +1,4 @@
-from src.twinkle.loss.base import Loss
+from .base import Loss
 import torch
 
 

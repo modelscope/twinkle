@@ -5,8 +5,8 @@ from typing import Dict, List
 import ray
 from ray.util.placement_group import PlacementGroup
 
-from .. import DeviceGroup
-from ... import Platform
+from twinkle import DeviceGroup
+from twinkle import Platform
 
 
 class ResourceManager:

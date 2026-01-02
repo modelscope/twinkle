@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import List, Literal, Optional, Union
 
 from requests.exceptions import HTTPError
-
-from ..infra import remote_class, remote_function
 from ..utils import requires
 
 
@@ -111,12 +109,10 @@ class HubOperation:
         raise NotImplementedError
 
 
-@remote_class()
 class MSHub(HubOperation):
     ms_token = None
 
     @staticmethod
-    @remote_function(execute='first')
     def create_repo(repo_id: str,
                     *,
                     token: Optional[Union[str, bool]] = None,
@@ -140,7 +136,6 @@ class MSHub(HubOperation):
         return RepoUrl(url=hub_model_id, )
 
     @staticmethod
-    @remote_function(execute='first')
     def upload_folder(
         *,
         repo_id: str,
@@ -165,7 +160,6 @@ class MSHub(HubOperation):
         )
 
     @classmethod
-    @remote_function(execute='first')
     def try_login(cls, token: Optional[str] = None) -> bool:
         requires('modelscope')
         from modelscope import HubApi
@@ -178,7 +172,6 @@ class MSHub(HubOperation):
         return False
 
     @classmethod
-    @remote_function(execute='first')
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
         requires('modelscope')
         from modelscope import HubApi
@@ -217,7 +210,6 @@ class MSHub(HubOperation):
         return repo_id
 
     @classmethod
-    @remote_function(execute='first')
     def push_to_hub(cls,
                     repo_id: str,
                     folder_path: Union[str, Path],
@@ -258,7 +250,6 @@ class MSHub(HubOperation):
             tag=path_in_repo)
 
     @classmethod
-    @remote_function(execute='all')
     def load_dataset(cls,
                      dataset_id: str,
                      subset_name: str,
@@ -285,7 +276,6 @@ class MSHub(HubOperation):
         )
 
     @classmethod
-    @remote_function(execute='first')
     def download_model(cls,
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
@@ -356,23 +346,19 @@ class MSHub(HubOperation):
         MSHub.add_patterns_to_file(repo, file_name, new_patterns, commit_message, ignore_push_error=True)
 
 
-@remote_class()
 class HFHub(HubOperation):
 
     @classmethod
-    @remote_function(execute='first')
     def try_login(cls, token: Optional[str] = None) -> bool:
         pass
 
     @classmethod
-    @remote_function(execute='first')
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
         requires('huggingface_hub')
         from huggingface_hub.hf_api import api
         return api.create_repo(repo_id, token=token, private=private)
 
     @classmethod
-    @remote_function(execute='first')
     def push_to_hub(cls,
                     repo_id: str,
                     folder_path: Union[str, Path],
@@ -401,7 +387,6 @@ class HFHub(HubOperation):
             **kwargs)
 
     @classmethod
-    @remote_function(execute='all')
     def load_dataset(cls,
                      dataset_id: str,
                      subset_name: str,
@@ -426,7 +411,6 @@ class HFHub(HubOperation):
             num_proc=num_proc)
 
     @classmethod
-    @remote_function(execute='first')
     def download_model(cls,
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
