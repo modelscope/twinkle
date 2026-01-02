@@ -581,16 +581,12 @@ class VLLMSampler(twinkle.sampler.VLLMSampler):
     Each adapter has its own lifecycle managed through automatic heartbeats.
     """
     
-    def __init__(self, model_id: str, engine_args: Dict[str, Any], device_mesh: DeviceMesh=None, **kwargs):
+    def __init__(self, model_id: str, **kwargs):
         """Create the sampler instance on server."""
         self.server_url = TWINKLE_SERVER_URL
         self.adapter_name = None
-        kwargs['model_id'] = model_id
-        kwargs['engine_args'] = engine_args
-        if device_mesh is not None:
-            kwargs['device_mesh'] = device_mesh.__dict__
         response = http_post(
-            url=f'{self.server_url}/create',
+            url=f'{self.server_url}/{model_id}/create',
             json_data=kwargs
         )
         response.raise_for_status()
