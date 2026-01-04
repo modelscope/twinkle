@@ -119,6 +119,8 @@ class Dataset(TorchDataset):
         else:
             key = dataset_meta.get_id()
         self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
+        if len(self.datasets) == 1:
+            self.dataset = self.datasets[key]
 
     @remote_function(execute='first')
     def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None, **kwargs) -> None:
@@ -142,6 +144,8 @@ class Dataset(TorchDataset):
         else:
             key = dataset_meta.get_id()
         self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
+        if len(self.datasets) == 1:
+            self.dataset = self.datasets[key]
 
     @remote_function(execute='first')
     def add_dataset(self,
