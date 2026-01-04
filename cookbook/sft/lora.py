@@ -20,7 +20,7 @@ def train():
     model = TransformersModel(pretrained_model_name_or_path='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']
+        target_modules='all-linear'
     )
 
     model.add_adapter_to_model('default', lora_config)
