@@ -295,6 +295,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 params[name] = param
         return params
 
+    def _activate_adapter_grad(self, adapter_name: str):
+        self._check_adapter_valid(adapter_name)
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        model = self.strategy.unwrap_model(self.model)
+        for name, param in model.named_parameters():
+            if pattern.search(name):
+                param.requires_grad = True
+
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
@@ -338,6 +346,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
         self.strategy.unwrap_model(self.model).add_adapter(adapter_name, config)
+        self._activate_adapter_grad(adapter_name)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
