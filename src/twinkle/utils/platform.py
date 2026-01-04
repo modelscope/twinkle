@@ -52,22 +52,18 @@ class DeviceMesh:
                 )
         assert all([name in valid_dim_names for name in self.mesh_dim_names])
 
-    @property
-    def ddp_group(self):
-        if not hasattr(self, "_ddp_group"):
-            rank = dist.get_rank()
-            data_parallel_dims = {'dp', 'fsdp'}
-            coords = np.argwhere(self.mesh == rank)[0]
-            slices = []
-            for i, dim_name in enumerate(self.mesh_dim_names):
-                if dim_name in data_parallel_dims:
-                    slices.append(slice(None))
-                else:
-                    slices.append(coords[i])
+    def create_process_group(self, dims):
+        rank = dist.get_rank()
+        coords = np.argwhere(self.mesh == rank)[0]
+        slices = []
+        for i, dim_name in enumerate(self.mesh_dim_names):
+            if dim_name in dims:
+                slices.append(slice(None))
+            else:
+                slices.append(coords[i])
 
-            ddp_ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
-            self._ddp_group = dist.new_group(ranks=ddp_ranks)
-        return self._ddp_group
+        ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
+        return dist.new_group(ranks=ranks)
 
     def to_torch_device_mesh(self):
         import torch

@@ -27,6 +27,7 @@ from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
 from .strategy import AccelerateStrategy
 from twinkle.data_format import InputFeature, Trajectory
+from ..utils.parallel import singleton
 
 
 @dataclass
@@ -45,6 +46,7 @@ class OptimizerGroup:
     scaler_has_nan: bool = False
     gradient_accumulation_steps: int = 1
     cur_step: int = 0
+    dp_group = None
 
     def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
@@ -119,22 +121,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            try:
-                with filelock.FileLock('.twinkle.lock'):
-                    if not self._model_wrapped:
-                        if self.optimizer_group[self._default_adapter_name].optimizer is None:
-                            optimizer = AdamW(self._get_trainable_parameters(self._default_adapter_name).values(), lr=1e-5)
-                            self.optimizer_group[self._default_adapter_name].optimizer=optimizer
-                        optimizer = self.optimizer_group[self._default_adapter_name].optimizer
-                        self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                        self.optimizer_group[self._default_adapter_name].optimizer = optimizer
-                        self._model_wrapped = True
-            finally:
-                if os.path.exists('.twinkle.lock'):
-                    try:
-                        os.remove('.twinkle.lock')
-                    except: # noqa
-                        pass
+            if self.optimizer_group[self._default_adapter_name].optimizer is None:
+                optimizer = AdamW(self._get_trainable_parameters(self._default_adapter_name).values(), lr=1e-5)
+                self.optimizer_group[self._default_adapter_name].optimizer=optimizer
+            optimizer = self.optimizer_group[self._default_adapter_name].optimizer
+            self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
+            self.optimizer_group[self._default_adapter_name].optimizer = optimizer
+            self._model_wrapped = True
 
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -248,7 +241,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                     grad = full_grad
 
                 if self.device_mesh.dp_world_size > 1:
-                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.device_mesh.dp_group)
+                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.optimizer_group[adapter_name].dp_group)
 
     @remote_function()
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -356,7 +349,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 params[name] = param
         return params
 
-    def _activate_adapter_grad(self, adapter_name: str):
+    def _activate_adapter(self, adapter_name: str):
         self._check_adapter_valid(adapter_name)
         pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
         unwrapped_model = self.strategy.unwrap_model(self.model)
@@ -366,6 +359,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 if adapter_name in name and hasattr(param.data, 'to_local'):
                     param.data = param.data.to_local().to(device)
                 param.requires_grad = True
+        self.optimizer_group[adapter_name].dp_group = self.device_mesh.create_process_group(['dp'])
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
@@ -415,7 +409,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         unwrapped_model = self.strategy.unwrap_model(self.model)
         unwrapped_model.add_adapter(adapter_name, config)
-        self._activate_adapter_grad(adapter_name)
+        self._activate_adapter(adapter_name)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
