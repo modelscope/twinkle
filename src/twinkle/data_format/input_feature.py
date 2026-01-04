@@ -16,11 +16,7 @@ class InputFeature(TypedDict, total=False):
 
 def to_transformers_dict(feature: InputFeature) -> dict:
     import torch
-    output = {
-        'input_ids': feature.get('input_ids'),
-        'attention_mask': feature.get('attention_mask'),
-        'position_ids': feature.get('position_ids'),
-    }
+    output = feature
     for key in list(output.keys()):
         if not isinstance(output[key], torch.Tensor):
             output[key] = np.array(output[key])

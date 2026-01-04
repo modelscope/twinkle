@@ -130,7 +130,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         inputs: Dict[str, Any] = processor(inputs)
         if adapter_name:
             self.strategy.unwrap_model(self.model).set_current_adapter_name(adapter_name)
+        labels = inputs.pop('labels', None)
         outputs = self.model(**inputs)
+        inputs['labels'] = labels
         self.optimizer_group[adapter_name].inputs = inputs
         self.optimizer_group[adapter_name].outputs = outputs
         return outputs
@@ -154,7 +156,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             inputs: Dict[str, Any] = processor(inputs)
             if adapter_name:
                 self.strategy.unwrap_model(self.model).set_current_adapter_name(adapter_name)
+            labels = inputs.pop('labels', None)
             outputs = self.model(**inputs)
+            inputs['labels'] = labels
         self.optimizer_group[adapter_name].inputs = inputs
         self.optimizer_group[adapter_name].outputs = outputs
         return outputs
@@ -179,7 +183,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         loss_value = self.optimizer_group[adapter_name].loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
         if adapter_name:
-            self.model.set_current_adapter_name(adapter_name)
+            self.strategy.unwrap_model(self.model).set_current_adapter_name(adapter_name)
 
         scaler = self.optimizer_group[adapter_name].scaler
         if scaler is None and self.mixed_precision == 'fp16':
