@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Literal
 from typing import overload, Type, Optional, Union
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
-from peft import PeftConfig
+from peft import PeftConfig, LoraConfig
 from peft import get_peft_model, PeftModel
 import torch
 from torch import GradScaler
@@ -21,7 +21,7 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
 from .strategy import AccelerateStrategy
-from twinkle.data_format import InputFeature, Trajectory, to_transformers_dict
+from twinkle.data_format import InputFeature, Trajectory
 
 
 @dataclass
@@ -84,6 +84,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.model_id = pretrained_model_name_or_path
         self.device_mesh = device_mesh
         from twinkle.patch.multi_adapter import MultiAdapter
+        config = LoraConfig(r=1, target_modules='all-linear')
+        # pre wrap
+        self.model = get_peft_model(self.model, config, adapter_name='__dummy_adapter_inner__')
         self.model: PreTrainedModel = MultiAdapter()(self.model) # patch multiple loras
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
@@ -334,10 +337,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[adapter_name] = OptimizerGroup()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
-        if isinstance(self.model, PeftModel):
-            self.model.add_adapter(adapter_name, config)
-        else:
-            self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
+        self.strategy.unwrap_model(self.model).add_adapter(adapter_name, config)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
