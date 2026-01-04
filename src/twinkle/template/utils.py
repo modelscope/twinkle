@@ -1,6 +1,8 @@
 from typing import List, Dict, Any, Tuple
 from copy import deepcopy
 
+from twinkle.data_format import Trajectory
+
 PLACEHOLDER = "<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>"
 
 
@@ -55,11 +57,13 @@ def build_labels(
     return labels
 
 
-def get_assistant_labels(
+def tokenize_with_assistant_labels(
         tokenizer,
-        messages: List[Dict[str, Any]],
+        trajectory: Trajectory,
         placeholder: str = PLACEHOLDER,
 ) -> Tuple[List[int], List[int]]:
+    messages = [dict(message) for message in trajectory['messages']]
+    tools = [dict(tool) for tool in trajectory['tools']]
     placeholder_ids = tokenizer.encode(placeholder, add_special_tokens=False)
 
     messages_with_placeholder = deepcopy(messages)
@@ -71,11 +75,13 @@ def get_assistant_labels(
 
     full_ids = tokenizer.apply_chat_template(
         messages,
+        tools=tools,
         tokenize=True,
     )
 
     template_ids = tokenizer.apply_chat_template(
         messages_with_placeholder,
+        tools=tools,
         tokenize=True,
     )
 

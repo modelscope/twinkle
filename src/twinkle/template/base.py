@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 import numpy as np
 from twinkle.hub import HubOperation
 from twinkle.data_format import Trajectory, InputFeature
-from .utils import get_assistant_labels
+from .utils import tokenize_with_assistant_labels
 
 
 class Template:
@@ -15,16 +15,12 @@ class Template:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
-        conversation = [dict(message) for message in trajectory['messages']]
-        tools = [dict(tool) for tool in trajectory['tools']]
-        encoded = self.tokenizer.apply_chat_template(conversation=conversation, tools=tools)
-        labels = get_assistant_labels(self.tokenizer, conversation)
-        labels = np.roll(labels, -1, axis=-1)
+        input_ids, labels = tokenize_with_assistant_labels(self.tokenizer, trajectory)
         return InputFeature(
-            input_ids=np.array(encoded),
-            attention_mask=np.ones_like(encoded),
-            position_ids=np.arange(0, len(encoded)),
-            labels=labels,
+            input_ids=np.array(input_ids),
+            attention_mask=np.ones_like(input_ids),
+            position_ids=np.arange(0, len(input_ids)),
+            labels=np.roll(labels, -1, axis=-1),
         )
 
     @staticmethod
