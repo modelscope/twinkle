@@ -128,6 +128,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                         optimizer = self.optimizer_group[self._default_adapter_name].optimizer
                         self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
                         self.optimizer_group[self._default_adapter_name].optimizer = optimizer
+                        self._model_wrapped = True
             finally:
                 if os.path.exists('.twinkle.lock'):
                     try:
@@ -148,7 +149,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
-
+        self._lazy_wrap_model()
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert self.optimizer_group[adapter_name].template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
@@ -233,11 +234,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self._reduce_adapter_grad(adapter_name=adapter_name)
 
     def _reduce_adapter_grad(self, adapter_name: str):
+        from torch.distributed.tensor import DTensor
         if adapter_name and self.device_mesh.fsdp_world_size > 1:
             import torch.distributed as dist
             for p in self._get_trainable_parameters(adapter_name).values():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=self.device_mesh.ddp_group)
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad
+                if isinstance(grad, DTensor):
+                    full_grad = grad.full_tensor()
+                    p.grad = full_grad
+                    grad = full_grad
+
+                if self.device_mesh.dp_world_size > 1:
+                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.device_mesh.dp_group)
 
     @remote_function()
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -348,9 +359,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def _activate_adapter_grad(self, adapter_name: str):
         self._check_adapter_valid(adapter_name)
         pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
-        model = self.strategy.unwrap_model(self.model)
-        for name, param in model.named_parameters():
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        device = next(unwrapped_model.parameters()).device
+        for name, param in unwrapped_model.named_parameters():
             if pattern.search(name):
+                if adapter_name in name and hasattr(param.data, 'to_local'):
+                    param.data = param.data.to_local().to(device)
                 param.requires_grad = True
 
     @remote_function()
@@ -399,7 +413,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
-        self.strategy.unwrap_model(self.model).add_adapter(adapter_name, config)
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        unwrapped_model.add_adapter(adapter_name, config)
         self._activate_adapter_grad(adapter_name)
 
     @remote_function()
