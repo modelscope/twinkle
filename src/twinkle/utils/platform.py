@@ -43,12 +43,14 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
+        valid_dim_names = {"dp", "fsdp", "tp", "pp", "sp", "cp", "ep"}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(
                     f"The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) "
                     f"does not match the shape of `mesh`: ({len(self.mesh.shape)})"
                 )
+        assert all([name in valid_dim_names for name in self.mesh_dim_names])
 
     @property
     def ddp_group(self):

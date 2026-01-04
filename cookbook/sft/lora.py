@@ -18,7 +18,7 @@ def train():
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True)
-    dataloader = DataLoader(dataset)
+    dataloader = DataLoader(dataset, batch_size=2)
     model = TransformersModel(pretrained_model_name_or_path='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
@@ -33,12 +33,12 @@ def train():
     model.set_lr_scheduler(LinearLR, adapter_name='default')
     logger.info(get_device_placement())
     for step, batch in enumerate(dataloader):
-        for gas in range(16):
-            output = model.forward_backward(inputs=batch, adapter_name='default', grad_acc_steps=16)
-            logger.info(f'Current is step {gas}/{step}, loss: {output["loss"]}')
-        model.step(adapter_name='default')
-        model.zero_grad(adapter_name='default')
-        model.lr_step(adapter_name='default')
+        output = model.forward_backward(inputs=batch, adapter_name='default', grad_acc_steps=16)
+        logger.info(f'Current is step {gas}/{step}, loss: {output["loss"]}')
+        if step % 16 == 0 and step > 0:
+            model.step(adapter_name='default')
+            model.zero_grad(adapter_name='default')
+            model.lr_step(adapter_name='default')
         if step % 50 == 0:
             model.save('./output', adapter_name='default')
 

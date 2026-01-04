@@ -111,7 +111,7 @@ def get_device_placement(device_group = None) -> str:
                     lines.append(f"│    Dimensions: {dim_info:<59} │")
 
                 world_sizes = []
-                for dim_name in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp']:
+                for dim_name in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
                     ws = mesh._get_world_size_for_dim(dim_name)
                     if ws > 1:
                         world_sizes.append(f"{dim_name.upper()}={ws}")
@@ -307,8 +307,8 @@ def remote_class():
                         # DeviceMesh not passed, create DDP by default
                         device_mesh = DeviceMesh(
                             device_type=Platform.get_platform().device_prefix(),
-                            mesh=np.array([Platform.get_world_size()]),
-                            mesh_dim_names=('data',)
+                            mesh=np.arange(Platform.get_world_size()),
+                            mesh_dim_names=('dp',)
                         )
                         kwargs[device_mesh_name] = device_mesh
                     assert len(_device_group) == 1
@@ -339,8 +339,8 @@ def remote_class():
                     # DeviceMesh not passed, create DDP by default
                     device_mesh = DeviceMesh(
                         device_type=Platform.get_platform().device_prefix(),
-                        mesh=np.array([Platform.get_world_size()]),
-                        mesh_dim_names=('data',)
+                        mesh=np.arange(Platform.get_world_size()),
+                        mesh_dim_names=('dp',)
                     )
                     kwargs[device_mesh_name] = device_mesh
 

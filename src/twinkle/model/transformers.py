@@ -329,18 +329,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def save(self, output_dir, **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
+        model = self.strategy.unwrap_model(self.model)
         if not adapter_name:
-            self.model.save_pretrained(output_dir)
+            model.save_pretrained(output_dir)
         else:
             state_dict = self.get_state_dict(adapter_name)
-            self.model.save_pretrained(output_dir, state_dict=state_dict)
+            model.save_pretrained(output_dir, state_dict=state_dict)
         self._save_tokenizer(output_dir, adapter_name=adapter_name)
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
         template_ins = self.optimizer_group[adapter_name].template
-        template_ins.tokenizer.save_pretrained(output_dir)
+        if template_ins is not None:
+            template_ins.tokenizer.save_pretrained(output_dir)
 
     @remote_function(execute='first')
     def get_state_dict(self, adapter_name: str = ''):
