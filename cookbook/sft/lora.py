@@ -1,6 +1,6 @@
 from torch.optim.lr_scheduler import LinearLR
 
-from twinkle import get_device_placement
+from twinkle import get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import CrossEntropyLoss
@@ -9,6 +9,8 @@ from peft import LoraConfig
 from torch.optim import AdamW
 
 from twinkle.processor import InputProcessor
+
+logger = get_logger()
 
 
 def train():
@@ -29,15 +31,16 @@ def train():
     model.set_loss(CrossEntropyLoss, adapter_name='default')
     model.set_optimizer(AdamW, lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(LinearLR, adapter_name='default')
-    print(get_device_placement())
+    logger.info(get_device_placement())
     for step, batch in enumerate(dataloader):
         for gas in range(16):
-            model.forward_backward(inputs=batch, adapter_name='default', grad_acc_steps=16)
-        model.step()
-        model.zero_grad()
-        model.lr_step()
+            output = model.forward_backward(inputs=batch, adapter_name='default', grad_acc_steps=16)
+            logger.info(f'Current is step {gas}/{step}, loss: {output["loss"]}')
+        model.step(adapter_name='default')
+        model.zero_grad(adapter_name='default')
+        model.lr_step(adapter_name='default')
         if step % 50 == 0:
-            model.save('./output')
+            model.save('./output', adapter_name='default')
 
 
 if __name__ == '__main__':

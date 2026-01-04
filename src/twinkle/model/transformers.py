@@ -135,7 +135,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         inputs['labels'] = labels
         self.optimizer_group[adapter_name].inputs = inputs
         self.optimizer_group[adapter_name].outputs = outputs
-        return outputs
+        return outputs.__dict__
 
     @remote_function()
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -205,9 +205,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], grad_acc_steps: int = 1, **kwargs):
-        self.forward(inputs=inputs, **kwargs)
-        self.calculate_loss(**kwargs)
+        output = self.forward(inputs=inputs, **kwargs)
+        loss = self.calculate_loss(**kwargs)
+        output['loss'] = loss
         self.backward(grad_acc_steps=grad_acc_steps, **kwargs)
+        return output
 
     def clip_grad_norm(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
