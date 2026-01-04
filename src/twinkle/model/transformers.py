@@ -2,7 +2,7 @@ import contextlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Dict, Any, List, Literal
+from typing import Dict, Any, List, Literal, Callable
 from typing import overload, Type, Optional, Union
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from peft import PeftConfig, LoraConfig
@@ -415,8 +415,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self._check_adapter_valid(adapter_name)
         expr = ''
         optimizer_config = self.optimizer_group[adapter_name]
-        config = optimizer_config.adapter_config.__dict__
-        config = {key: value for key, value in config.items() if value is not None}
+        if optimizer_config.adapter_config is not None:
+            config = optimizer_config.adapter_config.__dict__
+        else:
+            config = {}
+        config = {key: str(value) for key, value in config.items() if value is not None}
         expr += (f'Adapter config:\n'
                  f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
                  f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'

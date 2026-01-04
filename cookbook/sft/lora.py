@@ -32,7 +32,7 @@ def train():
     model.set_optimizer(AdamW, lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(LinearLR, adapter_name='default')
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs())
+    logger.info(model.get_train_configs(adapter_name='default'))
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch, adapter_name='default')
         if step % 16 == 0:
