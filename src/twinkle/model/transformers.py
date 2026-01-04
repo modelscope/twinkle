@@ -213,7 +213,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def _reduce_adapter_grad(self, adapter_name: str):
         if adapter_name and self.device_mesh.fsdp_world_size > 1:
             import torch.distributed as dist
-            for p in self._get_trainable_parameters(adapter_name):
+            for p in self._get_trainable_parameters(adapter_name).values():
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=self.device_mesh.ddp_group)
 
@@ -240,7 +240,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             if scaler is not None:
                 scaler.unscale_(optimizer)
 
-            parameters = self._get_trainable_parameters(adapter_name=adapter_name)
+            parameters = self._get_trainable_parameters(adapter_name=adapter_name).values()
             return torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
 
     @remote_function()

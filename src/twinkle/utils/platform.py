@@ -55,7 +55,17 @@ class DeviceMesh:
     @property
     def ddp_group(self):
         if not hasattr(self, "_ddp_group"):
-            ddp_ranks = set(self.get_fsdp_group_ranks() + self.get_dp_group_ranks())
+            rank = dist.get_rank()
+            data_parallel_dims = {'dp', 'fsdp'}
+            coords = np.argwhere(self.mesh == rank)[0]
+            slices = []
+            for i, dim_name in enumerate(self.mesh_dim_names):
+                if dim_name in data_parallel_dims:
+                    slices.append(slice(None))
+                else:
+                    slices.append(coords[i])
+
+            ddp_ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
             self._ddp_group = dist.new_group(ranks=ddp_ranks)
         return self._ddp_group
 
