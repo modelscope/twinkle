@@ -63,7 +63,7 @@ def tokenize_with_assistant_labels(
         placeholder: str = PLACEHOLDER,
 ) -> Tuple[List[int], List[int]]:
     messages = [dict(message) for message in trajectory['messages']]
-    tools = [dict(tool) for tool in trajectory['tools']]
+    tools = [dict(tool) for tool in trajectory.get('tools', [])]
     placeholder_ids = tokenizer.encode(placeholder, add_special_tokens=False)
 
     messages_with_placeholder = deepcopy(messages)

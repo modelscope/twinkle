@@ -203,9 +203,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             scaler = self.optimizer_group[adapter_name].scaler
         loss_value = loss_value / _gas
         if scaler is not None:
-            scaler.scale(loss_value).backward(**kwargs)
+            scaler.scale(loss_value).backward()
         else:
-            loss_value.backward(**kwargs)
+            loss_value.backward()
         self.optimizer_group[adapter_name].cur_step += 1
         self._reduce_adapter_grad(adapter_name=adapter_name)
 

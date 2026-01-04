@@ -29,6 +29,7 @@ class RetrySampler(Sampler):
                         continue
                     yield idx
                     total += 1
+                    break
                 except Exception: # noqa
                     continue
             else:

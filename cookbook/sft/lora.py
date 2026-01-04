@@ -14,7 +14,7 @@ logger = get_logger()
 
 
 def train():
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://modelscope/competition_math'))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://modelscope/competition_math', data_slice=range(0, 19)))
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True)
@@ -25,7 +25,7 @@ def train():
         target_modules='all-linear'
     )
 
-    model.add_adapter_to_model('default', lora_config)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
     model.set_template('Qwen3Template', adapter_name='default')
     model.set_processor(InputProcessor, adapter_name='default')
     model.set_loss(CrossEntropyLoss, adapter_name='default')
@@ -34,11 +34,11 @@ def train():
     logger.info(get_device_placement())
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch, adapter_name='default')
-        logger.info(f'Current is step {gas}/{step}, loss: {output["loss"]}')
-        if step % 16 == 0 and step > 0:
-            model.step(adapter_name='default')
-            model.zero_grad(adapter_name='default')
-            model.lr_step(adapter_name='default')
+        if step % 16 == 0:
+            logger.info(f'Current is step {step // 16}, loss: {output["loss"]}')
+        model.step(adapter_name='default')
+        model.zero_grad(adapter_name='default')
+        model.lr_step(adapter_name='default')
         if step % 50 == 0:
             model.save('./output', adapter_name='default')
 
