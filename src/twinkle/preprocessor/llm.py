@@ -11,4 +11,4 @@ class CompetitionMathProcessor(Preprocessor):
             Message(role='user', content=problem),
             Message(role='assistant', content=solution),
         ]
-        return Trajectory(messages=messages)
+        return Trajectory(messages=messages).to_dict()
