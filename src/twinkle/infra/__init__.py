@@ -305,11 +305,11 @@ def remote_class():
     def decorator(cls):
         # Get device mesh parameter name
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
-        if _mode == 'local':
-            init_method = cls.__init__
+        init_method = cls.__init__
 
-            @functools.wraps(init_method)
-            def new_init(self, *args, **kwargs):
+        @functools.wraps(init_method)
+        def new_init(self, *args, **kwargs):
+            if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name:
@@ -320,16 +320,9 @@ def remote_class():
                     init_method(self, *args, **kwargs)
                 else:
                     init_method(self, *args, **kwargs)
-            cls.__init__ = new_init
-            return cls
-        elif _mode == 'ray':
-            from .ray import RayHelper
+            elif _mode == 'ray':
+                from .ray import RayHelper
 
-            cls.decorated = True
-            init_method = cls.__init__
-
-            @functools.wraps(init_method)
-            def new_init(self, *args, **kwargs):
                 # In case the same class created twice in the same device group
                 frame = inspect.currentframe().f_back
                 caller_file = frame.f_code.co_filename
@@ -386,10 +379,9 @@ def remote_class():
                             self.device_mesh = arg
                             break
                     if hasattr(cls, '__iter__'):
-
                         def __iter__(self):
                             _workers_and_args = _dispatch_args(_get_workers(self._actors, 'all'), 'all',
-                                                              'all', None, (), {})
+                                                               'all', None, (), {})
                             RayHelper.execute_all_sync('__iter__', _workers_and_args)
                             return self
 
@@ -397,11 +389,11 @@ def remote_class():
 
                 self.remote_group = remote_group
                 self._instance_id = instance_id
+            else:
+                raise ValueError(f'Unsupported mode: {_mode}')
 
-            cls.__init__ = new_init
-            return cls
-        else:
-            raise ValueError(f'Unsupported mode: {_mode}')
+        cls.__init__ = new_init
+        return cls
 
     return decorator
 
