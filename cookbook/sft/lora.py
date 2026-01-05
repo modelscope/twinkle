@@ -1,7 +1,7 @@
 from torch.optim.lr_scheduler import LinearLR
 import numpy as np
 import twinkle
-from twinkle import get_device_placement, get_logger, DeviceMesh
+from twinkle import get_device_placement, get_logger, DeviceMesh, DeviceGroup
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import CrossEntropyLoss
@@ -12,6 +12,15 @@ from torch.distributed.fsdp import ShardingStrategy
 from twinkle.processor import InputProcessor
 
 logger = get_logger()
+
+
+device_group = [
+    DeviceGroup(
+        name='train',
+        ranks=list(range(Platform.get_world_size())),
+        device_type=Platform.get_platform().device_prefix(),
+    )
+]
 
 
 device_mesh = DeviceMesh(
@@ -26,7 +35,7 @@ device_mesh = DeviceMesh(
 #    mesh_dim_names=('dp',)
 #)
 
-twinkle.initialize(global_device_mesh=device_mesh)
+twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
 
 
 def train():

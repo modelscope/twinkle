@@ -326,9 +326,9 @@ def remote_class():
 
                 # In case the same class created twice in the same device group
                 frame = inspect.currentframe().f_back
-                caller_file = frame.f_code.co_filename
+                caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
                 caller_line = frame.f_lineno
-                instance_id = f"{caller_file}:{caller_line}"
+                instance_id = f"{caller_file}_{caller_line}"
                 remote_group = kwargs.pop('remote_group', None)
                 check_unsafe(*args, **kwargs)
 
