@@ -66,7 +66,7 @@ def train():
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch)
         if step % 16 == 0:
-get_train_configs            logger.info(f'Current is step {step // 16}, loss: {output}')
+            logger.info(f'Current is step {step // 16}, loss: {output}')
         model.clip_grad_norm(1.0)
         model.step()
         model.zero_grad()
