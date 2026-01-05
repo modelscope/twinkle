@@ -159,15 +159,28 @@ class RayHelper:
     @staticmethod
     def do_get_and_collect_func(collect_func: Callable, method: Union[Literal['none', 'flatten'], Callable], futures):
 
-        def do_collect():
-            result = []
-            for future in futures:
-                if isinstance(future, ray.ObjectRef):
-                    result.append(ray.get(future))
-                else:
-                    result.append(future)
-            return collect_func(method, result)
+        class LazyCollect:
+            def __init__(self, futures, method, collect_func):
+                self._futures = futures
+                self._method = method
+                self._collect_func = collect_func
 
+            def __call__(self):
+                result = []
+                for future in self._futures:
+                    if isinstance(future, ray.ObjectRef):
+                        result.append(ray.get(future))
+                    else:
+                        result.append(future)
+                return self._collect_func(self._method, result)
+
+            def __getattr__(self, name):
+                raise RuntimeError(f'This is a lazy function, use value().attr instead.')
+
+            def __getitem__(self, key):
+                raise RuntimeError(f'This is a lazy function, use value()[index] instead.')
+
+        do_collect = LazyCollect(futures, method, collect_func)
         do_collect._is_lazy_collect = True
         return do_collect
 
