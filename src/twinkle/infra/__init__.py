@@ -330,6 +330,9 @@ def remote_class():
                 caller_line = frame.f_lineno
                 instance_id = f"{caller_file}_{caller_line}"
                 remote_group = kwargs.pop('remote_group', None)
+                if len(_device_group) == 1:
+                    # To the default group
+                    remote_group = _device_group[0].name
                 check_unsafe(*args, **kwargs)
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
