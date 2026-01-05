@@ -10,6 +10,7 @@ import transformers
 from peft import PeftConfig
 from peft import get_peft_model, PeftModel
 from torch import GradScaler
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -326,8 +327,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function(execute='first')
     def save(self, output_dir, **kwargs):
+        adapter_name = kwargs.get('adapter_name', _default_adapter_name)
         model = self.strategy.unwrap_model(self.model)
-        model.save_pretrained(output_dir)
+        state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
+        processed_state_dict = {}
+
+        for key, value in state_dict.items():
+            if isinstance(value, DTensor):
+                processed_state_dict[key] = value.full_tensor().cpu()
+            else:
+                processed_state_dict[key] = value.cpu()
+
+        model.save_pretrained(output_dir, state_dict=processed_state_dict)
         self._save_tokenizer(output_dir)
 
     def _save_tokenizer(self, output_dir, **kwargs):

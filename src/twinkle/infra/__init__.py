@@ -33,6 +33,12 @@ _device_group: Optional[List[DeviceGroup]] = [
     )
 ]
 
+_device_mesh = DeviceMesh(
+                            device_type=Platform.get_platform().device_prefix(),
+                            mesh=np.arange(Platform.get_world_size()),
+                            mesh_dim_names=('dp',)
+                        )
+
 _remote_components: dict = {}
 
 
@@ -41,6 +47,7 @@ def initialize(mode: Literal['local', 'ray'],
                seed: int = 42,
                full_determinism: bool = False,
                groups: Optional[List[DeviceGroup]] = None,
+               global_device_mesh: Optional[DeviceMesh] = None,
                lazy_collect: bool = True):
     """Initialize the twinkle infrastructure.
 
@@ -52,13 +59,16 @@ def initialize(mode: Literal['local', 'ray'],
         seed: Seed everything with this.
         full_determinism: Freeze the random, use determinism kernels, default `False`.
         groups: The device groups of the training.
+        global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
     """
-    global _mode, _device_group, _nproc_per_node, _seed, _full_determinism, _lazy_collect
+    global _mode, _device_group, _nproc_per_node, _seed, _full_determinism, _lazy_collect, _device_mesh
     assert mode in ('local', 'ray')
     _mode = mode
     _full_determinism = full_determinism
     _lazy_collect = lazy_collect
+    if global_device_mesh is not None:
+        _device_mesh = global_device_mesh
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
@@ -304,13 +314,7 @@ def remote_class():
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name:
                     if device_mesh is None:
-                        # DeviceMesh not passed, create DDP by default
-                        device_mesh = DeviceMesh(
-                            device_type=Platform.get_platform().device_prefix(),
-                            mesh=np.arange(Platform.get_world_size()),
-                            mesh_dim_names=('dp',)
-                        )
-                        kwargs[device_mesh_name] = device_mesh
+                        kwargs[device_mesh_name] = _device_mesh
                     assert len(_device_group) == 1
                     _device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
                     init_method(self, *args, **kwargs)
@@ -336,13 +340,7 @@ def remote_class():
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh is None and device_mesh_name:
-                    # DeviceMesh not passed, create DDP by default
-                    device_mesh = DeviceMesh(
-                        device_type=Platform.get_platform().device_prefix(),
-                        mesh=np.arange(Platform.get_world_size()),
-                        mesh_dim_names=('dp',)
-                    )
-                    kwargs[device_mesh_name] = device_mesh
+                    kwargs[device_mesh_name] = _device_mesh
 
                 if remote_group and device_mesh_name:
                     device_group = [dg for dg in _device_group if dg.name == remote_group][0]

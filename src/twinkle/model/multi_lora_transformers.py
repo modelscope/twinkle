@@ -125,18 +125,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_lr_scheduler(scheduler_cls, **kwargs)
 
-    @remote_function(execute='first')
-    def save(self, output_dir, **kwargs):
-        adapter_name = kwargs.pop("adapter_name", None) or _default_adapter_name
-        self._check_adapter_valid(adapter_name)
-        model = self.strategy.unwrap_model(self.model)
-        if not adapter_name:
-            model.save_pretrained(output_dir)
-        else:
-            state_dict = self.get_state_dict(adapter_name)
-            model.save_pretrained(output_dir, state_dict=state_dict)
-        self._save_tokenizer(output_dir, adapter_name=adapter_name)
-
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         super()._patch_adapter(adapter_name, config_or_dir, adapter_name, **kwargs)
