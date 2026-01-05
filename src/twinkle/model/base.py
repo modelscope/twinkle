@@ -48,7 +48,7 @@ class TwinkleModel:
     def get_state_dict(self, **kwargs):
         ...
 
-    def add_adapter_to_model(self, adapter_name: str, config, **kwargs):
+    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs):
         ...
 
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
@@ -57,5 +57,5 @@ class TwinkleModel:
     def set_processor(self, processor_cls: Union[Type[processor.InputProcessor], str], **kwargs):
         ...
 
-    def get_train_configs(self, adapter_name: str = ''):
+    def get_train_configs(self, **kwargs):
         ...

@@ -1,7 +1,6 @@
 import os
 import threading
 from typing import Dict, Any, Union, Type, List, Optional
-
 from fastapi import FastAPI, Request
 from peft import LoraConfig
 from ray import serve
@@ -41,6 +40,7 @@ def build_model_app(model_id: str,
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)
             self.hb_thread.start()
+            self.adapter_lock = threading.Lock()
             self.config_registry: ConfigRegistry = init_config_registry()
             self.per_token_model_limit = os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 3)
             self.key_token_dict = {}
@@ -174,11 +174,12 @@ def build_model_app(model_id: str,
         def add_adapter_to_model(self, request, *, adapter_name: str, config: Dict[str, Any], **kwargs):
             assert adapter_name, 'You need to specify a valid `adapter_name`'
             adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
-            self.handle_adapter_count(request.state.token, True)
             config = LoraConfig(**config)
-            self.model.add_adapter_to_model(adapter_name, config, **kwargs)
+            with self.adapter_lock:
+                self.model.add_adapter_to_model(adapter_name, config, **kwargs)
             self.adapter_records[adapter_name] = 0
             self.key_token_dict[adapter_name] = request.state.token
+            self.handle_adapter_count(request.state.token, True)
 
         @app.post("/set_template")
         def set_template(self, request, *, template_cls: str, adapter_name: str, **kwargs):
