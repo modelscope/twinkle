@@ -235,6 +235,10 @@ def generate_processors():
             param_names = parse_params_from_signature(signature)
             kwargs_dict = '{' + ', '.join(f"'{p}': {p}" for p in param_names) + '}' if param_names else '{}'
             sig_part = f', {signature}' if signature else ''
+            if 'kwargs' in sig_part:
+                extra_args = '\n                **kwargs'
+            else:
+                extra_args = ''
             ret = 'self' if name == '__iter__' else 'response.json()'
 
             code = f'''    
@@ -244,7 +248,7 @@ def generate_processors():
             json_data={{
                 'processor_id': self.processor_id,
                 'function': '{name}',
-                **{kwargs_dict}
+                **{kwargs_dict},{extra_args}
             }}
         )
         response.raise_for_status()

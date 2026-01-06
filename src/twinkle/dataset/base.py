@@ -1,6 +1,6 @@
-import os
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Callable, Type, Union
 
 from datasets import interleave_datasets, concatenate_datasets
@@ -8,10 +8,10 @@ from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
 from twinkle import template, Plugin, preprocessor
-from twinkle.template import Template
-from twinkle.hub import MSHub, HFHub, HubOperation
+from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import Preprocessor, DataFilter
+from twinkle.template import Template
 
 
 @dataclass
@@ -46,12 +46,12 @@ class Dataset(TorchDataset):
         self.template = None
 
     @remote_function(execute='first')
-    def set_template(self, template_cls: Union[Type[Template], str], **template_params):
+    def set_template(self, template_cls: Union[Type[Template], str], **kwargs):
         """Set the template to encode/check the dataset.
 
         Args:
             template_cls: The template class, or the template plugin, or the template class name to load.
-            **template_params: The template init params.
+            **kwargs: The template init params.
         """
 
         if isinstance(template_cls, str):
@@ -59,7 +59,7 @@ class Dataset(TorchDataset):
                 template_cls = getattr(template, template_cls)
             else:
                 template_cls = Plugin.load_plugin(template_cls, Template)
-        self.template = template_cls(**template_params)
+        self.template = template_cls(**kwargs)
 
     @remote_function(execute='first')
     def encode(self, **kwargs):
