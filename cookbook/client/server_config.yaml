@@ -33,9 +33,9 @@ applications:
       device_group:
         name: model
         ranks: [ 0,1,2,3 ]
-        device_type: cuda
+        device_type: CPU
       device_mesh:
-        device_type: cuda
+        device_type: CPU
         mesh: [0,1,2,3]
         mesh_dim_names: ['dp']
     deployments:

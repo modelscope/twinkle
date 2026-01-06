@@ -18,8 +18,11 @@ class ResourceManager:
         last_rank = -1
         cpu_proc_count = 0
         device_types = set([group.device_type.upper() for group in groups]) - {'CPU'}
-        assert len(device_types) == 1
+        assert len(device_types) <= 1
+        if not device_type:
+            device_type = 'CPU'
         device_type = next(iter(device_types))
+        if 
         device_type = Platform.get_platform(device_type).__name__
 
         for group in groups:

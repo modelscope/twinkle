@@ -352,7 +352,7 @@ def remote_class():
                 caller_line = frame.f_lineno
                 instance_id = f"{caller_file}_{caller_line}"
                 remote_group = kwargs.pop('remote_group', None)
-                if len(_device_group) == 1:
+                if not remote_group and len(_device_group) == 1 and not RayHelper.is_worker():
                     # To the default group
                     remote_group = _device_group[0].name
                 check_unsafe(*args, **kwargs)
@@ -375,11 +375,11 @@ def remote_class():
                     return next(_self._iter)
 
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
+                    # remote_group is None when it's worker and remote_group not passed through arguments
+                    # Seed when a remote class is created.
+                    framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
+                                                    bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
                     init_method(self, *args, **kwargs)
-                    if remote_group and os.environ.get('CLUSTER_NAME') == remote_group:
-                        # Seed when a remote class is created.
-                        framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
-                                                       bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
                 else:
                     if hasattr(cls, '__iter__'):
                         _dispatch = self.__iter__._dispatch

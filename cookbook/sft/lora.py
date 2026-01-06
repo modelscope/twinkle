@@ -16,7 +16,7 @@ logger = get_logger()
 
 device_group = [
     DeviceGroup(
-        name='default',
+        name='model',
         ranks=[0,1,2,3],
         device_type=Platform.get_platform().device_prefix(),
     )

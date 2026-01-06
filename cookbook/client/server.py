@@ -6,6 +6,9 @@ from ray import serve
 from twinkle.server import build_processor_app, build_sampler_app, build_model_app
 
 ray.init()
+serve.shutdown()
+import time
+time.sleep(5)
 
 file_dir = os.path.abspath(os.path.dirname(__file__))
 config = OmegaConf.load(os.path.join(file_dir, 'server_config.yaml'))
