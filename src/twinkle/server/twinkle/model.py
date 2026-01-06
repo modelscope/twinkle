@@ -148,7 +148,7 @@ def build_model_app(model_id: str,
             return self.model.lr_step(adapter_name=adapter_name, **kwargs)
 
         @app.post("/set_loss")
-        def set_loss(self, request, *, loss_cls: Union[Type[Loss], str], adapter_name: str, **kwargs):
+        def set_loss(self, request, *, loss_cls: str, adapter_name: str, **kwargs):
             self.assert_adapter_exists(adapter_name=adapter_name)
             adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             return self.model.set_loss(loss_cls, adapter_name=adapter_name, **kwargs)

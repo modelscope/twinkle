@@ -34,16 +34,8 @@ def http_get(
         if hasattr(value, 'processor_id'):
             _params[key] = value.processor_id
         elif hasattr(value, '__dict__'):
-            primitive_types = (str, Number, bool, bytes, type(None))
-            container_types = (Mapping, list, tuple, set, frozenset)
-            basic_types = (*primitive_types, *container_types)
-
-            filtered_dict = {
-                _subkey: _subvalue
-                for _subkey, _subvalue in value.__dict__.items()
-                if isinstance(_subvalue, basic_types)
-            }
-            _params[key] = filtered_dict
+            from twinkle.server.twinkle.serialize import serialize_object
+            _params[key] = serialize_object(value)
         else:
             _params[key] = value
     response = requests.get(
@@ -88,16 +80,8 @@ def http_post(
         if hasattr(value, 'processor_id'):
             _params[key] = value.processor_id
         elif hasattr(value, '__dict__'):
-            primitive_types = (str, Number, bool, bytes, type(None))
-            container_types = (Mapping, list, tuple, set, frozenset)
-            basic_types = (*primitive_types, *container_types)
-
-            filtered_dict = {
-                _subkey: _subvalue
-                for _subkey, _subvalue in value.__dict__.items()
-                if isinstance(_subvalue, basic_types)
-            }
-            _params[key] = filtered_dict
+            from twinkle.server.twinkle.serialize import serialize_object
+            _params[key] = serialize_object(value)
         else:
             _params[key] = value
     response = requests.post(
