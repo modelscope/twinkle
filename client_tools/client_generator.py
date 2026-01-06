@@ -29,7 +29,7 @@ def generate_processors():
     # Get the project root directory
     project_root = Path(__file__).parent.parent
     src_twinkle_path = project_root / 'src' / 'twinkle'
-    src_client_path = project_root / 'src' / 'client'
+    src_client_path = project_root / 'src' / 'twinkle_client'
     
     def get_method_signature(func_node: ast.FunctionDef) -> str:
         """Extract method signature from AST node."""
@@ -112,6 +112,7 @@ def generate_processors():
             'DataFilter': ['from twinkle.preprocessor import DataFilter'],
             'Preprocessor': ['from twinkle.preprocessor import Preprocessor'],
             'DatasetMeta': ['from twinkle.dataset import DatasetMeta'],
+            'Dataset': ['from twinkle.dataset import Dataset'],
             'DeviceMesh': ['from twinkle import DeviceMesh'],
             'Template': ['from twinkle.template import Template'],
             'template.Template': ['from twinkle.template import Template', 'from twinkle import template'],
@@ -195,19 +196,30 @@ def generate_processors():
                    and is_public_or_dunder(item.name)
             ]
 
+            # Extract __init__ signature separately (it may not have @remote_function)
+            init_signature = ''
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                    init_signature = get_method_signature(item)
+                    break
+
             if methods:
-                classes_found.append((node.name, get_base_name(node), methods))
+                classes_found.append((node.name, get_base_name(node), methods, init_signature))
 
         return classes_found
 
     def generate_client_class(class_name: str, base_class_name: str,
                               methods: List[Tuple[str, str]], module_name: str,
                               processor_type: str, source_filename: str,
-                              has_base_file: bool) -> str:
+                              has_base_file: bool, init_signature: str = '') -> str:
         """Generate client wrapper class code."""
 
         def build_imports() -> Tuple[List[str], str]:
+            # Include both method signatures and __init__ signature for import detection
             signatures = [sig for _, sig in methods]
+            if init_signature:
+                signatures.append(init_signature)
+            
             typing_imports = extract_typing_imports(signatures)
             twinkle_imports = extract_twinkle_imports(signatures)
 
@@ -215,8 +227,8 @@ def generate_processors():
             if typing_imports:
                 lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
             lines.extend([
-                "from client.http import TWINKLE_SERVER_URL",
-                "from client.http import http_post, heartbeat_manager",
+                "from twinkle_client.http import TWINKLE_SERVER_URL",
+                "from twinkle_client.http import http_post, heartbeat_manager",
             ])
             lines.extend(sorted(twinkle_imports))
 
@@ -271,11 +283,26 @@ def generate_processors():
 
         import_lines, inheritance = build_imports()
 
+        # Build __init__ method with actual signature
+        if init_signature:
+            # Extract parameter names from signature
+            param_names = parse_params_from_signature(init_signature)
+            init_params = f"self, {init_signature}" if init_signature else "self"
+            if param_names:
+                kwargs_items = ', '.join([f"'{p}': {p}" for p in param_names])
+                kwargs_dict = f"{{{kwargs_items}}}"
+            else:
+                kwargs_dict = "{}"
+        else:
+            # Fallback to **kwargs if no __init__ found
+            init_params = "self, **kwargs"
+            kwargs_dict = "kwargs"
+
         class_template = f'''{chr(10).join(import_lines)}
 class {class_name}({inheritance}):
     """Client wrapper for {class_name} that calls server HTTP endpoints."""
 
-    def __init__(self, **kwargs):
+    def __init__({init_params}):
         assert TWINKLE_SERVER_URL
         self.server_url = TWINKLE_SERVER_URL
 
@@ -284,7 +311,7 @@ class {class_name}({inheritance}):
             json_data={{
                 'processor_type': '{processor_type}',
                 'class_type': '{class_name}',
-                **kwargs
+                **{kwargs_dict}
             }}
         )
         response.raise_for_status()
@@ -341,8 +368,8 @@ class {class_name}({inheritance}):
 
                 code = '\n\n'.join(
                     generate_client_class(class_name, base_class_name, methods,
-                                          module_name, processor_type, source_filename, has_base_file)
-                    for class_name, base_class_name, methods in classes
+                                          module_name, processor_type, source_filename, has_base_file, init_signature)
+                    for class_name, base_class_name, methods, init_signature in classes
                 )
                 client_file.write_text(code, encoding='utf-8')
 
@@ -357,7 +384,7 @@ class {class_name}({inheritance}):
             init_lines = [
                 f"from .{source_filename} import {class_name}"
                 for source_filename, classes in sorted(source_files.items())
-                for class_name, _, _ in classes
+                for class_name, _, _, _ in classes
             ]
             init_file.write_text('\n'.join(sorted(init_lines)) + '\n', encoding='utf-8')
 
@@ -373,7 +400,7 @@ def generate_models():
     from pathlib import Path
 
     project_root = Path(__file__).parent.parent
-    src_client_path = project_root / 'src' / 'client'
+    src_client_path = project_root / 'src' / 'twinkle_client'
     client_module_path = src_client_path / 'model'
     client_module_path.mkdir(parents=True, exist_ok=True)
 
@@ -583,7 +610,7 @@ def generate_samplers():
     from pathlib import Path
 
     project_root = Path(__file__).parent.parent
-    src_client_path = project_root / 'src' / 'client'
+    src_client_path = project_root / 'src' / 'twinkle_client'
     client_module_path = src_client_path / 'sampler'
     client_module_path.mkdir(parents=True, exist_ok=True)
 
