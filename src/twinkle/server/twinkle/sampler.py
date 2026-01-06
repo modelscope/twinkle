@@ -8,7 +8,7 @@ from peft import LoraConfig
 from ray import serve
 
 import twinkle
-from adapter.twinkle.validation import verify_request_token, ConfigRegistry, init_config_registry
+from twinkle.server.twinkle.validation import verify_request_token, ConfigRegistry, init_config_registry
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import Trajectory
 from twinkle.sampler import VLLMSampler, Sampler

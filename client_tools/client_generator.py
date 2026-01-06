@@ -379,8 +379,8 @@ def generate_models():
 
     model_code = '''from typing import Any, Optional, Union, Type, Dict, Literal, List
 import uuid
-from client.http import TWINKLE_SERVER_URL
-from client.http import http_post, heartbeat_manager
+from twinkle_client.http import TWINKLE_SERVER_URL
+from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.model.base import TwinkleModel
 from transformers import PreTrainedModel, PretrainedConfig
 from twinkle import DeviceMesh

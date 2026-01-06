@@ -1,6 +1,7 @@
-from client import Dataset, DatasetMeta
-from client import DataLoader
-from client import TransformersModel
+from twinkle.dataset import DatasetMeta
+from twinkle_client.dataset import Dataset
+from twinkle_client.dataloader import DataLoader
+from twinkle_client.model import MultiLoraTransformersModel
 from peft import LoraConfig
 
 
@@ -10,7 +11,7 @@ def train():
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset)
-    model = TransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']
