@@ -13,7 +13,8 @@ from twinkle import DeviceGroup, DeviceMesh
 
 
 def build_processor_app(device_group: Dict[str, Any],
-                      device_mesh: Dict[str, Any]):
+                        device_mesh: Dict[str, Any],
+                        deploy_options: Dict[str, Any]):
     app = FastAPI()
     device_group = DeviceGroup(**device_group)
     twinkle.initialize(mode='ray',
@@ -109,4 +110,4 @@ def build_processor_app(device_group: Dict[str, Any],
                     _kwargs[key] = value
             return function(**_kwargs)
 
-    return ProcessorManagement.bind()
+    return ProcessorManagement.options(**deploy_options).bind()

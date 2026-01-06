@@ -17,6 +17,7 @@ from twinkle.sampler import VLLMSampler, Sampler
 def build_sampler_app(model_id: str,
                       device_group: Dict[str, Any],
                       device_mesh: Dict[str, Any],
+                      deploy_options: Dict[str, Any],
                       **kwargs):
     app = FastAPI()
     device_group = DeviceGroup(**device_group)
@@ -114,4 +115,4 @@ def build_sampler_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             self.adapter_records[adapter_name] = 0
 
-    return SamplerManagement.bind()
+    return SamplerManagement.options(**deploy_options).bind()

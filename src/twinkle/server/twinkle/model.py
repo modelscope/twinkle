@@ -1,13 +1,13 @@
 import os
 import threading
-from typing import Dict, Any, Union, Type, List, Optional
+from typing import Dict, Any, Union, Type, Optional
+
 from fastapi import FastAPI, Request
 from peft import LoraConfig
 from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.data_format import InputFeature, Trajectory
 from twinkle.loss import Loss
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.model.base import TwinkleModel
@@ -17,6 +17,7 @@ from .validation import verify_request_token, init_config_registry, ConfigRegist
 def build_model_app(model_id: str,
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
+                    deploy_options: Dict[str, Any],
                     **kwargs):
     app = FastAPI()
     device_group = DeviceGroup(**device_group)
@@ -199,4 +200,4 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=adapter_name)
             self.adapter_records[adapter_name] = 0
 
-    return ModelManagement.bind()
+    return ModelManagement.options(**deploy_options).bind()
