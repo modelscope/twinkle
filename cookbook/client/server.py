@@ -7,12 +7,12 @@ from twinkle.server import build_processor_app, build_sampler_app, build_model_a
 
 ray.init()
 
-file_dir = os.path.dirname(__file__)
+file_dir = os.path.abspath(os.path.dirname(__file__))
 config = OmegaConf.load(os.path.join(file_dir, 'server_config.yaml'))
 
 APP_BUILDERS = {
     'main:build_model_app': build_model_app,
-    'main:build_sampler_app': build_sampler_app,
+    # 'main:build_sampler_app': build_sampler_app,
     'main:build_processor_app': build_processor_app,
 }
 
