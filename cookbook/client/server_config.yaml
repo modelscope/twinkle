@@ -4,19 +4,19 @@ http_options:
   port: 8000
 
 applications:
-  - name: models-qwen3-7B
-    route_prefix: /models/Qwen/Qwen3-7B
-    import_path: main:model_qwen3_7b
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+    import_path: main:model_qwen25_7B
     args:
-      model_id: "Qwen/Qwen3-7B"
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"
       device_group:
         name: model
         ranks: [ 0,1,2,3 ]
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [[0,1], [2,3]]
-        mesh_dim_names: ['dp', 'fsdp']
+        mesh: [0,1,2,3]
+        mesh_dim_names: ['dp']
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -36,8 +36,8 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [[0,1], [2,3]]
-        mesh_dim_names: ['dp', 'fsdp']
+        mesh: [0,1,2,3]
+        mesh_dim_names: ['dp']
     deployments:
       - name: ProcessorManagement
         autoscaling_config:

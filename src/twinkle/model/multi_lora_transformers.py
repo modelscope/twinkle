@@ -30,7 +30,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  fsdp_config: Dict[str, Any] = None,
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
-        assert device_mesh.fsdp_world_size == 1 and not fsdp_config, 'MultiLora does not support FSDP!'
+        assert device_mesh.fsdp_world_size == 1, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         super().__init__(model_cls, pretrained_model_name_or_path, config, device_mesh, mixed_precision,
                          ddp_config, fsdp_config, grad_scaler_config, **kwargs)
         self.add_adapter_to_model('__dummy_adapter__', LoraConfig(r=1, target_modules='all-linear'))

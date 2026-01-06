@@ -9,7 +9,7 @@ from ray import serve
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.loss import Loss
-from twinkle.model import MultiLoraTransformersModel
+from twinkle.model import TransformersModel
 from twinkle.model.base import TwinkleModel
 from .validation import verify_request_token, init_config_registry, ConfigRegistry
 
@@ -36,7 +36,7 @@ def build_model_app(model_id: str,
         COUNT_DOWN = 60 * 30
 
         def __init__(self):
-            self.model = MultiLoraTransformersModel(model_id=model_id, device_mesh=device_mesh,
+            self.model = TransformersModel(pretrained_model_name_or_path=model_id, device_mesh=device_mesh,
                                            remote_group=device_group.name, **kwargs)
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)

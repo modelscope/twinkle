@@ -1,6 +1,4 @@
 import os
-# os.environ["RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING"] = "1"
-
 import ray
 from omegaconf import OmegaConf
 from ray import serve
@@ -12,7 +10,7 @@ file_dir = os.path.abspath(os.path.dirname(__file__))
 config = OmegaConf.load(os.path.join(file_dir, 'server_config.yaml'))
 
 APP_BUILDERS = {
-    'main:model_qwen3_7b': build_model_app,
+    'main:model_qwen25_7B': build_model_app,
     # 'main:build_sampler_app': build_sampler_app,
     'main:processor_app': build_processor_app,
 }
@@ -23,22 +21,19 @@ for app_config in config.applications:
     builder = APP_BUILDERS[app_config.import_path]
     args = OmegaConf.to_container(app_config.args, resolve=True)
 
+    deploy_options = {}
+    deploy_config = app_config.deployments[0]
+    if 'autoscaling_config' in deploy_config:
+        deploy_options['autoscaling_config'] = OmegaConf.to_container(deploy_config.autoscaling_config)
+    if 'ray_actor_options' in deploy_config:
+        deploy_options['ray_actor_options'] = OmegaConf.to_container(deploy_config.ray_actor_options)
+
     app = builder(
         device_group=args['device_group'],
         device_mesh=args['device_mesh'],
+        deploy_options=deploy_options,
         **{k: v for k, v in args.items() if k not in ('device_group', 'device_mesh')}
     )
-
-    # 应用 deployment 配置
-    for deploy_config in app_config.deployments:
-        deploy_options = {}
-        if 'autoscaling_config' in deploy_config:
-            deploy_options['autoscaling_config'] = OmegaConf.to_container(deploy_config.autoscaling_config)
-        if 'ray_actor_options' in deploy_config:
-            deploy_options['ray_actor_options'] = OmegaConf.to_container(deploy_config.ray_actor_options)
-
-        if deploy_options:
-            app = app.options(**deploy_options)
 
     serve.run(app, name=app_config.name, route_prefix=app_config.route_prefix)
 
