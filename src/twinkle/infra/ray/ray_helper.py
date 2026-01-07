@@ -213,6 +213,8 @@ class RayHelper:
         placement_groups = RayHelper.resource_manager.get_group(group)
         worker_cls = RayHelper._get_remote_component(worker_cls)
         ranks = device_config.ranks
+        if isinstance(ranks, int):
+            ranks = list(range(ranks))
         world_size = len(ranks)
         assert len(placement_groups) == len(ranks)
         if execute == 'peer':
@@ -276,6 +278,10 @@ class RayHelper:
         else:
             world_size = len(ranks)
             workers = []
+            if device_config.device_type != 'CPU':
+                _visible_device_env = {Platform.get_platform(device_config.device_type.upper()).visible_device_env(): ''}
+            else:
+                _visible_device_env = {}
             for deploy_pg, index in zip(placement_groups, list(range(world_size))):
                 deploy_pg: Dict
                 cluster_name = group
@@ -284,10 +290,10 @@ class RayHelper:
                 env_vars.update({
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
-                    Platform.get_platform(device_config.device_type.upper()): '',
                     'TWINKLE_MODE': 'ray',
                     'TWINKLE_SEED': str(seed),
                     'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
+                    **_visible_device_env
                 })
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
