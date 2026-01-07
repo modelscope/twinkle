@@ -1,4 +1,5 @@
-from typing import Any, Tuple
+import functools
+from typing import Any, Tuple, Callable
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -26,6 +27,32 @@ def is_token_valid(token: str) -> bool:
     return True
 
 
+class ConfigRegistryProxy:
+
+    def __init__(self, actor_handle):
+        self._actor = actor_handle
+
+    def add_config(self, key: str, value: Any):
+        import ray
+        return ray.get(self._actor.add_config.remote(key, value))
+
+    def add_or_get(self, key: str, value: Any) -> Any:
+        import ray
+        return ray.get(self._actor.add_or_get.remote(key, value))
+
+    def get_config(self, key: str):
+        import ray
+        return ray.get(self._actor.get_config.remote(key))
+
+    def pop(self, key: str):
+        import ray
+        return ray.get(self._actor.pop.remote(key))
+
+    def clear(self):
+        import ray
+        return ray.get(self._actor.clear.remote())
+
+
 class ConfigRegistry:
 
     def __init__(self):
@@ -50,7 +77,7 @@ class ConfigRegistry:
         self.config.clear()
 
 
-def init_config_registry() -> ConfigRegistry:
+def init_config_registry() -> ConfigRegistryProxy:
     import ray
 
     _registry = None
@@ -67,4 +94,4 @@ def init_config_registry() -> ConfigRegistry:
         except ValueError:
             _registry = ray.get_actor('adapter_registry')
     assert _registry is not None
-    return _registry
+    return ConfigRegistryProxy(_registry)

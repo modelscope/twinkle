@@ -8,7 +8,7 @@ from peft import LoraConfig
 from ray import serve
 
 import twinkle
-from twinkle.server.twinkle.validation import verify_request_token, ConfigRegistry, init_config_registry
+from twinkle.server.twinkle.validation import verify_request_token, ConfigRegistryProxy, init_config_registry
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import Trajectory
 from twinkle.sampler import VLLMSampler, Sampler
@@ -45,7 +45,7 @@ def build_sampler_app(model_id: str,
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown)
             self.hb_thread.start()
-            self.config_registry: ConfigRegistry = init_config_registry()
+            self.config_registry: ConfigRegistryProxy = init_config_registry()
             self.per_token_sampler_limit = os.environ.get("TWINKLE_PER_USER_SAMPLER_LIMIT", 3)
             self.key_token_dict = {}
 

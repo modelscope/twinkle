@@ -12,7 +12,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.model import TransformersModel
 from twinkle.model.base import TwinkleModel
-from .validation import verify_request_token, init_config_registry, ConfigRegistry
+from .validation import verify_request_token, init_config_registry, ConfigRegistryProxy
 
 
 def build_model_app(model_id: str,
@@ -124,7 +124,7 @@ def build_model_app(model_id: str,
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()
             self.adapter_lock = threading.Lock()
-            self.config_registry: ConfigRegistry = init_config_registry()
+            self.config_registry: ConfigRegistryProxy = init_config_registry()
             self.per_token_model_limit = int(os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 3))
             self.key_token_dict = {}
 
@@ -143,18 +143,18 @@ def build_model_app(model_id: str,
 
         def handle_adapter_count(self, token: str, add: bool):
             user_key = token + '_' + 'model_adapter'
-            cur_count = self.config_registry.get_config.remote(user_key) or 0
+            cur_count = self.config_registry.get_config(user_key) or 0
             if add:
                 if cur_count < self.per_token_model_limit:
-                    self.config_registry.add_config.remote(user_key, cur_count + 1)
+                    self.config_registry.add_config(user_key, cur_count + 1)
                 else:
                     raise RuntimeError(f'Model adapter count limitation reached: {self.per_token_model_limit}')
             else:
                 if cur_count > 0:
                     cur_count -= 1
-                    self.config_registry.add_config.remote(user_key, cur_count)
+                    self.config_registry.add_config(user_key, cur_count)
                 if cur_count <= 0:
-                    self.config_registry.pop.remote(user_key)
+                    self.config_registry.pop(user_key)
 
         @app.post("/create")
         def create(self, request: Request, body: CreateRequest):
