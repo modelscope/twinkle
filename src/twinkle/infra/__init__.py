@@ -321,6 +321,17 @@ def _get_device_mesh_param(args, kwargs):
     return None
 
 
+def _prepare_lazy_collect(args, kwargs):
+    # if a worker received an actor handle, lazy collect should be false to prevent any outer function receives
+    # an object ref
+    if not RayHelper.is_worker():
+        return args, kwargs
+    from ray.actor import ActorHandle
+    for arg in list(args) + list(kwargs.values()):
+        if isinstance(arg, ActorHandle):
+            arg._lazy_collect = False
+    return args, kwargs
+
 def remote_class():
     """Patch each class used in remote clusters with this decorator."""
 
@@ -384,6 +395,8 @@ def remote_class():
                     if not device_mesh_name:
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
+                    from ray.actor import ActorHandle
+                    args, kwargs = _prepare_lazy_collect(args, kwargs)
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):
@@ -466,7 +479,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                                                        execute, device_mesh, args, kwargs)
                     result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
-                    result = result_func if _lazy_collect else result_func()
+                    lazy_collect = _lazy_collect
+                    if hasattr(self, '_lazy_collect'):
+                        lazy_collect = self._lazy_collect
+                    result = result_func if lazy_collect else result_func()
                     if func.__name__ == '__iter__':
                         return self
                     else:
