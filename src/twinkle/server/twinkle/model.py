@@ -12,6 +12,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.model.base import TwinkleModel
+from twinkle.data_format import InputFeature, Trajectory
 from .validation import verify_request_token, init_config_registry, ConfigRegistryProxy
 
 
@@ -178,84 +179,142 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.forward(inputs=body.inputs, adapter_name=adapter_name, **extra_kwargs)
+            inputs = body.inputs
+            if isinstance(inputs, list):
+                _input = inputs[0]
+                if 'input_ids' in _input:
+                    inputs = [InputFeature(**_input) for _input in inputs]
+                else:
+                    inputs = [Trajectory(**_input) for _input in inputs]
+            else:
+                assert isinstance(inputs, dict)
+                inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+            ret = self.model.forward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/forward_only")
         def forward_only(self, request: Request, body: ForwardOnlyRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.forward_only(inputs=body.inputs, adapter_name=adapter_name, **extra_kwargs)
+            inputs = body.inputs
+            if isinstance(inputs, list):
+                _input = inputs[0]
+                if 'input_ids' in _input:
+                    inputs = [InputFeature(**_input) for _input in inputs]
+                else:
+                    inputs = [Trajectory(**_input) for _input in inputs]
+            else:
+                assert isinstance(inputs, dict)
+                inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+            ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/calculate_loss")
         def calculate_loss(self, request: Request, body: AdapterRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.calculate_loss(adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.calculate_loss(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/backward")
         def backward(self, request: Request, body: AdapterRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.backward(adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.backward(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/forward_backward")
         def forward_backward(self, request: Request, body: ForwardRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.forward_backward(inputs=body.inputs, adapter_name=adapter_name, **extra_kwargs)
+            inputs = body.inputs
+            if isinstance(inputs, list):
+                _input = inputs[0]
+                if 'input_ids' in _input:
+                    inputs = [InputFeature(**_input) for _input in inputs]
+                else:
+                    inputs = [Trajectory(**_input) for _input in inputs]
+            else:
+                assert isinstance(inputs, dict)
+                inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+            ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': str(ret)}
+
+        @app.post("/get_train_configs")
+        def get_train_configs(self, request: Request, body: AdapterRequest):
+            adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
+            self.assert_adapter_exists(adapter_name=adapter_name)
+            extra_kwargs = body.model_extra or {}
+            ret = self.model.get_train_configs(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
+
+        @app.post("/clip_grad_norm")
+        def clip_grad_norm(self, request: Request, body: AdapterRequest):
+            adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
+            self.assert_adapter_exists(adapter_name=adapter_name)
+            extra_kwargs = body.model_extra or {}
+            ret = self.model.clip_grad_norm(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': str(ret)}
 
         @app.post("/step")
         def step(self, request: Request, body: AdapterRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.step(adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.step(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/zero_grad")
         def zero_grad(self, request: Request, body: AdapterRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.zero_grad(adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.zero_grad(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/lr_step")
         def lr_step(self, request: Request, body: AdapterRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.lr_step(adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.lr_step(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/set_loss")
         def set_loss(self, request: Request, body: SetLossRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.set_loss(body.loss_cls, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.set_loss(body.loss_cls, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/set_optimizer")
         def set_optimizer(self, request: Request, body: SetOptimizerRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.set_optimizer(body.optimizer_cls, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.set_optimizer(body.optimizer_cls, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/set_lr_scheduler")
         def set_lr_scheduler(self, request: Request, body: SetLrSchedulerRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.set_lr_scheduler(body.scheduler_cls, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.set_lr_scheduler(body.scheduler_cls, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/save")
         def save(self, request: Request, body: SaveRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.save(body.output_dir, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.save(body.output_dir, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/add_adapter_to_model")
         def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
@@ -275,14 +334,16 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.set_template(body.template_cls, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.set_template(body.template_cls, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/set_processor")
         def set_processor(self, request: Request, body: SetProcessorRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            return self.model.set_processor(body.processor_cls, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.set_processor(body.processor_cls, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post("/heartbeat")
         def heartbeat(self, request: Request, body: HeartbeatRequest):

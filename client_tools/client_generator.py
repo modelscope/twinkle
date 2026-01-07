@@ -251,7 +251,7 @@ def generate_processors():
                 extra_args = '\n                **kwargs'
             else:
                 extra_args = ''
-            ret = 'self' if name == '__iter__' else 'response.json()'
+            ret = 'self' if name == '__iter__' else 'response.json()["result"]'
 
             code = f'''    
     def {name}(self{sig_part}):
@@ -277,7 +277,7 @@ def generate_processors():
             }
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()["result"]
     '''
             return code
 
@@ -478,8 +478,6 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             self.adapter_name,
             self._send_adapter_heartbeat
         )
-        
-        return response.json()
     
     def __del__(self):
         """Cleanup: unregister adapter from heartbeat manager."""
@@ -495,7 +493,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def forward_only(self, inputs: Any, **kwargs):
         """Execute forward pass without gradient computation."""
@@ -504,7 +502,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def calculate_loss(self, **kwargs):
         """Calculate loss from model outputs."""
@@ -513,8 +511,17 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
+    def get_train_configs(self, **kwargs):
+        """Get training configs"""
+        response = http_post(
+            url=f'{self.server_url}/get_train_configs',
+            json_data={'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
     def backward(self, **kwargs):
         """Execute backward pass."""
         response = http_post(
@@ -522,7 +529,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def forward_backward(self, inputs: Any, **kwargs):
         """Execute combined forward and backward pass."""
@@ -531,7 +538,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def step(self, **kwargs):
         """Execute optimizer step."""
@@ -540,7 +547,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def zero_grad(self, **kwargs):
         """Zero out gradients."""
@@ -549,7 +556,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def lr_step(self, **kwargs):
         """Execute learning rate scheduler step."""
@@ -558,7 +565,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def set_loss(self, loss_cls: str, **kwargs):
         """Set the loss function."""
@@ -567,8 +574,17 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'loss_cls': loss_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
-    
+        return response.json()['result']
+
+    def clip_grad_norm(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+        """Set the loss function."""
+        response = http_post(
+            url=f'{self.server_url}/clip_grad_norm',
+            json_data={'max_grad_norm': max_grad_norm, 'norm_type': norm_type, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
     def set_optimizer(self, optimizer_cls: str, **kwargs):
         """Set the optimizer."""
         response = http_post(
@@ -576,7 +592,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'optimizer_cls': optimizer_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs):
         """Set the learning rate scheduler."""
@@ -585,7 +601,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'scheduler_cls': scheduler_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def save(self, output_dir: str, **kwargs):
         """Save model checkpoint."""
@@ -594,7 +610,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'output_dir': output_dir, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def set_template(self, template_cls: str, **kwargs):
         """Set the template for data processing."""
@@ -603,7 +619,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
     
     def set_processor(self, processor_cls: str, **kwargs):
         """Set the input processor."""
@@ -612,7 +628,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
             json_data={'processor_cls': processor_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()['result']
 '''
 
     # Write the model client file

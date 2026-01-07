@@ -8,7 +8,7 @@ def http_get(
     url: str,
     params: Optional[Dict[str, Any]] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 30,
+    timeout: int = 300,
 ) -> requests.Response:
     """
     Send HTTP GET request with required headers.
@@ -53,7 +53,7 @@ def http_post(
     json_data: Optional[Dict[str, Any]] = {},
     data: Optional[Any] = {},
     additional_headers: Optional[Dict[str, str]] = {},
-    timeout: int = 30,
+    timeout: int = 300,
 ) -> requests.Response:
     """
     Send HTTP POST request with required headers.

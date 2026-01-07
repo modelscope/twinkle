@@ -17,20 +17,21 @@ class DataLoader(TorchDataLoader):
     Args:
         dataset: A dataset instance, or a callable to create a dataset.
         device_mesh: The device_mesh of this dataloader.
-        dataloader_params: The dataloader creation parameters.
+        kwargs: The dataloader creation parameters.
     """
 
     def __init__(self, dataset: Union[Dataset, Callable], device_mesh: Optional[DeviceMesh]=None,
-                 **dataloader_params):
+                 **kwargs):
+        breakpoint()
         if isinstance(dataset, Callable):
             self.dataset: Dataset = dataset()
         else:
             self.dataset: Dataset = dataset
         self.dataloader = None
-        if 'batch_size' not in dataloader_params:
-            dataloader_params['batch_size'] = device_mesh.data_parallel_world_size
-        assert dataloader_params['batch_size'] >= device_mesh.data_parallel_world_size and dataloader_params['batch_size'] % device_mesh.data_parallel_world_size == 0
-        self.dataloader_params = dataloader_params
+        if 'batch_size' not in kwargs:
+            kwargs['batch_size'] = device_mesh.data_parallel_world_size
+        assert kwargs['batch_size'] >= device_mesh.data_parallel_world_size and kwargs['batch_size'] % device_mesh.data_parallel_world_size == 0
+        self.dataloader_params = kwargs
         self.device_mesh = device_mesh
         self._set_work_init_fn()
 

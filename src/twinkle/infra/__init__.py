@@ -242,7 +242,10 @@ def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
             output.append(_collect_func(method, _single_result))
         return output
     if method == 'none':
-        return result
+        if isinstance(result, list) and len(result) == 1:
+            return result[0]
+        else:
+            return result
     elif method == 'flatten':
         flatten = [item for sublist in result for item in sublist]
         if isinstance(result[0], np.ndarray):
@@ -266,10 +269,12 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         return [(worker, args, kwargs) for worker in workers]
     elif dispatch == 'slice':
         result = []
-        if device_mesh is not None:
+        # if device_mesh is not None:
             # TODO this may occurs error when remote calls remote
-            assert device_mesh.world_size == len(workers)
+            # Comment this because remote_class supports `first``
+            # assert device_mesh.world_size == len(workers)
         length = len(workers) if not device_mesh else device_mesh.data_parallel_world_size
+        length = min(length, len(workers))
         dp_repeat = len(workers) // length
 
         def dispatch_func(arg, n):
@@ -394,8 +399,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     if not device_mesh_name:
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
-                    if 'dataloader' in self.__class__.__name__.lower():
-                        breakpoint()
                     from ray.actor import ActorHandle
                     args, kwargs = _prepare_lazy_collect(args, kwargs)
                     init_method(self, *args, **kwargs)
@@ -482,7 +485,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     lazy_collect = _lazy_collect
                     if hasattr(self, '_lazy_collect'):
-                        breakpoint()
                         lazy_collect = self._lazy_collect
                     result = result_func if lazy_collect else result_func()
                     if func.__name__ == '__iter__':

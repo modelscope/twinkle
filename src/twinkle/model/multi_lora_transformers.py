@@ -56,13 +56,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         self._activate_adapter(kwargs.get("adapter_name"))
-        return super().forward(inputs, **kwargs)
+        return super().forward(inputs=inputs, **kwargs)
 
     @remote_function()
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         self._activate_adapter(kwargs.get("adapter_name"))
-        return super().forward_only(inputs, **kwargs)
+        return super().forward_only(inputs=inputs, **kwargs)
 
     @remote_function()
     def calculate_loss(self, **kwargs):

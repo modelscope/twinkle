@@ -161,6 +161,9 @@ def build_processor_app(nproc_per_node: int,
                     _kwargs[key] = value
 
             result = function(**_kwargs)
-            return {'result': result}
+            if function_name == '__iter__':
+                return {'result': 'ok'}
+            else:
+                return {'result': result}
 
     return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh)
