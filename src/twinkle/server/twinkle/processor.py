@@ -112,6 +112,7 @@ def build_processor_app(nproc_per_node: int,
             processor = getattr(processor_module, class_type)(
                 remote_group=self.device_group.name,
                 device_mesh=self.device_mesh,
+                instance_id=processor_id,
                 **kwargs
             )
             self.resource_dict[processor_id] = processor

@@ -350,7 +350,7 @@ def remote_class():
                 frame = inspect.currentframe().f_back
                 caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
                 caller_line = frame.f_lineno
-                instance_id = f"{caller_file}_{caller_line}"
+                instance_id = kwargs.pop('instance_id', '') + f"{caller_file}_{caller_line}"
                 remote_group = kwargs.pop('remote_group', None)
                 if not remote_group and len(_device_group) == 1 and not RayHelper.is_worker():
                     # To the default group

@@ -282,10 +282,10 @@ class RayHelper:
                 _visible_device_env = {Platform.get_platform(device_config.device_type.upper()).visible_device_env(): ''}
             else:
                 _visible_device_env = {}
-            for deploy_pg, index in zip(placement_groups, list(range(world_size))):
+            for rank, (deploy_pg, index) in enumerate(zip(placement_groups, list(range(world_size)))):
                 deploy_pg: Dict
                 cluster_name = group
-                worker_name = cluster_name + '-' + str(index)
+                worker_name = key + '-' + str(rank)
                 env_vars = os.environ.copy()
                 env_vars.update({
                     'CLUSTER_NAME': cluster_name,
