@@ -47,7 +47,7 @@ def serialize_object(obj) -> str:
 def deserialize_object(data: str) -> Any:
     try:
         data = json.loads(data)
-    except json.decoder.JSONDecodeError:
+    except Exception: # noqa
         return data
 
     if '_TWINKLE_TYPE_' in data:

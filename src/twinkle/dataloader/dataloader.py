@@ -28,7 +28,7 @@ class DataLoader(TorchDataLoader):
             self.dataset: Dataset = dataset
         self.dataloader = None
         if 'batch_size' not in dataloader_params:
-            dataloader_params['batch_size'] = self.device_mesh.data_parallel_world_size
+            dataloader_params['batch_size'] = device_mesh.data_parallel_world_size
         assert dataloader_params['batch_size'] >= device_mesh.data_parallel_world_size and dataloader_params['batch_size'] % device_mesh.data_parallel_world_size == 0
         self.dataloader_params = dataloader_params
         self.device_mesh = device_mesh

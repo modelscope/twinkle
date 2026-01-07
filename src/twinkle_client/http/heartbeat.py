@@ -52,7 +52,7 @@ class HeartbeatManager:
 
     def processor_heartbeat_func(self, processor_id_list: str):
         response = http_post(
-            url=f'{self.server_url}/heartbeat',
+            url=f'{self.server_url}/processors/heartbeat',
             json_data={'processor_id': processor_id_list}
         )
         response.raise_for_status()

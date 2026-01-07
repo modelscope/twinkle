@@ -315,7 +315,7 @@ class {class_name}({inheritance}):
             }}
         )
         response.raise_for_status()
-        self.processor_id = response.json()
+        self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
 
     def __del__(self):
@@ -424,7 +424,9 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
     def __init__(self, pretrained_model_name_or_path: str, **kwargs):
         """Initialize model client."""
         self.server_url = TWINKLE_SERVER_URL
-        self.server_url = f'{self.server_url}/{pretrained_model_name_or_path}'
+        if '://' in pretrained_model_name_or_path:
+            pretrained_model_name_or_path = pretrained_model_name_or_path.split('://')[1]
+        self.server_url = f'{self.server_url}/models/{pretrained_model_name_or_path}'
         self.adapter_name = None
         response = http_post(
             url=f'{self.server_url}/create',
@@ -439,10 +441,10 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         )
         response.raise_for_status()
     
-    def add_adapter(self, adapter_name: str, config: Dict[str, Any]):
+    def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any]):
         """Add a new adapter to the model and start automatic heartbeat."""
         response = http_post(
-            url=f'{self.server_url}/add_adapter',
+            url=f'{self.server_url}/add_adapter_to_model',
             json_data={'adapter_name': adapter_name, 'config': config}
         )
         response.raise_for_status()
@@ -637,8 +639,11 @@ class VLLMSampler(Sampler):
         """Create the sampler instance on server."""
         self.server_url = TWINKLE_SERVER_URL
         self.adapter_name = None
+        if '://' in model_id:
+            model_id = model_id.split('://')[1]
+        self.server_url = f'{self.server_url}/models/{model_id}'
         response = http_post(
-            url=f'{self.server_url}/{model_id}/create',
+            url=f'{self.server_url}/create',
             json_data=kwargs
         )
         response.raise_for_status()

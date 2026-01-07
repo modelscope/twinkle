@@ -381,6 +381,9 @@ def remote_class():
                     # Seed when a remote class is created.
                     framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
                                                     bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
+                    if not device_mesh_name:
+                        args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
+                        kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):

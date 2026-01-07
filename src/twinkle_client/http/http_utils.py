@@ -6,8 +6,8 @@ import requests
 
 def http_get(
     url: str,
-    params: Optional[Dict[str, Any]] = None,
-    additional_headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = {},
+    additional_headers: Optional[Dict[str, str]] = {},
     timeout: int = 30,
 ) -> requests.Response:
     """
@@ -50,9 +50,9 @@ def http_get(
 
 def http_post(
     url: str,
-    json_data: Optional[Dict[str, Any]] = None,
-    data: Optional[Any] = None,
-    additional_headers: Optional[Dict[str, str]] = None,
+    json_data: Optional[Dict[str, Any]] = {},
+    data: Optional[Any] = {},
+    additional_headers: Optional[Dict[str, str]] = {},
     timeout: int = 30,
 ) -> requests.Response:
     """
