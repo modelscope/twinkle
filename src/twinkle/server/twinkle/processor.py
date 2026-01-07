@@ -2,7 +2,7 @@ import os
 import threading
 import uuid
 from typing import Dict, Any
-
+import importlib
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
@@ -99,7 +99,7 @@ def build_processor_app(nproc_per_node: int,
             kwargs = body.model_extra or {}
 
             assert processor_type_name in processors, f"Invalid processor type: {processor_type_name}"
-            processor_module = getattr(twinkle, processor_type_name)
+            processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
             assert hasattr(processor_module, class_type), f"Class {class_type} not found in {processor_type_name}"
 
             self.handle_processor_count(request.state.token, True)
