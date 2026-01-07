@@ -104,8 +104,6 @@ def build_processor_app(nproc_per_node: int,
             assert processor_type_name in processors, f"Invalid processor type: {processor_type_name}"
             processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
             assert hasattr(processor_module, class_type), f"Class {class_type} not found in {processor_type_name}"
-            if class_type == 'dataloader':
-                breakpoint()
             self.handle_processor_count(request.state.token, True)
             processor_id = str(uuid.uuid4().hex)
             self.key_token_dict[processor_id] = request.state.token

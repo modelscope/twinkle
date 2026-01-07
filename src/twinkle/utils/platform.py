@@ -401,12 +401,12 @@ class Platform(ABC):
     @staticmethod
     def get_rank() -> int:
         """Get the global rank"""
-        return int(os.getenv('RANK', -1))
+        return int(os.getenv('RANK', 0))
 
     @staticmethod
     def get_local_rank() -> int:
         """Get the local rank"""
-        return int(os.getenv('LOCAL_RANK', -1))
+        return int(os.getenv('LOCAL_RANK', 0))
 
     @staticmethod
     def get_world_size() -> int:

@@ -32,7 +32,7 @@ def serialize_object(obj) -> str:
         filtered_dict = {
             _subkey: _subvalue
             for _subkey, _subvalue in obj.__dict__.items()
-            if isinstance(_subvalue, basic_types)
+            if isinstance(_subvalue, basic_types) and not _subkey.startswith('_')
         }
         filtered_dict['_TWINKLE_TYPE_'] = 'LoraConfig'
         return json.dumps(filtered_dict, ensure_ascii=False)

@@ -207,8 +207,6 @@ class RayHelper:
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
         workers = []
-        if RayHelper.resource_manager is None:
-            breakpoint()
         device_config = RayHelper.resource_manager.get_config(group)
         placement_groups = RayHelper.resource_manager.get_group(group)
         worker_cls = RayHelper._get_remote_component(worker_cls)

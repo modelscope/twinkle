@@ -31,11 +31,16 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
         assert device_mesh.fsdp_world_size == 1, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
-        super().__init__(model_cls, pretrained_model_name_or_path, config, device_mesh, mixed_precision,
-                         ddp_config, fsdp_config, grad_scaler_config, **kwargs)
+        super().__init__(pretrained_model_name_or_path=pretrained_model_name_or_path, 
+                        config=config, 
+                        device_mesh=device_mesh, 
+                        mixed_precision=mixed_precision,
+                        ddp_config=ddp_config, 
+                        fsdp_config=fsdp_config, 
+                        grad_scaler_config=grad_scaler_config, **kwargs)
         self.add_adapter_to_model('__dummy_adapter__', LoraConfig(r=1, target_modules='all-linear'))
         self.model: PreTrainedModel = MultiAdapter()(self.model)
-        self.model, _ = self.strategy.wrap_model(self.model, AdamW(self._get_trainable_parameters(), lr=1e-5))
+        self.model, _ = self.strategy.wrap_model(self.model, AdamW(self._get_trainable_parameters(adapter_name='__dummy_adapter__').values(), lr=1e-5))
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid {adapter_name} first, current is: {adapter_name}'

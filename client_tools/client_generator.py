@@ -441,11 +441,11 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         )
         response.raise_for_status()
     
-    def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any]):
+    def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs):
         """Add a new adapter to the model and start automatic heartbeat."""
         response = http_post(
             url=f'{self.server_url}/add_adapter_to_model',
-            json_data={'adapter_name': adapter_name, 'config': config}
+            json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
         
@@ -659,13 +659,13 @@ class VLLMSampler(Sampler):
         )
         response.raise_for_status()
     
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
+    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs):
         """Add a new adapter to the sampler and start automatic heartbeat."""
         if isinstance(config, PeftConfig):
             config = config.__dict__
         response = http_post(
             url=f'{self.server_url}/add_adapter_to_sampler',
-            json_data={'adapter_name': adapter_name, 'config': config}
+            json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
         
