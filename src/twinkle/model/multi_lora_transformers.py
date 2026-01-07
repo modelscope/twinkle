@@ -116,9 +116,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_optimizer(optimizer_cls, **kwargs)
 
+    def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
+        self._patch_adapter(adapter_name, config_or_dir, _default_adapter_name, **kwargs)
+        self._activate_adapter(adapter_name)
+
     def _activate_adapter(self, adapter_name: str):
         self._check_adapter_valid(adapter_name)
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        pattern = re.compile(r'\.lora_\w+\.[^.]+\.')
         unwrapped_model = self.strategy.unwrap_model(self.model)
         for name, param in unwrapped_model.named_parameters():
             if pattern.search(name):
