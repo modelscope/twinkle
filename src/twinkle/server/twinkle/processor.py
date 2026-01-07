@@ -8,9 +8,12 @@ from pydantic import BaseModel
 from ray import serve
 
 import twinkle
+from twinkle import get_logger
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.twinkle.serialize import deserialize_object
 from twinkle.server.twinkle.validation import verify_request_token, ConfigRegistryProxy, init_config_registry
+
+logger = get_logger()
 
 
 def build_processor_app(nproc_per_node: int,
@@ -109,11 +112,20 @@ def build_processor_app(nproc_per_node: int,
             kwargs.pop('remote_group', None)
             kwargs.pop('device_mesh', None)
 
+            _kwargs = {}
+            for key, value in kwargs.items():
+                if isinstance(value, str) and value.startswith('pid:'):
+                    ref_id = value[4:]
+                    _kwargs[key] = self.resource_dict[ref_id]
+                else:
+                    value = deserialize_object(value)
+                    _kwargs[key] = value
+
             processor = getattr(processor_module, class_type)(
                 remote_group=self.device_group.name,
                 device_mesh=self.device_mesh,
                 instance_id=processor_id,
-                **kwargs
+                **_kwargs
             )
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
@@ -132,7 +144,7 @@ def build_processor_app(nproc_per_node: int,
             processor_id = body.processor_id
             function_name = body.function
             kwargs = body.model_extra or {}
-
+            processor_id = processor_id[4:]
             self.assert_processor_exists(processor_id=processor_id)
             processor = self.resource_dict.get(processor_id)
             function = getattr(processor, function_name, None)

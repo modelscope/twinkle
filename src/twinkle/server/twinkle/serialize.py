@@ -51,12 +51,13 @@ def deserialize_object(data: str) -> Any:
         return data
 
     if '_TWINKLE_TYPE_' in data:
-        if data['_TWINKLE_TYPE_'] == 'DatasetMeta':
+        _type = data.pop('_TWINKLE_TYPE_')
+        if _type == 'DatasetMeta':
             return DatasetMeta(**data)
-        elif data['_TWINKLE_TYPE_'] == 'LoraConfig':
+        elif _type == 'LoraConfig':
             return LoraConfig(**data)
         else:
-            raise ValueError(f'Unsupported type: {data["_TWINKLE_TYPE_"]}')
+            raise ValueError(f'Unsupported type: {_type}')
     else:
         return data
 
