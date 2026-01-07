@@ -342,6 +342,8 @@ def remote_class():
                     _device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
                     init_method(self, *args, **kwargs)
                 else:
+                    args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
+                    kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
             elif _mode == 'ray':
                 from .ray import RayHelper
