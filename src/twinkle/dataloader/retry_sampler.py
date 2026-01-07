@@ -20,6 +20,7 @@ class RetrySampler(Sampler):
 
     def __iter__(self):
         total = 0
+        breakpoint()
         for idx in self.original_sampler:
             for _ in range(self.max_retries):
                 try:

@@ -299,7 +299,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        breakpoint()
         optimizer_config.optimizer = optimizer_cls(self._get_trainable_parameters(adapter_name).values(), **kwargs)
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):

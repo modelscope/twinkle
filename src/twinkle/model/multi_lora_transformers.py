@@ -44,7 +44,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.model, _ = self.strategy.wrap_model(self.model, AdamW(self._get_trainable_parameters(adapter_name='__dummy_adapter__').values(), lr=1e-5))
 
     def _check_adapter_valid(self, adapter_name: str):
-        assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid {adapter_name} first, current is: {adapter_name}'
+        assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
 
     def _activate_adapter(self, adapter_name: str):
         self.multi_adapter.set_current_adapter_name(adapter_name)
@@ -130,6 +130,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._activate_adapter(kwargs.get("adapter_name"))
         super().set_optimizer(optimizer_cls, **kwargs)
 
+    @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         # prevent opening requires_grad of the base model
         # prevent loading malicious code
