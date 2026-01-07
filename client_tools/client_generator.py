@@ -285,14 +285,37 @@ def generate_processors():
 
         # Build __init__ method with actual signature
         if init_signature:
-            # Extract parameter names from signature
+            # Extract parameter names from signature (excluding **kwargs)
             param_names = parse_params_from_signature(init_signature)
             init_params = f"self, {init_signature}" if init_signature else "self"
+            
+            # Check if signature has **kwargs
+            has_kwargs = '**' in init_signature
+            
+            # Extract the **kwargs name if present
+            kwargs_name = None
+            if has_kwargs:
+                # Find the **kwargs parameter name
+                for part in init_signature.split(','):
+                    part = part.strip()
+                    if part.startswith('**'):
+                        # Extract name after **, before : or end
+                        kwargs_name = part[2:].split(':')[0].strip()
+                        break
+            
+            # Build kwargs dict for HTTP request
             if param_names:
                 kwargs_items = ', '.join([f"'{p}': {p}" for p in param_names])
-                kwargs_dict = f"{{{kwargs_items}}}"
+                if has_kwargs and kwargs_name:
+                    # Include both named params and **kwargs
+                    kwargs_dict = f"{{{kwargs_items}}}, **{kwargs_name}"
+                else:
+                    kwargs_dict = f"{{{kwargs_items}}}"
             else:
-                kwargs_dict = "{}"
+                if has_kwargs and kwargs_name:
+                    kwargs_dict = kwargs_name
+                else:
+                    kwargs_dict = "{}"
         else:
             # Fallback to **kwargs if no __init__ found
             init_params = "self, **kwargs"
