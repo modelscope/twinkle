@@ -60,8 +60,12 @@ class InputProcessor:
             values = [item[key] for item in batch]
 
             if isinstance(values[0], np.ndarray):
-                values = [torch.from_numpy(v) for v in values]
-                result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                # Skip string arrays - they can't be converted to tensors
+                if values[0].dtype.kind in ('U', 'S', 'O'):  # Unicode, byte string, or object
+                    result[key] = values
+                else:
+                    values = [torch.from_numpy(v) for v in values]
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
             elif isinstance(values[0], torch.Tensor):
                 result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
             else:

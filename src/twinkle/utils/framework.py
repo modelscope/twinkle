@@ -166,3 +166,22 @@ class Torch(Framework):
                 if Torch.is_npu_available():
                     os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
                     os.environ["HCCL_DETERMINISTIC"] = "1"
+
+    @staticmethod
+    def to_local_tensor(tensor: 'torch.Tensor') -> 'torch.Tensor':
+        """Convert DTensor to local tensor if needed.
+
+        Args:
+            tensor: A torch.Tensor or DTensor instance.
+
+        Returns:
+            A local torch.Tensor.
+        """
+        import torch
+        if hasattr(tensor, 'full_tensor'):
+            # DTensor from torch.distributed.tensor
+            return tensor.full_tensor()
+        elif hasattr(tensor, 'to_local'):
+            # Alternative DTensor API
+            return tensor.to_local()
+        return tensor

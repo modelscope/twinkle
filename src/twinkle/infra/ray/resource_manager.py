@@ -96,12 +96,16 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
+        min_rank = min(all_ranks) if all_ranks else 0
         for group in groups:
             if device_type != 'CPU':
                 ranks = group.ranks
                 local_device_groups = []
                 for rank in ranks:
-                    node_rank = rank // nproc_per_node
+                    # Normalize rank by subtracting min_rank for node calculation
+                    normalized_rank = rank - min_rank
+                    node_rank = normalized_rank // nproc_per_node
+                    # Use original rank for gpu_rank to support non-zero starting ranks
                     gpu_rank = rank % nproc_per_node
                     local_device_groups.append(
                         dict(

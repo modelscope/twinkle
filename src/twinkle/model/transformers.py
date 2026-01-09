@@ -26,6 +26,7 @@ from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
 from .base import TwinkleModel
 from .strategy import AccelerateStrategy
+from twinkle.utils import torch_util
 
 
 @dataclass
@@ -231,7 +232,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 scaler.unscale_(optimizer)
 
             parameters = self._get_trainable_parameters(adapter_name).values()
-            return torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type).detach().cpu().numpy()
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
+            # Convert DTensor to local tensor for FSDP2 compatibility
+            grad_norm = torch_util.to_local_tensor(grad_norm)
+            return grad_norm.detach().cpu().numpy()
 
     @remote_function()
     def step(self, **kwargs):

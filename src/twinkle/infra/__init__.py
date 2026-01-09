@@ -217,7 +217,7 @@ def get_device_placement(device_group=None) -> str:
         lines.extend(section_bottom())
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n" + "\n".join(lines)
 
 
 def _get_workers(workers, execute):
