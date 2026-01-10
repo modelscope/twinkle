@@ -1,10 +1,10 @@
 import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
-from copy import copy
+
 import ray
 
 from .resource_manager import ResourceManager
-from ...utils import DeviceGroup, Platform, find_node_ip, find_free_port, requires, framework_util
+from ...utils import DeviceGroup, Platform, find_node_ip, find_free_port, requires
 
 T = TypeVar('T')
 

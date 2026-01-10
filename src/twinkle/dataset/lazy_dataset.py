@@ -1,6 +1,6 @@
-from typing import Type, Union
+# Copyright (c) ModelScope Contributors. All rights reserved.
 
-from twinkle import template, remote_class
+from twinkle import remote_class
 from .base import Dataset, DatasetMeta
 from .. import remote_function
 

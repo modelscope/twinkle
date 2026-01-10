@@ -1,9 +1,10 @@
-from collections.abc import Iterable
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Callable, Type, Union
 
-from datasets import interleave_datasets, concatenate_datasets
+from datasets import interleave_datasets, concatenate_datasets, load_dataset
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
@@ -12,6 +13,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import Preprocessor, DataFilter
 from twinkle.template import Template
+from twinkle.utils.parallel import processing_lock
 
 
 @dataclass
@@ -26,7 +28,7 @@ class DatasetMeta:
     data_slice: Iterable = None
 
     def get_id(self):
-        return self.dataset_id + ':' + self.subset_name + ':' + self.split
+        return self.dataset_id.replace(os.sep, '_').replace('.', '_') + ':' + self.subset_name + ':' + self.split
 
 
 @remote_class(execute='first')
@@ -35,6 +37,11 @@ class Dataset(TorchDataset):
 
     Args:
         dataset_meta: A dataset meta information for loading the original dataset.
+        kwargs:
+            streaming: Whether is streaming mode.
+            num_proc: Number of processes to use.
+            revision: The revision of the dataset, only available when dataset is id in the hf/ms hub.
+            Any other kwargs supported by `datasets.load_dataset`.
     """
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
@@ -68,10 +75,12 @@ class Dataset(TorchDataset):
         Args:
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
-        if kwargs.get('batched', True):
-            self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
-        else:
-            self.dataset = self.dataset.map(self.template.encode, **kwargs).filter(lambda x: len(x['input_ids']) > 0, **kwargs)
+        with processing_lock('dataset'):
+            # use a default lock because encode is to all datasets
+            if kwargs.get('batched', True):
+                self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
+            else:
+                self.dataset = self.dataset.map(self.template.encode, **kwargs).filter(lambda x: len(x['input_ids']) > 0, **kwargs)
 
     @remote_function()
     def check(self, **kwargs):
@@ -80,18 +89,30 @@ class Dataset(TorchDataset):
         Args:
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
-        if kwargs.get('batched', True):
-            self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
-        else:
-            self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
+        with processing_lock('dataset'):
+            # use a default lock because check is to all datasets
+            if kwargs.get('batched', True):
+                self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
+            else:
+                self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @staticmethod
     def _load_dataset(dataset_meta: DatasetMeta, **kwargs):
         dataset_id = dataset_meta.dataset_id
         subset_name = dataset_meta.subset_name
         split = dataset_meta.split
-        dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
-
+        with processing_lock(dataset_meta.get_id()):
+            if os.path.exists(dataset_id):
+                streaming = kwargs.get('streaming', False)
+                num_proc = kwargs.get('num_proc', 1)
+                ext = os.path.splitext(dataset_id)[1].lstrip('.')
+                file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
+                kwargs = {'split': 'train', 'streaming': streaming, 'num_proc': num_proc}
+                if file_type == 'csv':
+                    kwargs['na_filter'] = False
+                dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
+            else:
+                dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
         if isinstance(dataset_meta.data_slice, Iterable):
             dataset = dataset.select(dataset_meta.data_slice)
         return dataset
@@ -118,7 +139,8 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
-        self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
+        with processing_lock(key):
+            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
@@ -143,7 +165,8 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
-        self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
+        with processing_lock(key):
+            self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
