@@ -12,8 +12,8 @@ from peft import PeftConfig
 from peft import get_peft_model, PeftModel
 from torch import GradScaler
 from torch.distributed.tensor import DTensor
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim import Optimizer, AdamW
+from torch.optim.lr_scheduler import LRScheduler, CosineAnnealingLR
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
@@ -21,6 +21,7 @@ import twinkle
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.module import scheduler
 from twinkle.loss import Loss, CrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -102,13 +103,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             model_id = HubOperation.download_model(model_id)
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
                                            fsdp_config=fsdp_config, device_mesh=device_mesh)
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
-        self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: OptimizerGroup()}
+        self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
 
     @staticmethod
     def _not_encoded(inputs):
@@ -119,10 +121,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if not self._model_wrapped:
             assert len(self.optimizer_group) == 1
             optimizer = self.optimizer_group[_default_adapter_name].optimizer
-            assert isinstance(optimizer, Optimizer)
+            if optimizer is None:
+                optimizer = AdamW(self._get_trainable_parameters(_default_adapter_name).values(), lr=1e-5)
+                self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self._model_wrapped = True
+
+    def _construct_default_optimizer_group(self):
+        return OptimizerGroup(
+            loss_instance=CrossEntropyLoss(),
+            template=Template(self.tokenizer_id),
+            processor=InputProcessor(self.device_mesh),
+        )
 
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -289,6 +300,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             grad_norm = torch_util.to_local_tensor(grad_norm)
             return grad_norm.detach().cpu().numpy()
 
+    def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        self.step(**kwargs)
+        self.zero_grad(**kwargs)
+        self.lr_step(**kwargs)
+
     @remote_function()
     def step(self, **kwargs):
         """Optimizer step.
@@ -405,7 +422,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         return params
 
     @remote_function()
-    def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
+    def set_lr_scheduler(self,
+                         scheduler_cls: Union[Type[LRScheduler], str],
+                         **kwargs):
         """Set the lr_scheduler.
 
         Args:
@@ -420,6 +439,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             import torch
             if hasattr(torch.optim.lr_scheduler, scheduler_cls):
                 scheduler_cls = getattr(torch.optim.lr_scheduler, scheduler_cls)
+            if hasattr(scheduler, scheduler_cls):
+                scheduler_cls = getattr(scheduler, scheduler_cls)
             else:
                 scheduler_cls = Plugin.load_plugin(scheduler_cls, LRScheduler)
         optimizer = optimizer_config.optimizer
@@ -481,7 +502,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
-        self.optimizer_group[train_group] = OptimizerGroup()
+        self.optimizer_group[train_group] = self._construct_default_optimizer_group()
         self.optimizer_group[train_group].adapter_name = adapter_name
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
