@@ -12,7 +12,7 @@ from peft import PeftConfig
 from peft import get_peft_model, PeftModel
 from torch import GradScaler
 from torch.distributed.tensor import DTensor
-from torch.optim import Optimizer, AdamW
+from torch.optim import Optimizer, AdamW, Adam
 from torch.optim.lr_scheduler import LRScheduler, CosineAnnealingLR
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
@@ -218,7 +218,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         inputs = optimizer_config.inputs
         outputs = optimizer_config.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
-        loss_value = loss_instance(inputs, outputs, **kwargs)
+        loss_value: torch.Tensor = loss_instance(inputs, outputs, **kwargs)
         optimizer_config.loss_value = loss_value
         return loss_value.detach().cpu().float().numpy()
 
@@ -306,6 +306,49 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
+    def _create_param_group(self, adapter_name: str, lr: float, weight_decay:float, **kwargs):
+        # Some code borrowed from transformers
+
+        def get_parameter_names(model, forbidden_layer_types, forbidden_layer_names=None):
+            forbidden_layer_patterns = (
+                [re.compile(pattern) for pattern in forbidden_layer_names] if forbidden_layer_names is not None else []
+            )
+            result = []
+            for name, child in model.named_children():
+                child_params = get_parameter_names(child, forbidden_layer_types, forbidden_layer_names)
+                result += [
+                    f"{name}.{n}"
+                    for n in child_params
+                    if not isinstance(child, tuple(forbidden_layer_types))
+                       and not any(pattern.search(f"{name}.{n}".lower()) for pattern in forbidden_layer_patterns)
+                ]
+            # Add model specific parameters that are not in any child
+            result += [
+                k for k in model._parameters if
+                not any(pattern.search(k.lower()) for pattern in forbidden_layer_patterns)
+            ]
+
+            return result
+
+        forbidden_name_patterns = [r"bias", r"layernorm", r"rmsnorm", r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)"]
+        decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm], forbidden_name_patterns)
+        params = self._get_trainable_parameters(adapter_name)
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p for n, p in params if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": weight_decay, 'lr': lr
+            },
+            {
+                "params": [
+                    p for n, p in params if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0, 'lr': lr
+            },
+        ]
+        return optimizer_grouped_parameters
+
     @remote_function()
     def step(self, **kwargs):
         """Optimizer step.
@@ -327,6 +370,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
+
+        optim_params = kwargs.pop('optim_params', {})
+        if optim_params:
+            assert isinstance(optimizer, (AdamW, Adam))
+            for group in optimizer.param_groups:
+                group['lr'] = optim_params['lr']
+                if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
+                    group['weight_decay'] = optim_params['weight_decay']
+                if optim_params.get('eps') is not None:
+                    group['eps'] = optim_params['eps']
+                if optim_params.get('betas') is not None:
+                    group['betas'] = optim_params['betas']
 
         with context():
             if scaler is not None:
@@ -369,8 +424,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if optimizer_config.scaler_has_nan:
             return
         lr_scheduler = optimizer_config.lr_scheduler
-        assert isinstance(lr_scheduler, LRScheduler), 'Set lr_scheduler correctly before forwarding'
-        lr_scheduler.step(**kwargs)
+        if lr_scheduler is not None:
+            lr_scheduler.step(**kwargs)
 
     @remote_function()
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
@@ -409,7 +464,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 optimizer_cls = getattr(torch.optim, optimizer_cls)
             else:
                 optimizer_cls = Plugin.load_plugin(optimizer_cls, Optimizer)
-        optimizer_config.optimizer = optimizer_cls(self._get_trainable_parameters(adapter_name).values(), **kwargs)
+        optimizer_config.optimizer = optimizer_cls(self._create_param_group(adapter_name, **kwargs), **kwargs)
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):
         is_default = adapter_name == _default_adapter_name
