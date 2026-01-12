@@ -1,5 +1,8 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import List, Dict, Any, Tuple
 from copy import deepcopy
+
+from transformers import PreTrainedTokenizer
 
 from twinkle.data_format import Trajectory
 
@@ -58,7 +61,7 @@ def build_labels(
 
 
 def tokenize_with_assistant_labels(
-        tokenizer,
+        tokenizer: PreTrainedTokenizer,
         trajectory: Trajectory,
         placeholder: str = PLACEHOLDER,
 ) -> Tuple[List[int], List[int]]:

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import re
 from types import MethodType
 from typing import Union, Callable, Any, List, Optional, Literal

@@ -1,10 +1,11 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import re
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
 from peft import PeftConfig, LoraConfig
 from peft import PeftModel
-from torch.optim import Optimizer, AdamW
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig
 

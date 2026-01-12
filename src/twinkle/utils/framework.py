@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
 import os
 from abc import ABC, abstractmethod

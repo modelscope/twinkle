@@ -1,13 +1,14 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
 import os
 from typing import Literal, List, Optional, Union, Callable
 from typing import TypeVar
-from types import MethodType
+
 import numpy as np
 
-from ..utils import DeviceGroup, DeviceMesh, Platform
 from .ray import RayHelper
+from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
 
 T1 = TypeVar('T1', bound=object)
@@ -398,7 +399,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     if not device_mesh_name:
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
-                    from ray.actor import ActorHandle
                     args, kwargs = _prepare_lazy_collect(args, kwargs)
                     init_method(self, *args, **kwargs)
                 else:

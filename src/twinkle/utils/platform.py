@@ -1,8 +1,9 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import shutil
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from typing import Type
 from typing import Union, List
 import torch.distributed as dist

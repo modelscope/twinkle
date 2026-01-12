@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 from typing import Any, Tuple, Callable
 

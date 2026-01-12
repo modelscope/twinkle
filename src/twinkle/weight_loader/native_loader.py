@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from twinkle.model import TwinkleModel
 from twinkle.sampler import Sampler
 from .base import WeightLoader

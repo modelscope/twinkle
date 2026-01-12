@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from enum import Enum
 from .base import Loss
 import torch

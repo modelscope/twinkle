@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 from pathlib import Path
 from typing import Dict, List, Tuple, Set

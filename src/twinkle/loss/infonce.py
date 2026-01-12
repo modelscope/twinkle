@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Loss
 from ..utils import torch_util
 import numpy as np

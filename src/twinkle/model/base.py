@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Dict, Any, Union, Type
 
 from torch.optim import Optimizer

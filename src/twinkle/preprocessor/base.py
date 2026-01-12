@@ -1,4 +1,4 @@
-from typing import List
+# Copyright (c) ModelScope Contributors. All rights reserved.
 
 from twinkle.data_format import Trajectory
 

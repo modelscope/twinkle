@@ -1,10 +1,10 @@
-from collections.abc import Mapping
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import List, Optional, Dict, Any
 from transformers import AutoTokenizer, PreTrainedTokenizer
 import numpy as np
 from collections.abc import Mapping
 from twinkle.hub import HubOperation
-from twinkle.data_format import Trajectory, InputFeature
+from twinkle.data_format import Trajectory, InputFeature, Message
 from .utils import tokenize_with_assistant_labels
 
 
@@ -15,9 +15,29 @@ class Template:
     def __init__(self, model_id: str, **kwargs):
         model_id = HubOperation.download_model(model_id)
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
+        self._test_support_assistant_tokens_mask()
+
+    def _test_support_assistant_tokens_mask(self):
+        dummy_inputs = [
+            Message(role='user', content='How are you?'),
+            Message(role='assistant', content='Fine.'),
+        ]
+        outputs = self.tokenizer.apply_chat_template(conversation=dummy_inputs,
+                                                     return_assistant_tokens_mask=True, return_dict=True)
+        assistant_masks = outputs['assistant_masks']
+        self._template_support_assistant_tokens_mask = not all(np.array(assistant_masks).flatten())
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
-        input_ids, labels = tokenize_with_assistant_labels(self.tokenizer, trajectory)
+        if self._template_support_assistant_tokens_mask:
+            messages = [dict(message) for message in trajectory['messages']]
+            tools = [dict(tool) for tool in trajectory.get('tools', [])]
+            outputs = self.tokenizer.apply_chat_template(conversation=messages, tools=tools,
+                                               return_assistant_tokens_mask=True, return_dict=True)
+            input_ids = outputs['input_ids']
+            assistant_masks = outputs['assistant_masks']
+            labels = np.where(assistant_masks, input_ids, -100)
+        else:
+            input_ids, labels = tokenize_with_assistant_labels(self.tokenizer, trajectory)
         return InputFeature(
             input_ids=np.array(input_ids),
             attention_mask=np.ones_like(input_ids),
