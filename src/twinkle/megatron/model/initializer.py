@@ -250,30 +250,42 @@ class MegatronModelInitializer:
     ) -> None:
         """Load HuggingFace checkpoint into Megatron model.
         
-        Uses swift's GPTBridge for maximum compatibility and stability.
+        TODO: Remove swift dependency. Implement independent bridge logic.
         
         Args:
             model: The Megatron model.
-            hf_model_path: Path to HuggingFace checkpoint.
+            hf_model_path: Path to HuggingFace checkpoint or model ID.
             hf_config: HuggingFace model config.
         """
-        from .bridge import TwinkleBridgeAdapter
+        import os
+        
+        # Resolve model path if it's a model ID (not a local path)
+        if not os.path.isdir(hf_model_path):
+            # Try to download using HubOperation (twinkle's hub abstraction)
+            try:
+                from twinkle.hub import HubOperation
+                hf_model_path = HubOperation.download_model(hf_model_path)
+            except ImportError:
+                # Fallback to modelscope/huggingface snapshot download
+                try:
+                    from modelscope import snapshot_download
+                    hf_model_path = snapshot_download(hf_model_path)
+                except ImportError:
+                    from huggingface_hub import snapshot_download
+                    hf_model_path = snapshot_download(hf_model_path)
         
         # Calculate padded vocab size
         padded_vocab_size = self._pad_vocab_size(hf_config.vocab_size)
         
-        # Create bridge adapter
-        adapter = TwinkleBridgeAdapter(
+        from .swift_bridge import create_bridge_adapter
+        adapter = create_bridge_adapter(
             hf_config=hf_config,
             tp_size=self.tp_size,
             pp_size=self.pp_size,
             ep_size=self.ep_size,
-            etp_size=self.etp_size,
-            model_path=hf_model_path,
+            model_dir=hf_model_path,
             padded_vocab_size=padded_vocab_size,
         )
-        
-        # Load weights using swift's bridge
         adapter.load_weights(model, hf_model_path)
         
 

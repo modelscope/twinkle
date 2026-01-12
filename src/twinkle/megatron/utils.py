@@ -1,7 +1,4 @@
 # Copyright (c) twinkle authors. All rights reserved.
-# Code reference: Adapted from ms-swift with modifications for twinkle's multi-tenant architecture.
-# Original code markers: Functions marked with [SWIFT] are adapted from swift,
-# Functions marked with [TWINKLE] are original implementations.
 """Utility functions for Megatron-Core integration."""
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,9 +24,7 @@ from peft import LoraConfig, get_peft_model
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
-# =============================================================================
-# [SWIFT] Config mapping from HuggingFace to Megatron - adapted from swift
-# =============================================================================
+# Config mapping from HuggingFace to Megatron
 CONFIG_MAPPING = {
     'num_layers': ['num_hidden_layers'],
     'hidden_size': ['hidden_size'],
@@ -75,13 +70,8 @@ CONFIG_MAPPING = {
 }
 
 
-# =============================================================================
-# [TWINKLE] Multi-tenant Process Group Management
-# =============================================================================
 class TenantProcessGroupManager:
     """Manager for multi-tenant process groups.
-    
-    [TWINKLE] This is an original implementation for twinkle's multi-tenant architecture.
     
     In a multi-tenant scenario, multiple users may share the same base model in a single
     process, each with their own LoRA adapters. To avoid communication interference between
@@ -442,12 +432,12 @@ def get_tenant_manager() -> TenantProcessGroupManager:
 
 
 # =============================================================================
-# [SWIFT] Layer finding utilities - adapted from swift
+
 # =============================================================================
 def find_layers(model: nn.Module, cond_fn) -> List[str]:
     """Find all layers in model matching condition function.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The model to search.
@@ -466,7 +456,7 @@ def find_layers(model: nn.Module, cond_fn) -> List[str]:
 def find_all_linears(model: nn.Module) -> List[str]:
     """Find all linear layers suitable for LoRA in a Megatron model.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The Megatron model.
@@ -487,7 +477,7 @@ def find_all_linears(model: nn.Module) -> List[str]:
 def find_router(model: nn.Module) -> List[str]:
     """Find all MoE router layers in a Megatron model.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The Megatron model.
@@ -501,7 +491,7 @@ def find_router(model: nn.Module) -> List[str]:
 def find_embedding(model: nn.Module) -> List[str]:
     """Find all embedding layers in a Megatron model.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The Megatron model.
@@ -515,7 +505,7 @@ def find_embedding(model: nn.Module) -> List[str]:
 def get_target_modules(model: nn.Module, target_modules: List[str]) -> List[str]:
     """Expand target module specifications to actual module names.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The Megatron model.
@@ -540,7 +530,7 @@ def get_target_modules(model: nn.Module, target_modules: List[str]) -> List[str]
 def set_linear_is_expert(model: nn.Module):
     """Mark expert linear layers in MoE models.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         model: The Megatron model.
@@ -574,12 +564,12 @@ def deep_getattr(obj: Any, attr: str, default: Any = None) -> Any:
 
 
 # =============================================================================
-# [SWIFT] Config conversion - adapted from swift with Qwen3 enhancements
+
 # =============================================================================
 def _convert_hf_config(config, _internal_call: bool = False) -> Dict[str, Any]:
     """Convert HuggingFace config to Megatron config dict.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         config: HuggingFace model config.
@@ -629,7 +619,7 @@ def _convert_hf_config(config, _internal_call: bool = False) -> Dict[str, Any]:
 def convert_hf_config(config) -> Dict[str, Any]:
     """Convert HuggingFace config to Megatron-compatible config.
     
-    [SWIFT] Adapted from swift with Qwen3 specific handling.
+    
     
     Args:
         config: HuggingFace model config.
@@ -654,6 +644,14 @@ def convert_hf_config(config) -> Dict[str, Any]:
     first_k_dense_replace = res.pop('first_k_dense_replace', None)
     n_shared_experts = res.pop('n_shared_experts', None)
     
+    # ==== Qwen2/Qwen2.5 Model specific settings ====
+    if llm_architectures == 'Qwen2ForCausalLM':
+        # Qwen2/Qwen2.5 uses bias=True for Q, K, V projections (hardcoded in transformers)
+        # but the config doesn't have 'attention_bias' field
+        if 'add_qkv_bias' not in res:
+            res['add_qkv_bias'] = True
+        res['swiglu'] = True
+        
     # ==== Qwen3 Dense Model specific settings ====
     if llm_architectures == 'Qwen3ForCausalLM':
         res['qk_layernorm'] = True
@@ -701,7 +699,7 @@ def convert_hf_config(config) -> Dict[str, Any]:
 def patch_deepcopy():
     """Context manager to handle tp_group in deepcopy operations.
     
-    [SWIFT] Adapted from swift.
+    
     
     WHY THIS IS NECESSARY:
     ----------------------
@@ -751,7 +749,7 @@ def patch_deepcopy():
 
 
 # =============================================================================
-# [SWIFT] Sharded state dict for tuners - adapted from swift
+
 # =============================================================================
 def tuners_sharded_state_dict(
     module: nn.Module,
@@ -761,7 +759,7 @@ def tuners_sharded_state_dict(
 ) -> Dict[str, Any]:
     """Generate sharded state dict for PEFT tuners.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         module: The module to generate state dict for.
@@ -867,12 +865,12 @@ def prepare_lora_model(
 
 
 # =============================================================================
-# [SWIFT] Layer spec utilities - adapted from swift
+
 # =============================================================================
 def get_local_layer_specs(config, layer_specs: List, vp_stage: Optional[int] = None):
     """Get local layer specifications for current pipeline rank.
     
-    [SWIFT] Adapted from swift.
+    
     
     Args:
         config: Megatron transformer config.
@@ -937,7 +935,7 @@ def get_padding_to(
 
 
 # =============================================================================
-# [SWIFT] Forward step helper - adapted from swift
+
 # =============================================================================
 def forward_step_helper(model: nn.Module, inputs: Dict[str, Any], config) -> Optional[torch.Tensor]:
     """Helper for pipeline parallel forward step.
@@ -955,9 +953,17 @@ def forward_step_helper(model: nn.Module, inputs: Dict[str, Any], config) -> Opt
     from megatron.core.inference.communication_utils import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
     
     if mpu.is_pipeline_first_stage():
-        micro_batch_size = 1  # use qkv_format 'thd'
+        # Get micro_batch_size from input tensor, not config
+        # For padding_free (qkv_format 'thd'), use 1
+        micro_batch_size = 1
         if not getattr(config, 'padding_free', False):
-            micro_batch_size = config.micro_batch_size
+            # Infer batch size from input_ids or position_ids
+            if 'input_ids' in inputs:
+                micro_batch_size = inputs['input_ids'].shape[0]
+            elif 'position_ids' in inputs:
+                micro_batch_size = inputs['position_ids'].shape[0]
+            else:
+                micro_batch_size = 1
         seq_length = inputs['position_ids'].shape[-1]
         if config.sequence_parallel:
             seq_length //= mpu.get_tensor_model_parallel_world_size()

@@ -1,10 +1,8 @@
 # Copyright (c) twinkle authors. All rights reserved.
 # GPT Bridge for HuggingFace to Megatron-Core weight conversion.
-# This implementation is adapted from ms-swift's GPTBridge.
 """Weight conversion bridge between HuggingFace and Megatron-Core formats.
 
 This module provides independent implementation for weight loading/saving,
-adapted from swift's GPTBridge but without external dependencies.
 
 Supports:
 - Qwen2.5 / Qwen3 model families
@@ -309,6 +307,18 @@ class BridgeConfig:
                               getattr(hf_config, 'moe_topk', 2)
         shared_expert_size = getattr(hf_config, 'shared_expert_intermediate_size', 0)
         
+        # Determine QKV bias setting
+        # Qwen2 has attention bias by default (hardcoded in transformers),
+        # but config doesn't have 'attention_bias' field
+        model_type = getattr(hf_config, 'model_type', 'qwen2')
+        if hasattr(hf_config, 'attention_bias'):
+            add_qkv_bias = hf_config.attention_bias
+        elif model_type in ('qwen2', 'qwen2_5'):
+            # Qwen2/Qwen2.5 uses bias=True for Q, K, V projections
+            add_qkv_bias = True
+        else:
+            add_qkv_bias = False
+        
         return cls(
             tp_size=tp_size,
             pp_size=pp_size,
@@ -321,7 +331,7 @@ class BridgeConfig:
             vocab_size=vocab_size,
             padded_vocab_size=padded_vocab_size,
             intermediate_size=getattr(hf_config, 'intermediate_size', 11008),
-            add_qkv_bias=getattr(hf_config, 'attention_bias', False),
+            add_qkv_bias=add_qkv_bias,
             add_bias_linear=getattr(hf_config, 'mlp_bias', False),
             qk_layernorm=getattr(hf_config, 'qk_layernorm', False) or \
                          getattr(hf_config, 'use_qk_norm', False),
@@ -329,14 +339,13 @@ class BridgeConfig:
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
             shared_expert_intermediate_size=shared_expert_size,
-            model_type=getattr(hf_config, 'model_type', 'qwen2'),
+            model_type=model_type,
         )
 
 
 class TwinkleGPTBridge:
     """Bridge for converting weights between HuggingFace and Megatron-Core formats.
     
-    Adapted from swift's GPTBridge implementation.
     Supports Qwen2.5 / Qwen3 model families.
     """
     

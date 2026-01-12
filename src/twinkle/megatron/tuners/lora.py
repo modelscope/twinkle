@@ -1,6 +1,4 @@
 # Copyright (c) twinkle authors. All rights reserved.
-# Code adapted from huggingface/peft and ms-swift
-# [SWIFT] Core LoRA implementation adapted from swift's megatron tuners.
 """Megatron-compatible LoRA implementation with Tensor Parallel support."""
 import math
 import warnings

@@ -1,8 +1,7 @@
 # Copyright (c) twinkle authors. All rights reserved.
 """Qwen3 model metadata for Megatron-Core.
 
-This module provides metadata for Qwen3 models. The actual weight conversion
-is handled by swift's GPTBridge, which already has full Qwen3 support.
+This module provides metadata for Qwen3 models.
 """
 from typing import Any, Dict
 

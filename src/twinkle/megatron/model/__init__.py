@@ -2,7 +2,6 @@
 """Megatron model initialization and weight conversion.
 
 This module provides independent implementation for weight loading/saving,
-without external dependencies on swift.
 """
 
 from .bridge import (

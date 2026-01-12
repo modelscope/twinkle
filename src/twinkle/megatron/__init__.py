@@ -2,7 +2,6 @@
 """Megatron-Core integration for twinkle training framework.
 
 This module provides independent implementation for Megatron support,
-without external dependencies on swift's GPTBridge.
 """
 
 from .tuners import LoraParallelLinear, dispatch_megatron
