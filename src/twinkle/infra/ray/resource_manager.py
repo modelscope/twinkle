@@ -13,6 +13,7 @@ class ResourceManager:
 
     def __init__(self,
                  nproc_per_node: int,
+                 ncpu_proc_per_node: int,
                  groups: List[DeviceGroup]):
         all_ranks = []
         last_rank = -1
@@ -21,6 +22,7 @@ class ResourceManager:
         assert len(device_types) <= 1
 
         if not device_types:
+            # Pure cpu task
             device_type = 'CPU'
         else:
             device_type = next(iter(device_types))
@@ -43,17 +45,22 @@ class ResourceManager:
             last_rank = ranks[-1]
 
         assert len(set(all_ranks)) == len(all_ranks) # no duplication
-        self.nnodes = math.ceil(len(all_ranks) / nproc_per_node) or len(ray.nodes())
+        if device_type != 'CPU':
+            self.nnodes = math.ceil(len(all_ranks) / nproc_per_node)
+        else:
+            self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
         self.nodes = []
         for node in ray.nodes():
             # get available nodes
             resource = node['Resources']
-            node_gpu_num = int(resource.get(device_type, 0))
-            if node_gpu_num >= nproc_per_node and (device_type != 'CPU' or 'GPU' not in resource):
+            node_device_num = int(resource.get(device_type, 0))
+            if device_type != 'CPU' and node_device_num >= nproc_per_node:
                 self.nodes.append(node)
-        
-        self.nnodes = min(self.nnodes, len(self.nodes))
+            if device_type == 'CPU' and int(node['Resources']['CPU']) // 4 >= ncpu_proc_per_node:
+                self.nodes.append(node)
+
+        assert self.nnodes <= len(self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
 
         bundles = []
         cpu_bundles = []
@@ -61,18 +68,14 @@ class ResourceManager:
             node = self.nodes[i]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
-                bundles.append({device_type: nproc_per_node, 'CPU': node_cpu // 2 + 1}) # create bundles
-                cpu_bundles.append({'CPU': node_cpu // 4 + 1})  # TODO a fixed cpu count
-            else:
-                cpu_bundles.append({'CPU': node_cpu // 2 + 1})
-
-        nproc_cpu_per_node = cpu_proc_count // len(cpu_bundles) + 1 # how many processes in one node
+                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
+            cpu_bundles.append({'CPU': max(node_cpu // 4, 1)})
 
         self.cpu_node_map = {}
         for i in range(cpu_proc_count):
-            node_idx = i // nproc_cpu_per_node
+            node_idx = i // ncpu_proc_per_node
             cpu_cnt = cpu_bundles[node_idx]['CPU']
-            cpu_per_proc = cpu_cnt // nproc_cpu_per_node # cpus per process
+            cpu_per_proc = cpu_cnt // ncpu_proc_per_node # cpus per process
             assert cpu_per_proc >= 1
             self.cpu_node_map[i] = (node_idx, cpu_per_proc)
 
@@ -97,7 +100,7 @@ class ResourceManager:
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
         for group in groups:
-            if device_type != 'CPU':
+            if group.device_type != 'CPU':
                 ranks = group.ranks
                 local_device_groups = []
                 for rank in ranks:

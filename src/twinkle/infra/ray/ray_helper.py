@@ -60,11 +60,12 @@ class RayHelper:
         assert RayHelper._registry is not None
 
     @staticmethod
-    def initialize(nproc_per_node: int, device_groups: List[DeviceGroup]):
+    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups: List[DeviceGroup]):
         """Initialize RayHelper.
 
         Args:
-            nproc_per_node: How many devices in one node.
+            nproc_per_node: How many processes in one node.
+            ncpu_proc_per_node: How many cpu processes in one node.
             device_groups: The device groups to initialize.
 
         Returns:
@@ -78,7 +79,7 @@ class RayHelper:
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
-            RayHelper.resource_manager = ResourceManager(nproc_per_node, device_groups)
+            RayHelper.resource_manager = ResourceManager(nproc_per_node, ncpu_proc_per_node, device_groups)
         RayHelper.init_registry()
 
     @staticmethod

@@ -64,6 +64,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         model_cls: The PreTrainedModel model class, only needed when creating a blank(not pretrained) model.
         config: The config of the model.
         pretrained_model_name_or_path: The model id or path, this argument will be used in `from_pretrained`.
+        device_mesh: The model device mesh to follow.
+        mixed_precision: The mixed precision type.
+        ddp_config: The DDP config to use.
+        fsdp_config: The fsdp config to use.
+        grad_scaler_config: The gradient scaler config to use.
         kwargs: Any kwargs used in `from_pretrained` or `__init__`.
 
     If pretrained_model_name_or_path is passed in, `from_pretrained` will be used, else `__init__` will be used.
@@ -107,7 +112,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     @staticmethod
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)
-        return not 'input_ids' not in inputs and 'input_embedding' not in inputs
+        return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
@@ -152,6 +157,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
+        """Call forward function without grad and record the inputs and outputs.
+
+        Args:
+            inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
+            **kwargs:
+                adapter_name: Lora adapter name.
+        Returns:
+            The output of the model forward.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(inputs, dict) and self._not_encoded(inputs):
@@ -174,8 +188,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config.outputs = outputs
         return outputs
 
-    @remote_function(collect='avg')
+    @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
+        """Calculate loss
+
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed for the specific loss type.
+        Returns:
+            A scalar loss value.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.loss_instance
@@ -189,6 +212,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def backward(self, **kwargs):
+        """Backward propagation.
+
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                gradient_accumulation_steps: Number of gradient accumulation steps.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_value = optimizer_config.loss_value
@@ -207,8 +237,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             loss_value.backward()
         optimizer_config.cur_step += 1
 
-    @remote_function(collect='avg')
+    @remote_function(collect='mean')
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+        """Do forward, calculate loss, and backward.
+
+        Args:
+            inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
+            **kwargs:
+                adapter_name: Lora adapter name.
+                gradient_accumulation_steps: Number of gradient accumulation steps.
+                Any parameters needed for the specific loss type.
+        Returns:
+            The output of the model forward.
+        """
         output = self.forward(inputs=inputs, **kwargs)
         loss = self.calculate_loss(**kwargs)
         output['loss'] = loss
@@ -217,6 +258,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+        """ Clip the gradient norm
+
+        Args:
+            max_grad_norm: The maximum grad norm, default `1.0`.
+            norm_type: Default `2`.
+            **kwargs:
+                adapter_name: Lora adapter name.
+        Returns:
+            Total norm of the parameter gradients (viewed as a single vector).
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer = optimizer_config.optimizer
@@ -239,6 +290,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def step(self, **kwargs):
+        """Optimizer step.
+
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed for `optimizer.step`.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
@@ -262,6 +320,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def zero_grad(self, **kwargs):
+        """Optimizer zero_grad.
+
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed for `optimizer.zero_grad`.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
@@ -272,6 +337,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def lr_step(self, **kwargs):
+        """Do lr_scheduler step.
+
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed for `lr_scheduler.step`.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
@@ -284,6 +356,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
+        """Set the loss instance.
+
+        Args:
+            loss_cls: A loss class name, a loss plugin id, or a loss class type.
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the loss instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(loss_cls, str):
@@ -295,6 +375,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
+        """Set the optimizer.
+
+        Args:
+            optimizer_cls: An optimizer class name, an optimizer plugin id, or an optimizer class type.
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the optimizer instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(optimizer_cls, str):
@@ -317,6 +405,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
+        """Set the lr_scheduler.
+
+        Args:
+            scheduler_cls: An lr_scheduler class name, an lr_scheduler plugin id, or an lr_scheduler class type.
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the lr_scheduler instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(scheduler_cls, str):
@@ -331,6 +427,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def save(self, output_dir, **kwargs):
+        """Save model.
+
+        Args:
+            output_dir: An output_dir to save the model.
+            **kwargs:
+                adapter_name: Lora adapter name.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         model = self.strategy.unwrap_model(self.model)
         state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
@@ -390,10 +493,28 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
+        """Add adapter to model.
+
+        Args:
+            adapter_name: The lora adapter name.
+            config_or_dir:  The lora adapter config.
+            **kwargs:
+                is_trainable: Whether the adapter is trainable.
+                gradient_accumulation_steps: The number of gradient accumulation steps
+        """
         self._patch_adapter(adapter_name, config_or_dir, _default_adapter_name, **kwargs)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
+        """Set template. This is optional, if you need to input `Trajectory`,
+            you need to set the template to encode them.
+
+        Args:
+            template_cls: A template_cls class name, a template_cls plugin id, or a template_cls class type.
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the template_cls instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(template_cls, str):
@@ -405,6 +526,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
+        """Set task processor to prepare the task inputs.
+        Args:
+            processor_cls: A processor_cls class name, a processor_cls plugin id, or a processor_cls class type.
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the processor_cls instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(processor_cls, str):
@@ -416,6 +544,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):
+        """Set the grad scaler.
+        Args:
+            **kwargs:
+                adapter_name: Lora adapter name.
+                Any parameters needed to construct the GradScaler instance.
+        """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         from torch.amp.grad_scaler import GradScaler
