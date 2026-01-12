@@ -84,7 +84,7 @@ class Torch(Framework):
     @staticmethod
     @lru_cache
     def is_gpu_available() -> bool:
-        "Checks if at least one GPU device is available"
+        """Checks if at least one GPU device is available"""
         if not Torch.is_torch_available():
             return False
 

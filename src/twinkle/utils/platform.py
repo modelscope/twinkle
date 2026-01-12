@@ -378,14 +378,12 @@ class DeviceGroup:
 class Platform(ABC):
 
     @staticmethod
-    @abstractmethod
     def visible_device_env() -> str:
-        ...
+        return Platform.get_platform().visible_device_env()
 
     @staticmethod
-    @abstractmethod
     def device_prefix() -> str:
-        ...
+        return Platform.get_platform().device_prefix()
 
     @staticmethod
     def get_platform_names() -> List[str]:

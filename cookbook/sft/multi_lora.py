@@ -45,7 +45,7 @@ def train():
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-    model = MultiLoraTransformersModel(pretrained_model_name_or_path='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         target_modules='all-linear'

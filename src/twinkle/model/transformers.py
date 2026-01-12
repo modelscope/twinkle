@@ -64,7 +64,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     Args:
         model_cls: The PreTrainedModel model class, only needed when creating a blank(not pretrained) model.
         config: The config of the model.
-        pretrained_model_name_or_path: The model id or path, this argument will be used in `from_pretrained`.
+        model_id: The model id or path, this argument will be used in `from_pretrained`.
         device_mesh: The model device mesh to follow.
         mixed_precision: The mixed precision type.
         ddp_config: The DDP config to use.
@@ -72,7 +72,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         grad_scaler_config: The gradient scaler config to use.
         kwargs: Any kwargs used in `from_pretrained` or `__init__`.
 
-    If pretrained_model_name_or_path is passed in, `from_pretrained` will be used, else `__init__` will be used.
+    If model_id is passed in, `from_pretrained` will be used, else `__init__` will be used.
     """
 
     @overload
@@ -80,12 +80,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         ...
 
     @overload
-    def __init__(self, *, pretrained_model_name_or_path: str, config: Optional[PretrainedConfig] = None, **kwargs) -> None:
+    def __init__(self, *, model_id: str, config: Optional[PretrainedConfig] = None, **kwargs) -> None:
         ...
 
     def __init__(self, # noqa
                  model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
-                 pretrained_model_name_or_path: Optional[str] = None,
+                 model_id: Optional[str] = None,
                  config: Optional[PretrainedConfig] = None,
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
@@ -96,12 +96,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         super(PreTrainedModel, self).__init__()
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        if pretrained_model_name_or_path is None:
+        if model_id is None:
             self.model = model_cls(config, **kwargs)
         else:
-            pretrained_model_name_or_path = HubOperation.download_model(pretrained_model_name_or_path)
-            self.model = model_cls.from_pretrained(pretrained_model_name_or_path, config=config, **kwargs)
-        self.model_id = pretrained_model_name_or_path
+            model_id = HubOperation.download_model(model_id)
+            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
+        self.model_id = model_id
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,

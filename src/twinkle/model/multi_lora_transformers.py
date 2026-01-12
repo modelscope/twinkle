@@ -21,7 +21,7 @@ from .transformers import TransformersModel
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def __init__(self, # noqa
-                 pretrained_model_name_or_path: Optional[str] = None,
+                 model_id: Optional[str] = None,
                  config: Optional[PretrainedConfig] = None,
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
@@ -30,7 +30,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
         assert device_mesh.fsdp_world_size == 1, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
-        super().__init__(pretrained_model_name_or_path=pretrained_model_name_or_path, 
+        super().__init__(model_id=model_id, 
                         config=config, 
                         device_mesh=device_mesh, 
                         mixed_precision=mixed_precision,

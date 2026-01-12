@@ -54,7 +54,7 @@ class ActorGroup:
         self.sampler.set_template('Qwen3Template', adapter_name=adapter_name)
 
         self.model = TransformersModel(
-            pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', 
+            model_id='Qwen/Qwen2.5-7B-Instruct', 
             remote_group='actor', 
             device_mesh=actor_device_mesh
         )
@@ -141,7 +141,7 @@ def train():
     )
     
     ref_model = TransformersModel(
-        pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct', 
+        model_id='Qwen/Qwen2.5-7B-Instruct', 
         remote_group='ref', 
         device_mesh=ref_device_mesh
     )
