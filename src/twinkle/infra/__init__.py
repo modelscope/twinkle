@@ -24,6 +24,8 @@ _lazy_collect = True
 
 _full_determinism = False
 
+_inited = False
+
 _device_group: Optional[List[DeviceGroup]] = [
     DeviceGroup(
         name='default',
@@ -63,7 +65,7 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
     """
-    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh
+    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _inited
     assert mode in ('local', 'ray')
     _mode = mode
     _full_determinism = full_determinism
@@ -80,6 +82,17 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
                              device_groups=_device_group)
+        _inited = True
+
+
+def is_master():
+    if _mode == 'ray':
+        if _inited:
+            return True
+    elif _mode == 'local':
+        if Platform.is_master():
+            return True
+    return False
 
 
 def get_device_placement(device_group=None) -> str:

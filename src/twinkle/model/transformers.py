@@ -578,6 +578,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         results = {}
         for metric in optimizer_config.metrics:
+            metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
             results.update(metric.calculate())
         return results
 

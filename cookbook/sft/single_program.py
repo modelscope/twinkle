@@ -1,11 +1,18 @@
 from peft import LoraConfig
 
-from twinkle import get_device_placement, get_logger
+from twinkle import get_device_placement, get_logger, is_master
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
+import wandb
 
 logger = get_logger()
+
+
+wandb.init(
+    project="my-project",
+    name="experiment-1",
+)
 
 
 def eval(model: TransformersModel):
@@ -43,7 +50,9 @@ def train():
         model.clip_grad_and_step()
         if step % 50 == 0:
             metrics = eval(model)
-            logger.info(f'Eval finished with metrics: {metrics}')
+            metrics['step'] = step
+            if is_master():
+                wandb.log(metrics)
             if loss_metric > metrics['loss']:
                 model.save(f'checkpoint-{step}')
                 loss_metric = metrics['loss']
