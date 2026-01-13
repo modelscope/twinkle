@@ -11,7 +11,6 @@ Usage (Ray mode):
 """
 import argparse
 import os
-import sys
 
 # Parse arguments first to determine mode
 parser = argparse.ArgumentParser()
@@ -42,7 +41,7 @@ import twinkle
 from twinkle import get_device_placement, get_logger, DeviceMesh, DeviceGroup, Platform
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import VocabParallelCrossEntropyLoss
+from twinkle.loss import MegatronCrossEntropyLoss
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 
@@ -99,7 +98,7 @@ def train():
     # Use smaller batch size for single GPU to avoid OOM
     batch_size = 2 if WORLD_SIZE == 1 else 8
     
-    # In Ray mode, pass remote_group and device_mesh to DataLoader
+    # In Ray mode, pass remote_group and device_mesh
     if args.mode == 'ray':
         dataloader = DataLoader(
             dataset=create_dataset,
@@ -107,12 +106,6 @@ def train():
             remote_group=GROUP_NAME,
             device_mesh=device_mesh,
         )
-    else:
-        dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size)
-
-    # Create model
-    # In Ray mode, pass remote_group and device_mesh to MegatronModel
-    if args.mode == 'ray':
         model = MegatronModel(
             pretrained_model_name_or_path=args.model,
             tensor_model_parallel_size=TP_SIZE,
@@ -124,6 +117,7 @@ def train():
             device_mesh=device_mesh,
         )
     else:
+        dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size)
         model = MegatronModel(
             pretrained_model_name_or_path=args.model,
             tensor_model_parallel_size=TP_SIZE,
@@ -138,7 +132,7 @@ def train():
     model.add_adapter_to_model(adapter_name, lora_config, gradient_accumulation_steps=16)
     model.set_template('Qwen3Template', adapter_name=adapter_name)
     model.set_processor(InputProcessor, padding_side='right', adapter_name=adapter_name)
-    model.set_loss(VocabParallelCrossEntropyLoss, adapter_name=adapter_name)
+    model.set_loss(MegatronCrossEntropyLoss, adapter_name=adapter_name)
     model.set_optimizer(AdamW, lr=1e-4, adapter_name=adapter_name)
     model.set_lr_scheduler(LinearLR, adapter_name=adapter_name)
 

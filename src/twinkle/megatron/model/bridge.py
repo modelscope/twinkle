@@ -1,15 +1,5 @@
 # Copyright (c) twinkle authors. All rights reserved.
 # GPT Bridge for HuggingFace to Megatron-Core weight conversion.
-"""Weight conversion bridge between HuggingFace and Megatron-Core formats.
-
-This module provides independent implementation for weight loading/saving,
-
-Supports:
-- Qwen2.5 / Qwen3 model families
-- PEFT/LoRA format loading and saving
-- Tensor Parallel / Pipeline Parallel weight sharding
-- MoE (Mixture of Experts) models
-"""
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 from types import SimpleNamespace
 from dataclasses import dataclass, field

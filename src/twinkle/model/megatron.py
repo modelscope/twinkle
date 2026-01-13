@@ -16,7 +16,7 @@ import twinkle
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
+from twinkle.loss import Loss, MegatronCrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils.plugin import Plugin
@@ -151,10 +151,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.model = self._create_megatron_model(model_path, load_weights, **kwargs)
         
         self._model_wrapped = False
-        # Use VocabParallelCrossEntropyLoss by default for Megatron
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {
-            _default_adapter_name: MegatronOptimizerGroup(loss_instance=VocabParallelCrossEntropyLoss())
+            _default_adapter_name: MegatronOptimizerGroup(loss_instance=MegatronCrossEntropyLoss())
         }
         
     def _load_hf_config(self, model_path: str):
@@ -512,9 +511,13 @@ class MegatronModel(TwinkleModel, nn.Module):
         loss_value.backward()
         optimizer_config.cur_step += 1
 
-    @remote_function(dispatch='all', collect='avg')
+    @remote_function(dispatch='all', collect='avg', sync=True)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         """Combined forward and backward pass using Megatron's scheduler.
+        
+        Note: sync=True is required for Ray mode because Megatron's pipeline
+        parallel uses NCCL P2P communication that requires all ranks to enter
+        the function simultaneously.
         
         Always uses Megatron's get_forward_backward_func() which handles:
         - Pipeline scheduling (1F1B, interleaved, or no-pipeline)
@@ -583,13 +586,12 @@ class MegatronModel(TwinkleModel, nn.Module):
             labels = labels.to(torch.cuda.current_device())
         
         def split_tensor_for_cp(tensor, dim=-1):
-            """Split tensor along sequence dimension for Context Parallel.
+            """
+            Split tensor along sequence dimension for Context Parallel.
             
             With causal masking, split into 2*CP chunks and assign alternating
             chunks to balance workload across CP ranks.
             For CP rank i: chunks [i, 2*CP-1-i]
-            
-            Based on Swift's split_cp_inputs implementation.
             """
             if tensor is None or cp_size <= 1:
                 return tensor
@@ -901,7 +903,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if lr_scheduler is not None:
             lr_scheduler.step(**kwargs)
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
         """Set loss function.
         
@@ -928,7 +930,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         # Keep for API compatibility, but not used in forward_backward
         optimizer_config.loss_instance = loss_cls()
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         """Set optimizer.
         
@@ -968,7 +970,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 params[name] = param
         return params
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
         """Set learning rate scheduler.
         
@@ -989,7 +991,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         assert optimizer is not None, 'Set optimizer before setting lr_scheduler'
         optimizer_config.lr_scheduler = scheduler_cls(optimizer, **kwargs)
 
-    @remote_function()
+    @remote_function(dispatch='all', sync=True)
     def save(self, output_dir: str, **kwargs):
         """Save model checkpoint.
         
@@ -1140,7 +1142,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         BaseTuner._get_tied_target_modules = _get_tied_target_modules
         cls._peft_patched = True
 
-    @remote_function()
+    @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(
         self,
         adapter_name: str,
@@ -1250,7 +1252,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             if default_config.loss_instance:
                 self.optimizer_group[adapter_name].loss_instance = default_config.loss_instance
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
         """Set template for input encoding.
         
@@ -1268,7 +1270,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 template_cls = Plugin.load_plugin(template_cls, template.Template)
         optimizer_config.template = template_cls(self.model_id, **kwargs)
 
-    @remote_function()
+    @remote_function(dispatch='all')
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
         """Set input processor.
         

@@ -446,7 +446,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum'], Callable] = 'none',
+                    sync: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -462,6 +463,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             'none': Return as-is
             'flatten': Return a flattened list
             Callable: A callable that handles the collection
+        sync: If True, use synchronous execution (execute_all_sync) instead of async.
+            Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
     """
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -480,16 +483,22 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
-                    result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
-                    lazy_collect = _lazy_collect
-                    if hasattr(self, '_lazy_collect'):
-                        lazy_collect = self._lazy_collect
-                    result = result_func if lazy_collect else result_func()
-                    if func.__name__ == '__iter__':
-                        return self
+                    
+                    # Use sync execution for methods requiring NCCL synchronization
+                    if sync:
+                        result = RayHelper.execute_all_sync(func.__name__, _workers_and_args)
+                        return _collect_func(collect, result)
                     else:
-                        return result
+                        result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
+                        result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
+                        lazy_collect = _lazy_collect
+                        if hasattr(self, '_lazy_collect'):
+                            lazy_collect = self._lazy_collect
+                        result = result_func if lazy_collect else result_func()
+                        if func.__name__ == '__iter__':
+                            return self
+                        else:
+                            return result
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 
@@ -497,6 +506,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
         wrapper._collect = collect
         wrapper._dispatch = dispatch
         wrapper._lazy_collect = _lazy_collect
+        wrapper._sync = sync
         return wrapper
 
     return decorator

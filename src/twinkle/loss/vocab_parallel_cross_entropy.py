@@ -43,5 +43,4 @@ class VocabParallelCrossEntropyLoss(Loss):
         return loss
 
 
-# Alias for backward compatibility
 MegatronCrossEntropyLoss = VocabParallelCrossEntropyLoss
