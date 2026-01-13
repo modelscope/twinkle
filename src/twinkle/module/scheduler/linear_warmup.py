@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+# Some code borrowed from transformers
 from torch.optim.lr_scheduler import LambdaLR
 
 

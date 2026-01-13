@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import contextlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Literal
@@ -11,18 +12,17 @@ import transformers
 from peft import PeftConfig
 from peft import get_peft_model, PeftModel
 from torch import GradScaler
-from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer, AdamW, Adam
-from torch.optim.lr_scheduler import LRScheduler, CosineAnnealingLR
-from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
+from torch.optim.lr_scheduler import LRScheduler
+from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 import twinkle
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.module import scheduler
 from twinkle.loss import Loss, CrossEntropyLoss
+from twinkle.module import scheduler
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import torch_util
@@ -104,6 +104,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        # The Default tokenizer will be used to save with a model if no template was set.
+        self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
@@ -502,28 +504,40 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         optimizer_config.lr_scheduler = scheduler_cls(optimizer, **kwargs)
 
+    def __del__(self):
+        HubOperation.wait_for()
+
     @remote_function()
-    def save(self, output_dir, **kwargs):
+    def save(self, name, output_dir, **kwargs):
         """Save model.
 
         Args:
+            name: The name of checkpoint to save.
             output_dir: An output_dir to save the model.
             **kwargs:
                 adapter_name: Lora adapter name.
         """
+        checkpoint_dir = os.path.join(output_dir, name)
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         model = self.strategy.unwrap_model(self.model)
         state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
         processed_state_dict = {}
 
         for key, value in state_dict.items():
-            if isinstance(value, DTensor):
-                processed_state_dict[key] = value.full_tensor().cpu()
-            else:
-                processed_state_dict[key] = value.cpu()
+            processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
-        model.save_pretrained(output_dir, state_dict=processed_state_dict)
-        self._save_tokenizer(output_dir)
+        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict)
+        self._save_tokenizer(checkpoint_dir)
+        push_to_hub = kwargs.get('push_to_hub', False)
+        hub_model_id = kwargs.get('hub_model_id', None)
+        hub_token = kwargs.get('hub_token', None)
+        async_upload = kwargs.get('async_upload', True)
+        if push_to_hub:
+            assert hub_model_id is not None and hub_token is not None
+            if async_upload:
+                HubOperation.async_push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
+            else:
+                HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -531,6 +545,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         template_ins = optimizer_config.template
         if template_ins is not None:
             template_ins.tokenizer.save_pretrained(output_dir)
+        else:
+            self._default_tokenizer.save_pretrained(output_dir)
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
@@ -558,6 +574,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 unwrapped_model.add_adapter(adapter_name, config)
 
         self.optimizer_group[train_group] = self._construct_default_optimizer_group()
+        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
         self.optimizer_group[train_group].adapter_name = adapter_name
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)

@@ -70,3 +70,6 @@ class Message(TypedDict, total=False):
     tools: List[Tool]
     tool_call_id: Optional[str]
     reasoning_content: str
+    images: Optional[List[Union[str, Any]]]
+    videos: Optional[List[Union[str, Any]]]
+    audios: Optional[List[Union[str, Any]]]
