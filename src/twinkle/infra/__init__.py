@@ -233,7 +233,7 @@ def _get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable], result):
     if not result:
         return result
 
@@ -253,10 +253,12 @@ def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
         if isinstance(result[0], np.ndarray):
             return np.array(flatten)
         return type(result[0])(flatten)
-    elif method == 'avg':
+    elif method == 'mean':
         return np.mean(result)
     elif method == 'sum':
         return np.sum(result)
+    elif method == 'first':
+        return result[0]
     elif isinstance(method, Callable):
         # Callable
         return method(result)
@@ -446,7 +448,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none'):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -461,6 +463,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
         collect: How to collect the results.
             'none': Return as-is
             'flatten': Return a flattened list
+            'mean': Return the mean value of all processes
+            'sum': Return the sum value of all processes
+            'first': Return the first worker's result but executed in each process, usually works for scenarios of all-gather.
             Callable: A callable that handles the collection
     """
 
