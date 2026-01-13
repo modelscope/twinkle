@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from tqdm import tqdm
-
+from twinkle.hub import HubOperation
 try:
     from megatron.core import parallel_state as mpu
     MEGATRON_AVAILABLE = True
@@ -51,9 +51,28 @@ def deep_getattr(obj, attr: str, default=None):
 
 
 def is_last_rank() -> bool:
-    """Check if current process is the last rank."""
+    """Check if current process is the last rank for writing.
+    
+    For DP > 1, we want only DP rank 0 to write to avoid conflicts.
+    For PP, we want the last PP stage.
+    For TP, all TP ranks participate in gather, but only one writes.
+    """
     if not dist.is_initialized():
         return True
+    
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.is_initialized():
+            # Only DP rank 0 writes
+            dp_rank = mpu.get_data_parallel_rank()
+            if dp_rank != 0:
+                return False
+            # For PP, only last stage needs to write certain weights
+            # (handled separately in export_weights)
+            return True
+    except (ImportError, AssertionError):
+        pass
+    
     return dist.get_rank() == dist.get_world_size() - 1
 
 
@@ -1152,15 +1171,26 @@ class TwinkleGPTBridge:
             mg_models: Megatron model(s) to save.
             output_dir: Directory to save weights.
             is_peft_format: Whether saving in PEFT format.
+            
+        Note:
+            For DP > 1, only DP rank 0 writes to disk. All ranks participate
+            in tensor gather operations for TP.
         """
         torch.cuda.empty_cache()
         
-        saver = StreamingSafetensorSaver(
-            save_dir=output_dir,
-            max_shard_size=self.config.max_shard_size,
-            is_peft_format=is_peft_format,
-        )
+        # Determine if this rank should write
+        should_write = is_last_rank()
         
+        # Only the writing rank creates the saver
+        saver = None
+        if should_write:
+            saver = StreamingSafetensorSaver(
+                save_dir=output_dir,
+                max_shard_size=self.config.max_shard_size,
+                is_peft_format=is_peft_format,
+            )
+        
+        # All ranks participate in export (needed for TP gather)
         for key, tensor in self.export_weights(
             mg_models,
             target_device='cpu',
@@ -1168,12 +1198,14 @@ class TwinkleGPTBridge:
             is_peft_format=is_peft_format,
             tqdm_desc='Saving: ',
         ):
-            saver.add_tensor(key, tensor)
+            if saver is not None and tensor is not None:
+                saver.add_tensor(key, tensor)
         
-        saver.finalize()
+        if saver is not None:
+            saver.finalize()
         
-        # Save config on last rank
-        if is_last_rank():
+        # Save config on writing rank only
+        if should_write:
             if is_peft_format and not isinstance(mg_models, (list, tuple)):
                 mg_models = [mg_models]
             
@@ -1188,6 +1220,7 @@ class TwinkleGPTBridge:
                 self.hf_config.vocab_size = self.config.padded_vocab_size
                 self.hf_config.save_pretrained(output_dir)
         
+        # Synchronize all ranks before continuing
         if dist.is_initialized():
             dist.barrier()
 
@@ -1259,6 +1292,369 @@ class TwinkleBridgeAdapter:
         """Save Megatron model weights in HuggingFace format."""
         bridge = self._get_bridge()
         bridge.save_weights(mg_models, output_dir, is_peft_format)
+
+
+class TwinkleBridgeInitializer:
+    """
+    Megatron model initializer.
+    
+    This class provides complete model initialization flow including:
+    - Megatron parallel state initialization
+    - Model creation from HuggingFace config
+    - Weight loading using TwinkleGPTBridge
+    
+    Example:
+        initializer = TwinkleBridgeInitializer(
+            tp_size=2,
+            pp_size=1,
+            params_dtype=torch.bfloat16,
+        )
+        model = initializer.create_model('Qwen/Qwen2.5-7B-Instruct')
+    """
+    
+    def __init__(
+        self,
+        tp_size: int = 1,
+        pp_size: int = 1,
+        cp_size: int = 1,
+        ep_size: int = 1,
+        etp_size: Optional[int] = None,
+        params_dtype=None,
+        use_cpu_initialization: bool = False,
+        attention_backend: str = 'flash',
+        recompute_granularity: Optional[str] = 'selective',
+        recompute_modules: Optional[list] = None,
+        recompute_method: Optional[str] = None,
+        recompute_num_layers: Optional[int] = None,
+    ):
+        """Initialize TwinkleBridgeInitializer.
+        
+        Args:
+            tp_size: Tensor parallel size.
+            pp_size: Pipeline parallel size.
+            cp_size: Context parallel size.
+            ep_size: Expert parallel size.
+            etp_size: Expert tensor parallel size.
+            params_dtype: Parameter dtype (default: torch.bfloat16).
+            use_cpu_initialization: Initialize on CPU first.
+            attention_backend: Attention backend.
+            recompute_granularity: Activation recomputation strategy.
+                'selective' (default): Only recompute core attention (memory efficient).
+                'full': Recompute entire transformer layer (most memory efficient).
+                None: No recomputation (fastest but highest memory).
+            recompute_modules: Modules to recompute when using 'selective' granularity.
+                Default: ['core_attn'] for efficient memory/compute trade-off.
+            recompute_method: Method for full recompute ('uniform' or 'block').
+                Required when recompute_granularity='full'.
+            recompute_num_layers: Number of layers to recompute for 'full' mode.
+                Required when recompute_granularity='full'.
+        """
+        self.tp_size = tp_size
+        self.pp_size = pp_size
+        self.cp_size = cp_size
+        self.ep_size = ep_size
+        self.etp_size = etp_size or tp_size
+        self.params_dtype = params_dtype if params_dtype is not None else torch.bfloat16
+        self.use_cpu_initialization = use_cpu_initialization
+        self.attention_backend = attention_backend
+        self.recompute_granularity = recompute_granularity
+        self.recompute_modules = recompute_modules or ['core_attn']
+        self.recompute_method = recompute_method
+        self.recompute_num_layers = recompute_num_layers
+        
+        self._model = None
+        self._bridge = None
+        self._hf_config = None
+        self._model_path = None
+    
+    def _download_model(self, model_path: str) -> str:
+        """Download model if it's a model ID."""
+        if os.path.isdir(model_path):
+            return model_path
+        
+        try:
+            from modelscope import snapshot_download
+            return snapshot_download(model_path)
+        except ImportError:
+            from huggingface_hub import snapshot_download
+            return snapshot_download(model_path)
+    
+    def _initialize_megatron(self, hf_config: Any = None):
+        """Initialize Megatron parallel state.
+        
+        This sets up the required process groups for tensor, pipeline,
+        and data parallelism using Megatron's parallel state module directly.
+        
+        Args:
+            hf_config: Optional HuggingFace config for additional model parameters.
+        """
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        
+        # Check if already initialized
+        try:
+            if mpu.is_initialized():
+                return
+        except AssertionError:
+            pass
+        
+        # Initialize distributed if not already
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+        
+        # Initialize Megatron parallel state directly
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=self.pp_size,
+            context_parallel_size=self.cp_size,
+            expert_model_parallel_size=self.ep_size,
+        )
+        
+        # Initialize CUDA RNG tracker for tensor parallel random states
+        # This is required when use_cpu_initialization=False (GPU initialization)
+        model_parallel_cuda_manual_seed(42)
+    
+    def _create_model_from_config(
+        self, 
+        hf_config: Any, 
+        padded_vocab_size: int,
+    ) -> nn.Module:
+        """Create Megatron GPT model from HuggingFace config.
+        
+        Args:
+            hf_config: HuggingFace model configuration.
+            padded_vocab_size: Padded vocabulary size.
+            
+        Returns:
+            Megatron GPT model.
+        """
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+        from megatron.core.transformer import TransformerConfig
+        from megatron.core.models.gpt import GPTModel
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        
+        # Convert HF config to Megatron config
+        from ..utils import convert_hf_config
+        mg_config_dict = convert_hf_config(hf_config)
+        
+        # Build TransformerConfig
+        num_attention_heads = mg_config_dict['num_attention_heads']
+        num_query_groups = mg_config_dict.get('num_query_groups', num_attention_heads)
+        num_layers = mg_config_dict['num_layers']
+        
+        # Configure activation recomputation
+        recompute_method = self.recompute_method
+        recompute_num_layers = self.recompute_num_layers
+        
+        # Auto-configure for 'full' recomputation if not specified
+        if self.recompute_granularity == 'full':
+            if recompute_method is None:
+                recompute_method = 'uniform'
+            if recompute_num_layers is None:
+                # Recompute all layers for maximum memory savings
+                recompute_num_layers = num_layers // self.pp_size
+        
+        # Create finalize_model_grads function for DP gradient synchronization
+        # Megatron's native finalize_model_grads requires DDP-wrapped models with ddp_config.
+        # For PEFT/LoRA models, we use a custom implementation that handles non-DDP models.
+        from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
+        
+        def finalize_model_grads_for_lora(model, num_tokens=None, pg_collection=None):
+            """Finalize model grads that handles both DDP and PEFT/LoRA models.
+            
+            For DDP-wrapped models: Delegates to Megatron's native finalize_model_grads
+            For PEFT/LoRA models: Manually all-reduce gradients across DP ranks
+            
+            This is necessary because PEFT models don't have ddp_config attribute
+            that Megatron's native implementation expects.
+            """
+            from megatron.core import parallel_state as mpu
+            
+            # Check if model is DDP-wrapped (has ddp_config)
+            if hasattr(model[0], 'ddp_config'):
+                # Use native implementation for DDP models
+                return _native_finalize_model_grads(model, num_tokens, pg_collection)
+            
+            # For PEFT/LoRA models, call finish_grad_sync on each chunk
+            # The model should have finish_grad_sync added by MegatronModel.add_adapter_to_model
+            for model_chunk in model:
+                if hasattr(model_chunk, 'finish_grad_sync'):
+                    model_chunk.finish_grad_sync()
+        
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=mg_config_dict['hidden_size'],
+            num_attention_heads=num_attention_heads,
+            num_query_groups=num_query_groups,
+            ffn_hidden_size=mg_config_dict.get('ffn_hidden_size', 4 * mg_config_dict['hidden_size']),
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=self.pp_size,
+            context_parallel_size=self.cp_size,
+            expert_model_parallel_size=self.ep_size,
+            params_dtype=self.params_dtype,
+            pipeline_dtype=self.params_dtype,  # Required when using pipeline parallelism
+            use_cpu_initialization=self.use_cpu_initialization,
+            add_qkv_bias=mg_config_dict.get('add_qkv_bias', False),
+            add_bias_linear=not mg_config_dict.get('disable_bias_linear', True),
+            gated_linear_unit=mg_config_dict.get('swiglu', True),
+            normalization='RMSNorm',
+            layernorm_epsilon=mg_config_dict.get('norm_epsilon', 1e-6),
+            qk_layernorm=mg_config_dict.get('qk_layernorm', False),
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            # Activation recomputation for memory efficiency
+            recompute_granularity=self.recompute_granularity,
+            recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
+            recompute_method=recompute_method,
+            recompute_num_layers=recompute_num_layers,
+            # Critical: Set finalize_model_grads_func for DP gradient synchronization
+            # Uses custom wrapper that handles both DDP and PEFT/LoRA models
+            finalize_model_grads_func=finalize_model_grads_for_lora,
+        )
+        
+        # Get layer spec
+        try:
+            layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=mg_config_dict.get('num_experts'),
+                moe_grouped_gemm=False,
+                qk_layernorm=mg_config_dict.get('qk_layernorm', False),
+            )
+        except Exception:
+            from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+            layer_spec = get_gpt_layer_local_spec(
+                num_experts=mg_config_dict.get('num_experts'),
+                moe_grouped_gemm=False,
+                qk_layernorm=mg_config_dict.get('qk_layernorm', False),
+            )
+        
+        # Create model
+        max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
+        rotary_base = mg_config_dict.get('rotary_base', 10000)
+        
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=padded_vocab_size,
+            max_sequence_length=max_seq_length,
+            pre_process=mpu.is_pipeline_first_stage(),
+            post_process=mpu.is_pipeline_last_stage(),
+            parallel_output=True,
+            share_embeddings_and_output_weights=getattr(hf_config, 'tie_word_embeddings', False),
+            position_embedding_type='rope',
+            rotary_base=rotary_base,
+        )
+        
+        return model
+    
+    def _pad_vocab_size(self, vocab_size: int) -> int:
+        """Pad vocab size for tensor parallelism."""
+        divisor = self.tp_size * 128
+        return ((vocab_size + divisor - 1) // divisor) * divisor
+    
+    def create_model(
+        self,
+        model_path: str,
+        load_weights: bool = True,
+    ) -> nn.Module:
+        """Create Megatron model from HuggingFace checkpoint.
+        
+        Args:
+            model_path: Path to HuggingFace model or model ID.
+            load_weights: Whether to load weights.
+            
+        Returns:
+            Megatron model.
+        """
+        from transformers import AutoConfig
+        
+        # Download model if needed
+        model_path = HubOperation.download_model(model_path)
+        self._model_path = model_path
+        
+        # Load HF config first (needed for initialization)
+        self._hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # Initialize Megatron parallel state with hf_config for proper args setup
+        self._initialize_megatron(self._hf_config)
+        
+        # Calculate padded vocab size
+        padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
+        
+        # Create model
+        self._model = self._create_model_from_config(self._hf_config, padded_vocab_size)
+        
+        # Load weights
+        if load_weights:
+            bridge_adapter = TwinkleBridgeAdapter(
+                hf_config=self._hf_config,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                ep_size=self.ep_size,
+                etp_size=self.etp_size,
+                model_path=model_path,
+                padded_vocab_size=padded_vocab_size,
+            )
+            bridge_adapter.load_weights(self._model, model_path)
+            self._bridge = bridge_adapter._get_bridge()
+        
+        # Synchronize all ranks after model creation and weight loading
+        # This is critical for Pipeline Parallel to ensure all ranks are ready
+        # before any collective communication operations
+        if dist.is_initialized():
+            dist.barrier()
+        
+        return self._model
+    
+    @property
+    def hf_config(self):
+        """Get the HuggingFace config."""
+        return self._hf_config
+    
+    @property
+    def bridge(self):
+        """Get the bridge instance."""
+        return self._bridge
+    
+    def load_weights(self, model: nn.Module, model_path: str):
+        """Load weights into an existing model.
+        
+        Args:
+            model: Megatron model.
+            model_path: Path to HuggingFace checkpoint.
+        """
+        if self._bridge is None and self._hf_config is None:
+            raise ValueError("Must call create_model first")
+        
+        padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
+        bridge_adapter = TwinkleBridgeAdapter(
+            hf_config=self._hf_config,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            ep_size=self.ep_size,
+            model_path=model_path,
+            padded_vocab_size=padded_vocab_size,
+        )
+        bridge_adapter.load_weights(model, model_path)
+    
+    def save_weights(self, models: Union[nn.Module, List[nn.Module]], output_dir: str, is_peft_format: bool = False):
+        """Save weights in HuggingFace format.
+        
+        Args:
+            models: Megatron model(s).
+            output_dir: Output directory.
+            is_peft_format: Whether to save in PEFT format.
+        """
+        if self._bridge is None:
+            raise ValueError("Must load weights first")
+        
+        if not isinstance(models, (list, tuple)):
+            models = [models]
+        
+        self._bridge.save_weights(models, output_dir, is_peft_format=is_peft_format)
 
 
 # Legacy functions for backward compatibility

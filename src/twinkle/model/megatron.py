@@ -111,6 +111,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         use_distributed_optimizer: bool = True,
         load_weights: bool = True,
         use_megatron_bridge: bool = True,  # Use bridge-based initialization (recommended)
+        recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
+        recompute_modules: Optional[list] = None,  # Modules to recompute
         **kwargs,
     ):
         check_megatron_available()
@@ -120,6 +122,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.use_megatron_bridge = use_megatron_bridge
+        self.recompute_granularity = recompute_granularity
+        self.recompute_modules = recompute_modules
         
         # Load HuggingFace config first
         model_path = HubOperation.download_model(pretrained_model_name_or_path)
@@ -197,11 +201,12 @@ class MegatronModel(TwinkleModel, nn.Module):
     ) -> nn.Module:
         """Create Megatron model using bridge-based initialization flow.
         
-        This approach uses the bridge initialization which includes:
+        This approach uses TwinkleBridgeInitializer for independent initialization
+        It includes:
         - Proper config conversion from HuggingFace to Megatron format
         - Correct Megatron initialization (initialize_megatron)
-        - Correct model creation (model_provider)
-        - All necessary patches (RoPE, TransformerLayer, etc.)
+        - Correct model creation
+        - Weight loading with TwinkleGPTBridge
         
         Args:
             model_path: Path to HuggingFace model.
@@ -212,16 +217,21 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             Megatron model on GPU.
         """
-        from twinkle.megatron.model.swift_bridge import MegatronBridgeInitializer
+        from twinkle.megatron.model.bridge import TwinkleBridgeInitializer
         
         # Create bridge-based initializer
-        self._bridge_initializer = MegatronBridgeInitializer(
+        self._bridge_initializer = TwinkleBridgeInitializer(
             tp_size=self.strategy.tp_size,
             pp_size=self.strategy.pp_size,
+            cp_size=self.strategy.cp_size,
             ep_size=self.strategy.ep_size,
             params_dtype=params_dtype,
-            use_cpu_initialization=True,
+            use_cpu_initialization=False,
             attention_backend='flash',  # Use flash for training performance
+            recompute_granularity=self.recompute_granularity,
+            recompute_modules=self.recompute_modules,
+            recompute_method=getattr(self, 'recompute_method', None),
+            recompute_num_layers=getattr(self, 'recompute_num_layers', None),
         )
         
         # Create model (this calls initialize_megatron internally)
@@ -279,12 +289,24 @@ class MegatronModel(TwinkleModel, nn.Module):
         return model
     
     def _move_model_to_gpu(self, model: nn.Module) -> nn.Module:
+        """Move model to correct GPU device.
+        
+        This method handles moving parameters, buffers, and any cached tensors
+        (like RoPE embeddings) to the correct device for distributed training.
+        """
         # Determine the target device based on local rank
         local_rank = dist.get_rank() % torch.cuda.device_count() if dist.is_initialized() else 0
         device = torch.device(f'cuda:{local_rank}')
         
+        # Set CUDA device explicitly
+        torch.cuda.set_device(local_rank)
+        
         # Move all parameters and buffers to GPU
         model = model.to(device)
+        
+        # Force synchronize to ensure all transfers complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
         
         return model
         
@@ -353,7 +375,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         if processor is not None:
             inputs: Dict[str, Any] = processor(inputs)
             
-        labels = inputs.pop('labels', None)
+        labels = inputs.get('labels', None)
+        if 'labels' in inputs:
+            try:
+                del inputs['labels']
+            except (TypeError, KeyError):
+                pass  # Some dict-like types don't support deletion
         
         # Forward through model
         outputs = self._forward_step(inputs)
@@ -485,7 +512,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         loss_value.backward()
         optimizer_config.cur_step += 1
 
-    @remote_function(collect='avg')
+    @remote_function(dispatch='all', collect='avg')
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         """Combined forward and backward pass using Megatron's scheduler.
         
@@ -522,11 +549,32 @@ class MegatronModel(TwinkleModel, nn.Module):
             inputs = processor(inputs)
         
         # Store labels before removing from inputs
-        labels = inputs.pop('labels', None)
+        labels = inputs.get('labels', None)
+        if 'labels' in inputs:
+            try:
+                del inputs['labels']
+            except (TypeError, KeyError):
+                pass  # Some dict-like types don't support deletion
+        
+        # Get CP size for sequence padding and splitting
+        cp_size = self.strategy.cp_size
+        cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
         
         # Get sequence length and batch size
-        seq_length = inputs['input_ids'].shape[1] if 'input_ids' in inputs else 1
+        # Note: Megatron's schedule internally divides seq_length by cp_size
+        # So we pass the padded full sequence length here
+        original_seq_length = inputs['input_ids'].shape[1] if 'input_ids' in inputs else 1
         micro_batch_size = inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1
+        
+        # For CP > 1, pad seq_length to be divisible by 2*cp_size
+        if cp_size > 1:
+            divisor = 2 * cp_size
+            if original_seq_length % divisor != 0:
+                seq_length = original_seq_length + (divisor - original_seq_length % divisor)
+            else:
+                seq_length = original_seq_length
+        else:
+            seq_length = original_seq_length
         
         # Move labels to GPU if needed
         if labels is not None and not isinstance(labels, torch.Tensor):
@@ -534,19 +582,37 @@ class MegatronModel(TwinkleModel, nn.Module):
         elif labels is not None:
             labels = labels.to(torch.cuda.current_device())
         
-        # Define loss function that matches Megatron's expected signature
-        # loss_func(output_tensor) -> (loss, {str: tensor})
-        def loss_func(labels_tensor, loss_instance, output_tensor):
-            if labels_tensor is None or loss_instance is None:
-                loss = torch.tensor(0.0, device=output_tensor.device, requires_grad=True)
-                return loss, {'loss': loss}
+        def split_tensor_for_cp(tensor, dim=-1):
+            """Split tensor along sequence dimension for Context Parallel.
             
-            inputs_dict = {'labels': labels_tensor}
-            outputs_dict = {'logits': output_tensor}
-            loss = loss_instance(inputs_dict, outputs_dict)
+            With causal masking, split into 2*CP chunks and assign alternating
+            chunks to balance workload across CP ranks.
+            For CP rank i: chunks [i, 2*CP-1-i]
             
-            # Megatron expects (loss, {str: tensor}) for logging
-            return loss, {'loss': loss.detach()}
+            Based on Swift's split_cp_inputs implementation.
+            """
+            if tensor is None or cp_size <= 1:
+                return tensor
+            
+            if dim < 0:
+                dim = (dim + tensor.ndim) % tensor.ndim
+            
+            seq_len = tensor.shape[dim]
+            
+            # Reshape to [batch, 2*cp_size, seq_per_chunk, ...]
+            view_shape = list(tensor.shape)
+            view_shape[dim:dim+1] = [2 * cp_size, seq_len // (2 * cp_size)]
+            reshaped = tensor.view(*view_shape)
+            
+            # Select chunks [cp_rank, 2*cp_size-1-cp_rank]
+            index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], 
+                                device='cpu', pin_memory=True).cuda(non_blocking=True)
+            selected = reshaped.index_select(dim, index)
+            
+            # Reshape back: [batch, 2*seq_per_chunk, ...]
+            out_shape = list(tensor.shape)
+            out_shape[dim] = seq_len // cp_size
+            return selected.reshape(*out_shape)
         
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -555,6 +621,26 @@ class MegatronModel(TwinkleModel, nn.Module):
             input_ids = batch.get('input_ids')
             position_ids = batch.get('position_ids')
             attention_mask = batch.get('attention_mask')
+            batch_labels = batch.get('labels', labels)  # Use batch labels or passed labels
+            
+            # Pad sequence for Context Parallel compatibility
+            # Megatron's RoPE requires seq_len % (2 * cp_size) == 0
+            if cp_size > 1 and input_ids is not None:
+                seq_len = input_ids.shape[1]
+                divisor = 2 * cp_size
+                if seq_len % divisor != 0:
+                    pad_len = divisor - (seq_len % divisor)
+                    # Pad input_ids
+                    input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
+                    # Pad labels if present
+                    if batch_labels is not None:
+                        batch_labels = torch.nn.functional.pad(batch_labels, (0, pad_len), value=-100)
+                    # Pad attention_mask if present
+                    if attention_mask is not None:
+                        attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+                    # Pad position_ids if present
+                    if position_ids is not None:
+                        position_ids = torch.nn.functional.pad(position_ids, (0, pad_len), value=0)
             
             # Create position_ids if not provided
             if position_ids is None and input_ids is not None:
@@ -564,15 +650,55 @@ class MegatronModel(TwinkleModel, nn.Module):
                     dtype=torch.long,
                 ).unsqueeze(0).expand(input_ids.shape[0], -1)
             
-            # Forward pass
+            # Split tensors for Context Parallel
+            # Each CP rank processes a portion of the sequence
+            if cp_size > 1:
+                input_ids = split_tensor_for_cp(input_ids, dim=-1)
+                position_ids = split_tensor_for_cp(position_ids, dim=-1)
+                attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
+                batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
+            
+            # Forward pass with labels - Megatron will compute loss internally
+            # This uses Megatron's compute_language_model_loss which properly handles
+            # vocab parallel cross entropy
             output_tensor = model(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
+                labels=batch_labels,  # Pass labels to let Megatron compute loss
             )
             
-            # Return output and partial loss function
-            return output_tensor, partial(loss_func, labels, optimizer_config.loss_instance)
+            # Megatron's compute_language_model_loss returns per-token loss [batch, seq]
+            # We need to aggregate it with loss_mask
+            def megatron_loss_func(labels_for_mask, cp_size, output_tensor):
+                # output_tensor is per-token loss [batch, seq]
+                # Create loss mask from labels (ignore -100)
+                loss_mask = (labels_for_mask != -100).float()
+                
+                # Flatten and compute mean
+                losses = output_tensor.float().view(-1)
+                loss_mask_flat = loss_mask.view(-1)
+                
+                # Compute local sum and count
+                local_loss_sum = torch.sum(losses * loss_mask_flat)
+                local_count = loss_mask_flat.sum()
+                
+                # For CP > 1, aggregate loss across CP ranks
+                if cp_size > 1:
+                    # Combine loss_sum and count for efficient all-reduce
+                    loss_data = torch.cat([local_loss_sum.view(1), local_count.view(1)])
+                    torch.distributed.all_reduce(
+                        loss_data, 
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=mpu.get_context_parallel_group()
+                    )
+                    loss = loss_data[0] / loss_data[1].clamp(min=1)
+                else:
+                    loss = local_loss_sum / local_count.clamp(min=1)
+                
+                return loss, {'loss': loss.detach()}
+            
+            return output_tensor, partial(megatron_loss_func, batch_labels, cp_size)
         
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -607,7 +733,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                     break
         
         # For PP > 1, broadcast loss from last PP stage to all ranks
-        from megatron.core import parallel_state as mpu
+        # Note: mpu is imported at module level, no need to reimport
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             if isinstance(loss, torch.Tensor):
                 loss_tensor = loss.detach().clone()
@@ -624,6 +750,15 @@ class MegatronModel(TwinkleModel, nn.Module):
             loss = loss_tensor.item()
         
         optimizer_config.cur_step += 1
+        
+        # Critical: Synchronize all DP replicas before returning
+        # This ensures all DP replicas complete the same training step before
+        # moving to the next batch, preventing P2P communication deadlocks
+        dp_world_size = mpu.get_data_parallel_world_size()
+        if dp_world_size > 1:
+            # Use barrier on DP+CP group to synchronize all replicas
+            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            dist.barrier(group=dp_cp_group)
         
         if isinstance(loss, torch.Tensor):
             return loss.detach().cpu().float().numpy()
@@ -746,8 +881,16 @@ class MegatronModel(TwinkleModel, nn.Module):
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
         """Set loss function.
         
+        NOTE: For MegatronModel, the loss is computed internally by Megatron's
+        GPTModel when labels are passed. This method is kept for API compatibility
+        but the provided loss_cls is NOT used during forward_backward.
+        
+        Megatron internally uses vocab_parallel_cross_entropy which correctly
+        handles tensor parallelism. This design ensures Loss classes don't need
+        to be aware of the training backend (Megatron vs Transformers).
+        
         Args:
-            loss_cls: Loss class or string name.
+            loss_cls: Loss class or string name (not used for Megatron).
             **kwargs: Additional arguments.
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -758,6 +901,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 loss_cls = getattr(twinkle.loss, loss_cls)
             else:
                 loss_cls = Plugin.load_plugin(loss_cls, Loss)
+        # Keep for API compatibility, but not used in forward_backward
         optimizer_config.loss_instance = loss_cls()
 
     @remote_function()
@@ -840,42 +984,66 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._save_tokenizer(output_dir, adapter_name)
         
     def _save_hf_format(self, output_dir: str, adapter_name: str):
-        """Save in HuggingFace format using bridge adapter."""
+        """Save in HuggingFace format using bridge adapter.
+        
+        For distributed training:
+        - All PP ranks participate in export (each has different layers)
+        - Only DP rank 0 actually writes to disk
+        - Uses barrier for synchronization
+        
+        For LoRA training:
+        - Saves in PEFT format (adapter_model.safetensors + adapter_config.json)
+        """
         from twinkle.megatron.model.bridge import TwinkleBridgeAdapter
         import os
         
-        # Only save from last PP rank and first DP rank to avoid conflicts
-        if not self.strategy.is_pipeline_last_stage():
-            return
+        # Check if this is LoRA training (has adapter_name other than default)
+        is_lora = adapter_name and adapter_name != ''
+        is_peft_format = is_lora
         
-        # Only let DP rank 0 save to avoid file conflicts
-        if hasattr(self.strategy, 'dp_rank') and self.strategy.dp_rank != 0:
-            return
-        
-        # Also check via parallel_state if available
+        # Create output directory on rank 0 only
         try:
             from megatron.core import parallel_state as mpu
-            if mpu.is_initialized() and mpu.get_data_parallel_rank() != 0:
-                return
+            dp_rank = mpu.get_data_parallel_rank() if mpu.is_initialized() else 0
         except (ImportError, AssertionError):
-            pass
-            
-        os.makedirs(output_dir, exist_ok=True)
+            dp_rank = 0
+        
+        if dp_rank == 0:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Synchronize before saving
+        if dist.is_initialized():
+            dist.barrier()
+        
+        # Calculate padded vocab size
+        padded_vocab_size = self._pad_vocab_size(self.hf_config.vocab_size) \
+            if hasattr(self, '_pad_vocab_size') else None
         
         # Use TwinkleBridgeAdapter for weight conversion
+        # All ranks participate - bridge handles which ranks write
         adapter = TwinkleBridgeAdapter(
             hf_config=self.hf_config,
             tp_size=self.strategy.tp_size,
             pp_size=self.strategy.pp_size,
             ep_size=self.strategy.ep_size,
-            model_path=self.model_id,
+            model_path=self._model_path if hasattr(self, '_model_path') else self.model_id,
+            padded_vocab_size=padded_vocab_size,
         )
         
-        # Use bridge to save weights in HuggingFace format
-        adapter.save_weights([self.model], output_dir, is_peft_format=False)
-            
-        # Save config
-        self.hf_config.save_pretrained(output_dir)
+        # Get the model (unwrap if DDP wrapped)
+        model = self.strategy.unwrap_model(self.model)
+        
+        # Use bridge to save weights
+        adapter.save_weights([model], output_dir, is_peft_format=is_peft_format)
+        
+        # Save config on rank 0 only
+        if dp_rank == 0:
+            self.hf_config.save_pretrained(output_dir)
+    
+    def _pad_vocab_size(self, vocab_size: int) -> int:
+        """Pad vocab size for tensor parallelism."""
+        divisor = self.strategy.tp_size * 128
+        return ((vocab_size + divisor - 1) // divisor) * divisor
         
     def _save_megatron_format(self, output_dir: str, adapter_name: str):
         """Save in Megatron checkpoint format."""
@@ -1012,6 +1180,33 @@ class MegatronModel(TwinkleModel, nn.Module):
                 self.model.module = model
         else:
             self.model = model
+        
+        # Add finish_grad_sync method for Megatron's finalize_model_grads compatibility
+        # This is needed because Megatron's forward_backward_func calls finish_grad_sync
+        # on model chunks, but PEFT models don't have this method by default
+        if not hasattr(self.model, 'finish_grad_sync'):
+            def finish_grad_sync():
+                """Synchronize gradients across DP ranks for non-DDP models.
+                
+                This is a compatibility shim for Megatron's finalize_model_grads.
+                For PEFT/LoRA models, we manually all-reduce gradients.
+                """
+                dp_world_size = mpu.get_data_parallel_world_size()
+                if dp_world_size > 1:
+                    dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+                    grads = []
+                    for param in self.model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            grads.append(param.grad.data)
+                    
+                    if grads:
+                        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+                        coalesced = _flatten_dense_tensors(grads)
+                        dist.all_reduce(coalesced, op=dist.ReduceOp.AVG, group=dp_cp_group)
+                        for grad, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                            grad.copy_(synced)
+            
+            self.model.finish_grad_sync = finish_grad_sync
             
         # Create optimizer group for adapter
         self.optimizer_group[adapter_name] = MegatronOptimizerGroup()

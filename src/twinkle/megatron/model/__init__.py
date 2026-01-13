@@ -7,6 +7,7 @@ This module provides independent implementation for weight loading/saving,
 from .bridge import (
     # Main classes
     TwinkleBridgeAdapter,
+    TwinkleBridgeInitializer,
     TwinkleGPTBridge,
     BridgeConfig,
     SafetensorLoader,
@@ -28,6 +29,7 @@ from .qwen3 import Qwen3ModelMeta, get_model_default_config
 __all__ = [
     # Bridge classes
     'TwinkleBridgeAdapter',
+    'TwinkleBridgeInitializer',
     'TwinkleGPTBridge',
     'BridgeConfig',
     'SafetensorLoader',
