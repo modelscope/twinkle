@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from torch.utils.data import BatchSampler
 
 from twinkle import DeviceMesh
@@ -21,6 +22,7 @@ class DeviceMeshSampler(BatchSampler):
             else:
                 data = batch[self.device_mesh.get_slice(len(batch))]
                 if not data:
+                    # Use rank0 if data is not enough
                     data = batch[self.device_mesh.get_slice(len(batch), 0)]
                 yield data
 

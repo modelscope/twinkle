@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 from pathlib import Path
 from typing import Dict, List, Tuple, Set
@@ -444,12 +445,12 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
     Each adapter has its own lifecycle managed through automatic heartbeats.
     """
     
-    def __init__(self, pretrained_model_name_or_path: str, **kwargs):
+    def __init__(self, model_id: str, **kwargs):
         """Initialize model client."""
         self.server_url = TWINKLE_SERVER_URL
-        if '://' in pretrained_model_name_or_path:
-            pretrained_model_name_or_path = pretrained_model_name_or_path.split('://')[1]
-        self.server_url = f'{self.server_url}/models/{pretrained_model_name_or_path}'
+        if '://' in model_id:
+            model_id = model_id.split('://')[1]
+        self.server_url = f'{self.server_url}/models/{model_id}'
         self.adapter_name = None
         response = http_post(
             url=f'{self.server_url}/create',

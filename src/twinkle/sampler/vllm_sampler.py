@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import uuid
 from dataclasses import dataclass, asdict

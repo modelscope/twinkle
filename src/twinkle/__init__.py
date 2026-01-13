@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING
 from .utils.import_utils import _LazyModule # noqa
 

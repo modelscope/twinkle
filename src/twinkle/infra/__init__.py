@@ -1,13 +1,14 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
 import os
 from typing import Literal, List, Optional, Union, Callable
 from typing import TypeVar
-from types import MethodType
+
 import numpy as np
 
-from ..utils import DeviceGroup, DeviceMesh, Platform
 from .ray import RayHelper
+from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
 
 T1 = TypeVar('T1', bound=object)
@@ -16,8 +17,6 @@ _mode: Optional[Literal['local', 'ray']] = 'local'
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
-
-_nproc_per_node: Optional[int] = 8
 
 _seed = 42
 
@@ -43,7 +42,8 @@ _remote_components: dict = {}
 
 
 def initialize(mode: Literal['local', 'ray'] = 'local',
-               nproc_per_node: Optional[int] = 8,
+               nproc_per_node: int = 8,
+               ncpu_proc_per_node: int = 8,
                seed: int = 42,
                full_determinism: bool = False,
                groups: Optional[List[DeviceGroup]] = None,
@@ -55,14 +55,15 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         mode: The mode of twinkle works in.
             'local': Run with a single GPU, or torchrun.
             'ray': Run in ray cluster.
-        nproc_per_node: The GPU count per node.
+        nproc_per_node: The GPU count(number of processes) per node.
+        ncpu_proc_per_node: The CPU processes count per node.
         seed: Seed everything with this.
         full_determinism: Freeze the random, use determinism kernels, default `False`.
         groups: The device groups of the training.
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
     """
-    global _mode, _device_group, _nproc_per_node, _seed, _full_determinism, _lazy_collect, _device_mesh
+    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh
     assert mode in ('local', 'ray')
     _mode = mode
     _full_determinism = full_determinism
@@ -76,8 +77,9 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         requires('ray')
         if groups is not None:
             _device_group = groups
-        _nproc_per_node = nproc_per_node
-        RayHelper.initialize(nproc_per_node=_nproc_per_node, device_groups=_device_group)
+        RayHelper.initialize(nproc_per_node=nproc_per_node,
+                             ncpu_proc_per_node=ncpu_proc_per_node,
+                             device_groups=_device_group)
 
 
 def get_device_placement(device_group=None) -> str:
@@ -327,8 +329,8 @@ def _get_device_mesh_param(args, kwargs):
 
 
 def _prepare_lazy_collect(args, kwargs):
-    # if a worker received an actor handle, lazy collect should be false to prevent any outer function receives
-    # an object ref
+    # if a worker received an actor handle,
+    # lazy collect should be false to prevent any outer function receives an object ref
     if not RayHelper.is_worker():
         return args, kwargs
     for arg in list(args) + list(kwargs.values()):
@@ -369,17 +371,15 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                 caller_line = frame.f_lineno
                 instance_id = kwargs.pop('instance_id', '') + f"{caller_file}_{caller_line}"
                 remote_group = kwargs.pop('remote_group', None)
-                if not remote_group and len(_device_group) == 1 and not RayHelper.is_worker():
-                    # To the default group
-                    remote_group = _device_group[0].name
                 check_unsafe(*args, **kwargs)
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
-                if device_mesh is None and device_mesh_name:
-                    device_mesh = _device_mesh
-                    kwargs[device_mesh_name] = _device_mesh
-
                 if remote_group and device_mesh_name:
+                    # If it's a remote component
+                    if device_mesh is None:
+                        device_mesh = _device_mesh
+                        kwargs[device_mesh_name] = _device_mesh
+
                     device_group = [dg for dg in _device_group if dg.name == remote_group][0]
                     device_group._device_mesh[self.__class__.__name__] = device_mesh
 
@@ -399,7 +399,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     if not device_mesh_name:
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
-                    from ray.actor import ActorHandle
                     args, kwargs = _prepare_lazy_collect(args, kwargs)
                     init_method(self, *args, **kwargs)
                 else:
@@ -447,7 +446,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'avg', 'sum'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum'], Callable] = 'none'):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:

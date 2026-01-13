@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Dict, Any, Optional, Literal
 
 from .base import TrainStrategy
@@ -5,6 +6,14 @@ from twinkle import DeviceMesh
 
 
 class AccelerateStrategy(TrainStrategy):
+    """A training strategy that uses `accelerate` to wrap models.
+
+    Args:
+        device_mesh: The model device mesh.
+        mixed_precision: The mixed precision type.
+        ddp_config: Any ddp config passed into accelerate.
+        fsdp_config: Any fsdp config passed into accelerate.
+    """
 
     def __init__(self,
                  device_mesh: Optional[DeviceMesh] = None,

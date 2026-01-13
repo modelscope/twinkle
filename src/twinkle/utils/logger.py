@@ -1,4 +1,4 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib.util
 import logging
 import os
@@ -52,7 +52,7 @@ def warning_once(self, msg, *args, **kwargs):
     self.warning(msg)
 
 
-def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, file_mode: str = 'w'):
+def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, file_mode: str = 'w', only_local_master: bool = True) -> logging.Logger:
     """ Get logging logger
 
     Args:
@@ -61,6 +61,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
         log_level: Logging level.
         file_mode: Specifies the mode to open the file, if filename is
             specified (if filemode is unspecified, it defaults to 'w').
+        only_local_master: Output log only when it's local master, default True.
     """
     if log_level is None:
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -86,7 +87,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
     stream_handler = logging.StreamHandler()
     handlers = [stream_handler]
 
-    is_worker0 = _is_local_master()
+    is_worker0 = _is_local_master() or not only_local_master
 
     if is_worker0 and log_file is not None:
         file_handler = logging.FileHandler(log_file, file_mode)

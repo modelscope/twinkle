@@ -1,8 +1,9 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import shutil
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from typing import Type
 from typing import Union, List
 import torch.distributed as dist
@@ -108,6 +109,10 @@ class DeviceMesh:
         if dim_idx is None:
             return 1
         return self.mesh.shape[dim_idx]
+
+    @property
+    def is_single_process(self) -> bool:
+        return self.world_size == 1 and 'RANK' not in os.environ
 
     @property
     def dp_rank(self) -> int:
@@ -373,14 +378,16 @@ class DeviceGroup:
 class Platform(ABC):
 
     @staticmethod
-    @abstractmethod
     def visible_device_env() -> str:
-        ...
+        return Platform.get_platform().visible_device_env()
 
     @staticmethod
-    @abstractmethod
     def device_prefix() -> str:
-        ...
+        return Platform.get_platform().device_prefix()
+
+    @staticmethod
+    def get_platform_names() -> List[str]:
+        return ['GPU', 'NPU']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:

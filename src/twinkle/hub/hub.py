@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import tempfile
 from contextlib import contextmanager
@@ -38,7 +39,7 @@ class HubOperation:
 
     @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:
-        """Try to login to the hub
+        """Try to log in to the hub
 
         Args:
             token: The hub token to use
@@ -127,7 +128,8 @@ class HubOperation:
         elif cls.source_type(dataset_id) == 'ms':
             return MSHub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
         else:
-            raise NotImplementedError
+            import datasets
+            datasets.load_dataset()
 
     @classmethod
     def download_model(cls,

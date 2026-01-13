@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Dataset
 from twinkle import remote_function, remote_class
 

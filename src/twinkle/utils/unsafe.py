@@ -1,6 +1,7 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from collections.abc import Mapping
-from typing import Iterable, Callable
+from typing import Callable
 
 
 def any_callable(args):

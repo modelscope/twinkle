@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import threading
 import time
@@ -116,7 +117,7 @@ def build_model_app(model_id: str,
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
             self.model = MultiLoraTransformersModel(
-                pretrained_model_name_or_path=model_id,
+                model_id=model_id,
                 device_mesh=self.device_mesh,
                 remote_group=self.device_group.name,
                 **kwargs

@@ -44,7 +44,7 @@ def train():
     )
 
     ref_model = TransformersModel(
-        pretrained_model_name_or_path='Qwen/Qwen2.5-7B-Instruct',
+        model_id='Qwen/Qwen2.5-7B-Instruct',
         remote_group='ref',
         device_mesh=ref_device_mesh
     )

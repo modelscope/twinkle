@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Union, List, Optional
 import numpy as np
 from twinkle import Platform, DeviceMesh, remote_class, remote_function

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from .mse import MSELoss
 from .contrastive_loss import ContrastiveLoss
 from .online_contrastive_loss import OnlineContrastiveLoss

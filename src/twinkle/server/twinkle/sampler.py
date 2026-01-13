@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import threading
 from typing import Dict, Any, List

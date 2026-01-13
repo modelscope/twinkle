@@ -1,28 +1,27 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import re
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
 from peft import PeftConfig, LoraConfig
 from peft import PeftModel
-from torch.optim import Optimizer, AdamW
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
-from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from transformers import PreTrainedModel, PretrainedConfig
 
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.loss import Loss
 from twinkle.patch.multi_adapter import MultiAdapter
 from twinkle.processor import InputProcessor
-from .transformers import TransformersModel, _default_adapter_name
+from .transformers import TransformersModel
 
 
 @remote_class()
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def __init__(self, # noqa
-                 model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
-                 pretrained_model_name_or_path: Optional[str] = None,
+                 model_id: Optional[str] = None,
                  config: Optional[PretrainedConfig] = None,
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
@@ -31,7 +30,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
         assert device_mesh.fsdp_world_size == 1, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
-        super().__init__(pretrained_model_name_or_path=pretrained_model_name_or_path, 
+        super().__init__(model_id=model_id, 
                         config=config, 
                         device_mesh=device_mesh, 
                         mixed_precision=mixed_precision,
@@ -41,10 +40,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter = MultiAdapter()
         self.model: PreTrainedModel = self.multi_adapter(self.model)
         self.add_adapter_to_model('__dummy_adapter__', LoraConfig(r=1, target_modules='all-linear'))
-        self.model, _ = self.strategy.wrap_model(self.model, AdamW(self._get_trainable_parameters(adapter_name='__dummy_adapter__').values(), lr=1e-5))
 
     def _check_adapter_valid(self, adapter_name: str):
-        assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
+        assert adapter_name and adapter_name != '__dummy_adapter__' and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
 
     def _activate_adapter(self, adapter_name: str):
         self.multi_adapter.set_current_adapter_name(adapter_name)
