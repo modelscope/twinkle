@@ -16,6 +16,26 @@ from twinkle.server.twinkle.validation import verify_request_token, ConfigRegist
 
 logger = get_logger()
 
+# FIXME: move inner class outside
+class CreateRequest(BaseModel):
+    processor_type: str
+    class_type: str
+
+    class Config:
+        extra = "allow"
+
+
+class HeartbeatRequest(BaseModel):
+    processor_id: str
+
+
+class CallRequest(BaseModel):
+    processor_id: str
+    function: str
+
+    class Config:
+        extra = "allow"
+
 
 def build_processor_app(nproc_per_node: int,
                         device_group: Dict[str, Any],
@@ -29,23 +49,6 @@ def build_processor_app(nproc_per_node: int,
 
     processors = ['dataset', 'dataloader', 'preprocessor', 'processor',
                   'reward', 'template', 'weight_loader']
-
-    class CreateRequest(BaseModel):
-        processor_type: str
-        class_type: str
-
-        class Config:
-            extra = "allow"
-
-    class HeartbeatRequest(BaseModel):
-        processor_id: str
-
-    class CallRequest(BaseModel):
-        processor_id: str
-        function: str
-
-        class Config:
-            extra = "allow"
 
     @serve.deployment(name="ProcessorManagement")
     @serve.ingress(app)

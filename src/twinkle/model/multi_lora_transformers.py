@@ -42,7 +42,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.add_adapter_to_model('__dummy_adapter__', LoraConfig(r=1, target_modules='all-linear'))
 
     def _check_adapter_valid(self, adapter_name: str):
-        assert adapter_name and adapter_name != '__dummy_adapter__' and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
+        # FIXME: check on init
+        assert adapter_name and adapter_name != '__dummy_adapter_' and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
 
     def _activate_adapter(self, adapter_name: str):
         self.multi_adapter.set_current_adapter_name(adapter_name)
