@@ -2,7 +2,7 @@
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable, Type, Union
+from typing import Callable, Type, Union, List
 
 from datasets import interleave_datasets, concatenate_datasets, load_dataset
 from torch.utils.data import Dataset as TorchDataset
@@ -185,10 +185,11 @@ class Dataset(TorchDataset):
         Args:
             interleave: Whether to interleave the dataset, or concatenate the dataset.
         """
-        if interleave:
-            self.dataset = interleave_datasets(list(self.datasets.values()))
-        else:
-            self.dataset = concatenate_datasets(list(self.datasets.values()))
+        if len(self.datasets) > 1:
+            if interleave:
+                self.dataset = interleave_datasets(list(self.datasets.values()))
+            else:
+                self.dataset = concatenate_datasets(list(self.datasets.values()))
 
     @remote_function()
     def __getitem__(self, idx):

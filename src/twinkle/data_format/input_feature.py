@@ -30,6 +30,7 @@ class InputFeature(TypedDict, total=False):
     position_ids: InputType
     labels: InputType
     completion_mask: InputType
+    length: int
     logits_to_keep: Optional[int]
     num_items_in_batch: Optional[int]
 

@@ -16,7 +16,7 @@ class Template:
     def __init__(self,
                  model_id: str,
                  use_chat_template: bool = True,
-                 max_length: Optional[int] = None,
+                 max_length: Optional[int] = 2048,
                  truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
                  default_system: Optional[str] = None,
                  **kwargs):
@@ -96,6 +96,7 @@ class Template:
         input_ids = input_feature['input_ids']
         input_feature['attention_mask'] = np.ones_like(input_ids)
         input_feature['position_ids'] = np.arange(len(input_ids))
+        input_feature['length'] = len(input_ids)
         return [input_feature]
 
     def _roll_labels(self, input_feature: InputFeature) -> List[InputFeature]:
