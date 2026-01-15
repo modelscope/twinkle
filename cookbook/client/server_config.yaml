@@ -9,14 +9,14 @@ applications:
     import_path: main:model_qwen25_7B
     args:
       model_id: "ms://Qwen/Qwen2.5-7B-Instruct"
-      nproc_per_node: 4
+      nproc_per_node: 2
       device_group:
         name: model
-        ranks: [ 0,1,2,3 ]
+        ranks: [0,1]
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0,1,2,3]
+        mesh: [0,1]
         mesh_dim_names: ['dp']
     deployments:
       - name: ModelManagement
@@ -31,14 +31,14 @@ applications:
     route_prefix: /processors
     import_path: main:processor_app
     args:
-      nproc_per_node: 4
+      nproc_per_node: 2
       device_group:
         name: model
-        ranks: 4
+        ranks: 2
         device_type: CPU
       device_mesh:
         device_type: CPU
-        mesh: [0,1,2,3]
+        mesh: [0,1]
         mesh_dim_names: ['dp']
     deployments:
       - name: ProcessorManagement

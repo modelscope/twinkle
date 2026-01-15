@@ -17,7 +17,7 @@ logger = get_logger()
 device_group = [
     DeviceGroup(
         name='model',
-        ranks=[0,1,2,3],
+        ranks=[0,1],
         device_type=Platform.get_platform().device_prefix(),
     )
 ]
@@ -31,11 +31,11 @@ device_group = [
 
 device_mesh = DeviceMesh(
    device_type='cuda',
-   mesh=np.array([0,1,2,3]),
+   mesh=np.array([0,1]),
    mesh_dim_names=('dp',)
 )
 
-twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
+twinkle.initialize(mode='local', groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
 
 
 def create_dataset():
