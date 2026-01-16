@@ -43,6 +43,14 @@ class VLLMSampler(Sampler):
         super().__init__()
         requires('vllm')
         from vllm import LLMEngine, EngineArgs
+        import inspect
+
+        allowed = set(inspect.signature(EngineArgs.__init__).parameters.keys())
+
+        allowed.discard('self')
+
+        engine_args = {k: v for k, v in engine_args.items() if k in allowed}
+
         engine_args = EngineArgs(**engine_args)
         vllm_config = engine_args.create_engine_config()
         self.engine = LLMEngine.from_vllm_config(
