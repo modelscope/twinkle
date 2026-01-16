@@ -13,11 +13,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import ray
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 
 from tinker import types
-from .state import get_server_state
+from .state import get_server_state, schedule_task
 
 
 # ----- FastAPI + Serve deployment ------------------------------------------
@@ -40,15 +40,6 @@ class TinkerCompatServer:
     # --- Helpers -----------------------------------------------------------
 
     @staticmethod
-    def _new_request_id() -> str:
-        return f"req_{uuid.uuid4().hex}"
-
-    async def _store_future(self, payload: Any, model_id: Optional[str] = None) -> types.UntypedAPIFuture:
-        request_id = self._new_request_id()
-        await self.state.store_future(request_id, payload, model_id)
-        return types.UntypedAPIFuture(request_id=request_id, model_id=model_id)
-
-    @staticmethod
     def _sample_output() -> types.SampleResponse:
         sequence = types.SampledSequence(stop_reason="stop", tokens=[1, 2, 3], logprobs=[-0.1, -0.2, -0.3])
         return types.SampleResponse(sequences=[sequence])
@@ -56,26 +47,26 @@ class TinkerCompatServer:
     # --- Endpoints ---------------------------------------------------------
 
     @app.get("/healthz")
-    async def healthz(self) -> types.HealthResponse:
+    async def healthz(self, request: Request) -> types.HealthResponse:
         return types.HealthResponse(status="ok")
 
     @app.get("/get_server_capabilities")
-    async def get_server_capabilities(self) -> types.GetServerCapabilitiesResponse:
+    async def get_server_capabilities(self, request: Request) -> types.GetServerCapabilitiesResponse:
         return types.GetServerCapabilitiesResponse(supported_models=self.supported_models)
 
     @app.post("/telemetry")
-    async def telemetry(self, request: types.TelemetrySendRequest) -> types.TelemetryResponse:
+    async def telemetry(self, request: Request, body: types.TelemetrySendRequest) -> types.TelemetryResponse:
         # Telemetry is accepted but not persisted; this endpoint is intentionally lightweight.
         return types.TelemetryResponse(status="accepted")
 
     @app.post("/create_session")
-    async def create_session(self, request: types.CreateSessionRequest) -> types.CreateSessionResponse:
-        session_id = await self.state.create_session(request)
+    async def create_session(self, request: Request, body: types.CreateSessionRequest) -> types.CreateSessionResponse:
+        session_id = await self.state.create_session(body)
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post("/session_heartbeat")
-    async def session_heartbeat(self, request: types.SessionHeartbeatRequest) -> types.SessionHeartbeatResponse:
-        alive = await self.state.touch_session(request.session_id)
+    async def session_heartbeat(self, request: Request, body: types.SessionHeartbeatRequest) -> types.SessionHeartbeatResponse:
+        alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise HTTPException(status_code=404, detail="Unknown session")
         return types.SessionHeartbeatResponse()
@@ -83,32 +74,38 @@ class TinkerCompatServer:
 
     @app.post("/create_sampling_session")
     async def create_sampling_session(
-        self, request: types.CreateSamplingSessionRequest
+        self, request: Request, body: types.CreateSamplingSessionRequest
     ) -> types.CreateSamplingSessionResponse:
-        sampling_session_id = await self.state.create_sampling_session(request)
+        sampling_session_id = await self.state.create_sampling_session(body)
         return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
     @app.post("/asample")
-    async def asample(self, request: types.SampleRequest) -> types.UntypedAPIFuture:
-        return await self._store_future(self._sample_output())
+    async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
+        async def _do_sample():
+            return self._sample_output()
 
-
+        return await schedule_task(self.state, _do_sample())
 
     @app.post("/save_weights_for_sampler")
     async def save_weights_for_sampler(
-        self, request: types.SaveWeightsForSamplerRequest
+        self, request: Request, body: types.SaveWeightsForSamplerRequest
     ) -> types.UntypedAPIFuture:
-        suffix = request.path or f"sampler-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        path = f"tinker://{request.model_id}/{suffix}"
+        suffix = body.path or f"sampler-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        path = f"tinker://{body.model_id}/{suffix}"
         sampling_session_id = None
-        if request.sampling_session_seq_id is not None:
-            sampling_session_id = f"sampling_{request.sampling_session_seq_id}"
-        result = types.SaveWeightsForSamplerResponseInternal(path=path, sampling_session_id=sampling_session_id)
-        return await self._store_future(result, model_id=request.model_id)
+        if body.sampling_session_seq_id is not None:
+            sampling_session_id = f"sampling_{body.sampling_session_seq_id}"
+
+        async def _do_save():
+            return types.SaveWeightsForSamplerResponseInternal(
+                path=path, sampling_session_id=sampling_session_id
+            )
+
+        return await schedule_task(self.state, _do_save(), model_id=body.model_id)
 
     @app.post("/retrieve_future")
-    async def retrieve_future(self, request: types.FutureRetrieveRequest) -> Any:
-        record = await self.state.get_future(request.request_id)
+    async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
+        record = await self.state.get_future(body.request_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Future not found")
         result = record["result"]

@@ -18,10 +18,9 @@ from twinkle.model import TwinkleModel, MultiLoraTransformersModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.twinkle.validation import verify_request_token, init_config_registry, ConfigRegistryProxy
-from .state import get_server_state
+from .state import get_server_state, schedule_task
 
-def build_model_app(model_id: str,
-                    nproc_per_node: int,
+def build_model_app(nproc_per_node: int,
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
@@ -38,11 +37,10 @@ def build_model_app(model_id: str,
 
         COUNT_DOWN = 60 * 30
 
-        def __init__(self, model_id: str, nproc_per_node: int, device_group: Dict[str, Any], device_mesh: Dict[str, Any], **kwargs):
+        def __init__(self, nproc_per_node: int, device_group: Dict[str, Any], device_mesh: Dict[str, Any], **kwargs):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model_id = model_id
             self.model: TwinkleModel = None
             self.kwargs = kwargs
             self.adapter_records: Dict[str, int] = {}
@@ -83,40 +81,48 @@ def build_model_app(model_id: str,
                     self.config_registry.pop(user_key)
         
         @staticmethod
-        def _default_forward_output() -> types.ForwardBackwardOutput:
-            tensor = types.TensorData(data=[0.0], dtype="float32", shape=[1])
-            loss_output: types.LossFnOutput = {"loss": tensor, "logprobs": tensor}
-            return types.ForwardBackwardOutput(
-                loss_fn_output_type="TensorData",
-                loss_fn_outputs=[loss_output],
-                metrics={"loss:avg": 0.0, "tokens_per_second:avg": 0.0},
-            )
+        def get_adapter_name(request: Request, adapter_name: Optional[str]) -> Optional[str]:
+            if adapter_name is None or adapter_name == '':
+                return None
+            return request.state.request_id + '-' + adapter_name
+        
+        def assert_adapter_exists(self, adapter_name: str):
+            assert adapter_name and adapter_name in self.adapter_records, f"Adapter {adapter_name} not found"
 
-        @staticmethod
-        def _new_request_id() -> str:
-            return f"req_{uuid.uuid4().hex}"
-
-        async def _store_future(self, payload: Any, model_id: Optional[str] = None) -> types.UntypedAPIFuture:
-            request_id = self._new_request_id()
-            await self.state.store_future(request_id, payload, model_id)
-            return types.UntypedAPIFuture(request_id=request_id, model_id=model_id)
+        def assert_adapter_valid(self, adapter_name: Optional[str]):
+            assert adapter_name is None or adapter_name == '' or adapter_name in self.adapter_records, \
+                f"Adapter {adapter_name} is invalid"
 
         @app.post("/create_model")
-        async def create_model(self, request: types.CreateModelRequest) -> types.UntypedAPIFuture:
-            model_id = await self.state.register_model(request)
-            result = types.CreateModelResponse(model_id=model_id)
-            model = MultiLoraTransformersModel(
-                model_id=self.model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                **self.kwargs
-            )
-            return await self._store_future(result, model_id=model_id)
+        async def create_model(self, request: Request, body: types.CreateModelRequest) -> types.UntypedAPIFuture:
+            model_id = await self.state.register_model(body)
+
+            async def _load_model():
+                self.model = MultiLoraTransformersModel(
+                    model_id=body.base_model,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **body.user_metadata,
+                )
+                if body.lora_config:
+                    # TODO: support more lora config parameters
+                    lora_cfg = LoraConfig(
+                        r=body.lora_config.rank,
+                    )
+                    with self.adapter_lock:
+                        adapter_name = self.get_adapter_name(request=request, adapter_name=model_id)
+                        self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
+                    self.adapter_records[adapter_name] = 0
+                    self.key_token_dict[adapter_name] = request.state.token
+                    self.handle_adapter_count(request.state.token, True)
+                return types.CreateModelResponse(model_id=model_id)
+
+            return await schedule_task(self.state, _load_model(), model_id=model_id)
 
         @app.post("/get_info")
-        async def get_info(self, request: types.GetInfoRequest) -> types.GetInfoResponse:
-            metadata = await self.state.get_model_metadata(str(request.model_id))
-            model_name = metadata.get("base_model") if metadata else str(request.model_id)
+        async def get_info(self, request: Request, body: types.GetInfoRequest) -> types.GetInfoResponse:
+            metadata = await self.state.get_model_metadata(str(body.model_id))
+            model_name = metadata.get("base_model") if metadata else str(body.model_id)
             lora_rank = None
             is_lora = False
             if metadata and metadata.get("lora_config"):
@@ -124,44 +130,78 @@ def build_model_app(model_id: str,
                 is_lora = True
             return types.GetInfoResponse(
                 model_data=types.ModelData(model_name=model_name),
-                model_id=request.model_id,
+                model_id=body.model_id,
                 is_lora=is_lora,
                 lora_rank=lora_rank,
+                model_name=model_name,
             )
 
         @app.post("/unload_model")
-        async def unload_model(self, request: types.UnloadModelRequest) -> types.UntypedAPIFuture:
-            await self.state.unload_model(request.model_id)
-            result = types.UnloadModelResponse(model_id=request.model_id)
-            return await self._store_future(result, model_id=request.model_id)
+        async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> types.UntypedAPIFuture:
+            async def _do_unload():
+                await self.state.unload_model(body.model_id)
+                return types.UnloadModelResponse(model_id=body.model_id)
 
-        @app.post("/forward")
-        async def forward(self, request: types.ForwardRequest) -> types.UntypedAPIFuture:
-            return await self._store_future(self._default_forward_output(), model_id=request.model_id)
+            return await schedule_task(self.state, _do_unload(), model_id=body.model_id)
+
 
         @app.post("/forward_backward")
-        async def forward_backward(self, request: types.ForwardBackwardRequest) -> types.UntypedAPIFuture:
-            return await self._store_future(self._default_forward_output(), model_id=request.model_id)
+        async def forward_backward(self, request: Request, body: types.ForwardBackwardRequest) -> types.UntypedAPIFuture:
+            async def _do_forward_backward():
+                adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
+                self.assert_adapter_exists(adapter_name=adapter_name)
+                
+                datum_list = body.forward_backward_input.data
+                loss_fn = body.forward_backward_input.loss_fn
+                loss_fn_config = body.forward_backward_input.loss_fn_config
+                
+                if isinstance(inputs, list):
+                    _input = inputs[0]
+                    if 'input_ids' in _input:
+                        inputs = [InputFeature(**_input) for _input in inputs]
+                    else:
+                        inputs = [Trajectory(**_input) for _input in inputs]
+                else:
+                    assert isinstance(inputs, dict)
+                    inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+                ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name)
+                return types.F(
+                    loss_fn_output_type="TensorData",
+                    loss_fn_outputs=[loss_output],
+                    metrics={"loss:avg": 0.0, "tokens_per_second:avg": 0.0},
+                )
+
+            return await schedule_task(
+                self.state, _do_forward_backward(), model_id=body.model_id
+            )
 
         @app.post("/optim_step")
-        async def optim_step(self, request: types.OptimStepRequest) -> types.UntypedAPIFuture:
-            metrics = types.OptimStepResponse(metrics={
-                "grad_norm": 0.0,
-                "weight_norm": 0.0,
-                "update_norm": 0.0,
-            })
-            return await self._store_future(metrics, model_id=request.model_id)
+        async def optim_step(self, request: Request, body: types.OptimStepRequest) -> types.UntypedAPIFuture:
+            async def _do_optim():
+                return types.OptimStepResponse(
+                    metrics={
+                        "grad_norm": 0.0,
+                        "weight_norm": 0.0,
+                        "update_norm": 0.0,
+                    }
+                )
+
+            return await schedule_task(self.state, _do_optim(), model_id=body.model_id)
 
         @app.post("/save_weights")
-        async def save_weights(self, request: types.SaveWeightsRequest) -> types.UntypedAPIFuture:
-            suffix = request.path or f"checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            path = f"tinker://{request.model_id}/{suffix}"
-            result = types.SaveWeightsResponse(path=path)
-            return await self._store_future(result, model_id=request.model_id)
+        async def save_weights(self, request: Request, body: types.SaveWeightsRequest) -> types.UntypedAPIFuture:
+            async def _do_save():
+                suffix = body.path or f"checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                path = f"tinker://{body.model_id}/{suffix}"
+                return types.SaveWeightsResponse(path=path)
+
+            return await schedule_task(self.state, _do_save(), model_id=body.model_id)
 
         @app.post("/load_weights")
-        async def load_weights(self, request: types.LoadWeightsRequest) -> types.UntypedAPIFuture:
-            result = types.LoadWeightsResponse(path=request.path)
-            return await self._store_future(result, model_id=request.model_id)
+        async def load_weights(self, request: Request, body: types.LoadWeightsRequest) -> types.UntypedAPIFuture:
+            async def _do_load():
+                return types.LoadWeightsResponse(path=body.path)
 
-    return ModelManagement.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh, **kwargs)
+            return await schedule_task(self.state, _do_load(), model_id=body.model_id)
+
+    return ModelManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, **kwargs)

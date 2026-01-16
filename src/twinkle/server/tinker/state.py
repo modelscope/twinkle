@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import time
 import uuid
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 import ray
+from tinker import types
 
 
 @ray.remote(name="tinker_server_state", lifetime="detached")
@@ -116,3 +118,24 @@ def get_server_state(actor_name: str = "tinker_server_state") -> ServerStateProx
             actor = ray.get_actor(actor_name)
     assert actor is not None
     return ServerStateProxy(actor)
+
+
+async def schedule_task(
+    state: ServerStateProxy,
+    coro: Any,
+    model_id: Optional[str] = None,
+) -> types.UntypedAPIFuture:
+    request_id = f"req_{uuid.uuid4().hex}"
+
+    async def _runner():
+        try:
+            val = await coro
+            await state.store_future(request_id, val, model_id)
+        except Exception as e:
+            # Structure the error so the client SDK can interpret it
+            err_payload = {"error": str(e), "category": "Internal"}
+            await state.store_future(request_id, err_payload, model_id)
+
+    # Schedule execution in the background
+    asyncio.create_task(_runner())
+    return types.UntypedAPIFuture(request_id=request_id, model_id=model_id)
