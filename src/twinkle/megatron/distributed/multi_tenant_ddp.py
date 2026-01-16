@@ -2,21 +2,26 @@
 """
 Multi-Tenant LoRA DDP for Megatron models.
 
-This module provides a minimal, maintainable DDP solution for multi-tenant LoRA training:
-1. Inherits from Megatron's DistributedDataParallel to maximize code reuse
-2. Uses MultiAdapter's ContextVar mechanism for tenant isolation
-3. Supports per-tenant process groups for gradient synchronization
+This module provides a DDP implementation for multi-tenant LoRA training,
+inheriting from Megatron's DistributedDataParallel.
 
-Key insight: Megatron DDP already only creates buffers for requires_grad=True params,
-so we just need to control which params are trainable per-tenant.
+Key Design:
+1. Inherits from MegatronDDP for code reuse
+2. Overrides buffer/bucket creation to be per-tenant
+3. Uses ContextVar for automatic tenant resolution
+4. Tenant lifecycle managed by TenantManager (separate concern)
 """
 
-import contextvars
 import logging
-from typing import Dict, List, Optional, Set
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from .tenant_context import get_current_tenant, require_tenant, tenant_scope
 
 logger = logging.getLogger(__name__)
 
@@ -24,319 +29,370 @@ try:
     from megatron.core import parallel_state as mpu
     from megatron.core.distributed import DistributedDataParallel as MegatronDDP
     from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+    from megatron.core.distributed.param_and_grad_buffer import (
+        _ParamAndGradBuffer,
+        partition_buckets,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer.transformer_config import TransformerConfig
     MEGATRON_AVAILABLE = True
 except ImportError:
     MEGATRON_AVAILABLE = False
-    MegatronDDP = object
+
+    # Fallback for type hints
+    class MegatronDDP(nn.Module):
+        pass
 
 
-class TenantContext:
+@dataclass
+class TenantDDPState:
+    """Per-tenant DDP state: buffers, bucket groups, hooks."""
+    tenant_id: str
+    params: List[nn.Parameter] = field(default_factory=list)
+    buffers: List = field(default_factory=list)
+    bucket_groups: List = field(default_factory=list)
+    param_to_bucket_group: Dict[nn.Parameter,
+                                object] = field(default_factory=dict)
+    grad_accs: List = field(default_factory=list)
+    process_group: Optional[dist.ProcessGroup] = None
+
+
+class MultiTenantLoRADDP(MegatronDDP):
     """
-    Thread/coroutine-safe tenant context using ContextVar.
-    
-    This integrates with MultiAdapter's ContextVar mechanism to ensure
-    that each request/coroutine operates on the correct tenant's LoRA weights.
-    """
-    
-    _current_tenant: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-        'current_tenant', default=None
-    )
-    
-    @classmethod
-    def get_current_tenant(cls) -> Optional[str]:
-        return cls._current_tenant.get()
-    
-    @classmethod
-    def set_current_tenant(cls, tenant_id: str):
-        cls._current_tenant.set(tenant_id)
-    
-    @classmethod
-    def reset_tenant(cls):
-        cls._current_tenant.set(None)
+    Multi-Tenant LoRA DDP inheriting from MegatronDDP.
 
+    This class extends MegatronDDP to support per-tenant gradient buffers
+    and communication. The key difference is that instead of creating
+    buffers for all parameters at init, buffers are created dynamically
+    for each tenant.
 
-class TenantGradientManager:
-    """
-    Manages per-tenant gradient buffers and communication groups.
-    
-    This is a lightweight wrapper that doesn't duplicate Megatron DDP logic,
-    but instead coordinates gradient sync across tenants.
-    """
-    
-    def __init__(self):
-        self.tenant_params: Dict[str, Set[nn.Parameter]] = {}
-        self.tenant_process_groups: Dict[str, dist.ProcessGroup] = {}
-        self.tenant_param_names: Dict[str, Dict[nn.Parameter, str]] = {}
-    
-    def register_tenant(
-        self,
-        tenant_id: str,
-        params: List[nn.Parameter],
-        param_names: Dict[nn.Parameter, str],
-        process_group: Optional[dist.ProcessGroup] = None,
-    ):
-        """
-        Register a tenant with its LoRA parameters.
-        
-        Args:
-            tenant_id: Unique tenant identifier.
-            params: List of LoRA parameters for this tenant.
-            param_names: Mapping from param to name for debugging.
-            process_group: Optional custom process group for this tenant.
-        """
-        self.tenant_params[tenant_id] = set(params)
-        self.tenant_param_names[tenant_id] = param_names
-        
-        if process_group is not None:
-            self.tenant_process_groups[tenant_id] = process_group
-        else:
-            # Use default DP group
-            self.tenant_process_groups[tenant_id] = mpu.get_data_parallel_group(
-                with_context_parallel=True
-            )
-        
-        logger.info(
-            f"Registered tenant '{tenant_id}' with {len(params)} parameters, "
-            f"process group size: {self.tenant_process_groups[tenant_id].size()}"
-        )
-    
-    def unregister_tenant(self, tenant_id: str):
-        """Remove a tenant and its associated resources."""
-        self.tenant_params.pop(tenant_id, None)
-        self.tenant_param_names.pop(tenant_id, None)
-        self.tenant_process_groups.pop(tenant_id, None)
-        logger.info(f"Unregistered tenant '{tenant_id}'")
-    
-    def get_tenant_params(self, tenant_id: str) -> Set[nn.Parameter]:
-        return self.tenant_params.get(tenant_id, set())
-    
-    def get_tenant_process_group(self, tenant_id: str) -> Optional[dist.ProcessGroup]:
-        return self.tenant_process_groups.get(tenant_id)
+    Comparison with MegatronDDP:
+    - MegatronDDP: Creates buffers for all requires_grad=True params at __init__
+    - MultiTenantLoRADDP: Creates buffers per-tenant when add_tenant is called
 
-
-class MultiTenantLoRADDP(MegatronDDP if MEGATRON_AVAILABLE else object):
-    """
-    Multi-Tenant LoRA DDP wrapper that extends Megatron's DDP.
-    
-    Design principles:
-    1. **Minimal override**: Only override what's necessary for multi-tenant support
-    2. **Reuse Megatron DDP**: All gradient buffer management, bucketing, and
-       communication overlap logic is inherited from Megatron DDP
-    3. **ContextVar integration**: Uses TenantContext for thread-safe tenant switching
-    4. **Lazy buffer creation**: Buffers are created per-tenant on first use
-    
-    Key insight: Instead of creating a separate DDP per tenant, we:
-    - Keep one DDP instance with all LoRA parameters
-    - Use ContextVar to track current tenant
-    - Filter gradient sync to only current tenant's params
-    
-    Example:
-        >>> # Create multi-tenant DDP
+    Usage:
+        >>> # Create with frozen base model (no trainable params yet)
         >>> ddp = MultiTenantLoRADDP(config, ddp_config, model)
-        >>> 
-        >>> # Register tenants
-        >>> ddp.register_tenant('tenant_a', tenant_a_params)
-        >>> ddp.register_tenant('tenant_b', tenant_b_params)
-        >>> 
-        >>> # Training loop with tenant isolation
-        >>> TenantContext.set_current_tenant('tenant_a')
-        >>> output = ddp(input)  # Uses tenant_a's LoRA
-        >>> loss.backward()
-        >>> ddp.finish_grad_sync()  # Only syncs tenant_a's grads
+        >>>
+        >>> # Add tenant (creates buffers for their LoRA params)
+        >>> ddp.add_tenant('tenant_a', params_a, process_group_a)
+        >>>
+        >>> # Training uses current tenant context
+        >>> with tenant_scope('tenant_a'):
+        ...     ddp.zero_grad_buffer()  # Zeros tenant_a's buffers
+        ...     output = ddp(input)
+        ...     loss.backward()
+        ...     ddp.finish_grad_sync()  # Syncs tenant_a's gradients
+        >>>
+        >>> # Remove tenant
+        >>> ddp.remove_tenant('tenant_a')
     """
-    
-    # Default patterns to identify LoRA parameters
-    DEFAULT_LORA_PATTERNS = {'lora_A', 'lora_B', 'lora_'}
-    
     def __init__(
         self,
         config: 'TransformerConfig',
         ddp_config: 'DistributedDataParallelConfig',
         module: nn.Module,
         disable_bucketing: bool = False,
-        lora_param_patterns: Optional[Set[str]] = None,
-        **kwargs,
+        pg_collection: Optional['ProcessGroupCollection'] = None,
     ):
         """
         Initialize MultiTenantLoRADDP.
-        
-        This calls the parent Megatron DDP __init__ which will:
-        1. Create gradient buffers for all requires_grad=True params
-        2. Set up backward hooks
-        3. Initialize bucket groups
-        
-        We then add multi-tenant management on top.
+
+        Unlike MegatronDDP, this does NOT create buffers at init.
+        Buffers are created per-tenant via add_tenant().
+
+        Args:
+            config: Transformer config.
+            ddp_config: DDP config.
+            module: Model (base model should be frozen).
+            disable_bucketing: Disable bucketing.
+            pg_collection: Process group collection.
         """
         if not MEGATRON_AVAILABLE:
-            raise ImportError("Megatron-Core is required")
-        
-        self.lora_param_patterns = lora_param_patterns or self.DEFAULT_LORA_PATTERNS
-        self._tenant_manager = TenantGradientManager()
-        
-        # Pre-identify LoRA parameters before parent init
-        # This helps with debugging and tenant registration
-        self._lora_params: Dict[str, nn.Parameter] = {}
+            raise ImportError('Megatron-Core is required')
+
+        # Skip MegatronDDP's buffer creation by temporarily setting all params to not require grad
+        original_requires_grad = {}
         for name, param in module.named_parameters():
-            if param.requires_grad and self._is_lora_param(name):
-                self._lora_params[name] = param
-        
-        logger.info(f"Identified {len(self._lora_params)} LoRA parameters")
-        
-        # Call parent Megatron DDP init
-        # This creates buffers for all requires_grad=True params
+            original_requires_grad[name] = param.requires_grad
+            param.requires_grad = False
+
+        # Call parent init (will create empty buffers since no params require grad)
         super().__init__(
             config=config,
             ddp_config=ddp_config,
             module=module,
             disable_bucketing=disable_bucketing,
-            **kwargs,
+            pg_collection=pg_collection,
         )
-        
-        logger.info(
-            f"MultiTenantLoRADDP initialized with {len(self.params_with_grad)} "
-            f"trainable parameters, {len(self.bucket_groups)} bucket groups"
-        )
-    
-    def _is_lora_param(self, name: str) -> bool:
-        """Check if parameter name matches LoRA patterns."""
-        for pattern in self.lora_param_patterns:
-            if pattern in name:
-                return True
-        return False
-    
-    def register_tenant(
+
+        # Restore requires_grad
+        for name, param in module.named_parameters():
+            param.requires_grad = original_requires_grad[name]
+
+        # Per-tenant state
+        self._tenant_states: Dict[str, TenantDDPState] = {}
+
+        logger.info('MultiTenantLoRADDP initialized (no buffers yet)')
+
+    def add_tenant(
         self,
         tenant_id: str,
-        adapter_name: Optional[str] = None,
+        params: List[nn.Parameter],
         process_group: Optional[dist.ProcessGroup] = None,
+        param_names: Optional[Dict[nn.Parameter, str]] = None,
     ):
         """
-        Register a tenant for multi-tenant training.
-        
+        Add a tenant with their gradient buffers.
+
+        This creates per-tenant buffers and hooks, similar to what
+        MegatronDDP.__init__ does but scoped to this tenant.
+
         Args:
-            tenant_id: Unique tenant identifier.
-            adapter_name: PEFT adapter name (if different from tenant_id).
-            process_group: Custom process group for gradient sync.
+            tenant_id: Unique tenant ID.
+            params: Trainable parameters for this tenant.
+            process_group: Process group for gradient sync.
+            param_names: Param to name mapping for debugging.
         """
-        adapter_name = adapter_name or tenant_id
-        
-        # Find parameters belonging to this adapter
-        tenant_params = []
-        param_names = {}
-        
-        for name, param in self._lora_params.items():
-            # Match adapter name in parameter path
-            # e.g., "model.layers.0.self_attn.q_proj.lora_A.tenant_a.weight"
-            if f'.{adapter_name}.' in name or name.endswith(f'.{adapter_name}'):
-                tenant_params.append(param)
-                param_names[param] = name
-        
-        if not tenant_params:
-            # If no adapter-specific match, assume all LoRA params belong to this tenant
-            # This handles single-tenant scenarios
-            logger.warning(
-                f"No adapter-specific params found for '{adapter_name}', "
-                f"registering all {len(self._lora_params)} LoRA params"
-            )
-            tenant_params = list(self._lora_params.values())
-            param_names = {v: k for k, v in self._lora_params.items()}
-        
-        self._tenant_manager.register_tenant(
+        if tenant_id in self._tenant_states:
+            raise ValueError(f"Tenant '{tenant_id}' already exists")
+
+        if not params:
+            raise ValueError('No parameters provided')
+
+        process_group = process_group or self.intra_dp_cp_group
+        param_names = param_names or {}
+
+        # Build param_names if not provided
+        if not param_names:
+            for name, param in self.module.named_parameters():
+                if param in params:
+                    param_names[param] = name
+
+        # Create tenant state
+        state = TenantDDPState(
             tenant_id=tenant_id,
-            params=tenant_params,
-            param_names=param_names,
+            params=params,
             process_group=process_group,
         )
-    
-    def unregister_tenant(self, tenant_id: str):
-        """Remove a tenant."""
-        self._tenant_manager.unregister_tenant(tenant_id)
-    
-    def set_current_tenant(self, tenant_id: str):
-        """
-        Set the current tenant for subsequent operations.
-        
-        This should be called before forward/backward to ensure
-        correct LoRA adapter is used.
-        """
-        TenantContext.set_current_tenant(tenant_id)
-    
-    def get_current_tenant(self) -> Optional[str]:
-        """Get the current tenant ID."""
-        return TenantContext.get_current_tenant()
-    
-    def finish_grad_sync_for_tenant(self, tenant_id: Optional[str] = None):
-        """
-        Finish gradient sync for a specific tenant.
-        
-        If tenant_id is None, uses current tenant from context.
-        If no tenant is set, falls back to syncing all params (parent behavior).
-        """
-        tenant_id = tenant_id or TenantContext.get_current_tenant()
-        
-        if tenant_id is None:
-            # No tenant specified, use default behavior
-            super().finish_grad_sync()
-            return
-        
-        # Get tenant's process group
-        pg = self._tenant_manager.get_tenant_process_group(tenant_id)
-        if pg is None:
-            logger.warning(f"Tenant '{tenant_id}' not registered, using default sync")
-            super().finish_grad_sync()
-            return
-        
-        # For now, use parent's finish_grad_sync
-        # In a more advanced implementation, we could filter to only
-        # sync the tenant's parameters, but Megatron's bucket design
-        # makes this complex
-        super().finish_grad_sync()
-    
-    def get_tenant_param_count(self, tenant_id: str) -> int:
-        """Get number of parameters for a tenant."""
-        return len(self._tenant_manager.get_tenant_params(tenant_id))
-    
-    def get_tenant_param_numel(self, tenant_id: str) -> int:
-        """Get total number of elements in tenant's parameters."""
-        return sum(p.numel() for p in self._tenant_manager.get_tenant_params(tenant_id))
 
+        # Initialize grad flags
+        for param in params:
+            param.grad_added_to_main_grad = False
 
-def create_multi_tenant_ddp(
-    model: nn.Module,
-    config: 'TransformerConfig',
-    ddp_config: Optional['DistributedDataParallelConfig'] = None,
-    lora_param_patterns: Optional[Set[str]] = None,
-    overlap_grad_reduce: bool = True,
-    bucket_size: Optional[int] = None,
-) -> MultiTenantLoRADDP:
-    """
-    Factory function to create a MultiTenantLoRADDP wrapper.
-    
-    Args:
-        model: Model containing LoRA layers.
-        config: Transformer configuration.
-        ddp_config: DDP configuration. If None, creates default config.
-        lora_param_patterns: Patterns to identify LoRA parameters.
-        overlap_grad_reduce: Enable communication-computation overlap.
-        bucket_size: Size of gradient buckets.
-        
-    Returns:
-        MultiTenantLoRADDP wrapper.
-    """
-    if not MEGATRON_AVAILABLE:
-        raise ImportError("Megatron-Core is required")
-    
-    if ddp_config is None:
-        ddp_config = DistributedDataParallelConfig(
-            overlap_grad_reduce=overlap_grad_reduce,
-            use_distributed_optimizer=False,
-            bucket_size=bucket_size,
+        # Create buffers
+        self._create_tenant_buffers(state, param_names)
+
+        # Register hooks
+        self._register_tenant_hooks(state)
+
+        self._tenant_states[tenant_id] = state
+
+        logger.info(f"Added tenant '{tenant_id}' with {len(params)} params, "
+                    f'{len(state.bucket_groups)} bucket groups')
+
+    def _create_tenant_buffers(
+        self,
+        state: TenantDDPState,
+        param_names: Dict[nn.Parameter, str],
+    ):
+        """Create gradient buffers for a tenant."""
+        # Group by dtype
+        param_and_grad_dtype_to_params = {}
+        param_and_grad_dtype_to_indices = {}
+
+        for param in state.params:
+            param_dtype = param.dtype
+            grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
+
+            key = (param_dtype, grad_dtype)
+            if key not in param_and_grad_dtype_to_params:
+                param_and_grad_dtype_to_params[key] = []
+                param_and_grad_dtype_to_indices[key] = []
+
+            param_and_grad_dtype_to_params[key].append(param)
+            param_and_grad_dtype_to_indices[key].append(
+                len(param_and_grad_dtype_to_params[key]) - 1)
+
+        # Calculate gradient scaling
+        if self.config.calculate_per_token_loss:
+            gradient_scaling_factor = 1.0
+        elif self.ddp_config.average_in_collective:
+            gradient_scaling_factor = 1.0
+        else:
+            gradient_scaling_factor = 1.0 / state.process_group.size()
+
+        # ProcessGroupCollection for buffer creation
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = self.tp_group
+        pg_collection.dp_cp = state.process_group
+
+        # Create buffers
+        for (param_dtype,
+             grad_dtype), params in param_and_grad_dtype_to_params.items():
+            indices = param_and_grad_dtype_to_indices[(param_dtype,
+                                                       grad_dtype)]
+
+            buffer = _ParamAndGradBuffer(
+                self.ddp_config,
+                param_dtype,
+                grad_dtype,
+                params,
+                state.process_group,
+                self.bucket_size,
+                param_names,
+                gradient_scaling_factor,
+                indices,
+                getattr(self.ddp_config, 'nccl_ub', False),
+                pg_collection,
+            )
+            state.buffers.append(buffer)
+
+        # Create bucket groups
+        state.bucket_groups = partition_buckets(
+            state.buffers,
+            force_single_bucket_group=(self.bucket_size is None),
         )
-    
-    return MultiTenantLoRADDP(
-        config=config,
-        ddp_config=ddp_config,
-        module=model,
-        lora_param_patterns=lora_param_patterns,
-    )
+
+        # Build param to bucket group mapping
+        for bucket_group in state.bucket_groups:
+            for bucket in bucket_group.buckets:
+                for param in bucket.params_list:
+                    state.param_to_bucket_group[param] = bucket_group
+
+    def _register_tenant_hooks(self, state: TenantDDPState):
+        """Register backward hooks for a tenant."""
+        for param in state.params:
+            if param not in state.param_to_bucket_group:
+                continue
+
+            param_tmp = param.expand_as(param)
+            grad_acc = param_tmp.grad_fn.next_functions[0][0]
+            grad_acc.register_hook(
+                self._make_tenant_backward_hook(param, state))
+            state.grad_accs.append(grad_acc)
+
+    def _make_tenant_backward_hook(self, param: nn.Parameter,
+                                   state: TenantDDPState):
+        """Create backward hook for a tenant's parameter."""
+        def hook(*unused):
+            if param in state.param_to_bucket_group:
+                if param.grad is not None and not param.grad_added_to_main_grad:
+                    param.main_grad.add_(param.grad.data)
+                param.grad = None
+
+                if self.ddp_config.overlap_grad_reduce:
+                    bucket_group = state.param_to_bucket_group[param]
+                    if bucket_group.is_last_microbatch:
+                        bucket_group.register_grad_ready(param)
+
+        return hook
+
+    def remove_tenant(self, tenant_id: str):
+        """Remove a tenant and cleanup their resources."""
+        if tenant_id not in self._tenant_states:
+            raise KeyError(f"Tenant '{tenant_id}' not found")
+
+        state = self._tenant_states.pop(tenant_id)
+
+        # Clear hooks
+        state.grad_accs.clear()
+
+        # Clear buffers
+        state.buffers.clear()
+        state.bucket_groups.clear()
+        state.param_to_bucket_group.clear()
+
+        # Clear param attributes
+        for param in state.params:
+            if hasattr(param, 'main_grad'):
+                delattr(param, 'main_grad')
+            if hasattr(param, 'grad_added_to_main_grad'):
+                delattr(param, 'grad_added_to_main_grad')
+
+        logger.info(f"Removed tenant '{tenant_id}'")
+
+    def _get_tenant_state(self,
+                          tenant_id: Optional[str] = None) -> TenantDDPState:
+        """Get state for tenant (uses context if not specified)."""
+        tenant_id = tenant_id or require_tenant()
+        if tenant_id not in self._tenant_states:
+            raise KeyError(f"Tenant '{tenant_id}' not registered")
+        return self._tenant_states[tenant_id]
+
+    # ========== Override MegatronDDP methods to be tenant-aware ==========
+
+    @contextmanager
+    def no_sync(self, tenant_id: Optional[str] = None):
+        """Disable gradient sync for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+        for bucket_group in state.bucket_groups:
+            bucket_group.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            for bucket_group in state.bucket_groups:
+                bucket_group.is_last_microbatch = True
+
+    def start_grad_sync(self, tenant_id: Optional[str] = None):
+        """Start gradient sync for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+        for bucket_group in state.bucket_groups:
+            bucket_group.start_grad_sync()
+
+    def finish_grad_sync(self, tenant_id: Optional[str] = None):
+        """Finish gradient sync for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+        for bucket_group in state.bucket_groups:
+            bucket_group.finish_grad_sync()
+
+    def zero_grad_buffer(self, tenant_id: Optional[str] = None):
+        """Zero gradient buffers for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+
+        for param in state.params:
+            param.grad_added_to_main_grad = False
+
+        for buffer in state.buffers:
+            buffer.reset()
+
+        for bucket_group in state.bucket_groups:
+            bucket_group.reset()
+
+    def scale_gradients(self,
+                        scaling_factor: float,
+                        tenant_id: Optional[str] = None):
+        """Scale gradients for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+        for buffer in state.buffers:
+            buffer.scale_gradients(scaling_factor)
+
+    def broadcast_params(self, tenant_id: Optional[str] = None):
+        """Broadcast parameters for a tenant."""
+        state = self._get_tenant_state(tenant_id)
+        for param in state.params:
+            dist.broadcast(
+                param.data,
+                src=dist.get_global_rank(state.process_group, 0),
+                group=state.process_group,
+            )
+
+    # ========== Utility ==========
+
+    def has_tenant(self, tenant_id: str) -> bool:
+        """Check if tenant exists."""
+        return tenant_id in self._tenant_states
+
+    def list_tenants(self) -> List[str]:
+        """List all tenants."""
+        return list(self._tenant_states.keys())
+
+    def get_tenant_params(self,
+                          tenant_id: Optional[str] = None
+                          ) -> List[nn.Parameter]:
+        """Get parameters for a tenant (requires valid tenant context)."""
+        state = self._get_tenant_state(tenant_id)
+        return state.params
+
+    # Note: list_tenants() intentionally not exposed to prevent
+    # information leakage between tenants. Use has_tenant() instead.

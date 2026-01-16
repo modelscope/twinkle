@@ -430,10 +430,6 @@ def get_tenant_manager() -> TenantProcessGroupManager:
         _tenant_manager = TenantProcessGroupManager()
     return _tenant_manager
 
-
-# =============================================================================
-
-# =============================================================================
 def find_layers(model: nn.Module, cond_fn) -> List[str]:
     """Find all layers in model matching condition function.
     
