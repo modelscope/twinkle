@@ -303,11 +303,12 @@ class RayHelper:
                     'num_cpus':
                     0.01,
                 }
-                if device_config.device_type.upper() == 'NPU':
-                    # Fixes "resource request {'GPU':0.01} cannot fit bundles {'NPU':...}".
-                    worker_options['resources'] = {'NPU': 0.01}
-                else:
+                device_type = device_config.device_type.upper()
+                if device_type == 'GPU':
                     worker_options['num_gpus'] = 0.01
+                else:
+                    # Use custom resource key for non-GPU accelerators (e.g., NPU).
+                    worker_options['resources'] = {device_type: 0.01}
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)
