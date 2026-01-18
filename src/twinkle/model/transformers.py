@@ -61,7 +61,7 @@ class OptimizerGroup:
 
     def __post_init__(self):
         if self._device_mesh.data_parallel_world_size > 1:
-            self._dp_group = self._device_mesh.create_process_group(['dp'])
+            self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
             for metric in self.metrics:
                 metric.process_group = self._dp_group
 
@@ -578,7 +578,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         results = {}
-        for metric in optimizer_config.metrics:
+        for metric in optimizer_config.metrics[:1]:
             metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
             results.update(metric.calculate())
         return results

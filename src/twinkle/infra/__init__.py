@@ -527,13 +527,21 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self
+
                     if func.__name__ == '__next__':
-                        print()
-                    else:
-                        if hasattr(self, '_lazy_collect'):
-                            lazy_collect = self._lazy_collect
-                        result = result_func if lazy_collect else result_func()
-                        return result
+                        import ray
+                        for _res in result:
+                            # raise when any worker raises StopIteration
+                            stop = ray.get(_res[1])
+                            if stop:
+                                raise StopIteration()
+                        result = [_res[0] for _res in result]
+                        result_func._futures = result
+
+                    if hasattr(self, '_lazy_collect'):
+                        lazy_collect = self._lazy_collect
+                    result = result_func if lazy_collect else result_func()
+                    return result
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 

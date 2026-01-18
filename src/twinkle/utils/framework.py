@@ -62,7 +62,11 @@ class Framework(ABC):
         import torch
         output_objects = [None for _ in range(device_mesh.data_parallel_world_size)]
         torch.distributed.all_gather_object(output_objects, object, group=process_group)
-        return [x for y in output_objects for x in y]
+        _x = []
+        for y in output_objects:
+            if y is not None:
+                _x.extend(y)
+        return _x
 
 
 class Torch(Framework):
