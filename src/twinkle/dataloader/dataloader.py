@@ -42,6 +42,10 @@ class DataLoader:
         num_workers = self.dataloader_params.get('num_workers', 2)
         self.dataloader_params['worker_init_fn'] = partial(
             DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_parallel_rank or 0)
+    
+    @remote_function(execute='first')
+    def __len__(self):
+        return len(self.dataloader)
 
     @staticmethod
     def _seed_worker(worker_id: int, num_workers: int, rank: int):

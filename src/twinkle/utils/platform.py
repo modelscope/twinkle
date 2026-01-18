@@ -206,7 +206,8 @@ class DeviceMesh:
         if rank is None:
             rank = self.data_parallel_rank
             if rank is None:
-                return slice(0, world_size)
+                rank = 0
+                world_size = 1
 
         k, m = divmod(total_length, world_size)
         start = rank * k + min(rank, m)
@@ -488,6 +489,8 @@ class Platform(ABC):
         platform = Platform.get_platform(platform)
         if idx is None:
             idx = Platform.get_local_rank()
+        if idx < 0:
+            idx = 0
         return platform.get_local_device(idx)
 
 class GPU(Platform):

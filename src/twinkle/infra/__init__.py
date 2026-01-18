@@ -418,14 +418,13 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         assert _iter is not _self
                         _self._iter = _iter
                     else:
-                        breakpoint()
                         return _self.__iter_origin__()
 
                 def __next__(_self):
                     try:
-                        return next(_self._iter)
-                    except:
-                        breakpoint()
+                        return next(_self._iter), False
+                    except StopIteration:
+                        return [], True
 
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # remote_group is None when it's worker and remote_group not passed through arguments
@@ -465,7 +464,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                                                         collect='none')(__iter__)
                         cls.__next__ = remote_function(dispatch=_dispatch,
                                                         execute=_execute,
-                                                        collect=_collect)(__next__)
+                                                        collect=_collect)(ray.method(num_returns=2)(__next__))
                     for arg in (list(args) + list(kwargs.values())):
                         if isinstance(arg, DeviceMesh):
                             self.device_mesh = arg
@@ -525,12 +524,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     lazy_collect = _lazy_collect
-                    if hasattr(self, '_lazy_collect'):
-                        lazy_collect = self._lazy_collect
-                    result = result_func if lazy_collect else result_func()
                     if func.__name__ == '__iter__':
                         return self
+                    if func.__name__ == '__next__':
+                        print()
                     else:
+                        if hasattr(self, '_lazy_collect'):
+                            lazy_collect = self._lazy_collect
+                        result = result_func if lazy_collect else result_func()
                         return result
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')

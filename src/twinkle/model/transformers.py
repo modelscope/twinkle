@@ -60,9 +60,10 @@ class OptimizerGroup:
         return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
 
     def __post_init__(self):
-        self._dp_group = self._device_mesh.create_process_group(['dp'])
-        for metric in self.metrics:
-            metric.process_group = self._dp_group
+        if self._device_mesh.data_parallel_world_size > 1:
+            self._dp_group = self._device_mesh.create_process_group(['dp'])
+            for metric in self.metrics:
+                metric.process_group = self._dp_group
 
 
 _default_adapter_name = ''

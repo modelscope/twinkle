@@ -13,3 +13,15 @@ class CompetitionMathProcessor(Preprocessor):
             Message(role='assistant', content=solution),
         ]
         return Trajectory(messages=messages)
+
+
+class SelfCognitionProcessor(Preprocessor):
+
+    def __call__(self, row) -> Trajectory:
+        problem = row['query']
+        solution = row['response']
+        messages = [
+            Message(role='user', content=problem),
+            Message(role='assistant', content=solution),
+        ]
+        return Trajectory(messages=messages)
