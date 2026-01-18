@@ -70,7 +70,7 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         framework_util.seed_everything(seed, full_determinism)
     if _mode == 'ray':
         requires('ray')
-        from .ray import RayHelper
+        from ._ray import RayHelper
         if groups is not None:
             _device_group = groups
         else:
@@ -358,7 +358,7 @@ def _get_device_mesh_param(args, kwargs):
 def _prepare_lazy_collect(args, kwargs):
     # if a worker received an actor handle,
     # lazy collect should be false to prevent any outer function receives an object ref
-    from .ray import RayHelper
+    from ._ray import RayHelper
     if not RayHelper.is_worker():
         return args, kwargs
     for arg in list(args) + list(kwargs.values()):
@@ -391,7 +391,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
             elif _mode == 'ray':
-                from .ray import RayHelper
+                from ._ray import RayHelper
 
                 # In case the same class created twice in the same device group
                 frame = inspect.currentframe().f_back
@@ -445,9 +445,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         _collect = self.__iter__._collect
 
                     if hasattr(cls, '__iter__'):
+                        import ray
                         cls.__iter_origin__ = cls.__iter__
                         cls.__iter__ = __iter__
-                        cls.__next__ = __next__
+                        cls.__next__ = ray.method(num_returns=2)(__next__)
 
                     # Create remote workers
                     _actors = RayHelper.create_workers(cls,
@@ -464,7 +465,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                                                         collect='none')(__iter__)
                         cls.__next__ = remote_function(dispatch=_dispatch,
                                                         execute=_execute,
-                                                        collect=_collect)(ray.method(num_returns=2)(__next__))
+                                                        collect=_collect)(__next__)
                     for arg in (list(args) + list(kwargs.values())):
                         if isinstance(arg, DeviceMesh):
                             self.device_mesh = arg
@@ -514,11 +515,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             elif _mode == 'ray':
                 check_unsafe(*args, **kwargs)
                 if not hasattr(self, '_actors'):
-                    from .ray import RayHelper
+                    from ._ray import RayHelper
                     args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
                     return func(self, *args, **kwargs)
                 else:
-                    from .ray import RayHelper
+                    from ._ray import RayHelper
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
                     result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
