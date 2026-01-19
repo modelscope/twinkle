@@ -34,6 +34,7 @@ class DataLoader:
         if 'batch_size' not in kwargs:
             kwargs['batch_size'] = device_mesh.data_parallel_world_size
         assert kwargs['batch_size'] >= device_mesh.data_parallel_world_size and kwargs['batch_size'] % device_mesh.data_parallel_world_size == 0
+        self.batch_size = kwargs['batch_size']
         self.dataloader_params = kwargs
         self.device_mesh = device_mesh
         self._set_work_init_fn()
@@ -74,7 +75,8 @@ class DataLoader:
             self.dataloader.batch_sampler = DeviceMeshSampler(self.dataloader.batch_sampler, self.device_mesh)
         elif self.dataloader.sampler is not None:
             self.dataloader.sampler = RetrySampler(self.dataloader.sampler, self.dataset, max_retries=self.max_retries)
-        
+
+        from torch.utils.data import IterableDataset
         if isinstance(self.dataset, IterableDataset):
-            from 
-            self.dataloader._dataset_fetcher = IterableDatasetFetcher(self.dataloader._dataset_fetcher)
+            from .device_mesh_fetcher import _IterableDatasetFetcher
+            self.dataloader._dataset_fetcher = _IterableDatasetFetcher(self.dataloader._dataset_fetcher, self.batch_size, self.device_mesh)
