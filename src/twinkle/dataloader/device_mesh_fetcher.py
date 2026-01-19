@@ -42,5 +42,5 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
             if len(data) < self.device_mesh.data_parallel_world_size:
                 raise StopIteration
             else:
-                _data = data[self.device_mesh.get_slice(len(data))]
+                data = data[self.device_mesh.get_slice(len(data))]
         return self.collate_fn(data)

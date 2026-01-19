@@ -105,7 +105,7 @@ class PackingDataset(Dataset):
         output = {}
         for key in rows[0]:
             output[key] = [r[key] for r in rows]
-            if isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float)):
+            if isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):
                 output[key] = [v for lst in output[key] for v in lst]
         return output
 

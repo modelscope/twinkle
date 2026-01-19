@@ -65,6 +65,9 @@ class InputProcessor:
                 if isinstance(values[0], np.ndarray):
                     value = np.concatenate(values, axis=-1)
                     value = torch.from_numpy(value)
+                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
+                    values = [v for lst in values for v in lst]
+                    value = torch.tensor(values)
                 elif isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=-1)
                 else:
@@ -78,7 +81,7 @@ class InputProcessor:
                 if isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
-                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float)):
+                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
                     values = [torch.tensor(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                 elif isinstance(values[0], torch.Tensor):
