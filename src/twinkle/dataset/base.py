@@ -2,9 +2,9 @@
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable, Type, Union, List
+from typing import Callable, Type, Union
 
-from datasets import interleave_datasets, concatenate_datasets, load_dataset
+from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
@@ -51,6 +51,7 @@ class Dataset(TorchDataset):
         }
         self.dataset = dataset
         self.template = None
+        self.streaming = isinstance(self.dataset, IterableDataset)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[Template], str], **kwargs):
@@ -195,6 +196,8 @@ class Dataset(TorchDataset):
             interleave: Whether to interleave the dataset, or concatenate the dataset.
         """
         if len(self.datasets) > 1:
+            dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
+            assert all(dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
             if interleave:
                 self.dataset = interleave_datasets(list(self.datasets.values()))
             else:
@@ -202,8 +205,20 @@ class Dataset(TorchDataset):
 
     @remote_function()
     def __getitem__(self, idx):
+        if self.streaming:
+            raise ValueError(f'Index of streaming dataset is not supported.')
         return self.dataset[idx]
 
     @remote_function()
     def __len__(self):
+        if self.streaming:
+            raise ValueError(f'Index of streaming dataset is not supported.')
         return len(self.dataset)
+
+    @remote_function()
+    def __iter__(self):
+        if not self.streaming:
+            raise ValueError(f'`__iter__` function of lengthed dataset is not supported.')
+        # TODO if this class passed through actor handler, an error will occur:
+        # a global single dataset, multiple dataloaders, the self._iter will cover each other
+        return self.dataset.__iter__()
