@@ -209,6 +209,8 @@ class RayHelper:
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+        
+        # breakpoint()
         workers = []
         device_config = RayHelper.resource_manager.get_config(group)
         placement_groups = RayHelper.resource_manager.get_group(group)

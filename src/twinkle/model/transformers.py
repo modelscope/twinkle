@@ -160,6 +160,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         Returns:
             The output of the model forward.
         """
+        # breakpoint()
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
@@ -327,7 +328,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    def _create_param_group(self, adapter_name: str, lr: float, weight_decay:float, **kwargs):
+    def _create_param_group(self, adapter_name: str, lr: float=1e-5, weight_decay:float=0.01, **kwargs):
         # Some code borrowed from transformers
 
         def get_parameter_names(model, forbidden_layer_types, forbidden_layer_names=None):

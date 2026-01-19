@@ -39,6 +39,7 @@ def build_model_app(nproc_per_node: int,
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
             self.model: Optional[MultiLoraTransformersModel] = None
+            self.model_id: Optional[str] = None
             self.kwargs = kwargs
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
@@ -81,7 +82,7 @@ def build_model_app(nproc_per_node: int,
         
         @staticmethod
         def get_adapter_name(request: Request, adapter_name: str) -> str:
-            return request.state.request_id + '-' + adapter_name
+            return adapter_name
         
         def assert_adapter_exists(self, adapter_name: str):
             assert adapter_name and adapter_name in self.adapter_records, f"Adapter {adapter_name} not found"
@@ -92,10 +93,14 @@ def build_model_app(nproc_per_node: int,
 
         @app.post("/create_model")
         async def create_model(self, request: Request, body: types.CreateModelRequest) -> types.UntypedAPIFuture:
-            model_id = self.state.register_model(body.model_dump())
+            # In case create_model called multiple times, we reuse the same model_id
+            model_id = self.model_id or self.state.register_model(body.model_dump())
 
+            self.model_id = model_id
             async def _load_model():
-                breakpoint()
+                if self.model is not None and self.model_id is not None:
+                    return types.CreateModelResponse(model_id=self.model_id)
+            
                 extra_kwargs = body.user_metadata or {}
                 self.model = MultiLoraTransformersModel(
                     model_id=body.base_model,
@@ -115,6 +120,7 @@ def build_model_app(nproc_per_node: int,
                         self.key_token_dict[adapter_name] = request.state.token
                         self.handle_adapter_count(request.state.token, True)
                     self.model.set_processor('InputProcessor', adapter_name=adapter_name)
+                    self.model.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
                     self.model.set_optimizer('AdamW', adapter_name=adapter_name)
                 return types.CreateModelResponse(model_id=model_id)
 
@@ -141,6 +147,7 @@ def build_model_app(nproc_per_node: int,
         async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> types.UntypedAPIFuture:
             async def _do_unload():
                 self.model = None
+                self.model_id = None
                 with self.adapter_lock:
                     adapter_name = self.get_adapter_name(request=request, adapter_name=body.model_id)
                     del self.adapter_records[adapter_name]
@@ -166,14 +173,19 @@ def build_model_app(nproc_per_node: int,
                 
                 datum_list = body.forward_backward_input.data
                 loss_fn = body.forward_backward_input.loss_fn
-                loss_fn_config = body.forward_backward_input.loss_fn_config
+                loss_fn_config = body.forward_backward_input.loss_fn_config or {}
                 
+                # convert datum to input feature
                 inputs = [datum_to_input_feature(datum) for datum in datum_list]
-                ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name)
+
+                output = self.model.forward(inputs=inputs, adapter_name=adapter_name)
+                loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
+                self.model.backward(adapter_name=adapter_name)
+
                 return types.ForwardBackwardOutput(
-                    loss_fn_output_type="TensorData",
-                    loss_fn_outputs=[loss_output],
-                    metrics={"loss:avg": 0.0, "tokens_per_second:avg": 0.0},
+                    loss_fn_output_type="TorchLossReturn",
+                    loss_fn_outputs=[{'logprobs': types.TensorData.from_torch(output['logits'])}],
+                    metrics={"loss:avg": loss.tolist()},
                 )
 
             return await schedule_task(

@@ -100,7 +100,7 @@ def build_processor_app(nproc_per_node: int,
 
         @app.post("/create")
         def create(self, request: Request, body: CreateRequest):
-            # breakpoint()
+
             processor_type_name = body.processor_type
             class_type = body.class_type
             kwargs = body.model_extra or {}
