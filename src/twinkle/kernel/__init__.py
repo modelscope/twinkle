@@ -25,7 +25,14 @@ __all__ = [
 
 def kernelize_model(model, mode: ModeType = "inference", device: Optional[DeviceType] = None) -> Any:
     """Kernelize 模型（主入口）"""
-    return apply_layer_kernel(model, mode=mode, device=device)
+    # 1. 应用层级别 kernel
+    model = apply_layer_kernel(model, mode=mode, device=device)
+
+    # TODO: 2. 应用函数级别 kernel (Monkey Patch)
+    # from .function import apply_function_kernel
+    # model = apply_function_kernel(model, mode=mode, device=device)
+
+    return model
 
 
 def register_external_layer(layer_class: type, kernel_name: str) -> None:
