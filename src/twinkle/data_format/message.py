@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
-from typing import Literal, Union, List, Dict, Optional, Required, Any
+from typing import Literal, Union, List, Dict, Optional, Any
 if sys.version_info <= (3, 11):
     # Pydantic requirements.
     from typing_extensions import TypedDict
@@ -34,9 +34,9 @@ class Tool(TypedDict, total=False):
         >>>     "parameters": "{\\"image_path\\": \\"The input image path.\\"}"
         >>> }
     """
-    tool_name: Required[str]
-    description: Required[str]
-    parameters: Required[str]
+    tool_name: str
+    description: str
+    parameters: str
 
 
 class Message(TypedDict, total=False):
@@ -70,3 +70,6 @@ class Message(TypedDict, total=False):
     tools: List[Tool]
     tool_call_id: Optional[str]
     reasoning_content: str
+    images: Optional[List[Union[str, Any]]]
+    videos: Optional[List[Union[str, Any]]]
+    audios: Optional[List[Union[str, Any]]]

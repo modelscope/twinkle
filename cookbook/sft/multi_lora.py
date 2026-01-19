@@ -29,11 +29,6 @@ device_mesh = DeviceMesh(
     mesh_dim_names=('dp',)
 )
 
-#device_mesh = DeviceMesh(
-#    device_type='cuda',
-#    mesh=np.array([0,1,2,3]),
-#    mesh_dim_names=('dp',)
-#)
 
 twinkle.initialize(mode='local', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
 

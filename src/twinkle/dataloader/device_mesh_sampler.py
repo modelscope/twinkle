@@ -21,9 +21,10 @@ class DeviceMeshSampler(BatchSampler):
                 yield batch
             else:
                 data = batch[self.device_mesh.get_slice(len(batch))]
-                if not data:
+                # No this is wrong, should maintain the same behaviour with local
+                #if not data:
                     # Use rank0 if data is not enough
-                    data = batch[self.device_mesh.get_slice(len(batch), 0)]
+                #    data = batch[self.device_mesh.get_slice(len(batch), 0)]
                 yield data
 
     def __len__(self):

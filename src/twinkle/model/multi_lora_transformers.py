@@ -15,6 +15,7 @@ from twinkle.loss import Loss
 from twinkle.patch.multi_adapter import MultiAdapter
 from twinkle.processor import InputProcessor
 from .transformers import TransformersModel
+from ..metric import Metric
 
 
 @remote_class()
@@ -89,7 +90,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                     grad = full_grad
 
                 if self.device_mesh.dp_world_size > 1:
-                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.optimizer_group[adapter_name].dp_group)
+                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.optimizer_group[adapter_name]._dp_group)
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
@@ -150,7 +151,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         for name, param in unwrapped_model.named_parameters():
             if pattern.search(name):
                 param.requires_grad = True
-        self.optimizer_group[adapter_name].dp_group = self.device_mesh.create_process_group(['dp'])
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
@@ -175,6 +175,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         self._activate_adapter(kwargs.get("adapter_name"))
         super().set_grad_scaler(**kwargs)
+
+    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+        self._check_adapter_valid(kwargs.get("adapter_name"))
+        self._activate_adapter(kwargs.get("adapter_name"))
+        super().add_metric(metric_cls, **kwargs)
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):
