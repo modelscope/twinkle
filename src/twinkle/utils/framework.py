@@ -195,6 +195,7 @@ class Torch(Framework):
         Returns:
             A local torch.Tensor.
         """
+        import torch
         if hasattr(tensor, 'full_tensor'):
             # DTensor from torch.distributed.tensor
             return tensor.full_tensor()

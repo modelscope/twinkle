@@ -244,7 +244,7 @@ def get_device_placement(device_group=None) -> str:
         lines.extend(section_bottom())
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n" + "\n".join(lines)
 
 
 def _get_workers(workers, execute):
@@ -484,7 +484,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none',
+                    sync: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -503,6 +504,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             'sum': Return the sum value of all processes
             'first': Return the first worker's result but executed in each process, usually works for scenarios of all-gather.
             Callable: A callable that handles the collection
+        sync: If True, use synchronous execution (execute_all_sync) instead of async.
+            Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
     """
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -522,7 +525,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     from ._ray import RayHelper
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
-                    result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
+                    execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                    result = execute_method(func.__name__, _workers_and_args)
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
@@ -549,6 +553,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
         wrapper._collect = collect
         wrapper._dispatch = dispatch
         wrapper._lazy_collect = _lazy_collect
+        wrapper._sync = sync
         return wrapper
 
     return decorator
