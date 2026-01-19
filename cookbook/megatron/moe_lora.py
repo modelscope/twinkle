@@ -200,7 +200,7 @@ def train():
         model.step(adapter_name=adapter_name)
         model.zero_grad(adapter_name=adapter_name)
         model.lr_step(adapter_name=adapter_name)
-        if step % 100 == 0:
+        if step > 0 and step % 100 == 0:
             model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * 16:
