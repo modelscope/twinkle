@@ -1,11 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .base import Dataset
+from torch.utils.data import IterableDataset
+
+from .base import Dataset, DatasetMeta
 from twinkle import remote_function, remote_class
 
 
 @remote_class(execute='first')
-class IterableDataset(Dataset):
+class IterableDataset(IterableDataset, Dataset):
     """An Iterable dataset wrapper."""
+
+    def __init__(self, dataset_meta: DatasetMeta, **kwargs):
+        kwargs['streaming'] = True
+        super(IterableDataset, self).__init__(dataset_meta, **kwargs)
+
+    def add_dataset(self,
+                    dataset_meta: DatasetMeta,
+                    **kwargs):
+        kwargs['streaming'] = True
+        return super().add_dataset(dataset_meta, **kwargs)
 
     def __len__(self):
         raise NotImplementedError()

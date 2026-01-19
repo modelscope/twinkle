@@ -42,7 +42,10 @@ def to_transformers_dict(feature: InputFeature) -> dict:
     _keys = ['input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask', 'logits_to_keep', 'num_items_in_batch']
     for key in list(feature.keys()):
         if key in _keys:
-            output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
+            try:
+                output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
+            except:
+                print()
     return output
 
 

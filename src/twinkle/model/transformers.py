@@ -579,7 +579,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         results = {}
-        for metric in optimizer_config.metrics[:1]:
+        for metric in optimizer_config.metrics:
             metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
             results.update(metric.calculate())
         return results

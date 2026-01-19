@@ -2,9 +2,9 @@
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable, Type, Union, List
+from typing import Callable, Type, Union
 
-from datasets import interleave_datasets, concatenate_datasets, load_dataset
+from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
@@ -109,8 +109,17 @@ class Dataset(TorchDataset):
                 dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
-        if isinstance(dataset_meta.data_slice, Iterable):
-            dataset = dataset.select(dataset_meta.data_slice)
+        if isinstance(dataset_meta.data_slice, Iterable) and hasattr(dataset, '__len__'):
+
+            def _iter():
+                # Prevent out of range, repeat sampling
+                _data_len = len(dataset)
+                for idx in dataset_meta.data_slice:
+                    if idx >= _data_len:
+                        idx = idx % _data_len
+                    yield idx
+
+            dataset = dataset.select(_iter())
         return dataset
 
     @remote_function()
@@ -186,6 +195,8 @@ class Dataset(TorchDataset):
             interleave: Whether to interleave the dataset, or concatenate the dataset.
         """
         if len(self.datasets) > 1:
+            dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
+            assert all(dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
             if interleave:
                 self.dataset = interleave_datasets(list(self.datasets.values()))
             else:

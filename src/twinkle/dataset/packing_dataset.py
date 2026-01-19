@@ -101,8 +101,13 @@ class PackingDataset(Dataset):
     @remote_function()
     def __getitem__(self, index):
         sequence = self.packed_idx[index]
-        row = [self.dataset[i] for i in sequence]
-        return row
+        rows = [self.dataset[i] for i in sequence]
+        output = {}
+        for key in rows[0]:
+            output[key] = [r[key] for r in rows]
+            if isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):
+                output[key] = [v for lst in output[key] for v in lst]
+        return output
 
     @remote_function()
     def __len__(self):

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, IterableDataset
 
 from twinkle.dataset import Dataset
 
@@ -24,6 +24,7 @@ class RetrySampler(Sampler):
         for idx in self.original_sampler:
             for _ in range(self.max_retries):
                 try:
+                    assert not isinstance(self.dataset, IterableDataset)
                     # Skip None values and raises
                     data = self.dataset[idx]
                     if not data:
@@ -34,28 +35,27 @@ class RetrySampler(Sampler):
                 except Exception: # noqa
                     continue
             else:
-                raise ValueError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
+                raise StopIteration(f'Max retries exceeded: {self.max_retries}, no valid data found.')
 
-        if hasattr(self.dataset, '__len__'):
-            origin_dataset_len = len(self.dataset)
+        origin_dataset_len = len(self.dataset)
+        if total >= origin_dataset_len:
+            return
+
+        for idx in np.random.RandomState().permutation(len(self.dataset)).tolist():
             if total >= origin_dataset_len:
-                return
-
-            for idx in np.random.RandomState().permutation(len(self.dataset)).tolist():
-                if total >= origin_dataset_len:
-                    break
-                for _ in range(self.max_retries):
-                    try:
-                        # Skip None values and raises
-                        data = self.dataset[idx]
-                        if not data:
-                            continue
-                        yield idx
-                        total += 1
-                    except Exception: # noqa
+                break
+            for _ in range(self.max_retries):
+                try:
+                    # Skip None values and raises
+                    data = self.dataset[idx]
+                    if not data:
                         continue
-                else:
-                    raise ValueError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
+                    yield idx
+                    total += 1
+                except Exception: # noqa
+                    continue
+            else:
+                raise ValueError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
 
     def __len__(self):
         return len(self.dataset)
