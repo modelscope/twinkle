@@ -12,7 +12,7 @@ from .base import (
     to_kernels_mode,
     get_device_type,
 )
-from .registry import register_layer
+from .registry import register_layer, get_global_layer_registry
 
 logger = getLogger(__name__)
 
@@ -27,7 +27,18 @@ def register_layer_kernel(
     device: DeviceType = "cuda",
     mode: Optional[ModeType] = None,
 ) -> None:
-    """注册层级别 kernel，支持从 HuggingFace Hub 或本地路径加载"""
+    """注册层级别 kernel
+
+    Args:
+        kernel_name: Kernel 名称（相同 kernel_name 可以注册多个 mode）
+        repo_id: Hub 仓库 ID
+        repo_path: 本地仓库路径
+        package_name: 本仓包名（使用 repo_path 时必需）
+        layer_name: 层名称（默认为 kernel_name）
+        version: 版本约束
+        device: 设备类型
+        mode: 模式（train/inference/compile），None 表示 FALLBACK
+    """
     if not is_kernels_available():
         logger.warning(f"HF kernels package not available. Skipping registration for kernel: {kernel_name}")
         return
@@ -53,15 +64,19 @@ def register_layer_kernel(
             version=version,
         )
 
-    # 注册到 Twinkle 内部注册表
-    register_layer(kernel_name, repo_spec, device)
+    hf_mode = _to_hf_mode(mode)
+    register_layer(kernel_name, repo_spec, device, mode=hf_mode)
 
-    # 同步到 HF kernels 的全局映射
-    from kernels import register_kernel_mapping as hf_register_kernel_mapping
-    hf_mapping = {kernel_name: {device: repo_spec}}
-    hf_register_kernel_mapping(hf_mapping, inherit_mapping=True)
+    mode_str = mode or "FALLBACK"
+    logger.info(f"Registered layer kernel: {kernel_name} for device: {device}, mode: {mode_str}")
 
-    logger.info(f"Registered layer kernel: {kernel_name} for device: {device}")
+
+def _to_hf_mode(mode: Optional[ModeType]) -> Any:
+    """将 Twinkle mode 转换为 HF kernels Mode"""
+    if mode is None:
+        from kernels import Mode
+        return Mode.FALLBACK
+    return to_kernels_mode(mode)
 
 
 def apply_layer_kernel(model, mode: ModeType = "inference", device: Optional[DeviceType] = None) -> Any:
@@ -69,6 +84,9 @@ def apply_layer_kernel(model, mode: ModeType = "inference", device: Optional[Dev
     if not is_kernels_enabled():
         logger.debug("Kernels not enabled, returning original model")
         return model
+
+    # 同步到 HF kernels
+    get_global_layer_registry().sync_to_hf_kernels()
 
     if device is None:
         device = get_device_type() or "cuda"
