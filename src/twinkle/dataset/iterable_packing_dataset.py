@@ -3,14 +3,15 @@ import multiprocessing as mp
 from typing import TypeVar
 
 from twinkle.infra import remote_class, remote_function
-from .base import DatasetMeta, Dataset
+from .base import DatasetMeta
+from .iterable_dataset import IterableDataset
 from .packing_dataset import PackingDataset
 
 _T = TypeVar('_T')
 
 
 @remote_class(execute='first')
-class IterablePackingDataset(Dataset):
+class IterablePackingDataset(IterableDataset):
 
     def __init__(self, dataset_meta: DatasetMeta,
                  packing_interval: int = 128,

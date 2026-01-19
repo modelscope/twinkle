@@ -51,7 +51,6 @@ class Dataset(TorchDataset):
         }
         self.dataset = dataset
         self.template = None
-        self.streaming = isinstance(self.dataset, IterableDataset)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[Template], str], **kwargs):
@@ -205,20 +204,8 @@ class Dataset(TorchDataset):
 
     @remote_function()
     def __getitem__(self, idx):
-        if self.streaming:
-            raise ValueError(f'Index of streaming dataset is not supported.')
         return self.dataset[idx]
 
     @remote_function()
     def __len__(self):
-        if self.streaming:
-            raise ValueError(f'Index of streaming dataset is not supported.')
         return len(self.dataset)
-
-    @remote_function()
-    def __iter__(self):
-        if not self.streaming:
-            raise ValueError(f'`__iter__` function of lengthed dataset is not supported.')
-        # TODO if this class passed through actor handler, an error will occur:
-        # a global single dataset, multiple dataloaders, the self._iter will cover each other
-        return self.dataset.__iter__()

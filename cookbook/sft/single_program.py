@@ -2,7 +2,7 @@ from peft import LoraConfig
 import twinkle
 from twinkle import get_device_placement, get_logger, is_master
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset
+from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset
 from twinkle.model import TransformersModel
 
 twinkle.initialize(mode='local')
@@ -11,7 +11,7 @@ logger = get_logger()
 
 
 def eval(model: TransformersModel):
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'), streaming=True)
+    dataset = IterableDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
     dataset.map('SelfCognitionProcessor')
     dataset.encode(batched=True)
@@ -23,7 +23,7 @@ def eval(model: TransformersModel):
     return metrics
 
 def train():
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'), streaming=True)
+    dataset = IterableDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
     dataset.map('SelfCognitionProcessor')
     dataset.encode(batched=True)
