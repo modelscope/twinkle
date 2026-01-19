@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import re
 import time
 import uuid
 import asyncio
@@ -11,7 +12,6 @@ import ray
 from tinker import types
 
 
-@ray.remote(name="tinker_server_state", lifetime="detached")
 class ServerState:
     def __init__(self) -> None:
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -36,8 +36,11 @@ class ServerState:
         return True
 
     def register_model(self, payload: Dict[str, Any], model_id: Optional[str] = None) -> str:
-        model_id = model_id or payload.get("model_id") or f"{payload.get('base_model', 'model')}-{uuid.uuid4().hex[:8]}"
-        self.models[model_id] = {
+        _session_id = payload.get("session_id")
+        _model_id: str = model_id or payload.get("model_id") or f"{payload.get('base_model', 'model')}-{_session_id or uuid.uuid4().hex[:8]}"
+        _model_id = re.sub(r'[^\w\-]', '_', _model_id)
+
+        self.models[_model_id] = {
             "session_id": payload.get("session_id"),
             "model_seq_id": payload.get("model_seq_id"),
             "base_model": payload.get("base_model"),
@@ -45,21 +48,21 @@ class ServerState:
             "lora_config": payload.get("lora_config"),
             "created_at": datetime.now().isoformat(),
         }
-        return model_id
+        return _model_id
 
     def unload_model(self, model_id: str) -> bool:
         return self.models.pop(model_id, None) is not None
 
     def create_sampling_session(self, payload: Dict[str, Any], sampling_session_id: Optional[str] = None) -> str:
-        sampling_session_id = sampling_session_id or payload.get("sampling_session_id") or f"sampling_{uuid.uuid4().hex}"
-        self.sampling_sessions[sampling_session_id] = {
+        _sampling_session_id: str = sampling_session_id or payload.get("sampling_session_id") or f"sampling_{uuid.uuid4().hex}"
+        self.sampling_sessions[_sampling_session_id] = {
             "session_id": payload.get("session_id"),
             "seq_id": payload.get("sampling_session_seq_id"),
             "base_model": payload.get("base_model"),
             "model_path": payload.get("model_path"),
             "created_at": datetime.now().isoformat(),
         }
-        return sampling_session_id
+        return _sampling_session_id
 
     def get_model_metadata(self, model_id: str) -> Optional[Dict[str, Any]]:
         return self.models.get(model_id)
@@ -100,15 +103,16 @@ class ServerStateProxy:
     def get_model_metadata(self, model_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_model_metadata.remote(model_id))
 
-    def store_future(self, request_id: str, result: Any, model_id: Optional[str]):
-        return ray.get(self._actor.store_future.remote(request_id, result, model_id))
+    async def store_future(self, request_id: str, result: Any, model_id: Optional[str]):
+        # Make the Ray call asynchronously
+        await self._actor.store_future.remote(request_id, result, model_id)
 
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_future.remote(request_id))
 
 
 def get_server_state(actor_name: str = "tinker_server_state") -> ServerStateProxy:
-    _ServerState = ServerState
+    _ServerState = ray.remote(ServerState)
     try:
         actor = ray.get_actor(actor_name)
     except ValueError:

@@ -4,19 +4,16 @@ import os
 import threading
 import time
 from typing import Dict, Any, Optional
-import uuid
 
 from fastapi import FastAPI, Request
 from peft import LoraConfig
-from pydantic import BaseModel
 from ray import serve
 from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.model import TwinkleModel, MultiLoraTransformersModel
-from twinkle.model.base import TwinkleModel
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import datum_to_input_feature
 from twinkle.server.twinkle.validation import verify_request_token, init_config_registry, ConfigRegistryProxy
 from .state import get_server_state, schedule_task
 
@@ -41,7 +38,7 @@ def build_model_app(nproc_per_node: int,
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model: TwinkleModel = None
+            self.model: Optional[MultiLoraTransformersModel] = None
             self.kwargs = kwargs
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
@@ -55,6 +52,8 @@ def build_model_app(nproc_per_node: int,
         def countdown(self):
             while True:
                 time.sleep(1)
+                if not self.model:
+                    continue
                 for key in list(self.adapter_records.keys()):
                     self.adapter_records[key] += 1
                     if self.adapter_records[key] > self.COUNT_DOWN:
@@ -67,7 +66,7 @@ def build_model_app(nproc_per_node: int,
 
         def handle_adapter_count(self, token: str, add: bool):
             user_key = token + '_' + 'model_adapter'
-            cur_count = self.config_registry.get_config(user_key) or 0
+            cur_count: int = self.config_registry.get_config(user_key) or 0
             if add:
                 if cur_count < self.per_token_model_limit:
                     self.config_registry.add_config(user_key, cur_count + 1)
@@ -81,9 +80,7 @@ def build_model_app(nproc_per_node: int,
                     self.config_registry.pop(user_key)
         
         @staticmethod
-        def get_adapter_name(request: Request, adapter_name: Optional[str]) -> Optional[str]:
-            if adapter_name is None or adapter_name == '':
-                return None
+        def get_adapter_name(request: Request, adapter_name: str) -> str:
             return request.state.request_id + '-' + adapter_name
         
         def assert_adapter_exists(self, adapter_name: str):
@@ -95,14 +92,16 @@ def build_model_app(nproc_per_node: int,
 
         @app.post("/create_model")
         async def create_model(self, request: Request, body: types.CreateModelRequest) -> types.UntypedAPIFuture:
-            model_id = await self.state.register_model(body)
+            model_id = self.state.register_model(body.model_dump())
 
             async def _load_model():
+                breakpoint()
+                extra_kwargs = body.user_metadata or {}
                 self.model = MultiLoraTransformersModel(
                     model_id=body.base_model,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
-                    **body.user_metadata,
+                    **extra_kwargs,
                 )
                 if body.lora_config:
                     # TODO: support more lora config parameters
@@ -112,16 +111,18 @@ def build_model_app(nproc_per_node: int,
                     with self.adapter_lock:
                         adapter_name = self.get_adapter_name(request=request, adapter_name=model_id)
                         self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
-                    self.adapter_records[adapter_name] = 0
-                    self.key_token_dict[adapter_name] = request.state.token
-                    self.handle_adapter_count(request.state.token, True)
+                        self.adapter_records[adapter_name] = 0
+                        self.key_token_dict[adapter_name] = request.state.token
+                        self.handle_adapter_count(request.state.token, True)
+                    self.model.set_processor('InputProcessor', adapter_name=adapter_name)
+                    self.model.set_optimizer('AdamW', adapter_name=adapter_name)
                 return types.CreateModelResponse(model_id=model_id)
 
             return await schedule_task(self.state, _load_model(), model_id=model_id)
 
         @app.post("/get_info")
         async def get_info(self, request: Request, body: types.GetInfoRequest) -> types.GetInfoResponse:
-            metadata = await self.state.get_model_metadata(str(body.model_id))
+            metadata = self.state.get_model_metadata(str(body.model_id))
             model_name = metadata.get("base_model") if metadata else str(body.model_id)
             lora_rank = None
             is_lora = False
@@ -139,7 +140,13 @@ def build_model_app(nproc_per_node: int,
         @app.post("/unload_model")
         async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> types.UntypedAPIFuture:
             async def _do_unload():
-                await self.state.unload_model(body.model_id)
+                self.model = None
+                with self.adapter_lock:
+                    adapter_name = self.get_adapter_name(request=request, adapter_name=body.model_id)
+                    del self.adapter_records[adapter_name]
+                    del self.key_token_dict[adapter_name]
+                    self.handle_adapter_count(request.state.token, add=False)
+                self.state.unload_model(body.model_id)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
             return await schedule_task(self.state, _do_unload(), model_id=body.model_id)
@@ -148,6 +155,12 @@ def build_model_app(nproc_per_node: int,
         @app.post("/forward_backward")
         async def forward_backward(self, request: Request, body: types.ForwardBackwardRequest) -> types.UntypedAPIFuture:
             async def _do_forward_backward():
+                if not self.model:
+                    return types.RequestFailedResponse(
+                        error="Model not loaded, please load model first",
+                        category=types.RequestErrorCategory.User,
+                    )
+
                 adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
                 self.assert_adapter_exists(adapter_name=adapter_name)
                 
@@ -155,17 +168,9 @@ def build_model_app(nproc_per_node: int,
                 loss_fn = body.forward_backward_input.loss_fn
                 loss_fn_config = body.forward_backward_input.loss_fn_config
                 
-                if isinstance(inputs, list):
-                    _input = inputs[0]
-                    if 'input_ids' in _input:
-                        inputs = [InputFeature(**_input) for _input in inputs]
-                    else:
-                        inputs = [Trajectory(**_input) for _input in inputs]
-                else:
-                    assert isinstance(inputs, dict)
-                    inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
+                inputs = [datum_to_input_feature(datum) for datum in datum_list]
                 ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name)
-                return types.F(
+                return types.ForwardBackwardOutput(
                     loss_fn_output_type="TensorData",
                     loss_fn_outputs=[loss_output],
                     metrics={"loss:avg": 0.0, "tokens_per_second:avg": 0.0},
@@ -178,6 +183,7 @@ def build_model_app(nproc_per_node: int,
         @app.post("/optim_step")
         async def optim_step(self, request: Request, body: types.OptimStepRequest) -> types.UntypedAPIFuture:
             async def _do_optim():
+
                 return types.OptimStepResponse(
                     metrics={
                         "grad_norm": 0.0,
