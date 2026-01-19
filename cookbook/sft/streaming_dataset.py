@@ -25,17 +25,7 @@ device_mesh = DeviceMesh(
     mesh_dim_names=('dp', 'fsdp')
 )
 
-<<<<<<< HEAD
-#device_mesh = DeviceMesh(
-#    device_type='cuda',
-#    mesh=np.array([0,1,2,3]),
-#    mesh_dim_names=('dp',)
-#)
-
-twinkle.initialize(mode='ray', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
-=======
 twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
->>>>>>> origin/dev
 
 
 def create_dataset():
