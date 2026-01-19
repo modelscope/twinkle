@@ -1,0 +1,57 @@
+from peft import LoraConfig
+import twinkle
+from twinkle import get_device_placement, get_logger, is_master
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.model import TransformersModel
+
+twinkle.initialize(mode='local')
+
+logger = get_logger()
+
+
+def eval(model: TransformersModel):
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
+    dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    dataset.map('SelfCognitionProcessor')
+    dataset.encode(batched=True)
+    dataloader = DataLoader(dataset=dataset, batch_size=8)
+    for step, batch in enumerate(dataloader):
+        model.forward_only(inputs=batch)
+        model.calculate_loss()
+    metrics = model.calculate_metric()
+    return metrics
+
+def train():
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
+    dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    dataset.map('SelfCognitionProcessor')
+    dataset.encode(batched=True, load_from_cache_file=False)
+    dataloader = DataLoader(dataset=dataset, batch_size=8)
+
+    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+
+    lora_config = LoraConfig(
+        target_modules='all-linear'
+    )
+
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
+    logger.info(get_device_placement())
+    logger.info(model.get_train_configs())
+    loss_metric = 99.0
+    for step, batch in enumerate(dataloader):
+        output = model.forward_backward(inputs=batch)
+        if step % 16 == 0:
+            logger.info(f'Current is step {step // 16}, loss: {output}')
+        model.clip_grad_and_step()
+        if step % 50 == 0:
+            metrics = {'loss': 0.0} # eval(model)
+            logger.info(f'Current is step {step // 16}, metrics: {metrics}')
+            metrics['step'] = step
+            if loss_metric > metrics['loss']:
+                model.save(f'checkpoint-{step}')
+                loss_metric = metrics['loss']
+
+
+if __name__ == '__main__':
+    train()

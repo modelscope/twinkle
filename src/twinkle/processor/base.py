@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Dict, Any
 import numpy as np
 from twinkle import Platform, DeviceMesh, remote_class, remote_function
 from twinkle.data_format import InputFeature, to_transformers_dict
@@ -17,9 +17,10 @@ class InputProcessor:
         'position_ids': -1,
     }
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, **kwargs):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, **kwargs):
         self.device_mesh = device_mesh
         self.padding_side = kwargs.get('padding_side', 'right')
+        self.padding_free = padding_free
 
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):
@@ -52,25 +53,36 @@ class InputProcessor:
             padded_sequences.append(padded_seq)
         return torch.stack(padded_sequences)
 
-    def _inner_collate_fn(self, batch):
-        import torch
-        result = {}
-        keys = batch[0].keys()
-
-        for key in keys:
-            values = [item[key] for item in batch]
-
-            if isinstance(values[0], np.ndarray):
-                values = [torch.from_numpy(v) for v in values]
-                result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
-            elif isinstance(values[0], torch.Tensor):
-                result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
-            else:
-                result[key] = values
-
-        return result
-
     @remote_function()
-    def collate_fn(self, inputs: List[InputFeature]) -> InputFeature:
-        batch_encoded = self._inner_collate_fn([to_transformers_dict(_input) for _input in inputs])
-        return InputFeature(**batch_encoded)
+    def collate_fn(self, inputs: List[InputFeature]) -> Dict[str, Any]:
+        import torch
+        keys = inputs[0].keys()
+        result = {}
+        if self.padding_free:
+            for key in keys:
+                values = [item[key] for item in inputs]
+                if isinstance(values[0], np.ndarray):
+                    value = np.concatenate(values, axis=-1)
+                    value = torch.from_numpy(value)
+                elif isinstance(values[0], torch.Tensor):
+                    value = torch.cat(values, dim=-1)
+                else:
+                    value = values
+                result[key] = value
+            result = InputFeature(**result)
+        else:
+            for key in keys:
+                values = [item[key] for item in inputs]
+
+                if isinstance(values[0], np.ndarray):
+                    values = [torch.from_numpy(v) for v in values]
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float)):
+                    values = [torch.tensor(v) for v in values]
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                elif isinstance(values[0], torch.Tensor):
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                else:
+                    result[key] = values
+            result = InputFeature(**result)
+        return to_transformers_dict(result)

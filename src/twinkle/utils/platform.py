@@ -74,17 +74,17 @@ class DeviceMesh:
             mesh_dim_names=self.mesh_dim_names
         )
 
-    def _get_coord(self) -> tuple[int, ...]:
+    def _get_coord(self) -> Optional[tuple[int, ...]]:
         rank = Platform.get_rank()
         coords = np.argwhere(self.mesh == rank)
         if len(coords) == 0:
-            raise ValueError(f"Rank {rank} not found in mesh")
+            return None
         return tuple(coords[0])
 
-    def _get_coord_for_rank(self, rank: int) -> tuple[int, ...]:
+    def _get_coord_for_rank(self, rank: int) -> Optional[tuple[int, ...]]:
         coords = np.argwhere(self.mesh == rank)
         if len(coords) == 0:
-            raise ValueError(f"Rank {rank} not found in mesh")
+            return None
         return tuple(coords[0])
 
     def _get_dim_index(self, dim_name: str) -> Optional[int]:
@@ -97,12 +97,15 @@ class DeviceMesh:
     def _has_dim(self, dim_name: str) -> bool:
         return self._get_dim_index(dim_name) is not None
 
-    def _get_rank_for_dim(self, dim_name: str) -> int:
+    def _get_rank_for_dim(self, dim_name: str) -> Optional[int]:
         dim_idx = self._get_dim_index(dim_name)
         if dim_idx is None:
             return 0
         coord = self._get_coord()
-        return coord[dim_idx]
+        if coord is not None:
+            return coord[dim_idx]
+        else:
+            return None
 
     def _get_world_size_for_dim(self, dim_name: str) -> int:
         dim_idx = self._get_dim_index(dim_name)
@@ -188,7 +191,11 @@ class DeviceMesh:
         fsdp_rank = self.fsdp_rank
         fsdp_world_size = self.fsdp_world_size
 
-        return dp_rank * fsdp_world_size + fsdp_rank
+        if dp_rank is not None and fsdp_rank is not None:
+            # RANK env valid
+            return dp_rank * fsdp_world_size + fsdp_rank
+        else:
+            return None
 
     @property
     def data_parallel_world_size(self) -> int:
@@ -198,6 +205,9 @@ class DeviceMesh:
         world_size = self.data_parallel_world_size
         if rank is None:
             rank = self.data_parallel_rank
+            if rank is None:
+                rank = 0
+                world_size = 1
 
         k, m = divmod(total_length, world_size)
         start = rank * k + min(rank, m)
@@ -408,12 +418,12 @@ class Platform(ABC):
     @staticmethod
     def get_rank() -> int:
         """Get the global rank"""
-        return int(os.getenv('RANK', 0))
+        return int(os.getenv('RANK', -1))
 
     @staticmethod
     def get_local_rank() -> int:
         """Get the local rank"""
-        return int(os.getenv('LOCAL_RANK', 0))
+        return int(os.getenv('LOCAL_RANK', -1))
 
     @staticmethod
     def get_world_size() -> int:
@@ -479,6 +489,8 @@ class Platform(ABC):
         platform = Platform.get_platform(platform)
         if idx is None:
             idx = Platform.get_local_rank()
+        if idx < 0:
+            idx = 0
         return platform.get_local_device(idx)
 
 class GPU(Platform):

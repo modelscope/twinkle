@@ -7,7 +7,6 @@ from typing import TypeVar
 
 import numpy as np
 
-from .ray import RayHelper
 from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
 
@@ -24,21 +23,9 @@ _lazy_collect = True
 
 _full_determinism = False
 
-_STOP_ITERATION = {"__twinkle_stop__": True}  # Fixes Ray "Unhandled error" when DataLoader ends.
+_device_group: Optional[List[DeviceGroup]] = None
 
-_device_group: Optional[List[DeviceGroup]] = [
-    DeviceGroup(
-        name='default',
-        ranks=list(range(Platform.get_world_size())),
-        device_type=Platform.get_platform().device_prefix(),
-    )
-]
-
-_device_mesh = DeviceMesh(
-    device_type=Platform.get_platform().device_prefix(),
-    mesh=np.arange(Platform.get_world_size()),
-    mesh_dim_names=('dp',)
-)
+_device_mesh = None
 
 _remote_components: dict = {}
 
@@ -72,16 +59,52 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     _lazy_collect = lazy_collect
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
+    else:
+        _device_mesh = DeviceMesh(
+            device_type=Platform.get_platform().device_prefix(),
+            mesh=np.arange(Platform.get_world_size()),
+            mesh_dim_names=('dp',)
+        )
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
     if _mode == 'ray':
         requires('ray')
+        from ._ray import RayHelper
         if groups is not None:
             _device_group = groups
+        else:
+            _device_group = [
+                DeviceGroup(
+                    name='default',
+                    ranks=list(range(Platform.get_world_size())),
+                    device_type=Platform.get_platform().device_prefix(),
+                )
+            ]
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
                              device_groups=_device_group)
+    else:
+        if groups is not None:
+            _device_group = groups
+        else:
+            _device_group = [
+                DeviceGroup(
+                    name='default',
+                    ranks=list(range(Platform.get_world_size())),
+                    device_type=Platform.get_platform().device_prefix(),
+                )
+            ]
+
+
+def is_master():
+    if _mode == 'ray':
+        if 'TWINKLE_MODE' in os.environ:
+            return True
+    elif _mode == 'local':
+        if Platform.is_master():
+            return True
+    return False
 
 
 def get_device_placement(device_group=None) -> str:
@@ -235,13 +258,9 @@ def _get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable], result):
     if not result:
         return result
-
-    if isinstance(result, list) and any(item == _STOP_ITERATION for item in result):
-        # Stop in the driver to avoid Ray treating StopIteration as an actor error.
-        raise StopIteration
 
     if isinstance(result[0], tuple):
         output = []
@@ -264,6 +283,8 @@ def _collect_func(method: Union[Literal['none', 'flatten'], Callable], result):
         return np.mean(result)
     elif method == 'sum':
         return np.sum(result)
+    elif method == 'first':
+        return result[0]
     elif isinstance(method, Callable):
         # Callable
         return method(result)
@@ -338,6 +359,7 @@ def _get_device_mesh_param(args, kwargs):
 def _prepare_lazy_collect(args, kwargs):
     # if a worker received an actor handle,
     # lazy collect should be false to prevent any outer function receives an object ref
+    from ._ray import RayHelper
     if not RayHelper.is_worker():
         return args, kwargs
     for arg in list(args) + list(kwargs.values()):
@@ -370,47 +392,52 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     init_method(self, *args, **kwargs)
             elif _mode == 'ray':
-                from .ray import RayHelper
+                from ._ray import RayHelper
 
                 # In case the same class created twice in the same device group
                 frame = inspect.currentframe().f_back
                 caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
                 caller_line = frame.f_lineno
                 instance_id = kwargs.pop('instance_id', '') + f"{caller_file}_{caller_line}"
-                remote_group = kwargs.pop('remote_group', None)
+                remote_group = kwargs.get('remote_group')
                 check_unsafe(*args, **kwargs)
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
-                if remote_group and device_mesh_name:
+                if device_mesh_name:
                     # If it's a remote component
                     if device_mesh is None:
                         device_mesh = _device_mesh
                         kwargs[device_mesh_name] = _device_mesh
 
-                    device_group = [dg for dg in _device_group if dg.name == remote_group][0]
-                    device_group._device_mesh[self.__class__.__name__] = device_mesh
+                    if _device_group and remote_group:
+                        device_group = [dg for dg in _device_group if dg.name == remote_group][0]
+                        device_group._device_mesh[self.__class__.__name__] = device_mesh
 
                 def __iter__(_self):
-                    _iter = _self.__iter_origin__()
-                    assert _iter is not _self
-                    _self._iter = _iter
+                    if is_master():
+                        _iter = _self.__iter_origin__()
+                        assert _iter is not _self
+                        _self._iter = _iter
+                    else:
+                        return _self.__iter_origin__()
 
                 def __next__(_self):
                     try:
-                        return next(_self._iter)
+                        return next(_self._iter), False
                     except StopIteration:
-                        # Ray surfaces StopIteration as an actor error without this sentinel.
-                        return _STOP_ITERATION
+                        return [], True
 
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # remote_group is None when it's worker and remote_group not passed through arguments
                     # Seed when a remote class is created.
-                    framework_util.seed_everything(int(os.environ['TWINKLE_SEED']),
-                                                    bool(int(os.environ['TWINKLE_FULL_DETERMINISM'])))
+                    seed = int(os.environ.get('TWINKLE_SEED', _seed))
+                    determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
+                    framework_util.seed_everything(seed, bool(determinism))
                     if not device_mesh_name:
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
                     args, kwargs = _prepare_lazy_collect(args, kwargs)
+                    kwargs.pop('remote_group', None)
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):
@@ -419,9 +446,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         _collect = self.__iter__._collect
 
                     if hasattr(cls, '__iter__'):
+                        import ray
                         cls.__iter_origin__ = cls.__iter__
                         cls.__iter__ = __iter__
-                        cls.__next__ = __next__
+                        cls.__next__ = ray.method(num_returns=2)(__next__)
 
                     # Create remote workers
                     _actors = RayHelper.create_workers(cls,
@@ -457,7 +485,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none'):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -472,6 +500,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
         collect: How to collect the results.
             'none': Return as-is
             'flatten': Return a flattened list
+            'mean': Return the mean value of all processes
+            'sum': Return the sum value of all processes
+            'first': Return the first worker's result but executed in each process, usually works for scenarios of all-gather.
             Callable: A callable that handles the collection
     """
 
@@ -485,22 +516,33 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             elif _mode == 'ray':
                 check_unsafe(*args, **kwargs)
                 if not hasattr(self, '_actors'):
+                    from ._ray import RayHelper
+                    args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
                     return func(self, *args, **kwargs)
                 else:
-                    from .ray import RayHelper
-                    args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
+                    from ._ray import RayHelper
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
                     result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     lazy_collect = _lazy_collect
+                    if func.__name__ == '__iter__':
+                        return self
+
+                    if func.__name__ == '__next__':
+                        import ray
+                        for _res in result:
+                            # raise when any worker raises StopIteration
+                            stop = ray.get(_res[1])
+                            if stop:
+                                raise StopIteration()
+                        result = [_res[0] for _res in result]
+                        result_func._futures = result
+
                     if hasattr(self, '_lazy_collect'):
                         lazy_collect = self._lazy_collect
                     result = result_func if lazy_collect else result_func()
-                    if func.__name__ == '__iter__':
-                        return self
-                    else:
-                        return result
+                    return result
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 

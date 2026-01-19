@@ -30,6 +30,7 @@ class InputFeature(TypedDict, total=False):
     position_ids: InputType
     labels: InputType
     completion_mask: InputType
+    length: int
     logits_to_keep: Optional[int]
     num_items_in_batch: Optional[int]
 
@@ -39,9 +40,9 @@ def to_transformers_dict(feature: InputFeature) -> dict:
     import torch
     output = dict(feature)
     _keys = ['input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask', 'logits_to_keep', 'num_items_in_batch']
-    for key in list(output.keys()):
-        if key in _keys and not isinstance(output[key], torch.Tensor):
-            output[key] = np.array(output[key])
+    for key in list(feature.keys()):
+        if key in _keys:
+            output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
     return output
 
 

@@ -1,3 +1,3 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Preprocessor, DataFilter
-from .llm import CompetitionMathProcessor
+from .llm import CompetitionMathProcessor, SelfCognitionProcessor
