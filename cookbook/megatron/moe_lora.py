@@ -91,27 +91,45 @@ def train():
     else:
         WORLD_SIZE = args.num_gpus
 
-    # For MoE with EP: Total parallelism = TP * PP * CP * EP * DP
-    # EP is placed between CP and DP in Megatron's order
-    DP_SIZE = WORLD_SIZE // (TP_SIZE * PP_SIZE * CP_SIZE * EP_SIZE)
+    # DP calculation follows Megatron's logic: DP = world_size / (TP * PP * CP)
+    # EP is NOT included in DP calculation - it's handled separately by Megatron
+    # for MoE expert layers. Expert data parallel size is computed internally by Megatron.
+    DP_SIZE = WORLD_SIZE // (TP_SIZE * PP_SIZE * CP_SIZE)
 
+    # Validate that world size supports the parallelism config
+    # For MoE, EP must divide the data parallel replicas correctly
     if DP_SIZE < 1:
         raise ValueError(
             f'Not enough GPUs ({WORLD_SIZE}) for parallelism config: '
-            f'TP={TP_SIZE}, PP={PP_SIZE}, CP={CP_SIZE}, EP={EP_SIZE}. '
-            f'Required: {TP_SIZE * PP_SIZE * CP_SIZE * EP_SIZE}')
+            f'TP={TP_SIZE}, PP={PP_SIZE}, CP={CP_SIZE}. '
+            f'Required at least: {TP_SIZE * PP_SIZE * CP_SIZE}')
+
+    # EP should divide into world_size / (TP * PP) for proper expert parallelism
+    # This ensures expert_data_parallel_size = world_size / (ETP * EP * PP) is valid
+    expert_data_parallel_size = WORLD_SIZE // (TP_SIZE * EP_SIZE * PP_SIZE)
+    if expert_data_parallel_size < 1:
+        raise ValueError(
+            f'Not enough GPUs ({WORLD_SIZE}) for expert parallelism: '
+            f'TP={TP_SIZE}, PP={PP_SIZE}, EP={EP_SIZE}. '
+            f'Required at least: {TP_SIZE * EP_SIZE * PP_SIZE}')
 
     logger.info(
         f'Parallelism config: TP={TP_SIZE}, PP={PP_SIZE}, CP={CP_SIZE}, EP={EP_SIZE}, DP={DP_SIZE}'
     )
+    logger.info(
+        f'Expert data parallel size: {expert_data_parallel_size}'
+    )
 
     # Device mesh: Match Megatron's order "tp-cp-ep-dp-pp" from innermost to outermost
-    # Shape: (PP, DP, EP, CP, TP)
+    # Note: EP is not a separate dimension in the device mesh because:
+    # 1. Megatron handles EP internally in initialize_model_parallel()
+    # 2. For non-expert layers, DP = world_size / (TP * PP * CP)
+    # 3. For expert layers, expert_data_parallel_size = world_size / (ETP * EP * PP)
+    # The device mesh is used by twinkle for data sharding, which follows DP_SIZE
     device_mesh = DeviceMesh(
         device_type='cuda',
-        mesh=np.arange(WORLD_SIZE).reshape(PP_SIZE, DP_SIZE, EP_SIZE, CP_SIZE,
-                                           TP_SIZE),
-        mesh_dim_names=('pp', 'dp', 'ep', 'cp', 'tp'),
+        mesh=np.arange(WORLD_SIZE).reshape(PP_SIZE, DP_SIZE, CP_SIZE, TP_SIZE),
+        mesh_dim_names=('pp', 'dp', 'cp', 'tp'),
     )
 
     # Device group name - used as remote_group in Ray mode
