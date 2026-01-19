@@ -183,12 +183,6 @@ class RayHelper:
                         result.append(future)
                 return self._collect_func(self._method, result)
 
-            def __getattr__(self, name):
-                raise RuntimeError(f'This is a lazy function, use value().attr instead.')
-
-            def __getitem__(self, key):
-                raise RuntimeError(f'This is a lazy function, use value()[index] instead.')
-
         return LazyCollect(futures, method, collect_func)
 
     @staticmethod

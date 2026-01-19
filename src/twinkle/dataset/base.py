@@ -2,7 +2,7 @@
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable, Type, Union
+from typing import Callable, Type, Union, List
 
 from datasets import interleave_datasets, concatenate_datasets, load_dataset
 from torch.utils.data import Dataset as TorchDataset
@@ -75,12 +75,10 @@ class Dataset(TorchDataset):
         Args:
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
+        kwargs['batched'] = True # Only supported batched, because a single row may explode to several rows
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
-            if kwargs.get('batched', True):
-                self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
-            else:
-                self.dataset = self.dataset.map(self.template.encode, **kwargs).filter(lambda x: len(x['input_ids']) > 0, **kwargs)
+            self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
 
     @remote_function()
     def check(self, **kwargs):
@@ -89,12 +87,10 @@ class Dataset(TorchDataset):
         Args:
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
+        kwargs['batched'] = True  # Only supported batched, because a single row may explode to several rows
         with processing_lock('dataset'):
             # use a default lock because check is to all datasets
-            if kwargs.get('batched', True):
-                self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
-            else:
-                self.dataset = self.dataset.map(self.template.check, **kwargs).filter(lambda x: x is not None, **kwargs)
+            self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
 
     @staticmethod
     def _load_dataset(dataset_meta: DatasetMeta, **kwargs):
@@ -189,10 +185,11 @@ class Dataset(TorchDataset):
         Args:
             interleave: Whether to interleave the dataset, or concatenate the dataset.
         """
-        if interleave:
-            self.dataset = interleave_datasets(list(self.datasets.values()))
-        else:
-            self.dataset = concatenate_datasets(list(self.datasets.values()))
+        if len(self.datasets) > 1:
+            if interleave:
+                self.dataset = interleave_datasets(list(self.datasets.values()))
+            else:
+                self.dataset = concatenate_datasets(list(self.datasets.values()))
 
     @remote_function()
     def __getitem__(self, idx):

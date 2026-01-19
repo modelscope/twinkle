@@ -35,7 +35,6 @@ wheels/
 /package
 /temp
 MANIFEST
-.locks/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

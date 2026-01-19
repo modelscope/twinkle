@@ -5,9 +5,31 @@ from contextlib import contextmanager
 
 from datasets.utils._filelock import FileLock
 
-# Create locks directory
-_locks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '.locks')
-os.makedirs(_locks_dir, exist_ok=True)
+shutil.rmtree('.locks', ignore_errors=True)
+os.makedirs('.locks', exist_ok=True)
+
+def acquire_lock(lock, blocking):
+    try:
+        lock.acquire(blocking=blocking)
+        return True
+    except Exception:
+        return False
+
+
+def release_lock(lock):
+    lock.release()
+
+
+def acquire_lock(lock, blocking):
+    try:
+        lock.acquire(blocking=blocking)
+        return True
+    except Exception:
+        return False
+
+
+def release_lock(lock):
+    lock.release()
 
 
 @contextmanager
@@ -26,14 +48,12 @@ def processing_lock(lock_file: str, timeout: float = 600.0):
     lock_path = os.path.join(_locks_dir, f"{safe_name}.lock")
     lock = FileLock(lock_path, timeout=timeout)
 
-    try:
-        # Try to acquire lock with blocking and timeout
-        lock.acquire(blocking=True, timeout=timeout)
+    if acquire_lock(lock, False):
         try:
             yield
         finally:
-            lock.release()
-    except Exception:
-        # If lock acquisition fails (e.g., timeout), still yield to allow progress
-        # This prevents deadlock in distributed scenarios
+            release_lock(lock)
+    else:
+        acquire_lock(lock, True)
+        release_lock(lock)
         yield

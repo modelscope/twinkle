@@ -1,12 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import tempfile
+from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, Dict
+import concurrent.futures
 
 from requests.exceptions import HTTPError
 from ..utils import requires
+
+_executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
+_futures = {}
 
 
 class HubOperation:
@@ -18,14 +23,17 @@ class HubOperation:
     
     @staticmethod
     def source_type(resource_name: str):
-        if not resource_name:
-            return 'hf'
+        resource_name = resource_name or ''
         if resource_name.startswith('hf://'):
-            return 'hf'
+            source_type = 'hf'
         elif resource_name.startswith('ms://'):
-            return 'ms'
+            source_type = 'ms'
         else:
-            return 'hf'
+            source_type = 'ms'
+        if source_type == 'hf' and os.environ.get('TWINKLE_FORBID_HF', '0') != '0':
+            # Preventing from hang
+            raise ValueError(f'Using hf as hub backend is not supported.')
+        return source_type
     
     @staticmethod
     def remove_source_type(resource_name: str):
@@ -105,6 +113,35 @@ class HubOperation:
             raise NotImplementedError
 
     @classmethod
+    def async_push_to_hub(cls,
+                          repo_id: str,
+                            folder_path: Union[str, Path],
+                            path_in_repo: Optional[str] = None,
+                            commit_message: Optional[str] = None,
+                            commit_description: Optional[str] = None,
+                            token: Optional[Union[str, bool]] = None,
+                            private: bool = False,
+                            revision: Optional[str] = 'master',
+                            ignore_patterns: Optional[Union[List[str], str]] = None,
+                            **kwargs):
+        future: Future = _executor.submit(HubOperation.push_to_hub, repo_id, folder_path, path_in_repo,
+                         commit_message, commit_description, token, private,
+                         revision, ignore_patterns, **kwargs)
+        _futures[repo_id] = future
+
+    @classmethod
+    def wait_for(cls, repo_ids: Optional[List[str]] = None) -> Dict[str, str]:
+        results = {}
+        for repo_id, future in _futures.items():
+            future: Future
+            if not repo_ids or repo_id in repo_ids:
+                try:
+                    results[repo_id] = future.result()
+                except Exception as e:
+                    results[repo_id] = str(e)
+        return results
+
+    @classmethod
     def load_dataset(cls,
                      dataset_id: str,
                      subset_name: str,
@@ -128,8 +165,7 @@ class HubOperation:
         elif cls.source_type(dataset_id) == 'ms':
             return MSHub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
         else:
-            import datasets
-            datasets.load_dataset()
+            raise NotImplementedError()
 
     @classmethod
     def download_model(cls,

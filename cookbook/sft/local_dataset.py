@@ -1,15 +1,11 @@
 import numpy as np
 from peft import LoraConfig
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
 
 import twinkle
 from twinkle import get_device_placement, get_logger, DeviceMesh, DeviceGroup, Platform
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import CrossEntropyLoss
 from twinkle.model import TransformersModel
-from twinkle.processor import InputProcessor
 
 logger = get_logger()
 
@@ -29,52 +25,30 @@ device_mesh = DeviceMesh(
     mesh_dim_names=('dp', 'fsdp')
 )
 
-<<<<<<< HEAD
-#device_mesh = DeviceMesh(
-#    device_type='cuda',
-#    mesh=np.array([0,1,2,3]),
-#    mesh_dim_names=('dp',)
-#)
-
-twinkle.initialize(mode='ray', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
-=======
 twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
->>>>>>> origin/dev
 
 
-def create_dataset():
+def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://modelscope/competition_math'))
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True)
-    return dataset
+    dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-
-def train():
-    dataloader = DataLoader(dataset=create_dataset, batch_size=8)
-
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='model')
 
     lora_config = LoraConfig(
         target_modules='all-linear'
     )
 
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
-    model.set_template('Qwen3Template')
-    model.set_processor(InputProcessor, padding_side='right')
-    model.set_loss(CrossEntropyLoss)
-    model.set_optimizer(AdamW, lr=1e-4)
-    model.set_lr_scheduler(LinearLR)
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch)
         if step % 16 == 0:
             logger.info(f'Current is step {step // 16}, loss: {output}')
-        model.clip_grad_norm(1.0)
-        model.step()
-        model.zero_grad()
-        model.lr_step()
+        model.clip_grad_and_step()
         if step % 50 == 0:
             model.save('./output')
 

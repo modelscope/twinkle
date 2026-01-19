@@ -3,12 +3,13 @@ import importlib
 import os
 from abc import ABC, abstractmethod
 import random
-from typing import Literal, Union, Optional
+from typing import Literal, Union, Optional, Any
 from functools import lru_cache
 
 import numpy as np
+from accelerate import PartialState
 
-from .platform import Platform
+from .platform import Platform, DeviceMesh
 
 
 class Framework(ABC):
@@ -55,6 +56,17 @@ class Framework(ABC):
     @staticmethod
     def seed_everything(seed: Optional[int] = 42, full_determinism: bool = False):
         Torch.seed_everything(seed, full_determinism)
+
+    @staticmethod
+    def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):
+        import torch
+        output_objects = [None for _ in range(device_mesh.data_parallel_world_size)]
+        torch.distributed.all_gather_object(output_objects, object, group=process_group)
+        _x = []
+        for y in output_objects:
+            if y is not None:
+                _x.extend(y)
+        return _x
 
 
 class Torch(Framework):

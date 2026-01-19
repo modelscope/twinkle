@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from .message import Message, Tool
 
 if sys.version_info[:2] <= (3, 11):
@@ -11,10 +11,11 @@ else:
 
 
 class Trajectory(TypedDict, total=False):
-    """The """
+    """The input messages"""
     messages: List[Message]
+    extend_message: List[Tuple[str, List[Message]]]
     tools: List[Tool]
-    generation_config: Dict[str, Any]
-    experts: Dict[str, Any]
+    generation_config: List[Tuple[str, Any]]
+    experts: List[Tuple[str, Any]]
     rewards: List[float]
-    user_data: Dict[str, Any]
+    user_data: List[Tuple[str, Any]]
