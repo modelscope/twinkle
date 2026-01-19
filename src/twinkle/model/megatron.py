@@ -582,7 +582,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             if optimizer_config.template is not None:
                 inputs = optimizer_config.template.batch_encode(inputs)
 
-        # Process inputs
+        # Process inputs (collate list to batched dict)
         processor = optimizer_config.processor
         if processor is not None:
             inputs = processor(inputs)
@@ -832,9 +832,14 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         optimizer_config.cur_step += 1
 
-        # Note: finalize_model_grads is called inside forward_backward_func
-        # which already handles gradient synchronization across DP replicas.
-        # No additional barrier is needed here - adding one would hurt performance.
+        # Critical: Synchronize all DP replicas before returning
+        # This ensures all DP replicas complete the same training step before
+        # moving to the next batch, preventing P2P communication deadlocks
+        dp_world_size = mpu.get_data_parallel_world_size()
+        if dp_world_size > 1:
+            # Use barrier on DP+CP group to synchronize all replicas
+            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            dist.barrier(group=dp_cp_group)
 
         if isinstance(loss, torch.Tensor):
             return loss.detach().cpu().float().numpy()
