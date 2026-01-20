@@ -38,6 +38,7 @@ def train():
     )
 
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
+    model.set_processor('InputProcessor', padding_free=True)
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     loss_metric = 99.0
