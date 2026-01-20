@@ -3,6 +3,7 @@ from datetime import datetime
 import os
 import threading
 import time
+import traceback
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request
@@ -13,8 +14,8 @@ from tinker import types
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.model import TwinkleModel, MultiLoraTransformersModel
-from twinkle.data_format import datum_to_input_feature
 from twinkle.server.twinkle.validation import verify_request_token, init_config_registry, ConfigRegistryProxy
+from .common import datum_to_input_feature
 from .state import get_server_state, schedule_task
 
 def build_model_app(nproc_per_node: int,
@@ -47,7 +48,7 @@ def build_model_app(nproc_per_node: int,
             self.adapter_lock = threading.Lock()
             self.config_registry: ConfigRegistryProxy = init_config_registry()
             self.state = get_server_state()
-            self.per_token_model_limit = int(os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 3))
+            self.per_token_model_limit = int(os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 30))
             self.key_token_dict = {}
 
         def countdown(self):
@@ -178,14 +179,23 @@ def build_model_app(nproc_per_node: int,
                 # convert datum to input feature
                 inputs = [datum_to_input_feature(datum) for datum in datum_list]
 
-                output = self.model.forward(inputs=inputs, adapter_name=adapter_name)
-                loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
-                self.model.backward(adapter_name=adapter_name)
+                try:
+                    output = self.model.forward(inputs=inputs, adapter_name=adapter_name)
+                    # breakpoint()
+                    loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
+                    self.model.backward(adapter_name=adapter_name)
+                except Exception:
+                    print(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
+
 
                 return types.ForwardBackwardOutput(
-                    loss_fn_output_type="TorchLossReturn",
-                    loss_fn_outputs=[{'logprobs': types.TensorData.from_torch(output['logits'])}],
-                    metrics={"loss:avg": loss.tolist()},
+                    loss_fn_output_type="CrossEntropyLossReturn",
+                    loss_fn_outputs=output,
+                    metrics={"loss:avg": loss.item()},
                 )
 
             return await schedule_task(

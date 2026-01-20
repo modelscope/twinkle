@@ -9,6 +9,9 @@ import numpy as np
 
 from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
+from ..utils.logger import get_logger
+
+logger = get_logger()
 
 T1 = TypeVar('T1', bound=object)
 
@@ -521,14 +524,25 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                 if not hasattr(self, '_actors'):
                     from ._ray import RayHelper
                     args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                    return func(self, *args, **kwargs)
+                    
+                    logger.info(f'Executing ray function {func.__name__} with args: {args}, kwargs: {kwargs}')
+                    result = func(self, *args, **kwargs)
+                    logger.info(f'Execution of ray function {func.__name__} completed with result: {result}')
+                    return result
                 else:
                     from ._ray import RayHelper
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
                     execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                    
+                    logger.info(f'Executing remote function {func.__name__} with {_workers_and_args}')
                     result = execute_method(func.__name__, _workers_and_args)
+                    logger.info(f'Execution of remote function {func.__name__} completed with result: {result}')
+                    
+                    logger.info(f'Collecting results for remote function {func.__name__} with method {collect}')
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
+                    logger.info(f'Collection of results for remote function {func.__name__} completed with result: {result_func}')
+                    
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self

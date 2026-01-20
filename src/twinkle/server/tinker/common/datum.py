@@ -24,6 +24,6 @@ def datum_to_input_feature(datum: types.Datum) -> InputFeature:
         weights = datum.loss_fn_inputs['weights'].to_numpy()
         labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
         
-        input_feature['labels'] = np.where(weights > 0, labels, -100)
+        input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
 
     return input_feature
