@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 
-from dataclasses import dataclass, Tuple
+from dataclasses import dataclass
 from logging import getLogger
-from typing import Dict, Any, Optional, Type, List, Callable, TYPE_CHECKING
+from typing import Dict, Any, Optional, Type, List, Callable, Tuple
 
-from .base import DeviceType, is_kernels_available
+from .base import DeviceType, ModeType, is_kernels_available
 from kernels.layer.func import FuncRepositoryProtocol
 
 
@@ -116,7 +116,7 @@ class FunctionKernelSpec:
     revision: Optional[str]
     version: Optional[str]
     device: Optional[str]
-    mode: Optional[str]
+    mode: Optional[ModeType]
 
 
 

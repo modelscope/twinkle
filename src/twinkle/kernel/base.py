@@ -58,10 +58,12 @@ def to_kernels_mode(mode: ModeType) -> Any:
     if not is_kernels_available():
         return None
     from kernels import Mode
+    if isinstance(mode, Mode):
+        return mode
     mode_map = {
         "train": Mode.TRAINING,
         "inference": Mode.INFERENCE,
-        "compile": Mode.TORCH_COMPILE,
+        "compile": Mode.INFERENCE | Mode.TORCH_COMPILE,
     }
     return mode_map.get(mode, Mode.INFERENCE)
 
@@ -125,5 +127,3 @@ def validate_device_type(device_type: str) -> None:
             f"'{device_type}'. Supported device types are: "
             f"{', '.join(sorted(supported_devices))}"
         )
-
-

@@ -2,7 +2,7 @@
 """Twinkle Kernel Module - Kernel orchestration layer."""
 from typing import Optional, Union, Any, Dict
 from logging import getLogger
-
+from .function import apply_function_kernel
 from .base import (
     ModeType,
     DeviceType,
@@ -44,9 +44,7 @@ def kernelize_model(
     """
     model = apply_layer_kernel(model, mode=mode, device=device, use_fallback=use_fallback)
 
-    if is_kernels_enabled():
-        from .function import apply_function_kernel
-        apply_function_kernel(device=device, mode=mode, use_fallback=use_fallback)
+    apply_function_kernel(device=device, mode=mode, use_fallback=use_fallback)
 
     return model
 

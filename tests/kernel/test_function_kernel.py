@@ -13,11 +13,16 @@ def _install_kernel_stubs():
     if "kernels" in sys.modules:
         return
 
+    import importlib.machinery
+
     kernels_mod = types.ModuleType("kernels")
+    kernels_mod.__spec__ = importlib.machinery.ModuleSpec("kernels", loader=None)
     kernels_mod.__path__ = []
     layer_mod = types.ModuleType("kernels.layer")
+    layer_mod.__spec__ = importlib.machinery.ModuleSpec("kernels.layer", loader=None)
     layer_mod.__path__ = []
     func_mod = types.ModuleType("kernels.layer.func")
+    func_mod.__spec__ = importlib.machinery.ModuleSpec("kernels.layer.func", loader=None)
 
     class DummyProtocol:
         pass
@@ -25,6 +30,7 @@ def _install_kernel_stubs():
     func_mod.FuncRepositoryProtocol = DummyProtocol
 
     mode_mod = types.ModuleType("kernels.layer.mode")
+    mode_mod.__spec__ = importlib.machinery.ModuleSpec("kernels.layer.mode", loader=None)
     from enum import Flag, auto
 
     class Mode(Flag):
@@ -46,8 +52,10 @@ def _install_kernel_stubs():
             return union
 
     mode_mod.Mode = Mode
+    kernels_mod.Mode = Mode
 
     versions_mod = types.ModuleType("kernels._versions")
+    versions_mod.__spec__ = importlib.machinery.ModuleSpec("kernels._versions", loader=None)
 
     def select_revision_or_version(repo_id, revision, version):
         return revision or version
@@ -55,6 +63,7 @@ def _install_kernel_stubs():
     versions_mod.select_revision_or_version = select_revision_or_version
 
     utils_mod = types.ModuleType("kernels.utils")
+    utils_mod.__spec__ = importlib.machinery.ModuleSpec("kernels.utils", loader=None)
 
     def get_kernel(repo_id, revision=None):
         raise RuntimeError("Stub get_kernel called unexpectedly.")
@@ -156,14 +165,12 @@ class TestFunctionKernel(unittest.TestCase):
             )
 
     def test_register_function_kernel_appends_spec(self):
-        from kernels.layer.mode import Mode
-
         function_kernel.register_function_kernel(
             func_name="f",
             target_module="m",
             func_impl=lambda x: x,
             device="cpu",
-            mode=Mode.TRAINING,
+            mode="train",
         )
         registry = function_kernel.get_global_function_registry()
         self.assertEqual(len(registry.list_specs()), 1)
@@ -171,7 +178,7 @@ class TestFunctionKernel(unittest.TestCase):
         self.assertEqual(spec.func_name, "f")
         self.assertEqual(spec.target_module, "m")
         self.assertEqual(spec.device, "cpu")
-        self.assertEqual(spec.mode, Mode.TRAINING)
+        self.assertEqual(spec.mode, "train")
 
     def test_load_from_hub_with_repo(self):
         class DummyModule:
@@ -286,8 +293,6 @@ class TestFunctionKernel(unittest.TestCase):
         sys.modules.pop(module_name, None)
 
     def test_apply_function_kernel_mode_filter(self):
-        from kernels.layer.mode import Mode
-
         module_name = "tests.kernel._tmp_module_mode"
         temp_module = types.ModuleType(module_name)
         temp_module.target = lambda x: x
@@ -297,19 +302,17 @@ class TestFunctionKernel(unittest.TestCase):
             func_name="target",
             target_module=module_name,
             func_impl=lambda x: x + 3,
-            mode=Mode.TRAINING,
+            mode="train",
         )
 
         applied = function_kernel.apply_function_kernel(
             target_module=module_name,
-            mode=Mode.INFERENCE,
+            mode="inference",
         )
         self.assertEqual(applied, [])
         sys.modules.pop(module_name, None)
 
     def test_apply_function_kernel_mode_requires_mode(self):
-        from kernels.layer.mode import Mode
-
         module_name = "tests.kernel._tmp_module_mode_required"
         temp_module = types.ModuleType(module_name)
         temp_module.target = lambda x: x
@@ -319,7 +322,7 @@ class TestFunctionKernel(unittest.TestCase):
             func_name="target",
             target_module=module_name,
             func_impl=lambda x: x + 2,
-            mode=Mode.INFERENCE,
+            mode="inference",
         )
 
         applied = function_kernel.apply_function_kernel(
@@ -330,8 +333,6 @@ class TestFunctionKernel(unittest.TestCase):
         sys.modules.pop(module_name, None)
 
     def test_apply_function_kernel_fallback_on_unsupported_mode(self):
-        from kernels.layer.mode import Mode
-
         module_name = "tests.kernel._tmp_module_mode_fallback"
         temp_module = types.ModuleType(module_name)
 
@@ -352,12 +353,12 @@ class TestFunctionKernel(unittest.TestCase):
             func_name="target",
             target_module=module_name,
             func_impl=KernelImpl(),
-            mode=Mode.INFERENCE | Mode.TORCH_COMPILE,
+            mode="compile",
         )
 
         applied = function_kernel.apply_function_kernel(
             target_module=module_name,
-            mode=Mode.INFERENCE | Mode.TORCH_COMPILE,
+            mode="compile",
             use_fallback=True,
         )
         self.assertEqual(applied, [])
@@ -365,8 +366,6 @@ class TestFunctionKernel(unittest.TestCase):
         sys.modules.pop(module_name, None)
 
     def test_apply_function_kernel_no_fallback_raises(self):
-        from kernels.layer.mode import Mode
-
         module_name = "tests.kernel._tmp_module_mode_strict"
         temp_module = types.ModuleType(module_name)
         temp_module.target = lambda x: x
@@ -383,13 +382,13 @@ class TestFunctionKernel(unittest.TestCase):
             func_name="target",
             target_module=module_name,
             func_impl=KernelImpl(),
-            mode=Mode.INFERENCE | Mode.TORCH_COMPILE,
+            mode="compile",
         )
 
         with self.assertRaises(ValueError):
             function_kernel.apply_function_kernel(
                 target_module=module_name,
-                mode=Mode.INFERENCE | Mode.TORCH_COMPILE,
+                mode="compile",
                 use_fallback=False,
             )
         sys.modules.pop(module_name, None)

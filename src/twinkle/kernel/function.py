@@ -6,11 +6,17 @@ from logging import getLogger
 from typing import Callable, Iterable, List, Optional
 
 from kernels.layer.func import FuncRepositoryProtocol
-from kernels.layer.mode import Mode
 from kernels._versions import select_revision_or_version
 from kernels.utils import get_kernel
 from .registry import FunctionKernelSpec, get_global_function_registry
-from .base import validate_device_type, validate_mode, conditionally_apply_function
+from .base import (
+    ModeType,
+    is_kernels_available,
+    validate_device_type,
+    validate_mode,
+    conditionally_apply_function,
+    to_kernels_mode,
+)
 
 logger = getLogger(__name__)
 
@@ -52,7 +58,7 @@ def register_function_kernel(
     revision: Optional[str] = None,
     version: Optional[str] = None,
     device: Optional[str] = None,
-    mode: Optional[Mode] = None,
+    mode: Optional[ModeType] = None,
 ) -> None:
     """Register a function kernel with the registry."""
     sources = [func_impl is not None, repo is not None, repo_id is not None]
@@ -60,6 +66,8 @@ def register_function_kernel(
         raise ValueError("Provide exactly one of func_impl, repo, or repo_id.")
     if revision is not None and version is not None:
         raise ValueError("Either revision or version must be specified, not both.")
+    if mode is not None:
+        validate_mode(mode)
 
     get_global_function_registry().register(
         FunctionKernelSpec(
@@ -96,7 +104,7 @@ def apply_function_kernel(
     *,
     target_module: Optional[str] = None,
     device: Optional[str] = None,
-    mode: Optional[Mode] = None,
+    mode: Optional[ModeType] = None,
     use_fallback: bool = True,
     strict: bool = False,
 ) -> List[str]:
@@ -111,6 +119,7 @@ def apply_function_kernel(
 
     if mode is not None:
         validate_mode(mode)
+        mode = to_kernels_mode(mode)
     if device is not None:
         validate_device_type(device)
 
@@ -129,7 +138,7 @@ def apply_function_kernel(
                 raise ValueError(msg)
             logger.warning(msg)
             continue
-        if spec.mode is not None and mode is not None and spec.mode not in mode:
+        if spec.mode is not None and mode is not None and to_kernels_mode(spec.mode) not in mode:
             continue
 
         try:
@@ -150,6 +159,13 @@ def apply_function_kernel(
             impl = spec.func_impl
             support_target = impl
         else:
+            if not is_kernels_available():
+                msg = (
+                    "HF kernels package not available. "
+                    f"Cannot load function kernel: {spec.func_name}. "
+                    "Install it with `pip install kernels`."
+                )
+                raise RuntimeError(msg)
             impl, support_target = _load_from_hub(
                 repo=spec.repo,
                 repo_id=spec.repo_id,
