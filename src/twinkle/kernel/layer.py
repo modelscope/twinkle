@@ -79,8 +79,24 @@ def _to_hf_mode(mode: Optional[ModeType]) -> Any:
     return to_kernels_mode(mode)
 
 
-def apply_layer_kernel(model, mode: ModeType = "inference", device: Optional[DeviceType] = None) -> Any:
-    """Apply layer kernels to model."""
+def apply_layer_kernel(
+    model,
+    mode: ModeType = "inference",
+    device: Optional[DeviceType] = None,
+    use_fallback: bool = True,
+) -> Any:
+    """Apply layer kernels to model.
+
+    Args:
+        model: The PyTorch model to kernelize.
+        mode: The mode for kernel selection ("inference" or "train").
+        device: The device type (auto-detected if None).
+        use_fallback: Whether to use original forward when no compatible kernel found.
+            If False, raises ValueError when kernel is unavailable.
+
+    Returns:
+        The kernelized model.
+    """
     if not is_kernels_enabled():
         logger.debug("Kernels not enabled, returning original model")
         return model
@@ -94,11 +110,13 @@ def apply_layer_kernel(model, mode: ModeType = "inference", device: Optional[Dev
 
     try:
         from kernels import kernelize
-        logger.debug(f"Applying kernels with mode: {mode}, device: {device}")
-        return kernelize(model, mode=kernel_mode, device=device)
+        logger.debug(f"Applying kernels with mode: {mode}, device: {device}, use_fallback: {use_fallback}")
+        return kernelize(model, mode=kernel_mode, device=device, use_fallback=use_fallback)
     except Exception as e:
-        logger.warning(f"Failed to apply kernels: {e}. Returning original model.")
-        return model
+        if use_fallback:
+            logger.warning(f"Failed to apply kernels: {e}. Returning original model.")
+            return model
+        raise
 
 
 def register_layer_batch(mapping: dict, default_device: DeviceType = "cuda") -> None:

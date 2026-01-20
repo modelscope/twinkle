@@ -23,9 +23,25 @@ __all__ = [
 ]
 
 
-def kernelize_model(model, mode: ModeType = "inference", device: Optional[DeviceType] = None) -> Any:
-    """Apply kernels to model (main entry point)."""
-    model = apply_layer_kernel(model, mode=mode, device=device)
+def kernelize_model(
+    model,
+    mode: ModeType = "inference",
+    device: Optional[DeviceType] = None,
+    use_fallback: bool = True,
+) -> Any:
+    """Apply kernels to model (main entry point).
+
+    Args:
+        model: The PyTorch model to kernelize.
+        mode: The mode for kernel selection ("inference" or "train").
+        device: The device type (auto-detected if None).
+        use_fallback: Whether to use original forward when no compatible kernel found.
+            If False, raises ValueError when kernel is unavailable.
+
+    Returns:
+        The kernelized model.
+    """
+    model = apply_layer_kernel(model, mode=mode, device=device, use_fallback=use_fallback)
 
     # TODO: apply function-level kernel (Monkey Patch)
     # from .function import apply_function_kernel
