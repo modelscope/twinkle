@@ -30,7 +30,7 @@ device_mesh = DeviceMesh(
 )
 
 
-twinkle.initialize(mode='local', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
+twinkle.initialize(mode='ray', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh, lazy_collect=False)
 
 
 def train():
@@ -40,7 +40,7 @@ def train():
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='model')
 
     lora_config = LoraConfig(
         target_modules='all-linear'

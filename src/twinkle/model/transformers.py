@@ -549,7 +549,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict)
-        self._save_tokenizer(checkpoint_dir)
+        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
         push_to_hub = kwargs.get('push_to_hub', False)
         hub_model_id = kwargs.get('hub_model_id', None)
         hub_token = kwargs.get('hub_token', None)
@@ -611,7 +611,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[_default_adapter_name]
+        default_config = self.optimizer_group[train_group]
         if default_config.template:
             self.optimizer_group[train_group].template = default_config.template
         if default_config.processor:

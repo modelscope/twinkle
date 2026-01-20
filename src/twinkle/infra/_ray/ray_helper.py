@@ -237,6 +237,7 @@ class RayHelper:
 
         if device_config.device_type.upper() != 'CPU':
             visible_env = Platform.get_platform(device_config.device_type.upper()).visible_device_env()
+            device_type = Platform.get_platform(device_config.device_type.upper()).__name__
 
             @ray.remote
             def get_node_visible_env(env_name: str):
@@ -299,7 +300,7 @@ class RayHelper:
                     'num_cpus':
                     0.01,
                 }
-                device_type = device_config.device_type.upper()
+
                 if device_type == 'GPU':
                     worker_options['num_gpus'] = 0.01
                 else:
