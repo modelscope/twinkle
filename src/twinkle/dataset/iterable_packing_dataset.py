@@ -13,6 +13,15 @@ _T = TypeVar('_T')
 
 @remote_class(execute='first')
 class IterablePackingDataset(IterableDataset):
+    """An iterable packing dataset wrapper, this will use binpacking to pack the iterable dataset rows to minimum number of batches,
+        whose lengths are almost `max_length`
+
+    Args:
+        dataset_meta: The dataset meta
+        packing_interval: Packing within `packing_interval` rows
+        packing_num_proc: The number of processes to use for packing
+        cyclic: cyclic packing will start from the beginning if the dataset has ended, default `False`
+    """
 
     def __init__(self, dataset_meta: DatasetMeta,
                  packing_interval: int = 128,
@@ -38,6 +47,7 @@ class IterablePackingDataset(IterableDataset):
 
     @remote_function()
     def pack_dataset(self):
+        """Call to start packing dataset"""
         for _ in range(self.packing_num_proc):
             worker = mp.Process(target=self._processor, daemon=True)
             worker.start()
@@ -71,7 +81,7 @@ class IterablePackingDataset(IterableDataset):
         return last_res
 
     @staticmethod
-    def cyclic_iter(iterable):
+    def _cyclic_iter(iterable):
         while True:
             for x in iterable:
                 yield x
@@ -85,7 +95,7 @@ class IterablePackingDataset(IterableDataset):
             return
 
         if self.cyclic:
-            iterator = self.cyclic_iter(self.dataset)
+            iterator = self._cyclic_iter(self.dataset)
         else:
             iterator = iter(self.dataset)
         data = []

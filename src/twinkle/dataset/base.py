@@ -18,6 +18,9 @@ from twinkle.utils.parallel import processing_lock
 
 @dataclass
 class DatasetMeta:
+    """
+    The dataset meta-information, used to describe a dataset.
+    """
     # The dataset id or local path
     dataset_id: str
     # The subset name

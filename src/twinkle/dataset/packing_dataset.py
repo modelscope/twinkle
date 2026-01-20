@@ -14,6 +14,13 @@ _T = TypeVar('_T')
 
 @remote_class(execute='first')
 class PackingDataset(Dataset):
+    """A packing dataset wrapper, this will use binpacking to pack the dataset rows to minimum number of batches,
+        whose lengths are almost `max_length`
+
+    Args:
+        dataset_meta: The dataset meta
+        packing_num_proc: The number of processes to use for packing
+    """
 
     PACKING_BATCH_SIZE = 1000
 
@@ -26,6 +33,7 @@ class PackingDataset(Dataset):
 
     @remote_function()
     def pack_dataset(self):
+        """Call to start packing dataset"""
         assert 'input_ids' in self.dataset[0], 'Tokenize dataset first to do packing.'
         assert self.template is not None, 'Set template first to do packing.'
         lengths = self.dataset['length']

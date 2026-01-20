@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 import numpy as np
-from .input_feature import InputFeature
+from twinkle.data_format.input_feature import InputFeature
 
 if TYPE_CHECKING:
     from tinker import types
