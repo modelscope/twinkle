@@ -1,75 +1,67 @@
 import torch
 from tinker import types
 from typing import List, Union
-from twinkle.data_format.input_feature import InputFeature
 from twinkle.model.multi_lora_transformers import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
+from .datum import datum_to_input_feature
 
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
     
-    @remote_function()
-    def forward(self, *, inputs: List[InputFeature], **kwargs):
-        outputs = super().forward(inputs=inputs, **kwargs)
+    @remote_function(collect='flatten')
+    def forward(self, *, inputs: List[types.Datum], **kwargs):
+        # Convert Datum to InputFeature
+        input_features = [datum_to_input_feature(datum) for datum in inputs]
+        
+        outputs = super().forward(inputs=input_features, **kwargs)
         logits = outputs['logits'] # shape (batch_size, seq_len, vocab_size)
-        # gather log probabilities of each input_feature token with input_ids and attention_mask
         
-        batch_log_probs = []
-        batch_loss = []
-        
+        # breakpoint()
+        results = []
         for i, feature in enumerate(inputs):
-            device = logits.device
-            # Ensure we use the full length of the input feature as requested
-            input_ids = torch.tensor(feature['input_ids'], device=device, dtype=torch.long)
-            # Use labels provided in feature, assume they align with input_ids
-            labels = torch.tensor(feature['labels'], device=device, dtype=torch.long)
+            # Ensure 1D shape and correct device to avoid dimension mismatch and device errors
+            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(logits.device) # shape (seq_len,)
+            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(logits.device) # shape (seq_len,)
             
-            length = input_ids.numel()
+            # Slice logits to match the sequence length of labels
+            # Labels are assumed to be already shifted/aligned with logits
+            seq_len = labels.numel()
+            feature_logits = logits[i, :seq_len, :]
+
+            # Calculate log probs for all labels
+            # Apply log_softmax to convert raw logits to log-probabilities
+            feature_log_probs = torch.log_softmax(feature_logits, dim=-1)
+            token_log_probs = feature_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
             
-            # Initialize results with zeros matching input length
-            # Index 0 will remain 0.0 because it cannot be predicted by previous tokens
-            token_log_probs = torch.zeros(length, device=device, dtype=logits.dtype)
-            element_loss = torch.zeros(length, device=device, dtype=logits.dtype)
-            
-            # Causal LM shifting: logits[t] predicts input_ids[t+1]
-            if length > 1:
-                # We use logits 0..L-2 to predict tokens 1..L-1
-                # logits slice shape: (length-1, vocab_size)
-                feature_logits = logits[i, :length-1, :]
-                
-                # Targets are shifted by 1
-                target_ids = input_ids[1:]
-                target_labels = labels[1:]
-                
-                # Calculate log soft max
-                log_probs = feature_logits.log_softmax(dim=-1)
-                
-                # Gather log probability of the actual next token
-                # shape: (length-1,)
-                gathered_log_probs = log_probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)
-                
-                # Fill into result tensor starting from index 1
-                token_log_probs[1:] = gathered_log_probs
-                
-                # Calculate elementwise loss (NLL)
-                # Mask out loss where label is -100
-                loss_mask = (target_labels != -100)
-                step_loss = -gathered_log_probs
-                
-                # Apply mask: where mask is True keep loss, else 0.0
-                step_loss = torch.where(loss_mask, step_loss, torch.zeros_like(step_loss))
-                
-                element_loss[1:] = step_loss
-                
-            batch_log_probs.append(token_log_probs)
-            batch_loss.append(element_loss)
-            
-        # Return as list of dict, one per input feature
-        result = []
-        for log_probs, loss in zip(batch_log_probs, batch_loss):
-            result.append({
-            'logprobs': types.TensorData.from_torch(log_probs),
-            'elementwise_loss': types.TensorData.from_torch(loss)
+            # elementwise_loss: positive NLL loss (0.0 where masked)
+            elementwise_loss = -token_log_probs * weights
+
+            results.append({
+                'logprobs': types.TensorData.from_torch(token_log_probs),
+                'elementwise_loss': types.TensorData.from_torch(elementwise_loss)
             })
-        return result
+    
+        return results
+    
+    @remote_function(collect='sum')
+    def calculate_loss(self, **kwargs):
+        loss = super().calculate_loss(**kwargs)
+        return loss.item()
+    
+    @remote_function()
+    def step(self, *, adam_params: types.AdamParams, **kwargs):
+        # Gradient clipping
+        grad_clip_norm = adam_params.grad_clip_norm
+        if grad_clip_norm > 0.0:
+            self.clip_grad_norm(max_grad_norm=grad_clip_norm, norm_type=2, **kwargs)
+        # Optimizer step
+        optim_params = {
+            'lr': adam_params.learning_rate,
+            'eps': adam_params.eps,
+            'betas': (adam_params.beta1, adam_params.beta2),
+            'weight_decay': adam_params.weight_decay,
+        }
+        super().step(optim_params=optim_params, **kwargs)
+        # Zero gradients
+        self.zero_grad(**kwargs)

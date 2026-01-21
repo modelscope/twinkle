@@ -13,10 +13,12 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model import TwinkleModel, MultiLoraTransformersModel
 from twinkle.server.twinkle.validation import verify_request_token, init_config_registry, ConfigRegistryProxy
-from .common import datum_to_input_feature
+from twinkle.utils.logger import get_logger
+from .common import TwinkleCompatTransformersModel
 from .state import get_server_state, schedule_task
+
+logger = get_logger()
 
 def build_model_app(nproc_per_node: int,
                     device_group: Dict[str, Any],
@@ -39,7 +41,7 @@ def build_model_app(nproc_per_node: int,
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model: Optional[MultiLoraTransformersModel] = None
+            self.model: Optional[TwinkleCompatTransformersModel] = None
             self.model_id: Optional[str] = None
             self.kwargs = kwargs
             self.adapter_records: Dict[str, int] = {}
@@ -103,7 +105,7 @@ def build_model_app(nproc_per_node: int,
                     return types.CreateModelResponse(model_id=self.model_id)
             
                 extra_kwargs = body.user_metadata or {}
-                self.model = MultiLoraTransformersModel(
+                self.model = TwinkleCompatTransformersModel(
                     model_id=body.base_model,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
@@ -169,34 +171,28 @@ def build_model_app(nproc_per_node: int,
                         category=types.RequestErrorCategory.User,
                     )
 
-                adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
-                
-                datum_list = body.forward_backward_input.data
-                loss_fn = body.forward_backward_input.loss_fn
-                loss_fn_config = body.forward_backward_input.loss_fn_config or {}
-                
-                # convert datum to input feature
-                inputs = [datum_to_input_feature(datum) for datum in datum_list]
-
                 try:
-                    output = self.model.forward(inputs=inputs, adapter_name=adapter_name)
-                    # breakpoint()
+                    adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
+                    self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    datum_list = body.forward_backward_input.data
+                    loss_fn = body.forward_backward_input.loss_fn
+                    loss_fn_config = body.forward_backward_input.loss_fn_config or {}
+                    
+                    output = self.model.forward(inputs=datum_list, adapter_name=adapter_name)
                     loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
                     self.model.backward(adapter_name=adapter_name)
+                    return types.ForwardBackwardOutput(
+                        loss_fn_output_type="CrossEntropyLossReturn",
+                        loss_fn_outputs=output,
+                        metrics={"loss:sum": loss},
+                    )
                 except Exception:
-                    print(traceback.format_exc())
+                    logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
                         error=traceback.format_exc(),
                         category=types.RequestErrorCategory.Server,
                     )
-
-
-                return types.ForwardBackwardOutput(
-                    loss_fn_output_type="CrossEntropyLossReturn",
-                    loss_fn_outputs=output,
-                    metrics={"loss:avg": loss.item()},
-                )
 
             return await schedule_task(
                 self.state, _do_forward_backward(), model_id=body.model_id
@@ -205,14 +201,20 @@ def build_model_app(nproc_per_node: int,
         @app.post("/optim_step")
         async def optim_step(self, request: Request, body: types.OptimStepRequest) -> types.UntypedAPIFuture:
             async def _do_optim():
-
-                return types.OptimStepResponse(
-                    metrics={
-                        "grad_norm": 0.0,
-                        "weight_norm": 0.0,
-                        "update_norm": 0.0,
-                    }
-                )
+                try:
+                    adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
+                    self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    self.model.step(adam_params=body.adam_params, adapter_name=adapter_name)
+                    return types.OptimStepResponse(
+                        metrics=None
+                    )
+                except Exception:
+                    logger.error(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
 
             return await schedule_task(self.state, _do_optim(), model_id=body.model_id)
 

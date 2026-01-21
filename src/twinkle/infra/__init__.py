@@ -542,7 +542,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     logger.info(f'Collecting results for remote function {func.__name__} with method {collect}')
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     logger.info(f'Collection of results for remote function {func.__name__} completed with result: {result_func}')
-                    
+
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self
