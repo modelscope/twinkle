@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Megatron-Core model wrapper for twinkle training framework."""
-import contextlib
 import json
 import re
 from dataclasses import dataclass
@@ -19,10 +18,9 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss, MegatronCrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils.plugin import Plugin
 
-from .base import TwinkleModel
-from .strategy import MegatronStrategy
+from twinkle.model.base import TwinkleModel
+from twinkle.model.transformers.strategy import MegatronStrategy
 
 try:
     import megatron.core
@@ -220,10 +218,10 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             Megatron model on GPU.
         """
-        from twinkle.megatron.model.bridge import TwinkleBridgeInitializer
+        from twinkle.model.megatron.model.bridge import BridgeInitializer
 
         # Create bridge-based initializer
-        self._bridge_initializer = TwinkleBridgeInitializer(
+        self._bridge_initializer = BridgeInitializer(
             tp_size=self.strategy.tp_size,
             pp_size=self.strategy.pp_size,
             cp_size=self.strategy.cp_size,
@@ -275,7 +273,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             Megatron model on GPU.
         """
-        from twinkle.megatron.model.initializer import MegatronModelInitializer
+        from twinkle.model.megatron.model.initializer import MegatronModelInitializer
 
         initializer = MegatronModelInitializer(
             tp_size=self.strategy.tp_size,
@@ -452,7 +450,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         in forward_backward(). This method is for simple forward-only inference.
         For training, use forward_backward() which uses get_forward_backward_func().
         """
-        from twinkle.megatron.utils import forward_step_helper
+        from twinkle.model.megatron.utils import forward_step_helper
 
         model = self.strategy.unwrap_model(self.model)
 
@@ -1192,7 +1190,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         For LoRA training:
         - Saves in PEFT format (adapter_model.safetensors + adapter_config.json)
         """
-        from twinkle.megatron.model.bridge import TwinkleBridgeAdapter
+        from twinkle.model.megatron.model.bridge import TwinkleBridgeAdapter
         import os
 
         # Check if this is LoRA training (has adapter_name other than default)
@@ -1337,9 +1335,9 @@ class MegatronModel(TwinkleModel, nn.Module):
             config_or_dir: LoRA config or path to saved adapter.
             **kwargs: Additional arguments.
         """
-        from twinkle.megatron.utils import (prepare_lora_model, patch_deepcopy,
-                                            get_target_modules,
-                                            set_linear_is_expert)
+        from twinkle.model.megatron.utils import (patch_deepcopy,
+                                                  get_target_modules,
+                                                  set_linear_is_expert)
 
         # Patch PEFT BaseTuner to handle Megatron's TransformerConfig
         # which doesn't have a .get() method like HuggingFace configs

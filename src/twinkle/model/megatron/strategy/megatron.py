@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from .base import TrainStrategy
+from twinkle.model.transformers.strategy.base import TrainStrategy
 from twinkle import DeviceMesh, exists
 
 

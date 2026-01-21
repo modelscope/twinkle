@@ -68,7 +68,18 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
-    if _mode == 'ray':
+    if _mode == 'local':
+        if groups is not None:
+            _device_group = groups
+        else:
+            _device_group = [
+                DeviceGroup(
+                    name='default',
+                    ranks=list(range(Platform.get_world_size())),
+                    device_type=Platform.get_platform().device_prefix(),
+                )
+            ]
+    else:
         requires('ray')
         from ._ray import RayHelper
         if groups is not None:
@@ -84,18 +95,6 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
                              device_groups=_device_group)
-    else:
-        if groups is not None:
-            _device_group = groups
-        else:
-            _device_group = [
-                DeviceGroup(
-                    name='default',
-                    ranks=list(range(Platform.get_world_size())),
-                    device_type=Platform.get_platform().device_prefix(),
-                )
-            ]
-
 
 def is_master():
     if _mode == 'ray':
