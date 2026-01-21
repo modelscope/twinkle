@@ -13,6 +13,7 @@ from tinker import types
 
 from twinkle.server.twinkle.validation import verify_request_token
 from .state import get_server_state, schedule_task
+from .common.io_utils import list_training_runs, load_train_info, delete_checkpoint_file
 
 
 def build_server_app(
@@ -143,6 +144,36 @@ def build_server_app(
             if hasattr(result, "model_dump"):
                 return result.model_dump()
             return result
+
+        # --- Training Runs Endpoints ------------------------------------------
+
+        @app.get("/training_runs")
+        async def get_training_runs(self, request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
+            runs_data, total = list_training_runs(limit=limit, offset=offset)
+            training_runs = [types.TrainingRun(**r) for r in runs_data]
+            cursor = types.Cursor(limit=limit, offset=offset, total=total)
+            return types.TrainingRunsResponse(training_runs=training_runs, cursor=cursor)
+
+        @app.get("/training_runs/{run_id}")
+        async def get_training_run(self, request: Request, run_id: str) -> types.TrainingRun:
+            run_data = load_train_info(run_id)
+            if not run_data:
+                raise HTTPException(status_code=404, detail="Training run not found")
+            return types.TrainingRun(**run_data)
+
+        @app.get("/training_runs/{run_id}/checkpoints")
+        async def get_run_checkpoints(self, request: Request, run_id: str) -> types.CheckpointsListResponse:
+            run_data = load_train_info(run_id)
+            if not run_data:
+                raise HTTPException(status_code=404, detail="Training run not found")
+            checkpoints = [types.Checkpoint(**c) for c in run_data.get("checkpoints", [])]
+            return types.CheckpointsListResponse(checkpoints=checkpoints, cursor=None)
+
+        @app.delete("/training_runs/{run_id}/checkpoints/{checkpoint_id:path}")
+        async def delete_run_checkpoint(self, request: Request, run_id: str, checkpoint_id: str) -> Any:
+            success = delete_checkpoint_file(run_id, checkpoint_id)
+            # We return 200 (null) even if not found to be idempotent, or could raise 404
+            return None
 
     # --- Proxy Endpoints ---------------------------------------------------------
     

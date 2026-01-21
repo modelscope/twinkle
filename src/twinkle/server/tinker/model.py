@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from datetime import datetime
 import os
+from pathlib import Path
 import threading
 import time
 import traceback
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request
-from flask import app
 from peft import LoraConfig
 from ray import serve
 from tinker import types
@@ -17,9 +17,12 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.twinkle.validation import verify_request_token, init_config_registry, ConfigRegistryProxy
 from twinkle.utils.logger import get_logger
 from .common import TwinkleCompatTransformersModel
+from .common.io_utils import save_train_info, save_checkpoint_info, get_dir_size
 from .state import get_server_state, schedule_task
 
 logger = get_logger()
+
+DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
 
 def build_model_app(nproc_per_node: int,
                     device_group: Dict[str, Any],
@@ -112,11 +115,18 @@ def build_model_app(nproc_per_node: int,
                     remote_group=self.device_group.name,
                     **extra_kwargs,
                 )
+                
+                lora_rank = None
+                is_lora = False
+                
                 if body.lora_config:
                     # TODO: support more lora config parameters
                     lora_cfg = LoraConfig(
                         r=body.lora_config.rank,
                     )
+                    lora_rank = body.lora_config.rank
+                    is_lora = True
+                    
                     with self.adapter_lock:
                         adapter_name = self.get_adapter_name(request=request, adapter_name=model_id)
                         self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
@@ -126,6 +136,23 @@ def build_model_app(nproc_per_node: int,
                     self.model.set_processor('InputProcessor', adapter_name=adapter_name)
                     self.model.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
                     self.model.set_optimizer('AdamW', adapter_name=adapter_name)
+                    
+                # Initialize train info
+                run_data = types.TrainingRun(
+                    training_run_id=model_id,
+                    base_model=body.base_model,
+                    model_owner=request.state.token,
+                    is_lora=is_lora,
+                    corrupted=False,
+                    lora_rank=lora_rank,
+                    last_request_time=datetime.now(),
+                    last_checkpoint=None,
+                    last_sampler_checkpoint=None,
+                    user_metadata=body.user_metadata
+                )
+                # use mode='json' to serialize datetime to string
+                save_train_info(model_id, run_data.model_dump(mode='json'))
+
                 return types.CreateModelResponse(model_id=model_id)
 
             return await schedule_task(self.state, _load_model(), model_id=model_id)
@@ -256,10 +283,38 @@ def build_model_app(nproc_per_node: int,
         @app.post("/save_weights")
         async def save_weights(self, request: Request, body: types.SaveWeightsRequest) -> types.UntypedAPIFuture:
             async def _do_save():
-                suffix = body.path or f"checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                path = f"tinker://{body.model_id}/{suffix}"
-                return types.SaveWeightsResponse(path=path, type='save_weights')
+                try:
+                    adapter_name = self.get_adapter_name(request, adapter_name=body.model_id)
+                    self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    name = body.path or f"checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    checkpoint_id = Path(body.model_id) / "weights"
+                    save_path = Path(DEFAULT_SAVE_DIR) / checkpoint_id
 
+                    self.model.save(name=name, output_dir=save_path.as_posix(), adapter_name=adapter_name)
+                    tinker_path = f"twinkle://{(checkpoint_id / name).as_posix()}"
+                    
+                    checkpoint = types.Checkpoint(
+                        checkpoint_id=f"weights/{name}", 
+                        checkpoint_type="training",
+                        time=datetime.now(),
+                        tinker_path=tinker_path,
+                        size_bytes=get_dir_size(save_path / name),
+                        public=False
+                    )
+                    # FIXME:no update tranining run info and dummy adapter is saved
+                    save_checkpoint_info(self.model_id, checkpoint.model_dump(mode='json'))
+                    
+                    return types.SaveWeightsResponse(
+                        path=tinker_path,
+                        type='save_weights'
+                    )
+                except Exception:
+                    logger.error(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
             return await schedule_task(self.state, _do_save(), model_id=body.model_id)
 
         @app.post("/load_weights")

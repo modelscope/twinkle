@@ -104,9 +104,9 @@ class ServerStateProxy:
     def get_model_metadata(self, model_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_model_metadata.remote(model_id))
 
-    def store_future(self, request_id: str, result: Any, model_id: Optional[str]):
-        # Make the Ray call asynchronously
-        return ray.get(self._actor.store_future.remote(request_id, result, model_id))
+    async def store_future(self, request_id: str, result: Any, model_id: Optional[str]):  
+        # Make the Ray call asynchronously  
+        await self._actor.store_future.remote(request_id, result, model_id)  
 
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_future.remote(request_id))
@@ -135,11 +135,11 @@ async def schedule_task(
     async def _runner():
         try:
             val = await coro
-            state.store_future(request_id, val, model_id)
+            await state.store_future(request_id, val, model_id)
         except Exception:
             # Structure the error so the client SDK can interpret it
             err_payload = {"error": traceback.format_exc(), "category": "Server"}
-            state.store_future(request_id, err_payload, model_id)
+            await state.store_future(request_id, err_payload, model_id)
             
     # Schedule execution in the background
     asyncio.create_task(_runner())
