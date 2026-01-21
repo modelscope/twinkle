@@ -319,6 +319,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             grad_norm = torch_util.to_local_tensor(grad_norm)
             return grad_norm.detach().cpu().numpy()
 
+    @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)

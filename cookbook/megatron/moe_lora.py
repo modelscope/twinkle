@@ -24,6 +24,7 @@ from twinkle import (DeviceGroup, DeviceMesh, Platform, get_device_placement,
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import MegatronCrossEntropyLoss
+from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 
 GAS = 16 # gradient accumulation steps
@@ -102,38 +103,21 @@ def train():
     # Smaller batch size for MoE models (larger memory footprint)
     batch_size = 2
 
-    # In Ray mode, pass remote_group and device_mesh
+    _remote_args = {}
     if args.mode == 'ray':
-        dataloader = DataLoader(
-            dataset=create_dataset,
-            batch_size=batch_size,
-            remote_group=GROUP_NAME,
-            device_mesh=device_mesh,
-        )
-        model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
-            expert_model_parallel_size=EP_SIZE,
-            sequence_parallel=args.sequence_parallel,
-            mixed_precision='bf16',
-            recompute_granularity='selective',
-            remote_group=GROUP_NAME,
-            device_mesh=device_mesh,
-        )
-    else:
-        dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size)
-        model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
-            expert_model_parallel_size=EP_SIZE,
-            sequence_parallel=args.sequence_parallel,
-            mixed_precision='bf16',
-            recompute_granularity='selective',
-        )
+        _remote_args = {
+            'remote_group': GROUP_NAME,
+            'device_mesh': device_mesh,
+        }
+
+    dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size, **_remote_args)
+    model = MegatronModel(
+        pretrained_model_name_or_path=args.model,
+        sequence_parallel=args.sequence_parallel,
+        mixed_precision='bf16',
+        recompute_granularity='selective',
+        **_remote_args
+    )
 
     # LoRA config - target all linear layers in MoE (including experts)
     lora_config = LoraConfig(
@@ -143,17 +127,7 @@ def train():
         lora_dropout=0.0,
     )
     adapter_name = 'lora'
-    model.add_adapter_to_model(adapter_name,
-                               lora_config,
-                               gradient_accumulation_steps=GAS)
-    model.set_template('Qwen3Template', adapter_name=adapter_name)
-    model.set_processor(InputProcessor,
-                        padding_side='right',
-                        adapter_name=adapter_name)
-    model.set_loss(MegatronCrossEntropyLoss, adapter_name=adapter_name)
-    model.set_optimizer(AdamW, lr=1e-4, adapter_name=adapter_name)
-    model.set_lr_scheduler(LinearLR, adapter_name=adapter_name)
-
+    model.add_adapter_to_model(adapter_name, lora_config)
     logger.info(get_device_placement())
     logger.info(model.get_train_configs(adapter_name=adapter_name))
 
@@ -162,10 +136,7 @@ def train():
                                         adapter_name=adapter_name)
         if step % GAS == 0:
             logger.info(f'Step {step // GAS}, loss: {output}')
-        model.clip_grad_norm(1.0, adapter_name=adapter_name)
-        model.step(adapter_name=adapter_name)
-        model.zero_grad(adapter_name=adapter_name)
-        model.lr_step(adapter_name=adapter_name)
+        model.clip_grad_and_step()
         if step > 0 and step % (100 * GAS) == 0:
             model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
         # Early stop for testing

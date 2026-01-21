@@ -794,6 +794,13 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.lr_scheduler = construct_class(scheduler_cls, LRScheduler, torch.optim.lr_scheduler, **kwargs)
 
+    @remote_function(dispatch='all')
+    def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        self.step(**kwargs)
+        self.zero_grad(**kwargs)
+        self.lr_step(**kwargs)
+
     @remote_function(dispatch='all', sync=True)
     def save(self, output_dir: str, **kwargs):
         """Save model checkpoint.
