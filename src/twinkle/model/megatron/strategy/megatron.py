@@ -28,31 +28,6 @@ class MegatronStrategy:
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
         self._megatron_args = megatron_args or {}
-        self._initialized = False
-        self._parallel_state = None
-
-    def initialize(self, **kwargs) -> None:
-        if self._initialized:
-            return
-
-        from megatron.core import parallel_state
-        dist.init_process_group(backend='nccl')
-
-        init_kwargs = {
-            'tensor_model_parallel_size': self.device_mesh.tp_world_size or 1,
-            'pipeline_model_parallel_size': self.device_mesh.pp_world_size or 1,
-            'context_parallel_size': self.device_mesh.cp_world_size or 1,
-            'virtual_pipeline_model_parallel_size': self.device_mesh.vpp_size or 1,
-            'expert_model_parallel_size': self.device_mesh.ep_size or 1,
-        }
-
-        if exists('megatron_core>=0.13'):
-            init_kwargs['expert_tensor_parallel_size'] = self.etp_size
-
-        parallel_state.initialize_model_parallel(**init_kwargs)
-
-        self._parallel_state = parallel_state
-        self._initialized = True
 
     @property
     def params_type(self) -> torch.dtype:

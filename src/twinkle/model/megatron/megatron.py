@@ -72,7 +72,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         load_weights: bool = True,
-        use_megatron_bridge: bool = True,
         recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
         recompute_modules: Optional[list] = None,  # Modules to recompute
         **kwargs,
@@ -83,7 +82,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.model_id = pretrained_model_name_or_path
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.use_megatron_bridge = use_megatron_bridge
         self.recompute_granularity = recompute_granularity
         self.recompute_modules = recompute_modules
 
@@ -135,15 +133,10 @@ class MegatronModel(TwinkleModel, nn.Module):
         elif self.mixed_precision == 'no':
             params_dtype = torch.float32
 
-        if self.use_megatron_bridge:
-            # Use bridge-based initialization (recommended)
-            # This ensures all patches are applied and config is correctly generated
-            return self._create_megatron_model_with_bridge(
-                model_path, load_weights, params_dtype, **kwargs)
-        else:
-            # Use twinkle's native initialization
-            return self._create_megatron_model_native(model_path, load_weights,
-                                                      params_dtype, **kwargs)
+        # Use bridge-based initialization (recommended)
+        # This ensures all patches are applied and config is correctly generated
+        return self._create_megatron_model_with_bridge(
+            model_path, load_weights, params_dtype, **kwargs)
 
     def _create_megatron_model_with_bridge(
         self,
@@ -170,7 +163,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             Megatron model on GPU.
         """
-        from twinkle.model.megatron.model.bridge import BridgeInitializer
+        from twinkle.model.megatron.strategy.bridge import BridgeInitializer
 
         # Create bridge-based initializer
         self._bridge_initializer = BridgeInitializer(
@@ -1142,7 +1135,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         For LoRA training:
         - Saves in PEFT format (adapter_model.safetensors + adapter_config.json)
         """
-        from twinkle.model.megatron.model.bridge import TwinkleBridgeAdapter
+        from twinkle.model.megatron.strategy.bridge import TwinkleBridgeAdapter
         import os
 
         # Check if this is LoRA training (has adapter_name other than default)
