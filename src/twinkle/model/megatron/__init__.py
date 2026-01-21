@@ -14,7 +14,7 @@ from .model import (BridgeConfig, LazyTensor, MegatronModelInitializer,
 from .tuners import LoraParallelLinear, dispatch_megatron
 
 from .model import deep_getattr as bridge_deep_getattr  # Bridge classes; Helper functions; Avoid conflict with utils.deep_getattr; Legacy compatibility; Initializer; Qwen3 support
-from .utils import (  # Layer finding; Model preparation; Config conversion; Utilities; Multi-tenant support; Training state
+from twinkle.model.megatron.tuners.utils import (  # Layer finding; Model preparation; Config conversion; Utilities; Multi-tenant support; Training state
     MegatronTrainerState, TenantProcessGroupManager, convert_hf_config,
     deep_getattr, find_all_linears, find_embedding, find_router,
     forward_step_helper, get_model_parameter_info, get_padding_to,

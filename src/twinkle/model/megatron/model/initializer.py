@@ -6,7 +6,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
-from ..utils import convert_hf_config
+from twinkle.model.megatron.tuners.utils import convert_hf_config
 
 
 def _get_transformer_config_fields() -> set:
@@ -224,7 +224,6 @@ class MegatronModelInitializer:
         """
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
-            get_gpt_layer_local_spec,
         )
 
         # Determine if this is a MoE model

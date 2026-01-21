@@ -1725,7 +1725,7 @@ class BridgeInitializer:
             get_gpt_layer_with_transformer_engine_spec, )
 
         # Convert HF config to Megatron config
-        from ..utils import convert_hf_config
+        from twinkle.model.megatron.tuners.utils import convert_hf_config
         mg_config_dict = convert_hf_config(hf_config)
 
         # Build TransformerConfig
@@ -1762,7 +1762,6 @@ class BridgeInitializer:
             This is necessary because PEFT models don't have ddp_config attribute
             that Megatron's native implementation expects.
             """
-            from megatron.core import parallel_state as mpu
 
             # Check if model is DDP-wrapped (has ddp_config)
             if hasattr(model[0], 'ddp_config'):

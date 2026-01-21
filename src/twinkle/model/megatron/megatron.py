@@ -402,7 +402,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         in forward_backward(). This method is for simple forward-only inference.
         For training, use forward_backward() which uses get_forward_backward_func().
         """
-        from twinkle.model.megatron.utils import forward_step_helper
+        from twinkle.model.megatron.tuners.utils import forward_step_helper
 
         model = self.strategy.unwrap_model(self.model)
 
@@ -1287,9 +1287,9 @@ class MegatronModel(TwinkleModel, nn.Module):
             config_or_dir: LoRA config or path to saved adapter.
             **kwargs: Additional arguments.
         """
-        from twinkle.model.megatron.utils import (patch_deepcopy,
-                                                  get_target_modules,
-                                                  set_linear_is_expert)
+        from twinkle.model.megatron.tuners.utils import (patch_deepcopy,
+                                                         get_target_modules,
+                                                         set_linear_is_expert)
 
         # Patch PEFT BaseTuner to handle Megatron's TransformerConfig
         # which doesn't have a .get() method like HuggingFace configs
