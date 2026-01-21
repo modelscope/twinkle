@@ -434,8 +434,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         Returns:
             Sharded state dictionary.
         """
-        from twinkle.model.megatron.tuners.utils import tuners_sharded_state_dict
 
+        from .multi_lora import tuners_sharded_state_dict
         sharded_state_dict = tuners_sharded_state_dict(self, prefix,
                                                        sharded_offsets,
                                                        metadata)

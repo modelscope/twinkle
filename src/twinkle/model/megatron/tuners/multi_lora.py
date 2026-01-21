@@ -525,9 +525,7 @@ def get_target_modules(model: nn.Module, target_modules: List[str]) -> List[str]
 
 def set_linear_is_expert(model: nn.Module):
     """Mark expert linear layers in MoE models.
-    
-    
-    
+
     Args:
         model: The Megatron model.
     """

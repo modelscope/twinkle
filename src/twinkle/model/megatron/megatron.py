@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Megatron-Core model wrapper for twinkle training framework."""
 import json
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
@@ -12,19 +13,18 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 import twinkle
-from twinkle import DeviceMesh, remote_class, remote_function, template
+from twinkle import DeviceMesh, remote_class, remote_function, template, Platform
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, MegatronCrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle import exists, requires
+from twinkle import torch_util
 from twinkle.model.base import TwinkleModel
 from .strategy import MegatronStrategy
-
-
-_megatron_available = exists('megatron_core')
-_mcore_013 = exists('megatron_core>=0.13')
+from ...metric import Metric
+from ...utils import construct_class
 
 
 @dataclass
@@ -45,7 +45,9 @@ class MegatronOptimizerGroup:
     processor: InputProcessor = None
     gradient_accumulation_steps: int = 1
     cur_step: int = 0
-    dp_group = None
+    _dp_group = None
+    metrics: List[Metric] = field(default_factory=list)
+    _device_mesh: DeviceMesh = None
     # Megatron optimizer specific fields
     is_megatron_optimizer: bool = False
     _last_grad_norm: float = 0.0
@@ -78,6 +80,7 @@ class MegatronModel(TwinkleModel, nn.Module):
     ):
         requires('megatron_core')
         nn.Module.__init__(self)
+        from twinkle.patch.megatron_peft import MegatronPeft
 
         self.model_id = pretrained_model_name_or_path
         self.device_mesh = device_mesh
@@ -90,26 +93,33 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         from transformers import AutoConfig
         self.hf_config = AutoConfig.from_pretrained(model_path)
-
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         # Store model_path for later use
         self._model_path = model_path
 
+        self._seed = kwargs.pop('seed', None)
+        if self._seed is None and os.environ.get('TWINKLE_SEED'):
+            self._seed = int(os.environ.get('TWINKLE_SEED'))
+        if self._seed is None:
+            self._seed = 42
+
         # Create Megatron strategy
-        self.strategy = MegatronStrategy.from_device_mesh(self.device_mesh)
+        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
-        # Initialize parallel state (skip if using bridge init, as it handles this)
-        if not use_megatron_bridge:
-            self.strategy.initialize()
-
-        self.model = self._create_megatron_model(model_path, load_weights,
-                                                 **kwargs)
+        self.model = self._create_megatron_model(model_path, load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
-        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {
-            _default_adapter_name:
-            MegatronOptimizerGroup(loss_instance=MegatronCrossEntropyLoss())
-        }
+        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = self._construct_megatron_optimizer_group()
+        MegatronPeft().patch()
+
+    def _construct_default_optimizer_group(self):
+        return MegatronOptimizerGroup(
+            loss_instance=MegatronCrossEntropyLoss(),
+            template=Template(self.tokenizer_id),
+            processor=InputProcessor(self.device_mesh),
+            _device_mesh=self.device_mesh,
+        )
 
     def _create_megatron_model(
         self,
@@ -133,8 +143,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         elif self.mixed_precision == 'no':
             params_dtype = torch.float32
 
-        # Use bridge-based initialization (recommended)
-        # This ensures all patches are applied and config is correctly generated
         return self._create_megatron_model_with_bridge(
             model_path, load_weights, params_dtype, **kwargs)
 
@@ -167,11 +175,12 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         # Create bridge-based initializer
         self._bridge_initializer = BridgeInitializer(
-            tp_size=self.strategy.tp_size,
-            pp_size=self.strategy.pp_size,
-            cp_size=self.strategy.cp_size,
-            ep_size=self.strategy.ep_size,
+            tp_size=self.device_mesh.tp_world_size,
+            pp_size=self.device_mesh.pp_world_size,
+            cp_size=self.device_mesh.cp_world_size,
+            ep_size=self.device_mesh.ep_size,
             params_dtype=params_dtype,
+            seed=self._seed,
             use_cpu_initialization=False,
             attention_backend='flash',  # Use flash for training performance
             sequence_parallel=self.strategy.sequence_parallel,
@@ -185,91 +194,29 @@ class MegatronModel(TwinkleModel, nn.Module):
         model = self._bridge_initializer.create_model(
             model_path, load_weights=load_weights)
 
-        # Update strategy state since bridge has initialized Megatron
-        self.strategy._initialized = True
-        self.strategy._parallel_state = mpu
+        self._transformer_config = self._bridge_initializer.config
+        return self._move_model_to_gpu(model)
 
-        # Save transformer config for DDP wrapping
-        self._transformer_config = getattr(self._bridge_initializer,
-                                           '_transformer_config', None)
-
-        # Move to GPU
-        model = self._move_model_to_gpu(model)
-
-        return model
-
-    def _create_megatron_model_native(
-        self,
-        model_path: str,
-        load_weights: bool,
-        params_dtype: torch.dtype,
-        **kwargs,
-    ) -> nn.Module:
-        """Create Megatron model using twinkle's native initialization.
-
-        This is the fallback method when bridge is not available.
-
-        Args:
-            model_path: Path to HuggingFace model.
-            load_weights: Whether to load weights.
-            params_dtype: Parameter dtype.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Megatron model on GPU.
-        """
-        from twinkle.model.megatron.model.initializer import MegatronModelInitializer
-
-        initializer = MegatronModelInitializer(
-            tp_size=self.strategy.tp_size,
-            pp_size=self.strategy.pp_size,
-            cp_size=self.strategy.cp_size,
-            ep_size=self.strategy.ep_size,
-            sequence_parallel=self.strategy.sequence_parallel,
-            params_dtype=params_dtype,
-        )
-
-        # Create model
-        model = initializer.create_gpt_model(self.hf_config, **kwargs)
-
-        # Load weights
-        if load_weights:
-            initializer.load_from_hf(model, model_path, self.hf_config)
-
-        model = self._move_model_to_gpu(model)
-
-        return model
-
-    def _move_model_to_gpu(self, model: nn.Module) -> nn.Module:
-        """Move model to correct GPU device.
-
-        This method handles moving parameters, buffers, and any cached tensors
-        (like RoPE embeddings) to the correct device for distributed training.
-        """
-        # Determine the target device based on local rank
-        local_rank = dist.get_rank() % torch.cuda.device_count(
-        ) if dist.is_initialized() else 0
-        device = torch.device(f'cuda:{local_rank}')
-
-        # Set CUDA device explicitly
-        torch.cuda.set_device(local_rank)
-
-        # Move all parameters and buffers to GPU
-        model = model.to(device)
-
-        # Force synchronize to ensure all transfers complete
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(device)
-
+    @staticmethod
+    def _move_model_to_gpu(model: nn.Module) -> nn.Module:
+        model_device = next(model.parameters()).device
+        torch.cuda.set_device(Platform.get_local_rank())
+        if model_device.type == 'cpu':
+            model = model.to(Platform.get_local_device())
+        torch_util.synchronize()
         return model
 
     def _lazy_wrap_model(self):
-        """Lazily wrap model with distributed wrapper.
+        if not self._model_wrapped:
+            assert len(self.optimizer_group) == 1
+            optimizer = self.optimizer_group[_default_adapter_name].optimizer
+            if optimizer is None:
+                optimizer = AdamW(self._create_param_group(_default_adapter_name, 1e-5, 0.01), lr=1e-5)
+                self.optimizer_group[_default_adapter_name].optimizer = optimizer
+            self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
+            self.optimizer_group[_default_adapter_name].optimizer = optimizer
+            self._model_wrapped = True
 
-        Note: This should only be called after prepare_training() has been
-        executed on all workers. Direct calls from forward() may cause
-        deadlocks if not all DP ranks are participating.
-        """
         if not self._model_wrapped:
             # Find an optimizer from any adapter group (prefer default, then first available)
             optimizer = None
@@ -291,16 +238,6 @@ class MegatronModel(TwinkleModel, nn.Module):
                     self.model, optimizer)
                 self.optimizer_group[optimizer_adapter].optimizer = optimizer
             self._model_wrapped = True
-
-    @remote_function(dispatch='all')
-    def prepare_training(self, **kwargs):
-        """Prepare model for training.
-
-        Note: In Ray-based Megatron training, we skip DDP wrapping to avoid
-        deadlocks from collective operations. Each DP replica trains independently.
-        This method still calls _lazy_wrap_model for any non-DDP setup needed.
-        """
-        self._lazy_wrap_model()
 
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature],
@@ -1227,45 +1164,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         return self._get_trainable_parameters(adapter_name)
 
-    _peft_patched = False
-
-    @classmethod
-    def _patch_peft_for_megatron(cls):
-        """Patch PEFT's BaseTuner to handle Megatron's TransformerConfig.
-
-        Megatron's TransformerConfig doesn't have a .get() method like HuggingFace
-        configs. This patch handles the AttributeError that occurs when PEFT tries
-        to check tie_word_embeddings.
-        """
-        if cls._peft_patched:
-            return
-
-        from typing import List
-        import torch.nn as nn
-        from peft.tuners.tuners_utils import BaseTuner
-
-        _origin_get_tied_target_modules = BaseTuner._get_tied_target_modules
-
-        def _get_tied_target_modules(self, model: nn.Module) -> List[str]:
-            try:
-                return _origin_get_tied_target_modules(self, model)
-            except AttributeError:
-                # Megatron's TransformerConfig doesn't have .get() method
-                # Check share_embeddings_and_output_weights instead
-                tied_target_modules = []
-                if getattr(model, 'share_embeddings_and_output_weights',
-                           False):
-                    for target_module in self.targeted_module_names:
-                        module_name = target_module.split('.')[-1]
-                        if module_name in [
-                                'output_layer', 'embedding', 'word_embeddings'
-                        ]:
-                            tied_target_modules.append(target_module)
-                return tied_target_modules
-
-        BaseTuner._get_tied_target_modules = _get_tied_target_modules
-        cls._peft_patched = True
-
     @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(
         self,
@@ -1280,18 +1178,9 @@ class MegatronModel(TwinkleModel, nn.Module):
             config_or_dir: LoRA config or path to saved adapter.
             **kwargs: Additional arguments.
         """
-        from twinkle.model.megatron.tuners.utils import (patch_deepcopy,
-                                                         get_target_modules,
-                                                         set_linear_is_expert)
-
-        # Patch PEFT BaseTuner to handle Megatron's TransformerConfig
-        # which doesn't have a .get() method like HuggingFace configs
-        self._patch_peft_for_megatron()
-
+        from .tuners.multi_lora import set_linear_is_expert
         assert adapter_name, 'Use a non-empty adapter_name'
-
         model = self.strategy.unwrap_model(self.model)
-
         # Mark expert layers for MoE models
         set_linear_is_expert(model)
 
@@ -1413,17 +1302,10 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-
-        if isinstance(template_cls, str):
-            if hasattr(template, template_cls):
-                template_cls = getattr(template, template_cls)
-            else:
-                template_cls = Plugin.load_plugin(template_cls,
-                                                  template.Template)
-        optimizer_config.template = template_cls(self.model_id, **kwargs)
+        optimizer_config.template = construct_class(template_cls, Template, twinkle.template, **kwargs)
 
     @remote_function(dispatch='all')
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str],
+    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str],
                       **kwargs):
         """Set input processor.
 
@@ -1433,15 +1315,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-
-        if isinstance(processor_cls, str):
-            if hasattr(twinkle.processor, processor_cls):
-                processor_cls = getattr(twinkle.processor, processor_cls)
-            else:
-                processor_cls = Plugin.load_plugin(processor_cls,
-                                                   InputProcessor)
-        optimizer_config.processor = processor_cls(
-            device_mesh=self.device_mesh, **kwargs)
+        optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
     @remote_function(execute='first')
     def get_train_configs(self, **kwargs):
@@ -1457,10 +1331,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
 
         expr = f'Backend: Megatron-Core\n'
-        expr += f'TP size: {self.strategy.tp_size}\n'
-        expr += f'PP size: {self.strategy.pp_size}\n'
-        expr += f'CP size: {self.strategy.cp_size}\n'
-        expr += f'EP size: {self.strategy.ep_size}\n'
+        expr += f'DP size: {self.device_mesh.dp_world_size}\n'
+        expr += f'TP size: {self.device_mesh.tp_world_size}\n'
+        expr += f'  - VPP size: {self.device_mesh.vpp_size}\n'
+        expr += f'PP size: {self.device_mesh.pp_world_size}\n'
+        expr += f'CP size: {self.device_mesh.cp_world_size}\n'
+        expr += f'EP size: {self.device_mesh.ep_size}\n'
         expr += f'Sequence Parallel: {self.strategy.sequence_parallel}\n'
 
         if optimizer_config.adapter_config is not None:
@@ -1479,8 +1355,3 @@ class MegatronModel(TwinkleModel, nn.Module):
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
 
         return expr
-
-    def __repr__(self):
-        return (f"MegatronModel(model_id='{self.model_id}', "
-                f'tp={self.strategy.tp_size}, pp={self.strategy.pp_size}, '
-                f'cp={self.strategy.cp_size}, ep={self.strategy.ep_size})')

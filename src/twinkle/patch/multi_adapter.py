@@ -12,7 +12,7 @@ class MultiAdapter(Patch):
 
     _adapter_var = contextvars.ContextVar('adapter_names', default=None)
 
-    def __call__(self, module, **kwargs):
+    def patch(self, module, **kwargs):
         if getattr(LoraLayer, '_patched', False):
             return module
 

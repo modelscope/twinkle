@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Dict, Literal, Optional, Tuple, List
+from typing import Literal, Optional, Tuple, List
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from peft import PeftModel
 
-from twinkle import DeviceMesh, exists, Platform
+from twinkle import DeviceMesh, Platform
 
 
 class MegatronStrategy:
@@ -19,7 +18,7 @@ class MegatronStrategy:
         use_distributed_optimizer: bool = True,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         params_dtype: Optional[str] = None,
-        megatron_args: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
         self.device_mesh = device_mesh
         self.etp_size = expert_tensor_parallel_size or self.device_mesh.tp_world_size
@@ -27,7 +26,6 @@ class MegatronStrategy:
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
-        self._megatron_args = megatron_args or {}
 
     @property
     def params_type(self) -> torch.dtype:
@@ -74,9 +72,6 @@ class MegatronStrategy:
         optimizer: Optional[torch.optim.Optimizer] = None,
         use_distributed_optimizer: bool = True,
     ) -> Tuple[nn.Module, Optional[torch.optim.Optimizer]]:
-        if not self._initialized:
-            self.initialize()
-
         if self.device_mesh.world_size <= 1:
             return model, optimizer
 
@@ -96,9 +91,6 @@ class MegatronStrategy:
 
         assert not isinstance(model, PeftModel), 'Cannot wrap peft model.'
         config: TransformerConfig = model.config # noqa
-        model_device = next(model.parameters()).device
-        if model_device.type == 'cpu':
-            model = model.to(Platform.get_local_device())
 
         if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
             model = Float16Module(config, model)

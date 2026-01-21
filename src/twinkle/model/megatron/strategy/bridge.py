@@ -1627,6 +1627,7 @@ class BridgeInitializer:
         self._model_path = None
         self._initialized = False
         self._parallel_state = None
+        self.config = None
 
     def initialize(self, **kwargs) -> None:
         if self._initialized:
@@ -1852,7 +1853,7 @@ class BridgeInitializer:
         )
 
         # Save transformer config for later use (e.g., DDP wrapping)
-        self._transformer_config = config
+        self.config = config
 
         # Get layer spec - enable moe_grouped_gemm for MoE models
         moe_grouped_gemm = num_experts > 0
@@ -1894,6 +1895,7 @@ class BridgeInitializer:
         self,
         model_path: str,
         load_weights: bool = True,
+        **kwargs,
     ) -> nn.Module:
         """Create Megatron model from HuggingFace checkpoint.
 
@@ -1915,7 +1917,7 @@ class BridgeInitializer:
                                                      trust_remote_code=True)
 
         # Initialize Megatron parallel state with hf_config for proper args setup
-        self.initialize(self._hf_config)
+        self.initialize(**kwargs)
 
         # Calculate padded vocab size
         padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
