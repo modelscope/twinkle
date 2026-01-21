@@ -59,8 +59,14 @@ class MathReward(Reward):
     @remote_function()
     def calculate(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
-        predictions = [trajectory.messages[-1].content for trajectory in trajectories]
-        ground_truths = [trajectory.messages[-1].content for trajectory in ground_truths]
+        def _last_content(traj):
+            # Trajectories can be dicts after serialization in distributed runs.
+            if isinstance(traj, dict):
+                return traj['messages'][-1]['content']
+            return traj.messages[-1].content
+
+        predictions = [_last_content(trajectory) for trajectory in trajectories]
+        ground_truths = [_last_content(trajectory) for trajectory in ground_truths]
         for prediction, ground_truth in zip(predictions, ground_truths):
             if '# Answer' in prediction:
                 prediction = prediction.split('# Answer')[1]

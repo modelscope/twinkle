@@ -32,8 +32,17 @@ class InputProcessor:
     def prepare_inputs(self, inputs: InputFeature) -> InputFeature:
         import torch
         for key in list(inputs.keys()):
-            if isinstance(inputs[key], torch.Tensor):
-                inputs[key] = inputs[key].to(Platform.get_local_device())
+            value = inputs[key]
+            # Ray/pyarrow can return numpy or list scalars; normalize to tensors.
+            # After distributed/datasets.map, labels/completion_mask may become numpy arrays or lists,
+            # so tensor ops like labels != ignore_index or .to(device) would fail without this.
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            elif isinstance(value, list) and value and isinstance(value[0], (int, float)):
+                value = torch.tensor(value)
+            if isinstance(value, torch.Tensor):
+                value = value.to(Platform.get_local_device())
+            inputs[key] = value
         return inputs
 
     @staticmethod

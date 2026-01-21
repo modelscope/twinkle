@@ -455,9 +455,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     _actors = RayHelper.create_workers(cls,
                                                        remote_group,
                                                        execute,
-                                                       instance_id=instance_id,
-                                                       seed=_seed,
-                                                       full_determinism=_full_determinism,
+                                                       # Avoid duplicate keyword when instance_id is also in **kwargs.
+                                                       instance_id,
+                                                       _seed,
+                                                       _full_determinism,
                                                        *args, **kwargs)
                     self._actors = _actors
                     if hasattr(cls, '__iter__'):

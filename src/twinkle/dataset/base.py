@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os.path
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Callable, Type, Union, List
 
@@ -90,7 +90,13 @@ class Dataset(TorchDataset):
         kwargs['batched'] = True  # Only supported batched, because a single row may explode to several rows
         with processing_lock('dataset'):
             # use a default lock because check is to all datasets
-            self.dataset = self.dataset.map(self.template.batch_check, **kwargs).filter(lambda x: x is not None, **kwargs)
+            def _check_batch(batch):
+                # HF datasets.map expects dict/None; filter expects bool mask, so adapt batch_check output.
+                rows = self.template.map_col_to_row(batch) if isinstance(batch, Mapping) else batch
+                checked = self.template.batch_check(rows)
+                return [item is not None for item in checked]
+
+            self.dataset = self.dataset.filter(_check_batch, **kwargs)
 
     @staticmethod
     def _load_dataset(dataset_meta: DatasetMeta, **kwargs):

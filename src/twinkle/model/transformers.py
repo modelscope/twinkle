@@ -130,6 +130,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
+    def _move_inputs_to_model_device(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        import torch
+        try:
+            model_device = next(self.model.parameters()).device
+        except StopIteration:
+            return inputs
+        for key, value in inputs.items():
+            # Fixes observed device-mismatch errors when processor outputs CPU tensors for NPU models.
+            if isinstance(value, torch.Tensor) and value.device != model_device:
+                inputs[key] = value.to(model_device)
+        return inputs
+
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             assert len(self.optimizer_group) == 1
@@ -162,6 +174,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        # Fixes DDP/accelerate init errors when forward_only is called before wrapping.
         self._lazy_wrap_model()
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
@@ -174,6 +187,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
+        inputs = self._move_inputs_to_model_device(inputs)
         labels = inputs.pop('labels', None)
         self._accumulate_metric(optimizer_config)
         outputs = self.model(**inputs)
@@ -195,6 +209,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        self._lazy_wrap_model()
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
@@ -207,6 +222,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
+            inputs = self._move_inputs_to_model_device(inputs)
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config)
             outputs = self.model(**inputs)
@@ -465,7 +481,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 loss_cls = getattr(twinkle.loss, loss_cls)
             else:
                 loss_cls = Plugin.load_plugin(loss_cls, Loss)
-        optimizer_config.loss_instance = loss_cls()
+        # Fixes missing-loss-config issues by passing ctor kwargs through.
+        optimizer_config.loss_instance = loss_cls(**kwargs)
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
@@ -513,9 +530,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(scheduler_cls, str):
             import torch
+            # Fixes scheduler lookup fallthrough; prefer torch then twinkle.scheduler.
             if hasattr(torch.optim.lr_scheduler, scheduler_cls):
                 scheduler_cls = getattr(torch.optim.lr_scheduler, scheduler_cls)
-            if hasattr(scheduler, scheduler_cls):
+            elif hasattr(scheduler, scheduler_cls):
                 scheduler_cls = getattr(scheduler, scheduler_cls)
             else:
                 scheduler_cls = Plugin.load_plugin(scheduler_cls, LRScheduler)
