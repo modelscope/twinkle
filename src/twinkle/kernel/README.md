@@ -210,7 +210,7 @@ register_function_kernel(
     func_name="add",
     target_module=TARGET_MODULE,
     func_impl=fast_add,
-    device="cpu",
+    device="cuda",
     mode="inference",
 )
 
@@ -230,7 +230,7 @@ register_function_kernel(
     func_name="mul",
     target_module=TARGET_MODULE,
     repo=MyFuncRepo(),
-    device="cpu",
+    device="cuda",
     mode="compile",
 )
 
@@ -240,14 +240,14 @@ register_function_kernel(
     target_module="my_pkg.activations",
     repo_id="kernels-community/activation",
     revision="main",  # or version="0.1.0"
-    device="cpu",
+    device="cuda",
     mode="inference",
 )
 
 # 4) Apply function kernels
 applied = apply_function_kernel(
     target_module=TARGET_MODULE,
-    device="cpu",
+    device="cuda",
     mode="inference",
     strict=False,
 )
@@ -255,7 +255,7 @@ print("patched:", applied)
 
 # 5) Optional: unified entry via kernelize_model
 model = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
-kernelize_model(model=model, mode="inference", device="cpu", use_fallback=True)
+kernelize_model(model=model, mode="inference", device="cuda", use_fallback=True)
 ```
 
 ---
