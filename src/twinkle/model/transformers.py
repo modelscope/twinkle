@@ -28,7 +28,7 @@ from twinkle.template import Template
 from twinkle.utils import torch_util
 from twinkle.utils.plugin import Plugin
 from .base import TwinkleModel
-from .strategy import AccelerateStrategy
+from .strategy import AccelerateStrategy, NativeFSDPStrategy
 from twinkle.metric import Metric
 from ..metric.accuracy import Accuracy
 from ..metric.loss import LossMetric
@@ -119,8 +119,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
-                                           fsdp_config=fsdp_config, device_mesh=device_mesh)
+        use_native_fsdp = device_mesh is not None and device_mesh.has_dim("ep") and device_mesh.ep_world_size > 1
+        if use_native_fsdp:
+            self.strategy = NativeFSDPStrategy(mixed_precision=mixed_precision,
+                                               fsdp_config=fsdp_config,
+                                               device_mesh=device_mesh)
+        else:
+            self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
+                                               fsdp_config=fsdp_config, device_mesh=device_mesh)
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
