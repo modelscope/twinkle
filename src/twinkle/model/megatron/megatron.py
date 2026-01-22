@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Megatron-Core model wrapper for twinkle training framework."""
 import json
 import os
 import re
@@ -27,8 +26,8 @@ import twinkle.metric
 from twinkle import torch_util
 from twinkle.model.base import TwinkleModel
 from .strategy import MegatronStrategy
-from ...metric import Metric, LossMetric, Accuracy
-from ...utils import construct_class
+from twinkle.metric import Metric, LossMetric, Accuracy
+from twinkle.utils import construct_class
 
 
 @dataclass
@@ -109,10 +108,11 @@ class MegatronModel(TwinkleModel, nn.Module):
             self._seed = 42
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         # Create Megatron strategy
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
-        self.model = self._create_megatron_model(model_path, load_weights, **kwargs)
+        self.model: List[nn.Module] = self._create_megatron_model(model_path, load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
@@ -201,9 +201,11 @@ class MegatronModel(TwinkleModel, nn.Module):
             model_path, load_weights=load_weights)
 
         self._transformer_config = self._bridge_initializer.config
+        _models = []
         for _model in model:
-            return self._move_model_to_gpu(_model)
-        return model
+            _model = self._move_model_to_gpu(_model)
+            _models.append(_model)
+        return _models
 
     @staticmethod
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
@@ -244,7 +246,9 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     @remote_function(collect='last_pp')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature],
-                                            List[Trajectory]], **kwargs):
+                                            List[Trajectory]],
+                     micro_batch_size: Optional[int] = None,
+                     **kwargs):
         """Forward pass without gradient computation.
 
         Args:
@@ -262,6 +266,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
 
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size is None or vpp_size == 1:
+            micro_batch_size = None
+        else:
+            micro_batch_size = 1
+
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
@@ -272,26 +282,30 @@ class MegatronModel(TwinkleModel, nn.Module):
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        inputs: Dict[str, Any] = processor(inputs)
+        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
         self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
         # Check actual sequence_parallel setting from model config
         # Bridge may auto-enable sequence_parallel for MoE models
-        micro_batch_size = inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1
-        original_seq_length = inputs['input_ids'].shape[1] if 'input_ids' in inputs else 1
-        if cp_size > 1:
-            divisor = 2 * cp_size
-        elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
-            divisor = self.device_mesh.tp_world_size
+        if self.variable_seq_lengths:
+            seq_length = None
         else:
-            divisor = 1
+            _example = inputs[0] if isinstance(inputs, list) else inputs
+            original_seq_length = _example['input_ids'].shape[1] if 'input_ids' in _example else _example[
+                'input_embedding']
+            if cp_size > 1:
+                divisor = 2 * cp_size
+            elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
+                divisor = self.device_mesh.tp_world_size
+            else:
+                divisor = 1
 
-        if divisor > 1 and original_seq_length % divisor != 0:
-            seq_length = original_seq_length + (divisor - original_seq_length % divisor)
-        else:
-            seq_length = original_seq_length
+            if divisor > 1 and original_seq_length % divisor != 0:
+                seq_length = original_seq_length + (divisor - original_seq_length % divisor)
+            else:
+                seq_length = original_seq_length
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -303,33 +317,39 @@ class MegatronModel(TwinkleModel, nn.Module):
             attention_mask = batch.get('attention_mask')
             batch_labels = batch.get('labels')
 
+            # Forward pass with labels - Megatron will compute loss internally
+            # This uses Megatron's compute_language_model_loss which properly handles
+            # vocab parallel cross entropy
             output_tensor = model(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 labels=batch_labels,  # Pass labels to let Megatron compute loss
             )
-            return output_tensor, lambda tensor: tensor, {'loss': 0.}
+            return output_tensor, partial(optimizer_config.loss_instance.__call__, batch)
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
         # - PP > 1: forward_backward_pipelining_without_interleaving (or with interleaving if VPP)
         # - PP = 1: forward_backward_no_pipelining
         forward_backward_func = get_forward_backward_func()
+        vpp_size = self.device_mesh.vpp_size
 
-        # Create single-item iterator
-        data_iter = iter([inputs])
+        if vpp_size is None or vpp_size == 1:
+            data_iter = [iter(inputs)]
+        else:
+            data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
         losses = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
-            model=[self.model],
+            model=self.model,
             num_microbatches=1,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
-            forward_only=True,
+            forward_only=False,
         )
 
         # Extract loss from results (only last PP stage returns non-empty)
@@ -365,7 +385,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                          *,
                          inputs: Union[InputFeature, List[InputFeature],
                                        Trajectory, List[Trajectory]],
-                         num_microbatches: int = 1,
+                         micro_batch_size: Optional[int] = None,
                          **kwargs):
         """Combined forward and backward pass using Megatron's scheduler.
 
@@ -383,10 +403,6 @@ class MegatronModel(TwinkleModel, nn.Module):
                 - A single batch dict (num_microbatches=1)
                 - A list of batch dicts (num_microbatches=len(inputs))
                 - An iterator yielding batch dicts
-            num_microbatches: Number of microbatches to process in one call.
-                If inputs is a list, this is inferred from len(inputs).
-                Using num_microbatches > 1 enables Megatron's native gradient
-                accumulation with better memory management and compute overlap.
             **kwargs: Additional arguments.
 
         Returns:
@@ -400,6 +416,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
 
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size is None or vpp_size == 1:
+            micro_batch_size = None
+        else:
+            micro_batch_size = 1
+
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
@@ -410,26 +432,29 @@ class MegatronModel(TwinkleModel, nn.Module):
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        inputs: Dict[str, Any] = processor(inputs)
+        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
         self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
         # Check actual sequence_parallel setting from model config
         # Bridge may auto-enable sequence_parallel for MoE models
-        micro_batch_size = inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1
-        original_seq_length = inputs['input_ids'].shape[1] if 'input_ids' in inputs else 1
-        if cp_size > 1:
-            divisor = 2 * cp_size
-        elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
-            divisor = self.device_mesh.tp_world_size
+        if self.variable_seq_lengths:
+            seq_length = None
         else:
-            divisor = 1
+            _example = inputs[0] if isinstance(inputs, list) else inputs
+            original_seq_length = _example['input_ids'].shape[1] if 'input_ids' in _example else _example['input_embedding']
+            if cp_size > 1:
+                divisor = 2 * cp_size
+            elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
+                divisor = self.device_mesh.tp_world_size
+            else:
+                divisor = 1
 
-        if divisor > 1 and original_seq_length % divisor != 0:
-            seq_length = original_seq_length + (divisor - original_seq_length % divisor)
-        else:
-            seq_length = original_seq_length
+            if divisor > 1 and original_seq_length % divisor != 0:
+                seq_length = original_seq_length + (divisor - original_seq_length % divisor)
+            else:
+                seq_length = original_seq_length
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -458,7 +483,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         # - PP = 1: forward_backward_no_pipelining
         forward_backward_func = get_forward_backward_func()
         vpp_size = self.device_mesh.vpp_size
-        inputs = [inputs[i:i + micro_batch_size] for i in range(0, len(inputs), micro_batch_size)]
+
         if vpp_size is None or vpp_size == 1:
             data_iter = [iter(inputs)]
         else:
@@ -469,7 +494,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         losses = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
-            model=[self.model],
+            model=self.model,
             num_microbatches=1,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
@@ -866,7 +891,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         model = self.strategy.unwrap_model(self.model)
 
         # Use bridge to save weights
-        adapter.save_weights([model],
+        adapter.save_weights(model,
                              output_dir,
                              is_peft_format=is_peft_format)
 
@@ -922,37 +947,41 @@ class MegatronModel(TwinkleModel, nn.Module):
         from .tuners.multi_lora import set_linear_is_expert, get_target_modules, patch_deepcopy
         assert adapter_name, 'Use a non-empty adapter_name'
         model = self.strategy.unwrap_model(self.model)
-        # Mark expert layers for MoE models
-        set_linear_is_expert(model)
-
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
-            model = PeftModel.from_pretrained(model,
-                                              config_or_dir,
-                                              adapter_name=adapter_name,
-                                              is_trainable=kwargs.get(
-                                                  'is_trainable', True))
-            config = model.peft_config
-        else:
-            if not isinstance(config_or_dir, LoraConfig):
-                config_or_dir = LoraConfig(**config_or_dir)
-            config = config_or_dir
 
-            # Expand target_modules (e.g., 'all-linear' -> actual module names)
-            if config.target_modules:
-                if isinstance(config.target_modules, str):
-                    target_modules = [config.target_modules]
-                else:
-                    target_modules = list(config.target_modules)
+        _models = []
+        for _model in model:
+            # Mark expert layers for MoE models
+            set_linear_is_expert(_model)
+            if isinstance(config_or_dir, str):
+                _model = PeftModel.from_pretrained(_model,
+                                                  config_or_dir,
+                                                  adapter_name=adapter_name,
+                                                  is_trainable=kwargs.get(
+                                                      'is_trainable', True))
+                config = _model.peft_config
+            else:
+                if not isinstance(config_or_dir, LoraConfig):
+                    config_or_dir = LoraConfig(**config_or_dir)
+                config = config_or_dir
 
-                expanded_modules = get_target_modules(model, target_modules)
-                config.target_modules = expanded_modules
+                # Expand target_modules (e.g., 'all-linear' -> actual module names)
+                if config.target_modules:
+                    if isinstance(config.target_modules, str):
+                        target_modules = [config.target_modules]
+                    else:
+                        target_modules = list(config.target_modules)
 
-            with patch_deepcopy():
-                model = get_peft_model(model,
-                                       config,
-                                       adapter_name=adapter_name)
-        self.model = model
+                    expanded_modules = get_target_modules(_model, target_modules)
+                    config.target_modules = expanded_modules
+
+                with patch_deepcopy():
+                    _model = get_peft_model(_model,
+                                           config,
+                                           adapter_name=adapter_name)
+            _models.append(_model)
+        self.model = _models
 
         # Create optimizer group for adapter
         self.optimizer_group[train_group] = self._construct_default_optimizer_group()

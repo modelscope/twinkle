@@ -68,63 +68,66 @@ class MegatronStrategy:
 
     def wrap_model(
         self,
-        model: nn.Module,
+        model: List[nn.Module],
         optimizer: Optional[torch.optim.Optimizer] = None,
         use_distributed_optimizer: bool = True,
-    ) -> Tuple[nn.Module, Optional[torch.optim.Optimizer]]:
+    ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
         if self.device_mesh.world_size <= 1:
             return model, optimizer
 
         return self._wrap_with_megatron_ddp(model, optimizer,
                                             use_distributed_optimizer)
 
-    def unwrap_model(self, model: nn.Module) -> nn.Module:
+    def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
-        if isinstance(model, MegatronDDP):
-            return model.module
-
         from torch.nn.parallel import DistributedDataParallel as TorchDDP
-        if isinstance(model, TorchDDP):
-            return model.module
-
-        return model
+        _models = []
+        for _model in model:
+            if isinstance(_model, (MegatronDDP, TorchDDP)):
+                _models.append(model.module)
+            else:
+                _models.append(_model)
+        return _models
 
     @staticmethod
     def _wrap_with_megatron_ddp(
-        model: nn.Module,
+        model: List[nn.Module],
         optimizer: Optional[torch.optim.Optimizer],
         use_distributed_optimizer: bool,
-    ) -> Tuple[nn.Module, Optional[torch.optim.Optimizer]]:
+    ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.transformer.module import Float16Module
         from megatron.core.transformer import TransformerConfig
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
 
-        assert not isinstance(model, PeftModel), 'Cannot wrap peft model.'
-        config: TransformerConfig = model.config # noqa
+        wrapped_models = []
+        for _model in model:
+            assert not isinstance(_model, PeftModel), 'Cannot wrap peft model.'
+            config: TransformerConfig = _model.config # noqa
 
-        if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
-            model = Float16Module(config, model)
+            if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
+                _model = Float16Module(config, _model)
 
-        ddp_config = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True,
-            overlap_grad_reduce=False,
-            use_distributed_optimizer=use_distributed_optimizer,
-        )
+            ddp_config = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                overlap_grad_reduce=False,
+                use_distributed_optimizer=use_distributed_optimizer,
+            )
 
-        # Wrap with MegatronDDP
-        # TODO: multi-tenant ddp
-        wrapped_model = MegatronDDP(
-            config=config,
-            ddp_config=ddp_config,
-            module=model,
-        )
+            # Wrap with MegatronDDP
+            # TODO: multi-tenant ddp
+            wrapped_model = MegatronDDP(
+                config=config,
+                ddp_config=ddp_config,
+                module=_model,
+            )
 
-        # Broadcast params from data parallel src rank
-        # In torchrun mode, all ranks enter here simultaneously, so this works
-        wrapped_model.broadcast_params()
+            # Broadcast params from data parallel src rank
+            # In torchrun mode, all ranks enter here simultaneously, so this works
+            wrapped_model.broadcast_params()
+            wrapped_models.append(wrapped_model)
 
-        return wrapped_model, optimizer
+        return wrapped_models, optimizer
 
     def split_inputs_for_cp(self, inputs):
         # Calculate padded seq_length based on parallelism requirements
