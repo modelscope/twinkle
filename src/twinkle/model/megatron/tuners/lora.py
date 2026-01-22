@@ -1,40 +1,37 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """Megatron-compatible LoRA implementation with Tensor Parallel support."""
 import math
 import warnings
 from contextlib import contextmanager
 from typing import Any, List, Optional, Tuple
 
+from twinkle import exists, requires
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from packaging import version
 from peft.tuners.lora import model
 from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
 
-# Direct imports - assume megatron and peft are installed
-import megatron.core
-from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import (
-    TEColumnParallelGroupedLinear, TEColumnParallelLinear, TEGroupedLinear,
-    TELayerNormColumnParallelLinear, TELinear, TERowParallelGroupedLinear,
-    TERowParallelLinear)
-from megatron.core.models.common.embeddings.language_model_embedding import \
-    LanguageModelEmbedding
-from megatron.core.parallel_state import (
-    get_expert_tensor_parallel_world_size,
-    get_tensor_model_parallel_world_size)
-from megatron.core.tensor_parallel import (
-    gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region)
-from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.router import TopKRouter
-
-mcore_013 = version.parse(
-    megatron.core.__version__) >= version.parse('0.13.0rc0')
+if exists('megatron_core'):
+    from megatron.core import parallel_state
+    from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear, TEColumnParallelLinear, TEGroupedLinear,
+        TELayerNormColumnParallelLinear, TELinear, TERowParallelGroupedLinear,
+        TERowParallelLinear)
+    from megatron.core.parallel_state import (
+        get_expert_tensor_parallel_world_size,
+        get_tensor_model_parallel_world_size)
+    from megatron.core.tensor_parallel import (
+        gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region)
+    from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+    from megatron.core.transformer.module import MegatronModule
+    from megatron.core.transformer.moe.router import TopKRouter
+else:
+    # raise an error
+    requires('megatron_core')
 
 
 class LoraParallelLinear(MegatronModule, LoraLayer):
@@ -145,7 +142,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'config': self.config,
             'is_expert': self.is_expert,
         }
-        if mcore_013:
+        if exists('megatron_core>=0.13'):
             kwargs['tp_group'] = self.base_layer.tp_group
 
         if isinstance(self.base_layer, TopKRouter):
@@ -437,8 +434,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         Returns:
             Sharded state dictionary.
         """
-        from ..utils import tuners_sharded_state_dict
 
+        from .multi_lora import tuners_sharded_state_dict
         sharded_state_dict = tuners_sharded_state_dict(self, prefix,
                                                        sharded_offsets,
                                                        metadata)

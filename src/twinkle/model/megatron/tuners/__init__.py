@@ -1,5 +1,4 @@
-# Copyright (c) twinkle authors. All rights reserved.
-"""Megatron-compatible tuners for efficient fine-tuning."""
+# Copyright (c) ModelScope Contributors. All rights reserved.
 
 from .lora import LoraParallelLinear, dispatch_megatron
 

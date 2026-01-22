@@ -2,22 +2,26 @@
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable, Type, Union
+from typing import Callable, Type, Union, Dict, Any
 
 from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
-from twinkle import template, Plugin, preprocessor
+from twinkle import preprocessor
 from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
 from twinkle.preprocessor import Preprocessor, DataFilter
 from twinkle.template import Template
-from twinkle.utils.parallel import processing_lock
+from twinkle.utils import construct_class
+from twinkle.utils import processing_lock
 
 
 @dataclass
 class DatasetMeta:
+    """
+    The dataset meta-information, used to describe a dataset.
+    """
     # The dataset id or local path
     dataset_id: str
     # The subset name
@@ -53,20 +57,14 @@ class Dataset(TorchDataset):
         self.template = None
 
     @remote_function()
-    def set_template(self, template_cls: Union[Type[Template], str], **kwargs):
+    def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
         """Set the template to encode/check the dataset.
 
         Args:
-            template_cls: The template class, or the template plugin, or the template class name to load.
+            template_func: The template class/instance, or the template plugin, or the template class name to load.
             **kwargs: The template init params.
         """
-
-        if isinstance(template_cls, str):
-            if hasattr(template, template_cls):
-                template_cls = getattr(template, template_cls)
-            else:
-                template_cls = Plugin.load_plugin(template_cls, Template)
-        self.template = template_cls(**kwargs)
+        self.template = construct_class(template_func, Template, twinkle.template, **kwargs)
 
     @remote_function()
     def encode(self, **kwargs):
@@ -123,22 +121,18 @@ class Dataset(TorchDataset):
         return dataset
 
     @remote_function()
-    def map(self, preprocess_func: Union[Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, **kwargs) -> None:
+    def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
+            dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs) -> None:
         """An inplace method to operate or transform the dataset.
 
         Args:
-            preprocess_func: A preprocess function, or a `Preprocessor` class name, or a preprocessor plugin name.
+            preprocess_func: A preprocess function, or a `Preprocessor` class/instance, or a preprocessor plugin name.
             dataset_meta: The dataset_meta information of the loaded dataset.
+            init_args: The init args to construct the preprocessor.
             **kwargs: The kwargs of the `datasets.map`.
         """
-
-        if isinstance(preprocess_func, Preprocessor):
-            preprocess_func = preprocess_func()
-        elif isinstance(preprocess_func, str):
-            if hasattr(twinkle.preprocessor, preprocess_func):
-                preprocess_func = getattr(preprocessor, preprocess_func)()
-            else:
-                raise ValueError(f'Preprocessor {preprocess_func} not found.')
+        init_args = init_args or {}
+        preprocess_func = construct_class(preprocess_func, Preprocessor, twinkle.preprocessor, **init_args)
         if dataset_meta is None:
             assert len(self.datasets) == 1
             key = next(iter(self.datasets.keys()))
@@ -150,21 +144,19 @@ class Dataset(TorchDataset):
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None, **kwargs) -> None:
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None,
+               init_args: Dict[str, Any] = None,
+               **kwargs) -> None:
         """An inplace method to operate or transform the dataset.
 
         Args:
             filter_func: A filter function, or a `DataFilter` class name, or a filter plugin name.
             dataset_meta: The dataset_meta information of the loaded dataset.
+            init_args: The init args to construct the filter.
             **kwargs: The kwargs of the `datasets.map`.
         """
-        if isinstance(filter_func, DataFilter):
-            filter_func = filter_func()
-        elif isinstance(filter_func, str):
-            if hasattr(twinkle.preprocessor, filter_func):
-                filter_func = getattr(twinkle.preprocessor, filter_func)
-            else:
-                raise ValueError(f'Filter {filter_func} not found.')
+        init_args = init_args or {}
+        filter_func = construct_class(filter_func, DataFilter, twinkle.preprocessor, **init_args)
         if dataset_meta is None:
             assert len(self.datasets) == 1
             key = next(iter(self.datasets.keys()))

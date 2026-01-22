@@ -11,7 +11,7 @@ from .reranker import RerankerLoss
 from .listwise_reranker import ListwiseRerankerLoss
 from .listwise_generative_reranker import ListwiseGenerativeRerankerLoss
 from .grpo import GRPOLoss
-from .vocab_parallel_cross_entropy import MegatronCrossEntropyLoss
+from .megatron_cross_entropy import MegatronCrossEntropyLoss
 from .base import Loss
 
 torch_loss_mapping = {

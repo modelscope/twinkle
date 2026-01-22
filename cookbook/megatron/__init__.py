@@ -1,1 +1,1 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.

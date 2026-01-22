@@ -21,7 +21,7 @@ class DeviceMeshSampler(BatchSampler):
                 yield batch
             else:
                 if len(batch) < self.device_mesh.data_parallel_world_size:
-                    return
+                    raise StopIteration
                 else:
                     yield batch[self.device_mesh.get_slice(len(batch))]
 

@@ -44,8 +44,3 @@ def to_transformers_dict(feature: InputFeature) -> dict:
         if key in _keys:
             output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
     return output
-
-
-def to_megatron_dict(feature: InputFeature) -> dict:
-    """Transfer the InputFeature object to a dict needed by `megatron` models."""
-    raise NotImplementedError()

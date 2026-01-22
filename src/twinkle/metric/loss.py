@@ -6,6 +6,12 @@ from twinkle import torch_util
 
 
 class LossMetric(Metric):
+    """The loss metric.
+
+    Args:
+        device_mesh: The device mesh
+        process_group: The process group to collect data from
+    """
 
     def __init__(self, device_mesh, process_group, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)

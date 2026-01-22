@@ -13,6 +13,7 @@ from twinkle.data_format import Trajectory, Message
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from ..utils import construct_class
 
 
 @dataclass
@@ -55,25 +56,17 @@ class VLLMSampler(Sampler):
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name in self.sample_group, f'Use a valid {adapter_name} first, current is: {adapter_name}'
 
-    def set_template(self, template_cls: Union[Type[twinkle.template.Template], str], **kwargs):
+    def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
-        if isinstance(template_cls, str):
-            if hasattr(twinkle.template, template_cls):
-                template_cls = getattr(twinkle.template, template_cls)
-            else:
-                template_cls = Plugin.load_plugin(template_cls, twinkle.template.Template)
-        self.sample_group[adapter_name].template = template_cls(self.model_id, **kwargs)
+        template = construct_class(template_cls, Template, twinkle.template, **kwargs)
+        self.sample_group[adapter_name].template = template
 
-    def set_processor(self, processor_cls: Union[Type[twinkle.processor.InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
-        if isinstance(processor_cls, str):
-            if hasattr(twinkle.processor, processor_cls):
-                processor_cls = getattr(twinkle.processor, processor_cls)
-            else:
-                processor_cls = Plugin.load_plugin(processor_cls, twinkle.processor.InputProcessor)
-        self.sample_group[adapter_name].processor = processor_cls(**kwargs)
+        processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
+        self.sample_group[adapter_name].processor = processor
 
     @remote_function()
     def sample(self, trajectories: List[Trajectory], adapter_name = '') -> List[Trajectory]:

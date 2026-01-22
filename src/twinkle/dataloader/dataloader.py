@@ -15,7 +15,7 @@ class DataLoader:
     """A DataLoader wrapper, will retry failed samples and return the data belongs to the current dp rank.
 
     Notes:
-        If it is necessary to sample different in each epoch, recreate this dataloader is a better way,
+        If it is necessary to sample different in each epoch, re-create this dataloader is a better way,
             because the inner sampler does not implement a different seed in different epoches.
 
     Args:
@@ -56,7 +56,7 @@ class DataLoader:
         worker_seed = num_workers * rank + init_seed + worker_id
         framework_util.seed_everything(worker_seed)
 
-    @remote_function(collect='flatten')
+    @remote_function(collect='flatten') # flatten will be used in `__next__`
     def __iter__(self):
         from torch.utils.data import DataLoader as TorchDataLoader, IterableDataset
         if self.dataloader is None:
@@ -75,7 +75,8 @@ class DataLoader:
                                                                _iter._dataset_fetcher.auto_collation,
                                                                _iter._dataset_fetcher.collate_fn,
                                                                _iter._dataset_fetcher.drop_last,
-                                                               self.batch_size, self.device_mesh)
+                                                               self.batch_size, self.device_mesh,
+                                                               max_retries=self.max_retries)
         return _iter
 
     def _repeat_sample_and_shard(self):

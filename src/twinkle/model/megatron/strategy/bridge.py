@@ -1,38 +1,26 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 # GPT Bridge for HuggingFace to Megatron-Core weight conversion.
 import glob
+import inspect
 import json
-import math
 import os
 from copy import copy
-from dataclasses import dataclass, field
-from types import SimpleNamespace
+from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import save_file
 from tqdm import tqdm
 
+from twinkle import exists
 from twinkle.hub import HubOperation
 
-try:
-    from megatron.core import parallel_state as mpu
-    MEGATRON_AVAILABLE = True
-except ImportError:
-    MEGATRON_AVAILABLE = False
-    mpu = None
 
-try:
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-    SAFETENSORS_AVAILABLE = True
-except ImportError:
-    SAFETENSORS_AVAILABLE = False
-
-
-def deep_getattr(obj, attr: str, default=None):
+def _deep_getattr(obj, attr: str, default=None):
     """Get nested attribute from object using dot notation."""
     try:
         for key in attr.split('.'):
@@ -42,7 +30,7 @@ def deep_getattr(obj, attr: str, default=None):
         return default
 
 
-def is_last_rank() -> bool:
+def _is_last_rank() -> bool:
     """Check if current process is the last rank for writing.
 
     For DP > 1, we want only DP rank 0 to write to avoid conflicts.
@@ -52,23 +40,20 @@ def is_last_rank() -> bool:
     if not dist.is_initialized():
         return True
 
-    try:
-        from megatron.core import parallel_state as mpu
-        if mpu.is_initialized():
-            # Only DP rank 0 writes
-            dp_rank = mpu.get_data_parallel_rank()
-            if dp_rank != 0:
-                return False
-            # For PP, only last stage needs to write certain weights
-            # (handled separately in export_weights)
-            return True
-    except (ImportError, AssertionError):
-        pass
+    from megatron.core import parallel_state as mpu
+    if mpu.is_initialized():
+        # Only DP rank 0 writes
+        dp_rank = mpu.get_data_parallel_rank()
+        if dp_rank != 0:
+            return False
+        # For PP, only last stage needs to write certain weights
+        # (handled separately in export_weights)
+        return True
 
     return dist.get_rank() == dist.get_world_size() - 1
 
 
-class LazyTensor:
+class _LazyTensor:
     """Lazy tensor wrapper for deferred loading."""
     def __init__(self, loader, key: str):
         self._loader = loader
@@ -79,7 +64,7 @@ class LazyTensor:
         return self._loader.get_tensor(self._key)
 
 
-class SafetensorLoader:
+class _SafetensorLoader:
     """Lazy loader for safetensor files."""
     def __init__(self, model_dir: str, is_peft_format: bool = False):
         self.model_dir = model_dir
@@ -144,15 +129,15 @@ class SafetensorLoader:
         handle = self._get_handle(filepath)
         return handle.get_tensor(key)
 
-    def get_lazy(self, key: str) -> LazyTensor:
+    def get_lazy(self, key: str) -> _LazyTensor:
         """Get a lazy tensor reference."""
         if key not in self._key_to_file:
             raise KeyError(f'Tensor key not found: {key}')
-        return LazyTensor(self, key)
+        return _LazyTensor(self, key)
 
-    def get_state_dict(self) -> Dict[str, LazyTensor]:
+    def get_state_dict(self) -> Dict[str, _LazyTensor]:
         """Get lazy state dict."""
-        return {key: LazyTensor(self, key) for key in self._key_to_file}
+        return {key: _LazyTensor(self, key) for key in self._key_to_file}
 
     def keys(self) -> List[str]:
         """Get all tensor keys."""
@@ -172,7 +157,7 @@ class SafetensorLoader:
         self.close()
 
 
-class StreamingSafetensorSaver:
+class _StreamingSafetensorSaver:
     """Streaming saver for safetensor files."""
     def __init__(self,
                  save_dir: str,
@@ -379,7 +364,7 @@ class BridgeConfig:
         )
 
 
-class TwinkleGPTBridge:
+class GPTBridge:
     """Bridge for converting weights between HuggingFace and Megatron-Core formats.
 
     Supports Qwen2.5 / Qwen3 model families.
@@ -404,7 +389,7 @@ class TwinkleGPTBridge:
         """
         self.config = config
         self.hf_config = hf_config
-        self.disable_tqdm = disable_tqdm or not is_last_rank()
+        self.disable_tqdm = disable_tqdm or not _is_last_rank()
 
         # Parallel state
         self.tp_size = config.tp_size
@@ -412,8 +397,9 @@ class TwinkleGPTBridge:
         self.ep_size = config.ep_size
         self.etp_size = config.etp_size
 
+        from megatron.core import parallel_state as mpu
         # Get parallel ranks
-        if MEGATRON_AVAILABLE and mpu.is_initialized():
+        if mpu.is_initialized():
             self.tp_rank = mpu.get_tensor_model_parallel_rank()
             self.pp_rank = mpu.get_pipeline_model_parallel_rank()
             self.tp_group = mpu.get_tensor_model_parallel_group()
@@ -574,7 +560,7 @@ class TwinkleGPTBridge:
         if self._target_device is not None and tensor is not None:
             tensor = tensor.to(device=self._target_device)
 
-        if self._only_last_rank and not is_last_rank():
+        if self._only_last_rank and not _is_last_rank():
             return None, None
 
         return tensor, None
@@ -583,9 +569,9 @@ class TwinkleGPTBridge:
     # Weight Loading Methods
     # =========================================================================
 
-    def _load_embedding(self, mg_model, loader: SafetensorLoader):
+    def _load_embedding(self, mg_model, loader: _SafetensorLoader):
         """Load embedding weights."""
-        embed_module = deep_getattr(mg_model, 'embedding.word_embeddings')
+        embed_module = _deep_getattr(mg_model, 'embedding.word_embeddings')
         if embed_module is None:
             return
 
@@ -600,9 +586,9 @@ class TwinkleGPTBridge:
         self._set_weight(embed_module.weight, hf_weight,
                          'word_embeddings.weight')
 
-    def _load_output_layer(self, mg_model, loader: SafetensorLoader):
+    def _load_output_layer(self, mg_model, loader: _SafetensorLoader):
         """Load output layer (lm_head) weights."""
-        output_module = deep_getattr(mg_model, 'output_layer')
+        output_module = _deep_getattr(mg_model, 'output_layer')
         if output_module is None or output_module.weight is None:
             return
 
@@ -621,16 +607,16 @@ class TwinkleGPTBridge:
         self._set_weight(output_module.weight, hf_weight,
                          'output_layer.weight')
 
-    def _load_final_layernorm(self, mg_model, loader: SafetensorLoader):
+    def _load_final_layernorm(self, mg_model, loader: _SafetensorLoader):
         """Load final layer norm weights."""
-        ln_module = deep_getattr(mg_model, 'decoder.final_layernorm')
+        ln_module = _deep_getattr(mg_model, 'decoder.final_layernorm')
         if ln_module is None:
             return
 
         hf_weight = loader.get_tensor(self.HF_FINAL_LAYERNORM_KEY)
         ln_module.weight.data.copy_(hf_weight)
 
-    def _load_attention(self, mg_layer, loader: SafetensorLoader,
+    def _load_attention(self, mg_layer, loader: _SafetensorLoader,
                         layer_idx: int):
         """Load attention layer weights."""
         mg_attn = mg_layer.self_attention
@@ -697,11 +683,11 @@ class TwinkleGPTBridge:
         ln_key = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.input_layernorm.weight'
         ln_weight = loader.get_tensor(ln_key)
 
-        ln_param = deep_getattr(mg_attn, 'linear_qkv.layer_norm_weight')
+        ln_param = _deep_getattr(mg_attn, 'linear_qkv.layer_norm_weight')
         if ln_param is not None:
             ln_param.data.copy_(ln_weight)
         else:
-            ln_module = deep_getattr(mg_layer, 'input_layernorm')
+            ln_module = _deep_getattr(mg_layer, 'input_layernorm')
             if ln_module is not None:
                 ln_module.weight.data.copy_(ln_weight)
 
@@ -710,8 +696,8 @@ class TwinkleGPTBridge:
             try:
                 q_norm = loader.get_tensor(f'{prefix}q_norm.weight')
                 k_norm = loader.get_tensor(f'{prefix}k_norm.weight')
-                q_ln = deep_getattr(mg_attn, 'q_layernorm')
-                k_ln = deep_getattr(mg_attn, 'k_layernorm')
+                q_ln = _deep_getattr(mg_attn, 'q_layernorm')
+                k_ln = _deep_getattr(mg_attn, 'k_layernorm')
                 if q_ln is not None:
                     q_ln.weight.data.copy_(q_norm)
                 if k_ln is not None:
@@ -719,7 +705,7 @@ class TwinkleGPTBridge:
             except KeyError:
                 pass
 
-    def _load_mlp(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_mlp(self, mg_layer, loader: _SafetensorLoader, layer_idx: int):
         """Load MLP layer weights."""
         mg_mlp = mg_layer.mlp
         prefix = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.mlp.'
@@ -758,17 +744,17 @@ class TwinkleGPTBridge:
         try:
             ln_weight = loader.get_tensor(ln_key)
 
-            ln_param = deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
+            ln_param = _deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
             if ln_param is not None:
                 ln_param.data.copy_(ln_weight)
             else:
-                ln_module = deep_getattr(mg_layer, 'pre_mlp_layernorm')
+                ln_module = _deep_getattr(mg_layer, 'pre_mlp_layernorm')
                 if ln_module is not None:
                     ln_module.weight.data.copy_(ln_weight)
         except KeyError:
             pass
 
-    def _load_moe(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_moe(self, mg_layer, loader: _SafetensorLoader, layer_idx: int):
         """Load MoE layer weights.
 
         Handles Expert Parallel (EP) sharding - each EP rank loads only its
@@ -792,7 +778,7 @@ class TwinkleGPTBridge:
 
             if router_key:
                 router_weight = loader.get_tensor(router_key)
-                router_module = deep_getattr(mg_mlp, 'router')
+                router_module = _deep_getattr(mg_mlp, 'router')
                 if router_module is not None and hasattr(
                         router_module, 'weight'):
                     router_module.weight.data.copy_(router_weight)
@@ -828,7 +814,7 @@ class TwinkleGPTBridge:
                     down_weight = loader.get_tensor(
                         f'{prefix}{shared_key}.down_proj.weight')
 
-                    shared_module = deep_getattr(mg_mlp, 'shared_experts')
+                    shared_module = _deep_getattr(mg_mlp, 'shared_experts')
                     if shared_module is not None:
                         fc1_weight = torch.stack([gate_weight, up_weight],
                                                  dim=0)
@@ -846,7 +832,7 @@ class TwinkleGPTBridge:
                 if full_gate_key in loader:
                     try:
                         gate_weight = loader.get_tensor(full_gate_key)
-                        shared_module = deep_getattr(mg_mlp, 'shared_experts')
+                        shared_module = _deep_getattr(mg_mlp, 'shared_experts')
                         if shared_module is not None and hasattr(
                                 shared_module, 'gate_weight'):
                             shared_module.gate_weight.data.copy_(gate_weight)
@@ -857,7 +843,7 @@ class TwinkleGPTBridge:
         # Load experts with EP sharding
         num_local_experts = self.config.num_experts // self.ep_size
         start_expert_idx = self.ep_rank * num_local_experts
-        experts_module = deep_getattr(mg_mlp, 'experts')
+        experts_module = _deep_getattr(mg_mlp, 'experts')
 
         if experts_module is not None:
             # Determine expert module type
@@ -993,18 +979,18 @@ class TwinkleGPTBridge:
         try:
             ln_weight = loader.get_tensor(ln_key)
             # Try pre_mlp_layernorm first (used in MoE layers)
-            ln_module = deep_getattr(mg_layer, 'pre_mlp_layernorm')
+            ln_module = _deep_getattr(mg_layer, 'pre_mlp_layernorm')
             if ln_module is not None and hasattr(ln_module, 'weight'):
                 ln_module.weight.data.copy_(ln_weight)
             else:
                 # Fallback to linear_fc1.layer_norm_weight
-                ln_param = deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
+                ln_param = _deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
                 if ln_param is not None:
                     ln_param.data.copy_(ln_weight)
         except KeyError:
             pass
 
-    def _load_layer(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_layer(self, mg_layer, loader: _SafetensorLoader, layer_idx: int):
         """Load a single transformer layer."""
         self._load_attention(mg_layer, loader, layer_idx)
 
@@ -1033,7 +1019,7 @@ class TwinkleGPTBridge:
         self._adapter_name = adapter_name
 
         with torch.no_grad():
-            with SafetensorLoader(model_path,
+            with _SafetensorLoader(model_path,
                                   is_peft_format=is_peft_format) as loader:
                 if is_peft_format:
                     self._load_peft_weights(mg_model, loader)
@@ -1041,10 +1027,10 @@ class TwinkleGPTBridge:
                     self._load_base_weights(mg_model, loader)
 
     def _load_base_weights(self, mg_model: nn.Module,
-                           loader: SafetensorLoader):
+                           loader: _SafetensorLoader):
         """Load base model weights."""
         # Get decoder
-        decoder = deep_getattr(mg_model, 'decoder')
+        decoder = _deep_getattr(mg_model, 'decoder')
         if decoder is None:
             decoder = mg_model
 
@@ -1077,7 +1063,7 @@ class TwinkleGPTBridge:
                 print(f'Warning: Failed to load post-process: {e}')
 
     def _load_peft_weights(self, mg_model: nn.Module,
-                           loader: SafetensorLoader):
+                           loader: _SafetensorLoader):
         """Load PEFT/LoRA adapter weights."""
         state_dict = loader.get_state_dict()
         hf_prefix = 'base_model.model.' if self._is_peft_format else ''
@@ -1110,7 +1096,7 @@ class TwinkleGPTBridge:
             return
 
         # Get layer
-        decoder = deep_getattr(mg_model, 'decoder')
+        decoder = _deep_getattr(mg_model, 'decoder')
         if decoder is None:
             decoder = mg_model
 
@@ -1129,17 +1115,17 @@ class TwinkleGPTBridge:
         if 'self_attn' in key:
             mg_attn = mg_layer.self_attention
             if 'q_proj' in key or 'k_proj' in key or 'v_proj' in key:
-                target = deep_getattr(mg_attn, 'linear_qkv')
+                target = _deep_getattr(mg_attn, 'linear_qkv')
             elif 'o_proj' in key:
-                target = deep_getattr(mg_attn, 'linear_proj')
+                target = _deep_getattr(mg_attn, 'linear_proj')
             else:
                 return
         elif 'mlp' in key:
             mg_mlp = mg_layer.mlp
             if 'gate_proj' in key or 'up_proj' in key:
-                target = deep_getattr(mg_mlp, 'linear_fc1')
+                target = _deep_getattr(mg_mlp, 'linear_fc1')
             elif 'down_proj' in key:
-                target = deep_getattr(mg_mlp, 'linear_fc2')
+                target = _deep_getattr(mg_mlp, 'linear_fc2')
             else:
                 return
         else:
@@ -1150,9 +1136,9 @@ class TwinkleGPTBridge:
 
         # Get LoRA module
         if is_lora_A:
-            lora_module = deep_getattr(target, f'lora_A.{self._adapter_name}')
+            lora_module = _deep_getattr(target, f'lora_A.{self._adapter_name}')
         else:
-            lora_module = deep_getattr(target, f'lora_B.{self._adapter_name}')
+            lora_module = _deep_getattr(target, f'lora_B.{self._adapter_name}')
 
         if lora_module is not None and hasattr(lora_module, 'weight'):
             lora_module.weight.data.copy_(tensor)
@@ -1190,7 +1176,7 @@ class TwinkleGPTBridge:
             # For now, handle single model
             mg_model = mg_models[0]
 
-            decoder = deep_getattr(mg_model, 'decoder')
+            decoder = _deep_getattr(mg_model, 'decoder')
             if decoder is None:
                 decoder = mg_model
 
@@ -1199,7 +1185,7 @@ class TwinkleGPTBridge:
             if not is_peft_format:
                 # Export embedding
                 if self.pp_size <= 1 or self.pp_rank == 0:
-                    embed = deep_getattr(mg_model,
+                    embed = _deep_getattr(mg_model,
                                          'embedding.word_embeddings.weight')
                     if embed is not None:
                         weight, _ = self._get_weight(embed.data,
@@ -1218,13 +1204,13 @@ class TwinkleGPTBridge:
             if not is_peft_format:
                 # Export final layernorm and output layer
                 if self.pp_size <= 1 or self.pp_rank == self.pp_size - 1:
-                    ln_module = deep_getattr(mg_model,
+                    ln_module = _deep_getattr(mg_model,
                                              'decoder.final_layernorm')
                     if ln_module is not None:
                         yield f'{hf_prefix}{self.HF_FINAL_LAYERNORM_KEY}', ln_module.weight.data.clone(
                         )
 
-                    output = deep_getattr(mg_model, 'output_layer.weight')
+                    output = _deep_getattr(mg_model, 'output_layer.weight')
                     if output is not None:
                         weight, _ = self._get_weight(output.data,
                                                      'output_layer.weight')
@@ -1283,7 +1269,7 @@ class TwinkleGPTBridge:
                 yield f'{prefix}self_attn.o_proj.weight', o_weight
 
             # Export layernorms
-            ln = deep_getattr(mg_attn, 'linear_qkv.layer_norm_weight')
+            ln = _deep_getattr(mg_attn, 'linear_qkv.layer_norm_weight')
             if ln is not None:
                 yield f'{prefix}input_layernorm.weight', ln.data.clone()
 
@@ -1300,7 +1286,7 @@ class TwinkleGPTBridge:
             if fc2_weight is not None:
                 yield f'{prefix}mlp.down_proj.weight', fc2_weight
 
-            ln2 = deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
+            ln2 = _deep_getattr(mg_mlp, 'linear_fc1.layer_norm_weight')
             if ln2 is not None:
                 yield f'{prefix}post_attention_layernorm.weight', ln2.data.clone(
                 )
@@ -1316,13 +1302,13 @@ class TwinkleGPTBridge:
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Export LoRA weights from a layer."""
         # Check if LoRA is applied
-        from twinkle.megatron.tuners import LoraParallelLinear
+        from ..tuners import LoraParallelLinear
 
         # Attention LoRA
         if isinstance(mg_attn.linear_qkv, LoraParallelLinear):
-            lora_A = deep_getattr(mg_attn.linear_qkv,
+            lora_A = _deep_getattr(mg_attn.linear_qkv,
                                   f'lora_A.{self._adapter_name}.weight')
-            lora_B = deep_getattr(mg_attn.linear_qkv,
+            lora_B = _deep_getattr(mg_attn.linear_qkv,
                                   f'lora_B.{self._adapter_name}.weight')
 
             if lora_A is not None and lora_B is not None:
@@ -1362,9 +1348,9 @@ class TwinkleGPTBridge:
 
         # O projection LoRA
         if isinstance(mg_attn.linear_proj, LoraParallelLinear):
-            lora_A = deep_getattr(mg_attn.linear_proj,
+            lora_A = _deep_getattr(mg_attn.linear_proj,
                                   f'lora_A.{self._adapter_name}.weight')
-            lora_B = deep_getattr(mg_attn.linear_proj,
+            lora_B = _deep_getattr(mg_attn.linear_proj,
                                   f'lora_B.{self._adapter_name}.weight')
 
             if lora_A is not None and lora_B is not None:
@@ -1383,9 +1369,9 @@ class TwinkleGPTBridge:
         # MLP LoRA
         if hasattr(mg_mlp, 'linear_fc1') and isinstance(
                 mg_mlp.linear_fc1, LoraParallelLinear):
-            lora_A = deep_getattr(mg_mlp.linear_fc1,
+            lora_A = _deep_getattr(mg_mlp.linear_fc1,
                                   f'lora_A.{self._adapter_name}.weight')
-            lora_B = deep_getattr(mg_mlp.linear_fc1,
+            lora_B = _deep_getattr(mg_mlp.linear_fc1,
                                   f'lora_B.{self._adapter_name}.weight')
 
             if lora_A is not None and lora_B is not None:
@@ -1408,9 +1394,9 @@ class TwinkleGPTBridge:
 
         if hasattr(mg_mlp, 'linear_fc2') and isinstance(
                 mg_mlp.linear_fc2, LoraParallelLinear):
-            lora_A = deep_getattr(mg_mlp.linear_fc2,
+            lora_A = _deep_getattr(mg_mlp.linear_fc2,
                                   f'lora_A.{self._adapter_name}.weight')
-            lora_B = deep_getattr(mg_mlp.linear_fc2,
+            lora_B = _deep_getattr(mg_mlp.linear_fc2,
                                   f'lora_B.{self._adapter_name}.weight')
 
             if lora_A is not None and lora_B is not None:
@@ -1446,12 +1432,12 @@ class TwinkleGPTBridge:
         torch.cuda.empty_cache()
 
         # Determine if this rank should write
-        should_write = is_last_rank()
+        should_write = _is_last_rank()
 
         # Only the writing rank creates the saver
         saver = None
         if should_write:
-            saver = StreamingSafetensorSaver(
+            saver = _StreamingSafetensorSaver(
                 save_dir=output_dir,
                 max_shard_size=self.config.max_shard_size,
                 is_peft_format=is_peft_format,
@@ -1495,8 +1481,8 @@ class TwinkleGPTBridge:
             dist.barrier()
 
 
-class TwinkleBridgeAdapter:
-    """Adapter for weight loading using TwinkleGPTBridge.
+class BridgeAdapter:
+    """Adapter for weight loading using GPTBridge.
 
     Provides a simple interface for loading HF weights into Megatron models.
     """
@@ -1528,10 +1514,10 @@ class TwinkleBridgeAdapter:
 
         self._bridge = None
 
-    def _get_bridge(self) -> TwinkleGPTBridge:
+    def _get_bridge(self) -> GPTBridge:
         """Get or create the bridge instance."""
         if self._bridge is None:
-            self._bridge = TwinkleGPTBridge(
+            self._bridge = GPTBridge(
                 config=self.config,
                 hf_config=self.hf_config,
             )
@@ -1563,17 +1549,17 @@ class TwinkleBridgeAdapter:
         bridge.save_weights(mg_models, output_dir, is_peft_format)
 
 
-class TwinkleBridgeInitializer:
+class BridgeInitializer:
     """
     Megatron model initializer.
 
     This class provides complete model initialization flow including:
     - Megatron parallel state initialization
     - Model creation from HuggingFace config
-    - Weight loading using TwinkleGPTBridge
+    - Weight loading using GPTBridge
 
     Example:
-        initializer = TwinkleBridgeInitializer(
+        initializer = BridgeInitializer(
             tp_size=2,
             pp_size=1,
             params_dtype=torch.bfloat16,
@@ -1587,7 +1573,9 @@ class TwinkleBridgeInitializer:
         cp_size: int = 1,
         ep_size: int = 1,
         etp_size: Optional[int] = None,
+        vpp_size: Optional[int] = None,
         params_dtype=None,
+        seed: int = 42,
         use_cpu_initialization: bool = False,
         attention_backend: str = 'flash',
         sequence_parallel: bool = False,
@@ -1596,7 +1584,7 @@ class TwinkleBridgeInitializer:
         recompute_method: Optional[str] = None,
         recompute_num_layers: Optional[int] = None,
     ):
-        """Initialize TwinkleBridgeInitializer.
+        """Initialize BridgeInitializer.
 
         Args:
             tp_size: Tensor parallel size.
@@ -1624,6 +1612,7 @@ class TwinkleBridgeInitializer:
         self.cp_size = cp_size
         self.ep_size = ep_size
         self.etp_size = etp_size or tp_size
+        self.vpp_size = vpp_size or 1
         self.params_dtype = params_dtype if params_dtype is not None else torch.bfloat16
         self.use_cpu_initialization = use_cpu_initialization
         self.attention_backend = attention_backend
@@ -1632,95 +1621,45 @@ class TwinkleBridgeInitializer:
         self.recompute_modules = recompute_modules or ['core_attn']
         self.recompute_method = recompute_method
         self.recompute_num_layers = recompute_num_layers
-
+        self.seed = seed
         self._model = None
         self._bridge = None
         self._hf_config = None
         self._model_path = None
+        self._initialized = False
+        self._parallel_state = None
+        self.config = None
 
-    def _download_model(self, model_path: str) -> str:
-        """Download model if it's a model ID."""
-        if os.path.isdir(model_path):
-            return model_path
+    def initialize(self, **kwargs) -> None:
+        if self._initialized:
+            return
 
-        try:
-            from modelscope import snapshot_download
-            return snapshot_download(model_path)
-        except ImportError:
-            from huggingface_hub import snapshot_download
-            return snapshot_download(model_path)
-
-    def _initialize_megatron(self, hf_config: Any = None):
-        """Initialize Megatron parallel state.
-
-        This sets up the required process groups for tensor, pipeline,
-        and data parallelism using Megatron's parallel state module directly.
-
-        Handles both local (torchrun) and Ray execution modes:
-        - Local: Uses torchrun's environment variables (already set)
-        - Ray: Uses RayHelper's environment variables (RANK, WORLD_SIZE, etc.)
-
-        Args:
-            hf_config: Optional HuggingFace config for additional model parameters.
-        """
-        import os
-        import torch.distributed as dist
-        from datetime import timedelta
-        from megatron.core import parallel_state as mpu
+        from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        dist.init_process_group(backend='nccl')
 
-        # Check if already initialized
-        try:
-            if mpu.is_initialized():
-                return
-        except AssertionError:
-            pass
+        init_kwargs = {
+            'tensor_model_parallel_size': self.tp_size,
+            'pipeline_model_parallel_size': self.pp_size,
+            'context_parallel_size': self.cp_size,
+            'virtual_pipeline_model_parallel_size': self.vpp_size,
+            'expert_model_parallel_size': self.ep_size,
+        }
 
-        # Determine execution mode
-        twinkle_mode = os.environ.get('TWINKLE_MODE', 'local')
+        if exists('megatron_core>=0.13'):
+            init_kwargs['expert_tensor_parallel_size'] = self.etp_size
+        init_kwargs.update(kwargs)
+        parallel_state.initialize_model_parallel(**init_kwargs)
+        model_parallel_cuda_manual_seed(self.seed)
 
-        # Initialize distributed if not already
-        if not dist.is_initialized():
-            if twinkle_mode == 'ray':
-                # Ray mode: use environment variables set by RayHelper
-                rank = int(os.environ.get('RANK', '0'))
-                world_size = int(os.environ.get('WORLD_SIZE', '1'))
-                master_addr = os.environ.get('MASTER_ADDR', 'localhost')
-                master_port = os.environ.get('MASTER_PORT', '29500')
-                local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-
-                # Set CUDA device before init_process_group
-                torch.cuda.set_device(local_rank)
-
-                # Initialize process group with explicit parameters
-                dist.init_process_group(
-                    backend='nccl',
-                    init_method=f'tcp://{master_addr}:{master_port}',
-                    rank=rank,
-                    world_size=world_size,
-                    timeout=timedelta(minutes=10),
-                )
-            else:
-                # Local mode (torchrun): environment variables are already set
-                dist.init_process_group(backend='nccl')
-
-        # Initialize Megatron parallel state directly
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=self.pp_size,
-            context_parallel_size=self.cp_size,
-            expert_model_parallel_size=self.ep_size,
-        )
-
-        # Initialize CUDA RNG tracker for tensor parallel random states
-        # This is required when use_cpu_initialization=False (GPU initialization)
-        model_parallel_cuda_manual_seed(42)
+        self._parallel_state = parallel_state
+        self._initialized = True
 
     def _create_model_from_config(
         self,
         hf_config: Any,
         padded_vocab_size: int,
-    ) -> nn.Module:
+    ) -> List[nn.Module]:
         """Create Megatron GPT model from HuggingFace config.
 
         Args:
@@ -1730,7 +1669,6 @@ class TwinkleBridgeInitializer:
         Returns:
             Megatron GPT model.
         """
-        import torch.distributed as dist
         from megatron.core import parallel_state as mpu
         from megatron.core.transformer import TransformerConfig
         from megatron.core.transformer.enums import AttnBackend
@@ -1739,7 +1677,7 @@ class TwinkleBridgeInitializer:
             get_gpt_layer_with_transformer_engine_spec, )
 
         # Convert HF config to Megatron config
-        from ..utils import convert_hf_config
+        from ..tuners.multi_lora import convert_hf_config
         mg_config_dict = convert_hf_config(hf_config)
 
         # Build TransformerConfig
@@ -1776,7 +1714,6 @@ class TwinkleBridgeInitializer:
             This is necessary because PEFT models don't have ddp_config attribute
             that Megatron's native implementation expects.
             """
-            from megatron.core import parallel_state as mpu
 
             # Check if model is DDP-wrapped (has ddp_config)
             if hasattr(model[0], 'ddp_config'):
@@ -1917,7 +1854,7 @@ class TwinkleBridgeInitializer:
         )
 
         # Save transformer config for later use (e.g., DDP wrapping)
-        self._transformer_config = config
+        self.config = config
 
         # Get layer spec - enable moe_grouped_gemm for MoE models
         moe_grouped_gemm = num_experts > 0
@@ -1933,21 +1870,48 @@ class TwinkleBridgeInitializer:
         # Create model
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=padded_vocab_size,
-            max_sequence_length=max_seq_length,
-            pre_process=mpu.is_pipeline_first_stage(),
-            post_process=mpu.is_pipeline_last_stage(),
-            parallel_output=True,
-            share_embeddings_and_output_weights=getattr(
-                hf_config, 'tie_word_embeddings', False),
-            position_embedding_type='rope',
-            rotary_base=rotary_base,
-        )
-
+        rope_scaling = {}
+        if hasattr(hf_config, 'rope_scaling') and 'factor' in hf_config.rope_scaling:
+            rope_scaling = {
+                'seq_len_interpolation_factor': hf_config.rope_scaling["factor"]
+            }
+        if mpu.get_virtual_pipeline_model_parallel_world_size() > 1:
+            model = []
+            has_vp_stage = inspect.signature(mpu.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
+            for i in range(mpu.get_virtual_pipeline_model_parallel_world_size()):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": i}
+                _model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=layer_spec,
+                    vocab_size=padded_vocab_size,
+                    max_sequence_length=max_seq_length,
+                    pre_process=mpu.is_pipeline_first_stage(**extra_kwargs),
+                    post_process=mpu.is_pipeline_last_stage(**extra_kwargs),
+                    parallel_output=True,
+                    share_embeddings_and_output_weights=getattr(
+                        hf_config, 'tie_word_embeddings', False),
+                    position_embedding_type='rope',
+                    rotary_base=rotary_base,
+                    **rope_scaling
+                )
+                model.append(_model)
+            mpu.set_virtual_pipeline_model_parallel_rank(0)
+        else:
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=padded_vocab_size,
+                max_sequence_length=max_seq_length,
+                pre_process=mpu.is_pipeline_first_stage(),
+                post_process=mpu.is_pipeline_last_stage(),
+                parallel_output=True,
+                share_embeddings_and_output_weights=getattr(
+                    hf_config, 'tie_word_embeddings', False),
+                position_embedding_type='rope',
+                rotary_base=rotary_base,
+            )
+            model = [model]
         return model
 
     def _pad_vocab_size(self, vocab_size: int) -> int:
@@ -1959,7 +1923,8 @@ class TwinkleBridgeInitializer:
         self,
         model_path: str,
         load_weights: bool = True,
-    ) -> nn.Module:
+        **kwargs,
+    ) -> List[nn.Module]:
         """Create Megatron model from HuggingFace checkpoint.
 
         Args:
@@ -1980,7 +1945,7 @@ class TwinkleBridgeInitializer:
                                                      trust_remote_code=True)
 
         # Initialize Megatron parallel state with hf_config for proper args setup
-        self._initialize_megatron(self._hf_config)
+        self.initialize(**kwargs)
 
         # Calculate padded vocab size
         padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
@@ -1991,7 +1956,7 @@ class TwinkleBridgeInitializer:
 
         # Load weights
         if load_weights:
-            bridge_adapter = TwinkleBridgeAdapter(
+            bridge_adapter = BridgeAdapter(
                 hf_config=self._hf_config,
                 tp_size=self.tp_size,
                 pp_size=self.pp_size,
@@ -2000,7 +1965,8 @@ class TwinkleBridgeInitializer:
                 model_path=model_path,
                 padded_vocab_size=padded_vocab_size,
             )
-            bridge_adapter.load_weights(self._model, model_path)
+            for _model in self._model:
+                bridge_adapter.load_weights(_model, model_path)
             self._bridge = bridge_adapter._get_bridge()
 
         # Synchronize all ranks after model creation and weight loading
@@ -2032,7 +1998,7 @@ class TwinkleBridgeInitializer:
             raise ValueError('Must call create_model first')
 
         padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
-        bridge_adapter = TwinkleBridgeAdapter(
+        bridge_adapter = BridgeAdapter(
             hf_config=self._hf_config,
             tp_size=self.tp_size,
             pp_size=self.pp_size,
@@ -2062,51 +2028,3 @@ class TwinkleBridgeInitializer:
         self._bridge.save_weights(models,
                                   output_dir,
                                   is_peft_format=is_peft_format)
-
-
-# Legacy functions for backward compatibility
-def create_megatron_args(*args, **kwargs) -> SimpleNamespace:
-    """Legacy function - use BridgeConfig instead."""
-    return SimpleNamespace(**kwargs)
-
-
-def set_megatron_args(args: SimpleNamespace) -> None:
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    pass
-
-
-def restore_megatron_args() -> None:
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    pass
-
-
-def mock_megatron_args(args: SimpleNamespace):
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    from contextlib import contextmanager
-
-    @contextmanager
-    def noop():
-        yield args
-
-    return noop()
-
-
-def load_hf_weights_to_megatron(
-    mg_model: nn.Module,
-    model_path: str,
-    hf_config: Any,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    ep_size: int = 1,
-    padded_vocab_size: Optional[int] = None,
-) -> None:
-    """Convenience function to load HF weights into Megatron model."""
-    adapter = TwinkleBridgeAdapter(
-        hf_config=hf_config,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        ep_size=ep_size,
-        model_path=model_path,
-        padded_vocab_size=padded_vocab_size,
-    )
-    adapter.load_weights(mg_model, model_path)

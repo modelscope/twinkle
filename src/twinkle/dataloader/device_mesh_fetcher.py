@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from torch.utils.data._utils.fetch import _BaseDatasetFetcher
 from twinkle import DeviceMesh
 
@@ -12,7 +13,13 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
         self.device_mesh = device_mesh
         self.max_retries = max_retries
 
-    def fetch(self, possibly_batched_index):
+    def fetch(self, _):
+        """Fetch data of global batch size and returns the slices belong to the current RANK.
+
+        This function will retry until a valid data returns.
+        Returns:
+            The input data slice.
+        """
         if self.ended:
             raise StopIteration
 
@@ -22,8 +29,13 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                 try:
                     _data = None
                     for _ in range(self.max_retries):
-                        _data = next(self.dataset_iter)
-                        if _data is None:
+                        try:
+                            _data = next(self.dataset_iter)
+                            if _data is None:
+                                continue
+                        except StopIteration as e:
+                            raise e
+                        except Exception: # noqa
                             continue
                         else:
                             break
@@ -32,7 +44,7 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                     self.ended = True
                     break
             if len(data) == 0 or (
-                self.drop_last and len(data) < len(possibly_batched_index)
+                self.drop_last and len(data) < self.batch_size
             ):
                 raise StopIteration
         else:

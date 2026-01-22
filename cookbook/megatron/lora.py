@@ -1,4 +1,4 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """Megatron-Core LoRA training example.
 
 Supports both local (torchrun) and Ray execution modes.
@@ -34,9 +34,6 @@ parser.add_argument('--mode',
                     type=str,
                     default='local',
                     choices=['local', 'ray'])
-parser.add_argument('--tp_size', type=int, default=1)
-parser.add_argument('--pp_size', type=int, default=1)
-parser.add_argument('--cp_size', type=int, default=1)
 parser.add_argument('--num_gpus',
                     type=int,
                     default=4,

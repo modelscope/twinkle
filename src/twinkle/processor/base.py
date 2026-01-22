@@ -54,8 +54,7 @@ class InputProcessor:
             padded_sequences.append(padded_seq)
         return torch.stack(padded_sequences)
 
-    @remote_function()
-    def collate_fn(self, inputs: List[InputFeature]) -> Dict[str, Any]:
+    def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
         keys = inputs[0].keys()
         result = {}
@@ -90,3 +89,26 @@ class InputProcessor:
                     result[key] = values
             result = InputFeature(**result)
         return to_transformers_dict(result)
+
+    @remote_function()
+    def collate_fn(self, inputs: List[InputFeature], micro_batch_size: Optional[int] = None, variable_seq_lengths=False) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        if micro_batch_size is None:
+            return self._collate_macro_batch(inputs)
+        elif variable_seq_lengths:
+            assert len(inputs) > micro_batch_size
+            outputs = []
+            for i in range(0, len(inputs), micro_batch_size):
+                outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))
+            return outputs
+        else:
+            res = self._collate_macro_batch(inputs)
+            keys = list(res.keys())
+            outputs = []
+            for i in range(0, len(inputs), micro_batch_size):
+                output = {}
+                for key in keys:
+                    output[key] = res[key][i:i + micro_batch_size]
+                outputs.append(output)
+            return outputs
+
+

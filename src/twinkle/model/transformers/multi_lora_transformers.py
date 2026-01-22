@@ -18,8 +18,8 @@ from twinkle.patch.multi_adapter import MultiAdapter
 from twinkle.processor import InputProcessor
 from .strategy import AccelerateStrategy
 from .transformers import TransformersModel, OptimizerGroup
-from ..hub import HubOperation
-from ..metric import Metric
+from twinkle.hub import HubOperation
+from twinkle.metric import Metric
 
 
 @remote_class()
