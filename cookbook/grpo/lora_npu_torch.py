@@ -1,3 +1,4 @@
+"""GRPO training with TorchSampler (PyTorch native inference, no vLLM dependency)"""
 import numpy as np
 from peft import LoraConfig
 import os
@@ -8,12 +9,9 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import TorchSampler  # Use TorchSampler instead of VLLMSampler
 from twinkle.weight_loader import NativeLoader
 
-# import debugpy
-# debugpy.listen(5678)
-# debugpy.wait_for_client()
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')
 os.environ.setdefault('TWINKLE_SEED', '42')
 os.environ.setdefault('TWINKLE_FULL_DETERMINISM', '1')
@@ -89,10 +87,10 @@ twinkle.initialize(mode='ray', groups=device_groups, nproc_per_node=nproc_per_no
 @remote_class()
 class ActorGroup:
 
-    def __init__(self, engine_args, lora_config=None, adapter_name=None, **kwargs):
-        self.sampler = VLLMSampler(
+    def __init__(self, lora_config=None, adapter_name=None, **kwargs):
+        # Use TorchSampler instead of VLLMSampler - no engine_args needed
+        self.sampler = TorchSampler(
             'Qwen/Qwen3-0.6B',
-            engine_args,
             device_mesh=actor_device_mesh,
         )
         self.sampler.add_adapter_to_sampler(adapter_name, lora_config)
@@ -177,22 +175,13 @@ def train():
         remote_group='actor', 
         device_mesh=actor_device_mesh
     )
-    
-    engine_args = {
-        "model": "Qwen/Qwen3-0.6B",
-        "enable_lora": True,
-        "max_loras": 1,
-        "max_lora_rank": 64,
-        "max_model_len": max_length,
-        "gpu_memory_utilization": float(os.environ.get("TWINKLE_VLLM_GPU_MEMORY_UTILIZATION", "0.5")),
-    }
 
     lora_config = LoraConfig(
         target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']
     )
 
+    # No engine_args needed for TorchSampler
     actor_group = ActorGroup(
-        engine_args,
         remote_group='actor',
         lora_config=lora_config,
         adapter_name='default',
