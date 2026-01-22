@@ -5,7 +5,7 @@ import warnings
 from contextlib import contextmanager
 from typing import Any, List, Optional, Tuple
 
-from twinkle import exists, requires
+from twinkle import exists, requires, Platform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -522,9 +522,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         origin_device = base_layer.weight0.device if self.is_grouped else base_layer.weight.device
 
         if origin_device.type == 'cpu':
-            device = torch.cuda.current_device() if torch.cuda.is_available(
-            ) else 'cpu'
-            self.to(device=device)
+            self.to(device=Platform.get_local_device())
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_A.keys():
@@ -576,9 +574,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         origin_device = base_layer.weight0.device if self.is_grouped else base_layer.weight.device
 
         if origin_device.type == 'cpu':
-            device = torch.cuda.current_device() if torch.cuda.is_available(
-            ) else 'cpu'
-            self.to(device=device)
+            self.to(device=Platform.get_local_device())
 
         for active_adapter in self.merged_adapters:
             if active_adapter in self.lora_A.keys():

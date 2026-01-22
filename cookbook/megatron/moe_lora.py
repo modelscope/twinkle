@@ -35,15 +35,16 @@ parser.add_argument('--mode',
                     type=str,
                     default='local',
                     choices=['local', 'ray'])
+parser.add_argument('--dp_size', type=int, default=2)
 parser.add_argument('--tp_size', type=int, default=2)
-parser.add_argument('--pp_size', type=int, default=1)
-parser.add_argument('--vpp_size', type=int, default=1)
-parser.add_argument('--cp_size', type=int, default=1)
+parser.add_argument('--pp_size', type=int, default=2)
+parser.add_argument('--vpp_size', type=int, default=2)
+parser.add_argument('--cp_size', type=int, default=2)
 parser.add_argument('--ep_size',
                     type=int,
                     default=2,
                     help='Expert parallel size')
-parser.add_argument('--max_steps', type=int, default=5)
+parser.add_argument('--max_steps', type=int, default=100)
 parser.add_argument(
     '--model',
     type=str,
@@ -52,16 +53,9 @@ parser.add_argument(
 parser.add_argument(
     '--sequence_parallel',
     action='store_true',
-    default=False,
+    default=True,
     help='Enable sequence parallel (auto-enabled for MoE with TP > 1)')
-args = parser.parse_args()
-
-# Set mode in environment before importing twinkle
-os.environ['TWINKLE_MODE'] = args.mode
-
-if args.mode == 'local':
-    LOCAL_RANK = int(os.environ.get('LOCAL_RANK', '0'))
-    torch.cuda.set_device(LOCAL_RANK)
+args, unknown = parser.parse_known_args()
 
 logger = get_logger()
 
@@ -71,7 +65,7 @@ def create_dataset():
     dataset = Dataset(
         dataset_meta=DatasetMeta('ms://modelscope/competition_math'))
     # Use Qwen3 template for MoE model
-    dataset.set_template('Qwen3Template', model_id=args.model)
+    dataset.set_template('Template', model_id=args.model)
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True, load_from_cache_file=False)
     return dataset
@@ -101,7 +95,7 @@ def train():
     )
 
     # Smaller batch size for MoE models (larger memory footprint)
-    batch_size = 2
+    batch_size = 4
 
     _remote_args = {}
     if args.mode == 'ray':
@@ -112,7 +106,7 @@ def train():
 
     dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size, **_remote_args)
     model = MegatronModel(
-        pretrained_model_name_or_path=args.model,
+        model_id=args.model,
         sequence_parallel=args.sequence_parallel,
         mixed_precision='bf16',
         recompute_granularity='selective',
@@ -133,6 +127,7 @@ def train():
 
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch,
+                                        micro_batch_size=1,
                                         adapter_name=adapter_name)
         if step % GAS == 0:
             logger.info(f'Step {step // GAS}, loss: {output}')
