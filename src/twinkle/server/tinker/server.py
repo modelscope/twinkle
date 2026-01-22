@@ -169,7 +169,7 @@ def build_server_app(
 
         @app.delete("/training_runs/{run_id}/checkpoints/{checkpoint_id:path}")
         async def delete_run_checkpoint(self, request: Request, run_id: str, checkpoint_id: str) -> Any:
-            success = delete_checkpoint_file(run_id, checkpoint_id)
+            delete_checkpoint_file(run_id, checkpoint_id)
             # We return 200 (null) even if not found to be idempotent, or could raise 404
             return None
 
