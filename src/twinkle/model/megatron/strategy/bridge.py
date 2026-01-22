@@ -16,8 +16,9 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-from twinkle import exists
+from twinkle import exists, Platform
 from twinkle.hub import HubOperation
+from twinkle import torch_util
 
 
 def _deep_getattr(obj, attr: str, default=None):
@@ -1429,7 +1430,7 @@ class GPTBridge:
             For DP > 1, only DP rank 0 writes to disk. All ranks participate
             in tensor gather operations for TP.
         """
-        torch.cuda.empty_cache()
+        torch_util.empty_cache()
 
         # Determine if this rank should write
         should_write = _is_last_rank()

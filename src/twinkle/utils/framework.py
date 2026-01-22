@@ -121,6 +121,16 @@ class Torch(Framework):
         return torch.npu.is_available() and torch.npu.device_count() > 0
 
     @staticmethod
+    def empty_cache():
+        if Torch.is_gpu_available():
+            import torch
+            torch.cuda.empty_cache()
+        elif Torch.is_npu_available():
+            import torch
+            import torch_npu
+            torch.npu.empty_cache()
+
+    @staticmethod
     @lru_cache
     def get_current_device() -> 'Union[int, str, "torch.device"]':
         import torch
@@ -149,7 +159,7 @@ class Torch(Framework):
         return device
 
     @staticmethod
-    def set_device(local_rank: Union[int, str]) -> None:
+    def set_device(local_rank: Union[int, str] = None) -> None:
         import torch
         if local_rank is None:
             local_rank = max(0, Platform.get_local_rank())

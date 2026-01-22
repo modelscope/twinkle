@@ -109,6 +109,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
+        torch_util.set_device()
         # Create Megatron strategy
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
