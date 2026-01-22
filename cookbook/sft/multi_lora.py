@@ -40,7 +40,7 @@ def train():
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='model')
 
     lora_config = LoraConfig(
         target_modules='all-linear'

@@ -14,6 +14,13 @@ _T = TypeVar('_T')
 
 @remote_class(execute='first')
 class PackingDataset(Dataset):
+    """A packing dataset wrapper, this will use binpacking to pack the dataset rows to minimum number of batches,
+        whose lengths are almost `max_length`
+
+    Args:
+        dataset_meta: The dataset meta
+        packing_num_proc: The number of processes to use for packing
+    """
 
     PACKING_BATCH_SIZE = 1000
 
@@ -26,6 +33,7 @@ class PackingDataset(Dataset):
 
     @remote_function()
     def pack_dataset(self):
+        """Call to start packing dataset"""
         assert 'input_ids' in self.dataset[0], 'Tokenize dataset first to do packing.'
         assert self.template is not None, 'Set template first to do packing.'
         lengths = self.dataset['length']
@@ -101,8 +109,13 @@ class PackingDataset(Dataset):
     @remote_function()
     def __getitem__(self, index):
         sequence = self.packed_idx[index]
-        row = [self.dataset[i] for i in sequence]
-        return row
+        rows = [self.dataset[i] for i in sequence]
+        output = {}
+        for key in rows[0]:
+            output[key] = [r[key] for r in rows]
+            if isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):
+                output[key] = [v for lst in output[key] for v in lst]
+        return output
 
     @remote_function()
     def __len__(self):

@@ -1,39 +1,51 @@
-[tool.setuptools.packages.find]
-where = ["src"]
+[project]
+name = "twinkle"
+version = "0.0.1"
+description = "Training API for large language models with efficient data handling and advanced optimization techniques."
+readme = "README.md"
+authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "datasets>=3.0,<4.0",
+  "numpy",
+  "omegaconf>=2.3.0,<3.0.0",
+  "fastapi",
+  "modelscope[framework]",
+  "safetensors",
+  "peft>=0.11.0,<=0.19.0",
+  "transformers",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-datasets = "^3.0"
-numpy = "*"
-binpacking = {optional = true}
-peft = {version = ">=0.11.0,<=0.19.0", optional = true}
-pillow = {optional = true}
-rouge = {optional = true}
-safetensors = {optional = true}
-accelerate = {optional = true}
-sentencepiece = {optional = true}
-ray = {optional = true}
-transformers = {optional = true}
-megatron-core = {version = "^0.12.0", optional = true}
-torch = {version = "^2.6.0", optional = true}
-torchvision = {optional = true}
-deepspeed = {optional = true}
-sphinx = {version = "^5.3.0", optional = true}
-docutils = {version = "^0.16.0", optional = true}
-myst_parser = {optional = true}
-recommonmark = {optional = true}
-sphinx-book-theme = {optional = true}
-sphinx-copybutton = {optional = true}
-sphinx-rtd-theme = {optional = true}
-sphinx_markdown_tables = {optional = true}
-sphinxcontrib-mermaid = {optional = true}
-sklearn = {optional = true}
-scipy = {optional = true}
+[project.optional-dependencies]
+transformers = [
+  "accelerate",
+  "torch>=2.6.0,<3.0.0",
+  "torchvision",
+]
+megatron = ["megatron-core>=0.12.0"]
+ray = ["ray[serve]"]
+docs = [
+  "sphinx>=5.3.0,<6.0.0",
+  "docutils>=0.16.0,<0.17.0",
+  "myst_parser",
+  "recommonmark",
+  "sphinx-book-theme",
+  "sphinx-copybutton",
+  "sphinx-rtd-theme",
+  "sphinx_markdown_tables",
+  "sphinxcontrib-mermaid",
+]
 
-[tool.poetry.extras]
-transformers = ["peft", "transformers", "accelerate", "safetensors", "torch", "torchvision"]
-megatron = ["megatron-core"]
-ray = ["ray"]
-docs = ["sphinx", "docutils", "myst_parser", "recommonmark", "sphinx-book-theme", "sphinx-copybutton", "sphinx-rtd-theme", "sphinx_markdown_tables", "sphinxcontrib-mermaid"]
+[tool.poetry]
+packages = [
+  { include = "twinkle", from = "src" },
+  { include = "twinkle_client", from = "src" },
+]
 
+[[tool.poetry.source]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
 
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

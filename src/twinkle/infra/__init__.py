@@ -2,7 +2,7 @@
 import functools
 import inspect
 import os
-from typing import Literal, List, Optional, Union, Callable
+from typing import Literal, List, Optional, Union, Callable, Any
 from typing import TypeVar
 
 import numpy as np
@@ -68,7 +68,18 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
-    if _mode == 'ray':
+    if _mode == 'local':
+        if groups is not None:
+            _device_group = groups
+        else:
+            _device_group = [
+                DeviceGroup(
+                    name='default',
+                    ranks=list(range(Platform.get_world_size())),
+                    device_type=Platform.get_platform().device_prefix(),
+                )
+            ]
+    else:
         requires('ray')
         from ._ray import RayHelper
         if groups is not None:
@@ -84,18 +95,6 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
                              device_groups=_device_group)
-    else:
-        if groups is not None:
-            _device_group = groups
-        else:
-            _device_group = [
-                DeviceGroup(
-                    name='default',
-                    ranks=list(range(Platform.get_world_size())),
-                    device_type=Platform.get_platform().device_prefix(),
-                )
-            ]
-
 
 def is_master():
     if _mode == 'ray':
@@ -244,7 +243,7 @@ def get_device_placement(device_group=None) -> str:
         lines.extend(section_bottom())
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n" + "\n".join(lines)
 
 
 def _get_workers(workers, execute):
@@ -258,7 +257,7 @@ def _get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable], result):
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable], result: List[Any], device_mesh: DeviceMesh=None):
     if not result:
         return result
 
@@ -266,7 +265,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         output = []
         for i in range(len(result[0])):
             _single_result = [r[i] for r in result]
-            output.append(_collect_func(method, _single_result))
+            output.append(_collect_func(method, _single_result, device_mesh=device_mesh))
         return output
     if method == 'none':
         if isinstance(result, list) and len(result) == 1:
@@ -285,6 +284,9 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         return np.sum(result)
     elif method == 'first':
         return result[0]
+    elif method == 'last_pp':
+        assert device_mesh is not None
+        return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif isinstance(method, Callable):
         # Callable
         return method(result)
@@ -486,7 +488,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none'):
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
+                    sync: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -505,6 +508,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
             'sum': Return the sum value of all processes
             'first': Return the first worker's result but executed in each process, usually works for scenarios of all-gather.
             Callable: A callable that handles the collection
+        sync: If True, use synchronous execution (execute_all_sync) instead of async.
+            Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
     """
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -524,8 +529,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     from ._ray import RayHelper
                     _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
                                                        execute, device_mesh, args, kwargs)
-                    result = RayHelper.execute_all_async(func.__name__, _workers_and_args)
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
+                    execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                    result = execute_method(func.__name__, _workers_and_args)
+                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result,
+                                                                    getattr(self, 'device_mesh', None))
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self
@@ -551,6 +558,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
         wrapper._collect = collect
         wrapper._dispatch = dispatch
         wrapper._lazy_collect = _lazy_collect
+        wrapper._sync = sync
         return wrapper
 
     return decorator

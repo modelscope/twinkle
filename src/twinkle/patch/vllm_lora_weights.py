@@ -29,7 +29,7 @@ class TensorLoRARequest(LoRARequest):
 
 class VLLMLoraWeights(Patch):
 
-    def __call__(self, sampler, **kwargs):
+    def patch(self, sampler, **kwargs):
         requires('vllm>=0.11')
         tokenizer = sampler.template.tokenizer
         from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager

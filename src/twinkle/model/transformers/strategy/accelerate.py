@@ -1,11 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Dict, Any, Optional, Literal
-
-from .base import TrainStrategy
 from twinkle import DeviceMesh
 
 
-class AccelerateStrategy(TrainStrategy):
+class AccelerateStrategy:
     """A training strategy that uses `accelerate` to wrap models.
 
     Args:

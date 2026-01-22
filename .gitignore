@@ -35,6 +35,7 @@ wheels/
 /package
 /temp
 MANIFEST
+.locks/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -93,7 +94,6 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.locks
 .env
 .venv
 env/
@@ -142,7 +142,6 @@ wandb/
 benchmarks/
 eval_output/
 eval_outputs/
-transformers/
 vlmeval/
 my_model/
 /data
@@ -157,3 +156,4 @@ megatron_output/
 
 # ast template
 ast_index_file.py
+test_cookbook/

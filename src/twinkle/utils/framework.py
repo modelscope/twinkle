@@ -202,3 +202,10 @@ class Torch(Framework):
             # Alternative DTensor API
             return tensor.to_local()
         return tensor
+
+    @staticmethod
+    def synchronize():
+        import torch
+        if Torch.is_gpu_available():
+            torch.cuda.synchronize(Platform.get_local_device())
+

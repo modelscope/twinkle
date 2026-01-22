@@ -16,8 +16,25 @@ from twinkle.server.twinkle.validation import verify_request_token, ConfigRegist
 
 logger = get_logger()
 
+class CreateRequest(BaseModel):
+    processor_type: str
+    class_type: str
+
+    class Config:
+        extra = "allow"
+
+class HeartbeatRequest(BaseModel):
+    processor_id: str
+
+class CallRequest(BaseModel):
+    processor_id: str
+    function: str
+
+    class Config:
+        extra = "allow"
 
 def build_processor_app(nproc_per_node: int,
+                        ncpu_proc_per_node:int,
                         device_group: Dict[str, Any],
                         device_mesh: Dict[str, Any],
                         deploy_options: Dict[str, Any]):
@@ -30,22 +47,7 @@ def build_processor_app(nproc_per_node: int,
     processors = ['dataset', 'dataloader', 'preprocessor', 'processor',
                   'reward', 'template', 'weight_loader']
 
-    class CreateRequest(BaseModel):
-        processor_type: str
-        class_type: str
 
-        class Config:
-            extra = "allow"
-
-    class HeartbeatRequest(BaseModel):
-        processor_id: str
-
-    class CallRequest(BaseModel):
-        processor_id: str
-        function: str
-
-        class Config:
-            extra = "allow"
 
     @serve.deployment(name="ProcessorManagement")
     @serve.ingress(app)
@@ -53,10 +55,10 @@ def build_processor_app(nproc_per_node: int,
 
         COUNT_DOWN = 60 * 30
 
-        def __init__(self, nproc_per_node: int, device_group: Dict[str, Any], device_mesh: Dict[str, Any]):
+        def __init__(self, nproc_per_node: int, ncpu_proc_per_node:int, device_group: Dict[str, Any], device_mesh: Dict[str, Any]):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group],
-                               lazy_collect=False)
+                               lazy_collect=False, ncpu_proc_per_node=ncpu_proc_per_node)
             self.device_mesh = DeviceMesh(**device_mesh)
             self.resource_dict = {}
             self.resource_records: Dict[str, int] = {}
@@ -98,6 +100,7 @@ def build_processor_app(nproc_per_node: int,
 
         @app.post("/create")
         def create(self, request: Request, body: CreateRequest):
+
             processor_type_name = body.processor_type
             class_type = body.class_type
             kwargs = body.model_extra or {}
@@ -167,4 +170,4 @@ def build_processor_app(nproc_per_node: int,
             else:
                 return {'result': result}
 
-    return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh)
+    return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, ncpu_proc_per_node, device_group, device_mesh)

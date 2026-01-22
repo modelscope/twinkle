@@ -19,10 +19,16 @@ device_group = [
 ]
 
 
+# device_mesh = DeviceMesh(
+#     device_type='cuda',
+#     mesh=np.array([[0,1], [2,3]]),
+#     mesh_dim_names=('dp', 'fsdp')
+# )
+
 device_mesh = DeviceMesh(
-    device_type='cuda',
-    mesh=np.array([[0,1], [2,3]]),
-    mesh_dim_names=('dp', 'fsdp')
+   device_type='cuda',
+   mesh=np.array([0,1,2,3]),
+   mesh_dim_names=('dp',)
 )
 
 twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
