@@ -12,7 +12,8 @@ else:
     _import_structure = {
         'version': ['__release_datetime__', '__version__'],
         'utils': ['framework_util', 'torch_util', 'requires', 'Platform', 'GPU', 'NPU', 'find_node_ip', 'find_free_port', 'trust_remote_code', 'check_unsafe', 'DeviceMesh', 'Plugin', 'DeviceGroup', 'get_logger'],
-        'infra': ['initialize', 'remote_class', 'remote_function', 'get_device_placement'],
+        'infra': ['initialize', 'remote_class', 'remote_function', 'get_device_placement', 'is_master'],
+        'model.moe': ['apply_expert_parallel'],
     }
 
     import sys
