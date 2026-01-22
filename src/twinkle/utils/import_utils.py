@@ -6,30 +6,27 @@ import os
 from itertools import chain
 from types import ModuleType
 from typing import Any
-
+from functools import lru_cache
 from packaging.requirements import Requirement
 
 
+@lru_cache
 def requires(package: str):
     req = Requirement(package)
     pkg_name = req.name
-
-    if importlib.util.find_spec(pkg_name) is None:
+    try:
+        installed_version = importlib.metadata.version(pkg_name)
+        if req.specifier:
+            if not req.specifier.contains(installed_version):
+                raise ImportError(
+                    f"Package '{pkg_name}' version {installed_version} "
+                    f"does not satisfy {req.specifier}"
+                )
+    except importlib.metadata.PackageNotFoundError:
         raise ImportError(f"Required package '{pkg_name}' is not installed")
+        
 
-    if req.specifier:
-        try:
-            installed_version = importlib.metadata.version(pkg_name)
-        except importlib.metadata.PackageNotFoundError:
-            raise ImportError(f"Cannot determine version for '{pkg_name}'")
-
-        if not req.specifier.contains(installed_version):
-            raise ImportError(
-                f"Package '{pkg_name}' version {installed_version} "
-                f"does not satisfy {req.specifier}"
-            )
-
-
+@lru_cache
 def exists(package: str):
     try:
         requires(package)

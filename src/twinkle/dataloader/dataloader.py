@@ -34,7 +34,7 @@ class DataLoader:
         self.max_retries = kwargs.pop('max_retries', 20)
         if 'batch_size' not in kwargs:
             kwargs['batch_size'] = device_mesh.data_parallel_world_size
-        assert kwargs['batch_size'] >= device_mesh.data_parallel_world_size and kwargs['batch_size'] % device_mesh.data_parallel_world_size == 0
+        assert kwargs['batch_size'] >= device_mesh.data_world_size and kwargs['batch_size'] % device_mesh.data_world_size == 0
         self.batch_size = kwargs['batch_size']
         self.dataloader_params = kwargs
         self.device_mesh = device_mesh
@@ -43,7 +43,7 @@ class DataLoader:
     def _set_work_init_fn(self):
         num_workers = self.dataloader_params.get('num_workers', 2)
         self.dataloader_params['worker_init_fn'] = partial(
-            DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_parallel_rank or 0)
+            DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_rank or 0)
     
     @remote_function(execute='first')
     def __len__(self):

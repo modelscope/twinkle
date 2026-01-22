@@ -1871,7 +1871,7 @@ class BridgeInitializer:
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
         rope_scaling = {}
-        if hasattr(hf_config, 'rope_scaling') and 'factor' in hf_config.rope_scaling:
+        if hasattr(hf_config, 'rope_scaling') and hf_config.rope_scaling is not None and 'factor' in hf_config.rope_scaling:
             rope_scaling = {
                 'seq_len_interpolation_factor': hf_config.rope_scaling["factor"]
             }

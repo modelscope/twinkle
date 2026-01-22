@@ -21,7 +21,7 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss, MegatronCrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle import exists, requires
+from twinkle import requires
 import twinkle.metric
 from twinkle import torch_util
 from twinkle.model.base import TwinkleModel
@@ -185,6 +185,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             pp_size=self.device_mesh.pp_world_size,
             cp_size=self.device_mesh.cp_world_size,
             ep_size=self.device_mesh.ep_size,
+            vpp_size=self.device_mesh.vpp_size,
             params_dtype=params_dtype,
             seed=self._seed,
             use_cpu_initialization=False,

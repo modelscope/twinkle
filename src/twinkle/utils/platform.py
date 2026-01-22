@@ -62,10 +62,12 @@ class DeviceMesh:
             if origin_world_size == 1:
                 world_size *= pp_size
         if dp_size is not None:
-            mesh_dim_sizes.append(dp_size)
             mesh_dim_names.append("dp")
             if origin_world_size == 1:
                 world_size *= dp_size
+            mesh_dim_sizes.append(dp_size)
+        else:
+            mesh_dim_sizes.append(-1)
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")
@@ -76,7 +78,6 @@ class DeviceMesh:
             mesh_dim_names.append("tp")
             if origin_world_size == 1:
                 world_size *= tp_size
-
         """
         fsdp/dp/pp/tp/cp(megatron only) will affect the world_size
         sp here for two meanings:
