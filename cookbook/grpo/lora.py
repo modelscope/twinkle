@@ -1,7 +1,168 @@
+print("[cookbook] ENTRY OK", flush=True)
 import ray
 # cookbook/grpo/lora.py
-import os
+
 import torch
+from twinkle.data_format import Trajectory, Message
+
+from twinkle.infra import DiagnosticsConfig
+import os
+import time
+import logging
+from typing import Dict, Any, Optional
+
+def _setup_logger(name: str = "twinkle_grpo") -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s"
+    )
+    h = logging.StreamHandler()
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    return logger
+
+LOGGER = _setup_logger()
+
+def _safe_int(x, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _ray_cluster_snapshot() -> Dict[str, Any]:
+    import ray
+    ray.init(address="auto", ignore_reinit_error=True)
+    return {
+        "cluster_resources": ray.cluster_resources(),
+        "available_resources": ray.available_resources(),
+    }
+
+def _ray_min_gpu_probe(timeout_s: int = 60) -> Dict[str, Any]:
+    """
+    Submit a minimal GPU task to prove:
+    - Ray sees GPU resources
+    - a GPU worker can actually start
+    This isolates infrastructure/resource issues from algorithm issues.
+    """
+    import ray
+    ray.init(address="auto", ignore_reinit_error=True)
+
+    @ray.remote(num_gpus=1)
+    def _probe():
+        import os
+        import torch
+        out = {
+            "pid": os.getpid(),
+            "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "torch_cuda_available": torch.cuda.is_available(),
+            "torch_cuda_device_count": torch.cuda.device_count(),
+        }
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            out["cuda_name0"] = torch.cuda.get_device_name(0)
+        return out
+
+    ref = _probe.remote()
+    # wait with timeout to avoid hanging forever
+    start = time.time()
+    while True:
+        ready, _ = ray.wait([ref], timeout=1.0)
+        if ready:
+            return ray.get(ready[0])
+        if time.time() - start > timeout_s:
+            raise TimeoutError(f"GPU probe timed out after {timeout_s}s (likely resource starvation).")
+
+def _is_resource_starvation(snapshot: Dict[str, Any], need_gpu: float = 1.0, need_cpu: float = 1.0) -> bool:
+    """
+    Decide if current state is clearly resource starvation:
+    - cluster has GPUs but available GPUs < need_gpu
+    - or cluster GPUs == 0 (Ray didn't see GPUs)
+    """
+    cr = snapshot.get("cluster_resources", {}) or {}
+    ar = snapshot.get("available_resources", {}) or {}
+    cluster_gpu = float(cr.get("GPU", 0.0))
+    avail_gpu = float(ar.get("GPU", 0.0))
+    avail_cpu = float(ar.get("CPU", 0.0))
+
+    if cluster_gpu <= 0.0:
+        return True
+    if avail_gpu < need_gpu:
+        return True
+    if avail_cpu < need_cpu:
+        # CPU starvation is rarer but still blocks scheduling
+        return True
+    return False
+
+def preflight_resource_check(
+    *,
+    need_gpu: float = 1.0,
+    need_cpu: float = 1.0,
+    do_gpu_probe: bool = True,
+    probe_timeout_s: int = 90,
+) -> None:
+    """
+    Fail-fast with a clear diagnostic message if the job cannot run due to infra/resources.
+    This prevents misattributing scheduling issues to algorithm/logic issues.
+    Controlled by env:
+      - TWINKLE_PREFLIGHT=1 (default) enable
+      - TWINKLE_GPU_PROBE=1 enable minimal GPU probe (default 1)
+    """
+    if os.environ.get("TWINKLE_PREFLIGHT", "1") != "1":
+        LOGGER.info("[preflight] disabled by TWINKLE_PREFLIGHT!=1")
+        return
+
+    LOGGER.info("[preflight] checking Ray cluster resources ...")
+    snap = _ray_cluster_snapshot()
+    LOGGER.info("[preflight] cluster_resources=%s", snap["cluster_resources"])
+    LOGGER.info("[preflight] available_resources=%s", snap["available_resources"])
+
+    if _is_resource_starvation(snap, need_gpu=need_gpu, need_cpu=need_cpu):
+        # This is *not* algorithm logic. It's infra/resources.
+        raise RuntimeError(
+            "Ray resource starvation or GPU not visible to Ray. "
+            f"Need GPU>={need_gpu}, CPU>={need_cpu}. "
+            f"cluster={snap['cluster_resources']} available={snap['available_resources']}. "
+            "This indicates resource/placement issues (e.g., GPU=0, or GPUs held by other actors), "
+            "not training algorithm logic."
+        )
+
+    if do_gpu_probe and os.environ.get("TWINKLE_GPU_PROBE", "1") == "1":
+        LOGGER.info("[preflight] running minimal GPU probe task ...")
+        info = _ray_min_gpu_probe(timeout_s=probe_timeout_s)
+        LOGGER.info("[preflight] GPU probe ok: %s", info)
+
+def post_submit_watchdog(
+    *,
+    start_ts: float,
+    warn_after_s: int = 60,
+    hard_fail_after_s: int = 300,
+) -> None:
+    """
+    Optional watchdog: if your program is stuck waiting for scheduling,
+    emit a strong hint before users suspect 'logic bug'.
+    Controlled by TWINKLE_WATCHDOG=1 (default 1)
+    """
+    if os.environ.get("TWINKLE_WATCHDOG", "1") != "1":
+        return
+    elapsed = int(time.time() - start_ts)
+    if elapsed >= warn_after_s:
+        try:
+            snap = _ray_cluster_snapshot()
+            if _is_resource_starvation(snap, need_gpu=1.0, need_cpu=1.0):
+                LOGGER.warning(
+                    "[watchdog] still waiting after %ss; likely scheduling/resource starvation. "
+                    "cluster=%s available=%s",
+                    elapsed, snap["cluster_resources"], snap["available_resources"]
+                )
+                if elapsed >= hard_fail_after_s:
+                    raise RuntimeError(
+                        f"Hard-fail after {elapsed}s waiting; this is almost certainly resource starvation, "
+                        "not algorithm logic. Please free GPUs / restart ray / reduce actors."
+                    )
+        except Exception as e:
+            LOGGER.warning("[watchdog] snapshot failed: %s: %s", type(e).__name__, e, exc_info=True)
 
 # -----------------------------------------------------------------------------
 # AttrDict: dict with attribute access (supports both .keys() and .labels usage)
@@ -265,6 +426,9 @@ if ngpu >= 2:
 
 
 def create_dataset():
+    if os.environ.get("TWINKLE_SKIP_DATASET", "0") == "1":
+        raise RuntimeError("Skip dataset by TWINKLE_SKIP_DATASET=1")
+
     dataset = Dataset(DatasetMeta("ms://modelscope/competition_math"))
     try:
         dataset.set_template("Qwen3Template", model_id=LOCAL_MODEL_PATH)
@@ -273,10 +437,7 @@ def create_dataset():
     dataset.map("CompetitionMathProcessor")
     dataset.check(batched=True)
     return dataset
-
-
 @remote_class()
-@ray.remote(num_gpus=1)
 class ActorGroup:
     """
     Goal A: no vLLM. Sampling + training both inside this actor using transformers.
@@ -559,9 +720,9 @@ def train():
         task_type="CAUSAL_LM",
     )
 
-    actor_group = ActorGroup.remote(
+    actor_group = ActorGroup(
         lora_config=lora_config,
-        remote_group="actor",
+        remote_group="actor",   # 允许传；__init__ 有 **kwargs
         adapter_name=adapter_name,
         max_new_tokens=int(os.environ.get("TWINKLE_MAX_NEW_TOKENS", "64")),
     )
@@ -587,12 +748,47 @@ def train():
     max_steps = int(os.environ.get("TWINKLE_MAX_STEPS", "1"))
     step = 0
     for batch in dataloader:
+        # 1) sampling: ideally returns List[Trajectory] once you switch to VLLMSampler
         trajectories = ray.get(actor_group.sample.remote(batch))
-        trajectories_for_reward = _wrap_trajectories_for_reward(trajectories)
-        ground_truths_for_reward = _wrap_trajectories_for_reward(batch)
-        trajectories = reward.calculate(trajectories_for_reward, ground_truths_for_reward)
 
-        ray.get(actor_group.forward_backward.remote(batch, trajectories, ref_logits, adapter_name=adapter_name))
+        # 2) build ground truths as List[Trajectory] for MathReward
+        from twinkle.data_format import Trajectory, Message
+        ground_truths_for_reward = []
+        if isinstance(batch, list) and batch and isinstance(batch[0], dict):
+            for row in batch:
+                gt = (
+                    row.get("answer")
+                    or row.get("ground_truth")
+                    or row.get("label")
+                    or row.get("output")
+                    or ""
+                )
+                ground_truths_for_reward.append(
+                    Trajectory(messages=[Message(role="assistant", content=str(gt))])
+                )
+        else:
+            # fallback if dataloader yields non-list/dict
+            ground_truths_for_reward = [
+                Trajectory(messages=[Message(role="assistant", content=str(batch))])
+            ]
+
+        # 3) if your sampler still returns dicts, keep compatibility via wrapper
+        trajectories_for_reward = _wrap_trajectories_for_reward(trajectories)
+
+        # 4) reward.calculate returns List[float]; write back to trajectories (required by GRPOLoss)
+        rewards = reward.calculate(trajectories_for_reward, ground_truths_for_reward)
+
+        # IMPORTANT: the `trajectories` passed into GRPOLoss must have `.rewards`
+        if trajectories and isinstance(trajectories[0], dict) and "messages" in trajectories[0]:
+            for t, r in zip(trajectories, rewards):
+                t["rewards"] = [float(r)]
+            trajs_for_loss = trajectories
+        else:
+            for t, r in zip(trajectories_for_reward, rewards):
+                t.rewards = [float(r)]
+            trajs_for_loss = trajectories_for_reward
+
+        ray.get(actor_group.forward_backward.remote(batch, trajs_for_loss, ref_logits, adapter_name=adapter_name))
         actor_group.step()
         actor_group.zero_grad()
         actor_group.lr_step()
@@ -608,16 +804,28 @@ def main():
     os.environ.setdefault("TWINKLE_FULL_DETERMINISM", "0")
     os.environ.setdefault("TRUST_REMOTE_CODE", "1")
 
+    # 关键：启动前判定“是不是资源问题”
+    preflight_resource_check(need_gpu=1.0, need_cpu=1.0, do_gpu_probe=True, probe_timeout_s=90)
+    diag = DiagnosticsConfig(
+        enabled=True,
+        need_gpu=1.0,
+        need_cpu=1.0,
+        gpu_probe=True,          # 用一次最小 GPU remote probe 来验证调度链路
+        probe_timeout_s=60,
+        watchdog=True,           # 资源心跳
+        watchdog_interval_s=30,
+        warn_after_s=60,
+        hard_fail_after_s=300,   # 目前只会 ERROR 日志，不会强杀进程
+    )
     twinkle.initialize(
-    mode="ray",
-    nproc_per_node=ngpu if ngpu >= 1 else 1,
-    groups=device_groups,
-    lazy_collect=False,
-)
-
+        mode="ray",
+        nproc_per_node=ngpu if ngpu >= 1 else 1,
+        groups=device_groups,
+        lazy_collect=False,
+        diagnostics=diag,
+    )
 
     train()
-
 
 if __name__ == "__main__":
     main()

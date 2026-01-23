@@ -7,6 +7,8 @@ from typing import TypeVar
 
 import numpy as np
 
+from .diagnostics import DiagnosticsConfig
+
 from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
 
@@ -37,7 +39,8 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                full_determinism: bool = False,
                groups: Optional[List[DeviceGroup]] = None,
                global_device_mesh: Optional[DeviceMesh] = None,
-               lazy_collect: bool = True):
+               lazy_collect: bool = True,
+               diagnostics: Optional[DiagnosticsConfig] = None):
     """Initialize the twinkle infrastructure.
 
     Args:
@@ -94,7 +97,7 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             ]
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
-                             device_groups=_device_group)
+                             device_groups=_device_group, diagnostics=diagnostics)
 
 def is_master():
     if _mode == 'ray':

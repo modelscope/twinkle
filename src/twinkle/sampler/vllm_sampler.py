@@ -75,40 +75,121 @@ class VLLMSampler(Sampler):
         self._check_adapter_valid(adapter_name)
         processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
         self.sample_group[adapter_name].processor = processor
+    def _kv_list_to_dict(self, kv_list):
+        """Trajectory.generation_config is List[Tuple[str, Any]]; normalize to dict."""
+        if kv_list is None:
+          return {}
+        if isinstance(kv_list, dict):
+          return kv_list
+        if isinstance(kv_list, list):
+          out = {}
+        for item in kv_list:
+            if isinstance(item, tuple) and len(item) == 2:
+                k, v = item
+                out[str(k)] = v
+            return out
+        return {}
+
+    def _build_sampling_params(self, traj: Trajectory):
+        """WIP: build vLLM SamplingParams from trajectory.generation_config (best-effort)."""
+        from vllm import SamplingParams
+
+        cfg = self._kv_list_to_dict(traj.get("generation_config", None))
+        temperature = float(cfg.get("temperature", os.environ.get("TWINKLE_TEMPERATURE", 0.8)))
+        top_p = float(cfg.get("top_p", os.environ.get("TWINKLE_TOP_P", 0.95)))
+        max_tokens = int(cfg.get("max_new_tokens", cfg.get("max_tokens", os.environ.get("TWINKLE_MAX_NEW_TOKENS", 128))))
+        n = int(cfg.get("n", cfg.get("num_return_sequences", os.environ.get("TWINKLE_NUM_GENERATIONS", 1))))
+
+        return SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            n=n,
+        )
 
     @remote_function()
-    def sample(self, trajectories: List[Trajectory], adapter_name = '') -> List[Trajectory]:
+    def sample(self, trajectories: List[Trajectory], adapter_name: str = "") -> List[Trajectory]:
         self._check_adapter_valid(adapter_name)
+
+        group = self.sample_group[adapter_name]
+        template_ins = group.template
+        if template_ins is None:
+            raise RuntimeError(
+                "VLLMSampler requires template to be set before sampling. "
+                "Call sampler.set_template(...) first."
+            )
+
+        # Ensure messages exists (Trajectory is total=False)
+        for t in trajectories:
+            t.setdefault("messages", [])
+
+        # LoRA request (WIP: keep current behavior)
         if adapter_name:
-            group = self.sample_group[adapter_name]
             from vllm.lora.request import LoRARequest
             adapter_request = LoRARequest(
                 lora_name=adapter_name,
                 lora_int_id=group.lora_int_id,
-                lora_path='dummy_lora_path',
+                lora_path="dummy_lora_path",
             )
         else:
             adapter_request = None
 
-        request_ids = []
-        template_ins = self.sample_group[adapter_name].template
+        request_ids: List[str] = []
+        outputs_by_id: Dict[str, Any] = {}
+
+        # enqueue
         for trajectory in trajectories:
             inputs = template_ins.encode(trajectory)
-            request_id = str(uuid.uuid4().hex)
+            request_id = uuid.uuid4().hex
             request_ids.append(request_id)
-            llm_inputs = {'prompt_token_ids': inputs.input_ids}
-            self.engine.add_request(request_id, llm_inputs, generation_config=trajectory.generation_config, adapter_request=adapter_request)
-        outputs = []
+
+            sampling_params = self._build_sampling_params(trajectory)
+
+            # vLLM LLMEngine.add_request signature varies by version; try both
+            try:
+                self.engine.add_request(
+                    request_id=request_id,
+                    prompt=None,
+                    sampling_params=sampling_params,
+                    prompt_token_ids=inputs.input_ids,
+                    lora_request=adapter_request,
+                )
+            except TypeError:
+                # fallback older naming
+                self.engine.add_request(
+                    request_id,
+                    prompt=None,
+                    sampling_params=sampling_params,
+                    prompt_token_ids=inputs.input_ids,
+                    adapter_request=adapter_request,
+                )
+
+        # collect until done
         while self.engine.has_unfinished_requests():
             step_outputs = self.engine.step()
-            for output in step_outputs:
-                if output.finished:
-                    outputs[output.request_id] = output
-        outputs = [outputs[request_id] for request_id in request_ids]
-        for trajectory, output in zip(trajectories, outputs):
-            response = template_ins.decode(output.token_ids)
-            trajectory.messages.append(Message(role='assistant', content=response))
+            for out in step_outputs:
+                if getattr(out, "finished", False):
+                    outputs_by_id[out.request_id] = out
+
+        # decode and append assistant message (take first candidate)
+        for trajectory, rid in zip(trajectories, request_ids):
+            out = outputs_by_id.get(rid)
+            if out is None:
+                raise RuntimeError(f"Missing vLLM output for request_id={rid}")
+
+            candidates = getattr(out, "outputs", None)
+            if candidates:
+                token_ids = candidates[0].token_ids
+            else:
+                token_ids = getattr(out, "token_ids", None)
+                if token_ids is None:
+                    raise RuntimeError(f"vLLM output has no token_ids for request_id={rid}")
+
+            response = template_ins.decode(token_ids)
+            trajectory["messages"].append(Message(role="assistant", content=response))
+
         return trajectories
+
 
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
         assert adapter_name not in self.sample_group, f'{adapter_name} already exists.'

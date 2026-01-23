@@ -3,6 +3,7 @@ import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
 
 import ray
+from ..diagnostics import DiagnosticsConfig, preflight_or_raise, Watchdog
 
 from .resource_manager import ResourceManager
 from twinkle import DeviceGroup, Platform, find_node_ip, find_free_port, requires
@@ -12,6 +13,7 @@ T = TypeVar('T')
 
 class RayHelper:
 
+    _watchdog = None
     resource_manager: Optional[ResourceManager] = None
 
     _registry = None
@@ -60,27 +62,45 @@ class RayHelper:
         assert RayHelper._registry is not None
 
     @staticmethod
-    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups: List[DeviceGroup]):
+    @staticmethod
+    def initialize(
+        nproc_per_node: int,
+        ncpu_proc_per_node: int,
+        device_groups: List[DeviceGroup],
+        diagnostics: Optional[DiagnosticsConfig] = None,
+    ):
         """Initialize RayHelper.
 
         Args:
             nproc_per_node: How many processes in one node.
             ncpu_proc_per_node: How many cpu processes in one node.
             device_groups: The device groups to initialize.
+            diagnostics: Optional diagnostics config (framework-level preflight + watchdog).
 
         Returns:
             None
         """
         requires('ray')
         import ray
+
         RayHelper.device_groups = device_groups
+
         if not RayHelper.ray_inited():
-            ray.init(address=os.environ.get("RAY_ADDRESS","auto"), ignore_reinit_error=True)
+            ray.init(address=os.environ.get("RAY_ADDRESS", "auto"), ignore_reinit_error=True)
+
+        # diagnostics: ensure preflight/watchdog runs even if Ray already initialized
+        if diagnostics is not None and diagnostics.enabled:
+            preflight_or_raise(diagnostics)
+            if RayHelper._watchdog is None:
+                RayHelper._watchdog = Watchdog(diagnostics)
+                RayHelper._watchdog.start()
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
             RayHelper.resource_manager = ResourceManager(nproc_per_node, ncpu_proc_per_node, device_groups)
+
         RayHelper.init_registry()
+
 
     @staticmethod
     def teardown():
