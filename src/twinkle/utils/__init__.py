@@ -8,3 +8,4 @@ from .unsafe import trust_remote_code, check_unsafe
 from .loader import Plugin, construct_class
 from .logger import get_logger
 from .parallel import processing_lock
+from .io_utils import move_to_cpu_detach

@@ -8,7 +8,7 @@ from typing import TypeVar
 import numpy as np
 
 from ..utils import DeviceGroup, DeviceMesh, Platform
-from ..utils import requires, framework_util, check_unsafe
+from ..utils import requires, framework_util, check_unsafe, move_to_cpu_detach
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -308,7 +308,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             # TODO this may occurs error when remote calls remote
             # Comment this because remote_class supports `first``
             # assert device_mesh.world_size == len(workers)
-        length = len(workers) if not device_mesh else device_mesh.data_parallel_world_size
+        length = len(workers) if not device_mesh else device_mesh.dp_world_size
         length = min(length, len(workers))
         dp_repeat = len(workers) // length
 
@@ -530,6 +530,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     logger.info(f'Executing ray function {func.__name__} with args: {args}, kwargs: {kwargs}')
                     result = func(self, *args, **kwargs)
                     logger.info(f'Execution of ray function {func.__name__} completed with result: {result}')
+                    # return move_to_cpu_detach(result)
                     return result
                 else:
                     from ._ray import RayHelper
@@ -542,8 +543,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     logger.info(f'Execution of remote function {func.__name__} completed with result: {result}')
                     
                     logger.info(f'Collecting results for remote function {func.__name__} with method {collect}')
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result,
-                                                                    getattr(self, 'device_mesh', None))
+                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
                     logger.info(f'Collection of results for remote function {func.__name__} completed with result: {result_func}')
 
                     lazy_collect = _lazy_collect

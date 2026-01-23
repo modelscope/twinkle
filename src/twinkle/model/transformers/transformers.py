@@ -57,7 +57,7 @@ class OptimizerGroup:
         return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
 
     def __post_init__(self):
-        if self._device_mesh.data_parallel_world_size > 1:
+        if self._device_mesh.dp_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
             for metric in self.metrics:
                 metric.process_group = self._dp_group
@@ -178,7 +178,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
         # only return logits on cpu for remote call
-        return {'logits': outputs['logits'].detach().cpu()}  
+        # return {'logits': outputs['logits'].detach().cpu()}  
+        return outputs
 
     @remote_function()
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -212,7 +213,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
         # only return logits on cpu for remote call
-        return {'logits': outputs['logits'].detach().cpu()}
+        # return {'logits': outputs['logits'].detach().cpu()}
+        return outputs
 
     @staticmethod
     def _accumulate_metric(optimizer_config: OptimizerGroup):
@@ -594,7 +596,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[_default_adapter_name]
+        default_config = self.optimizer_group[train_group]
         if default_config.template:
             self.optimizer_group[train_group].template = default_config.template
         if default_config.processor:

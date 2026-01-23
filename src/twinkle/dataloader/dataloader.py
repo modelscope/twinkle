@@ -33,8 +33,8 @@ class DataLoader:
         self.dataloader = None
         self.max_retries = kwargs.pop('max_retries', 20)
         if 'batch_size' not in kwargs:
-            kwargs['batch_size'] = device_mesh.data_parallel_world_size
-        assert kwargs['batch_size'] >= device_mesh.data_parallel_world_size and kwargs['batch_size'] % device_mesh.data_parallel_world_size == 0
+            kwargs['batch_size'] = device_mesh.dp_world_size
+        assert kwargs['batch_size'] >= device_mesh.dp_world_size and kwargs['batch_size'] % device_mesh.dp_world_size == 0
         self.batch_size = kwargs['batch_size']
         self.dataloader_params = kwargs
         self.device_mesh = device_mesh

@@ -1,7 +1,7 @@
 import torch
 from tinker import types
 from typing import List
-from twinkle.model.multi_lora_transformers import MultiLoraTransformersModel
+from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature
 
