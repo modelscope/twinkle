@@ -27,21 +27,11 @@ from twinkle.metric import Metric, LossMetric, Accuracy
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-<<<<<<< HEAD
-from twinkle import requires
-import twinkle.metric
-from twinkle import torch_util
-from twinkle.model.base import TwinkleModel
 from .strategy import MegatronStrategy
-from twinkle.metric import Metric, LossMetric, Accuracy
 from twinkle.utils import construct_class, exists
 from twinkle.model.megatron.args import get_args, set_args, TwinkleMegatronArgs
 from twinkle.model.megatron.model import get_megatron_model_meta, GPTBridge
-=======
-from twinkle.utils import construct_class
-from .strategy import MegatronStrategy
 
->>>>>>> dev
 
 @dataclass
 class MegatronOptimizerGroup:
