@@ -46,7 +46,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         input_features = [datum_to_input_feature(datum) for datum in inputs]
 
         outputs = super().forward(inputs=input_features, **kwargs)
-        logits = outputs['logits']  # shape (batch_size, seq_len, vocab_size)
+        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
         results = self._get_forward_output(inputs, logits)
         return results
 
@@ -56,7 +56,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         input_features = [datum_to_input_feature(datum) for datum in inputs]
 
         outputs = super().forward_only(inputs=input_features, **kwargs)
-        logits = outputs['logits']  # shape (batch_size, seq_len, vocab_size)
+        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
         results = self._get_forward_output(inputs, logits)
         return results
 

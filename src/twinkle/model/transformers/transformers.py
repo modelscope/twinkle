@@ -177,8 +177,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
-        # only return logits on cpu for remote call
-        # return {'logits': outputs['logits'].detach().cpu()}  
         return outputs
 
     @remote_function()
@@ -212,8 +210,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
-        # only return logits on cpu for remote call
-        # return {'logits': outputs['logits'].detach().cpu()}
         return outputs
 
     @staticmethod

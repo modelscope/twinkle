@@ -8,7 +8,7 @@ from typing import TypeVar
 import numpy as np
 
 from ..utils import DeviceGroup, DeviceMesh, Platform
-from ..utils import requires, framework_util, check_unsafe, move_to_cpu_detach
+from ..utils import requires, framework_util, check_unsafe
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -530,7 +530,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     logger.info(f'Executing ray function {func.__name__} with args: {args}, kwargs: {kwargs}')
                     result = func(self, *args, **kwargs)
                     logger.info(f'Execution of ray function {func.__name__} completed with result: {result}')
-                    # return move_to_cpu_detach(result)
                     return result
                 else:
                     from ._ray import RayHelper
