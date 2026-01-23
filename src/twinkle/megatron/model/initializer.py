@@ -29,6 +29,7 @@ def _get_transformer_config_fields() -> set:
     return {f.name for f in fields(TransformerConfig)}
 
 
+# TODO: check
 class MegatronModelInitializer:
     """Initialize Megatron-Core models from HuggingFace checkpoints.
 
@@ -231,7 +232,6 @@ class MegatronModelInitializer:
         """
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
-            get_gpt_layer_local_spec,
         )
 
         # Determine if this is a MoE model
@@ -241,7 +241,6 @@ class MegatronModelInitializer:
         multi_latent_attention = getattr(config, 'multi_latent_attention',
                                          False)
 
-        # Try TE (TransformerEngine) layers first for better performance
         try:
             return get_gpt_layer_with_transformer_engine_spec(
                 num_experts=num_experts,
@@ -251,85 +250,3 @@ class MegatronModelInitializer:
             )
         except (ImportError, AttributeError):
             raise RuntimeError("TransformerEngine is not installed or not compatible with this version of Megatron-Core.")
-
-    def load_from_hf(
-        self,
-        model: nn.Module,
-        hf_model_path: str,
-        hf_config: Any,
-    ) -> None:
-        """Load HuggingFace checkpoint into Megatron model.
-
-        Args:
-            model: The Megatron model.
-            hf_model_path: Path to HuggingFace checkpoint or model ID.
-            hf_config: HuggingFace model config.
-        """
-        import os
-
-        # Resolve model path if it's a model ID (not a local path)
-        if not os.path.isdir(hf_model_path):
-            from twinkle.hub import HubOperation
-            hf_model_path = HubOperation.download_model(hf_model_path)
-
-        # Calculate padded vocab size
-        padded_vocab_size = self._pad_vocab_size(hf_config.vocab_size)
-
-        # Use TwinkleBridgeAdapter
-        from .bridge import TwinkleBridgeAdapter
-        adapter = TwinkleBridgeAdapter(
-            hf_config=hf_config,
-            tp_size=self.tp_size,
-            pp_size=self.pp_size,
-            ep_size=self.ep_size,
-            model_path=hf_model_path,
-            padded_vocab_size=padded_vocab_size,
-        )
-        adapter.load_weights(model, hf_model_path)
-
-
-def initialize_megatron_model(
-    hf_model_path: str,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    cp_size: int = 1,
-    ep_size: int = 1,
-    params_dtype: torch.dtype = torch.bfloat16,
-    load_weights: bool = True,
-) -> nn.Module:
-    """Convenience function to initialize Megatron model from HuggingFace checkpoint.
-
-    Args:
-        hf_model_path: Path to HuggingFace checkpoint.
-        tp_size: Tensor parallel size.
-        pp_size: Pipeline parallel size.
-        cp_size: Context parallel size.
-        ep_size: Expert parallel size.
-        params_dtype: Parameter data type.
-        load_weights: Whether to load weights.
-
-    Returns:
-        Initialized Megatron model.
-    """
-    from transformers import AutoConfig
-
-    # Load HuggingFace config
-    hf_config = AutoConfig.from_pretrained(hf_model_path)
-
-    # Create initializer
-    initializer = MegatronModelInitializer(
-        tp_size=tp_size,
-        pp_size=pp_size,
-        cp_size=cp_size,
-        ep_size=ep_size,
-        params_dtype=params_dtype,
-    )
-
-    # Create model
-    model = initializer.create_gpt_model(hf_config)
-
-    # Load weights
-    if load_weights:
-        initializer.load_from_hf(model, hf_model_path, hf_config)
-
-    return model

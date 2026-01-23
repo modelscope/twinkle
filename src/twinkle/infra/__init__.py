@@ -106,6 +106,14 @@ def is_master():
             return True
     return False
 
+def is_last_rank():
+    if _mode == 'ray':
+        if 'TWINKLE_MODE' in os.environ:
+            return True
+    elif _mode == 'local':
+        if Platform.is_last_rank():
+            return True
+    return False
 
 def get_device_placement(device_group=None) -> str:
     """Get the device placement graph, can be used to show the training topology.

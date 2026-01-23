@@ -1,13 +1,8 @@
 # Copyright (c) twinkle authors. All rights reserved.
 # GPT Bridge for HuggingFace to Megatron-Core weight conversion.
-import glob
-import json
-import math
 import os
 from copy import copy
-from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
+from typing import Any, Generator, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -16,403 +11,73 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from twinkle.hub import HubOperation
+from twinkle.utils import SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr
+from twinkle.utils.platform import Platform
+from twinkle.infra import is_last_rank
+from twinkle.megatron.args import get_args, set_args, TwinkleArgs
 
 try:
-    from megatron.core import parallel_state as mpu
+    from megatron.core import mpu
     MEGATRON_AVAILABLE = True
 except ImportError:
     MEGATRON_AVAILABLE = False
     mpu = None
 
-try:
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-    SAFETENSORS_AVAILABLE = True
-except ImportError:
-    SAFETENSORS_AVAILABLE = False
-
-
-def deep_getattr(obj, attr: str, default=None):
-    """Get nested attribute from object using dot notation."""
-    try:
-        for key in attr.split('.'):
-            obj = getattr(obj, key)
-        return obj
-    except AttributeError:
-        return default
-
-
-def is_last_rank() -> bool:
-    """Check if current process is the last rank for writing.
-
-    For DP > 1, we want only DP rank 0 to write to avoid conflicts.
-    For PP, we want the last PP stage.
-    For TP, all TP ranks participate in gather, but only one writes.
-    """
-    if not dist.is_initialized():
-        return True
-
-    try:
-        from megatron.core import parallel_state as mpu
-        if mpu.is_initialized():
-            # Only DP rank 0 writes
-            dp_rank = mpu.get_data_parallel_rank()
-            if dp_rank != 0:
-                return False
-            # For PP, only last stage needs to write certain weights
-            # (handled separately in export_weights)
-            return True
-    except (ImportError, AssertionError):
-        pass
-
-    return dist.get_rank() == dist.get_world_size() - 1
-
-
-class LazyTensor:
-    """Lazy tensor wrapper for deferred loading."""
-    def __init__(self, loader, key: str):
-        self._loader = loader
-        self._key = key
-
-    def load(self) -> torch.Tensor:
-        """Load the tensor."""
-        return self._loader.get_tensor(self._key)
-
-
-class SafetensorLoader:
-    """Lazy loader for safetensor files."""
-    def __init__(self, model_dir: str, is_peft_format: bool = False):
-        self.model_dir = model_dir
-        self.is_peft_format = is_peft_format
-        self._handles = {}
-        self._index = None
-        self._key_to_file = {}
-        self._load_index()
-
-    def _load_index(self):
-        """Load safetensor index file if exists."""
-        # Try adapter format first for PEFT
-        if self.is_peft_format:
-            adapter_file = os.path.join(self.model_dir,
-                                        'adapter_model.safetensors')
-            if os.path.exists(adapter_file):
-                handle = safe_open(adapter_file, framework='pt', device='cpu')
-                for key in handle.keys():
-                    self._key_to_file[key] = adapter_file
-                self._handles[adapter_file] = handle
-                return
-
-        # Standard index file
-        index_file = os.path.join(self.model_dir,
-                                  'model.safetensors.index.json')
-        if os.path.exists(index_file):
-            with open(index_file, 'r') as f:
-                self._index = json.load(f)
-            for key, filename in self._index['weight_map'].items():
-                self._key_to_file[key] = os.path.join(self.model_dir, filename)
-        else:
-            # Single file model
-            single_file = os.path.join(self.model_dir, 'model.safetensors')
-            if os.path.exists(single_file):
-                handle = safe_open(single_file, framework='pt', device='cpu')
-                for key in handle.keys():
-                    self._key_to_file[key] = single_file
-                self._handles[single_file] = handle
-            else:
-                # Try to find any safetensor file
-                files = glob.glob(os.path.join(self.model_dir,
-                                               '*.safetensors'))
-                for filepath in files:
-                    handle = safe_open(filepath, framework='pt', device='cpu')
-                    for key in handle.keys():
-                        self._key_to_file[key] = filepath
-                    self._handles[filepath] = handle
-
-    def _get_handle(self, filepath: str):
-        """Get or create file handle."""
-        if filepath not in self._handles:
-            self._handles[filepath] = safe_open(filepath,
-                                                framework='pt',
-                                                device='cpu')
-        return self._handles[filepath]
-
-    def get_tensor(self, key: str) -> torch.Tensor:
-        """Load a single tensor."""
-        filepath = self._key_to_file.get(key)
-        if filepath is None:
-            raise KeyError(f'Tensor key not found: {key}')
-        handle = self._get_handle(filepath)
-        return handle.get_tensor(key)
-
-    def get_lazy(self, key: str) -> LazyTensor:
-        """Get a lazy tensor reference."""
-        if key not in self._key_to_file:
-            raise KeyError(f'Tensor key not found: {key}')
-        return LazyTensor(self, key)
-
-    def get_state_dict(self) -> Dict[str, LazyTensor]:
-        """Get lazy state dict."""
-        return {key: LazyTensor(self, key) for key in self._key_to_file}
-
-    def keys(self) -> List[str]:
-        """Get all tensor keys."""
-        return list(self._key_to_file.keys())
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._key_to_file
-
-    def close(self):
-        """Close all file handles."""
-        self._handles.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-
-class StreamingSafetensorSaver:
-    """Streaming saver for safetensor files."""
-    def __init__(self,
-                 save_dir: str,
-                 max_shard_size: str = '5GB',
-                 is_peft_format: bool = False):
-        self.save_dir = save_dir
-        self.is_peft_format = is_peft_format
-        os.makedirs(save_dir, exist_ok=True)
-
-        # Parse max shard size
-        size_str = max_shard_size.upper()
-        if size_str.endswith('GB'):
-            self.max_shard_bytes = int(float(size_str[:-2]) * 1024**3)
-        elif size_str.endswith('MB'):
-            self.max_shard_bytes = int(float(size_str[:-2]) * 1024**2)
-        else:
-            self.max_shard_bytes = int(size_str)
-
-        self.current_shard = {}
-        self.current_shard_size = 0
-        self.shard_idx = 1
-        self.weight_map = {}
-
-    def add_tensor(self, key: str, tensor: torch.Tensor):
-        """Add tensor to the current shard."""
-        if tensor is None:
-            return
-
-        tensor_size = tensor.numel() * tensor.element_size()
-
-        # Flush if needed
-        if self.current_shard_size + tensor_size > self.max_shard_bytes and self.current_shard:
-            self._flush_shard()
-
-        self.current_shard[key] = tensor.contiguous()
-        self.current_shard_size += tensor_size
-
-    def _flush_shard(self):
-        """Flush current shard to disk."""
-        if not self.current_shard:
-            return
-
-        if self.is_peft_format:
-            filename = 'adapter_model.safetensors'
-        else:
-            filename = f'model-{self.shard_idx:05d}-of-XXXXX.safetensors'
-
-        filepath = os.path.join(self.save_dir, filename)
-        save_file(self.current_shard, filepath)
-
-        for key in self.current_shard:
-            self.weight_map[key] = filename
-
-        self.current_shard = {}
-        self.current_shard_size = 0
-        self.shard_idx += 1
-
-    def finalize(self):
-        """Finalize and write index."""
-        self._flush_shard()
-
-        if self.is_peft_format:
-            return  # PEFT format doesn't need index
-
-        # Fix shard filenames
-        total_shards = self.shard_idx - 1
-        if total_shards == 0:
-            return
-
-        for old_name in list(self.weight_map.values()):
-            new_name = old_name.replace('XXXXX', f'{total_shards:05d}')
-            if old_name != new_name:
-                old_path = os.path.join(self.save_dir, old_name)
-                new_path = os.path.join(self.save_dir, new_name)
-                if os.path.exists(old_path):
-                    os.rename(old_path, new_path)
-                for key in self.weight_map:
-                    if self.weight_map[key] == old_name:
-                        self.weight_map[key] = new_name
-
-        if total_shards > 1:
-            index = {
-                'metadata': {
-                    'total_size':
-                    sum(t.numel() * t.element_size()
-                        for t in self.current_shard.values())
-                },
-                'weight_map': self.weight_map
-            }
-            with open(
-                    os.path.join(self.save_dir,
-                                 'model.safetensors.index.json'), 'w') as f:
-                json.dump(index, f, indent=2)
-
-
-@dataclass
-class BridgeConfig:
-    """Configuration for GPTBridge."""
-    # Parallelism
-    tp_size: int = 1
-    pp_size: int = 1
-    ep_size: int = 1
-    etp_size: int = 1
-
-    # Model architecture
-    hidden_size: int = 4096
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    num_layers: int = 32
-    vocab_size: int = 32000
-    padded_vocab_size: int = 32000
-    intermediate_size: int = 11008
-    kv_channels: int = None  # head_dim, if None will be computed from hidden_size // num_attention_heads
-
-    # Options
-    add_qkv_bias: bool = False
-    add_bias_linear: bool = False
-    qk_layernorm: bool = False
-    tie_word_embeddings: bool = False
-
-    # MoE
-    num_experts: int = 0
-    num_experts_per_tok: int = 2
-    shared_expert_intermediate_size: int = 0
-
-    model_type: str = 'qwen2'
-    max_shard_size: str = '5GB'
-
-    @classmethod
-    def from_hf_config(
-        cls,
-        hf_config: Any,
-        tp_size: int = 1,
-        pp_size: int = 1,
-        ep_size: int = 1,
-        padded_vocab_size: Optional[int] = None,
-    ) -> 'BridgeConfig':
-        """Create BridgeConfig from HuggingFace config."""
-        vocab_size = getattr(hf_config, 'vocab_size', 32000)
-        if padded_vocab_size is None:
-            padded_vocab_size = vocab_size
-            # Pad to multiple of 64 for efficiency
-            if padded_vocab_size % 64 != 0:
-                padded_vocab_size = ((padded_vocab_size // 64) + 1) * 64
-
-        num_attention_heads = getattr(hf_config, 'num_attention_heads', 32)
-        num_key_value_heads = getattr(hf_config, 'num_key_value_heads',
-                                      num_attention_heads)
-
-        # MoE config
-        num_experts = getattr(hf_config, 'num_experts', 0) or \
-                      getattr(hf_config, 'n_routed_experts', 0) or \
-                      getattr(hf_config, 'num_local_experts', 0)
-        num_experts_per_tok = getattr(hf_config, 'num_experts_per_tok', 2) or \
-                              getattr(hf_config, 'moe_topk', 2)
-        shared_expert_size = getattr(hf_config,
-                                     'shared_expert_intermediate_size', 0)
-
-        # Determine QKV bias setting
-        # Qwen2 has attention bias by default (hardcoded in transformers),
-        # but config doesn't have 'attention_bias' field
-        model_type = getattr(hf_config, 'model_type', 'qwen2')
-        if hasattr(hf_config, 'attention_bias'):
-            add_qkv_bias = hf_config.attention_bias
-        elif model_type in ('qwen2', 'qwen2_5'):
-            # Qwen2/Qwen2.5 uses bias=True for Q, K, V projections
-            add_qkv_bias = True
-        else:
-            add_qkv_bias = False
-
-        # Determine QK layernorm setting
-        # Qwen3 uses QK layernorm but doesn't have explicit config attribute
-        qk_layernorm = getattr(hf_config, 'qk_layernorm', False) or \
-                       getattr(hf_config, 'use_qk_norm', False)
-        if not qk_layernorm and model_type in ('qwen3', 'qwen3_moe'):
-            # Qwen3 (dense and MoE) always uses QK layernorm (q_norm, k_norm weights)
-            qk_layernorm = True
-
-        # Determine kv_channels (head_dim) - Qwen3 has explicit head_dim
-        kv_channels = getattr(hf_config, 'head_dim', None)
-
-        return cls(
-            tp_size=tp_size,
-            pp_size=pp_size,
-            ep_size=ep_size,
-            etp_size=tp_size,
-            hidden_size=getattr(hf_config, 'hidden_size', 4096),
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            num_layers=getattr(hf_config, 'num_hidden_layers', 32),
-            vocab_size=vocab_size,
-            padded_vocab_size=padded_vocab_size,
-            intermediate_size=getattr(hf_config, 'intermediate_size', 11008),
-            add_qkv_bias=add_qkv_bias,
-            add_bias_linear=getattr(hf_config, 'mlp_bias', False),
-            qk_layernorm=qk_layernorm,
-            tie_word_embeddings=getattr(hf_config, 'tie_word_embeddings',
-                                        False),
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            shared_expert_intermediate_size=shared_expert_size,
-            model_type=model_type,
-            kv_channels=kv_channels,  # Explicit head_dim for Qwen3
-        )
-
-
+# deprecated
 class TwinkleGPTBridge:
-    """Bridge for converting weights between HuggingFace and Megatron-Core formats.
-
-    Supports Qwen2.5 / Qwen3 model families.
+    """GPT Bridge for HuggingFace to Megatron-Core weight conversion.
+    
+    Uses global get_args() for configuration. The args should be set before
+    creating the bridge instance via set_args(TwinkleArgs.from_hf_config(...)).
     """
-
-    # HuggingFace model structure constants (Qwen2/Qwen3 compatible)
+    # HuggingFace model structure constants
+    # LLM models
     HF_LAYERS_PREFIX = 'model.layers'
     HF_EMBED_KEY = 'model.embed_tokens.weight'
     HF_FINAL_LAYERNORM_KEY = 'model.norm.weight'
     HF_LM_HEAD_KEY = 'lm_head.weight'
+    
+    # MLLMs - language model is nested
+    HF_VL_LAYERS_PREFIX = 'model.language_model.layers'
+    HF_VL_EMBED_KEY = 'model.language_model.embed_tokens.weight'
+    HF_VL_FINAL_LAYERNORM_KEY = 'model.language_model.norm.weight'
+    HF_VL_LM_HEAD_KEY = 'model.language_model.lm_head.weight'
 
     def __init__(self,
-                 config: BridgeConfig,
                  hf_config: Any = None,
                  disable_tqdm: bool = False):
         """Initialize the bridge.
 
         Args:
-            config: Bridge configuration.
-            hf_config: HuggingFace model config (for reference).
+            hf_config: HuggingFace model config (for VL model detection).
             disable_tqdm: Whether to disable progress bar.
         """
-        self.config = config
+        # Get configuration from global args
+        args = get_args()
+        self.args = args
         self.hf_config = hf_config
         self.disable_tqdm = disable_tqdm or not is_last_rank()
+        
+        # Detect VL model for correct weight prefixes
+        self._is_vl_model = args.is_multimodal
+        if self._is_vl_model:
+            self._layers_prefix = self.HF_VL_LAYERS_PREFIX
+            self._embed_key = self.HF_VL_EMBED_KEY
+            self._final_layernorm_key = self.HF_VL_FINAL_LAYERNORM_KEY
+            self._lm_head_key = self.HF_VL_LM_HEAD_KEY
+        else:
+            self._layers_prefix = self.HF_LAYERS_PREFIX
+            self._embed_key = self.HF_EMBED_KEY
+            self._final_layernorm_key = self.HF_FINAL_LAYERNORM_KEY
+            self._lm_head_key = self.HF_LM_HEAD_KEY
 
-        # Parallel state
-        self.tp_size = config.tp_size
-        self.pp_size = config.pp_size
-        self.ep_size = config.ep_size
-        self.etp_size = config.etp_size
+        # Parallel state from args
+        self.tp_size = args.tp_size
+        self.pp_size = args.pp_size
+        self.ep_size = args.ep_size
+        self.etp_size = args.etp_size
 
-        # Get parallel ranks
+        # Get parallel ranks from Megatron
         if MEGATRON_AVAILABLE and mpu.is_initialized():
             self.tp_rank = mpu.get_tensor_model_parallel_rank()
             self.pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -429,14 +94,7 @@ class TwinkleGPTBridge:
                 self.etp_rank = 0
                 self.etp_group = None
         else:
-            self.tp_rank = 0
-            self.pp_rank = 0
-            self.tp_group = None
-            self.pp_group = None
-            self.ep_rank = 0
-            self.ep_group = None
-            self.etp_rank = 0
-            self.etp_group = None
+            raise ValueError("Megatron is not initialized. Please initialize megatron first.")
 
         # PEFT tracking
         self._is_peft_format = False
@@ -445,7 +103,7 @@ class TwinkleGPTBridge:
         self._peft_modules_to_save: Set[str] = set()
         self._target_device = None
         self._only_last_rank = False
-
+    
     def _get_tp_split_dim(self, mg_key: Optional[str]) -> Optional[int]:
         """Determine which dimension to split for tensor parallelism."""
         if mg_key is None:
@@ -583,64 +241,64 @@ class TwinkleGPTBridge:
     # Weight Loading Methods
     # =========================================================================
 
-    def _load_embedding(self, mg_model, loader: SafetensorLoader):
+    def _load_embedding(self, mg_model, loader: SafetensorLazyLoader):
         """Load embedding weights."""
         embed_module = deep_getattr(mg_model, 'embedding.word_embeddings')
         if embed_module is None:
             return
 
-        hf_weight = loader.get_tensor(self.HF_EMBED_KEY)
+        hf_weight = loader.get_tensor(self._embed_key)
 
         # Pad vocabulary if needed
-        if hf_weight.shape[0] < self.config.padded_vocab_size:
+        if hf_weight.shape[0] < self.args.padded_vocab_size:
             hf_weight = F.pad(
                 hf_weight,
-                (0, 0, 0, self.config.padded_vocab_size - hf_weight.shape[0]))
+                (0, 0, 0, self.args.padded_vocab_size - hf_weight.shape[0]))
 
         self._set_weight(embed_module.weight, hf_weight,
                          'word_embeddings.weight')
 
-    def _load_output_layer(self, mg_model, loader: SafetensorLoader):
+    def _load_output_layer(self, mg_model, loader: SafetensorLazyLoader):
         """Load output layer (lm_head) weights."""
         output_module = deep_getattr(mg_model, 'output_layer')
         if output_module is None or output_module.weight is None:
             return
 
         # Check if weights are tied
-        if self.config.tie_word_embeddings:
-            hf_weight = loader.get_tensor(self.HF_EMBED_KEY)
+        if self.args.tie_word_embeddings:
+            hf_weight = loader.get_tensor(self._embed_key)
         else:
-            hf_weight = loader.get_tensor(self.HF_LM_HEAD_KEY)
+            hf_weight = loader.get_tensor(self._lm_head_key)
 
         # Pad vocabulary if needed
-        if hf_weight.shape[0] < self.config.padded_vocab_size:
+        if hf_weight.shape[0] < self.args.padded_vocab_size:
             hf_weight = F.pad(
                 hf_weight,
-                (0, 0, 0, self.config.padded_vocab_size - hf_weight.shape[0]))
+                (0, 0, 0, self.args.padded_vocab_size - hf_weight.shape[0]))
 
         self._set_weight(output_module.weight, hf_weight,
                          'output_layer.weight')
 
-    def _load_final_layernorm(self, mg_model, loader: SafetensorLoader):
+    def _load_final_layernorm(self, mg_model, loader: SafetensorLazyLoader):
         """Load final layer norm weights."""
         ln_module = deep_getattr(mg_model, 'decoder.final_layernorm')
         if ln_module is None:
             return
 
-        hf_weight = loader.get_tensor(self.HF_FINAL_LAYERNORM_KEY)
+        hf_weight = loader.get_tensor(self._final_layernorm_key)
         ln_module.weight.data.copy_(hf_weight)
 
-    def _load_attention(self, mg_layer, loader: SafetensorLoader,
+    def _load_attention(self, mg_layer, loader: SafetensorLazyLoader,
                         layer_idx: int):
         """Load attention layer weights."""
         mg_attn = mg_layer.self_attention
-        prefix = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.self_attn.'
+        prefix = f'{self._layers_prefix}.{layer_idx}.self_attn.'
 
-        num_heads = self.config.num_attention_heads
-        num_kv_heads = self.config.num_key_value_heads
-        hidden_size = self.config.hidden_size
+        num_heads = self.args.num_attention_heads
+        num_kv_heads = self.args.num_key_value_heads
+        hidden_size = self.args.hidden_size
         # Use kv_channels (head_dim) from config if available (for Qwen3 etc.)
-        head_dim = getattr(self.config, 'kv_channels',
+        head_dim = getattr(self.args, 'kv_channels',
                            hidden_size // num_heads)
         heads_per_group = num_heads // num_kv_heads
 
@@ -672,7 +330,7 @@ class TwinkleGPTBridge:
                          'linear_proj.weight')
 
         # Load biases if present
-        if self.config.add_qkv_bias:
+        if self.args.add_qkv_bias:
             try:
                 q_bias = loader.get_tensor(f'{prefix}q_proj.bias')
                 k_bias = loader.get_tensor(f'{prefix}k_proj.bias')
@@ -694,7 +352,7 @@ class TwinkleGPTBridge:
                 pass
 
         # Load input layernorm (may be fused)
-        ln_key = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.input_layernorm.weight'
+        ln_key = f'{self._layers_prefix}.{layer_idx}.input_layernorm.weight'
         ln_weight = loader.get_tensor(ln_key)
 
         ln_param = deep_getattr(mg_attn, 'linear_qkv.layer_norm_weight')
@@ -706,7 +364,7 @@ class TwinkleGPTBridge:
                 ln_module.weight.data.copy_(ln_weight)
 
         # QK layernorm (Qwen3)
-        if self.config.qk_layernorm:
+        if self.args.qk_layernorm:
             try:
                 q_norm = loader.get_tensor(f'{prefix}q_norm.weight')
                 k_norm = loader.get_tensor(f'{prefix}k_norm.weight')
@@ -719,10 +377,10 @@ class TwinkleGPTBridge:
             except KeyError:
                 pass
 
-    def _load_mlp(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_mlp(self, mg_layer, loader: SafetensorLazyLoader, layer_idx: int):
         """Load MLP layer weights."""
         mg_mlp = mg_layer.mlp
-        prefix = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.mlp.'
+        prefix = f'{self._layers_prefix}.{layer_idx}.mlp.'
 
         # Check if gate_up_proj is fused
         try:
@@ -754,7 +412,7 @@ class TwinkleGPTBridge:
             pass
 
         # Load post attention layernorm
-        ln_key = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.post_attention_layernorm.weight'
+        ln_key = f'{self._layers_prefix}.{layer_idx}.post_attention_layernorm.weight'
         try:
             ln_weight = loader.get_tensor(ln_key)
 
@@ -768,7 +426,7 @@ class TwinkleGPTBridge:
         except KeyError:
             pass
 
-    def _load_moe(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_moe(self, mg_layer, loader: SafetensorLazyLoader, layer_idx: int):
         """Load MoE layer weights.
 
         Handles Expert Parallel (EP) sharding - each EP rank loads only its
@@ -779,7 +437,7 @@ class TwinkleGPTBridge:
           - EP rank 1 loads experts 64-127
         """
         mg_mlp = mg_layer.mlp
-        prefix = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.mlp.'
+        prefix = f'{self._layers_prefix}.{layer_idx}.mlp.'
 
         # Load router (replicated across all ranks)
         try:
@@ -816,7 +474,7 @@ class TwinkleGPTBridge:
             pass
 
         # Load shared experts if present
-        if self.config.shared_expert_intermediate_size > 0:
+        if self.args.shared_expert_intermediate_size > 0:
             for shared_key in [
                     'shared_expert', 'shared_experts', 'shared_mlp'
             ]:
@@ -855,7 +513,7 @@ class TwinkleGPTBridge:
                         continue
 
         # Load experts with EP sharding
-        num_local_experts = self.config.num_experts // self.ep_size
+        num_local_experts = self.args.num_experts // self.ep_size
         start_expert_idx = self.ep_rank * num_local_experts
         experts_module = deep_getattr(mg_mlp, 'experts')
 
@@ -989,7 +647,7 @@ class TwinkleGPTBridge:
                         continue
 
         # Load post attention layernorm (pre_mlp_layernorm for MoE)
-        ln_key = f'{self.HF_LAYERS_PREFIX}.{layer_idx}.post_attention_layernorm.weight'
+        ln_key = f'{self._layers_prefix}.{layer_idx}.post_attention_layernorm.weight'
         try:
             ln_weight = loader.get_tensor(ln_key)
             # Try pre_mlp_layernorm first (used in MoE layers)
@@ -1004,12 +662,12 @@ class TwinkleGPTBridge:
         except KeyError:
             pass
 
-    def _load_layer(self, mg_layer, loader: SafetensorLoader, layer_idx: int):
+    def _load_layer(self, mg_layer, loader: SafetensorLazyLoader, layer_idx: int):
         """Load a single transformer layer."""
         self._load_attention(mg_layer, loader, layer_idx)
 
         # Check if MoE layer
-        if self.config.num_experts > 0:
+        if self.args.num_experts > 0:
             self._load_moe(mg_layer, loader, layer_idx)
         else:
             self._load_mlp(mg_layer, loader, layer_idx)
@@ -1033,15 +691,14 @@ class TwinkleGPTBridge:
         self._adapter_name = adapter_name
 
         with torch.no_grad():
-            with SafetensorLoader(model_path,
-                                  is_peft_format=is_peft_format) as loader:
+            with SafetensorLazyLoader(model_path, is_peft_format=is_peft_format) as loader:
                 if is_peft_format:
                     self._load_peft_weights(mg_model, loader)
                 else:
                     self._load_base_weights(mg_model, loader)
 
     def _load_base_weights(self, mg_model: nn.Module,
-                           loader: SafetensorLoader):
+                           loader: SafetensorLazyLoader):
         """Load base model weights."""
         # Get decoder
         decoder = deep_getattr(mg_model, 'decoder')
@@ -1077,7 +734,7 @@ class TwinkleGPTBridge:
                 print(f'Warning: Failed to load post-process: {e}')
 
     def _load_peft_weights(self, mg_model: nn.Module,
-                           loader: SafetensorLoader):
+                           loader: SafetensorLazyLoader):
         """Load PEFT/LoRA adapter weights."""
         state_dict = loader.get_state_dict()
         hf_prefix = 'base_model.model.' if self._is_peft_format else ''
@@ -1205,8 +862,8 @@ class TwinkleGPTBridge:
                         weight, _ = self._get_weight(embed.data,
                                                      'word_embeddings.weight')
                         if weight is not None:
-                            weight = weight[:self.config.vocab_size]
-                            yield f'{hf_prefix}{self.HF_EMBED_KEY}', weight
+                            weight = weight[:self.args.vocab_size]
+                            yield f'{hf_prefix}{self._embed_key}', weight
 
             # Export layers
             prog_bar = tqdm(layers, desc=tqdm_desc, disable=self.disable_tqdm)
@@ -1221,7 +878,7 @@ class TwinkleGPTBridge:
                     ln_module = deep_getattr(mg_model,
                                              'decoder.final_layernorm')
                     if ln_module is not None:
-                        yield f'{hf_prefix}{self.HF_FINAL_LAYERNORM_KEY}', ln_module.weight.data.clone(
+                        yield f'{hf_prefix}{self._final_layernorm_key}', ln_module.weight.data.clone(
                         )
 
                     output = deep_getattr(mg_model, 'output_layer.weight')
@@ -1229,8 +886,8 @@ class TwinkleGPTBridge:
                         weight, _ = self._get_weight(output.data,
                                                      'output_layer.weight')
                         if weight is not None:
-                            weight = weight[:self.config.vocab_size]
-                            yield f'{hf_prefix}{self.HF_LM_HEAD_KEY}', weight
+                            weight = weight[:self.args.vocab_size]
+                            yield f'{hf_prefix}{self._lm_head_key}', weight
 
     def _export_layer(
         self,
@@ -1240,14 +897,14 @@ class TwinkleGPTBridge:
         is_peft_format: bool,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Export a single layer."""
-        prefix = f'{hf_prefix}{self.HF_LAYERS_PREFIX}.{layer_idx}.'
+        prefix = f'{hf_prefix}{self._layers_prefix}.{layer_idx}.'
 
         mg_attn = mg_layer.self_attention
         mg_mlp = mg_layer.mlp
 
-        num_heads = self.config.num_attention_heads
-        num_kv_heads = self.config.num_key_value_heads
-        hidden_size = self.config.hidden_size
+        num_heads = self.args.num_attention_heads
+        num_kv_heads = self.args.num_key_value_heads
+        hidden_size = self.args.hidden_size
         head_dim = hidden_size // num_heads
         heads_per_group = num_heads // num_kv_heads
         q_dim = heads_per_group * head_dim
@@ -1339,9 +996,9 @@ class TwinkleGPTBridge:
                         yield f'{prefix}self_attn.{key}.lora_A.weight', lora_A.clone(
                         )
 
-                    num_kv_heads = self.config.num_key_value_heads
-                    head_dim = self.config.hidden_size // self.config.num_attention_heads
-                    heads_per_group = self.config.num_attention_heads // num_kv_heads
+                    num_kv_heads = self.args.num_key_value_heads
+                    head_dim = self.args.hidden_size // self.args.num_attention_heads
+                    heads_per_group = self.args.num_attention_heads // num_kv_heads
                     q_dim = heads_per_group * head_dim
 
                     lora_B = lora_B.reshape(num_kv_heads, -1, lora_B.shape[-1])
@@ -1453,7 +1110,7 @@ class TwinkleGPTBridge:
         if should_write:
             saver = StreamingSafetensorSaver(
                 save_dir=output_dir,
-                max_shard_size=self.config.max_shard_size,
+                max_shard_size=self.args.max_shard_size,
                 is_peft_format=is_peft_format,
             )
 
@@ -1487,7 +1144,10 @@ class TwinkleGPTBridge:
                     peft_config.save_pretrained(output_dir)
             elif not is_peft_format and self.hf_config is not None:
                 # Save HF config
-                self.hf_config.vocab_size = self.config.padded_vocab_size
+                if hasattr(self.hf_config, 'text_config') and hasattr(self.hf_config.text_config, 'vocab_size'):
+                    self.hf_config.text_config.vocab_size = self.args.padded_vocab_size
+                if hasattr(self.hf_config, 'vocab_size'):
+                    self.hf_config.vocab_size = self.args.padded_vocab_size
                 self.hf_config.save_pretrained(output_dir)
 
         # Synchronize all ranks before continuing
@@ -1515,26 +1175,25 @@ class TwinkleBridgeAdapter:
         self.hf_config = hf_config
         self.model_path = model_path
 
-        # Create bridge config
-        self.config = BridgeConfig.from_hf_config(
+        # Create and set global args
+        etp_size = etp_size or tp_size
+        args = TwinkleArgs.from_hf_config(
             hf_config=hf_config,
+            model_dir=model_path or '',
             tp_size=tp_size,
             pp_size=pp_size,
             ep_size=ep_size,
+            etp_size=etp_size,
             padded_vocab_size=padded_vocab_size,
         )
-        if etp_size is not None:
-            self.config.etp_size = etp_size
-
+        set_args(args)
+        self.args = args
         self._bridge = None
 
     def _get_bridge(self) -> TwinkleGPTBridge:
         """Get or create the bridge instance."""
         if self._bridge is None:
-            self._bridge = TwinkleGPTBridge(
-                config=self.config,
-                hf_config=self.hf_config,
-            )
+            self._bridge = TwinkleGPTBridge(hf_config=self.hf_config)
         return self._bridge
 
     def load_weights(
@@ -1955,6 +1614,38 @@ class TwinkleBridgeInitializer:
         divisor = self.tp_size * 128
         return ((vocab_size + divisor - 1) // divisor) * divisor
 
+    def _get_vocab_size(self, hf_config) -> int:
+        """Get vocab size from HuggingFace config.
+
+        Handles both regular LLM configs and multimodal configs where
+        vocab_size might be in text_config sub-config.
+
+        Args:
+            hf_config: HuggingFace model config.
+
+        Returns:
+            Vocabulary size.
+        """
+        # Try direct vocab_size first
+        if hasattr(hf_config, 'vocab_size') and hf_config.vocab_size is not None:
+            return hf_config.vocab_size
+
+        # For multimodal models like Qwen3-VL, vocab_size is in text_config
+        if hasattr(hf_config, 'text_config') and hasattr(hf_config.text_config, 'vocab_size'):
+            return hf_config.text_config.vocab_size
+
+        # Fallback for other multimodal configs
+        for attr in ['llm_config', 'language_config', 'lm_config']:
+            if hasattr(hf_config, attr):
+                sub_config = getattr(hf_config, attr)
+                if hasattr(sub_config, 'vocab_size'):
+                    return sub_config.vocab_size
+
+        raise ValueError(
+            f'Cannot find vocab_size in config of type {type(hf_config).__name__}. '
+            'Please check the config structure or add support for this model type.'
+        )
+
     def create_model(
         self,
         model_path: str,
@@ -1983,7 +1674,25 @@ class TwinkleBridgeInitializer:
         self._initialize_megatron(self._hf_config)
 
         # Calculate padded vocab size
-        padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
+        vocab_size = self._get_vocab_size(self._hf_config)
+        padded_vocab_size = self._pad_vocab_size(vocab_size)
+        
+        args = get_args()
+        if args is None:
+            args = TwinkleArgs.from_hf_config(
+                hf_config=self._hf_config,
+                model_dir=model_path,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                cp_size=self.cp_size,
+                ep_size=self.ep_size,
+                etp_size=self.etp_size,
+                sequence_parallel=self.sequence_parallel,
+                torch_dtype=self.params_dtype,
+                padded_vocab_size=padded_vocab_size,
+            )
+            set_args(args)
+        self._args = args
 
         # Create model
         self._model = self._create_model_from_config(self._hf_config,
@@ -2031,7 +1740,8 @@ class TwinkleBridgeInitializer:
         if self._bridge is None and self._hf_config is None:
             raise ValueError('Must call create_model first')
 
-        padded_vocab_size = self._pad_vocab_size(self._hf_config.vocab_size)
+        vocab_size = self._get_vocab_size(self._hf_config)
+        padded_vocab_size = self._pad_vocab_size(vocab_size)
         bridge_adapter = TwinkleBridgeAdapter(
             hf_config=self._hf_config,
             tp_size=self.tp_size,
@@ -2063,32 +1773,6 @@ class TwinkleBridgeInitializer:
                                   output_dir,
                                   is_peft_format=is_peft_format)
 
-
-# Legacy functions for backward compatibility
-def create_megatron_args(*args, **kwargs) -> SimpleNamespace:
-    """Legacy function - use BridgeConfig instead."""
-    return SimpleNamespace(**kwargs)
-
-
-def set_megatron_args(args: SimpleNamespace) -> None:
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    pass
-
-
-def restore_megatron_args() -> None:
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    pass
-
-
-def mock_megatron_args(args: SimpleNamespace):
-    """Legacy function - no longer needed with TwinkleGPTBridge."""
-    from contextlib import contextmanager
-
-    @contextmanager
-    def noop():
-        yield args
-
-    return noop()
 
 
 def load_hf_weights_to_megatron(

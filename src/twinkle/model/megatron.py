@@ -116,8 +116,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         use_distributed_optimizer: bool = True,
         load_weights: bool = True,
-        use_megatron_bridge:
-        bool = True,  # Use bridge-based initialization (recommended)
         recompute_granularity: Optional[
             str] = 'selective',  # Activation checkpointing
         recompute_modules: Optional[list] = None,  # Modules to recompute
@@ -129,7 +127,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.model_id = pretrained_model_name_or_path
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.use_megatron_bridge = use_megatron_bridge
         self.recompute_granularity = recompute_granularity
         self.recompute_modules = recompute_modules
 
@@ -150,10 +147,6 @@ class MegatronModel(TwinkleModel, nn.Module):
             use_distributed_optimizer=use_distributed_optimizer,
             mixed_precision=mixed_precision,
         )
-
-        # Initialize parallel state (skip if using bridge init, as it handles this)
-        if not use_megatron_bridge:
-            self.strategy.initialize()
 
         # Create Megatron model
         self.model = self._create_megatron_model(model_path, load_weights,
@@ -193,15 +186,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         elif self.mixed_precision == 'no':
             params_dtype = torch.float32
 
-        if self.use_megatron_bridge:
-            # Use bridge-based initialization (recommended)
-            # This ensures all patches are applied and config is correctly generated
-            return self._create_megatron_model_with_bridge(
-                model_path, load_weights, params_dtype, **kwargs)
-        else:
-            # Use twinkle's native initialization
-            return self._create_megatron_model_native(model_path, load_weights,
-                                                      params_dtype, **kwargs)
+        return self._create_megatron_model_with_bridge(
+            model_path, load_weights, params_dtype, **kwargs)
 
     def _create_megatron_model_with_bridge(
         self,
@@ -259,48 +245,6 @@ class MegatronModel(TwinkleModel, nn.Module):
                                            '_transformer_config', None)
 
         # Move to GPU
-        model = self._move_model_to_gpu(model)
-
-        return model
-
-    def _create_megatron_model_native(
-        self,
-        model_path: str,
-        load_weights: bool,
-        params_dtype: torch.dtype,
-        **kwargs,
-    ) -> nn.Module:
-        """Create Megatron model using twinkle's native initialization.
-
-        This is the fallback method when bridge is not available.
-
-        Args:
-            model_path: Path to HuggingFace model.
-            load_weights: Whether to load weights.
-            params_dtype: Parameter dtype.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Megatron model on GPU.
-        """
-        from twinkle.megatron.model.initializer import MegatronModelInitializer
-
-        initializer = MegatronModelInitializer(
-            tp_size=self.strategy.tp_size,
-            pp_size=self.strategy.pp_size,
-            cp_size=self.strategy.cp_size,
-            ep_size=self.strategy.ep_size,
-            sequence_parallel=self.strategy.sequence_parallel,
-            params_dtype=params_dtype,
-        )
-
-        # Create model
-        model = initializer.create_gpt_model(self.hf_config, **kwargs)
-
-        # Load weights
-        if load_weights:
-            initializer.load_from_hf(model, model_path, self.hf_config)
-
         model = self._move_model_to_gpu(model)
 
         return model
