@@ -1,72 +1,78 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import re
-from types import MethodType
-from typing import Union, Callable, Any, List, Optional, Literal
-from ..utils import torch_util, framework_util
-from ..utils import exists
+"""Twinkle Kernel Module - Kernel orchestration layer."""
+from typing import Optional, Union, Any, Dict
+from logging import getLogger
+from .function import apply_function_kernel, register_function_kernel
+from .base import (
+    ModeType,
+    DeviceType,
+    is_kernels_enabled,
+)
+from .layer import register_layer_kernel, apply_layer_kernel, register_layer_batch
+from .registry import (
+    register_external_layer as _register_external_layer,
+)
+
+logger = getLogger(__name__)
 
 
-torch_kernel_mapping = {
-}
+__all__ = [
+    "kernelize_model",
+    "register_layer_kernel",
+    "register_function_kernel",
+    "register_external_layer",
+    "register_kernels",
+]
 
 
-def apply_kernel(module: Any,
-                 mode: Literal['train', 'inference', 'compile', None] = 'train',
-                 kernel: "Optional[Union[str, Callable, 'torch.nn.Module']]"=None,
-                 target_modules: Union[str, List[str]]=None,
-                 device: Optional[Union[str, Any]] = None,
-                ) -> Any:
-    if framework_util.get_framework(module) == 'torch':
-        if torch_util.get_library(module) == 'transformers':
-            if exists('kernels'):
-                from kernels import kernelize, Mode
-                kernel_mode = Mode.TRAINING
-                if mode == 'inference':
-                    kernel_mode = Mode.INFERENCE
-                elif mode == 'compile':
-                    kernel_mode = Mode.TORCH_COMPILE
-                from kernels import kernelize
-                return kernelize(module, mode=kernel_mode, device=device)
+def kernelize_model(
+    model,
+    mode: ModeType = "inference",
+    device: Optional[DeviceType] = None,
+    use_fallback: bool = True,
+) -> Any:
+    """Apply kernels to model (main entry point).
 
-        assert target_modules is not None and kernel is not None
+    Args:
+        model: The PyTorch model to kernelize.
+        mode: The mode for kernel selection ("inference" or "train").
+        device: The device type (auto-detected if None).
+        use_fallback: Whether to use original forward when no compatible kernel found.
+            If False, raises ValueError when kernel is unavailable.
 
-        if torch_util.get_library(module) == 'megatron':
-            ...
+    Returns:
+        The kernelized model.
+    """
+    model = apply_layer_kernel(model, mode=mode, device=device, use_fallback=use_fallback)
 
-        return apply_kernel_torch(module, kernel, target_modules=target_modules)
-    else:
-        raise NotImplementedError(f'Unsupported applying kernels for: {module.__class__}')
+    apply_function_kernel(device=device, mode=mode)
+
+    return model
 
 
-def apply_kernel_torch(module: Any,
-                     kernel: "Optional[Union[str, Callable, 'torch.nn.Module']]",
-                     target_modules: Union[str, List[str]]):
-    if kernel in torch_kernel_mapping:
-        kernel = torch_kernel_mapping[kernel]
-
-    kernel_fn = kernel
-    import torch
-    if isinstance(kernel_fn, torch.nn.Module):
-        kernel_fn = kernel_fn.forward
-
-    if target_modules is None:
-        raise ValueError(f'Module patching needs a valid `target_modules` parameter,'
-                         f'but current is: {target_modules}')
-
-    if isinstance(target_modules, str):
-        pattern = re.compile(target_modules)
-        for name, submodule in module.named_modules():
-            if pattern.search(name):
-                if not hasattr(submodule, '__origin_forward__'):
-                    submodule.__origin_forward__ = submodule.forward
-                    submodule.forward = MethodType(kernel_fn, submodule)
-
-    elif isinstance(target_modules, list):
-        for name, submodule in module.named_modules():
-            if any(name.endswith(target) for target in target_modules):
-                if not hasattr(submodule, '__origin_forward__'):
-                    submodule.__origin_forward__ = submodule.forward
-                    submodule.forward = MethodType(kernel_fn, submodule)
-    return module
+def register_external_layer(layer_class: type, kernel_name: str) -> None:
+    _register_external_layer(layer_class, kernel_name)
 
 
+def register_kernels(config: Dict[str, Dict[str, Any]]) -> None:
+    """Batch register kernels (framework integration API)."""
+    if "layers" in config:
+        for kernel_name, spec in config["layers"].items():
+            device = spec.pop("device", "cuda")
+            register_layer_kernel(kernel_name=kernel_name, device=device, **spec)
+
+    if "functions" in config:
+        from .function import register_function_batch
+
+        functions = config["functions"]
+        if isinstance(functions, dict):
+            function_specs = []
+            for func_name, spec in functions.items():
+                if not isinstance(spec, dict):
+                    raise TypeError(f"Function spec for {func_name} must be a dict.")
+                if "func_name" not in spec:
+                    spec["func_name"] = func_name
+                function_specs.append(spec)
+            register_function_batch(function_specs)
+        else:
+            register_function_batch(functions)
