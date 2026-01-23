@@ -43,7 +43,7 @@ class TwinkleModel:
     def set_lr_scheduler(self, scheduler_cls: Union[LRScheduler, Type[LRScheduler], str], **kwargs):
         ...
 
-    def save(self, name, output_dir, **kwargs):
+    def save(self, name, output_dir, interval=1, **kwargs):
         ...
 
     def get_state_dict(self, **kwargs):

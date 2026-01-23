@@ -60,7 +60,7 @@ class Framework(ABC):
     @staticmethod
     def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):
         import torch
-        output_objects = [None for _ in range(device_mesh.data_parallel_world_size)]
+        output_objects = [None for _ in range(device_mesh.data_world_size)]
         torch.distributed.all_gather_object(output_objects, object, group=process_group)
         _x = []
         for y in output_objects:

@@ -18,6 +18,8 @@ from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 import twinkle
+import twinkle.module.scheduler
+from twinkle import Platform
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
@@ -57,7 +59,7 @@ class OptimizerGroup:
         return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
 
     def __post_init__(self):
-        if self._device_mesh.data_parallel_world_size > 1:
+        if self._device_mesh.data_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
             for metric in self.metrics:
                 metric.process_group = self._dp_group
@@ -305,7 +307,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         scaler = optimizer_config.scaler
 
         context = contextlib.nullcontext
-        if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
+        if self.device_mesh is not None and self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
 
@@ -502,19 +504,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer = optimizer_config.optimizer
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         kwargs['optimizer'] = optimizer
-        scheduler = construct_class(scheduler_cls, LRScheduler, torch.optim.lr_scheduler, **kwargs)
+        scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler], **kwargs)
         optimizer_config.lr_scheduler = scheduler
 
     def __del__(self):
         HubOperation.wait_for()
 
     @remote_function()
-    def save(self, name, output_dir=None, **kwargs):
+    def save(self, name, output_dir=None, interval=1, **kwargs):
         """Save model.
 
         Args:
             name: The name of checkpoint to save.
             output_dir: An output_dir to save the model.
+            interval: Save each interval steps.
             **kwargs:
                 adapter_name: Lora adapter name.
         """
@@ -522,6 +525,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.cur_step % interval != 0:
+            return
         model = self.strategy.unwrap_model(self.model)
         state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
         processed_state_dict = {}
@@ -529,7 +535,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         for key, value in state_dict.items():
             processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
-        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict)
+        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master())
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
         push_to_hub = kwargs.get('push_to_hub', False)
         hub_model_id = kwargs.get('hub_model_id', None)
@@ -546,10 +552,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
-        if template_ins is not None:
-            template_ins.tokenizer.save_pretrained(output_dir)
-        else:
-            self._default_tokenizer.save_pretrained(output_dir)
+        if Platform.is_master():
+            if template_ins is not None:
+                template_ins.tokenizer.save_pretrained(output_dir)
+            else:
+                self._default_tokenizer.save_pretrained(output_dir)
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):

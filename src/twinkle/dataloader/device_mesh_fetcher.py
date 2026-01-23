@@ -51,7 +51,7 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
             data = next(self.dataset_iter)
 
         if self.device_mesh:
-            if len(data) < self.device_mesh.data_parallel_world_size:
+            if len(data) < self.device_mesh.data_world_size:
                 raise StopIteration
             else:
                 data = data[self.device_mesh.get_slice(len(data))]

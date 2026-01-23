@@ -164,15 +164,16 @@ class RayHelper:
         return ip, port
 
     @staticmethod
-    def do_get_and_collect_func(collect_func: Callable, method: Union[Literal['none', 'flatten'], Callable], futures):
+    def do_get_and_collect_func(collect_func: Callable, method: Union[Literal['none', 'flatten'], Callable], futures, device_mesh):
         """Return a callable to collect results in the workers."""
 
         class LazyCollect:
-            def __init__(self, futures, method, collect_func):
+            def __init__(self, futures, method, collect_func, device_mesh):
                 self._futures = futures
                 self._method = method
                 self._collect_func = collect_func
                 self._is_lazy_collect = True
+                self.device_mesh = device_mesh
 
             def __call__(self):
                 result = []
@@ -181,9 +182,9 @@ class RayHelper:
                         result.append(ray.get(future))
                     else:
                         result.append(future)
-                return self._collect_func(self._method, result)
+                return self._collect_func(self._method, result, self.device_mesh)
 
-        return LazyCollect(futures, method, collect_func)
+        return LazyCollect(futures, method, collect_func, device_mesh)
 
     @staticmethod
     def do_get_and_collect(args, kwargs):

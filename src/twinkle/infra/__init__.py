@@ -322,7 +322,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             # TODO this may occurs error when remote calls remote
             # Comment this because remote_class supports `first``
             # assert device_mesh.world_size == len(workers)
-        length = len(workers) if not device_mesh else device_mesh.data_parallel_world_size
+        length = len(workers) if not device_mesh else device_mesh.data_world_size
         length = min(length, len(workers))
         dp_repeat = len(workers) // length
 
