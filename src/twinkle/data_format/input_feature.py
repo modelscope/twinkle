@@ -44,3 +44,11 @@ def to_transformers_dict(feature: InputFeature) -> dict:
         if key in _keys:
             output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
     return output
+
+# -----------------------------------------------------------------------------
+# Compatibility shim: `to_megatron_dict` is required by twinkle.data_format.__init__
+# In this repo version, only transformers format is implemented.
+# -----------------------------------------------------------------------------
+def to_megatron_dict(feature: "InputFeature") -> dict:
+    """Fallback implementation for compatibility."""
+    return to_transformers_dict(feature)

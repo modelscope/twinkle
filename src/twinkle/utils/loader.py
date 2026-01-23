@@ -67,7 +67,7 @@ def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: Mo
     elif isinstance(func, str):
         # Is a subclass name, or a plugin name
         if hasattr(module_T, func):
-            cls = getattr(func, func)
+            cls = getattr(module_T, func)
         else:
             cls = Plugin.load_plugin(func, class_T)
         return cls(**init_args)

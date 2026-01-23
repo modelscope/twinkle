@@ -11,7 +11,11 @@ import torch
 import transformers
 from peft import PeftConfig
 from peft import get_peft_model, PeftModel
-from torch import GradScaler
+try:
+    from torch.cuda.amp import GradScaler
+except Exception:
+    from torch.amp import GradScaler
+
 from torch.optim import Optimizer, AdamW, Adam
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -57,7 +61,14 @@ class OptimizerGroup:
         return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
 
     def __post_init__(self):
-        if self._device_mesh.data_parallel_world_size > 1:
+        # Compatibility: DeviceMesh API differs across versions.
+        if self._device_mesh is None:
+            return
+        dp_world_size = getattr(self._device_mesh, 'data_parallel_world_size', None)
+        if dp_world_size is None:
+            mesh = getattr(self._device_mesh, 'mesh', None)
+            dp_world_size = len(mesh) if mesh is not None else 1
+        if dp_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
             for metric in self.metrics:
                 metric.process_group = self._dp_group
@@ -103,10 +114,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
         super(PreTrainedModel, self).__init__()
+        # Compat: allow HF-style argument name.
+        if model_id is None and "pretrained_model_name_or_path" in kwargs:
+            model_id = kwargs.pop("pretrained_model_name_or_path")
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
-            self.model = model_cls(config, **kwargs)
+            # AutoModel classes should be instantiated via from_config/from_pretrained.
+            if hasattr(model_cls, "from_config"):
+                self.model = model_cls.from_config(config, **kwargs)
+            else:
+                self.model = model_cls(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)

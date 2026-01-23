@@ -244,18 +244,32 @@ assert os.path.isdir(LOCAL_MODEL_PATH), f"LOCAL_MODEL_PATH not found: {LOCAL_MOD
 # -----------------------------------------------------------------------------
 # 1) Goal A: 2 GPUs total
 # -----------------------------------------------------------------------------
-device_groups = [
-    DeviceGroup(name="actor", ranks=[0], device_type="GPU"),
-    DeviceGroup(name="ref",   ranks=[1], device_type="GPU"),
-]
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+ngpu = len([x for x in visible.split(",") if x.strip() != ""]) if visible else torch.cuda.device_count()
+ngpu = max(1, ngpu)
+if ngpu >= 2:
+    device_groups = [
+        DeviceGroup(name="actor", ranks=[0], device_type="GPU"),
+        DeviceGroup(name="ref",   ranks=[1], device_type="GPU"),
+    ]
+else:
+    device_groups = [
+        DeviceGroup(name="actor", ranks=[0], device_type="GPU"),
+    ]
 
 actor_device_mesh = DeviceMesh(device_type="cuda", mesh=[0], mesh_dim_names=("dp",))
-ref_device_mesh   = DeviceMesh(device_type="cuda", mesh=[1], mesh_dim_names=("dp",))
+ref_device_mesh = None
+if ngpu >= 2:
+    ref_device_mesh = DeviceMesh(device_type="cuda", mesh=[1], mesh_dim_names=("dp",))
+
 
 
 def create_dataset():
     dataset = Dataset(DatasetMeta("ms://modelscope/competition_math"))
-    dataset.set_template("Qwen3Template", model_id=LOCAL_MODEL_PATH)
+    try:
+        dataset.set_template("Qwen3Template", model_id=LOCAL_MODEL_PATH)
+    except Exception as e:
+        print(f"[WARN] set_template failed, continue without template: {type(e).__name__}: {e}")
     dataset.map("CompetitionMathProcessor")
     dataset.check(batched=True)
     return dataset
@@ -513,19 +527,29 @@ class ActorGroup:
 
 
 def train():
-    dataset = create_dataset()
+    # 1) dataset/dataloader
+    dataloader = None
     try:
-        dataloader = DataLoader(dataset, remote_group="actor", device_mesh=actor_device_mesh)
-        _ = iter(dataloader)
+        dataset = create_dataset()
     except Exception as e:
-        print(f"[WARN] DataLoader/dataset init failed, fallback to dummy batch. err={type(e).__name__}: {e}")
-        # minimal local fallback for 1-step closure
+        print(f"[WARN] create_dataset failed, fallback to dummy batch. err={type(e).__name__}: {e}")
+        dataset = None
+
+    if dataset is not None:
+        try:
+            dataloader = DataLoader(dataset, remote_group="actor", device_mesh=actor_device_mesh)
+            _ = iter(dataloader)
+        except Exception as e:
+            print(f"[WARN] DataLoader/dataset init failed, fallback to dummy batch. err={type(e).__name__}: {e}")
+            dataloader = None
+
+    if dataloader is None:
         dataloader = [
             [{"prompt": "Compute 1+1.", "answer": "2"}],
         ]
 
+    # 2) actor lora
     adapter_name = "default"
-
     lora_config = LoraConfig(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         r=int(os.environ.get("LORA_R", "8")),
@@ -542,16 +566,18 @@ def train():
         max_new_tokens=int(os.environ.get("TWINKLE_MAX_NEW_TOKENS", "64")),
     )
 
-    ref_model = TransformersModel(
-        pretrained_model_name_or_path=LOCAL_MODEL_PATH,
-        remote_group="ref",
-        device_mesh=ref_device_mesh,
-    )
-    ref_model.set_processor("InputProcessor")
-    ref_model.set_template("Qwen3Template")
-    # Ref model only needs forward; provide a dummy torch Optimizer to satisfy _lazy_wrap_model assertions
-    ref_model.set_optimizer("AdamW", lr=0.0)
-    ref_model.set_lr_scheduler("LinearLR")
+    # 3) ref is optional (but if single GPU, you should also remove ref from initialize/groups)
+    use_ref = os.environ.get("TWINKLE_USE_REF", "0") == "1"
+    ref_logits = None
+    if use_ref:
+        ref_model = TransformersModel(
+            pretrained_model_name_or_path=LOCAL_MODEL_PATH,
+            remote_group="ref",
+            device_mesh=ref_device_mesh,
+        )
+        ref_model.set_processor("InputProcessor")
+        ref_model.set_template("Qwen3Template")
+        # ref forward not wired yet; keep ref_logits=None for now
 
     reward = MathReward()
 
@@ -560,10 +586,8 @@ def train():
 
     max_steps = int(os.environ.get("TWINKLE_MAX_STEPS", "1"))
     step = 0
-
     for batch in dataloader:
         trajectories = ray.get(actor_group.sample.remote(batch))
-        ref_logits = None  # Goal A minimal loop: skip ref model to avoid OOM
         trajectories_for_reward = _wrap_trajectories_for_reward(trajectories)
         ground_truths_for_reward = _wrap_trajectories_for_reward(batch)
         trajectories = reward.calculate(trajectories_for_reward, ground_truths_for_reward)
@@ -578,17 +602,19 @@ def train():
             break
 
 
+
 def main():
     os.environ.setdefault("TWINKLE_SEED", "42")
     os.environ.setdefault("TWINKLE_FULL_DETERMINISM", "0")
     os.environ.setdefault("TRUST_REMOTE_CODE", "1")
 
     twinkle.initialize(
-        mode="ray",
-        nproc_per_node=2,
-        groups=device_groups,
-        lazy_collect=False,
-    )
+    mode="ray",
+    nproc_per_node=ngpu if ngpu >= 1 else 1,
+    groups=device_groups,
+    lazy_collect=False,
+)
+
 
     train()
 
