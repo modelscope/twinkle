@@ -38,6 +38,7 @@ class DeviceMesh:
     mesh: np.ndarray
     mesh_dim_names: Optional[tuple[str, ...]]
     ep_size: Optional[int] = None
+    etp_size: Optional[int] = None
     vpp_size: Optional[int] = None
     ulysses_size: Optional[int] = None
     device_type: str = 'cuda'
@@ -45,7 +46,7 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   vpp_size: int = None, device_type: str = 'cuda') -> "DeviceMesh":
+                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda') -> "DeviceMesh":
 
         origin_world_size = Platform.get_world_size()
         world_size = origin_world_size
@@ -92,6 +93,7 @@ class DeviceMesh:
             mesh_dim_names=tuple(mesh_dim_names),
             vpp_size=vpp_size,
             ep_size=ep_size,
+            etp_size=etp_size,
             ulysses_size=ulysses_size,
         )
 

@@ -25,53 +25,6 @@ from twinkle import Platform
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
-
-# Config mapping from HuggingFace to Megatron
-CONFIG_MAPPING = {
-    'num_layers': ['num_hidden_layers'],
-    'hidden_size': ['hidden_size'],
-    'mlp_ffn_hidden_size': ['intermediate_size_mlp'],
-    'ffn_hidden_size': ['intermediate_size'],
-    'num_attention_heads': ['num_attention_heads'],
-    'num_query_groups': ['num_key_value_heads'],
-    'max_position_embeddings': ['max_position_embeddings'],
-    'norm_epsilon': ['rms_norm_eps'],
-    'rotary_base': ['rope_theta'],
-    'padded_vocab_size': ['vocab_size'],
-    'attention_dropout': ['attention_dropout'],
-    'untie_embeddings_and_output_weights': ['tie_word_embeddings'],
-    'swiglu': ['hidden_act'],
-    'add_qkv_bias': ['attention_bias', 'qkv_bias', 'use_bias'],
-    'disable_bias_linear': ['mlp_bias'],
-    'kv_channels': ['head_dim', 'v_head_dim'],
-    'architectures': ['architectures'],
-    # moe
-    'moe_ffn_hidden_size': ['moe_intermediate_size'],
-    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],
-    'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k'],
-    'moe_router_num_groups': ['n_group'],
-    'moe_router_group_topk': ['topk_group'],
-    'num_experts': ['num_experts', 'n_routed_experts', 'moe_num_experts', 'num_local_experts'],
-    'moe_router_pre_softmax': ['norm_topk_prob'],
-    # deepseek
-    'q_lora_rank': ['q_lora_rank'],
-    'kv_lora_rank': ['kv_lora_rank'],
-    'moe_router_score_function': ['scoring_func'],
-    'moe_router_bias_update_rate': ['aux_loss_alpha'],
-    'qk_head_dim': ['qk_nope_head_dim'],
-    'qk_pos_emb_head_dim': ['qk_rope_head_dim'],
-    'moe_router_topk_scaling_factor': ['routed_scaling_factor'],
-    'qk_layernorm': ['use_qk_norm'],
-    # other
-    'original_max_position_embeddings': ['original_max_position_embeddings'],
-    'partial_rotary_factor': ['partial_rotary_factor'],
-    'first_k_dense_replace': ['first_k_dense_replace', 'moe_layer_start_index'],
-    'n_shared_experts': ['n_shared_experts', 'num_shared_expert', 'moe_num_shared_experts'],
-    'window_size': ['sliding_window'],
-    'layer_types': ['layer_types'],
-}
-
-
 class TenantProcessGroupManager:
     """Manager for multi-tenant process groups.
     
@@ -540,157 +493,6 @@ def set_linear_is_expert(model: nn.Module):
             module.is_expert = True
 
 
-def deep_getattr(obj: Any, attr: str, default: Any = None) -> Any:
-    """Get nested attribute using dot notation.
-    
-    Args:
-        obj: The object.
-        attr: Dot-separated attribute path.
-        default: Default value if attribute not found.
-        
-    Returns:
-        The attribute value or default.
-    """
-    try:
-        for a in attr.split('.'):
-            obj = getattr(obj, a)
-        return obj
-    except AttributeError:
-        return default
-
-
-# =============================================================================
-
-# =============================================================================
-def _convert_hf_config(config, _internal_call: bool = False) -> Dict[str, Any]:
-    """Convert HuggingFace config to Megatron config dict.
-    
-    
-    
-    Args:
-        config: HuggingFace model config.
-        _internal_call: Internal flag for recursion.
-        
-    Returns:
-        Megatron-compatible config dict.
-    """
-    megatron_config = {}
-    for k, hf_keys in CONFIG_MAPPING.items():
-        for hf_k in hf_keys:
-            if hasattr(config, hf_k):
-                hf_v = getattr(config, hf_k)
-                if hf_v is None:
-                    continue
-                if k == 'rotary_base':
-                    megatron_config[k] = int(hf_v)
-                elif k in {'untie_embeddings_and_output_weights', 'disable_bias_linear', 'moe_router_pre_softmax'}:
-                    megatron_config[k] = not hf_v
-                elif k == 'swiglu':
-                    if hf_v == 'silu':
-                        megatron_config[k] = True
-                else:
-                    if k == 'kv_lora_rank':
-                        megatron_config['multi_latent_attention'] = True
-                    elif k == 'architectures':
-                        if _internal_call:
-                            k = 'llm_architectures'
-                    megatron_config[k] = hf_v
-                break
-                
-    # Handle nested configs
-    for key in ['text_config', 'llm_config', 'thinker_config']:
-        if hasattr(config, key):
-            megatron_config.update(_convert_hf_config(getattr(config, key), _internal_call=True))
-            
-    # Compat llama3 rope scaling
-    if getattr(config, 'rope_scaling', None) is not None:
-        if isinstance(config.rope_scaling, int):
-            megatron_config['rope_scaling'] = {'factor': config.rope_scaling, 'type': 'linear'}
-        elif isinstance(config.rope_scaling, dict):
-            megatron_config['rope_scaling'] = config.rope_scaling
-            
-    return megatron_config
-
-
-def convert_hf_config(config) -> Dict[str, Any]:
-    """Convert HuggingFace config to Megatron-compatible config.
-    
-    
-    
-    Args:
-        config: HuggingFace model config.
-        
-    Returns:
-        Megatron-compatible config dict.
-    """
-    res = _convert_hf_config(config)
-    
-    # Process architectures
-    architectures = res.get('architectures')
-    if isinstance(architectures, list) and architectures:
-        architectures = architectures[0]
-    res['architectures'] = architectures
-    
-    llm_architectures = res.get('llm_architectures') or architectures
-    if isinstance(llm_architectures, list) and llm_architectures:
-        llm_architectures = llm_architectures[0]
-    res['llm_architectures'] = llm_architectures
-    
-    # Process MoE settings
-    first_k_dense_replace = res.pop('first_k_dense_replace', None)
-    n_shared_experts = res.pop('n_shared_experts', None)
-    
-    # ==== Qwen2/Qwen2.5 Model specific settings ====
-    if llm_architectures == 'Qwen2ForCausalLM':
-        # Qwen2/Qwen2.5 uses bias=True for Q, K, V projections (hardcoded in transformers)
-        # but the config doesn't have 'attention_bias' field
-        if 'add_qkv_bias' not in res:
-            res['add_qkv_bias'] = True
-        res['swiglu'] = True
-        
-    # ==== Qwen3 Dense Model specific settings ====
-    if llm_architectures == 'Qwen3ForCausalLM':
-        res['qk_layernorm'] = True
-        # Qwen3 uses SwiGLU activation
-        res['swiglu'] = True
-        # Qwen3 typically doesn't use bias in linear layers
-        res['disable_bias_linear'] = True
-        
-    # ==== Qwen3 MoE Model specific settings ====
-    if llm_architectures == 'Qwen3MoeForCausalLM':
-        res['qk_layernorm'] = True
-        res['swiglu'] = True
-        res['disable_bias_linear'] = True
-        # Qwen3 MoE uses shared expert gate
-        res['use_shared_expert_gate'] = True
-        # Remove ffn_hidden_size as MoE uses moe_ffn_hidden_size
-        res.pop('ffn_hidden_size', None)
-        
-    # DeepSeek models
-    if llm_architectures in {'DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM'}:
-        res['qk_layernorm'] = True
-        res['moe_router_load_balancing_type'] = 'seq_aux_loss'
-        res.pop('num_query_groups', None)
-        
-    # Handle rope scaling
-    rope_scaling = res.get('rope_scaling') or {}
-    if 'partial_rotary_factor' not in res and 'partial_rotary_factor' in rope_scaling:
-        res['partial_rotary_factor'] = rope_scaling['partial_rotary_factor']
-    if rope_scaling.get('mrope_section') is not None:
-        res['position_embedding_type'] = 'mrope'
-        res['mrope_section'] = rope_scaling['mrope_section']
-        
-    # MoE layer frequency
-    if first_k_dense_replace is not None:
-        res['moe_layer_freq'] = f'[0]*{first_k_dense_replace}+[1]*{res["num_layers"] - first_k_dense_replace}'
-    if res.get('moe_router_score_function', 'softmax') == 'sigmoid' and 'moe_router_enable_expert_bias' not in res:
-        res['moe_router_enable_expert_bias'] = True
-    if n_shared_experts is not None and 'moe_shared_expert_intermediate_size' not in res:
-        res['moe_shared_expert_intermediate_size'] = n_shared_experts * res.get('moe_ffn_hidden_size', res.get('ffn_hidden_size', 0))
-        
-    return res
-
-
 @contextmanager
 def patch_deepcopy():
     """Context manager to handle tp_group in deepcopy operations.
@@ -743,10 +545,6 @@ def patch_deepcopy():
     finally:
         copy.deepcopy = _origin_deepcopy
 
-
-# =============================================================================
-
-# =============================================================================
 def tuners_sharded_state_dict(
     module: nn.Module,
     prefix: str = '',
@@ -859,10 +657,6 @@ def prepare_lora_model(
         
     return model
 
-
-# =============================================================================
-
-# =============================================================================
 def get_local_layer_specs(config, layer_specs: List, vp_stage: Optional[int] = None):
     """Get local layer specifications for current pipeline rank.
     
@@ -930,9 +724,6 @@ def get_padding_to(
     return padding_to
 
 
-# =============================================================================
-
-# =============================================================================
 def forward_step_helper(model: nn.Module, inputs: Dict[str, Any], config) -> Optional[torch.Tensor]:
     """Helper for pipeline parallel forward step.
     

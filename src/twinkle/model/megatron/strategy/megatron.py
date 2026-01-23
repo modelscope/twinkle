@@ -81,9 +81,9 @@ class MegatronStrategy:
         self,
         model: List[nn.Module],
         use_distributed_optimizer: bool = True,
-    ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
+    ) -> List[nn.Module]:
         if self.device_mesh.world_size <= 1:
-            return model, optimizer
+            return model
 
         self._check_device_mesh()
         return self._wrap_with_megatron_ddp(model,
@@ -298,6 +298,7 @@ class MegatronStrategy:
             params_dtype=self.params_type,
             tensor_model_parallel_size=self.device_mesh.tp_world_size or 1,
             pipeline_model_parallel_size=self.device_mesh.pp_world_size or 1,
+            virtual_pipeline_model_parallel_size=self.device_mesh.vpp_size if self.device_mesh.vpp_size > 1 else None,
             context_parallel_size=self.device_mesh.cp_world_size or 1,
             expert_model_parallel_size=self.device_mesh.ep_size or 1,
             sequence_parallel=self.sequence_parallel,

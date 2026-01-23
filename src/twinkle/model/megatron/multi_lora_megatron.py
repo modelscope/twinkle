@@ -65,7 +65,7 @@ class MultiLoraMegatronModel(MegatronModel):
         # Create Megatron strategy
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
-        self.model = self._create_megatron_model(model_path, load_weights, **kwargs)
+        self.model = self._create_megatron_model(load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
