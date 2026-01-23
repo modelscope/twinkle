@@ -123,6 +123,8 @@ def train():
     )
     adapter_name = 'lora'
     model.add_adapter_to_model(adapter_name, lora_config)
+    model.set_optimizer('default', lr=1e-4)
+    model.set_lr_scheduler('default', max_lr=1e-4, lr_decay_steps=len(dataloader))
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
 
