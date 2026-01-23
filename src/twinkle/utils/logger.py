@@ -82,7 +82,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
     # at the ERROR level.
     for handler in logger.root.handlers:
         if type(handler) is logging.StreamHandler:
-            handler.setLevel(logging.INFO)
+            handler.setLevel(logging.ERROR)
 
     stream_handler = logging.StreamHandler()
     handlers = [stream_handler]

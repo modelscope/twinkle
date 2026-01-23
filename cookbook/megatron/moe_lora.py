@@ -23,7 +23,6 @@ from twinkle import (DeviceGroup, DeviceMesh, Platform, get_device_placement,
                      get_logger)
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import MegatronCrossEntropyLoss
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 
@@ -38,7 +37,7 @@ parser.add_argument('--mode',
 parser.add_argument('--dp_size', type=int, default=2)
 parser.add_argument('--tp_size', type=int, default=2)
 parser.add_argument('--pp_size', type=int, default=2)
-parser.add_argument('--vpp_size', type=int, default=2)
+parser.add_argument('--vpp_size', type=int, default=1)
 parser.add_argument('--cp_size', type=int, default=2)
 parser.add_argument('--ep_size',
                     type=int,
@@ -126,8 +125,7 @@ def train():
     logger.info(model.get_train_configs())
 
     for step, batch in enumerate(dataloader):
-        output = model.forward_backward(inputs=batch,
-                                        micro_batch_size=1)
+        output = model.forward_backward(inputs=batch)
         if step % GAS == 0:
             logger.info(f'Step {step // GAS}, loss: {output}')
         model.clip_grad_and_step()

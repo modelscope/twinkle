@@ -1614,7 +1614,7 @@ class BridgeInitializer:
         self.cp_size = cp_size
         self.ep_size = ep_size
         self.etp_size = etp_size or tp_size
-        self.vpp_size = vpp_size or 1
+        self.vpp_size = vpp_size
         self.order = order
         self.params_dtype = params_dtype if params_dtype is not None else torch.bfloat16
         self.use_cpu_initialization = use_cpu_initialization
@@ -1885,10 +1885,11 @@ class BridgeInitializer:
             extra_init_args = {
                 'seq_len_interpolation_factor': hf_config.rope_scaling["factor"]
             }
-        if mpu.get_virtual_pipeline_model_parallel_world_size() > 1:
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+        if vpp_size is not None and vpp_size > 1:
             model = []
             has_vp_stage = inspect.signature(mpu.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
-            for i in range(mpu.get_virtual_pipeline_model_parallel_world_size()):
+            for i in range(vpp_size):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)
                 extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": i}
                 if has_vp_stage:

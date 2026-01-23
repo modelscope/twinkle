@@ -109,9 +109,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
-        # Create Megatron strategy
-        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
+        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
         self.model: List[nn.Module] = self._create_megatron_model(model_path, load_weights, **kwargs)
 
         self._model_wrapped = False
@@ -184,7 +183,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             pp_size=self.device_mesh.pp_world_size,
             cp_size=self.device_mesh.cp_world_size,
             ep_size=self.device_mesh.ep_size,
-            vpp_size=self.device_mesh.vpp_size,
+            vpp_size=self.device_mesh.vpp_size if self.device_mesh.vpp_size > 1 else None,
             order=self.device_mesh.order,
             params_dtype=params_dtype,
             seed=self._seed,
@@ -424,12 +423,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
 
-        vpp_size = self.device_mesh.vpp_size
-        if vpp_size is None or vpp_size == 1:
-            micro_batch_size = None
-        else:
-            micro_batch_size = 1
-
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
@@ -440,7 +433,15 @@ class MegatronModel(TwinkleModel, nn.Module):
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
+
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size is None or vpp_size == 1:
+            inputs = [processor(inputs)]
+            micro_batch_size = inputs[0]['input_ids'].shape[0]
+        else:
+            if micro_batch_size is None:
+                micro_batch_size = 1
+            inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
         self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
@@ -450,8 +451,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if self.variable_seq_lengths:
             seq_length = None
         else:
-            _example = inputs[0] if isinstance(inputs, list) else inputs
-            original_seq_length = _example['input_ids'].shape[1] if 'input_ids' in _example else _example['input_embedding']
+            original_seq_length = inputs[0]['input_ids'].shape[1]
             if cp_size > 1:
                 divisor = 2 * cp_size
             elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
@@ -499,7 +499,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         vpp_size = self.device_mesh.vpp_size
 
         if vpp_size is None or vpp_size == 1:
-            data_iter = [iter(inputs)]
+            data_iter = iter(inputs)
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
@@ -509,7 +509,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=len(inputs) if isinstance(inputs, list) else 1,
+            num_microbatches=len(inputs),
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             forward_only=False,
@@ -594,15 +594,11 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         optimizer = optimizer_config.optimizer
         assert optimizer is not None, 'Set optimizer correctly before stepping'
-
-        if optimizer_config.is_megatron_optimizer:
-            # Megatron optimizer step() returns (success, grad_norm, num_zeros)
-            success, grad_norm, num_zeros = optimizer.step(**kwargs)
-            # Store grad_norm for later retrieval
-            optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
-            optimizer_config._last_step_success = success
-        else:
-            optimizer.step(**kwargs)
+        # Megatron optimizer step() returns (success, grad_norm, num_zeros)
+        success, grad_norm, num_zeros = optimizer.step()
+        # Store grad_norm for later retrieval
+        optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
+        optimizer_config._last_step_success = success
 
     def _is_model_ddp_wrapped(self) -> bool:
         """Check if model is wrapped with DDP.
@@ -718,7 +714,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         # Check if requesting Megatron distributed optimizer
         if not optimizer_cls or optimizer_cls == 'MegatronDistributed':
             optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)
-            optimizer_config.is_megatron_optimizer = True
         else:
             raise NotImplementedError(f'Unsupported optimizer: {optimizer_cls}, only support MegatronOptimizer currently.')
 
@@ -744,8 +739,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         from megatron.core import parallel_state as mpu
 
         # Build optimizer config
-        lr = kwargs.get('lr', 1e-4)
-        use_distributed_optimizer: bool = kwargs.get('use_distributed_optimizer', self.use_distributed_optimizer)
+        lr = kwargs.pop('lr', 1e-4)
+        use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
 
         opt_config = OptimizerConfig(
             optimizer='adam',
@@ -760,18 +755,12 @@ class MegatronModel(TwinkleModel, nn.Module):
             use_distributed_optimizer=use_distributed_optimizer,
             overlap_param_gather=kwargs.get('overlap_param_gather', False),
             log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
+            **kwargs,
         )
 
         # For PEFT models, we need to handle the case where model is not DDP-wrapped
         # We create a temporary wrapper to satisfy Megatron's optimizer requirements
         model_chunks = self.model
-
-        # Check if model has ddp_config (required for distributed optimizer)
-        if not hasattr(self.model[0], 'ddp_config') and use_distributed_optimizer:
-            # For PEFT models without DDP, fall back to non-distributed optimizer
-            # but still use Megatron's optimized implementation
-            opt_config.use_distributed_optimizer = False
-
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,

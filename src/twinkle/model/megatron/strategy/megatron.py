@@ -26,6 +26,17 @@ class MegatronStrategy:
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
+    
+    def _check_device_mesh(self):
+        from megatron.core import parallel_state as mpu
+        # Make sure device_mesh and mpu match each other
+        assert self.device_mesh.dp_rank == mpu.get_data_parallel_rank()
+        if self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
+            assert self.device_mesh.tp_rank == mpu.get_tensor_model_parallel_rank()
+        if self.device_mesh.pp_world_size is not None and self.device_mesh.pp_world_size > 1:
+            assert self.device_mesh.pp_rank == mpu.get_pipeline_model_parallel_rank()
+        if self.device_mesh.vpp_size is not None and self.device_mesh.vpp_size > 1:
+            assert self.device_mesh.vpp_size == mpu.get_virtual_pipeline_model_parallel_world_size()
 
     @property
     def params_type(self) -> torch.dtype:
@@ -74,6 +85,7 @@ class MegatronStrategy:
         if self.device_mesh.world_size <= 1:
             return model, optimizer
 
+        self._check_device_mesh()
         return self._wrap_with_megatron_ddp(model,
                                             use_distributed_optimizer)
 
