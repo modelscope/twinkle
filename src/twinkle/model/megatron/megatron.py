@@ -21,7 +21,7 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss, MegatronCrossEntropyLoss
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle import exists, requires
+from twinkle import requires
 import twinkle.metric
 from twinkle import torch_util
 from twinkle.model.base import TwinkleModel
@@ -109,6 +109,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
+        torch_util.set_device()
         # Create Megatron strategy
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
@@ -185,6 +186,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             pp_size=self.device_mesh.pp_world_size,
             cp_size=self.device_mesh.cp_world_size,
             ep_size=self.device_mesh.ep_size,
+            vpp_size=self.device_mesh.vpp_size,
             params_dtype=params_dtype,
             seed=self._seed,
             use_cpu_initialization=False,

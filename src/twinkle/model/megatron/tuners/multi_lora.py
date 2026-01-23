@@ -21,6 +21,8 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint,
 from packaging import version
 from peft import LoraConfig, get_peft_model
 
+from twinkle import Platform
+
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
@@ -963,11 +965,11 @@ def forward_step_helper(model: nn.Module, inputs: Dict[str, Any], config) -> Opt
             seq_length //= mpu.get_tensor_model_parallel_world_size()
         recv_shape_buffer = torch.tensor(
             [seq_length, micro_batch_size, config.hidden_size],
-            device=torch.cuda.current_device(),
+            device=Platform.get_local_device(),
             dtype=torch.int64
         )
     else:
-        recv_shape_buffer = torch.empty((3,), device=torch.cuda.current_device(), dtype=torch.int64)
+        recv_shape_buffer = torch.empty((3,), device=Platform.get_local_device(), dtype=torch.int64)
         recv_from_prev_pipeline_rank_(recv_shape_buffer)
         
     if not mpu.is_pipeline_last_stage():
@@ -976,7 +978,7 @@ def forward_step_helper(model: nn.Module, inputs: Dict[str, Any], config) -> Opt
 
     if not mpu.is_pipeline_first_stage():
         dtype = config.params_dtype
-        recv_buffer = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
+        recv_buffer = torch.empty(shape, device=Platform.get_local_device(), dtype=dtype)
         recv_from_prev_pipeline_rank_(recv_buffer)
         model.set_input_tensor(recv_buffer)
         

@@ -75,7 +75,7 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init()
+            ray.init(address=os.environ.get("RAY_ADDRESS","auto"), ignore_reinit_error=True)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.

@@ -16,8 +16,9 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-from twinkle import exists
+from twinkle import exists, Platform
 from twinkle.hub import HubOperation
+from twinkle import torch_util
 
 
 def _deep_getattr(obj, attr: str, default=None):
@@ -1429,7 +1430,7 @@ class GPTBridge:
             For DP > 1, only DP rank 0 writes to disk. All ranks participate
             in tensor gather operations for TP.
         """
-        torch.cuda.empty_cache()
+        torch_util.empty_cache()
 
         # Determine if this rank should write
         should_write = _is_last_rank()
@@ -1871,7 +1872,7 @@ class BridgeInitializer:
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
         rope_scaling = {}
-        if hasattr(hf_config, 'rope_scaling') and 'factor' in hf_config.rope_scaling:
+        if hasattr(hf_config, 'rope_scaling') and hf_config.rope_scaling is not None and 'factor' in hf_config.rope_scaling:
             rope_scaling = {
                 'seq_len_interpolation_factor': hf_config.rope_scaling["factor"]
             }
