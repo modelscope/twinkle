@@ -24,10 +24,14 @@ class InputProcessor:
         self.padding_free = padding_free
 
     @remote_function()
-    def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):
+    def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
         if isinstance(inputs, list):
-            inputs = self.collate_fn(inputs)
-        return self.prepare_inputs(inputs)
+            inputs = self.collate_fn(inputs, **kwargs)
+        if not isinstance(inputs, list):
+            return self.prepare_inputs(inputs)
+        else:
+            return [self.prepare_inputs(_input) for _input in inputs]
+        
 
     @remote_function()
     def prepare_inputs(self, inputs: InputFeature) -> InputFeature:

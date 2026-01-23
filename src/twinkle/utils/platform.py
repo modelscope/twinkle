@@ -174,7 +174,8 @@ class DeviceMesh:
 
     @property
     def dp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("dp")
+        rank = self._get_rank_for_dim("dp")
+        return rank
 
     @property
     def fsdp_rank(self) -> Optional[int]:
@@ -250,6 +251,7 @@ class DeviceMesh:
         world_size = self.data_world_size
         if rank is None:
             rank = self.data_rank
+            from megatron.core import parallel_state as mpu
             if rank is None:
                 rank = 0
                 world_size = 1

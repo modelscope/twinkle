@@ -123,22 +123,21 @@ def train():
     adapter_name = 'lora'
     model.add_adapter_to_model(adapter_name, lora_config)
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs(adapter_name=adapter_name))
+    logger.info(model.get_train_configs())
 
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch,
-                                        micro_batch_size=1,
-                                        adapter_name=adapter_name)
+                                        micro_batch_size=1)
         if step % GAS == 0:
             logger.info(f'Step {step // GAS}, loss: {output}')
         model.clip_grad_and_step()
         if step > 0 and step % (100 * GAS) == 0:
-            model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
+            model.save('./output/megatron_moe_lora')
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * GAS:
             logger.info(f'Reached max_steps ({args.max_steps}), stopping.')
             break
-    model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
+    model.save('./output/megatron_moe_lora')
     logger.info('Training completed!')
 
 
@@ -158,7 +157,4 @@ def cleanup():
 
 
 if __name__ == '__main__':
-    try:
-        train()
-    finally:
-        cleanup()
+    train()

@@ -69,13 +69,12 @@ class MegatronStrategy:
     def wrap_model(
         self,
         model: List[nn.Module],
-        optimizer: Optional[torch.optim.Optimizer] = None,
         use_distributed_optimizer: bool = True,
     ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
         if self.device_mesh.world_size <= 1:
             return model, optimizer
 
-        return self._wrap_with_megatron_ddp(model, optimizer,
+        return self._wrap_with_megatron_ddp(model,
                                             use_distributed_optimizer)
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
@@ -84,7 +83,7 @@ class MegatronStrategy:
         _models = []
         for _model in model:
             if isinstance(_model, (MegatronDDP, TorchDDP)):
-                _models.append(model.module)
+                _models.append(_model.module)
             else:
                 _models.append(_model)
         return _models
@@ -92,9 +91,8 @@ class MegatronStrategy:
     @staticmethod
     def _wrap_with_megatron_ddp(
         model: List[nn.Module],
-        optimizer: Optional[torch.optim.Optimizer],
         use_distributed_optimizer: bool,
-    ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
+    ) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.transformer.module import Float16Module
         from megatron.core.transformer import TransformerConfig
@@ -102,7 +100,6 @@ class MegatronStrategy:
 
         wrapped_models = []
         for _model in model:
-            assert not isinstance(_model, PeftModel), 'Cannot wrap peft model.'
             config: TransformerConfig = _model.config # noqa
 
             if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
@@ -127,7 +124,7 @@ class MegatronStrategy:
             wrapped_model.broadcast_params()
             wrapped_models.append(wrapped_model)
 
-        return wrapped_models, optimizer
+        return wrapped_models
 
     def split_inputs_for_cp(self, inputs):
         # Calculate padded seq_length based on parallelism requirements
@@ -217,11 +214,12 @@ class MegatronStrategy:
             attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
             batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
 
-        inputs['input_ids'] = input_ids
-        inputs['position_ids'] = position_ids
-        inputs['attention_mask'] = attention_mask
-        inputs['labels'] = batch_labels
-        return inputs
+        return {
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
+            'labels': batch_labels,
+        }
 
     def get_model_config(
         self,

@@ -228,7 +228,7 @@ def get_device_placement(device_group=None) -> str:
                 parallelism = []
                 for dim in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
                     ws = mesh._get_world_size_for_dim(dim)
-                    if ws > 1:
+                    if ws is not None and ws > 1:
                         parallelism.append(f"{dim.upper()}={ws}")
 
                 if parallelism:

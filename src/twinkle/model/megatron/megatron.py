@@ -52,7 +52,7 @@ class MegatronOptimizerGroup:
     metrics: List[Metric] = field(default_factory=list)
     _device_mesh: DeviceMesh = None
     # Megatron optimizer specific fields
-    is_megatron_optimizer: bool = False
+    is_megatron_optimizer: bool = True
     _last_grad_norm: float = 0.0
     _last_step_success: bool = True
 
@@ -117,7 +117,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
-        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = self._construct_megatron_optimizer_group()
+        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
         MegatronPeft().patch()
 
     def _construct_default_optimizer_group(self):
@@ -213,19 +213,18 @@ class MegatronModel(TwinkleModel, nn.Module):
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
         model_device = next(model.parameters()).device
         torch.cuda.set_device(Platform.get_local_rank())
-        if model_device.type == 'cpu':
-            model = model.to(Platform.get_local_device())
+        model = model.to(Platform.get_local_device())
         torch_util.synchronize()
         return model
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             assert len(self.optimizer_group) == 1
+            self.model = self.strategy.wrap_model(self.model)
             optimizer = self.optimizer_group[_default_adapter_name].optimizer
             if optimizer is None:
                 optimizer = self._create_megatron_optimizer()
                 self.optimizer_group[_default_adapter_name].optimizer = optimizer
-            self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self._model_wrapped = True
 
@@ -497,23 +496,26 @@ class MegatronModel(TwinkleModel, nn.Module):
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=1,
+            num_microbatches=len(inputs) if isinstance(inputs, list) else 1,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
 
         # Extract loss from results (only last PP stage returns non-empty)
-        loss = 0.0
-
+        loss = torch.tensor(0.0).to(Platform.get_local_device())
+        count = 0
         if losses:
             for loss_dict in losses:
                 if isinstance(loss_dict, dict) and 'loss' in loss_dict:
-                    loss = loss_dict['loss']
-                    break
+                    loss += loss_dict['loss']
+                    count += 1
                 elif isinstance(loss_dict, torch.Tensor):
-                    loss = loss_dict
-                    break
+                    loss += loss_dict
+                    count += 1
+        
+        if count > 0:
+            loss /= count
 
         # For PP > 1, broadcast loss from last PP stage to all ranks
         # Note: mpu is imported at module level, no need to reimport
@@ -529,7 +531,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
             loss = loss_tensor.item()
 
-        optimizer_config.cur_step += 1
+        optimizer_config.cur_step += (len(inputs) if isinstance(inputs, list) else 1)
 
         # Critical: Synchronize all DP replicas before returning
         # This ensures all DP replicas complete the same training step before
@@ -549,29 +551,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                        max_grad_norm: float = 1.0,
                        norm_type: int = 2,
                        **kwargs):
-        """Clip gradient norm.
-
-        Args:
-            max_grad_norm: Maximum gradient norm.
-            norm_type: Type of norm to use.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Total norm of gradients.
-        """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-
-        if optimizer_config.is_megatron_optimizer:
-            # Megatron optimizer handles gradient clipping in step()
-            # Return the grad_norm from last step if available
-            return getattr(optimizer_config, '_last_grad_norm', 0.0)
-
-        parameters = self._get_trainable_parameters(adapter_name).values()
-
-        return torch.nn.utils.clip_grad_norm_(
-            parameters, max_grad_norm,
-            norm_type=norm_type).detach().cpu().numpy()
+        raise NotImplementedError
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):
@@ -772,10 +752,10 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         # For PEFT models, we need to handle the case where model is not DDP-wrapped
         # We create a temporary wrapper to satisfy Megatron's optimizer requirements
-        model_chunks = [self.model]
+        model_chunks = self.model
 
         # Check if model has ddp_config (required for distributed optimizer)
-        if not hasattr(self.model, 'ddp_config') and use_distributed_optimizer:
+        if not hasattr(self.model[0], 'ddp_config') and use_distributed_optimizer:
             # For PEFT models without DDP, fall back to non-distributed optimizer
             # but still use Megatron's optimized implementation
             opt_config.use_distributed_optimizer = False
@@ -803,9 +783,10 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         params = {}
         model = self.strategy.unwrap_model(self.model)
-        for name, param in model.named_parameters():
-            if param.requires_grad and (pattern.search(name) or is_default):
-                params[name] = param
+        for _model in model:
+            for name, param in _model.named_parameters():
+                if param.requires_grad and (pattern.search(name) or is_default):
+                    params[name] = param
         return params
 
     @remote_function(dispatch='all')
@@ -823,7 +804,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
-        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        # self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)

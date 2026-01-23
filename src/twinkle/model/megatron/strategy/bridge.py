@@ -1818,10 +1818,12 @@ class BridgeInitializer:
             pipeline_model_parallel_size=self.pp_size,
             context_parallel_size=self.cp_size,
             expert_model_parallel_size=self.ep_size,
+            virtual_pipeline_model_parallel_size=self.vpp_size,
             sequence_parallel=use_sequence_parallel,
             params_dtype=self.params_dtype,
-            pipeline_dtype=self.
-            params_dtype,  # Required when using pipeline parallelism
+            fp16=self.params_dtype == torch.float16,
+            bf16=self.params_dtype == torch.bfloat16,
+            pipeline_dtype=self.params_dtype,  # Required when using pipeline parallelism
             use_cpu_initialization=self.use_cpu_initialization,
             add_qkv_bias=mg_config_dict.get('add_qkv_bias', False),
             add_bias_linear=not mg_config_dict.get('disable_bias_linear',
@@ -1853,6 +1855,8 @@ class BridgeInitializer:
             # MoE configuration
             **moe_kwargs,
         )
+        if exists('megatron_core>=0.13'):
+            config.expert_tensor_parallel_size = self.etp_size
 
         # Save transformer config for later use (e.g., DDP wrapping)
         self.config = config
@@ -1871,17 +1875,19 @@ class BridgeInitializer:
         # Create model
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
-        rope_scaling = {}
+        extra_init_args = {}
         if hasattr(hf_config, 'rope_scaling') and hf_config.rope_scaling is not None and 'factor' in hf_config.rope_scaling:
-            rope_scaling = {
+            extra_init_args = {
                 'seq_len_interpolation_factor': hf_config.rope_scaling["factor"]
             }
         if mpu.get_virtual_pipeline_model_parallel_world_size() > 1:
             model = []
             has_vp_stage = inspect.signature(mpu.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
             for i in range(mpu.get_virtual_pipeline_model_parallel_world_size()):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                # mpu.set_virtual_pipeline_model_parallel_rank(i)
                 extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": i}
+                if has_vp_stage:
+                    extra_init_args['vp_stage'] = i
                 _model = GPTModel(
                     config=config,
                     transformer_layer_spec=layer_spec,
@@ -1894,10 +1900,10 @@ class BridgeInitializer:
                         hf_config, 'tie_word_embeddings', False),
                     position_embedding_type='rope',
                     rotary_base=rotary_base,
-                    **rope_scaling
+                    **extra_init_args
                 )
                 model.append(_model)
-            mpu.set_virtual_pipeline_model_parallel_rank(0)
+            # mpu.set_virtual_pipeline_model_parallel_rank(0)
         else:
             model = GPTModel(
                 config=config,
@@ -1911,6 +1917,7 @@ class BridgeInitializer:
                     hf_config, 'tie_word_embeddings', False),
                 position_embedding_type='rope',
                 rotary_base=rotary_base,
+                **extra_init_args,
             )
             model = [model]
         return model
