@@ -25,25 +25,26 @@ from twinkle.kernel.registry import (
     get_layer_spec,
     get_global_layer_registry,
     get_global_external_layer_registry,
+    get_global_function_registry,
 )
 
 
 class TestBase(unittest.TestCase):
-    """测试基础类和环境变量"""
+    """Test base helpers and env vars."""
 
     def test_get_device_type_no_torch(self):
-        """测试无 torch 时的设备检测"""
+        """Test device detection without torch."""
         with patch("twinkle.kernel.base.exists", return_value=False):
             result = get_device_type()
             self.assertIsNone(result)
 
     def test_is_kernels_available(self):
-        """测试 kernels 可用性检测"""
+        """Test kernels availability check."""
         result = is_kernels_available()
         self.assertIsInstance(result, bool)
 
     def test_kernels_enabled_env_var(self):
-        """测试环境变量控制"""
+        """Test env var controls kernels enablement."""
         original = os.environ.get("TWINKLE_USE_KERNELS")
         try:
             os.environ["TWINKLE_USE_KERNELS"] = "YES"
@@ -63,7 +64,7 @@ class TestBase(unittest.TestCase):
                 os.environ.pop("TWINKLE_USE_KERNELS", None)
 
     def test_to_kernels_mode(self):
-        """测试 mode 转换"""
+        """Test mode conversion."""
         if not is_kernels_available():
             self.skipTest("kernels package not available")
 
@@ -73,13 +74,13 @@ class TestBase(unittest.TestCase):
 
 
 class TestLayerRegistry(unittest.TestCase):
-    """测试层注册表"""
+    """Test layer registry."""
 
     def setUp(self):
         self.registry = LayerRegistry()
 
     def test_register_and_get(self):
-        """测试注册和获取"""
+        """Test register and lookup."""
         mock_spec = Mock()
         self.registry.register("TestLayer", mock_spec, "cuda")
 
@@ -90,7 +91,7 @@ class TestLayerRegistry(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_register_multiple_devices(self):
-        """测试多设备注册"""
+        """Test registration for multiple devices."""
         mock_cuda = Mock()
         mock_npu = Mock()
 
@@ -101,7 +102,7 @@ class TestLayerRegistry(unittest.TestCase):
         self.assertEqual(self.registry.get("TestLayer", "npu"), mock_npu)
 
     def test_get_without_device(self):
-        """测试不指定设备时获取第一个"""
+        """Test lookup without device."""
         mock_spec = Mock()
         self.registry.register("TestLayer", mock_spec, "cuda")
 
@@ -109,7 +110,7 @@ class TestLayerRegistry(unittest.TestCase):
         self.assertEqual(result, mock_spec)
 
     def test_has(self):
-        """测试是否存在检查"""
+        """Test has checks."""
         mock_spec = Mock()
         self.assertFalse(self.registry.has("TestLayer"))
 
@@ -119,7 +120,7 @@ class TestLayerRegistry(unittest.TestCase):
         self.assertFalse(self.registry.has("TestLayer", "npu"))
 
     def test_list_kernel_names(self):
-        """测试列出 kernel 名称"""
+        """Test listing kernel names."""
         mock_spec = Mock()
         self.registry.register("Layer1", mock_spec, "cuda")
         self.registry.register("Layer2", mock_spec, "cuda")
@@ -129,13 +130,13 @@ class TestLayerRegistry(unittest.TestCase):
 
 
 class TestExternalLayerRegistry(unittest.TestCase):
-    """测试外部层注册表"""
+    """Test external layer registry."""
 
     def setUp(self):
         self.registry = ExternalLayerRegistry()
 
     def test_register_and_get(self):
-        """测试注册和获取"""
+        """Test register and lookup."""
         mock_class = Mock
         self.registry.register(mock_class, "LlamaAttention")
 
@@ -143,7 +144,7 @@ class TestExternalLayerRegistry(unittest.TestCase):
         self.assertEqual(result, "LlamaAttention")
 
     def test_has(self):
-        """测试是否存在检查"""
+        """Test has checks."""
         mock_class = Mock
         self.assertFalse(self.registry.has(mock_class))
 
@@ -151,7 +152,7 @@ class TestExternalLayerRegistry(unittest.TestCase):
         self.assertTrue(self.registry.has(mock_class))
 
     def test_list_mappings(self):
-        """测试列出所有映射"""
+        """Test list mappings."""
         class MockClass1:
             pass
 
@@ -166,13 +167,14 @@ class TestExternalLayerRegistry(unittest.TestCase):
 
 
 class TestRegisterLayer(unittest.TestCase):
-    """测试全局注册函数"""
+    """Test global register helpers."""
 
     def setUp(self):
         get_global_layer_registry()._clear()
+        get_global_function_registry()._clear()
 
     def test_register_and_get_spec(self):
-        """测试全局注册和获取"""
+        """Test global register and lookup."""
         mock_spec = Mock()
         register_layer("TestLayer", mock_spec, "cuda")
 
@@ -181,19 +183,19 @@ class TestRegisterLayer(unittest.TestCase):
 
 
 class TestRegisterLayerKernel(unittest.TestCase):
-    """测试 register_layer_kernel 函数"""
+    """Test register_layer_kernel."""
 
     def setUp(self):
         get_global_layer_registry()._clear()
 
     def test_register_without_kernels_package(self):
-        """测试无 kernels 包时的注册"""
+        """Test registration when kernels package missing."""
         with patch("twinkle.kernel.layer.is_kernels_available", return_value=False):
             register_layer_kernel("TestLayer", repo_id="test/repo")
             self.assertIsNone(get_layer_spec("TestLayer"))
 
     def test_register_with_kernels_package(self):
-        """测试有 kernels 包时的注册"""
+        """Test registration when kernels package available."""
         if not is_kernels_available():
             self.skipTest("kernels package not available")
 
@@ -206,32 +208,31 @@ class TestRegisterLayerKernel(unittest.TestCase):
 
 
 class TestKernelizeModel(unittest.TestCase):
-    """测试 kernelize_model 函数"""
+    """Test kernelize_model."""
 
     def test_kernelize_without_kernels_enabled(self):
-        """测试 kernels 未启用时返回原模型"""
+        """Test returns original model when kernels disabled."""
         with patch("twinkle.kernel.layer.is_kernels_enabled", return_value=False):
             mock_model = Mock()
             result = kernelize_model(mock_model)
             self.assertEqual(result, mock_model)
 
-    @patch("twinkle.kernel.layer.is_kernels_enabled", return_value=True)
     @patch("twinkle.kernel.layer.is_kernels_available", return_value=False)
-    def test_kernelize_without_kernels_available(self, mock_available, mock_enabled):
-        """测试 kernels 不可用时返回原模型"""
+    def test_kernelize_without_kernels_available(self, mock_available):
+        """Test returns original model when kernels unavailable."""
         mock_model = Mock()
         result = kernelize_model(mock_model)
         self.assertEqual(result, mock_model)
 
 
 class TestRegisterExternalLayer(unittest.TestCase):
-    """测试 register_external_layer 函数"""
+    """Test register_external_layer."""
 
     def setUp(self):
         get_global_external_layer_registry()._clear()
 
     def test_register_external_layer(self):
-        """测试注册外部层"""
+        """Test registering external layer."""
         mock_class = Mock
 
         register_external_layer(mock_class, "LlamaAttention")
@@ -240,7 +241,7 @@ class TestRegisterExternalLayer(unittest.TestCase):
         self.assertEqual(result, "LlamaAttention")
 
     def test_register_external_qwen_layer(self):
-        """测试注册 Qwen2 外部层映射"""
+        """Test registering Qwen2 external layer mapping."""
         try:
             from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
         except ImportError:
@@ -253,7 +254,7 @@ class TestRegisterExternalLayer(unittest.TestCase):
         self.assertEqual(registry.get(Qwen2Attention), "LlamaAttention")
 
     def test_register_external_layer_adds_kernel_layer_name(self):
-        """测试 register_external_layer 添加 kernel_layer_name 属性"""
+        """Test register_external_layer sets kernel_layer_name."""
         if not is_kernels_available():
             self.skipTest("kernels package not available")
 
@@ -267,14 +268,14 @@ class TestRegisterExternalLayer(unittest.TestCase):
 
 
 class TestRegisterKernels(unittest.TestCase):
-    """测试 register_kernels 批量注册函数"""
+    """Test register_kernels batch registration."""
 
     def setUp(self):
         get_global_layer_registry()._clear()
 
     @patch("twinkle.kernel.layer.is_kernels_available", return_value=False)
     def test_register_layers_without_kernels(self, mock_available):
-        """测试无 kernels 包时批量注册"""
+        """Test layer batch registration when kernels missing."""
         config = {
             "layers": {
                 "LlamaAttention": {"repo_id": "kernels-community/llama-attention"},
@@ -287,26 +288,39 @@ class TestRegisterKernels(unittest.TestCase):
         self.assertIsNone(get_layer_spec("LlamaAttention"))
         self.assertIsNone(get_layer_spec("LlamaMLP"))
 
-    def test_register_functions_not_implemented(self):
-        """测试函数级别注册尚未实现"""
+    def test_register_functions(self):
+        """Test function batch registration."""
         config = {
             "functions": {
-                "apply_rotary_pos_emb": {"func_impl": Mock, "target_module": "test"}
+                "apply_rotary_pos_emb": {
+                    "func_impl": Mock,
+                    "target_module": "test",
+                    "device": "cpu",
+                    "mode": "inference",
+                }
             }
         }
 
         register_kernels(config)
+        specs = get_global_function_registry().list_specs()
+        self.assertEqual(len(specs), 1)
+        spec = specs[0]
+        self.assertEqual(spec.func_name, "apply_rotary_pos_emb")
+        self.assertEqual(spec.target_module, "test")
+        self.assertEqual(spec.func_impl, Mock)
+        self.assertEqual(spec.device, "cpu")
+        self.assertEqual(spec.mode, "inference")
 
 
 class TestModeSupport(unittest.TestCase):
-    """测试 mode 参数支持"""
+    """Test mode support."""
 
     def setUp(self):
         get_global_layer_registry()._clear()
 
     @patch("twinkle.kernel.layer.is_kernels_available", return_value=False)
     def test_register_with_mode_fallback(self, mock_available):
-        """测试注册时 mode=None 使用 FALLBACK"""
+        """Test fallback mode mapping when mode is None."""
         from twinkle.kernel.layer import register_layer_kernel, _to_hf_mode
         from kernels import Mode
 
@@ -314,7 +328,7 @@ class TestModeSupport(unittest.TestCase):
         self.assertEqual(result, Mode.FALLBACK)
 
     def test_to_hf_mode_conversion(self):
-        """测试 Twinkle mode 到 HF kernels Mode 的转换"""
+        """Test Twinkle mode to HF kernels Mode conversion."""
         if not is_kernels_available():
             self.skipTest("kernels package not available")
 
@@ -327,7 +341,7 @@ class TestModeSupport(unittest.TestCase):
 
     @patch("twinkle.kernel.layer.is_kernels_available", return_value=False)
     def test_register_multiple_modes(self, mock_available):
-        """测试为同一层注册不同 mode 的 kernel"""
+        """Test registering multiple modes for the same layer."""
         registry = get_global_layer_registry()
 
         class MockRepo:
