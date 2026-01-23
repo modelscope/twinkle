@@ -2,13 +2,15 @@
 
 from twinkle import remote_class
 from .base import Dataset, DatasetMeta
-from .. import remote_function
+from twinkle import remote_function
 
 
 @remote_class(execute='first')
 class LazyDataset(Dataset):
-    """A lazy encode dataset wrapper."""
+    """A lazy encode dataset wrapper.
 
+    This class is used to do lazy tokenize to preventing OOM, e.g. multimodal datasets.
+    """
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
         super().__init__(dataset_meta, **kwargs)
         self.do_encode = False

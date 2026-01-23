@@ -6,7 +6,7 @@ from peft import LoraConfig
 import twinkle
 from twinkle import get_device_placement, get_logger, DeviceGroup, Platform, DeviceMesh
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta, IterablePackingDataset
 from twinkle.model import TransformersModel
 
 logger = get_logger()
@@ -30,10 +30,11 @@ twinkle.initialize(mode='ray', nproc_per_node=4, groups=device_group, global_dev
 
 
 def create_dataset(data_slice=None):
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://modelscope/competition_math',data_slice=data_slice))
+    dataset = IterablePackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition',data_slice=data_slice))
     dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', truncation_strategy='left', max_length=1024)
-    dataset.map('CompetitionMathProcessor')
+    dataset.map('SelfCognitionProcessor')
     dataset.encode(batched=True)
+    dataset.pack_dataset()
     return dataset
 
 

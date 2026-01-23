@@ -2,13 +2,15 @@
 import functools
 import inspect
 import os
-from typing import Literal, List, Optional, Union, Callable
+from typing import Literal, List, Optional, Union, Callable, Any
 from typing import TypeVar
 
 import numpy as np
 
 from ..utils import DeviceGroup, DeviceMesh, Platform
 from ..utils import requires, framework_util, check_unsafe
+
+import torch.distributed as dist
 
 T1 = TypeVar('T1', bound=object)
 
@@ -68,7 +70,18 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
-    if _mode == 'ray':
+    if _mode == 'local':
+        if groups is not None:
+            _device_group = groups
+        else:
+            _device_group = [
+                DeviceGroup(
+                    name='default',
+                    ranks=list(range(Platform.get_world_size())),
+                    device_type=Platform.get_platform().device_prefix(),
+                )
+            ]
+    else:
         requires('ray')
         from ._ray import RayHelper
         if groups is not None:
@@ -84,18 +97,6 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         RayHelper.initialize(nproc_per_node=nproc_per_node,
                              ncpu_proc_per_node=ncpu_proc_per_node,
                              device_groups=_device_group)
-    else:
-        if groups is not None:
-            _device_group = groups
-        else:
-            _device_group = [
-                DeviceGroup(
-                    name='default',
-                    ranks=list(range(Platform.get_world_size())),
-                    device_type=Platform.get_platform().device_prefix(),
-                )
-            ]
-
 
 def is_master():
     if _mode == 'ray':
@@ -107,13 +108,20 @@ def is_master():
     return False
 
 def is_last_rank():
-    if _mode == 'ray':
-        if 'TWINKLE_MODE' in os.environ:
-            return True
-    elif _mode == 'local':
-        if Platform.is_last_rank():
-            return True
-    return False
+    if not dist.is_initialized():
+        return True
+
+    from megatron.core import parallel_state as mpu
+    if mpu.is_initialized():
+        # Only DP rank 0 writes
+        dp_rank = mpu.get_data_parallel_rank()
+        if dp_rank != 0:
+            return False
+        # For PP, only last stage needs to write certain weights
+        # (handled separately in export_weights)
+        return True
+
+    return dist.get_rank() == dist.get_world_size() - 1
 
 def get_device_placement(device_group=None) -> str:
     """Get the device placement graph, can be used to show the training topology.
@@ -237,7 +245,7 @@ def get_device_placement(device_group=None) -> str:
                 parallelism = []
                 for dim in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
                     ws = mesh._get_world_size_for_dim(dim)
-                    if ws > 1:
+                    if ws is not None and ws > 1:
                         parallelism.append(f"{dim.upper()}={ws}")
 
                 if parallelism:
@@ -266,7 +274,7 @@ def _get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable], result):
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable], result: List[Any], device_mesh: DeviceMesh=None):
     if not result:
         return result
 
@@ -274,7 +282,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         output = []
         for i in range(len(result[0])):
             _single_result = [r[i] for r in result]
-            output.append(_collect_func(method, _single_result))
+            output.append(_collect_func(method, _single_result, device_mesh=device_mesh))
         return output
     if method == 'none':
         if isinstance(result, list) and len(result) == 1:
@@ -286,12 +294,16 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         if isinstance(result[0], np.ndarray):
             return np.array(flatten)
         return type(result[0])(flatten)
-    elif method == 'mean':
+    elif method in ('avg', 'mean'):
+        # Fixes "Unsupported collect method: mean" by aliasing to avg.
         return np.mean(result)
     elif method == 'sum':
         return np.sum(result)
     elif method == 'first':
         return result[0]
+    elif method == 'last_pp':
+        assert device_mesh is not None
+        return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif isinstance(method, Callable):
         # Callable
         return method(result)
@@ -492,7 +504,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
 def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first'], Callable] = 'none',
+                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
                     sync: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
@@ -535,7 +547,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                                                        execute, device_mesh, args, kwargs)
                     execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
                     result = execute_method(func.__name__, _workers_and_args)
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result)
+                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result,
+                                                                    getattr(self, 'device_mesh', None))
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self

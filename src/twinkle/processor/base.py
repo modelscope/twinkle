@@ -15,6 +15,7 @@ class InputProcessor:
         'labels': -100,
         'loss_scale': 0.0,
         'position_ids': -1,
+        'length': -1,
     }
 
     def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, **kwargs):
@@ -23,10 +24,14 @@ class InputProcessor:
         self.padding_free = padding_free
 
     @remote_function()
-    def __call__(self, inputs: Union[InputFeature, List[InputFeature]]):
+    def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
         if isinstance(inputs, list):
-            inputs = self.collate_fn(inputs)
-        return self.prepare_inputs(inputs)
+            inputs = self.collate_fn(inputs, **kwargs)
+        if not isinstance(inputs, list):
+            return self.prepare_inputs(inputs)
+        else:
+            return [self.prepare_inputs(_input) for _input in inputs]
+        
 
     @remote_function()
     def prepare_inputs(self, inputs: InputFeature) -> InputFeature:
@@ -53,8 +58,7 @@ class InputProcessor:
             padded_sequences.append(padded_seq)
         return torch.stack(padded_sequences)
 
-    @remote_function()
-    def collate_fn(self, inputs: List[InputFeature]) -> Dict[str, Any]:
+    def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
         keys = inputs[0].keys()
         result = {}
@@ -62,10 +66,13 @@ class InputProcessor:
             for key in keys:
                 values = [item[key] for item in inputs]
                 if isinstance(values[0], np.ndarray):
-                    value = np.concatenate(values, axis=-1)
+                    value = np.concatenate(values, axis=-1).unsqueeze(0)
                     value = torch.from_numpy(value)
+                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
+                    values = [[v for lst in values for v in lst]]
+                    value = torch.tensor(values)
                 elif isinstance(values[0], torch.Tensor):
-                    value = torch.cat(values, dim=-1)
+                    value = torch.cat(values, dim=-1).unsqueeze(0)
                 else:
                     value = values
                 result[key] = value
@@ -77,7 +84,7 @@ class InputProcessor:
                 if isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
-                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float)):
+                elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
                     values = [torch.tensor(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                 elif isinstance(values[0], torch.Tensor):
@@ -86,3 +93,26 @@ class InputProcessor:
                     result[key] = values
             result = InputFeature(**result)
         return to_transformers_dict(result)
+
+    @remote_function()
+    def collate_fn(self, inputs: List[InputFeature], micro_batch_size: Optional[int] = None, variable_seq_lengths=False) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        if micro_batch_size is None:
+            return self._collate_macro_batch(inputs)
+        elif variable_seq_lengths:
+            assert len(inputs) > micro_batch_size
+            outputs = []
+            for i in range(0, len(inputs), micro_batch_size):
+                outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))
+            return outputs
+        else:
+            res = self._collate_macro_batch(inputs)
+            keys = list(res.keys())
+            outputs = []
+            for i in range(0, len(inputs), micro_batch_size):
+                output = {}
+                for key in keys:
+                    output[key] = res[key][i:i + micro_batch_size]
+                outputs.append(output)
+            return outputs
+
+

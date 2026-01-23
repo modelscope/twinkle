@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import multiprocessing as mp
 from typing import TypeVar
-
+import numpy as np
 from twinkle.infra import remote_class, remote_function
-from .iterable_dataset import IterableDataset
 from .base import DatasetMeta
+from .iterable_dataset import IterableDataset
 from .packing_dataset import PackingDataset
 
 _T = TypeVar('_T')
@@ -12,12 +13,23 @@ _T = TypeVar('_T')
 
 @remote_class(execute='first')
 class IterablePackingDataset(IterableDataset):
+    """An iterable packing dataset wrapper, this will use binpacking to pack the iterable dataset rows to minimum number of batches,
+        whose lengths are almost `max_length`
+
+    Args:
+        dataset_meta: The dataset meta
+        packing_interval: Packing within `packing_interval` rows
+        packing_num_proc: The number of processes to use for packing
+        cyclic: cyclic packing will start from the beginning if the dataset has ended, default `False`
+    """
 
     def __init__(self, dataset_meta: DatasetMeta,
                  packing_interval: int = 128,
                  packing_num_proc: int = 1,
                  cyclic: bool = False, **kwargs):
+        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self.packing_num_proc = packing_num_proc
+        kwargs['streaming'] = True
         super().__init__(dataset_meta, **kwargs)
         self._out_queue = mp.Queue()
         self.packed_idx = []
@@ -27,6 +39,15 @@ class IterablePackingDataset(IterableDataset):
         self._out_queue = mp.Queue()
         self.workers = []
         self.cyclic = cyclic
+    
+    @remote_function()
+    def set_template(self, template_cls, **kwargs):
+        super().set_template(template_cls, **kwargs)
+        assert self.template.truncation_strategy != 'split', 'Iterable packing does not support truncation_strategy==`split`'
+
+    @remote_function()
+    def pack_dataset(self):
+        """Call to start packing dataset"""
         for _ in range(self.packing_num_proc):
             worker = mp.Process(target=self._processor, daemon=True)
             worker.start()
@@ -35,8 +56,9 @@ class IterablePackingDataset(IterableDataset):
     def _processor(self):
         while True:
             i, data = self._in_queue.get()
-            encoded_data = self.template.batch_encode(data, return_length=True)
-            self._out_queue.put((i, encoded_data))
+            encoded_data = self.template.batch_encode([data])
+            data.update(encoded_data[0])
+            self._out_queue.put((i, data))
 
     def _put_data_in_queue(self, iterator) -> int:
         for i in range(self.packing_interval):
@@ -59,7 +81,7 @@ class IterablePackingDataset(IterableDataset):
         return last_res
 
     @staticmethod
-    def cyclic_iter(iterable):
+    def _cyclic_iter(iterable):
         while True:
             for x in iterable:
                 yield x
@@ -73,7 +95,7 @@ class IterablePackingDataset(IterableDataset):
             return
 
         if self.cyclic:
-            iterator = self.cyclic_iter(self.dataset)
+            iterator = self._cyclic_iter(self.dataset)
         else:
             iterator = iter(self.dataset)
         data = []
@@ -84,8 +106,14 @@ class IterablePackingDataset(IterableDataset):
             data = self._fetch_data_out_queue(data, num_samples)
             sequences, data = PackingDataset._calculate_matched_group(data, max_length, is_finished=finished)
             res = []
-            for row in sequences:
-                res.append([r[0] for r in row])
+            for rows in sequences:
+                output = {}
+                # rows: [({'input_ids': [0,1,2,...]}, length), ({'input_ids': [0,1,2,...]}, length)]
+                for key in rows[0][0]:
+                    output[key] = [r[0][key] for r in rows]
+                    if isinstance(rows[0][0][key], (list, np.ndarray)) and isinstance(rows[0][0][key][0], (int, float, np.number)):
+                        output[key] = [v for lst in output[key] for v in lst]
+                res.append(output)
             yield from res
             if finished:
                 break
