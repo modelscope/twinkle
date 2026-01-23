@@ -26,6 +26,17 @@ class MegatronStrategy:
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
+    
+    def _check_device_mesh(self):
+        from megatron.core import parallel_state as mpu
+        # Make sure device_mesh and mpu match each other
+        assert self.device_mesh.dp_rank == mpu.get_data_parallel_rank()
+        if self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
+            assert self.device_mesh.tp_rank == mpu.get_tensor_model_parallel_rank()
+        if self.device_mesh.pp_world_size is not None and self.device_mesh.pp_world_size > 1:
+            assert self.device_mesh.pp_rank == mpu.get_pipeline_model_parallel_rank()
+        if self.device_mesh.vpp_size is not None and self.device_mesh.vpp_size > 1:
+            assert self.device_mesh.vpp_size == mpu.get_virtual_pipeline_model_parallel_world_size()
 
     @property
     def params_type(self) -> torch.dtype:
@@ -69,13 +80,13 @@ class MegatronStrategy:
     def wrap_model(
         self,
         model: List[nn.Module],
-        optimizer: Optional[torch.optim.Optimizer] = None,
         use_distributed_optimizer: bool = True,
     ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
         if self.device_mesh.world_size <= 1:
             return model, optimizer
 
-        return self._wrap_with_megatron_ddp(model, optimizer,
+        self._check_device_mesh()
+        return self._wrap_with_megatron_ddp(model,
                                             use_distributed_optimizer)
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
@@ -84,7 +95,7 @@ class MegatronStrategy:
         _models = []
         for _model in model:
             if isinstance(_model, (MegatronDDP, TorchDDP)):
-                _models.append(model.module)
+                _models.append(_model.module)
             else:
                 _models.append(_model)
         return _models
@@ -92,9 +103,8 @@ class MegatronStrategy:
     @staticmethod
     def _wrap_with_megatron_ddp(
         model: List[nn.Module],
-        optimizer: Optional[torch.optim.Optimizer],
         use_distributed_optimizer: bool,
-    ) -> Tuple[List[nn.Module], Optional[torch.optim.Optimizer]]:
+    ) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.transformer.module import Float16Module
         from megatron.core.transformer import TransformerConfig
@@ -102,7 +112,6 @@ class MegatronStrategy:
 
         wrapped_models = []
         for _model in model:
-            assert not isinstance(_model, PeftModel), 'Cannot wrap peft model.'
             config: TransformerConfig = _model.config # noqa
 
             if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
@@ -127,7 +136,7 @@ class MegatronStrategy:
             wrapped_model.broadcast_params()
             wrapped_models.append(wrapped_model)
 
-        return wrapped_models, optimizer
+        return wrapped_models
 
     def split_inputs_for_cp(self, inputs):
         # Calculate padded seq_length based on parallelism requirements
@@ -217,11 +226,54 @@ class MegatronStrategy:
             attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
             batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
 
-        inputs['input_ids'] = input_ids
-        inputs['position_ids'] = position_ids
-        inputs['attention_mask'] = attention_mask
-        inputs['labels'] = batch_labels
-        return inputs
+        return {
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
+            'labels': batch_labels,
+        }
+
+    def gather_loss_for_cp(self, output_tensor, labels):
+        import torch
+        from megatron.core import parallel_state as mpu
+        cp_size = mpu.get_context_parallel_world_size()
+        labels_for_mask = labels
+        # output_tensor is per-token loss [batch, seq]
+        # Create loss mask from labels (ignore -100)
+        loss_mask = (labels_for_mask != -100).float()
+
+        # Flatten and compute mean
+        losses = output_tensor.float().view(-1)
+        loss_mask_flat = loss_mask.view(-1)
+
+        # Compute local sum and count
+        local_loss_sum = torch.sum(losses * loss_mask_flat)
+        local_count = loss_mask_flat.sum()
+
+        # For CP > 1, aggregate loss across CP ranks
+        if cp_size > 1:
+            # All-reduce the count across CP ranks
+            total_count = local_count.clone()
+            torch.distributed.all_reduce(
+                total_count,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_context_parallel_group()
+            )
+
+            # All-reduce the loss sum
+            total_loss_sum = local_loss_sum.clone()
+            torch.distributed.all_reduce(
+                total_loss_sum,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_context_parallel_group()
+            )
+
+            # Return global mean, divided by cp_size to counteract Megatron's multiplication
+            loss = (total_loss_sum / total_count.clamp(min=1)) / cp_size
+        else:
+            loss = local_loss_sum / local_count.clamp(min=1)
+
+        return loss, {'loss': loss.detach()}
 
     def get_model_config(
         self,

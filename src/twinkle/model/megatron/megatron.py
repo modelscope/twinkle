@@ -8,26 +8,27 @@ from typing import Any, Dict, List, Literal, Optional, Type, Union
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from peft import LoraConfig, get_peft_model
+from peft import PeftModel, PeftConfig
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from peft import PeftModel, PeftConfig
-from peft import LoraConfig, get_peft_model
-from transformers import PretrainedConfig
 from transformers import AutoConfig
+from transformers import PretrainedConfig
+
 import twinkle
+import twinkle.metric
 from twinkle import DeviceMesh, remote_class, remote_function, template, Platform
+from twinkle import requires
+from twinkle import torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss, MegatronCrossEntropyLoss
+from twinkle.loss import Loss
+from twinkle.metric import Metric, LossMetric, Accuracy
+from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle import requires
-import twinkle.metric
-from twinkle import torch_util
-from twinkle.model.base import TwinkleModel
-from .strategy import MegatronStrategy
-from twinkle.metric import Metric, LossMetric, Accuracy
 from twinkle.utils import construct_class
+from .strategy import MegatronStrategy
 
 
 @dataclass
@@ -52,7 +53,6 @@ class MegatronOptimizerGroup:
     metrics: List[Metric] = field(default_factory=list)
     _device_mesh: DeviceMesh = None
     # Megatron optimizer specific fields
-    is_megatron_optimizer: bool = False
     _last_grad_norm: float = 0.0
     _last_step_success: bool = True
 
@@ -110,19 +110,17 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
-        # Create Megatron strategy
-        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
+        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
         self.model: List[nn.Module] = self._create_megatron_model(model_path, load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
-        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = self._construct_megatron_optimizer_group()
+        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
         MegatronPeft().patch()
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
-            loss_instance=MegatronCrossEntropyLoss(),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh),
             _device_mesh=self.device_mesh,
@@ -186,7 +184,8 @@ class MegatronModel(TwinkleModel, nn.Module):
             pp_size=self.device_mesh.pp_world_size,
             cp_size=self.device_mesh.cp_world_size,
             ep_size=self.device_mesh.ep_size,
-            vpp_size=self.device_mesh.vpp_size,
+            vpp_size=self.device_mesh.vpp_size if self.device_mesh.vpp_size > 1 else None,
+            order=self.device_mesh.order,
             params_dtype=params_dtype,
             seed=self._seed,
             use_cpu_initialization=False,
@@ -213,20 +212,18 @@ class MegatronModel(TwinkleModel, nn.Module):
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
         model_device = next(model.parameters()).device
         torch.cuda.set_device(Platform.get_local_rank())
-        if model_device.type == 'cpu':
-            model = model.to(Platform.get_local_device())
+        model = model.to(Platform.get_local_device())
         torch_util.synchronize()
         return model
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             assert len(self.optimizer_group) == 1
+            self.model = self.strategy.wrap_model(self.model)
             optimizer = self.optimizer_group[_default_adapter_name].optimizer
             if optimizer is None:
                 optimizer = self._create_megatron_optimizer()
                 self.optimizer_group[_default_adapter_name].optimizer = optimizer
-            self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-            self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self._model_wrapped = True
 
     @staticmethod
@@ -267,6 +264,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        loss_instance = self.optimizer_group[adapter_name].loss_instance
 
         vpp_size = self.device_mesh.vpp_size
         if vpp_size is None or vpp_size == 1:
@@ -309,6 +307,12 @@ class MegatronModel(TwinkleModel, nn.Module):
             else:
                 seq_length = original_seq_length
 
+        def post_loss_function(output_tensor, inputs):
+            if loss_instance is not None:
+                # TODO
+                loss = loss_instance(inputs, output_tensor)
+            return self.strategy.gather_loss_for_cp(output_tensor, inputs['labels'])
+
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
@@ -328,7 +332,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 attention_mask=attention_mask,
                 labels=batch_labels,  # Pass labels to let Megatron compute loss
             )
-            return output_tensor, partial(optimizer_config.loss_instance.__call__, batch)
+            return output_tensor, partial(post_loss_function, inputs=batch)
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -348,10 +352,10 @@ class MegatronModel(TwinkleModel, nn.Module):
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=1,
+            num_microbatches=len(inputs) if isinstance(inputs, list) else 1,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
-            forward_only=False,
+            forward_only=True,
         )
 
         # Extract loss from results (only last PP stage returns non-empty)
@@ -417,12 +421,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-
-        vpp_size = self.device_mesh.vpp_size
-        if vpp_size is None or vpp_size == 1:
-            micro_batch_size = None
-        else:
-            micro_batch_size = 1
+        loss_instance = self.optimizer_group[adapter_name].loss_instance
 
         if isinstance(inputs, dict) and self._not_encoded(inputs):
             assert optimizer_config.template is not None, \
@@ -434,7 +433,15 @@ class MegatronModel(TwinkleModel, nn.Module):
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
+
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size is None or vpp_size == 1:
+            inputs = [processor(inputs)]
+            micro_batch_size = inputs[0]['input_ids'].shape[0]
+        else:
+            if micro_batch_size is None:
+                micro_batch_size = 1
+            inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
         self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
@@ -444,8 +451,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if self.variable_seq_lengths:
             seq_length = None
         else:
-            _example = inputs[0] if isinstance(inputs, list) else inputs
-            original_seq_length = _example['input_ids'].shape[1] if 'input_ids' in _example else _example['input_embedding']
+            original_seq_length = inputs[0]['input_ids'].shape[1]
             if cp_size > 1:
                 divisor = 2 * cp_size
             elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
@@ -457,6 +463,12 @@ class MegatronModel(TwinkleModel, nn.Module):
                 seq_length = original_seq_length + (divisor - original_seq_length % divisor)
             else:
                 seq_length = original_seq_length
+
+        def post_loss_function(output_tensor, inputs):
+            if loss_instance is not None:
+                # TODO
+                loss = loss_instance(inputs, output_tensor)
+            return self.strategy.gather_loss_for_cp(output_tensor, inputs['labels'])
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -477,7 +489,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 attention_mask=attention_mask,
                 labels=batch_labels,  # Pass labels to let Megatron compute loss
             )
-            return output_tensor, partial(optimizer_config.loss_instance.__call__, batch)
+            return output_tensor, partial(post_loss_function, inputs=batch)
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -487,7 +499,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         vpp_size = self.device_mesh.vpp_size
 
         if vpp_size is None or vpp_size == 1:
-            data_iter = [iter(inputs)]
+            data_iter = iter(inputs)
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
@@ -497,23 +509,26 @@ class MegatronModel(TwinkleModel, nn.Module):
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=1,
+            num_microbatches=len(inputs),
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
 
         # Extract loss from results (only last PP stage returns non-empty)
-        loss = 0.0
-
+        loss = torch.tensor(0.0).to(Platform.get_local_device())
+        count = 0
         if losses:
             for loss_dict in losses:
                 if isinstance(loss_dict, dict) and 'loss' in loss_dict:
-                    loss = loss_dict['loss']
-                    break
+                    loss += loss_dict['loss']
+                    count += 1
                 elif isinstance(loss_dict, torch.Tensor):
-                    loss = loss_dict
-                    break
+                    loss += loss_dict
+                    count += 1
+        
+        if count > 0:
+            loss /= count
 
         # For PP > 1, broadcast loss from last PP stage to all ranks
         # Note: mpu is imported at module level, no need to reimport
@@ -529,7 +544,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
             loss = loss_tensor.item()
 
-        optimizer_config.cur_step += 1
+        optimizer_config.cur_step += (len(inputs) if isinstance(inputs, list) else 1)
 
         # Critical: Synchronize all DP replicas before returning
         # This ensures all DP replicas complete the same training step before
@@ -549,29 +564,8 @@ class MegatronModel(TwinkleModel, nn.Module):
                        max_grad_norm: float = 1.0,
                        norm_type: int = 2,
                        **kwargs):
-        """Clip gradient norm.
-
-        Args:
-            max_grad_norm: Maximum gradient norm.
-            norm_type: Type of norm to use.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Total norm of gradients.
-        """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-
-        if optimizer_config.is_megatron_optimizer:
-            # Megatron optimizer handles gradient clipping in step()
-            # Return the grad_norm from last step if available
-            return getattr(optimizer_config, '_last_grad_norm', 0.0)
-
-        parameters = self._get_trainable_parameters(adapter_name).values()
-
-        return torch.nn.utils.clip_grad_norm_(
-            parameters, max_grad_norm,
-            norm_type=norm_type).detach().cpu().numpy()
+        # Megatron optimizer will cover this function.
+        pass
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):
@@ -600,15 +594,11 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         optimizer = optimizer_config.optimizer
         assert optimizer is not None, 'Set optimizer correctly before stepping'
-
-        if optimizer_config.is_megatron_optimizer:
-            # Megatron optimizer step() returns (success, grad_norm, num_zeros)
-            success, grad_norm, num_zeros = optimizer.step(**kwargs)
-            # Store grad_norm for later retrieval
-            optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
-            optimizer_config._last_step_success = success
-        else:
-            optimizer.step(**kwargs)
+        # Megatron optimizer step() returns (success, grad_norm, num_zeros)
+        success, grad_norm, num_zeros = optimizer.step()
+        # Store grad_norm for later retrieval
+        optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
+        optimizer_config._last_step_success = success
 
     def _is_model_ddp_wrapped(self) -> bool:
         """Check if model is wrapped with DDP.
@@ -720,15 +710,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        use_megatron_optimizer = kwargs.pop('use_megatron_optimizer', False)
 
         # Check if requesting Megatron distributed optimizer
-        if optimizer_cls == 'MegatronDistributed' or use_megatron_optimizer:
-            optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)
-            optimizer_config.is_megatron_optimizer = True
+        if not optimizer_cls or optimizer_cls in ('MegatronDistributedOptimizer', 'default'):
+            optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs) # noqa
         else:
-            optimizer_config.optimizer = construct_class(optimizer_cls, Optimizer, torch.optim, **kwargs)
-            optimizer_config.is_megatron_optimizer = False
+            raise NotImplementedError(f'Unsupported optimizer: {optimizer_cls}, only support MegatronOptimizer currently.')
 
     def _create_megatron_optimizer(self, **kwargs):
         """Create Megatron distributed optimizer.
@@ -749,17 +736,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             MegatronOptimizer instance.
         """
         from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
-        from megatron.core import parallel_state as mpu
 
         # Build optimizer config
-        lr = kwargs.get('lr', 1e-4)
-        use_distributed_optimizer: bool = kwargs.get('use_distributed_optimizer', self.use_distributed_optimizer)
+        lr = kwargs.pop('lr', 1e-4)
+        use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
 
         opt_config = OptimizerConfig(
             optimizer='adam',
             lr=lr,
             min_lr=kwargs.get('min_lr', 0.0),
-            weight_decay=kwargs.get('weight_decay', 0.0),
+            weight_decay=kwargs.get('weight_decay', 0.01),
             adam_beta1=kwargs.get('adam_beta1', 0.9),
             adam_beta2=kwargs.get('adam_beta2', 0.999),
             adam_eps=kwargs.get('adam_eps', 1e-8),
@@ -768,23 +754,32 @@ class MegatronModel(TwinkleModel, nn.Module):
             use_distributed_optimizer=use_distributed_optimizer,
             overlap_param_gather=kwargs.get('overlap_param_gather', False),
             log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
+            **kwargs,
         )
 
         # For PEFT models, we need to handle the case where model is not DDP-wrapped
         # We create a temporary wrapper to satisfy Megatron's optimizer requirements
-        model_chunks = [self.model]
-
-        # Check if model has ddp_config (required for distributed optimizer)
-        if not hasattr(self.model, 'ddp_config') and use_distributed_optimizer:
-            # For PEFT models without DDP, fall back to non-distributed optimizer
-            # but still use Megatron's optimized implementation
-            opt_config.use_distributed_optimizer = False
-
+        model_chunks = self.model
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
         )
         return optimizer
+
+    def _create_megatron_scheduler(self, optimizer, lr_decay_steps, max_lr=1e-4, **kwargs):
+        from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+        return OptimizerParamScheduler(
+            optimizer,
+            init_lr=kwargs.pop('init_lr', 0.0),
+            max_lr=max_lr,
+            min_lr=kwargs.pop('min_lr', 0.0),
+            lr_warmup_steps=kwargs.pop('lr_warmup_steps', 0),
+            lr_decay_steps=lr_decay_steps,
+            lr_decay_style=kwargs.pop('lr_decay_style', 'cosine'),
+            start_wd=kwargs.pop('start_wd', 0.01),
+            end_wd=kwargs.pop('end_wd', 0),
+            **kwargs,
+        )
 
     def _get_trainable_parameters(
             self,
@@ -803,9 +798,10 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         params = {}
         model = self.strategy.unwrap_model(self.model)
-        for name, param in model.named_parameters():
-            if param.requires_grad and (pattern.search(name) or is_default):
-                params[name] = param
+        for _model in model:
+            for name, param in _model.named_parameters():
+                if param.requires_grad and (pattern.search(name) or is_default):
+                    params[name] = param
         return params
 
     @remote_function(dispatch='all')
@@ -819,24 +815,30 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.lr_scheduler = construct_class(scheduler_cls, LRScheduler, torch.optim.lr_scheduler, **kwargs)
+        if not scheduler_cls or scheduler_cls in ('OptimizerParamScheduler', 'default'):
+            optimizer_config.lr_scheduler = self._create_megatron_scheduler(**kwargs) # noqa
+        else:
+            raise NotImplementedError(f'Unsupported scheduler: {scheduler_cls}, only support OptimizerParamScheduler currently.')
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
-        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
     @remote_function(dispatch='all', sync=True)
-    def save(self, output_dir: str, **kwargs):
+    def save(self, output_dir: str, interval=1, **kwargs):
         """Save model checkpoint.
 
         Args:
             output_dir: Output directory.
+            interval: Save each interval steps.
             **kwargs: Additional arguments.
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.cur_step % interval != 0:
+            return
         save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
 
         if save_format == 'hf':

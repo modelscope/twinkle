@@ -4,7 +4,7 @@ import inspect
 import os
 import sys
 from types import ModuleType
-from typing import Type, TypeVar, Union
+from typing import Type, TypeVar, Union, List
 
 from ..hub import MSHub, HFHub
 from .unsafe import trust_remote_code
@@ -47,7 +47,7 @@ class Plugin:
         raise ValueError(f'Cannot find any subclass of {plugin_base.__name__}.')
 
 
-def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: ModuleType, **init_args) -> T:
+def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: Union[List[ModuleType], ModuleType], **init_args) -> T:
     """Try to load a class.
 
     Args:
@@ -58,6 +58,8 @@ def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: Mo
     Returns:
         The instance
     """
+    if not isinstance(module_T, list):
+        module_T = [module_T]
     if isinstance(func, class_T):
         # Already an instance
         return func
@@ -66,8 +68,10 @@ def construct_class(func: Union[str, Type[T], T], class_T: Type[T], module_T: Mo
         return func(**init_args)
     elif isinstance(func, str):
         # Is a subclass name, or a plugin name
-        if hasattr(module_T, func):
-            cls = getattr(module_T, func)
+        for module in module_T:
+            if hasattr(module, func):
+                cls = getattr(module, func)
+                break
         else:
             cls = Plugin.load_plugin(func, class_T)
         return cls(**init_args)

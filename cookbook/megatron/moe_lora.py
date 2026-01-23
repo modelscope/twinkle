@@ -23,7 +23,6 @@ from twinkle import (DeviceGroup, DeviceMesh, Platform, get_device_placement,
                      get_logger)
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import MegatronCrossEntropyLoss
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 
@@ -33,7 +32,7 @@ GAS = 16 # gradient accumulation steps
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode',
                     type=str,
-                    default='local',
+                    default='ray',
                     choices=['local', 'ray'])
 parser.add_argument('--dp_size', type=int, default=2)
 parser.add_argument('--tp_size', type=int, default=2)
@@ -89,6 +88,8 @@ def train():
 
     twinkle.initialize(
         mode=args.mode,
+        nproc_per_node=16,
+        ncpu_proc_per_node=16,
         groups=device_group,
         global_device_mesh=device_mesh,
         lazy_collect=True,
@@ -122,23 +123,22 @@ def train():
     )
     adapter_name = 'lora'
     model.add_adapter_to_model(adapter_name, lora_config)
+    model.set_optimizer('default', lr=1e-4)
+    model.set_lr_scheduler('default', max_lr=1e-4, lr_decay_steps=len(dataloader))
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs(adapter_name=adapter_name))
+    logger.info(model.get_train_configs())
 
     for step, batch in enumerate(dataloader):
-        output = model.forward_backward(inputs=batch,
-                                        micro_batch_size=1,
-                                        adapter_name=adapter_name)
+        output = model.forward_backward(inputs=batch)
         if step % GAS == 0:
-            logger.info(f'Step {step // GAS}, loss: {output}')
+            logger.info(f'Step {step // GAS}, loss: {output()}')
         model.clip_grad_and_step()
-        if step > 0 and step % (100 * GAS) == 0:
-            model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
+        model.save('./output/megatron_moe_lora', interval=50)
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * GAS:
             logger.info(f'Reached max_steps ({args.max_steps}), stopping.')
             break
-    model.save('./output/megatron_moe_lora', adapter_name=adapter_name)
+    model.save('./output/megatron_moe_lora')
     logger.info('Training completed!')
 
 
@@ -158,7 +158,4 @@ def cleanup():
 
 
 if __name__ == '__main__':
-    try:
-        train()
-    finally:
-        cleanup()
+    train()
