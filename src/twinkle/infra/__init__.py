@@ -4,14 +4,11 @@ import inspect
 import os
 from typing import Literal, List, Optional, Union, Callable, Any
 from typing import TypeVar
-import torch.distributed as dist
+
 import numpy as np
 
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform
 from twinkle.utils import requires, framework_util, check_unsafe
-from twinkle.utils import get_logger
-
-logger = get_logger()
 
 
 T1 = TypeVar('T1', bound=object)
