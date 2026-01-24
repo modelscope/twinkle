@@ -10,7 +10,7 @@ from .device_mesh_sampler import DeviceMeshSampler
 from .device_mesh_fetcher import DeviceMeshIterableFetcher
 
 
-@remote_class()
+@remote_class(execute='first')
 class DataLoader:
     """A DataLoader wrapper, will retry failed samples and return the data belongs to the current dp rank.
 
@@ -45,8 +45,9 @@ class DataLoader:
         self.dataloader_params['worker_init_fn'] = partial(
             DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_rank or 0)
     
-    @remote_function(execute='first')
+    @remote_function()
     def __len__(self):
+        self._lazy_init_dataloader()
         return len(self.dataloader)
 
     @staticmethod
@@ -55,11 +56,10 @@ class DataLoader:
         init_seed = torch.initial_seed() % 2 ** 32
         worker_seed = num_workers * rank + init_seed + worker_id
         framework_util.seed_everything(worker_seed)
-
-    @remote_function(collect='flatten') # flatten will be used in `__next__`
-    def __iter__(self):
-        from torch.utils.data import DataLoader as TorchDataLoader, IterableDataset
+    
+    def _lazy_init_dataloader(self):
         if self.dataloader is None:
+            from torch.utils.data import DataLoader as TorchDataLoader, IterableDataset
             if 'collate_fn' not in self.dataloader_params:
                 self.dataloader_params['collate_fn'] = lambda x: x
             self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params)
@@ -69,6 +69,10 @@ class DataLoader:
                 self._repeat_sample_and_shard()
                 self.dataloader.__initialized = True
 
+    @remote_function()
+    def __iter__(self):
+        from torch.utils.data import IterableDataset
+        self._lazy_init_dataloader()
         _iter = self.dataloader.__iter__()
         if isinstance(self.dataset, IterableDataset):
             _iter._dataset_fetcher = DeviceMeshIterableFetcher(_iter._dataset_fetcher.dataset,

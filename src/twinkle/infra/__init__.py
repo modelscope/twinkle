@@ -13,6 +13,8 @@ from ..utils.logger import get_logger
 
 logger = get_logger()
 
+import torch.distributed as dist
+
 T1 = TypeVar('T1', bound=object)
 
 _mode: Optional[Literal['local', 'ray']] = 'local'
@@ -108,6 +110,21 @@ def is_master():
             return True
     return False
 
+def is_last_rank():
+    if not dist.is_initialized():
+        return True
+
+    from megatron.core import parallel_state as mpu
+    if mpu.is_initialized():
+        # Only DP rank 0 writes
+        dp_rank = mpu.get_data_parallel_rank()
+        if dp_rank != 0:
+            return False
+        # For PP, only last stage needs to write certain weights
+        # (handled separately in export_weights)
+        return True
+
+    return dist.get_rank() == dist.get_world_size() - 1
 
 def get_device_placement(device_group=None) -> str:
     """Get the device placement graph, can be used to show the training topology.
@@ -304,21 +321,14 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         return [(worker, args, kwargs) for worker in workers]
     elif dispatch == 'slice':
         result = []
-        # if device_mesh is not None:
-            # TODO this may occurs error when remote calls remote
-            # Comment this because remote_class supports `first``
-            # assert device_mesh.world_size == len(workers)
-        length = len(workers) if not device_mesh else device_mesh.data_world_size
-        length = min(length, len(workers))
-        dp_repeat = len(workers) // length
+        length = len(workers)
 
         def dispatch_func(arg, n):
             if isinstance(arg, list):
                 _args = []
                 k, m = divmod(len(arg), n)
                 for i in range(n):
-                    for j in range(dp_repeat):
-                        _args.append(arg[i * k + min(i, m):(i + 1) * k + min(i + 1, m)])
+                    _args.append(arg[i * k + min(i, m):(i + 1) * k + min(i + 1, m)])
                 return _args
             else:
                 return [arg] * n
@@ -330,6 +340,31 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
             result.append((workers[i], sliced_args, sliced_kwargs))
 
+        return result
+    elif dispatch == 'slice_dp':
+        result = []
+        # if device_mesh is not None:
+            # TODO this may occurs error when remote calls remote
+            # Comment this because remote_class supports `first``
+            # assert device_mesh.world_size == len(workers)
+        length = len(workers)
+
+        def dispatch_func(arg, n):
+            if isinstance(arg, list):
+                _args = []
+                for i in range(n):
+                    _args.append(arg[device_mesh.get_slice(len(arg), i)])
+                return _args
+            else:
+                return [arg] * n
+
+        args = [dispatch_func(arg, length) for arg in args]
+        kwargs = {k: dispatch_func(v, length) for k, v in kwargs.items()}
+
+        for i in range(length):
+            sliced_args = tuple(arg[i] for arg in args)
+            sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
+            result.append((workers[i], sliced_args, sliced_kwargs))
         return result
     elif isinstance(dispatch, Callable):
         length = len(workers)
@@ -413,6 +448,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     if device_mesh is None:
                         device_mesh = _device_mesh
                         kwargs[device_mesh_name] = _device_mesh
+                    
+                    if 'dataloader' in cls.__name__.lower():
+                        # Dataloader runs in simple worker mode, so returns all data to driver
+                        kwargs[device_mesh_name] = DeviceMesh.from_sizes(dp_size=1)
 
                     if _device_group and remote_group:
                         device_group = [dg for dg in _device_group if dg.name == remote_group][0]
@@ -488,7 +527,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
     return decorator
 
 
-def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice',
+def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
                     sync: bool = False):
@@ -525,19 +564,28 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                 check_unsafe(*args, **kwargs)
                 if not hasattr(self, '_actors'):
                     from ._ray import RayHelper
-                    args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                    
-                    logger.info(f'Executing ray function {func.__name__} with args: {args}, kwargs: {kwargs}')
-                    result = func(self, *args, **kwargs)
-                    logger.info(f'Execution of ray function {func.__name__} completed with result: {result}')
-                    return result
+                    if RayHelper.has_ref(args, kwargs):
+                        # In this case, driver dispatch is all, redispatch here
+                        args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
+                        world_size = Platform.get_world_size()
+                        rank = Platform.get_rank()
+                        _workers_and_args = _dispatch_args(_get_workers([None]*world_size, execute), dispatch,
+                                                           execute, device_mesh, args, kwargs)
+                        _, args, kwargs = _workers_and_args[rank]
+                    return func(self, *args, **kwargs)
                 else:
                     from ._ray import RayHelper
-                    _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
-                                                       execute, device_mesh, args, kwargs)
                     execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
                     
                     logger.info(f'Executing remote function {func.__name__} with {_workers_and_args}')
+                    if RayHelper.has_ref(args, kwargs):
+                        # dispatch all, slice in worker
+                        _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), 'all',
+                                                           execute, device_mesh, args, kwargs)
+                    else:
+                        _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
+                                                           execute, device_mesh, args, kwargs)
+
                     result = execute_method(func.__name__, _workers_and_args)
                     logger.info(f'Execution of remote function {func.__name__} completed with result: {result}')
                     
@@ -548,6 +596,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all'], Callable] = 'slice'
                     lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         return self
+                    
+                    if func.__name__ == '__len__':
+                        import ray
+                        return ray.get(result[0])
 
                     if func.__name__ == '__next__':
                         import ray

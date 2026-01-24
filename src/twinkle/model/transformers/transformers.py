@@ -19,6 +19,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 import twinkle
 import twinkle.module.scheduler
+from twinkle import Platform
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
@@ -180,7 +181,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config.outputs = outputs
         return outputs
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -269,7 +270,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             loss_value.backward()
         optimizer_config.cur_step += 1
 
-    @remote_function(collect='mean')
+    @remote_function(dispatch='slice_dp', collect='mean')
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         """Do forward, calculate loss, and backward.
 
@@ -534,7 +535,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         for key, value in state_dict.items():
             processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
-        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict)
+        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master())
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
         push_to_hub = kwargs.get('push_to_hub', False)
         hub_model_id = kwargs.get('hub_model_id', None)
@@ -551,10 +552,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
-        if template_ins is not None:
-            template_ins.tokenizer.save_pretrained(output_dir)
-        else:
-            self._default_tokenizer.save_pretrained(output_dir)
+        if Platform.is_master():
+            if template_ins is not None:
+                template_ins.tokenizer.save_pretrained(output_dir)
+            else:
+                self._default_tokenizer.save_pretrained(output_dir)
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):

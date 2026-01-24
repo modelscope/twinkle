@@ -76,13 +76,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _lazy_wrap_model(self):
         pass
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect='mean')
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         self._activate_adapter(kwargs.get("adapter_name"))
         return super().forward(inputs=inputs, **kwargs)
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         self._activate_adapter(kwargs.get("adapter_name"))

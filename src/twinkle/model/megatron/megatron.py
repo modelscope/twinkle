@@ -27,8 +27,10 @@ from twinkle.metric import Metric, LossMetric, Accuracy
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class
 from .strategy import MegatronStrategy
+from twinkle.utils import construct_class, exists
+from twinkle.model.megatron.args import get_args, set_args, TwinkleMegatronArgs
+from twinkle.model.megatron.model import get_megatron_model_meta, GPTBridge
 
 
 @dataclass
@@ -89,35 +91,59 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.model_id = model_id
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.recompute_granularity = recompute_granularity
-        self.recompute_modules = recompute_modules
-        model_path = HubOperation.download_model(model_id)
-        if config is None:
-            # Load HuggingFace config first
-            self.hf_config = AutoConfig.from_pretrained(model_path)
-        else:
-            self.hf_config = config
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-        # Store model_path for later use
-        self._model_path = model_path
 
-        self._seed = kwargs.pop('seed', None)
-        if self._seed is None and os.environ.get('TWINKLE_SEED'):
-            self._seed = int(os.environ.get('TWINKLE_SEED'))
-        if self._seed is None:
-            self._seed = 42
+        self._model_path = HubOperation.download_model(model_id)
+        self.hf_config = config or AutoConfig.from_pretrained(self._model_path)
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+
+        self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
 
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
-        self.model: List[nn.Module] = self._create_megatron_model(model_path, load_weights, **kwargs)
+        self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
         MegatronPeft().patch()
+        
+        params_dtype = torch.bfloat16
+        if self.mixed_precision == 'fp16':
+            params_dtype = torch.float16
+        elif self.mixed_precision == 'no':
+            params_dtype = torch.float32
+
+        ac_kwargs = {
+            'recompute_granularity': recompute_granularity,
+            'recompute_modules': recompute_modules,
+        }
+        if kwargs.get('recompute_method'):
+            ac_kwargs['recompute_method'] = kwargs.get('recompute_method')
+        if kwargs.get('recompute_num_layers'):
+            ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
+
+        # Check if TwinkleMegatronArgs has already been initialized
+        try:
+            get_args()
+            raise ValueError('TwinkleMegatronArgs has already been initialized')
+        except RuntimeError:
+            pass
+
+        args = TwinkleMegatronArgs.from_hf_config(
+            self.hf_config, 
+            model_dir=self._model_path,
+            device_mesh=self.device_mesh,
+            params_dtype=params_dtype,
+            sequence_parallel=self.strategy.sequence_parallel,
+            **ac_kwargs,
+        )
+        set_args(args)
+
+        self._initialized = False
+
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
@@ -128,80 +154,21 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     def _create_megatron_model(
         self,
-        model_path: str,
         load_weights: bool = True,
         **kwargs,
     ) -> List[nn.Module]:
-        """Create Megatron model from HuggingFace checkpoint.
+        args = get_args()
+        self.initialize(**kwargs)
+        
+        model = args.create_model()
+        if load_weights:
+            bridge = self._bridge
+            for _model in model:
+                bridge.load_weights(_model, args.model_dir)
 
-        Args:
-            model_path: Path to HuggingFace model.
-            load_weights: Whether to load weights.
-            **kwargs: Additional arguments.
+        if dist.is_initialized():
+            dist.barrier()
 
-        Returns:
-            Megatron model on GPU.
-        """
-        params_dtype = torch.bfloat16
-        if self.mixed_precision == 'fp16':
-            params_dtype = torch.float16
-        elif self.mixed_precision == 'no':
-            params_dtype = torch.float32
-
-        return self._create_megatron_model_with_bridge(
-            model_path, load_weights, params_dtype, **kwargs)
-
-    def _create_megatron_model_with_bridge(
-        self,
-        model_path: str,
-        load_weights: bool,
-        params_dtype: torch.dtype,
-        **kwargs,
-    ) -> List[nn.Module]:
-        """Create Megatron model using bridge-based initialization flow.
-
-        This approach uses TwinkleBridgeInitializer for independent initialization
-        It includes:
-        - Proper config conversion from HuggingFace to Megatron format
-        - Correct Megatron initialization (initialize_megatron)
-        - Correct model creation
-        - Weight loading with TwinkleGPTBridge
-
-        Args:
-            model_path: Path to HuggingFace model.
-            load_weights: Whether to load weights.
-            params_dtype: Parameter dtype.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Megatron model on GPU.
-        """
-        from twinkle.model.megatron.strategy.bridge import BridgeInitializer
-
-        # Create bridge-based initializer
-        self._bridge_initializer = BridgeInitializer(
-            tp_size=self.device_mesh.tp_world_size,
-            pp_size=self.device_mesh.pp_world_size,
-            cp_size=self.device_mesh.cp_world_size,
-            ep_size=self.device_mesh.ep_size,
-            vpp_size=self.device_mesh.vpp_size if self.device_mesh.vpp_size > 1 else None,
-            order=self.device_mesh.order,
-            params_dtype=params_dtype,
-            seed=self._seed,
-            use_cpu_initialization=False,
-            attention_backend='flash',  # Use flash for training performance
-            sequence_parallel=self.strategy.sequence_parallel,
-            recompute_granularity=self.recompute_granularity,
-            recompute_modules=self.recompute_modules,
-            recompute_method=getattr(self, 'recompute_method', None),
-            recompute_num_layers=getattr(self, 'recompute_num_layers', None),
-        )
-
-        # Create model (this calls initialize_megatron internally)
-        model = self._bridge_initializer.create_model(
-            model_path, load_weights=load_weights)
-
-        self._transformer_config = self._bridge_initializer.config
         _models = []
         for _model in model:
             _model = self._move_model_to_gpu(_model)
@@ -243,7 +210,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 **kwargs):
         raise NotImplementedError(f'Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(collect='last_pp')
+    @remote_function(dispatch='slice_dp', collect='last_pp')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature],
                                             List[Trajectory]],
                      micro_batch_size: Optional[int] = None,
@@ -386,7 +353,7 @@ class MegatronModel(TwinkleModel, nn.Module):
     def backward(self, **kwargs):
         raise NotImplementedError(f'Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='all', collect='mean', sync=True)
+    @remote_function(dispatch='slice_dp', collect='mean', sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature],
@@ -710,6 +677,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        if not self._model_wrapped:
+            self.model = self.strategy.wrap_model(self.model)
+            self._model_wrapped = True
 
         # Check if requesting Megatron distributed optimizer
         if not optimizer_cls or optimizer_cls in ('MegatronDistributedOptimizer', 'default'):
@@ -777,7 +747,9 @@ class MegatronModel(TwinkleModel, nn.Module):
             lr_decay_steps=lr_decay_steps,
             lr_decay_style=kwargs.pop('lr_decay_style', 'cosine'),
             start_wd=kwargs.pop('start_wd', 0.01),
-            end_wd=kwargs.pop('end_wd', 0),
+            end_wd=kwargs.pop('end_wd', 0.01),
+            wd_incr_steps=lr_decay_steps,
+            wd_incr_style=kwargs.pop('wd_incr_style', 'constant'),
             **kwargs,
         )
 
@@ -815,8 +787,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer = optimizer_config.optimizer
         if not scheduler_cls or scheduler_cls in ('OptimizerParamScheduler', 'default'):
-            optimizer_config.lr_scheduler = self._create_megatron_scheduler(**kwargs) # noqa
+            optimizer_config.lr_scheduler = self._create_megatron_scheduler(optimizer, **kwargs) # noqa
         else:
             raise NotImplementedError(f'Unsupported scheduler: {scheduler_cls}, only support OptimizerParamScheduler currently.')
 
@@ -859,7 +832,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         For LoRA training:
         - Saves in PEFT format (adapter_model.safetensors + adapter_config.json)
         """
-        from .strategy import BridgeAdapter
         # Check if this is LoRA training (has adapter_name other than default)
         is_lora = adapter_name and adapter_name != ''
         is_peft_format = is_lora
@@ -875,38 +847,16 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
-        # Calculate padded vocab size
-        padded_vocab_size = self._pad_vocab_size(self.hf_config.vocab_size) \
-            if hasattr(self, '_pad_vocab_size') else None
-
-        # Use TwinkleBridgeAdapter for weight conversion
-        # All ranks participate - bridge handles which ranks write
-        adapter = BridgeAdapter(
-            hf_config=self.hf_config,
-            tp_size=self.device_mesh.tp_world_size,
-            pp_size=self.device_mesh.pp_world_size,
-            ep_size=self.device_mesh.ep_size,
-            model_path=self._model_path
-            if hasattr(self, '_model_path') else self.model_id,
-            padded_vocab_size=padded_vocab_size,
-        )
-
         # Get the model (unwrap if DDP wrapped)
         model = self.strategy.unwrap_model(self.model)
 
-        # Use bridge to save weights
-        adapter.save_weights(model,
+        self._bridge.save_weights(model,
                              output_dir,
                              is_peft_format=is_peft_format)
 
         # Save config on rank 0 only
         if dp_rank == 0:
             self.hf_config.save_pretrained(output_dir)
-
-    def _pad_vocab_size(self, vocab_size: int) -> int:
-        """Pad vocab size for tensor parallelism."""
-        divisor = self.device_mesh.tp_world_size * 128
-        return ((vocab_size + divisor - 1) // divisor) * divisor
 
     def _save_megatron_format(self, output_dir: str, adapter_name: str):
         """Save in Megatron checkpoint format."""
@@ -1090,3 +1040,41 @@ class MegatronModel(TwinkleModel, nn.Module):
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
 
         return expr
+
+    def initialize(self, **kwargs) -> None:
+        if self._initialized:
+            return
+
+        from megatron.core import parallel_state
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        dist.init_process_group(backend='nccl')
+        args = get_args()
+        init_kwargs = {
+            'tensor_model_parallel_size': args.tensor_model_parallel_size,
+            'pipeline_model_parallel_size': args.pipeline_model_parallel_size,
+            'context_parallel_size': args.context_parallel_size,
+            'virtual_pipeline_model_parallel_size': args.virtual_pipeline_model_parallel_size,
+            'expert_model_parallel_size': args.expert_model_parallel_size,
+        }
+
+        if args.order:
+            init_kwargs['order'] = args.order
+
+        if exists('megatron_core>=0.13'):
+            init_kwargs['expert_tensor_parallel_size'] = args.expert_tensor_parallel_size
+        init_kwargs.update(kwargs)
+        parallel_state.initialize_model_parallel(**init_kwargs)
+        model_parallel_cuda_manual_seed(self._seed)
+
+        self._parallel_state = parallel_state
+        self._initialized = True
+
+    @property
+    def _bridge(self) -> GPTBridge:
+        if not hasattr(self, '_bridge'):
+            args = get_args()
+            megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
+            assert megatron_model_meta is not None, f'Model: {args.hf_model_type} is not supported.'
+            self._bridge = megatron_model_meta.bridge_cls()
+            
+        return self._bridge

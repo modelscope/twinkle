@@ -65,7 +65,7 @@ class MultiLoraMegatronModel(MegatronModel):
         # Create Megatron strategy
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
 
-        self.model = self._create_megatron_model(model_path, load_weights, **kwargs)
+        self.model = self._create_megatron_model(load_weights, **kwargs)
 
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
@@ -86,7 +86,7 @@ class MultiLoraMegatronModel(MegatronModel):
     def _lazy_wrap_model(self):
         pass
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect='last_pp', sync=True)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature],
                                             List[Trajectory]], **kwargs):
         """Forward pass without gradient computation.
@@ -102,7 +102,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._activate_adapter(kwargs.get("adapter_name"))
         return super().forward_only(inputs=inputs, **kwargs)
 
-    @remote_function(dispatch='all', collect='mean', sync=True)
+    @remote_function(dispatch='slice_dp', collect='mean', sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature],
