@@ -235,7 +235,7 @@ class TwinkleMegatronArgs:
     
     @property
     def expert_model_parallel_size(self) -> int:
-        return self.device_mesh.ep_size
+        return self.device_mesh.ep_size or 1
 
     @property
     def ep_size(self) -> int:
@@ -243,7 +243,7 @@ class TwinkleMegatronArgs:
     
     @property
     def expert_tensor_parallel_size(self) -> int:
-        return self.device_mesh.etp_size
+        return self.device_mesh.etp_size or 1
 
     @property
     def etp_size(self) -> int:
@@ -581,7 +581,7 @@ class TwinkleMegatronArgs:
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
             context_parallel_size=self.cp_size,
-            expert_model_parallel_size=self.ep_size,
+            expert_model_parallel_size=self.ep_size or 1,
             virtual_pipeline_model_parallel_size=self.vpp_size,
             sequence_parallel=use_sequence_parallel,
             params_dtype=self.params_dtype,
@@ -589,7 +589,7 @@ class TwinkleMegatronArgs:
             bf16=self.params_dtype == torch.bfloat16,
             pipeline_dtype=self.params_dtype,  # Required when using pipeline parallelism
             use_cpu_initialization=self.use_cpu_initialization,
-            add_qkv_bias=mg_config_dict.get('add_qkv_bias', False),
+            add_qkv_bias=self.add_qkv_bias,
             add_bias_linear=not mg_config_dict.get('disable_bias_linear',
                                                    True),
             gated_linear_unit=use_swiglu,

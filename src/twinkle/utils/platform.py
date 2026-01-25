@@ -10,7 +10,7 @@ from typing import Type
 from typing import Union, List
 import torch.distributed as dist
 import numpy as np
-from modelscope.models.science.unifold.data.utils import lru_cache
+from functools import lru_cache
 
 
 @dataclass
@@ -539,3 +539,22 @@ class MPS(Platform):
             return "Metal Support" in output
         except Exception: # noqa
             return False
+
+def is_last_rank():
+    if not dist.is_initialized():
+        return True
+
+    from megatron.core import parallel_state as mpu
+    if mpu.is_initialized():
+        # Only DP rank 0 writes
+        dp_rank = mpu.get_data_parallel_rank()
+        if dp_rank != 0:
+            return False
+        # For PP, only last stage needs to write certain weights
+        # (handled separately in export_weights)
+        return True
+
+    return dist.get_rank() == dist.get_world_size() - 1
+
+def is_master():
+    return Platform.is_master()

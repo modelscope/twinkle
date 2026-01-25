@@ -31,23 +31,7 @@ import os
 logger = get_logger()
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
-
-
-def is_last_rank():
-    if not dist.is_initialized():
-        return True
-
-    from megatron.core import parallel_state as mpu
-    if mpu.is_initialized():
-        # Only DP rank 0 writes
-        dp_rank = mpu.get_data_parallel_rank()
-        if dp_rank != 0:
-            return False
-        # For PP, only last stage needs to write certain weights
-        # (handled separately in export_weights)
-        return True
-
-    return dist.get_rank() == dist.get_world_size() - 1
+from twinkle.utils.platform import is_last_rank
 
 
 # Some ideas for LoRA conversion are referenced from: https://github.com/modelscope/ms-swift/pull/6225
@@ -72,7 +56,8 @@ class GPTBridge:
         self._is_peft_format = False
         self._adapter_name = 'default'
         self._init_meta_hf_model()
-        self.hf_layers = deep_getattr(self.hf_model, self.hf_layers_prefix)
+        # Get HF layers if model was loaded, otherwise None
+        self.hf_layers = deep_getattr(self.hf_model, self.hf_layers_prefix) if self.hf_model is not None else None
         self.module_mapping = {}
         self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
         megatron_model_meta = get_megatron_model_meta(self.args.hf_model_type)
@@ -127,22 +112,19 @@ class GPTBridge:
         return getattr(self.hf_layers[layer_idx], self.get_hf_mlp_prefix(layer_idx))
 
     def _init_meta_hf_model(self):
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
         
         model_dir = self.args.model_dir
         model_type = self.args.hf_model_type
         
         with torch.device('meta'):
             try:
-                # Try to load the model structure without weights
                 self.hf_model = AutoModelForCausalLM.from_pretrained(
                     model_dir,
                     trust_remote_code=True,
                     torch_dtype=self.args.params_dtype,
                 )
             except Exception:
-                # Fallback: create a minimal dummy model structure
-                # This is used when the model can't be loaded (e.g., missing dependencies)
                 self.hf_model = None
         if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
             auto_tokenizer_cls = AutoProcessor

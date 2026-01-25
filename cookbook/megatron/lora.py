@@ -16,15 +16,12 @@ import numpy as np
 # CRITICAL: Set CUDA device before any CUDA imports (local mode only)
 import torch
 from peft import LoraConfig
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
 
 import twinkle
 from twinkle import (DeviceGroup, DeviceMesh, Platform, get_device_placement,
                      get_logger)
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import MegatronCrossEntropyLoss
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 
@@ -42,6 +39,9 @@ parser.add_argument('--max_steps', type=int, default=None)
 parser.add_argument('--model',
                     type=str,
                     default='ms://Qwen/Qwen2.5-7B-Instruct')
+parser.add_argument('--tp_size', type=int, default=1, help='Tensor parallel size')
+parser.add_argument('--pp_size', type=int, default=1, help='Pipeline parallel size')
+parser.add_argument('--cp_size', type=int, default=1, help='Context parallel size')
 GAS = 16 # gradient accumulation steps
 args = parser.parse_args()
 
@@ -116,22 +116,17 @@ def train():
             device_mesh=device_mesh,
         )
         model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
+            model_id=args.model,
+            device_mesh=device_mesh,
             mixed_precision='bf16',
             recompute_granularity='full' if WORLD_SIZE <= 2 else 'selective',
             remote_group=GROUP_NAME,
-            device_mesh=device_mesh,
         )
     else:
         dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size)
         model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
+            model_id=args.model,
+            device_mesh=device_mesh,
             mixed_precision='bf16',
             recompute_granularity='full' if WORLD_SIZE <= 2 else 'selective',
         )
@@ -141,14 +136,12 @@ def train():
     model.add_adapter_to_model(adapter_name,
                                lora_config,
                                gradient_accumulation_steps=GAS)
-    model.set_template('Qwen3Template', adapter_name=adapter_name)
+    model.set_template('Qwen3Template', model_id=args.model, adapter_name=adapter_name)
     model.set_processor(InputProcessor,
                         padding_side='right',
                         adapter_name=adapter_name)
-    model.set_loss(MegatronCrossEntropyLoss, adapter_name=adapter_name)
-    model.set_optimizer(AdamW, lr=1e-4, adapter_name=adapter_name)
-    model.set_lr_scheduler(LinearLR, adapter_name=adapter_name)
-
+    model.set_optimizer('default', lr=1e-4, adapter_name=adapter_name)
+    model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4, adapter_name=adapter_name)
     logger.info(get_device_placement())
     logger.info(model.get_train_configs(adapter_name=adapter_name))
 
@@ -156,7 +149,8 @@ def train():
         output = model.forward_backward(inputs=batch,
                                         adapter_name=adapter_name)
         if step % GAS == 0:
-            logger.info(f'Step {step // 16}, loss: {output}')
+            loss_value = output() if callable(output) else output
+            logger.info(f'Step {step // GAS}, loss: {loss_value}')
         model.clip_grad_norm(1.0, adapter_name=adapter_name)
         model.step(adapter_name=adapter_name)
         model.zero_grad(adapter_name=adapter_name)

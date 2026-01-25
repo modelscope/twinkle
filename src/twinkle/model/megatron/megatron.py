@@ -103,13 +103,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         torch_util.set_device()
 
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
-        self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
-
-        self._model_wrapped = False
-        # This correctly handles vocab sharding in Tensor Parallelism
-        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
-        MegatronPeft().patch()
         
+        # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
         if self.mixed_precision == 'fp16':
             params_dtype = torch.float16
@@ -125,13 +120,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if kwargs.get('recompute_num_layers'):
             ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
 
-        # Check if TwinkleMegatronArgs has already been initialized
-        try:
-            get_args()
-            raise ValueError('TwinkleMegatronArgs has already been initialized')
-        except RuntimeError:
-            pass
-
+        # Initialize TwinkleMegatronArgs BEFORE creating the model
         args = TwinkleMegatronArgs.from_hf_config(
             self.hf_config, 
             model_dir=self._model_path,
@@ -143,6 +132,13 @@ class MegatronModel(TwinkleModel, nn.Module):
         set_args(args)
 
         self._initialized = False
+        
+        self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
+
+        self._model_wrapped = False
+        # This correctly handles vocab sharding in Tensor Parallelism
+        self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
+        MegatronPeft().patch()
 
 
     def _construct_default_optimizer_group(self):
@@ -264,7 +260,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 'input_embedding']
             if cp_size > 1:
                 divisor = 2 * cp_size
-            elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
+            elif self.strategy.sequence_parallel and self.device_mesh.tp_world_size > 1:
                 divisor = self.device_mesh.tp_world_size
             else:
                 divisor = 1
@@ -421,7 +417,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             original_seq_length = inputs[0]['input_ids'].shape[1]
             if cp_size > 1:
                 divisor = 2 * cp_size
-            elif self.sequence_parallel and self.device_mesh.tp_world_size > 1:
+            elif self.strategy.sequence_parallel and self.device_mesh.tp_world_size > 1:
                 divisor = self.device_mesh.tp_world_size
             else:
                 divisor = 1
@@ -624,7 +620,13 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         lr_scheduler = optimizer_config.lr_scheduler
         if lr_scheduler is not None:
-            lr_scheduler.step(**kwargs)
+            # Megatron's OptimizerParamScheduler.step() requires increment argument
+            try:
+                increment = kwargs.pop('increment', 1)
+                lr_scheduler.step(increment=increment)
+            except TypeError:
+                # Standard PyTorch scheduler
+                lr_scheduler.step(**kwargs)
 
     @remote_function(dispatch='all')
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
@@ -973,7 +975,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             config_or_dir: LoRA config or path to saved adapter.
             **kwargs: Additional arguments.
         """
-        self._patch_adapter(adapter_name, config_or_dir, _default_adapter_name, **kwargs)
+        self._patch_adapter(adapter_name, config_or_dir, adapter_name, **kwargs)
 
 
     @remote_function(dispatch='all')
@@ -1034,7 +1036,6 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         if optimizer_config.optimizer:
             expr += f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
-            expr += f'Learning rate: {optimizer_config.optimizer.defaults.get("lr", "N/A")}\n'
         if optimizer_config.lr_scheduler:
             expr += f'LR scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
@@ -1071,10 +1072,10 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     @property
     def _bridge(self) -> GPTBridge:
-        if not hasattr(self, '_bridge'):
+        if not hasattr(self, '_bridge_instance'):
             args = get_args()
             megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
             assert megatron_model_meta is not None, f'Model: {args.hf_model_type} is not supported.'
-            self._bridge = megatron_model_meta.bridge_cls()
+            self._bridge_instance = megatron_model_meta.bridge_cls()
             
-        return self._bridge
+        return self._bridge_instance

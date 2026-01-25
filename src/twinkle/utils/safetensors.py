@@ -4,8 +4,7 @@ from typing import Literal
 
 import json
 from safetensors.torch import safe_open, save_file
-from .platform import Platform
-from twinkle.infra import is_master, is_last_rank
+from .platform import is_last_rank, is_master
 
 
 class LazyTensor:

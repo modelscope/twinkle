@@ -88,7 +88,7 @@ def train():
 
     twinkle.initialize(
         mode=args.mode,
-        nproc_per_node=16,
+        nproc_per_node=device_mesh.world_size,
         ncpu_proc_per_node=16,
         groups=device_group,
         global_device_mesh=device_mesh,
@@ -133,12 +133,12 @@ def train():
         if step % GAS == 0:
             logger.info(f'Step {step // GAS}, loss: {output()}')
         model.clip_grad_and_step()
-        model.save('./output/megatron_moe_lora', interval=50)
+        # model.save('./output/megatron_moe_lora', interval=50)  # TODO: fix save
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * GAS:
             logger.info(f'Reached max_steps ({args.max_steps}), stopping.')
             break
-    model.save('./output/megatron_moe_lora')
+    # model.save('./output/megatron_moe_lora')  # TODO: fix save
     logger.info('Training completed!')
 
 
