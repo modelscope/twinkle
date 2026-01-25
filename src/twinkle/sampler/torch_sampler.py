@@ -13,6 +13,7 @@ from twinkle.data_format import Trajectory, Message
 from twinkle.hub import HubOperation
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.utils import construct_class
 
 from .base import Sampler
 
@@ -87,12 +88,7 @@ class TorchSampler(Sampler):
     def set_template(self, template_cls: Union[Type[Template], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
-        if isinstance(template_cls, str):
-            if hasattr(twinkle.template, template_cls):
-                template_cls = getattr(twinkle.template, template_cls)
-            else:
-                template_cls = Plugin.load_plugin(template_cls, Template)
-        template_ins = template_cls(self.model_id, **kwargs)
+        template_ins = construct_class(template_cls, Template, twinkle.template, **kwargs)
         self.sample_group[adapter_name]['template'] = template_ins
         if adapter_name == '' or not hasattr(self, 'template'):
             self.template = template_ins
@@ -140,10 +136,22 @@ class TorchSampler(Sampler):
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'eos_token_id': self.tokenizer.eos_token_id,
             }
-            
+
             # Override with trajectory-specific config
             if generation_config:
-                gen_kwargs.update(generation_config)
+                # Convert VLLM-style parameters to transformers-style
+                converted_config = {}
+                for key, value in generation_config.items():
+                    if key == 'max_tokens':
+                        converted_config['max_new_tokens'] = value
+                    elif key == 'min_tokens':
+                        converted_config['min_new_tokens'] = value
+                    elif key in ['stop', 'ignore_eos', 'logit_bias']:
+                        # Skip VLLM-specific parameters not supported by transformers
+                        continue
+                    else:
+                        converted_config[key] = value
+                gen_kwargs.update(converted_config)
             
             # Generate
             with torch.no_grad():
