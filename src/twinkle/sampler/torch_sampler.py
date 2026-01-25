@@ -210,12 +210,14 @@ class TorchSampler(Sampler):
             self._check_adapter_valid(adapter_name)
             from peft import PeftModel
             if isinstance(self.model, PeftModel):
-                # Load adapter weights
-                adapter_state_dict = {}
+                # Load only adapter-specific weights to avoid modifying base model weights
+                adapter_state_dict: Dict[str, Any] = {}
                 for key, value in state_dict.items():
-                    # Adapt key names if needed
-                    adapter_state_dict[key] = value
-                self.model.load_state_dict(adapter_state_dict, strict=False)
+                    # Keep only parameters that belong to the specified adapter
+                    if adapter_name in key:
+                        adapter_state_dict[key] = value
+                if adapter_state_dict:
+                    self.model.load_state_dict(adapter_state_dict, strict=False)
 
     def remove_adapter(self, adapter_name: str):
         """Remove an adapter from the sampler."""
