@@ -599,7 +599,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[train_group]
+        default_config = self.optimizer_group[train_group] # TODO this is wrong
         if default_config.template:
             self.optimizer_group[train_group].template = default_config.template
         if default_config.processor:
