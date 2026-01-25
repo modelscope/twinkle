@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import List, Optional, Dict, Any, Literal, Union
 
 import numpy as np
+
 from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.hub import HubOperation
 from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
@@ -48,14 +49,25 @@ class Template:
             self._roll_labels, # roll labels
         ]
 
+    @property
+    def tokenizer(self):
+        tokenizer = self.processor
+        if hasattr(tokenizer, 'tokenizer'):
+            tokenizer = tokenizer.tokenizer
+        return tokenizer
+
+    @property
+    def is_mm(self):
+        from transformers import ProcessorMixin
+        return isinstance(self.processor, ProcessorMixin)
+
     def _test_support_assistant_tokens_mask(self):
         dummy_inputs = [
             Message(role='user', content='How are you?'),
             Message(role='assistant', content='Fine.'),
         ]
-        # Fix: use self.processor instead of self.tokenizer - Template.__init__ creates self.processor
-        outputs = self.processor.apply_chat_template(conversation=dummy_inputs,
-                                                     return_assistant_tokens_mask=True, return_dict=True)
+        outputs = self.tokenizer.apply_chat_template(conversation=dummy_inputs,
+                                                     return_assistant_tokens_mask=True, return_dict=True, tokenize=True)
         assistant_masks = outputs['assistant_masks']
         self._template_support_assistant_tokens_mask = (0 < np.array(assistant_masks).sum() < len(assistant_masks))
 
@@ -117,39 +129,39 @@ class Template:
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
         return [input_feature]
 
-    def _build_mm_messages(self, trajectory: Trajectory):
+    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
         messages = trajectory['messages']
-        # Must return a list; pre_pipeline uses extend() and will iterate dict keys otherwise,
-        # which turns trajectory into strings and makes all checks fail.
-        # Pass placeholders explicitly to avoid utils signature mismatch errors.
-        messages = [
-            transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder)
-            for message in messages
-        ]
+        messages = [transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder, self.is_mm) for message in messages]
         trajectory['messages'] = messages
         return [trajectory]
+
+    def _apply_chat_template(self, trajectory: Trajectory, **kwargs):
+        messages = [dict(message) for message in trajectory['messages']]
+        tools = [dict(tool) for tool in trajectory.get('tools', [])]
+        inputs = self.processor.apply_chat_template(conversation=messages, tools=tools, padding=False,
+                                           tokenize=True, return_dict=True,
+                                           add_generation_prompt=False, return_tensors='pt', **kwargs)
+        return inputs
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
         if self.use_chat_template:
             if self._template_support_assistant_tokens_mask:
-                messages = [dict(message) for message in trajectory['messages']]
-                tools = [dict(tool) for tool in trajectory.get('tools', [])]
-                outputs = self.processor.apply_chat_template(conversation=messages, tools=tools,
-                                                   return_assistant_tokens_mask=True, return_dict=True,
-                                                             return_tensors='np')
-                input_ids = outputs['input_ids']
-                assistant_masks = outputs['assistant_masks']
+                encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=True)
+                input_ids = encoded.pop('input_ids')
+                assistant_masks = encoded.pop('assistant_masks')
                 labels = np.where(assistant_masks, input_ids, -100)
             else:
-                input_ids, labels = tokenize_with_assistant_labels(self.processor, trajectory)
+                input_ids, labels, encoded = tokenize_with_assistant_labels(self.tokenizer, self._apply_chat_template, trajectory)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']
-            input_ids = self.processor.encode(text)
+            input_ids = self.tokenizer.encode(text)
+            encoded = {}
             labels = deepcopy(input_ids)
         return InputFeature(
             input_ids=np.array(input_ids),
-            labels=labels,
+            labels=np.array(labels),
+            **encoded,
         )
 
     @staticmethod

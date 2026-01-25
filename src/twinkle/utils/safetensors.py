@@ -4,6 +4,7 @@ from typing import Literal
 
 import json
 from safetensors.torch import safe_open, save_file
+
 from .platform import Platform
 
 
@@ -98,7 +99,9 @@ class StreamingSafetensorSaver:
         self.total_size = 0
         self.shard_index = 1
         self.weight_map = {}
-        self.is_save_rank = Platform.is_last_rank() if save_rank == 'last' else Platform.is_master()
+        is_last_rank = Platform.get_rank() == Platform.get_world_size() - 1
+        is_master = Platform.get_rank() == 0
+        self.is_save_rank = is_last_rank if save_rank == 'last' else is_master
         self.is_peft_format = is_peft_format
         if self.is_save_rank:
             os.makedirs(save_dir, exist_ok=True)

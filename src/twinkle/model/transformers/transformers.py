@@ -585,8 +585,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         template_ins = optimizer_config.template
         if Platform.is_master():
             if template_ins is not None:
-                # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-                template_ins.processor.save_pretrained(output_dir)
+                template_ins.tokenizer.save_pretrained(output_dir)
             else:
                 self._default_tokenizer.save_pretrained(output_dir)
 
@@ -631,7 +630,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[train_group]
+        default_config = self.optimizer_group[train_group] # TODO this is wrong
         if default_config.template:
             self.optimizer_group[train_group].template = default_config.template
         if default_config.processor:
@@ -639,8 +638,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if default_config.loss_instance:
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         dp_group = self.optimizer_group[train_group]._dp_group
-        # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-        self._default_tokenizer = self.optimizer_group[train_group].template.processor
+        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
         self.optimizer_group[train_group].metrics = [
                 LossMetric(self.device_mesh, dp_group),
                 Accuracy(self.device_mesh, dp_group),

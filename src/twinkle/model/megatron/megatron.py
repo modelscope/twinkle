@@ -29,8 +29,8 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from .strategy import MegatronStrategy
 from twinkle.utils import construct_class, exists
-from twinkle.model.megatron.args import get_args, set_args, TwinkleMegatronArgs
-from twinkle.model.megatron.model import get_megatron_model_meta, GPTBridge
+from .args import get_args, set_args, TwinkleMegatronArgs
+from .model import get_megatron_model_meta, GPTBridge
 
 
 @dataclass
@@ -177,8 +177,6 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     @staticmethod
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
-        model_device = next(model.parameters()).device
-        torch.cuda.set_device(Platform.get_local_rank())
         model = model.to(Platform.get_local_device())
         torch_util.synchronize()
         return model
@@ -880,8 +878,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
         if template_ins is not None:
-            # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-            template_ins.processor.save_pretrained(output_dir)
+            template_ins.tokenizer.save_pretrained(output_dir)
         else:
             self._default_tokenizer.save_pretrained(output_dir)
 
@@ -954,7 +951,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if default_config.loss_instance:
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-        self._default_tokenizer = self.optimizer_group[train_group].template.processor
+        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
         dp_group = self.optimizer_group[train_group]._dp_group
         self.optimizer_group[train_group].metrics = [
                 LossMetric(self.device_mesh, dp_group),
