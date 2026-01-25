@@ -63,6 +63,7 @@ class Message(TypedDict, total=False):
         >>> {"role": "assistant", "content": "The weather of Beijing is sunny."}
     """ # noqa
     role: Literal['system', 'user', 'assistant', 'tool']
+    type: str
     content: Union[str, List[Dict[str, str]]]
     tool_calls: List[ToolCall]
     reasoning_content: str

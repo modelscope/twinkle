@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import List, Dict, Any, Tuple, Optional
-from copy import deepcopy
+from typing import List, Dict, Any, Tuple, Optional, Callable
+from copy import deepcopy, copy
 
 from transformers import PreTrainedTokenizer
 
@@ -62,32 +62,42 @@ def build_labels(
 
 def tokenize_with_assistant_labels(
         tokenizer: PreTrainedTokenizer,
+        encode_func: Callable,
         trajectory: Trajectory,
         placeholder: str = PLACEHOLDER,
-) -> Tuple[List[int], List[int]]:
+) -> Tuple[List[int], List[int], Dict[str, Any]]:
+    import torch
     messages = [dict(message) for message in trajectory['messages']]
-    tools = [dict(tool) for tool in trajectory.get('tools', [])]
-    placeholder_ids = tokenizer.encode(placeholder, add_special_tokens=False)
 
-    messages_with_placeholder = deepcopy(messages)
+    _dummy_messages = []
     assistant_count = 0
-    for msg in messages_with_placeholder:
-        if msg["role"] == "assistant":
-            msg["content"] = placeholder
+    for msg in messages:
+        if msg['role'] == 'assistant':
+            msg = deepcopy(msg)
+            if isinstance(msg["content"], str):
+                msg["content"] = placeholder
+            else:
+                msg["content"][0]['text'] = placeholder
             assistant_count += 1
+        _dummy_messages.append(msg)
 
-    full_ids = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        tokenize=True,
+    encoded = encode_func(
+        trajectory,
     )
+    full_ids = encoded.pop('input_ids')
+    if isinstance(full_ids, torch.Tensor):
+        full_ids = full_ids.tolist()[0]
 
-    template_ids = tokenizer.apply_chat_template(
-        messages_with_placeholder,
-        tools=tools,
-        tokenize=True,
+    _dummy_trajectory = copy(trajectory)
+    _dummy_trajectory['messages'] = _dummy_messages
+    template_ids = encode_func(
+        _dummy_trajectory,
     )
+    template_ids = template_ids['input_ids']
+    if isinstance(template_ids, torch.Tensor):
+        template_ids = template_ids.tolist()[0]
 
+    placeholder_ids = tokenizer.encode(placeholder, add_special_tokens=False)
     template_parts = split_by_subsequence(template_ids, placeholder_ids)
 
     if len(template_parts) != assistant_count + 1:
@@ -103,10 +113,10 @@ def tokenize_with_assistant_labels(
         while start_idx > 0 and labels[start_idx - 1] == -100:
             start_idx -= 1
 
-        for i in range(max(start_idx, end_idx - 2), end_idx):
+        for i in range(start_idx, end_idx):
             labels[i] = full_ids[i]
 
-    return full_ids, labels
+    return full_ids, labels, encoded
 
 
 def _load_image(img: Any) -> Optional[Any]:
@@ -169,14 +179,12 @@ def _transfer_single_message(content: str, image_placeholder, video_placeholder,
             remaining = remaining[vid_pos + len(video_placeholder):]
     return new_content
 
-def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder):
-    has_image = image_placeholder in message['content']
-    has_video = video_placeholder in message['content']
-    if has_image and has_video:
+def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder, is_mm):
+    if is_mm:
         new_content = _transfer_single_message(message['content'], image_placeholder, video_placeholder,
-                                               message['images'], message['videos'])
+                                               message.get('images'), message.get('videos'))
     else:
         new_content = message['content']
 
-    return Message(role=message['role'], content=new_content, tool_calls=message['tool_calls'],
-                   reasoning_content=message['reasoning_content'])
+    return Message(role=message['role'], content=new_content, tool_calls=message.get('tool_calls'),
+                   reasoning_content=message.get('reasoning_content'))
