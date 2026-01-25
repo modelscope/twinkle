@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """PyTorch native sampler using transformers model.generate()"""
-import os
 from typing import List, Dict, Any, Type, Union
 
 import torch
 from peft import PeftConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import twinkle
 from twinkle import remote_class, remote_function, DeviceMesh, Plugin
@@ -44,7 +43,7 @@ class TorchSampler(Sampler):
         self.model_id = model_id
         self.device_mesh = device_mesh
         
-        # Determine device
+        # Determine device (for reference, actual device placement handled by device_map='auto')
         if device_mesh is not None and getattr(device_mesh, 'device_type', None):
             self.device = torch.device(device_mesh.device_type)
         elif torch.cuda.is_available():
@@ -118,8 +117,8 @@ class TorchSampler(Sampler):
             if hasattr(input_ids, 'tolist'):
                 input_ids = input_ids.tolist()
             
-            # Convert to tensor
-            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+            # Convert to tensor (transformers will auto-move to correct device with device_map='auto')
+            input_tensor = torch.tensor([input_ids], dtype=torch.long)
             attention_mask = torch.ones_like(input_tensor)
             
             # Get generation config from trajectory if provided
@@ -192,7 +191,7 @@ class TorchSampler(Sampler):
         
         # Apply LoRA to model if config provided
         if config is not None:
-            from peft import PeftModel, LoraConfig
+            from peft import PeftModel
             if isinstance(self.model, PeftModel):
                 # Add another adapter
                 self.model.add_adapter(adapter_name, config)

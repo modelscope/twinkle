@@ -506,14 +506,22 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         cls.__next__ = ray.method(num_returns=2)(__next__)
 
                     # Create remote workers
-                    _actors = RayHelper.create_workers(cls,
-                                                       remote_group,
-                                                       execute,
-                                                       # Avoid duplicate keyword when instance_id is also in **kwargs.
-                                                       instance_id,
-                                                       _seed,
-                                                       _full_determinism,
-                                                       *args, **kwargs)
+                    # Remove potential duplicate keys from kwargs before passing
+                    kwargs_for_workers = kwargs.copy()
+                    kwargs_for_workers.pop('instance_id', None)
+                    kwargs_for_workers.pop('seed', None)
+                    kwargs_for_workers.pop('full_determinism', None)
+
+                    _actors = RayHelper.create_workers(
+                        cls,
+                        remote_group,
+                        execute,
+                        instance_id=instance_id,
+                        seed=_seed,
+                        full_determinism=_full_determinism,
+                        *args,
+                        **kwargs_for_workers
+                    )
                     self._actors = _actors
                     if hasattr(cls, '__iter__'):
                         # wraps again, because ray uses cls method to call remote

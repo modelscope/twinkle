@@ -176,8 +176,8 @@ class RayHelper:
                 self.device_mesh = device_mesh
                 self._result = None  # Cache collected results
 
-            def __call__(self):
-                """Lazily collect results, support repeated calls (with caching)"""
+            def _get_result(self):
+                """Internal method to lazily collect and cache results"""
                 if self._result is None:
                     result = []
                     for future in self._futures:
@@ -188,13 +188,17 @@ class RayHelper:
                     self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
                 return self._result
 
+            def __call__(self):
+                """Lazily collect results, support repeated calls (with caching)"""
+                return self._get_result()
+
             def __iter__(self):
                 """Support iteration: automatically collect results then iterate"""
-                return iter(self())
+                return iter(self._get_result())
 
             def __len__(self):
                 """Support len() function"""
-                return len(self())
+                return len(self._get_result())
 
 
         return LazyCollect(futures, method, collect_func, device_mesh)

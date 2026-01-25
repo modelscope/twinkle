@@ -477,17 +477,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-# <<<<<<< HEAD:src/twinkle/model/transformers.py
-#         if isinstance(loss_cls, str):
-#             if hasattr(twinkle.loss, loss_cls):
-#                 loss_cls = getattr(twinkle.loss, loss_cls)
-#             else:
-#                 loss_cls = Plugin.load_plugin(loss_cls, Loss)
-#         # Fixes missing-loss-config issues by passing ctor kwargs through.
-#         optimizer_config.loss_instance = loss_cls(**kwargs)
-# =======
         optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
-# >>>>>>> dev:src/twinkle/model/transformers/transformers.py
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
@@ -542,18 +532,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-# <<<<<<< HEAD:src/twinkle/model/transformers.py
-#         if isinstance(scheduler_cls, str):
-#             import torch
-#             # Fixes scheduler lookup fallthrough; prefer torch then twinkle.scheduler.
-#             if hasattr(torch.optim.lr_scheduler, scheduler_cls):
-#                 scheduler_cls = getattr(torch.optim.lr_scheduler, scheduler_cls)
-#             elif hasattr(scheduler, scheduler_cls):
-#                 scheduler_cls = getattr(scheduler, scheduler_cls)
-#             else:
-#                 scheduler_cls = Plugin.load_plugin(scheduler_cls, LRScheduler)
-# =======
-# >>>>>>> dev:src/twinkle/model/transformers/transformers.py
         optimizer = optimizer_config.optimizer
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         kwargs['optimizer'] = optimizer
