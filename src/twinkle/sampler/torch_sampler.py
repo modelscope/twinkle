@@ -179,7 +179,7 @@ class TorchSampler(Sampler):
 
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
         """Add a LoRA adapter to the sampler's model."""
-        if adapter_name in self.sample_group and adapter_name != self._default_adapter_name:
+        if adapter_name in self.sample_group:
             return  # Already exists
         
         self.sample_group[adapter_name] = {

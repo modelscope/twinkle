@@ -10,6 +10,9 @@ from twinkle.data_format import Trajectory
 @remote_class()
 class MathReward(Reward):
 
+    def __init__(self, ground_truth_key: str = 'solution'):
+        self.ground_truth_key = ground_truth_key
+
     @staticmethod
     def check_terminate(answers: Union[str, List[str]]) -> List[bool]:
         if isinstance(answers, str):
@@ -73,7 +76,7 @@ class MathReward(Reward):
                 user_data = traj.get('user_data')
                 if isinstance(user_data, list):
                     for item in user_data:
-                        if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == 'solution':
+                        if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == self.ground_truth_key:
                             return item[1]
             return _last_content(traj)
 
@@ -90,9 +93,5 @@ class MathReward(Reward):
             ground_truth = MathReward.extract_boxed_result(ground_truth)
             reward = MathReward.compare_consecutive(prediction, ground_truth)
             reward = 1.0 if reward else -1.0
-            print(
-                f"[reward] pred_boxed='{prediction}' gt_boxed='{ground_truth}' match={reward}",
-                flush=True,
-            )
             rewards.append(float(reward))
         return rewards

@@ -258,14 +258,6 @@ class DeviceMesh:
         assert dp_world_size % ulysses_size == 0, f'dp_world_size: {dp_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
         return dp_world_size // ulysses_size
 
-    @property
-    def data_parallel_world_size(self) -> int:
-        return self.data_world_size
-
-    @property
-    def data_parallel_rank(self) -> Optional[int]:
-        return self.data_rank
-
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
         if rank is None:
