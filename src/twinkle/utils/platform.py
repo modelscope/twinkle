@@ -10,7 +10,7 @@ from typing import Type
 from typing import Union, List
 import torch.distributed as dist
 import numpy as np
-from modelscope.models.science.unifold.data.utils import lru_cache
+from functools import lru_cache
 
 
 @dataclass

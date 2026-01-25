@@ -53,7 +53,8 @@ class Template:
             Message(role='user', content='How are you?'),
             Message(role='assistant', content='Fine.'),
         ]
-        outputs = self.tokenizer.apply_chat_template(conversation=dummy_inputs,
+        # Fix: use self.processor instead of self.tokenizer - Template.__init__ creates self.processor
+        outputs = self.processor.apply_chat_template(conversation=dummy_inputs,
                                                      return_assistant_tokens_mask=True, return_dict=True)
         assistant_masks = outputs['assistant_masks']
         self._template_support_assistant_tokens_mask = (0 < np.array(assistant_masks).sum() < len(assistant_masks))
@@ -80,9 +81,10 @@ class Template:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':
                 trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
-            for (_, messages) in trajectory['extend_message']:
-                if trajectory['messages'][0]['role'] == 'user':
-                    trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
+            # Fix: use .get() to avoid KeyError - extend_message is optional in Trajectory (TypedDict total=False)
+            for (_, messages) in trajectory.get('extend_message', []):
+                if messages and messages[0]['role'] == 'user':
+                    messages.insert(0, Message(role='system', content=self.default_system))
         return [trajectory]
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
@@ -117,9 +119,15 @@ class Template:
 
     def _build_mm_messages(self, trajectory: Trajectory):
         messages = trajectory['messages']
-        messages = [transfer_to_standard_message(message) for message in messages]
+        # Must return a list; pre_pipeline uses extend() and will iterate dict keys otherwise,
+        # which turns trajectory into strings and makes all checks fail.
+        # Pass placeholders explicitly to avoid utils signature mismatch errors.
+        messages = [
+            transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder)
+            for message in messages
+        ]
         trajectory['messages'] = messages
-        return trajectory
+        return [trajectory]
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
         if self.use_chat_template:
@@ -192,7 +200,10 @@ class Template:
                 return None
             else:
                 return trajectory
-        except Exception as e:  # noqa
+        except Exception as e:
+            import traceback
+            print(f"[Template.check] Error encoding trajectory: {e}")
+            traceback.print_exc()
             return None
         finally:
             if encoded:

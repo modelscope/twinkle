@@ -86,6 +86,9 @@ class Dataset(TorchDataset):
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
         kwargs['batched'] = True  # Only supported batched, because a single row may explode to several rows
+        # check depends on template/tokenizer behavior; cached filter results can keep old empty outputs.
+        # Disable cache here to avoid the "silent stop" caused by stale empty cache.
+        kwargs.setdefault('load_from_cache_file', False)
         with processing_lock('dataset'):
             # use a default lock because check is to all datasets
             def _check_batch(batch):

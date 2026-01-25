@@ -585,7 +585,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         template_ins = optimizer_config.template
         if Platform.is_master():
             if template_ins is not None:
-                template_ins.tokenizer.save_pretrained(output_dir)
+                # Fix: use .processor instead of .tokenizer - Template class uses self.processor
+                template_ins.processor.save_pretrained(output_dir)
             else:
                 self._default_tokenizer.save_pretrained(output_dir)
 
@@ -638,7 +639,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if default_config.loss_instance:
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         dp_group = self.optimizer_group[train_group]._dp_group
-        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
+        # Fix: use .processor instead of .tokenizer - Template class uses self.processor
+        self._default_tokenizer = self.optimizer_group[train_group].template.processor
         self.optimizer_group[train_group].metrics = [
                 LossMetric(self.device_mesh, dp_group),
                 Accuracy(self.device_mesh, dp_group),

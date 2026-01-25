@@ -207,7 +207,8 @@ class ActorGroup:
                 device_mesh=actor_device_mesh,
             )
         self.sampler.add_adapter_to_sampler(adapter_name, lora_config)
-        self.sampler.set_template('Qwen3Template', adapter_name=adapter_name, **build_template_kwargs(include_model_id=True))
+        # Fix: use 'Template' instead of 'Qwen3Template' - Qwen3Template was never exported in twinkle.template
+        self.sampler.set_template('Template', adapter_name=adapter_name, **build_template_kwargs(include_model_id=True))
         
         self.model = TransformersModel(
             model_id=model_path, 
@@ -227,7 +228,7 @@ class ActorGroup:
         
         self.model.set_optimizer('AdamW', lr=1e-6)
         self.model.set_lr_scheduler('LinearLR')
-        self.model.set_template('Qwen3Template', **build_template_kwargs(include_model_id=False))
+        self.model.set_template('Template', **build_template_kwargs(include_model_id=False))
         self.model.set_processor('GRPOLossProcessor')
         
         self.weight_loader = NativeLoader()
@@ -279,7 +280,7 @@ class ActorGroup:
 
 def create_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/competition_math'))
-    dataset.set_template('Qwen3Template', **build_template_kwargs(include_model_id=True))
+    dataset.set_template('Template', **build_template_kwargs(include_model_id=True))
     dataset.map('CompetitionMathGRPOProcessor')
     dataset.check(batched=True)
     return dataset
@@ -330,7 +331,7 @@ def train():
             device_mesh=ref_device_mesh
         )
         ref_model.set_processor('InputProcessor')
-        ref_model.set_template('Qwen3Template', **build_template_kwargs())
+        ref_model.set_template('Template', **build_template_kwargs())
     
     reward = MathReward()
     

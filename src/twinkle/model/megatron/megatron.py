@@ -880,7 +880,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
         if template_ins is not None:
-            template_ins.tokenizer.save_pretrained(output_dir)
+            # Fix: use .processor instead of .tokenizer - Template class uses self.processor
+            template_ins.processor.save_pretrained(output_dir)
         else:
             self._default_tokenizer.save_pretrained(output_dir)
 
@@ -952,7 +953,8 @@ class MegatronModel(TwinkleModel, nn.Module):
             self.optimizer_group[train_group].processor = default_config.processor
         if default_config.loss_instance:
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
-        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
+        # Fix: use .processor instead of .tokenizer - Template class uses self.processor
+        self._default_tokenizer = self.optimizer_group[train_group].template.processor
         dp_group = self.optimizer_group[train_group]._dp_group
         self.optimizer_group[train_group].metrics = [
                 LossMetric(self.device_mesh, dp_group),

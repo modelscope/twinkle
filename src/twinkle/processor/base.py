@@ -89,21 +89,20 @@ class InputProcessor:
 
         vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
         text_inputs = []
-        keys = []
         for inp in inputs:
             inp = dict(inp)
             for field in self.VLM_CONCAT_FIELDS:
                 if field in inp:
-                    # mm keys
                     vlm_fields[field].append(inp.pop(field))
-                else:
-                    # text keys
-                    keys.append(field)
             text_inputs.append(inp)
+
+        # Collect text field keys preserving first-seen order (dict.fromkeys deduplicates while keeping order).
+        # This avoids treating VLM fields as text and fixes KeyError on pure-text batches.
+        text_keys = list(dict.fromkeys(key for inp in text_inputs for key in inp.keys()))
 
         result = {}
         if self.padding_free:
-            for key in keys:
+            for key in text_keys:
                 values = [item[key] for item in text_inputs]
                 if isinstance(values[0], np.ndarray):
                     value = np.expand_dims(np.concatenate(values, axis=0), axis=0)
@@ -118,7 +117,7 @@ class InputProcessor:
                 result[key] = value
             result = InputFeature(**result)
         else:
-            for key in keys:
+            for key in text_keys:
                 values = [item[key] for item in text_inputs]
 
                 if isinstance(values[0], np.ndarray):
@@ -165,5 +164,3 @@ class InputProcessor:
                     output[key] = res[key][i:i + micro_batch_size]
                 outputs.append(output)
             return outputs
-
-

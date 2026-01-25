@@ -170,13 +170,29 @@ def _transfer_single_message(content: str, image_placeholder, video_placeholder,
     return new_content
 
 def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder):
-    has_image = image_placeholder in message['content']
-    has_video = video_placeholder in message['content']
-    if has_image and has_video:
-        new_content = _transfer_single_message(message['content'], image_placeholder, video_placeholder,
-                                               message['images'], message['videos'])
-    else:
-        new_content = message['content']
+    # Message fields are optional (TypedDict total=False); use get() to avoid KeyError.
+    # Otherwise template.check may swallow errors and filter the dataset to empty.
+    content = message.get('content', '')
+    # Preserve original types: None stays None, [] stays [] (don't convert [] to None)
+    original_images = message.get('images')
+    original_videos = message.get('videos')
+    images = original_images or []
+    videos = original_videos or []
 
-    return Message(role=message['role'], content=new_content, tool_calls=message['tool_calls'],
-                   reasoning_content=message['reasoning_content'])
+    has_image = image_placeholder in content
+    has_video = video_placeholder in content
+    if has_image or has_video:
+        new_content = _transfer_single_message(content, image_placeholder, video_placeholder,
+                                               images, videos)
+    else:
+        new_content = content
+
+    return Message(
+        role=message.get('role'),
+        content=new_content,
+        tool_calls=message.get('tool_calls'),
+        reasoning_content=message.get('reasoning_content'),
+        images=original_images,
+        videos=original_videos,
+        audios=message.get('audios'),
+    )

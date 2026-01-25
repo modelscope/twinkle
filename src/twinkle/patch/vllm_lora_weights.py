@@ -31,7 +31,8 @@ class VLLMLoraWeights(Patch):
 
     def patch(self, sampler, **kwargs):
         requires('vllm>=0.11')
-        tokenizer = sampler.template.tokenizer
+        # Fix: use .processor instead of .tokenizer - Template class uses self.processor
+        tokenizer = sampler.template.processor
         from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
         try:
             from vllm.lora.models import LoRAModel

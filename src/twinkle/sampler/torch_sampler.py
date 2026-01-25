@@ -117,8 +117,9 @@ class TorchSampler(Sampler):
             if hasattr(input_ids, 'tolist'):
                 input_ids = input_ids.tolist()
             
-            # Convert to tensor (transformers will auto-move to correct device with device_map='auto')
-            input_tensor = torch.tensor([input_ids], dtype=torch.long)
+            # Fix: create tensor directly on model device to avoid "npu:0 vs cpu" device mismatch error
+            device = next(self.model.parameters()).device
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_tensor)
             
             # Get generation config from trajectory if provided

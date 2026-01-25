@@ -75,7 +75,7 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init(address=os.environ.get("RAY_ADDRESS","auto"), ignore_reinit_error=True)
+            ray.init(ignore_reinit_error=True)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -232,7 +232,7 @@ class RayHelper:
         return False
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], instance_id, seed=42, full_determinism=False, *args, **kwargs) -> List[T]:
+    def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], *args, instance_id, seed=42, full_determinism=False, **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
