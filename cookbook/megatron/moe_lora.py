@@ -153,12 +153,11 @@ def train():
         model.step(adapter_name=adapter_name)
         model.zero_grad(adapter_name=adapter_name)
         model.lr_step(adapter_name=adapter_name)
-        # model.save('./output/megatron_moe_lora', interval=50)  # TODO: fix save
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * GAS:
             logger.info(f'Reached max_steps ({args.max_steps}), stopping.')
             break
-    # model.save('./output/megatron_moe_lora')  # TODO: fix save
+    model.save('./output/megatron_moe_lora')
     logger.info('Training completed!')
 
 

@@ -867,7 +867,8 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         self._bridge.save_weights(model,
                              output_dir,
-                             is_peft_format=is_peft_format)
+                             is_peft_format=is_peft_format,
+                             adapter_name=adapter_name)
 
         # Save config on rank 0 only
         if dp_rank == 0:

@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Reference: swift/swift/megatron/model/gpt_bridge.py
 
-# Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 from copy import copy
 from typing import List, Optional, Union
@@ -1468,25 +1467,26 @@ class GPTBridge:
                        target_device=None,
                        only_last_rank: bool = False,
                        is_peft_format: bool = False,
+                       adapter_name: str = 'default',
                        tqdm_desc: str = 'Exporting: '):
         self._target_device = target_device
         self._only_last_rank = only_last_rank
         self._is_peft_format = is_peft_format
-        self._adapter_name = 'default'
+        self._adapter_name = adapter_name
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
         hf_prefix = 'base_model.model.' if is_peft_format else ''
         with torch.no_grad():
             yield from self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc)
 
-    def save_weights(self, mg_models, output_dir: str, is_peft_format: bool = False) -> None:
+    def save_weights(self, mg_models, output_dir: str, is_peft_format: bool = False, adapter_name: str = 'default') -> None:
         """Save the mg_model checkpoint in HF format"""
         torch.cuda.empty_cache()
         saver = StreamingSafetensorSaver(
             save_dir=output_dir, max_shard_size=self.args.max_shard_size, is_peft_format=is_peft_format)
         for k, v in self.export_weights(
                 mg_models, target_device='cpu', only_last_rank=True, is_peft_format=is_peft_format,
-                tqdm_desc='Saving: '):
+                adapter_name=adapter_name, tqdm_desc='Saving: '):
             saver.add_tensor(k, v)
         saver.finalize()
         args = self.args

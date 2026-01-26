@@ -242,7 +242,7 @@ def train():
 
     # Save model
     output_dir = './output/megatron_vlm_lora'
-    # model.save(output_dir, adapter_name=adapter_name)
+    model.save(output_dir, adapter_name=adapter_name)
     logger.info(f'Model saved to {output_dir}')
     logger.info('VLM LoRA training completed!')
 
