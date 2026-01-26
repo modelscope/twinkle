@@ -26,13 +26,13 @@ class Template:
                  truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
                  default_system: Optional[str] = None,
                  **kwargs):
-        model_id = HubOperation.download_model(model_id)
+        model_id = HubOperation.download_model(model_id, ignore_model=True)
         if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
         else:
             from transformers import AutoTokenizer
-            self.processor = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            self.processor = AutoTokenizer.from_pretrained(model_id, **kwargs)
 
         self.use_chat_template = use_chat_template
         self.max_length = max_length

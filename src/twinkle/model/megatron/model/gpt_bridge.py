@@ -17,7 +17,7 @@ from packaging import version
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
-from transformers.modeling_utils import custom_object_save
+from transformers.modeling_utils import custom_object_save, PreTrainedModel
 
 from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger, 
                             get_multimodal_target_regex, get_modules_to_not_convert)
@@ -1532,7 +1532,7 @@ class GPTBridge:
                         custom_object_save(self.hf_model, output_dir, config=self.hf_model.config)
                     except FileNotFoundError as e:
                         logger.error(f'custom_object_save Error: {e}')
-                save_checkpoint(
+                GPTBridge.save_checkpoint(
                     None,
                     self.processor,
                     output_dir,
@@ -1540,6 +1540,45 @@ class GPTBridge:
                     additional_saved_files=self.hf_model.model_meta.additional_saved_files)
             logger.info_if(f'Successfully saved `safetensors` model weights in `{output_dir}`.', cond=is_last_rank())
         dist.barrier()  # Ensure all weights are saved completely
+
+    @staticmethod
+    def save_checkpoint(model: Optional[PreTrainedModel],
+                        processor,
+                        output_dir: str,
+                        *,
+                        safe_serialization: bool = True,
+                        max_shard_size: Union[int, str] = '5GB',
+                        model_dirs: List[str] = None,
+                        additional_saved_files: Optional[List[str]] = None) -> None:
+        if model is not None:
+            if model.__class__.__name__ != 'SentenceTransformer':
+                model.save_pretrained(output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+            else:
+                model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+                # copy sentencetransformers files
+                from twinkle.utils import copy_files_by_pattern
+                copy_files_by_pattern(model.model_dir, output_dir, '*.py')
+                copy_files_by_pattern(model.model_dir, output_dir, '*.json')
+        processor.save_pretrained(output_dir)
+
+        if model_dirs is None:
+            model_dirs = []
+        else:
+            model_dirs = model_dirs.copy()
+        if model and model.model_dir and model.model_dir not in model_dirs:
+            model_dirs.append(model.model_dir)
+        for src_file in (additional_saved_files or []) + ['preprocessor_config.json', 'args.json']:
+            tgt_path = os.path.join(output_dir, src_file)
+            if os.path.exists(tgt_path) and src_file == 'args.json':
+                continue
+            for model_dir in model_dirs:
+                src_path: str = os.path.join(model_dir, src_file)
+                if os.path.isfile(src_path):
+                    shutil.copy(src_path, tgt_path)
+                    break
+                elif os.path.isdir(src_path):
+                    shutil.copytree(src_path, tgt_path)
+                    break
 
 
 class MultimodalGPTBridge(GPTBridge):

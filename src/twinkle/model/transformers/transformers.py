@@ -108,7 +108,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
-            self.model = model_cls(config, **kwargs)
+            self.model = model_cls.from_config(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
@@ -134,7 +134,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             assert len(self.optimizer_group) == 1
             optimizer = self.optimizer_group[_default_adapter_name].optimizer
             if optimizer is None:
-                optimizer = AdamW(self._create_param_group(_default_adapter_name, 1e-5, 0.01), lr=1e-5)
+                optimizer = AdamW(self._create_param_group(_default_adapter_name, 1e-4, 0.01), lr=1e-4)
                 self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             self.optimizer_group[_default_adapter_name].optimizer = optimizer
@@ -162,16 +162,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
-        if isinstance(inputs, dict) and self._not_encoded(inputs):
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            inputs = optimizer_config.template.encode(inputs) # noqa
-        if isinstance(inputs, list) and self._not_encoded(inputs[0]):
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
-        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
+        assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
         labels = inputs.pop('labels', None)
         self._accumulate_metric(optimizer_config)
@@ -194,11 +191,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        if isinstance(inputs, dict) and self._not_encoded(inputs):
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            inputs = optimizer_config.template.encode(inputs) # noqa
-        if isinstance(inputs, list) and self._not_encoded(inputs[0]):
+        self._lazy_wrap_model()
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
@@ -234,13 +229,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.loss_instance
-        assert isinstance(loss_instance, Loss), 'Set loss_instance correctly before calculating loss'
+        assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
         inputs = optimizer_config.inputs
         outputs = optimizer_config.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         loss_value: torch.Tensor = loss_instance(inputs, outputs, **kwargs)
         optimizer_config.loss_value = loss_value
-        return loss_value.detach().cpu().float().numpy()
+        return loss_value.item()
 
     @remote_function()
     def backward(self, **kwargs):
@@ -307,7 +302,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         scaler = optimizer_config.scaler
 
         context = contextlib.nullcontext
-        if self.device_mesh is not None and self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
+        if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
 
@@ -319,14 +314,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
             # Convert DTensor to local tensor for FSDP2 compatibility
             grad_norm = torch_util.to_local_tensor(grad_norm)
-            return grad_norm.detach().cpu().numpy()
+            return grad_norm.item()
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
-        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        grad_norm = self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
+        return grad_norm
 
     def _create_param_group(self, adapter_name: str, lr: float=1e-5, weight_decay:float=0.01, **kwargs):
         # Some code borrowed from transformers
@@ -532,8 +528,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
         processed_state_dict = {}
 
-        for key, value in state_dict.items():
-            processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
+        if Platform.is_master():
+            for key, value in state_dict.items():
+                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master())
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
@@ -554,7 +551,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         template_ins = optimizer_config.template
         if Platform.is_master():
             if template_ins is not None:
-                template_ins.tokenizer.save_pretrained(output_dir)
+                template_ins.processor.save_pretrained(output_dir)
             else:
                 self._default_tokenizer.save_pretrained(output_dir)
 
@@ -575,7 +572,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], train_group: str, **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
         unwrapped_model = self.strategy.unwrap_model(self.model)
-        config = None
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
             _adapted_model = PeftModel.from_pretrained(unwrapped_model, model_id=config_or_dir,
@@ -584,6 +580,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             if unwrapped_model is self.model:
                 self.model = _adapted_model
             else:
+                # post check: unwrapped_model must be already a peft model before wrapping ddp
                 assert isinstance(unwrapped_model, PeftModel)
             config = _adapted_model.peft_config
         else:
@@ -599,7 +596,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[train_group] # TODO this is wrong
+        default_config = self.optimizer_group[_default_adapter_name]
         if default_config.template:
             self.optimizer_group[train_group].template = default_config.template
         if default_config.processor:
@@ -607,7 +604,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if default_config.loss_instance:
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         dp_group = self.optimizer_group[train_group]._dp_group
-        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
+        self._default_tokenizer = self.optimizer_group[train_group].template.processor
         self.optimizer_group[train_group].metrics = [
                 LossMetric(self.device_mesh, dp_group),
                 Accuracy(self.device_mesh, dp_group),

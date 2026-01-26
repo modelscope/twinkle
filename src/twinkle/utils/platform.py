@@ -171,10 +171,10 @@ class DeviceMesh:
         else:
             return None
 
-    def _get_world_size_for_dim(self, dim_name: str) -> Optional[int]:
+    def _get_world_size_for_dim(self, dim_name: str) -> int:
         dim_idx = self._get_dim_index(dim_name)
         if dim_idx is None:
-            return None
+            return 0 # not valid
         return self.mesh.shape[dim_idx]
 
     @property
@@ -203,23 +203,23 @@ class DeviceMesh:
         return self._get_rank_for_dim("cp")
 
     @property
-    def dp_world_size(self) -> Optional[int]:
+    def dp_world_size(self) -> int:
         return self._get_world_size_for_dim("dp")
 
     @property
-    def fsdp_world_size(self) -> Optional[int]:
+    def fsdp_world_size(self) -> int:
         return self._get_world_size_for_dim("fsdp")
 
     @property
-    def tp_world_size(self) -> Optional[int]:
+    def tp_world_size(self) -> int:
         return self._get_world_size_for_dim("tp")
 
     @property
-    def pp_world_size(self) -> Optional[int]:
+    def pp_world_size(self) -> int:
         return self._get_world_size_for_dim("pp")
 
     @property
-    def cp_world_size(self) -> Optional[int]:
+    def cp_world_size(self) -> int:
         return self._get_world_size_for_dim("cp")
 
     @property

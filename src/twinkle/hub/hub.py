@@ -14,6 +14,20 @@ _executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
 _futures = {}
 
 
+large_file_pattern = [
+    r'\w+\.bin',
+    r'\w+\.safetensors',
+    r'\w+\.pth',
+    r'\w+\.pt',
+    r'\w+\.h5',
+    r'\w+\.ckpt',
+    r'\w+\.zip',
+    r'\w+\.onnx',
+    r'\w+\.tar',
+    r'\w+\.gz',
+]
+
+
 class HubOperation:
 
     @classmethod
@@ -183,10 +197,12 @@ class HubOperation:
                 using tokenizer
             ignore_patterns: Custom ignore pattern
             **kwargs:
-
+                ignore_model: If true, will ignore all `large_file_pattern` files
         Returns:
             The local dir
         """
+        if kwargs.pop('ignore_model', False):
+            ignore_patterns = set(ignore_patterns) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
             return model_id_or_path
         if cls.source_type(model_id_or_path) == 'hf':

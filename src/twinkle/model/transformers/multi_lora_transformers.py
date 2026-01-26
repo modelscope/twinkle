@@ -103,7 +103,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _reduce_adapter_grad(self, adapter_name: str):
         from torch.distributed.tensor import DTensor
-        if adapter_name and self.device_mesh.fsdp_world_size > 1:
+        if adapter_name:
             import torch.distributed as dist
             for p in self._get_trainable_parameters(adapter_name).values():
                 if p.grad is None:
