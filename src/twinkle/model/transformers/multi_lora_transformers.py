@@ -7,6 +7,7 @@ from typing import Type, Optional, Union
 
 from peft import PeftConfig, LoraConfig
 from peft import PeftModel
+import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -20,6 +21,7 @@ from .strategy import AccelerateStrategy
 from .transformers import TransformersModel, OptimizerGroup
 from twinkle.hub import HubOperation
 from twinkle.metric import Metric
+from twinkle import Platform, torch_util
 
 
 @remote_class()
@@ -34,8 +36,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
-        assert device_mesh.fsdp_world_size is None, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
-        dist.init_process_group('nccl')
+        assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
+        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        torch_util.set_device()
+        dist.init_process_group('nccl', world_size=device_mesh.world_size, rank=Platform.get_rank(), device_id=torch.device(Platform.get_local_device()))
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
         self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
@@ -50,8 +54,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
         self.multi_adapter = MultiAdapter()
         self.model: PreTrainedModel = self.multi_adapter.patch(self.model)
-        with self._no_ddp_context():
+        with self._no_ddp_context() as local_rank:
             self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
+            from accelerate import PartialState
+            local_device = torch.device(Platform.get_local_device(local_rank))
+            PartialState._shared_state['device'] = local_device
+            self.strategy.accelerator.state.device = local_device
             self.model = self.strategy.wrap_model(self.model)
         self.add_adapter_to_model(MultiLoraTransformersModel.DUMMY_ADAPTER_NAME, LoraConfig(r=1, target_modules='all-linear'))
         self._inited = True
@@ -62,7 +70,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         origin_world_size = os.environ['WORLD_SIZE']
         os.environ['WORLD_SIZE'] = '1'
         os.environ['LOCAL_RANK'] = '-1'
-        yield
+        yield int(origin_local_rank)
         os.environ['LOCAL_RANK'] = origin_local_rank
         os.environ['WORLD_SIZE'] = origin_world_size
 
@@ -117,6 +125,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
                 if self.device_mesh.dp_world_size > 1:
                     dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.optimizer_group[adapter_name]._dp_group)
+            dist.barrier()
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):

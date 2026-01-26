@@ -644,14 +644,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.optimizer_group[train_group].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[train_group].gradient_accumulation_steps = _gas_default
-        default_config = self.optimizer_group[_default_adapter_name]
-        if default_config.template:
-            self.optimizer_group[train_group].template = default_config.template
-        if default_config.processor:
-            self.optimizer_group[train_group].processor = default_config.processor
-        if default_config.loss_instance:
-            self.optimizer_group[train_group].loss_instance = default_config.loss_instance
-        dp_group = self.optimizer_group[train_group]._dp_group
         self._default_tokenizer = self.optimizer_group[train_group].template.processor
 
     @remote_function()
