@@ -47,7 +47,9 @@ class LossMetric(Metric):
         max_grad_norm = max(r["max_grad_norm"] for r in all_results)
         avg_loss = total_loss / total_count if total_count > 0 else np.nan
         self.reset()
-        return {
-            "loss": avg_loss,
-            "grad_norm": max_grad_norm,
-        }
+        results = {}
+        if avg_loss is not None:
+            results['loss'] = f'{avg_loss:.4f}'
+        if max_grad_norm > 0:
+            results['grad_norm'] = f'{max_grad_norm:.2f}'
+        return results

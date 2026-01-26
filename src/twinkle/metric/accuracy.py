@@ -58,7 +58,7 @@ class Accuracy(Metric):
         accuracy = total_correct / total_count if total_count > 0 else np.nan
         self.reset()
         return {
-            "accuracy": accuracy,
+            "accuracy": f'{accuracy:.2f}',
             "correct_tokens": total_correct,
             "total_tokens": total_count,
         }

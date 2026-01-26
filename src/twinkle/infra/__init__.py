@@ -450,7 +450,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
                     if execute == 'first':
                         # Manually create a device_mesh because there is only one worker
-                        kwargs[device_mesh_name] = DeviceMesh.from_sizes(dp_size=1)
+                        device_mesh = DeviceMesh.from_sizes(dp_size=1)
+                        kwargs[device_mesh_name] = device_mesh
 
                     if _device_group and remote_group:
                         # usually this happens in driver because worker does not has a valid _device_group

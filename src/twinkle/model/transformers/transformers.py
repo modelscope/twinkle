@@ -48,7 +48,7 @@ class OptimizerGroup:
     scaler: GradScaler = None
     scaler_has_nan: bool = False
     gradient_accumulation_steps: int = 1
-    cur_step: int = 0
+    cur_step: int = -1
     train_metrics: List[Metric] = field(default_factory=list)
     eval_metrics: List[Metric] = field(default_factory=list)
     _dp_group = None
@@ -335,6 +335,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler
+        outputs = optimizer_config.outputs
 
         context = contextlib.nullcontext
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
@@ -349,7 +350,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
             # Convert DTensor to local tensor for FSDP2 compatibility
             grad_norm = torch_util.to_local_tensor(grad_norm)
-            return grad_norm.item()
+            grad_norm = grad_norm.item()
+            outputs['grad_norm'] = grad_norm
+            return grad_norm
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
@@ -746,7 +749,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         for name, parameter in self.model.named_parameters():
             if parameter.requires_grad:
                 trainable_param_names.append(name)
-        trainable_param_names = trainable_param_names[:5] + trainable_param_names[-5:]
+        trainable_param_names = trainable_param_names[:5] + ['...'] + trainable_param_names[-5:]
         trainable_param_names = '\n'.join(trainable_param_names)
         if optimizer_config.optimizer is not None:
             expr += (f'Adapter config:\n'
@@ -763,6 +766,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                      f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
                      f'Trainable parameters examples:\n'
                      f'{trainable_param_names}\n'
-                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}\n'
+                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}%\n'
                      )
         return expr
