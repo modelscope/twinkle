@@ -129,18 +129,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
-    def _move_inputs_to_model_device(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        import torch
-        try:
-            model_device = next(self.model.parameters()).device
-        except StopIteration:
-            return inputs
-        for key, value in inputs.items():
-            # Fixes observed device-mismatch errors when processor outputs CPU tensors for NPU models.
-            if isinstance(value, torch.Tensor) and value.device != model_device:
-                inputs[key] = value.to(model_device)
-        return inputs
-
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             assert len(self.optimizer_group) == 1
@@ -213,7 +201,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
-            inputs = self._move_inputs_to_model_device(inputs)
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config)
             outputs = self.model(**inputs)
@@ -398,7 +385,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before forwarding'
 
         context = contextlib.nullcontext
-        if self.device_mesh is not None and (self.device_mesh.tp_world_size or 1) > 1:
+        if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
 
