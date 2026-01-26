@@ -112,7 +112,7 @@ def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, 
     return logger
 
 
-logger = get_logger(only_local_master=False)
+logger = get_logger()
 
 logger.handlers[0].setFormatter(logger_format)
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()

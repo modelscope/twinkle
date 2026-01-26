@@ -450,7 +450,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
                     if execute == 'first':
                         # Manually create a device_mesh because there is only one worker
-                        kwargs[device_mesh_name] = DeviceMesh.from_sizes(dp_size=1)
+                        device_mesh = DeviceMesh.from_sizes(dp_size=1)
+                        kwargs[device_mesh_name] = device_mesh
 
                     if _device_group and remote_group:
                         # usually this happens in driver because worker does not has a valid _device_group
@@ -551,7 +552,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
-                    sync: bool = False):
+                    sync: bool = False,
+                    lazy_collect: Optional[bool] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -576,6 +578,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             Callable: A callable that handles the collection
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
+        lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
     """
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -617,7 +620,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     result = execute_method(func.__name__, _workers_and_args)
                     # This is a result future, call it to get the actual result
                     result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
-                    lazy_collect = _lazy_collect
+                    _local_lazy_collect = _lazy_collect
                     if func.__name__ == '__iter__':
                         # return self
                         return self
@@ -637,10 +640,15 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         result = [_res[0] for _res in result]
                         result_func._futures = result
 
+                    if lazy_collect is not None:
+                        # Maybe this function returns a small object
+                        _local_lazy_collect = lazy_collect
                     if hasattr(self, '_lazy_collect'):
-                        # _lazy_collect in class has a higher priority
-                        lazy_collect = self._lazy_collect
-                    result = result_func if lazy_collect else result_func()
+                        # _lazy_collect in class has the highest priority
+                        # This is the unique case that an object ref contains another
+                        # And this is user independent, only decided by the code.
+                        _local_lazy_collect = self._lazy_collect
+                    result = result_func if _local_lazy_collect else result_func()
                     return result
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')

@@ -30,7 +30,7 @@ from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.model.base import TwinkleModel
 from twinkle.model.transformers.strategy import AccelerateStrategy
-from twinkle.metric import LossMetric, Accuracy
+from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
 
 @dataclass
@@ -48,8 +48,9 @@ class OptimizerGroup:
     scaler: GradScaler = None
     scaler_has_nan: bool = False
     gradient_accumulation_steps: int = 1
-    cur_step: int = 0
-    metrics: List[Metric] = field(default_factory=list)
+    cur_step: int = -1
+    train_metrics: List[Metric] = field(default_factory=list)
+    eval_metrics: List[Metric] = field(default_factory=list)
     _dp_group = None
     _device_mesh: DeviceMesh = None
 
@@ -61,8 +62,44 @@ class OptimizerGroup:
     def __post_init__(self):
         if self._device_mesh.data_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
-            for metric in self.metrics:
-                metric.process_group = self._dp_group
+        self.train_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group),
+            TrainMetric(self._device_mesh, self._dp_group),
+        ]
+
+        self.eval_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group),
+            TrainMetric(self._device_mesh, self._dp_group),
+        ]
+
+    def _get_lr(self):
+        _lrs = []
+        _default_lr = self.optimizer.defaults.get('lr')
+        for param_group in self.optimizer.param_groups:
+            _lrs.append(param_group.get('lr', _default_lr))
+        return _lrs
+
+    def accumulate_metrics(self, is_training):
+        if is_training:
+            metrics = self.train_metrics
+        else:
+            metrics = self.eval_metrics
+        if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
+            for metric in metrics:
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step})
+
+    def calculate_metrics(self, is_training):
+        self.accumulate_metrics(is_training)
+        if is_training:
+            metrics = self.train_metrics
+        else:
+            metrics = self.eval_metrics
+        results = {}
+        for metric in metrics:
+            results.update(metric.calculate())
+        return results
 
 
 _default_adapter_name = ''
@@ -171,7 +208,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
         labels = inputs.pop('labels', None)
-        self._accumulate_metric(optimizer_config)
+        self._accumulate_metric(optimizer_config, is_training=True)
         outputs = self.model(**inputs)
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
@@ -202,7 +239,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
             labels = inputs.pop('labels', None)
-            self._accumulate_metric(optimizer_config)
+            self._accumulate_metric(optimizer_config, is_training=False)
             outputs = self.model(**inputs)
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
@@ -210,10 +247,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         return outputs
 
     @staticmethod
-    def _accumulate_metric(optimizer_config: OptimizerGroup):
-        if len(optimizer_config.metrics) > 0 and optimizer_config.inputs is not None and optimizer_config.outputs is not None:
-            for metric in optimizer_config.metrics:
-                metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
+    def _accumulate_metric(optimizer_config: OptimizerGroup, is_training):
+        optimizer_config.accumulate_metrics(is_training)
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -300,6 +335,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler
+        outputs = optimizer_config.outputs
 
         context = contextlib.nullcontext
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
@@ -314,7 +350,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
             # Convert DTensor to local tensor for FSDP2 compatibility
             grad_norm = torch_util.to_local_tensor(grad_norm)
-            return grad_norm.item()
+            grad_norm = grad_norm.item()
+            outputs['grad_norm'] = grad_norm
+            return grad_norm
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
@@ -544,14 +582,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         state_dict = self._get_trainable_parameters(adapter_name=adapter_name)
         processed_state_dict = {}
 
-        if Platform.is_master():
-            for key, value in state_dict.items():
-                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
-        
         save_kwargs = {}
         if isinstance(model, PeftModel):
             # Only save the selected adapter, avoid save dummy adapters
             save_kwargs['selected_adapters'] = [adapter_name]
+
+        for key, value in state_dict.items():
+            processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
@@ -636,14 +673,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', _default_adapter_name))
 
     @remote_function(collect='first')
-    def calculate_metric(self, **kwargs):
+    def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        results = {}
-        for metric in optimizer_config.metrics:
-            metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
-            results.update(metric.calculate())
-        return results
+        return optimizer_config.calculate_metrics(is_training)
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], train_group: str, **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
@@ -681,10 +714,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         dp_group = self.optimizer_group[train_group]._dp_group
         self._default_tokenizer = self.optimizer_group[train_group].template.processor
-        self.optimizer_group[train_group].metrics = [
-                LossMetric(self.device_mesh, dp_group),
-                Accuracy(self.device_mesh, dp_group),
-            ]
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
@@ -759,8 +788,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
-        metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
-        optimizer_config.metrics.append(metric)
+        is_training = kwargs.pop('is_training', None)
+        if is_training is None or is_training is True:
+            optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+        if not is_training:
+            optimizer_config.eval_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     @remote_function(execute='first')
     def get_train_configs(self, **kwargs):
@@ -772,14 +804,28 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         else:
             config = {}
         config = {key: str(value) for key, value in config.items() if value is not None}
+        trainable_params, all_param = PeftModel.get_nb_trainable_parameters(self.model)
+        trainable_param_names = []
+        for name, parameter in self.model.named_parameters():
+            if parameter.requires_grad:
+                trainable_param_names.append(name)
+        trainable_param_names = trainable_param_names[:5] + ['...'] + trainable_param_names[-5:]
+        trainable_param_names = '\n'.join(trainable_param_names)
         if optimizer_config.optimizer is not None:
             expr += (f'Adapter config:\n'
                     f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
+                    f'Trainable parameters examples:\n'
+                    f'{trainable_param_names}\n'
+                    f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}\n'
                     f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
                     f'Learning rate: {optimizer_config.optimizer.defaults.get("lr", "No default lr")}\n'
                     f'Lr scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
                     f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n')
         else:
             expr += (f'Adapter config:\n'
-                    f'{json.dumps(config, indent=2, ensure_ascii=False)}\n')
+                     f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
+                     f'Trainable parameters examples:\n'
+                     f'{trainable_param_names}\n'
+                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}%\n'
+                     )
         return expr

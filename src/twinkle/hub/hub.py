@@ -202,7 +202,7 @@ class HubOperation:
             The local dir
         """
         if kwargs.pop('ignore_model', False):
-            ignore_patterns = set(ignore_patterns) | set(large_file_pattern)
+            ignore_patterns = set(ignore_patterns or []) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
             return model_id_or_path
         if cls.source_type(model_id_or_path) == 'hf':

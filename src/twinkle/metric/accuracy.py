@@ -42,6 +42,10 @@ class Accuracy(Metric):
         self.total_correct += local_correct
         self.total_count += local_total
 
+    def reset(self):
+        self.total_correct = 0
+        self.total_count = 0
+
     def calculate(self):
         local_results = [
             {"correct": self.total_correct, "total": self.total_count}
@@ -52,9 +56,9 @@ class Accuracy(Metric):
         total_correct = sum(r["correct"] for r in all_results)
         total_count = sum(r["total"] for r in all_results)
         accuracy = total_correct / total_count if total_count > 0 else np.nan
-
+        self.reset()
         return {
-            "accuracy": accuracy,
+            "accuracy": f'{accuracy:.2f}',
             "correct_tokens": total_correct,
             "total_tokens": total_count,
         }

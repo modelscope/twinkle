@@ -30,9 +30,13 @@ class CompetitionMathGRPOProcessor(Preprocessor):
 
 class SelfCognitionProcessor(Preprocessor):
 
+    def __init__(self, model_name, model_author):
+        self.model_name = model_name
+        self.model_author = model_author
+
     def __call__(self, row) -> Trajectory:
-        problem = row['query']
-        solution = row['response']
+        problem = row['query'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
+        solution = row['response'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
         messages = [
             Message(role='user', content=problem),
             Message(role='assistant', content=solution),

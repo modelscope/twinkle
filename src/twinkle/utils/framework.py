@@ -55,7 +55,7 @@ class Framework(ABC):
 
     @staticmethod
     def seed_everything(seed: Optional[int] = 42, full_determinism: bool = False):
-        Torch.seed_everything(seed, full_determinism)
+        Torch.seed_everything(int(seed), full_determinism)
 
     @staticmethod
     def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):

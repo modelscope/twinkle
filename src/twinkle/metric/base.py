@@ -11,3 +11,6 @@ class Metric:
 
     def calculate(self):
         ...
+
+    def reset(self):
+        ...

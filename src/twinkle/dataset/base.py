@@ -33,6 +33,10 @@ class DatasetMeta:
 
     def get_id(self):
         return self.dataset_id.replace(os.sep, '_').replace('.', '_') + ':' + self.subset_name + ':' + self.split
+    
+    def __post_init__(self):
+        if self.data_slice is not None and not isinstance(self.data_slice, Iterable):
+            raise ValueError('data_slice must be an iterable')
 
 
 @remote_class(execute='first')
