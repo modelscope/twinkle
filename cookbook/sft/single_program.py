@@ -4,7 +4,7 @@ from tqdm import tqdm
 from twinkle import get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
-from twinkle.model import TransformersModel
+from twinkle.model import MultiLoraTransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
 twinkle.initialize(mode='local')
@@ -12,7 +12,7 @@ twinkle.initialize(mode='local')
 logger = get_logger()
 
 
-def eval(model: TransformersModel):
+def eval(model: MultiLoraTransformersModel):
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
@@ -33,7 +33,7 @@ def train():
     # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=8, num_workers=4)
 
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         r=8,
