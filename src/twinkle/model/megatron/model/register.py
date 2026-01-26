@@ -22,6 +22,8 @@ class MegatronModelMeta:
     model_provider: Optional[Callable[[], nn.Module]] = None
     visual_cls: Optional[Type[nn.Module]] = None
     get_mtp_block_spec: Optional[Callable] = None
+    # AutoModel class for loading HF model (AutoModelForCausalLM for text, AutoModel for multimodal)
+    auto_model_cls: Optional[Type] = None
 
     extra_args_provider: Optional[Callable[[ArgumentParser], ArgumentParser]] = None
 
@@ -35,6 +37,9 @@ class MegatronModelMeta:
             from .mm_gpt_model import MultimodalGPTModel
             from megatron.core.models.gpt import GPTModel
             self.model_cls = MultimodalGPTModel if self.is_multimodal else GPTModel
+        if self.auto_model_cls is None:
+            from transformers import AutoModelForCausalLM, AutoModel
+            self.auto_model_cls = AutoModel if self.is_multimodal else AutoModelForCausalLM
 
 
 def register_megatron_model(megatron_model_meta: MegatronModelMeta, *, exist_ok: bool = False):

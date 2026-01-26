@@ -87,11 +87,13 @@ class TwinkleMegatronArgs:
     # =========================================================================
     # RoPE settings
     # =========================================================================
-    rotary_base: int = 10000
+    rotary_base: int = 10000  # rope_theta in HF config
     rotary_percent: float = 1.0
     max_position_embeddings: int = 4096
     original_max_position_embeddings: Optional[int] = None
     rope_scaling: Optional[Dict[str, Any]] = None
+    partial_rotary_factor: Optional[float] = None  # For partial RoPE
+    rope_interleaved: bool = False  # mrope_interleaved in Swift
     
     # =========================================================================
     # Model settings
@@ -227,11 +229,11 @@ class TwinkleMegatronArgs:
     
     @property
     def context_parallel_size(self) -> int:
-        return self.device_mesh.cp_world_size
+        return self.device_mesh.cp_world_size or 1
 
     @property
     def cp_size(self) -> int:
-        return self.device_mesh.cp_world_size
+        return self.device_mesh.cp_world_size or 1
     
     @property
     def expert_model_parallel_size(self) -> int:
@@ -243,7 +245,7 @@ class TwinkleMegatronArgs:
     
     @property
     def expert_tensor_parallel_size(self) -> int:
-        return self.device_mesh.etp_size or 1
+        return self.device_mesh.etp_world_size
 
     @property
     def etp_size(self) -> int:
@@ -350,10 +352,7 @@ class TwinkleMegatronArgs:
         
         # Determine QK layernorm
         qk_layernorm = getattr(text_config, 'qk_layernorm', False) or \
-                       getattr(text_config, 'use_qk_norm', False)
-        if not qk_layernorm and model_type in ('qwen3', 'qwen3_moe', 'qwen3_vl', 'qwen3_vl_moe'):
-            qk_layernorm = True
-        
+                       getattr(text_config, 'use_qk_norm', False)        
         # MoE config
         num_experts = getattr(text_config, 'num_experts', 0) or \
                       getattr(text_config, 'n_routed_experts', 0) or \
@@ -417,6 +416,19 @@ class TwinkleMegatronArgs:
         object.__setattr__(instance, '_hf_config', hf_config)
         object.__setattr__(instance, '_text_config', text_config if text_config is not hf_config else None)
         
+        # Apply convert_hf_config results to instance (like swift's init_model_args)
+        # This ensures derived values like qk_layernorm are correctly set
+        mg_config = convert_hf_config(hf_config)
+        for k, v in mg_config.items():
+            if not hasattr(instance, k):
+                continue
+            current_value = getattr(instance, k)
+            if current_value is None:
+                object.__setattr__(instance, k, v)
+            elif current_value is False and isinstance(v, bool) and v:
+                # update false
+                object.__setattr__(instance, k, v)
+        
         return instance
 
 
@@ -440,10 +452,15 @@ class TwinkleMegatronArgs:
         from megatron.core.models.gpt import GPTModel
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec, )
+        from .model.register import get_megatron_model_meta
         hf_config = self.hf_config
         padded_vocab_size = self.padded_vocab_size
         # Convert HF config to Megatron config
         mg_config_dict = convert_hf_config(hf_config)
+        
+        # Get registered model class (for multimodal models like Qwen3-VL)
+        model_meta = get_megatron_model_meta(self.hf_model_type)
+        ModelClass = model_meta.model_cls if model_meta else GPTModel
 
         # Build TransformerConfig
         num_attention_heads = mg_config_dict['num_attention_heads']
@@ -471,26 +488,23 @@ class TwinkleMegatronArgs:
         def finalize_model_grads_for_lora(model,
                                           num_tokens=None,
                                           pg_collection=None):
-            """Finalize model grads that handles both DDP and PEFT/LoRA models.
-
-            For DDP-wrapped models: Delegates to Megatron's native finalize_model_grads
-            For PEFT/LoRA models: Manually all-reduce gradients across DP ranks
-
-            This is necessary because PEFT models don't have ddp_config attribute
-            that Megatron's native implementation expects.
-            """
-
+            from peft import PeftModel as _PeftModel
+            from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+            
             # Check if model is DDP-wrapped (has ddp_config)
-            if hasattr(model[0], 'ddp_config'):
+            # Need to unwrap PeftModel to check the underlying model
+            def _get_base_model(m):
+                if isinstance(m, _PeftModel):
+                    return _get_base_model(m.base_model.model)
+                return m
+            
+            base_model = _get_base_model(model[0])
+            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'ddp_config'):
                 # Use native implementation for DDP models
                 return _native_finalize_model_grads(model, num_tokens,
                                                     pg_collection)
 
-            # For PEFT/LoRA models, call finish_grad_sync on each chunk
-            # The model should have finish_grad_sync added by MegatronModel.add_adapter_to_model
-            for model_chunk in model:
-                if hasattr(model_chunk, 'finish_grad_sync'):
-                    model_chunk.finish_grad_sync()
+            raise NotImplementedError()
 
         # MoE configuration
         num_experts = mg_config_dict.get('num_experts', 0) or 0
@@ -653,7 +667,7 @@ class TwinkleMegatronArgs:
                 extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": i}
                 if has_vp_stage:
                     extra_init_args['vp_stage'] = i
-                _model = GPTModel(
+                _model = ModelClass(
                     config=config,
                     transformer_layer_spec=layer_spec,
                     vocab_size=padded_vocab_size,
@@ -670,7 +684,7 @@ class TwinkleMegatronArgs:
                 model.append(_model)
             mpu.set_virtual_pipeline_model_parallel_rank(0)
         else:
-            model = GPTModel(
+            model = ModelClass(
                 config=config,
                 transformer_layer_spec=layer_spec,
                 vocab_size=padded_vocab_size,

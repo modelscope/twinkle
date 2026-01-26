@@ -1,17 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from copy import deepcopy, copy
-from typing import List, Optional, Dict, Any, Literal, Union
-from transformers import AutoTokenizer, PreTrainedTokenizer
-import numpy as np
+import os
 from collections.abc import Mapping
-from twinkle.hub import HubOperation
+from copy import deepcopy
+from typing import List, Optional, Dict, Any, Literal, Union
+
+import numpy as np
 from twinkle.data_format import Trajectory, InputFeature, Message
-from .utils import tokenize_with_assistant_labels
+from twinkle.hub import HubOperation
+from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
+import torch
 
 
 class Template:
 
-    PLACEHOLDER = "<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>"
+    # Placeholder tokens in user text
+    image_placeholder: str = '<image>'
+    video_placeholder: str = '<video>'
+    audio_placeholder: str = '<audio>'
 
     def __init__(self,
                  model_id: str,
@@ -21,7 +26,14 @@ class Template:
                  default_system: Optional[str] = None,
                  **kwargs):
         model_id = HubOperation.download_model(model_id)
-        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
+        if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            from transformers import AutoTokenizer
+            self.processor = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        self.tokenizer = getattr(self.processor, 'tokenizer', self.processor)
+
         self.use_chat_template = use_chat_template
         self.max_length = max_length
         self.truncation_strategy = truncation_strategy
@@ -29,6 +41,7 @@ class Template:
         self._test_support_assistant_tokens_mask()
         self.pre_pipeline = [
             self._add_default_system, # Add a default system field
+            self._build_mm_messages, # turn to standard mm messages
         ]
         self.post_pipeline = [
             self._check_max_length, # Check and split input_features
@@ -41,10 +54,21 @@ class Template:
             Message(role='user', content='How are you?'),
             Message(role='assistant', content='Fine.'),
         ]
-        outputs = self.tokenizer.apply_chat_template(conversation=dummy_inputs,
-                                                     return_assistant_tokens_mask=True, return_dict=True)
-        assistant_masks = outputs['assistant_masks']
-        self._template_support_assistant_tokens_mask = (0 < np.array(assistant_masks).sum() < len(assistant_masks))
+        outputs = self.processor.apply_chat_template(
+            conversation=dummy_inputs,
+            return_assistant_tokens_mask=True,
+            return_dict=True
+        )
+        # Check if outputs is a dict (not all processors return dict even with return_dict=True)
+        if isinstance(outputs, dict) and 'assistant_masks' in outputs:
+            assistant_masks = outputs['assistant_masks']
+            self._template_support_assistant_tokens_mask = (
+                0 < np.array(assistant_masks).sum() < len(assistant_masks)
+            )
+        else:
+            # Processor doesn't support return_dict properly
+            self._template_support_assistant_tokens_mask = False
+
 
     def _invoke_pre_pipeline(self, trajectories: List[Trajectory]) -> List[Trajectory]:
         current = trajectories
@@ -103,22 +127,33 @@ class Template:
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
         return [input_feature]
 
+    def _build_mm_messages(self, trajectory: Trajectory):
+        messages = trajectory['messages']
+        messages = [transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder) for message in messages]
+        trajectory['messages'] = messages
+        return [trajectory]
+
     def encode(self, trajectory: Trajectory) -> InputFeature:
         if self.use_chat_template:
             if self._template_support_assistant_tokens_mask:
                 messages = [dict(message) for message in trajectory['messages']]
                 tools = [dict(tool) for tool in trajectory.get('tools', [])]
-                outputs = self.tokenizer.apply_chat_template(conversation=messages, tools=tools,
-                                                   return_assistant_tokens_mask=True, return_dict=True)
+                outputs = self.processor.apply_chat_template(conversation=messages, tools=tools,
+                                                   return_assistant_tokens_mask=True, return_dict=True,
+                                                             return_tensors='np')
                 input_ids = outputs['input_ids']
                 assistant_masks = outputs['assistant_masks']
                 labels = np.where(assistant_masks, input_ids, -100)
             else:
-                input_ids, labels = tokenize_with_assistant_labels(self.tokenizer, trajectory)
+                if hasattr(self.processor, 'tokenizer'):
+                    tokenizer = self.processor.tokenizer
+                else:
+                    tokenizer = self.processor
+                input_ids, labels = tokenize_with_assistant_labels(tokenizer, trajectory)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']
-            input_ids = self.tokenizer.encode(text)
+            input_ids = self.processor.encode(text)
             labels = deepcopy(input_ids)
         return InputFeature(
             input_ids=np.array(input_ids),
@@ -186,7 +221,77 @@ class Template:
         return output
 
     def decode(self, token_ids: List[int], **kwargs) -> str:
-        return self.tokenizer.decode(token_ids, **kwargs)
+        return self.processor.decode(token_ids, **kwargs)
 
     def batch_decode(self, token_ids: List[List[int]], **kwargs) -> List[str]:
-        return [self.tokenizer.decode(_ids, **kwargs) for _ids in token_ids]
+        return [self.processor.decode(_ids, **kwargs) for _ids in token_ids]
+
+    def post_encode(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Transform inputs for model forward.
+
+        Default: use helper methods for embedding merge.
+        Override if model handles internally (like Qwen3-VL).
+        """
+        input_ids = inputs.get('input_ids')
+        if input_ids is None:
+            return inputs
+
+        text_embeds = self._get_text_embeddings(model, input_ids)
+        vision_embeds = self._get_vision_embeddings(model, inputs)
+
+        if vision_embeds is not None:
+            inputs_embeds = self._merge_vision_embeddings(
+                text_embeds, vision_embeds, input_ids, inputs
+            )
+        else:
+            inputs_embeds = text_embeds
+
+        result = {k: v for k, v in inputs.items() if k != 'input_ids'}
+        result['inputs_embeds'] = inputs_embeds
+        return result
+
+    def _get_text_embeddings(self, model: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+        """Get text embeddings from model."""
+        embed_fn = None
+        if hasattr(model, 'get_input_embeddings'):
+            embed_fn = model.get_input_embeddings()
+        elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+            embed_fn = model.model.embed_tokens
+        elif hasattr(model, 'language_model') and hasattr(model.language_model, 'embed_tokens'):
+            embed_fn = model.language_model.embed_tokens
+
+        if embed_fn is None:
+            raise ValueError("Cannot find embedding layer in model")
+
+        return embed_fn(input_ids)
+
+    def _get_vision_embeddings(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Get vision embeddings. Override in subclass."""
+        return None
+
+    def _get_vision_token_id(self) -> Optional[int]:
+        """Get vision placeholder token ID. Override in subclass."""
+        return self.processor.encode(self.image_placeholder)
+
+    def _merge_vision_embeddings(
+            self,
+            text_embeds: torch.Tensor,
+            vision_embeds: torch.Tensor,
+            input_ids: torch.Tensor,
+            inputs: Dict[str, Any]
+    ) -> torch.Tensor:
+        """Merge vision embeddings at placeholder positions."""
+        vision_token_id = self._get_vision_token_id()
+        if vision_token_id is None:
+            return text_embeds
+
+        vision_mask = (input_ids == vision_token_id).unsqueeze(-1).expand_as(text_embeds)
+        vision_embeds = vision_embeds.to(device=text_embeds.device, dtype=text_embeds.dtype)
+        vision_mask = vision_mask.to(device=text_embeds.device)
+
+        return text_embeds.masked_scatter(vision_mask, vision_embeds)
+
+    def _get_position_ids(self, inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Get position_ids. Override for models with special position encoding."""
+        return None

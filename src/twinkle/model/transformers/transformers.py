@@ -66,7 +66,8 @@ class OptimizerGroup:
 
 
 _default_adapter_name = ''
-
+DEFAULT_LEARNING_RATE = 1e-5
+DEFAULT_WEIGHT_DECAY = 0.01
 
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel):
@@ -134,7 +135,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             assert len(self.optimizer_group) == 1
             optimizer = self.optimizer_group[_default_adapter_name].optimizer
             if optimizer is None:
-                optimizer = AdamW(self._create_param_group(_default_adapter_name, 1e-5, 0.01), lr=1e-5)
+                optimizer = AdamW(self._create_param_group(_default_adapter_name, DEFAULT_LEARNING_RATE, DEFAULT_WEIGHT_DECAY), lr=DEFAULT_LEARNING_RATE)
                 self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             self.optimizer_group[_default_adapter_name].optimizer = optimizer
@@ -328,7 +329,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    def _create_param_group(self, adapter_name: str, lr: float=1e-5, weight_decay:float=0.01, **kwargs):
+    def _create_param_group(self, adapter_name: str, lr: float=DEFAULT_LEARNING_RATE, weight_decay:float=DEFAULT_WEIGHT_DECAY, **kwargs):
         # Some code borrowed from transformers
 
         def get_parameter_names(model, forbidden_layer_types, forbidden_layer_names=None):
@@ -389,7 +390,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before forwarding'
 
         context = contextlib.nullcontext
-        if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
+        if self.device_mesh is not None and self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
 
@@ -471,10 +472,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_cls: An optimizer class name, an optimizer plugin id, or an optimizer class type/instance.
             **kwargs:
                 adapter_name: Lora adapter name.
+                lr: Learning rate
+                weight_decay: Weight decay
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        lr = kwargs.pop('lr', DEFAULT_LEARNING_RATE)
+        weight_decay = kwargs.pop('weight_decay', DEFAULT_WEIGHT_DECAY)
+        param_groups = self._create_param_group(adapter_name, lr=lr, weight_decay=weight_decay)
+        kwargs['params'] = param_groups
         optimizer_config.optimizer = construct_class(optimizer_cls, Optimizer, torch.optim, **kwargs)
 
     def _get_trainable_parameters(self, adapter_name=_default_adapter_name):

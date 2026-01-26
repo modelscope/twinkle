@@ -286,6 +286,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             attention_mask = batch.get('attention_mask')
             batch_labels = batch.get('labels')
 
+            extra_kwargs = self.get_extra_vlm_kwargs(batch)
             # Forward pass with labels - Megatron will compute loss internally
             # This uses Megatron's compute_language_model_loss which properly handles
             # vocab parallel cross entropy
@@ -294,6 +295,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 labels=batch_labels,  # Pass labels to let Megatron compute loss
+                **extra_kwargs,
             )
             return output_tensor, partial(post_loss_function, inputs=batch)
 
@@ -443,6 +445,8 @@ class MegatronModel(TwinkleModel, nn.Module):
             attention_mask = batch.get('attention_mask')
             batch_labels = batch.get('labels')
 
+            extra_kwargs = self.get_extra_vlm_kwargs(batch)
+
             # Forward pass with labels - Megatron will compute loss internally
             # This uses Megatron's compute_language_model_loss which properly handles
             # vocab parallel cross entropy
@@ -451,6 +455,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 labels=batch_labels,  # Pass labels to let Megatron compute loss
+                **extra_kwargs,
             )
             return output_tensor, partial(post_loss_function, inputs=batch)
 
@@ -509,14 +514,13 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         optimizer_config.cur_step += (len(inputs) if isinstance(inputs, list) else 1)
 
-        # Critical: Synchronize all DP replicas before returning
-        # This ensures all DP replicas complete the same training step before
-        # moving to the next batch, preventing P2P communication deadlocks
         dp_world_size = mpu.get_data_parallel_world_size()
         if dp_world_size > 1:
-            # Use barrier on DP+CP group to synchronize all replicas
+            if isinstance(loss, (int, float)):
+                loss = torch.tensor(loss, device=Platform.get_local_device())
+            # Average loss across DP group (with CP if enabled)
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-            dist.barrier(group=dp_cp_group)
+            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         if isinstance(loss, torch.Tensor):
             return loss.detach().cpu().float().numpy()
@@ -711,7 +715,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
-        use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
+        use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', False)
 
         opt_config = OptimizerConfig(
             optimizer='adam',
@@ -729,9 +733,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             **kwargs,
         )
 
-        # For PEFT models, we need to handle the case where model is not DDP-wrapped
-        # We create a temporary wrapper to satisfy Megatron's optimizer requirements
+        # Ensure each model chunk has ddp_config attached (required by Megatron optimizer)
+        from megatron.core.distributed import DistributedDataParallelConfig
         model_chunks = self.model
+        for model_chunk in model_chunks:
+            if not hasattr(model_chunk, 'ddp_config'):
+                model_chunk.ddp_config = DistributedDataParallelConfig(
+                    grad_reduce_in_fp32=True,
+                    use_megatron_fsdp=False,
+                )
+        
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
@@ -822,6 +833,10 @@ class MegatronModel(TwinkleModel, nn.Module):
             self._save_megatron_format(output_dir, adapter_name)
 
         self._save_tokenizer(output_dir, adapter_name=adapter_name)
+        
+        # Final synchronization to ensure all ranks complete save
+        if dist.is_initialized():
+            dist.barrier()
 
     def _save_hf_format(self, output_dir: str, adapter_name: str):
         """Save in HuggingFace format using bridge adapter.
@@ -877,7 +892,10 @@ class MegatronModel(TwinkleModel, nn.Module):
     def _save_tokenizer(self,
                         output_dir: str,
                         **kwargs):
-        """Save tokenizer."""
+        from twinkle.utils.platform import is_last_rank
+        if not is_last_rank():
+            return
+            
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
@@ -1036,11 +1054,20 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         if optimizer_config.optimizer:
             expr += f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
+            expr += f'Learning rate: N/A\n'  # ChainedOptimizer has no defaults
         if optimizer_config.lr_scheduler:
             expr += f'LR scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
 
         return expr
+
+    def get_extra_vlm_kwargs(self, batch):
+        extra_kwargs = {}
+        for key in ['pixel_values', 'pixel_values_videos', 'image_grid_thw', 
+                    'video_grid_thw', 'packed_seq_params']:
+            if key in batch and batch[key] is not None:
+                extra_kwargs[key] = batch[key]
+        return extra_kwargs
 
     def initialize(self, **kwargs) -> None:
         if self._initialized:
@@ -1048,7 +1075,8 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        dist.init_process_group(backend='nccl')
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
         args = get_args()
         init_kwargs = {
             'tensor_model_parallel_size': args.tensor_model_parallel_size,
@@ -1063,7 +1091,13 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         if exists('megatron_core>=0.13'):
             init_kwargs['expert_tensor_parallel_size'] = args.expert_tensor_parallel_size
-        init_kwargs.update(kwargs)
+        
+        # Filter out kwargs that are not valid for initialize_model_parallel
+        # Dynamically check the signature to exclude unsupported parameters
+        import inspect
+        valid_params = set(inspect.signature(parallel_state.initialize_model_parallel).parameters.keys())
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+        init_kwargs.update(filtered_kwargs)
         parallel_state.initialize_model_parallel(**init_kwargs)
         model_parallel_cuda_manual_seed(self._seed)
 

@@ -7,6 +7,7 @@ from ..gpt_bridge import MultimodalGPTBridge
 from ..register import MegatronModelMeta, register_megatron_model
 from .utils import HuggingFaceModule
 from twinkle.utils.torch_utils import to_device
+from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
 
 
 class Qwen2_5VL_Vit(HuggingFaceModule):
@@ -101,7 +102,10 @@ register_megatron_model(
     MegatronModelMeta(
         MegatronModelType.qwen2_5_vl, [
             ModelType.qwen2_5_vl,
-        ], bridge_cls=Qwen2_5VLBridge, visual_cls=Qwen2_5VL_Vit))
+        ],
+        bridge_cls=Qwen2_5VLBridge,
+        visual_cls=Qwen2_5VL_Vit,
+        auto_model_cls=Qwen2_5_VLForConditionalGeneration))
 
 
 class Qwen2VL_Vit(Qwen2_5VL_Vit):
@@ -112,4 +116,7 @@ register_megatron_model(
     MegatronModelMeta(
         MegatronModelType.qwen2_vl, [
             ModelType.qwen2_vl,
-        ], bridge_cls=Qwen2_5VLBridge, visual_cls=Qwen2VL_Vit))
+        ],
+        bridge_cls=Qwen2_5VLBridge,
+        visual_cls=Qwen2VL_Vit,
+        auto_model_cls=Qwen2VLForConditionalGeneration))

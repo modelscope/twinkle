@@ -112,20 +112,35 @@ class GPTBridge:
         return getattr(self.hf_layers[layer_idx], self.get_hf_mlp_prefix(layer_idx))
 
     def _init_meta_hf_model(self):
-        from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
+        import copy
+        from transformers import AutoProcessor, AutoConfig
+        from .register import get_megatron_model_meta
         
         model_dir = self.args.model_dir
         model_type = self.args.hf_model_type
         
+        # Get the correct AutoModel class from MegatronModelMeta
+        megatron_model_meta = get_megatron_model_meta(model_type)
+        auto_model_cls = megatron_model_meta.auto_model_cls if megatron_model_meta else None
+        if auto_model_cls is None:
+            from transformers import AutoModelForCausalLM
+            auto_model_cls = AutoModelForCausalLM
+        
+        # Load config first
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        config.torch_dtype = self.args.params_dtype
+        
         with torch.device('meta'):
-            try:
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
-                    model_dir,
-                    trust_remote_code=True,
-                    torch_dtype=self.args.params_dtype,
-                )
-            except Exception:
-                self.hf_model = None
+            origin_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(self.args.params_dtype)
+            config_copy = copy.deepcopy(config)
+            # Auto classes have from_config, concrete model classes have _from_config
+            if hasattr(auto_model_cls, 'from_config'):
+                self.hf_model = auto_model_cls.from_config(config_copy, trust_remote_code=True)
+            else:
+                self.hf_model = auto_model_cls._from_config(config_copy)
+            torch.set_default_dtype(origin_dtype)
+
         if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
             auto_tokenizer_cls = AutoProcessor
         else:

@@ -12,6 +12,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core import mpu
 from packaging import version
 
+from megatron.core.enums import ModelType
 from .gpt_model import GPTModel
 from twinkle.model.megatron.args import get_args
 
@@ -31,6 +32,8 @@ class MultimodalGPTModel(MegatronModule):
                  **kwargs):
         from .register import get_megatron_model_meta
         super().__init__(config)
+        # Required by Megatron's forward_backward scheduling
+        self.model_type = ModelType.encoder_or_decoder
         self.pre_process = pre_process
         self.post_process = post_process
         self.language_model = GPTModel(config, transformer_layer_spec, vocab_size, max_sequence_length, pre_process,
@@ -65,8 +68,19 @@ class MultimodalGPTModel(MegatronModule):
                     inputs_embeds = res.pop('inputs_embeds')
                     kwargs.update(res)
                     res = inputs_embeds
-            if mpu.get_context_parallel_world_size() > 1:
-                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
+            cp_size = mpu.get_context_parallel_world_size()
+            if cp_size > 1:
+                # Pad embedding sequence to be divisible by 2 * cp_size
+                # This is required for the load-balanced CP split algorithm
+                seq_dim = 1  # res shape: [batch, seq, hidden]
+                seq_len = res.shape[seq_dim]
+                divisor = 2 * cp_size
+                if seq_len % divisor != 0:
+                    pad_len = divisor - (seq_len % divisor)
+                    # Pad with zeros on the sequence dimension
+                    # res shape: [batch, seq, hidden], pad the seq dimension
+                    res = torch.nn.functional.pad(res, (0, 0, 0, pad_len), value=0)
+                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), seq_dim)
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 group_kwargs = {'group': _self.tp_group} if mcore_013 else {}

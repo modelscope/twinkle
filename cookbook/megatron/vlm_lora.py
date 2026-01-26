@@ -23,16 +23,14 @@ import numpy as np
 import torch
 from PIL import Image
 from peft import LoraConfig
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger, get_device_placement
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.loss import MegatronCrossEntropyLoss
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
+from twinkle.utils.platform import is_last_rank
 
 # Parse arguments
 parser = argparse.ArgumentParser()
@@ -45,7 +43,7 @@ parser.add_argument('--max_steps', type=int, default=10)
 parser.add_argument('--model', type=str, default='Qwen/Qwen3-VL-8B-Instruct')
 parser.add_argument('--dataset', type=str, default='ms://AI-ModelScope/LaTeX_OCR')
 parser.add_argument('--subset', type=str, default='human_handwrite')
-parser.add_argument('--samples', type=int, default=100)
+parser.add_argument('--samples', type=int, default=1000)
 parser.add_argument('--batch_size', type=int, default=1)
 GAS = 4  # gradient accumulation steps
 args = parser.parse_args()
@@ -135,11 +133,12 @@ def train():
     logger.info(f"Model: {args.model}")
     logger.info(f"Dataset: {args.dataset}/{args.subset} ({args.samples} samples)")
     
-    # Device mesh: Match Megatron's order "tp-cp-ep-dp-pp"
-    device_mesh = DeviceMesh(
-        device_type='cuda',
-        mesh=np.arange(WORLD_SIZE).reshape(PP_SIZE, DP_SIZE, CP_SIZE, TP_SIZE),
-        mesh_dim_names=('pp', 'dp', 'cp', 'tp'),
+    # Device mesh: Use DeviceMesh.from_sizes for proper configuration
+    device_mesh = DeviceMesh.from_sizes(
+        dp_size=DP_SIZE,
+        pp_size=PP_SIZE,
+        tp_size=TP_SIZE,
+        cp_size=CP_SIZE,
     )
     
     GROUP_NAME = 'model'
@@ -171,30 +170,25 @@ def train():
         dataloader = DataLoader(
             dataset=create_dataset,
             batch_size=args.batch_size,
+            device_mesh=device_mesh,
         )
     
     # Create Megatron model
-    # Note: MegatronModel will use TwinkleBridgeInitializer which sets up global args
+    _remote_args = {}
     if args.mode == 'ray':
-        model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
-            mixed_precision='bf16',
-            recompute_granularity='selective',
-            remote_group=GROUP_NAME,
-            device_mesh=device_mesh,
-        )
-    else:
-        model = MegatronModel(
-            pretrained_model_name_or_path=args.model,
-            tensor_model_parallel_size=TP_SIZE,
-            pipeline_model_parallel_size=PP_SIZE,
-            context_parallel_size=CP_SIZE,
-            mixed_precision='bf16',
-            recompute_granularity='selective',
-        )
+        _remote_args = {
+            'remote_group': GROUP_NAME,
+            'device_mesh': device_mesh,
+        }
+    
+    model = MegatronModel(
+        model_id=args.model,
+        device_mesh=device_mesh,
+        mixed_precision='bf16',
+        recompute_granularity='selective',
+        sequence_parallel=False,  # VLM may have variable seq lengths
+        **_remote_args
+    )
     
     # Configure LoRA
     lora_config = LoraConfig(
@@ -213,18 +207,16 @@ def train():
     
     # Set up template for VLM
     # The template handles image token insertion for Qwen3-VL
-    model.set_template('Qwen3VLTemplate', adapter_name=adapter_name)
+    model.set_template('Qwen3VLTemplate', model_id=args.model, adapter_name=adapter_name)
     
     # Set up processor for input collation
     model.set_processor(InputProcessor, padding_side='right', adapter_name=adapter_name)
     
-    # Set up loss
-    model.set_loss(MegatronCrossEntropyLoss, adapter_name=adapter_name)
+    # Set up optimizer (use Megatron's default optimizer)
+    model.set_optimizer('default', lr=1e-4, adapter_name=adapter_name)
+    model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4, adapter_name=adapter_name)
     
-    # Set up optimizer
-    model.set_optimizer(AdamW, lr=1e-4, adapter_name=adapter_name)
-    model.set_lr_scheduler(LinearLR, adapter_name=adapter_name)
-    
+    logger.info(get_device_placement())
     logger.info(model.get_train_configs(adapter_name=adapter_name))
     
     # Training loop
@@ -233,8 +225,8 @@ def train():
         output = model.forward_backward(inputs=batch, adapter_name=adapter_name)
         
         if step % GAS == 0:
-            avg_loss = float(output) if output is not None else 0.0
-            losses.append(avg_loss)
+            loss_value = output() if callable(output) else output
+            avg_loss = float(loss_value) if loss_value is not None else 0.0
             logger.info(f'Step {step // GAS}, loss: {avg_loss:.4f}')
         
         model.clip_grad_norm(1.0, adapter_name=adapter_name)
@@ -247,18 +239,10 @@ def train():
             logger.info(f'Reached max_steps ({args.max_steps}), stopping.')
             break
     
-    # Summary
-    if losses:
-        logger.info("=" * 60)
-        logger.info("TRAINING SUMMARY")
-        logger.info(f"Steps: {len(losses)}")
-        logger.info(f"Initial loss: {losses[0]:.4f}")
-        logger.info(f"Final loss: {losses[-1]:.4f}")
-        logger.info(f"Average loss: {np.mean(losses):.4f}")
-    
+
     # Save model
     output_dir = './output/megatron_vlm_lora'
-    model.save(output_dir, adapter_name=adapter_name)
+    # model.save(output_dir, adapter_name=adapter_name)
     logger.info(f'Model saved to {output_dir}')
     logger.info('VLM LoRA training completed!')
 

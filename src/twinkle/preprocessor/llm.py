@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Preprocessor
-from ..data_format import Trajectory, Message
+from twinkle.data_format import Trajectory, Message
 
 
 class CompetitionMathProcessor(Preprocessor):

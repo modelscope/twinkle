@@ -15,8 +15,6 @@ import os
 # CRITICAL: Set CUDA device before any CUDA imports (local mode only)
 import torch
 from peft import LoraConfig
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
 
 import twinkle
 from twinkle import (DeviceGroup, DeviceMesh, Platform, get_device_placement,
@@ -34,16 +32,22 @@ parser.add_argument('--mode',
                     type=str,
                     default='ray',
                     choices=['local', 'ray'])
-parser.add_argument('--dp_size', type=int, default=2)
 parser.add_argument('--tp_size', type=int, default=2)
 parser.add_argument('--pp_size', type=int, default=2)
-parser.add_argument('--vpp_size', type=int, default=2)
-parser.add_argument('--cp_size', type=int, default=2)
+parser.add_argument('--vpp_size', type=int, default=None)
+parser.add_argument('--cp_size', type=int, default=1)
 parser.add_argument('--ep_size',
                     type=int,
                     default=2,
                     help='Expert parallel size')
+parser.add_argument('--etp_size',
+                    type=int,
+                    default=None,
+                    help='Expert Tensor Parallel size (default: None, derived from TP)')
 parser.add_argument('--max_steps', type=int, default=100)
+parser.add_argument('--micro_batch_size', type=int, default=1,
+                    help='Micro batch size per DP rank')
+parser.add_argument('--num_gpus', type=int, default=4)
 parser.add_argument(
     '--model',
     type=str,
@@ -71,9 +75,18 @@ def create_dataset():
 
 
 def train():
-    device_mesh = DeviceMesh.from_sizes(dp_size=args.dp_size, pp_size=args.pp_size,
+    if args.mode == 'local':
+        WORLD_SIZE = int(os.environ.get('WORLD_SIZE', '1'))
+    else:
+        WORLD_SIZE = args.num_gpus
+    
+    # Calculate DP size based on world size and parallelism dimensions
+    # ETP (Expert Tensor Parallel) is orthogonal to TP, so we don't include it in world_size calculation
+    dp_size = WORLD_SIZE // (args.tp_size * args.pp_size * args.ep_size)
+    assert dp_size > 0, f"dp_size must be greater than 0, got {dp_size}"
+    device_mesh = DeviceMesh.from_sizes(dp_size=dp_size, pp_size=args.pp_size,
                                         tp_size=args.tp_size, cp_size=args.cp_size, ep_size=args.ep_size,
-                                        vpp_size=args.vpp_size)
+                                        etp_size=args.etp_size, vpp_size=args.vpp_size)
 
     # Device group name - used as remote_group in Ray mode
     GROUP_NAME = 'model'
@@ -95,8 +108,9 @@ def train():
         lazy_collect=True,
     )
 
-    # Smaller batch size for MoE models (larger memory footprint)
-    batch_size = 4
+    # Batch size must be >= data_parallel_size and divisible by it
+    micro_batch_size = args.micro_batch_size
+    batch_size = micro_batch_size * device_mesh.data_world_size
 
     _remote_args = {}
     if args.mode == 'ray':
@@ -105,7 +119,7 @@ def train():
             'device_mesh': device_mesh,
         }
 
-    dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size, **_remote_args)
+    dataloader = DataLoader(dataset=create_dataset, batch_size=batch_size, device_mesh=device_mesh, **_remote_args)
     model = MegatronModel(
         model_id=args.model,
         sequence_parallel=args.sequence_parallel,
@@ -122,17 +136,23 @@ def train():
         lora_dropout=0.0,
     )
     adapter_name = 'lora'
-    model.add_adapter_to_model(adapter_name, lora_config)
-    model.set_optimizer('default', lr=1e-4)
-    model.set_lr_scheduler('default', max_lr=1e-4, lr_decay_steps=len(dataloader))
+    model.add_adapter_to_model(adapter_name, lora_config, gradient_accumulation_steps=GAS)
+    model.set_template('Template', model_id=args.model, adapter_name=adapter_name)
+    model.set_processor(InputProcessor, padding_side='right', adapter_name=adapter_name)
+    model.set_optimizer('default', lr=1e-4, adapter_name=adapter_name)
+    model.set_lr_scheduler('default', max_lr=1e-4, lr_decay_steps=1000, adapter_name=adapter_name)
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs())
+    logger.info(model.get_train_configs(adapter_name=adapter_name))
 
     for step, batch in enumerate(dataloader):
-        output = model.forward_backward(inputs=batch)
+        output = model.forward_backward(inputs=batch, adapter_name=adapter_name)
         if step % GAS == 0:
-            logger.info(f'Step {step // GAS}, loss: {output()}')
-        model.clip_grad_and_step()
+            loss_value = output() if callable(output) else output
+            logger.info(f'Step {step // GAS}, loss: {loss_value}')
+        model.clip_grad_norm(1.0, adapter_name=adapter_name)
+        model.step(adapter_name=adapter_name)
+        model.zero_grad(adapter_name=adapter_name)
+        model.lr_step(adapter_name=adapter_name)
         # model.save('./output/megatron_moe_lora', interval=50)  # TODO: fix save
         # Early stop for testing
         if args.max_steps and step >= args.max_steps * GAS:

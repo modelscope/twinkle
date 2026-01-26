@@ -22,6 +22,8 @@ from packaging import version
 from peft import LoraConfig, get_peft_model
 
 from twinkle import Platform
+# Import lora module to register dispatch_megatron with peft
+from . import lora as _ 
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 

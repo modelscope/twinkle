@@ -49,18 +49,23 @@ class HuggingFaceModule(_HuggingFaceModule, ABC):
         super().__init__(config)
         args = get_args()
         attn_impl = getattr(args, 'attn_impl', None) or 'flash_attn'
-        kwargs = {'attn_impl': attn_impl} if args.attention_backend.name == 'flash' else {}
+        # Handle both enum and string attention_backend
+        attn_backend = args.attention_backend
+        is_flash = (getattr(attn_backend, 'name', attn_backend) == 'flash'
+                    if attn_backend else False)
+        kwargs = {'attn_impl': attn_impl} if is_flash else {}
         ignore_init_model_cls = ignore_init_model_cls or []
         if not isinstance(ignore_init_model_cls, list):
             ignore_init_model_cls = [ignore_init_model_cls]
         context_list = [patch_device_map_meta(model_cls) for model_cls in ignore_init_model_cls]
         context_list.append(patch_hf_initialize_weight())
         kwargs['model_type'] = args.hf_model_type
-        # DIFF: swift uses get_model_processor
-        # We use transformers directly and skip disable_safe_ddp_context_use_barrier
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        from ..register import get_megatron_model_meta
+        from transformers import AutoModel, AutoProcessor
+        megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
+        auto_model_cls = megatron_model_meta.auto_model_cls if megatron_model_meta else AutoModel
         with ContextManagers(context_list):
-            model = AutoModelForCausalLM.from_pretrained(
+            model = auto_model_cls.from_pretrained(
                 args.model_dir, torch_dtype=args.torch_dtype, trust_remote_code=True)
             self.processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
 

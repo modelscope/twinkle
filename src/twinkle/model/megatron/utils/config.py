@@ -19,6 +19,7 @@ config_mapping = {
     'disable_bias_linear': ['mlp_bias'],
     'kv_channels': ['head_dim', 'v_head_dim'],
     'architectures': ['architectures'],
+    'hf_model_type': ['model_type'], # TODO: check
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
     'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],

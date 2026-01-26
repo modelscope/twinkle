@@ -16,6 +16,20 @@ class InputProcessor:
         'loss_scale': 0.0,
         'position_ids': -1,
         'length': -1,
+        'pixel_values': 0.0,
+        'image_grid_thw': 0,
+        'pixel_values_videos': 0.0,
+        'video_grid_thw': 0,
+        'input_features': 0.0,
+        'feature_attention_mask': 0,
+    }
+
+    # VLM fields to concatenate (not pad) in batch
+    VLM_CONCAT_FIELDS = {
+        'pixel_values', 'image_grid_thw',
+        'pixel_values_videos', 'video_grid_thw',
+        'input_features', 'feature_attention_mask',
+        'grid_thws',
     }
 
     def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, **kwargs):
@@ -25,12 +39,15 @@ class InputProcessor:
 
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
+        _collated = inputs
         if isinstance(inputs, list):
-            inputs = self.collate_fn(inputs, **kwargs)
-        if not isinstance(inputs, list):
-            return self.prepare_inputs(inputs)
+            _collated = self.collate_fn(inputs, **kwargs)
+        if not isinstance(_collated, list):
+            # macro_batch_size is None, so it's a dict
+            return self.prepare_inputs(_collated)
         else:
-            return [self.prepare_inputs(_input) for _input in inputs]
+            # a list of macro batches
+            return [self.prepare_inputs(_macro_batch) for _macro_batch in _collated]
         
 
     @remote_function()
@@ -60,26 +77,39 @@ class InputProcessor:
 
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
-        keys = inputs[0].keys()
+
+        vlm_fields = {k: [] for k in self.VLM_CONCAT_FIELDS}
+        text_inputs = []
+        for inp in inputs:
+            inp = dict(inp)
+            for field in self.VLM_CONCAT_FIELDS:
+                if field in inp:
+                    vlm_fields[field].append(inp.pop(field))
+            text_inputs.append(inp)
+
+        # Collect text field keys preserving first-seen order (dict.fromkeys deduplicates while keeping order).
+        # This avoids treating VLM fields as text and fixes KeyError on pure-text batches.
+        text_keys = list(dict.fromkeys(key for inp in text_inputs for key in inp.keys()))
+
         result = {}
         if self.padding_free:
-            for key in keys:
-                values = [item[key] for item in inputs]
+            for key in text_keys:
+                values = [item[key] for item in text_inputs]
                 if isinstance(values[0], np.ndarray):
-                    value = np.concatenate(values, axis=-1).unsqueeze(0)
+                    value = np.expand_dims(np.concatenate(values, axis=0), axis=0)
                     value = torch.from_numpy(value)
                 elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
                     values = [[v for lst in values for v in lst]]
                     value = torch.tensor(values)
                 elif isinstance(values[0], torch.Tensor):
-                    value = torch.cat(values, dim=-1).unsqueeze(0)
+                    value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
                     value = values
                 result[key] = value
             result = InputFeature(**result)
         else:
-            for key in keys:
-                values = [item[key] for item in inputs]
+            for key in text_keys:
+                values = [item[key] for item in text_inputs]
 
                 if isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
@@ -92,19 +122,30 @@ class InputProcessor:
                 else:
                     result[key] = values
             result = InputFeature(**result)
+
+        for field, values in vlm_fields.items():
+            if values:
+                if isinstance(values[0], np.ndarray):
+                    result[field] = torch.from_numpy(np.concatenate(values, axis=0))
+                elif isinstance(values[0], torch.Tensor):
+                    result[field] = torch.cat(values, dim=0)
+
         return to_transformers_dict(result)
 
     @remote_function()
     def collate_fn(self, inputs: List[InputFeature], micro_batch_size: Optional[int] = None, variable_seq_lengths=False) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         if micro_batch_size is None:
+            # normal collate
             return self._collate_macro_batch(inputs)
         elif variable_seq_lengths:
+            # each macro batch has its own length
             assert len(inputs) > micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))
             return outputs
         else:
+            # each macro batch shares the same length
             res = self._collate_macro_batch(inputs)
             keys = list(res.keys())
             outputs = []

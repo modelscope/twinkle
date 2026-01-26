@@ -13,6 +13,7 @@ from peft.tuners.lora import model
 from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
+from transformers.utils import is_torch_npu_available
 
 if exists('megatron_core'):
     from megatron.core import parallel_state
@@ -202,7 +203,10 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora_a.parallel_mode = self.base_layer.parallel_mode
         else:
             # Column parallel layer - LoRA A is not parallel, LoRA B is parallel
-            out_features = self.out_features * self.tp_size
+            if is_torch_npu_available():
+                out_features = self.out_features
+            else:
+                out_features = self.out_features * self.tp_size
             if self.is_grouped:
                 lora_a = TEGroupedLinear(num_gemms=self.base_layer.num_gemms,
                                          input_size=self.in_features,
@@ -218,12 +222,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     **kwargs,
                 )
             else:
-                lora_a = TELinear(input_size=self.in_features,
-                                  output_size=r,
-                                  bias=lora_bias,
-                                  parallel_mode=None,
-                                  skip_weight_param_allocation=False,
-                                  **kwargs)
+                if is_torch_npu_available():
+                    lora_a = nn.Linear(
+                        in_features=self.in_features,
+                        out_features=r,
+                        bias=lora_bias,
+                    )
+                else:
+                    lora_a = TELinear(input_size=self.in_features,
+                                      output_size=r,
+                                      bias=lora_bias,
+                                      parallel_mode=None,
+                                      skip_weight_param_allocation=False,
+                                      **kwargs)
                 lora_b = TEColumnParallelLinear(
                     input_size=r,
                     output_size=out_features,
@@ -367,7 +378,10 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 result, bias = self.base_layer(x, *args, **kwargs)
             else:
                 self.base_layer.return_layernorm_output = True
-                (result, x), bias = self.base_layer(x, *args, **kwargs)
+                if is_torch_npu_available():
+                    result, bias = self.base_layer(x, *args, **kwargs)
+                else:
+                    (result, x), bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):

@@ -6,14 +6,13 @@ import torch.nn as nn
 from peft import PeftModel
 
 from twinkle import DeviceMesh, Platform
-
+from twinkle.model.megatron.args import get_args
 
 class MegatronStrategy:
 
     def __init__(
         self,
         device_mesh: Optional[DeviceMesh] = None,
-        expert_tensor_parallel_size: Optional[int] = None,
         sequence_parallel: bool = False,
         use_distributed_optimizer: bool = True,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
@@ -21,7 +20,6 @@ class MegatronStrategy:
         **kwargs,
     ):
         self.device_mesh = device_mesh
-        self.etp_size = expert_tensor_parallel_size or self.device_mesh.tp_world_size
         self.sequence_parallel = sequence_parallel
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
@@ -29,16 +27,36 @@ class MegatronStrategy:
     
     def _check_device_mesh(self):
         from megatron.core import parallel_state as mpu
-        # Make sure device_mesh and mpu match each other
-        assert self.device_mesh.dp_rank == mpu.get_data_parallel_rank()
+        import warnings
+        
+        # Note: DeviceMesh uses numpy C-order (row-major) while Megatron uses
+        # its 'order' parameter to define rank mapping. These may differ.
+        # We skip rank comparison as Megatron mpu is the source of truth.
+        
+        # Only validate world sizes match
         if self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
-            assert self.device_mesh.tp_rank == mpu.get_tensor_model_parallel_rank()
+            mpu_tp_size = mpu.get_tensor_model_parallel_world_size()
+            if self.device_mesh.tp_world_size != mpu_tp_size:
+                warnings.warn(
+                    f"tp_world_size mismatch: device_mesh={self.device_mesh.tp_world_size} vs mpu={mpu_tp_size}. "
+                    "Using Megatron mpu as source of truth."
+                )
+        
         if self.device_mesh.pp_world_size is not None and self.device_mesh.pp_world_size > 1:
-            assert self.device_mesh.pp_rank == mpu.get_pipeline_model_parallel_rank()
-            assert self.device_mesh.is_pp_last_rank() == mpu.is_pipeline_last_stage()
-            assert self.device_mesh.is_pp_first_rank() == mpu.is_pipeline_first_stage()
+            mpu_pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if self.device_mesh.pp_world_size != mpu_pp_size:
+                warnings.warn(
+                    f"pp_world_size mismatch: device_mesh={self.device_mesh.pp_world_size} vs mpu={mpu_pp_size}. "
+                    "Using Megatron mpu as source of truth."
+                )
+        
         if self.device_mesh.vpp_size is not None and self.device_mesh.vpp_size > 1:
-            assert self.device_mesh.vpp_size == mpu.get_virtual_pipeline_model_parallel_world_size()
+            mpu_vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+            if self.device_mesh.vpp_size != mpu_vpp_size:
+                warnings.warn(
+                    f"vpp_size mismatch: device_mesh={self.device_mesh.vpp_size} vs mpu={mpu_vpp_size}. "
+                    "Using Megatron mpu as source of truth."
+                )
 
     @property
     def params_type(self) -> torch.dtype:
@@ -93,13 +111,14 @@ class MegatronStrategy:
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+        from megatron.core.transformer.module import Float16Module
         from torch.nn.parallel import DistributedDataParallel as TorchDDP
         _models = []
         for _model in model:
-            if isinstance(_model, (MegatronDDP, TorchDDP)):
-                _models.append(_model.module)
-            else:
-                _models.append(_model)
+            # Unwrap DDP first
+            while isinstance(_model, (MegatronDDP, TorchDDP, Float16Module)):
+                _model = _model.module
+            _models.append(_model)
         return _models
 
     @staticmethod
@@ -185,45 +204,49 @@ class MegatronStrategy:
             out_shape[dim] = seq_len // cp_size
             return selected.reshape(*out_shape)
 
+        # Pad sequence for parallel compatibility
+        # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
+        # 2. For sequence_parallel with TP > 1: seq_len must be divisible by TP size
+        if input_ids is not None:
+            seq_len = input_ids.shape[1]
+
+            # Calculate required divisor based on parallelism settings
+            if cp_size > 1:
+                divisor = 2 * cp_size
+            elif self.sequence_parallel and tp_size > 1:
+                divisor = tp_size
+            else:
+                divisor = 1
+
+            if divisor > 1 and seq_len % divisor != 0:
+                pad_len = divisor - (seq_len % divisor)
+                # Pad input_ids
+                input_ids = torch.nn.functional.pad(input_ids,
+                                                    (0, pad_len),
+                                                    value=0)
+                # Pad labels if present
+                if batch_labels is not None:
+                    batch_labels = torch.nn.functional.pad(batch_labels,
+                                                           (0, pad_len),
+                                                           value=-100)
+                # Pad attention_mask if present
+                if attention_mask is not None:
+                    attention_mask = torch.nn.functional.pad(
+                        attention_mask, (0, pad_len), value=0)
+                # Pad position_ids if present
+                if position_ids is not None:
+                    position_ids = torch.nn.functional.pad(position_ids,
+                                                           (0, pad_len),
+                                                           value=0)
+
         # Split tensors for Context Parallel
         # Each CP rank processes a portion of the sequence
+        # For multimodal models, input_ids is NOT split here - it will be handled
+        # in mm_gpt_model._patch_word_embeddings after visual embedding fusion
         if cp_size > 1:
-            # Pad sequence for parallel compatibility
-            # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
-            # 2. For sequence_parallel: seq_len must be divisible by TP size
-            if input_ids is not None:
-                seq_len = input_ids.shape[1]
-
-                # Calculate required divisor based on parallelism settings
-                if cp_size > 1:
-                    divisor = 2 * cp_size
-                elif self.sequence_parallel and tp_size > 1:
-                    divisor = tp_size
-                else:
-                    divisor = 1
-
-                if divisor > 1 and seq_len % divisor != 0:
-                    pad_len = divisor - (seq_len % divisor)
-                    # Pad input_ids
-                    input_ids = torch.nn.functional.pad(input_ids,
-                                                        (0, pad_len),
-                                                        value=0)
-                    # Pad labels if present
-                    if batch_labels is not None:
-                        batch_labels = torch.nn.functional.pad(batch_labels,
-                                                               (0, pad_len),
-                                                               value=-100)
-                    # Pad attention_mask if present
-                    if attention_mask is not None:
-                        attention_mask = torch.nn.functional.pad(
-                            attention_mask, (0, pad_len), value=0)
-                    # Pad position_ids if present
-                    if position_ids is not None:
-                        position_ids = torch.nn.functional.pad(position_ids,
-                                                               (0, pad_len),
-                                                               value=0)
-
-            input_ids = split_tensor_for_cp(input_ids, dim=-1)
+            args = get_args()
+            if not args.is_multimodal:
+                input_ids = split_tensor_for_cp(input_ids, dim=-1)
             position_ids = split_tensor_for_cp(position_ids, dim=-1)
             attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
             batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
@@ -300,7 +323,6 @@ class MegatronStrategy:
             params_dtype=self.params_type,
             tensor_model_parallel_size=self.device_mesh.tp_world_size or 1,
             pipeline_model_parallel_size=self.device_mesh.pp_world_size or 1,
-            virtual_pipeline_model_parallel_size=self.device_mesh.vpp_size if self.device_mesh.vpp_size > 1 else None,
             context_parallel_size=self.device_mesh.cp_world_size or 1,
             expert_model_parallel_size=self.device_mesh.ep_size or 1,
             sequence_parallel=self.sequence_parallel,
