@@ -15,12 +15,14 @@ class TrainMetric(Metric):
     def __init__(self, device_mesh, process_group, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)
         self.lr = ''
-        self.step = -1
+        self.step = 0
+        self.last_step = 0
         self.time = None
 
     def accumulate(self, inputs, outputs):
         if self.time is None:
             self.time = time.time()
+            self.last_step = self.step
         lr = outputs.get('lr')
         if isinstance(lr, list):
             lr = [f'{x:.2e}' for x in lr]
@@ -31,7 +33,9 @@ class TrainMetric(Metric):
         self.step = outputs.get('step')
 
     def reset(self):
-        pass
+        self.time = None
+        self.step = 0
+        self.last_step = 0
 
     def calculate(self):
         results = {}
@@ -40,10 +44,11 @@ class TrainMetric(Metric):
         if self.step is not None:
             results['forward count'] = self.step
             interval = time.time() - self.time
-            speed = self.step / interval
+            speed = (self.step - self.last_step) / interval
             if interval < 60:
                 results['total time elapse'] = f'{interval:.0f} seconds'
             else:
                 results['total time elapse'] = f'{interval/60:.1f} minutes'
             results['total avg speed'] = f'{speed:.2f} forwards/s'
+        self.reset()
         return results
