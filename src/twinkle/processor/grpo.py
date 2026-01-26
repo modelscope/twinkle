@@ -22,13 +22,20 @@ class GRPOLossProcessor(InputProcessor):
     """
     
     def __init__(self, device_mesh: Optional[DeviceMesh] = None, ignore_index: int = -100, **kwargs):
-        super(GRPOLossProcessor, self).__init__(device_mesh)
+        super(GRPOLossProcessor, self).__init__(device_mesh=device_mesh, **kwargs)
         self.ignore_index = ignore_index
 
     @remote_function()
     def prepare_inputs(self, inputs: InputFeature) -> InputFeature:
         """Compute GRPO-specific fields from labels."""
-        labels = inputs.labels
+        import torch
+        labels = inputs['labels']
+        # Inputs may arrive as dict/array; ensure tensor ops work.
+        # After Ray serialization, inputs can be plain dicts, so inputs.labels would raise
+        # AttributeError (e.g., 'dict' object has no attribute 'labels').
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.as_tensor(labels)
+            inputs['labels'] = labels
         # Compute logits_to_keep: maximum completion length across batch
         non_ignored = (labels != self.ignore_index).int()
         first_non_ignored = non_ignored.argmax(dim=-1)
@@ -42,8 +49,8 @@ class GRPOLossProcessor(InputProcessor):
         num_items_in_batch = completion_mask.sum().int().item()
 
         # Update inputs with GRPO-specific fields
-        inputs.completion_mask = completion_mask
-        inputs.logits_to_keep = logits_to_keep
-        inputs.num_items_in_batch = num_items_in_batch
+        inputs['completion_mask'] = completion_mask
+        inputs['logits_to_keep'] = logits_to_keep
+        inputs['num_items_in_batch'] = num_items_in_batch
 
         return super().prepare_inputs(inputs)

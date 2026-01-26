@@ -1,4 +1,4 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 
 # LLMModelType/MLLMModelType: model_type attribute in model config
 class LLMModelType:

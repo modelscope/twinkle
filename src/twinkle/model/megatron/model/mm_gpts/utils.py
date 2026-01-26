@@ -1,4 +1,4 @@
-# Copyright (c) twinkle authors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 # Reference: swift/swift/megatron/model/mm_gpts/utils.py
 from abc import ABC, abstractmethod
 from contextlib import contextmanager

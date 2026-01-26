@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import List, Optional, Dict, Any, Literal, Union
 
 import numpy as np
+
 from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.hub import HubOperation
 from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
@@ -25,14 +26,13 @@ class Template:
                  truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
                  default_system: Optional[str] = None,
                  **kwargs):
-        model_id = HubOperation.download_model(model_id)
+        model_id = HubOperation.download_model(model_id, ignore_model=True)
         if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
         else:
             from transformers import AutoTokenizer
-            self.processor = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        self.tokenizer = getattr(self.processor, 'tokenizer', self.processor)
+            self.processor = AutoTokenizer.from_pretrained(model_id, **kwargs)
 
         self.use_chat_template = use_chat_template
         self.max_length = max_length
@@ -49,24 +49,49 @@ class Template:
             self._roll_labels, # roll labels
         ]
 
+    @property
+    def tokenizer(self):
+        tokenizer = self.processor
+        if hasattr(tokenizer, 'tokenizer'):
+            tokenizer = tokenizer.tokenizer
+        return tokenizer
+
+    @property
+    def is_mm(self):
+        from transformers import ProcessorMixin
+        return isinstance(self.processor, ProcessorMixin)
+
     def _test_support_assistant_tokens_mask(self):
-        dummy_inputs = [
-            Message(role='user', content='How are you?'),
-            Message(role='assistant', content='Fine.'),
-        ]
-        outputs = self.processor.apply_chat_template(
-            conversation=dummy_inputs,
-            return_assistant_tokens_mask=True,
-            return_dict=True
-        )
-        # Check if outputs is a dict (not all processors return dict even with return_dict=True)
-        if isinstance(outputs, dict) and 'assistant_masks' in outputs:
-            assistant_masks = outputs['assistant_masks']
-            self._template_support_assistant_tokens_mask = (
-                0 < np.array(assistant_masks).sum() < len(assistant_masks)
-            )
+        # For VLM processors (is_mm=True), content must be list of dicts
+        # For text-only processors, content can be a simple string
+        if self.is_mm:
+            dummy_inputs = [
+                {'role': 'user', 'content': [{'type': 'text', 'text': 'How are you?'}]},
+                {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Fine.'}]},
+            ]
         else:
-            # Processor doesn't support return_dict properly
+            dummy_inputs = [
+                Message(role='user', content='How are you?'),
+                Message(role='assistant', content='Fine.'),
+            ]
+        try:
+            outputs = self.processor.apply_chat_template(
+                conversation=dummy_inputs,
+                return_assistant_tokens_mask=True,
+                return_dict=True,
+                tokenize=True
+            )
+            # Check if outputs is a dict (not all processors return dict even with return_dict=True)
+            if isinstance(outputs, dict) and 'assistant_masks' in outputs:
+                assistant_masks = outputs['assistant_masks']
+                self._template_support_assistant_tokens_mask = (
+                    0 < np.array(assistant_masks).sum() < len(assistant_masks)
+                )
+            else:
+                # Processor doesn't support return_dict properly
+                self._template_support_assistant_tokens_mask = False
+        except Exception:
+            # If any error occurs during testing, fall back to not supporting
             self._template_support_assistant_tokens_mask = False
 
 
@@ -92,9 +117,10 @@ class Template:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':
                 trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
-            for (_, messages) in trajectory['extend_message']:
-                if trajectory['messages'][0]['role'] == 'user':
-                    trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
+            # Fix: use .get() to avoid KeyError - extend_message is optional in Trajectory (TypedDict total=False)
+            for (_, messages) in trajectory.get('extend_message', []):
+                if messages and messages[0]['role'] == 'user':
+                    messages.insert(0, Message(role='system', content=self.default_system))
         return [trajectory]
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
@@ -127,37 +153,39 @@ class Template:
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
         return [input_feature]
 
-    def _build_mm_messages(self, trajectory: Trajectory):
+    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
         messages = trajectory['messages']
-        messages = [transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder) for message in messages]
+        messages = [transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder, self.is_mm) for message in messages]
         trajectory['messages'] = messages
         return [trajectory]
+
+    def _apply_chat_template(self, trajectory: Trajectory, **kwargs):
+        messages = [dict(message) for message in trajectory['messages']]
+        tools = [dict(tool) for tool in trajectory.get('tools', [])]
+        inputs = self.processor.apply_chat_template(conversation=messages, tools=tools, padding=False,
+                                           tokenize=True, return_dict=True,
+                                           add_generation_prompt=False, return_tensors='pt', **kwargs)
+        return inputs
 
     def encode(self, trajectory: Trajectory) -> InputFeature:
         if self.use_chat_template:
             if self._template_support_assistant_tokens_mask:
-                messages = [dict(message) for message in trajectory['messages']]
-                tools = [dict(tool) for tool in trajectory.get('tools', [])]
-                outputs = self.processor.apply_chat_template(conversation=messages, tools=tools,
-                                                   return_assistant_tokens_mask=True, return_dict=True,
-                                                             return_tensors='np')
-                input_ids = outputs['input_ids']
-                assistant_masks = outputs['assistant_masks']
+                encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=True)
+                input_ids = encoded.pop('input_ids')
+                assistant_masks = encoded.pop('assistant_masks')
                 labels = np.where(assistant_masks, input_ids, -100)
             else:
-                if hasattr(self.processor, 'tokenizer'):
-                    tokenizer = self.processor.tokenizer
-                else:
-                    tokenizer = self.processor
-                input_ids, labels = tokenize_with_assistant_labels(tokenizer, trajectory)
+                input_ids, labels, encoded = tokenize_with_assistant_labels(self.tokenizer, self._apply_chat_template, trajectory)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']
-            input_ids = self.processor.encode(text)
+            input_ids = self.tokenizer.encode(text)
+            encoded = {}
             labels = deepcopy(input_ids)
         return InputFeature(
             input_ids=np.array(input_ids),
-            labels=labels,
+            labels=np.array(labels),
+            **encoded,
         )
 
     @staticmethod
@@ -208,7 +236,10 @@ class Template:
                 return None
             else:
                 return trajectory
-        except Exception as e:  # noqa
+        except Exception as e:
+            import traceback
+            print(f"[Template.check] Error encoding trajectory: {e}")
+            traceback.print_exc()
             return None
         finally:
             if encoded:

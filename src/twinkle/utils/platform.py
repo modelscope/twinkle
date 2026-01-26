@@ -5,12 +5,12 @@ import shutil
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Optional, Dict
 from typing import Type
 from typing import Union, List
 import torch.distributed as dist
 import numpy as np
-from functools import lru_cache
 
 
 @dataclass
@@ -171,10 +171,10 @@ class DeviceMesh:
         else:
             return None
 
-    def _get_world_size_for_dim(self, dim_name: str) -> Optional[int]:
+    def _get_world_size_for_dim(self, dim_name: str) -> int:
         dim_idx = self._get_dim_index(dim_name)
         if dim_idx is None:
-            return None
+            return 0 # not valid
         return self.mesh.shape[dim_idx]
 
     @property
@@ -203,23 +203,23 @@ class DeviceMesh:
         return self._get_rank_for_dim("cp")
 
     @property
-    def dp_world_size(self) -> Optional[int]:
+    def dp_world_size(self) -> int:
         return self._get_world_size_for_dim("dp")
 
     @property
-    def fsdp_world_size(self) -> Optional[int]:
+    def fsdp_world_size(self) -> int:
         return self._get_world_size_for_dim("fsdp")
 
     @property
-    def tp_world_size(self) -> Optional[int]:
+    def tp_world_size(self) -> int:
         return self._get_world_size_for_dim("tp")
 
     @property
-    def pp_world_size(self) -> Optional[int]:
+    def pp_world_size(self) -> int:
         return self._get_world_size_for_dim("pp")
 
     @property
-    def cp_world_size(self) -> Optional[int]:
+    def cp_world_size(self) -> int:
         return self._get_world_size_for_dim("cp")
 
     @property
@@ -250,6 +250,8 @@ class DeviceMesh:
             data_rank = 0
 
         ulysses_size = self.ulysses_size or 1
+        if data_rank is None:
+            return None
         return data_rank // ulysses_size
 
     @property

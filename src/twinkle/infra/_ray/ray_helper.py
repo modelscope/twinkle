@@ -75,7 +75,7 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            ray.init(address=os.environ.get("RAY_ADDRESS","auto"), ignore_reinit_error=True)
+            ray.init(ignore_reinit_error=True)
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -174,15 +174,32 @@ class RayHelper:
                 self._collect_func = collect_func
                 self._is_lazy_collect = True
                 self.device_mesh = device_mesh
+                self._result = None  # Cache collected results
+
+            def _get_result(self):
+                """Internal method to lazily collect and cache results"""
+                if self._result is None:
+                    result = []
+                    for future in self._futures:
+                        if isinstance(future, ray.ObjectRef):
+                            result.append(ray.get(future))
+                        else:
+                            result.append(future)
+                    self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
+                return self._result
 
             def __call__(self):
-                result = []
-                for future in self._futures:
-                    if isinstance(future, ray.ObjectRef):
-                        result.append(ray.get(future))
-                    else:
-                        result.append(future)
-                return self._collect_func(self._method, result, self.device_mesh)
+                """Lazily collect results, support repeated calls (with caching)"""
+                return self._get_result()
+
+            def __iter__(self):
+                """Support iteration: automatically collect results then iterate"""
+                return iter(self._get_result())
+
+            def __len__(self):
+                """Support len() function"""
+                return len(self._get_result())
+
 
         return LazyCollect(futures, method, collect_func, device_mesh)
 
@@ -215,7 +232,7 @@ class RayHelper:
         return False
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], instance_id, seed=42, full_determinism=False, *args, **kwargs) -> List[T]:
+    def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], *args, instance_id, seed=42, full_determinism=False, **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?

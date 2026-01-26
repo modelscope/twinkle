@@ -75,9 +75,13 @@ class GRPOLoss(Loss):
             advantages: Computed advantages, shape [batch_size]
         """
         num_generations = num_generations or self.num_generations
-        
         if rewards.dim() > 1:
             rewards = rewards.sum(dim=-1)
+        # Guard against mis-specified num_generations causing invalid reshapes.
+        if num_generations <= 0 or rewards.numel() % num_generations != 0:
+            num_generations = 1
+        if num_generations == 1:
+            return rewards
         
         grouped_rewards = rewards.view(-1, num_generations)
         group_mean = grouped_rewards.mean(dim=1, keepdim=True)
@@ -173,11 +177,41 @@ class GRPOLoss(Loss):
         """
         logits = outputs['logits']
         input_ids = inputs['input_ids']
+
+        def _unwrap_logits(value):
+            # Ray multi-worker gathers may wrap tensors in lists/tuples.
+            if isinstance(value, (list, tuple)):
+                if len(value) == 1:
+                    return value[0]
+                return torch.cat(value, dim=0)
+            return value
+        # old_logits and ref_logits may be wrapped; unwrap them.
+        old_logits = _unwrap_logits(old_logits)
+        if not torch.is_tensor(old_logits):
+            old_logits = torch.as_tensor(old_logits, device=logits.device)
+        else:
+            old_logits = old_logits.to(logits.device)
+        if ref_logits is not None:
+            ref_logits = _unwrap_logits(ref_logits)
+            if not torch.is_tensor(ref_logits):
+                ref_logits = torch.as_tensor(ref_logits, device=logits.device)
+            else:
+                ref_logits = ref_logits.to(logits.device)
         
         # Get preprocessed fields from inputs
         completion_mask = inputs['completion_mask']
         logits_to_keep = inputs['logits_to_keep']
         num_items_in_batch = inputs.get('num_items_in_batch')
+
+        # Clamp to avoid negative lengths when truncation exceeds available tokens.
+        # Observed errors: index out of range / size mismatch during loss computation when logits_to_keep
+        # exceeded seq_len - 1, causing misaligned slices for next-token prediction.
+        max_keep = min(logits_to_keep, logits.shape[1] - 1, input_ids.shape[1] - 1)
+        if max_keep <= 0:
+            return torch.zeros((), dtype=logits.dtype, device=logits.device)
+        if max_keep != logits_to_keep:
+            logits_to_keep = max_keep
+            completion_mask = completion_mask[:, -logits_to_keep:]
         
         # Compute per-token log probabilities
         per_token_logps = self._get_per_token_logps(logits, input_ids, logits_to_keep)
@@ -188,7 +222,17 @@ class GRPOLoss(Loss):
             ref_per_token_logps = self._get_per_token_logps(ref_logits, input_ids, logits_to_keep)
         
         # Extract rewards from trajectories
-        rewards_list = [sum(t.rewards) if isinstance(t.rewards, list) else t.rewards for t in trajectories]
+        rewards_list = []
+        for trajectory in trajectories:
+            # Trajectories can be dicts after serialization; rewards can be None or list.
+            if isinstance(trajectory, dict):
+                reward_value = trajectory.get('rewards')
+            else:
+                reward_value = trajectory.rewards
+            if reward_value is None:
+                reward_value = 0.0
+            reward_value = sum(reward_value) if isinstance(reward_value, list) else reward_value
+            rewards_list.append(reward_value)
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=logits.device)
         
         # Compute advantages

@@ -44,7 +44,7 @@ parser.add_argument('--model', type=str, default='Qwen/Qwen3-VL-8B-Instruct')
 parser.add_argument('--dataset', type=str, default='ms://AI-ModelScope/LaTeX_OCR')
 parser.add_argument('--subset', type=str, default='human_handwrite')
 parser.add_argument('--samples', type=int, default=1000)
-parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--batch_size', type=int, default=4)
 GAS = 4  # gradient accumulation steps
 args = parser.parse_args()
 
