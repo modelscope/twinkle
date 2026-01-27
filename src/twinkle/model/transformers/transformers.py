@@ -11,6 +11,8 @@ import torch
 import transformers
 from peft import PeftConfig
 from peft import get_peft_model, PeftModel
+from peft.utils import set_peft_model_state_dict, load_peft_weights
+from safetensors.torch import save_file
 from torch import GradScaler
 from torch.optim import Optimizer, AdamW, Adam
 from torch.optim.lr_scheduler import LRScheduler
@@ -560,7 +562,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         HubOperation.wait_for()
 
     @remote_function()
-    def save(self, name, output_dir=None, interval=1, **kwargs):
+    def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 
         Args:
@@ -571,11 +573,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 adapter_name: Lora adapter name.
                 save_optimizer: Whether to save optimizer state.
         """
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        if name is None:
+            name = f'checkpoint-step-{optimizer_config.cur_step}'
         if output_dir is None:
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
@@ -583,14 +587,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         processed_state_dict = {}
 
         save_kwargs = {}
-        if isinstance(model, PeftModel):
-            # Only save the selected adapter, avoid save dummy adapters
-            save_kwargs['selected_adapters'] = [adapter_name]
 
         for key, value in state_dict.items():
             processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
-        model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
+        if isinstance(model, PeftModel):
+            if Platform.is_master():
+                model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
+                save_file(processed_state_dict, os.path.join(checkpoint_dir, "adapter_model.safetensors"))
+        else:
+            model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
+
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
         
         if kwargs.get('save_optimizer', False):
@@ -644,7 +651,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
-            from peft.utils import set_peft_model_state_dict, load_peft_weights
             # Load to CPU to avoid safetensors device issues in Ray environment
             adapter_weights = load_peft_weights(checkpoint_dir, device="cpu")
             set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)

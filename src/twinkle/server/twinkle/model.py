@@ -66,6 +66,7 @@ class SaveRequest(BaseModel):
     output_dir: str
     adapter_name: str
     save_optimizer: bool = False
+    checkpoint_name: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -323,7 +324,11 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.save(output_dir=body.output_dir, adapter_name=adapter_name, save_optimizer=body.save_optimizer, **extra_kwargs)
+            ret = self.model.save(name=body.checkpoint_name, 
+                                  output_dir=body.output_dir, 
+                                  adapter_name=adapter_name, 
+                                  save_optimizer=body.save_optimizer, 
+                                  **extra_kwargs)
             return {'result': ret}
         
         @app.post("/load")
@@ -331,7 +336,10 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.load(checkpoint_dir=body.input_dir, adapter_name=adapter_name, load_optimizer=body.load_optimizer, **extra_kwargs)
+            ret = self.model.load(checkpoint_dir=body.input_dir, 
+                                  adapter_name=adapter_name, 
+                                  load_optimizer=body.load_optimizer, 
+                                  **extra_kwargs)
             return {'result': ret}
 
         @app.post("/add_adapter_to_model")
