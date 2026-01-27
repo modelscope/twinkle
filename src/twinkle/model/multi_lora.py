@@ -223,7 +223,26 @@ class MultiLora(Patch):
             for name, parameter in self.module.named_parameters():
                 if pattern.search(name):
                     lora_tenant.lora_A_weights[name] = parameter.data.clone().to('cpu')
-    
+
+    def set_state_dict(self, tenant_adapter_name, state_dict):
+        _lora = self.find_lora_by_tenant(tenant_adapter_name)
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(_lora.adapter_name)}\.')
+        for name, parameter in self.module.named_parameters():
+            if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
+                src_tensor = state_dict[name]
+                if 'embedding_A' in name:
+                    r_saved = src_tensor.shape[1]
+                    parameter.data[:, :r_saved].copy_(src_tensor)
+                elif 'embedding_B' in name:
+                    r_saved = src_tensor.shape[0]
+                    parameter.data[:r_saved, :].copy_(src_tensor)
+                elif '_A' in name:
+                    r_saved = src_tensor.shape[0]
+                    parameter.data[:r_saved, :].copy_(src_tensor)
+                elif '_B' in name:
+                    r_saved = src_tensor.shape[1]
+                    parameter.data[:, :r_saved].copy_(src_tensor)
+
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
         _lora = self.find_lora_by_tenant(tenant_adapter_name)

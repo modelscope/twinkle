@@ -3,7 +3,7 @@ import os
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
-from peft import PeftConfig, LoraConfig
+from peft import PeftConfig, LoraConfig, load_peft_weights, set_peft_model_state_dict, PeftModel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -180,6 +180,21 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         with self.multi_adapter.save_context(kwargs.get("adapter_name")):
             return super().save(name, output_dir, interval, **kwargs)
+
+    @remote_function()
+    def load(self, checkpoint_dir: str, **kwargs):
+        adapter_name = kwargs.get("adapter_name")
+        self._check_adapter_valid(adapter_name)
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")):
+            load_optimizer = kwargs.get('load_optimizer', False)
+            model = self.strategy.unwrap_model(self.model)
+            if isinstance(model, PeftModel):
+                # Load to CPU to avoid safetensors device issues in Ray environment
+                adapter_weights = load_peft_weights(checkpoint_dir, device="cpu")
+                self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
+
+            if load_optimizer:
+                self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):
