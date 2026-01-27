@@ -16,6 +16,93 @@ from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from .validation import verify_request_token, init_config_registry, ConfigRegistryProxy
 
+# 请求体模型定义
+class CreateRequest(BaseModel):
+    class Config:
+        extra = "allow"
+
+class ForwardRequest(BaseModel):
+    inputs: Any
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class ForwardOnlyRequest(BaseModel):
+    inputs: Any
+    adapter_name: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+class AdapterRequest(BaseModel):
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class SetLossRequest(BaseModel):
+    loss_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class SetOptimizerRequest(BaseModel):
+    optimizer_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class SetLrSchedulerRequest(BaseModel):
+    scheduler_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class SaveRequest(BaseModel):
+    output_dir: str
+    adapter_name: str
+    save_optimizer: bool = False
+    checkpoint_name: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+class LoadRequest(BaseModel):
+    input_dir: str
+    adapter_name: str
+    load_optimizer: bool = False
+
+    class Config:
+        extra = "allow"
+
+class AddAdapterRequest(BaseModel):
+    adapter_name: str
+    config: str
+
+    class Config:
+        extra = "allow"
+
+class SetTemplateRequest(BaseModel):
+    template_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class SetProcessorRequest(BaseModel):
+    processor_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
+class HeartbeatRequest(BaseModel):
+    adapter_name: str
+
 
 def build_model_app(model_id: str,
                     nproc_per_node: int,
@@ -28,83 +115,6 @@ def build_model_app(model_id: str,
     @app.middleware("http")
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
-
-    # 请求体模型定义
-    class CreateRequest(BaseModel):
-        class Config:
-            extra = "allow"
-
-    class ForwardRequest(BaseModel):
-        inputs: Any
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class ForwardOnlyRequest(BaseModel):
-        inputs: Any
-        adapter_name: Optional[str] = None
-
-        class Config:
-            extra = "allow"
-
-    class AdapterRequest(BaseModel):
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class SetLossRequest(BaseModel):
-        loss_cls: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class SetOptimizerRequest(BaseModel):
-        optimizer_cls: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class SetLrSchedulerRequest(BaseModel):
-        scheduler_cls: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class SaveRequest(BaseModel):
-        output_dir: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class AddAdapterRequest(BaseModel):
-        adapter_name: str
-        config: str
-
-        class Config:
-            extra = "allow"
-
-    class SetTemplateRequest(BaseModel):
-        template_cls: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class SetProcessorRequest(BaseModel):
-        processor_cls: str
-        adapter_name: str
-
-        class Config:
-            extra = "allow"
-
-    class HeartbeatRequest(BaseModel):
-        adapter_name: str
 
     @serve.deployment(name="ModelManagement")
     @serve.ingress(app)
@@ -314,7 +324,22 @@ def build_model_app(model_id: str,
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            ret = self.model.save(body.output_dir, adapter_name=adapter_name, **extra_kwargs)
+            ret = self.model.save(name=body.checkpoint_name, 
+                                  output_dir=body.output_dir, 
+                                  adapter_name=adapter_name, 
+                                  save_optimizer=body.save_optimizer, 
+                                  **extra_kwargs)
+            return {'result': ret}
+        
+        @app.post("/load")
+        def load(self, request: Request, body: LoadRequest):
+            adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
+            self.assert_adapter_exists(adapter_name=adapter_name)
+            extra_kwargs = body.model_extra or {}
+            ret = self.model.load(checkpoint_dir=body.input_dir, 
+                                  adapter_name=adapter_name, 
+                                  load_optimizer=body.load_optimizer, 
+                                  **extra_kwargs)
             return {'result': ret}
 
         @app.post("/add_adapter_to_model")

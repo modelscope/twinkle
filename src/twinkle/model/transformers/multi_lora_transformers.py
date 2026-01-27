@@ -224,3 +224,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             model.base_model.delete_adapter(adapter_name=adapter_name)
+
+    @remote_function()
+    def save(self, **kwargs):
+        adapter_name = kwargs.get("adapter_name")
+        self._check_adapter_valid(adapter_name)
+        self._activate_adapter(adapter_name)
+        super().save(**kwargs)
+        
+    @remote_function()
+    def load(self, **kwargs):
+        adapter_name = kwargs.get("adapter_name")
+        self._check_adapter_valid(adapter_name)
+        self._activate_adapter(adapter_name)
+        super().load(**kwargs)

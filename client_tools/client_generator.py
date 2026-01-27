@@ -118,6 +118,7 @@ def generate_processors():
             'Template': ['from twinkle.template import Template'],
             'template.Template': ['from twinkle.template import Template', 'from twinkle import template'],
             'processor.InputProcessor': ['from twinkle.processor import InputProcessor', 'from twinkle import processor'],
+            'InputProcessor': ['from twinkle.processor import InputProcessor'],
         }
 
         all_text = ' '.join(signatures)
@@ -235,6 +236,9 @@ def generate_processors():
 
             if source_filename == 'base':
                 inheritance = "object"
+            elif base_class_name == 'IterableDataset':
+                lines.append("from torch.utils.data import IterableDataset")
+                inheritance = "IterableDataset"
             elif has_base_file and base_class_name != 'object':
                 lines.append(f"from .base import {base_class_name}")
                 inheritance = base_class_name
@@ -609,6 +613,15 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         response = http_post(
             url=f'{self.server_url}/save',
             json_data={'output_dir': output_dir, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+        
+    def load(self, input_dir: str, **kwargs):
+        """Load model checkpoint."""
+        response = http_post(
+            url=f'{self.server_url}/load',
+            json_data={'input_dir': input_dir, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']

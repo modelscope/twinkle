@@ -13,7 +13,7 @@ from tinker import types
 
 from twinkle.server.twinkle.validation import verify_request_token
 from .state import get_server_state, schedule_task
-from .common.io_utils import list_training_runs, get_training_run, get_run_checkpoints, delete_checkpoint_file
+from .common.io_utils import TrainingRunManager, CheckpointManager
 
 
 def build_server_app(
@@ -149,11 +149,11 @@ def build_server_app(
 
         @app.get("/training_runs")
         async def get_training_runs(self, request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
-            return list_training_runs(limit=limit, offset=offset)
+            return TrainingRunManager.list_runs(limit=limit, offset=offset)
 
         @app.get("/training_runs/{run_id}")
         async def get_training_run(self, request: Request, run_id: str) -> types.TrainingRun:
-            run = get_training_run(run_id)
+            run = TrainingRunManager.get(run_id)
             if not run:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -161,7 +161,7 @@ def build_server_app(
 
         @app.get("/training_runs/{run_id}/checkpoints")
         async def get_run_checkpoints(self, request: Request, run_id: str) -> types.CheckpointsListResponse:
-            response = get_run_checkpoints(run_id)
+            response = CheckpointManager.list_checkpoints(run_id)
             if not response:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -169,9 +169,18 @@ def build_server_app(
 
         @app.delete("/training_runs/{run_id}/checkpoints/{checkpoint_id:path}")
         async def delete_run_checkpoint(self, request: Request, run_id: str, checkpoint_id: str) -> Any:
-            delete_checkpoint_file(run_id, checkpoint_id)
+            CheckpointManager.delete(run_id, checkpoint_id)
             # We return 200 (null) even if not found to be idempotent, or could raise 404
             return None
+
+        @app.post("/weights_info")
+        async def weights_info(self, request: Request, body: Dict[str, Any]) -> types.WeightsInfoResponse:
+            tinker_path = body.get("tinker_path")
+            response = CheckpointManager.get_weights_info(tinker_path)
+            if not response:
+                raise HTTPException(
+                    status_code=404, detail=f"Weights at {tinker_path} not found")
+            return response
 
     # --- Proxy Endpoints ---------------------------------------------------------
 

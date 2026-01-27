@@ -186,7 +186,7 @@ class HubOperation:
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
                        download_model: bool = True,
-                       ignore_patterns: Optional[List[str]] = None,
+                       ignore_patterns: Optional[List[str]] = [],
                        **kwargs):
         """Download model from the hub
 
