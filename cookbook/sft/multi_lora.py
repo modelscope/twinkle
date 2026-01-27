@@ -26,7 +26,7 @@ def eval(model: MultiLoraTransformersModel):
     return metrics
 
 def train():
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(5000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
@@ -53,7 +53,6 @@ def train():
         if step > 0 and step % 20 == 0:
             logger.info(f'Current is step {step // 4} of {len(dataloader)//4}, metric: {model.calculate_metric(is_training=True, adapter_name='default')}')
         model.clip_grad_and_step(adapter_name='default')
-        model.save(f'test', adapter_name='default')
         #if step > 0 and (step / 4) % 30 == 0:
         #    metrics = eval(model)
         #    logger.info(f'Eval metric: {metrics}')
