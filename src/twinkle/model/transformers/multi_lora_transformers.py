@@ -101,6 +101,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         with self.multi_adapter.adapter(kwargs.get("adapter_name")):
             return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
+    
+    def _create_param_group(self, adapter_name: str, lr: float=1e-5, weight_decay:float=0.01, **kwargs):
 
     def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
         with self.multi_adapter.adapter(kwargs.get("adapter_name")) as adapter_name:
