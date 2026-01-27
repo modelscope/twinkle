@@ -1,14 +1,17 @@
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import Optional, List, Dict
 
+import re
+from typing import Optional, Union, List
+import torch.nn as nn
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import LoraLayer, Linear, Embedding
 
 from twinkle import torch_util
+from twinkle.data_format import InputFeature
 from twinkle.patch.base import Patch
 
 
@@ -25,12 +28,13 @@ class LoraTenant:
 
 class MultiLora(Patch):
 
-    def __init__(self, max_loras=5, max_r=32):
+    def __init__(self, max_loras=5, max_r=32, max_length: int = 8192):
         self.max_loras = max_loras
         self.max_r = max_r
         self.loras: List[LoraTenant] = []
-        self.module = None
+        self.module: PeftModel
         self._active_adapters = []
+        self.max_length = max_length
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -38,11 +42,23 @@ class MultiLora(Patch):
                 return _lora
         return None
 
-    @contextmanager
-    def active_adapters(self, adapter_names: List[str]):
-        self._active_adapters = adapter_names
+    def activate_adapter(self, tenant_adapter_name: str):
+        if not self.has_lora(tenant_adapter_name):
+            raise ValueError(f"Adapter {tenant_adapter_name} does not exist")
+        adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        self.module.set_adapter(adapter_name)
+
+    def deactivate_adapter(self):
+        self.module.disable_adapter_layers()
+
+    def adapter(self, tenant_adapter_name: str):
+        self.activate_adapter(tenant_adapter_name)
         yield
-        self._active_adapters = []
+        self.deactivate_adapter()
+
+    def check_length(self, input: InputFeature):
+        if len(input['input_ids']) > self.max_length:
+             raise ValueError(f'Max length exceeds {self.max_length}')
 
     def acquire_lora(self, tenant_adapter_name: str, config: LoraConfig) -> LoraTenant:
         if self.has_lora(tenant_adapter_name):
@@ -69,42 +85,54 @@ class MultiLora(Patch):
     def has_lora(self, adapter_name: str) -> bool:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0
 
+    def find_lora_by_tenant(self, tenant_adapter_name):
+        return [_lora for _lora in self.loras if _lora.tenant_adapter_name == tenant_adapter_name][0]
+
     def find_lora(self, adapter_name):
-        return [_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name][0]
+        return [_lora for _lora in self.loras if _lora.adapter_name == adapter_name][0]
 
-    def _find_loras(self, hidden_states, adapter_names: List[str]):
-        _loras = []
-        _hidden_states = []
-        start_idx = 0
-        current_adapter = adapter_names[0]
+    @staticmethod
+    def match_target_modules(
+            module_name: str,
+            target_modules: Optional[Union[List[str], str]],
+    ) -> bool:
+        if target_modules is None:
+            return False
 
-        for i in range(1, len(adapter_names) + 1):
-            if i == len(adapter_names) or adapter_names[i] != current_adapter:
-                end_idx = i
-                _hidden_states.append(hidden_states[start_idx:end_idx])
-                _loras.append(self.find_lora(current_adapter))
-                if i < len(adapter_names):
-                    start_idx = i
-                    current_adapter = adapter_names[i]
+        if isinstance(target_modules, list) and len(target_modules) == 0:
+            return False
 
-        return _hidden_states, _loras
+        if target_modules == "all-linear":
+            return True
 
-    def _patch_lora_forward(_self, base_layer: LoraLayer):
+        if isinstance(target_modules, str):
+            return re.fullmatch(target_modules, module_name) is not None
+
+        if isinstance(target_modules, list):
+            return any(module_name.endswith(t) for t in target_modules)
+
+        return False
+
+    def _patch_lora_forward(_self, name, base_layer: LoraLayer):
 
         if isinstance(base_layer, Linear):
             def _linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
                 self._check_forward_args(x, *args, **kwargs)
+
                 result = self.base_layer(x, *args, **kwargs)
                 torch_result_dtype = result.dtype
 
-                assert x.shape[0] == len(_self._active_adapters)
-                hidden_states, loras = self._find_loras(x, _self._active_adapters)
-                results = []
-                for i, _hidden_state, _lora in enumerate(zip(hidden_states, loras)):
-                    result = self.base_layer(_hidden_state, *args, **kwargs)
-                    lora_A = self.lora_A[_lora.adapter_name]
-                    lora_B = self.lora_B[_lora.adapter_name]
+                lora_A_keys = self.lora_A.keys()
+                for active_adapter in self.active_adapters:
+                    if active_adapter not in lora_A_keys:
+                        continue
+                    _lora = self.find_lora(active_adapter)
+                    target_modules = _lora.tenant_config.target_modules
+                    if not self.match_target_modules(self.layer_name, target_modules):
+                        continue
 
+                    lora_A = self.lora_A[active_adapter]
+                    lora_B = self.lora_B[active_adapter]
                     dropout = self.lora_dropout[_lora.adapter_name]
                     scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
                     x = self._cast_input_dtype(x, lora_A.weight.dtype)
@@ -112,42 +140,45 @@ class MultiLora(Patch):
                     lora_A_out = torch.nn.functional.linear(dropout_x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
                     lora_B_out = torch.nn.functional.linear(lora_A_out, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
                     result = result + lora_B_out * scaling
-
-                    result = result.to(torch_result_dtype)
-                    results.append(result)
-
-                return torch.cat(results, dim=0)
+                result = result.to(torch_result_dtype)
+                return result
 
             base_layer.forward = MethodType(_linear_forward, base_layer)
+            base_layer.layer_name = name
         elif isinstance(base_layer, Embedding):
 
             def _embedding_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
                 self._check_forward_args(x, *args, **kwargs)
+
                 result = self.base_layer(x, *args, **kwargs)
                 torch_result_dtype = result.dtype
 
-                assert x.shape[0] == len(self._active_adapters)
-                hidden_states, loras = self._find_loras(x, self._active_adapters)
-                results = []
-                for _hidden_state, _lora in zip(hidden_states, loras):
-                    sub_result = self.base_layer(_hidden_state, *args, **kwargs)
+                lora_embedding_A_keys = self.lora_embedding_A.keys()
+                for active_adapter in self.active_adapters:
+                    if active_adapter not in lora_embedding_A_keys:
+                        continue
+                    _lora = self.find_lora(active_adapter)
+                    target_modules = _lora.tenant_config.target_modules
+                    if not self.match_target_modules(self.layer_name, target_modules):
+                        continue
 
-                    embedding_A = self.lora_embedding_A[_lora.adapter_name].T
-                    embedding_B = self.lora_embedding_B[_lora.adapter_name].T
+                    embedding_A = self.lora_embedding_A[active_adapter]
+                    embedding_B = self.lora_embedding_B[active_adapter]
                     scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
 
-                    embedding_A = embedding_A[:, :_lora.tenant_config.r]
-                    embedding_B = embedding_B[:_lora.tenant_config.r, :]
+                    embedding_A_T = embedding_A.T[:, :_lora.tenant_config.r]
+                    embedding_B_T = embedding_B.T[:_lora.tenant_config.r, :]
 
-                    after_A = self._embed(_hidden_state, embedding_A)
-                    sub_result = sub_result + (after_A @ embedding_B) * scaling
+                    after_A = self._embed(x, embedding_A_T.T)
+                    lora_out = after_A @ embedding_B_T.T
 
-                    sub_result = sub_result.to(torch_result_dtype)
-                    results.append(sub_result)
+                    result = result + lora_out * scaling
 
-                return torch.cat(results, dim=0)
+                result = result.to(torch_result_dtype)
+                return result
 
             base_layer.forward = MethodType(_embedding_forward, base_layer)
+            base_layer.layer_name = name
 
     def patch(self, module: torch.nn.Module, *args, **kwargs):
         self.module = module
@@ -163,6 +194,11 @@ class MultiLora(Patch):
                 module.add_adapter(lora_tenant.adapter_name, config)
             else:
                 module = get_peft_model(module, config, lora_tenant.adapter_name)
+
+        for name, submodule in module.named_children():
+            if isinstance(submodule, LoraLayer):
+                self._patch_lora_forward(name, submodule)
+
         self.module = module
         return module
 
