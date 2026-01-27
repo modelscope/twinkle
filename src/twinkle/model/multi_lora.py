@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import Optional, List, Dict
-
+from contextlib import contextmanager
 import re
 from typing import Optional, Union, List
 import torch.nn as nn
@@ -51,13 +51,15 @@ class MultiLora(Patch):
     def deactivate_adapter(self):
         self.module.disable_adapter_layers()
 
+    @contextmanager
     def adapter(self, tenant_adapter_name: str):
         self.activate_adapter(tenant_adapter_name)
         yield
         self.deactivate_adapter()
 
-    def check_length(self, input: InputFeature):
-        if len(input['input_ids']) > self.max_length:
+    def check_length(self, inputs: InputFeature):
+        total_length = sum(len(_input['input_ids']) for _input in inputs)
+        if total_length > self.max_length:
              raise ValueError(f'Max length exceeds {self.max_length}')
 
     def acquire_lora(self, tenant_adapter_name: str, config: LoraConfig) -> LoraTenant:
@@ -126,9 +128,9 @@ class MultiLora(Patch):
                 for active_adapter in self.active_adapters:
                     if active_adapter not in lora_A_keys:
                         continue
-                    _lora = self.find_lora(active_adapter)
+                    _lora = _self.find_lora(active_adapter)
                     target_modules = _lora.tenant_config.target_modules
-                    if not self.match_target_modules(self.layer_name, target_modules):
+                    if not _self.match_target_modules(self.layer_name, target_modules):
                         continue
 
                     lora_A = self.lora_A[active_adapter]
@@ -195,7 +197,7 @@ class MultiLora(Patch):
             else:
                 module = get_peft_model(module, config, lora_tenant.adapter_name)
 
-        for name, submodule in module.named_children():
+        for name, submodule in module.named_modules():
             if isinstance(submodule, LoraLayer):
                 self._patch_lora_forward(name, submodule)
 

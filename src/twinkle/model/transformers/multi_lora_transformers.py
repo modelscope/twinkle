@@ -42,8 +42,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        self._inited = False
-
         self.multi_adapter = MultiLora()
         self.model = self.multi_adapter.patch(self.model)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
@@ -51,8 +49,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter.save_initial_weights()
 
     def _check_adapter_valid(self, adapter_name: str):
-        if self._inited:
-            assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
+        assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
 
     def _lazy_wrap_model(self):
         pass
