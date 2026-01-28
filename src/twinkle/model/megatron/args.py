@@ -504,7 +504,9 @@ class TwinkleMegatronArgs:
                 return _native_finalize_model_grads(model, num_tokens,
                                                     pg_collection)
 
-            raise NotImplementedError()
+            # For non-DDP models (single GPU or DP=1), gradients don't need distributed sync
+            # All gradients are already local, no finalization needed
+            return
 
         # MoE configuration
         num_experts = mg_config_dict.get('num_experts', 0) or 0

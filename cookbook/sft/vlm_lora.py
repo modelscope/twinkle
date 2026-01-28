@@ -34,7 +34,7 @@ parser.add_argument('--model', type=str, default='Qwen/Qwen3-VL-8B-Instruct')
 parser.add_argument('--dataset', type=str, default='ms://AI-ModelScope/LaTeX_OCR')
 parser.add_argument('--subset', type=str, default='human_handwrite')
 parser.add_argument('--samples', type=int, default=500)
-parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--batch_size', type=int, default=None)
 parser.add_argument('--max_steps', type=int, default=50)
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--lora_rank', type=int, default=8)
@@ -121,6 +121,8 @@ def train():
     logger.info("=" * 60)
     
     # Create dataloader
+    if args.batch_size is None:
+        args.batch_size = int(os.environ.get('WORLD_SIZE', 4))
     dataloader = DataLoader(
         dataset=create_dataset,
         batch_size=args.batch_size,
