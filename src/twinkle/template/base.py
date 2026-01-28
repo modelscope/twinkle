@@ -5,11 +5,17 @@ from copy import deepcopy
 from typing import List, Optional, Dict, Any, Literal, Union
 
 import numpy as np
+from PIL import Image
 
 from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.hub import HubOperation
 from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
 import torch
+
+# Type aliases for multimodal data
+ImageInput = Union[str, Image.Image, "torch.Tensor"]
+VideoInput = Union[str, List[Image.Image], "torch.Tensor"]
+AudioInput = Union[str, np.ndarray, "torch.Tensor"]
 
 
 class Template:
@@ -94,6 +100,26 @@ class Template:
             # If any error occurs during testing, fall back to not supporting
             self._template_support_assistant_tokens_mask = False
 
+    def preprocess_image(self, image: ImageInput) -> Image.Image: 
+        return image
+
+    def preprocess_video(self, video: VideoInput) -> List[Image.Image]:
+        return video
+
+    def preprocess_audio(self, audio: AudioInput) -> np.ndarray:
+        return audio
+
+    def preprocess_images(self, images: List[ImageInput]) -> List[Image.Image]:
+        """Preprocess a list of images."""
+        return [self.preprocess_image(img) for img in images]
+
+    def preprocess_videos(self, videos: List[VideoInput]) -> List[List[Image.Image]]:
+        """Preprocess a list of videos."""
+        return [self.preprocess_video(video) for video in videos]
+
+    def preprocess_audios(self, audios: List[AudioInput]) -> List[np.ndarray]:
+        """Preprocess a list of audio clips."""
+        return [self.preprocess_audio(audio) for audio in audios]
 
     def _invoke_pre_pipeline(self, trajectories: List[Trajectory]) -> List[Trajectory]:
         current = trajectories
@@ -155,8 +181,59 @@ class Template:
 
     def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
         messages = trajectory['messages']
-        messages = [transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder, self.is_mm) for message in messages]
-        trajectory['messages'] = messages
+        # Get images/videos from trajectory level (common case) or message level
+        traj_images = trajectory.get('images') or []
+        traj_videos = trajectory.get('videos') or []
+        
+        # Preprocess all trajectory-level images and videos
+        if traj_images and self.is_mm:
+            traj_images = self.preprocess_images(traj_images)
+        if traj_videos and self.is_mm:
+            traj_videos = self.preprocess_videos(traj_videos)
+        
+        # Distribute trajectory-level images to messages that contain placeholders
+        image_idx = 0
+        video_idx = 0
+        new_messages = []
+        for message in messages:
+            # If message already has images/videos at message level, use those
+            msg_images = message.get('images')
+            msg_videos = message.get('videos')
+            
+            # If not, assign from trajectory level based on placeholder count
+            if msg_images is None and self.is_mm:
+                content = message.get('content', '')
+                if isinstance(content, str):
+                    placeholder_count = content.count(self.image_placeholder)
+                    if placeholder_count > 0 and image_idx < len(traj_images):
+                        msg_images = traj_images[image_idx:image_idx + placeholder_count]
+                        image_idx += placeholder_count
+            elif msg_images and self.is_mm:
+                # Preprocess message-level images
+                msg_images = self.preprocess_images(msg_images)
+            
+            if msg_videos is None and self.is_mm:
+                content = message.get('content', '')
+                if isinstance(content, str):
+                    placeholder_count = content.count(self.video_placeholder)
+                    if placeholder_count > 0 and video_idx < len(traj_videos):
+                        msg_videos = traj_videos[video_idx:video_idx + placeholder_count]
+                        video_idx += placeholder_count
+            elif msg_videos and self.is_mm:
+                # Preprocess message-level videos
+                msg_videos = self.preprocess_videos(msg_videos)
+            
+            # Create message with images/videos attached
+            msg_with_media = dict(message)
+            if msg_images:
+                msg_with_media['images'] = msg_images
+            if msg_videos:
+                msg_with_media['videos'] = msg_videos
+            
+            new_messages.append(transfer_to_standard_message(
+                msg_with_media, self.image_placeholder, self.video_placeholder, self.is_mm))
+        
+        trajectory['messages'] = new_messages
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, **kwargs):
