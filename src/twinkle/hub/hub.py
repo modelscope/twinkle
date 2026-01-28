@@ -187,7 +187,7 @@ class HubOperation:
                        revision: Optional[str] = None,
                        download_model: bool = True,
                        ignore_patterns: Optional[List[str]] = [],
-                       **kwargs):
+                       **kwargs) -> str:
         """Download model from the hub
 
         Args:

@@ -3,7 +3,7 @@ import os
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
-from peft import PeftConfig, LoraConfig, load_peft_weights, set_peft_model_state_dict, PeftModel
+from peft import PeftConfig, LoraConfig, load_peft_weights, PeftModel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -132,7 +132,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        super().set_optimizer(optimizer_cls, **kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):

@@ -189,7 +189,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         )
 
     @remote_function()
-    def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+    def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
         Args:

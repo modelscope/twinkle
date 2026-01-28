@@ -23,7 +23,7 @@ from twinkle import torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss
-from twinkle.metric import Metric, LossMetric, Accuracy
+from twinkle.metric import Metric, LossMetric, Accuracy, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -52,7 +52,8 @@ class MegatronOptimizerGroup:
     gradient_accumulation_steps: int = 1
     cur_step: int = 0
     _dp_group = None
-    metrics: List[Metric] = field(default_factory=list)
+    train_metrics: List[Metric] = field(default_factory=list)
+    eval_metrics: List[Metric] = field(default_factory=list)
     _device_mesh: DeviceMesh = None
     # Megatron optimizer specific fields
     _last_grad_norm: float = 0.0
@@ -65,6 +66,49 @@ class MegatronOptimizerGroup:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
         return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
+
+
+    def __post_init__(self):
+        if self._device_mesh.data_world_size > 1:
+            self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
+        self.train_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group),
+            TrainMetric(self._device_mesh, self._dp_group),
+        ]
+
+        self.eval_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group),
+            TrainMetric(self._device_mesh, self._dp_group),
+        ]
+
+    def _get_lr(self):
+        _lrs = []
+        _default_lr = self.optimizer.defaults.get('lr')
+        for param_group in self.optimizer.param_groups:
+            _lrs.append(param_group.get('lr', _default_lr))
+        return _lrs
+
+    def accumulate_metrics(self, is_training):
+        if is_training:
+            metrics = self.train_metrics
+        else:
+            metrics = self.eval_metrics
+        if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
+            for metric in metrics:
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step})
+
+    def calculate_metrics(self, is_training):
+        self.accumulate_metrics(is_training)
+        if is_training:
+            metrics = self.train_metrics
+        else:
+            metrics = self.eval_metrics
+        results = {}
+        for metric in metrics:
+            results.update(metric.calculate())
+        return results
 
 
 _default_adapter_name = ''
@@ -130,9 +174,6 @@ class MegatronModel(TwinkleModel, nn.Module):
             **ac_kwargs,
         )
         set_args(args)
-
-        self._initialized = False
-        
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
 
         self._model_wrapped = False
@@ -192,12 +233,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
-    @staticmethod
-    def _accumulate_metric(optimizer_config: MegatronOptimizerGroup):
-        if len(optimizer_config.metrics) > 0 and optimizer_config.inputs is not None and optimizer_config.outputs is not None:
-            for metric in optimizer_config.metrics:
-                metric.accumulate(optimizer_config.inputs, optimizer_config.outputs)
-
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature],
                                        Trajectory, List[Trajectory]],
@@ -244,7 +279,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
-        self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -309,6 +343,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
+        self._accumulate_metric(optimizer_config, is_training=False)
+
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
         losses = forward_backward_func(
@@ -372,6 +408,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 - A single batch dict (num_microbatches=1)
                 - A list of batch dicts (num_microbatches=len(inputs))
                 - An iterator yielding batch dicts
+            micro_batch_size: split and trains by `micro_batch_size`
             **kwargs: Additional arguments.
 
         Returns:
@@ -386,13 +423,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
 
-        if isinstance(inputs, dict) and self._not_encoded(inputs):
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
-            inputs = optimizer_config.template.encode(inputs) # noqa
-        if isinstance(inputs, list) and self._not_encoded(inputs[0]):
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            if isinstance(inputs, dict):
+                inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
@@ -405,7 +441,6 @@ class MegatronModel(TwinkleModel, nn.Module):
             if micro_batch_size is None:
                 micro_batch_size = 1
             inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
-        self._accumulate_metric(optimizer_config)
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -468,6 +503,8 @@ class MegatronModel(TwinkleModel, nn.Module):
             data_iter = iter(inputs)
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
+
+        self._accumulate_metric(optimizer_config, is_training=True)
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
@@ -623,12 +660,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         lr_scheduler = optimizer_config.lr_scheduler
         if lr_scheduler is not None:
             # Megatron's OptimizerParamScheduler.step() requires increment argument
-            try:
-                increment = kwargs.pop('increment', 1)
-                lr_scheduler.step(increment=increment)
-            except TypeError:
-                # Standard PyTorch scheduler
-                lr_scheduler.step(**kwargs)
+            increment = kwargs.pop('increment', 1)
+            lr_scheduler.step(increment=increment)
 
     @remote_function(dispatch='all')
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
@@ -663,8 +696,11 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
-        metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
-        optimizer_config.metrics.append(metric)
+        is_training = kwargs.pop('is_training', None)
+        if is_training is None or is_training is True:
+            optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+        if not is_training:
+            optimizer_config.eval_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str],
@@ -690,6 +726,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs) # noqa
         else:
             raise NotImplementedError(f'Unsupported optimizer: {optimizer_cls}, only support MegatronOptimizer currently.')
+
+    @staticmethod
+    def _accumulate_metric(optimizer_config: MegatronOptimizerGroup, is_training):
+        optimizer_config.accumulate_metrics(is_training)
+
+    @remote_function(collect='first')
+    def calculate_metric(self, is_training, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        return optimizer_config.calculate_metrics(is_training)
 
     def _create_megatron_optimizer(self, **kwargs):
         """Create Megatron distributed optimizer.
@@ -917,7 +963,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         return self._get_trainable_parameters(adapter_name)
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], train_group: str, **kwargs):
-        from .tuners.multi_lora import set_linear_is_expert, get_target_modules, patch_deepcopy
+        from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
         assert adapter_name, 'Use a non-empty adapter_name'
         model = self.strategy.unwrap_model(self.model)
         if isinstance(config_or_dir, str):
@@ -963,21 +1009,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.optimizer_group[
             train_group].gradient_accumulation_steps = kwargs.get(
             'gradient_accumulation_steps', 1)
-
-        default_config = self.optimizer_group[_default_adapter_name]
-        if default_config.template:
-            self.optimizer_group[train_group].template = default_config.template
-        if default_config.processor:
-            self.optimizer_group[train_group].processor = default_config.processor
-        if default_config.loss_instance:
-            self.optimizer_group[train_group].loss_instance = default_config.loss_instance
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-        self._default_tokenizer = self.optimizer_group[train_group].template.tokenizer
-        dp_group = self.optimizer_group[train_group]._dp_group
-        self.optimizer_group[train_group].metrics = [
-                LossMetric(self.device_mesh, dp_group),
-                Accuracy(self.device_mesh, dp_group),
-            ]
+        self._default_tokenizer = self.optimizer_group[train_group].template.processor
 
     @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(
