@@ -1,32 +1,26 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import re
 import os
-from contextlib import contextmanager
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
-from peft import PeftConfig, LoraConfig
-from peft import PeftModel
-import torch
+from peft import PeftConfig, LoraConfig, load_peft_weights, set_peft_model_state_dict, PeftModel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
-import torch.distributed as dist
+
 from twinkle import remote_class, remote_function, template, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle.hub import HubOperation
 from twinkle.loss import Loss
-from twinkle.patch.multi_adapter import MultiAdapter
+from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from .strategy import AccelerateStrategy
 from .transformers import TransformersModel, OptimizerGroup
-from twinkle.hub import HubOperation
-from twinkle.metric import Metric
-from twinkle import Platform, torch_util
+from ..multi_lora import MultiLora
 
 
 @remote_class()
 class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
-    DUMMY_ADAPTER_NAME = '__dummy_adapter__'
 
     def __init__(self,  # noqa
                  model_cls = AutoModelForCausalLM,
@@ -38,8 +32,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  **kwargs):
         assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        torch_util.set_device()
-        dist.init_process_group('nccl', world_size=device_mesh.world_size, rank=Platform.get_rank(), device_id=torch.device(Platform.get_local_device()))
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
         self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
@@ -50,36 +42,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        self._inited = False
-
-        self.multi_adapter = MultiAdapter()
-        self.model: PreTrainedModel = self.multi_adapter.patch(self.model)
-        with self._no_ddp_context() as local_rank:
-            self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
-            from accelerate import PartialState
-            local_device = torch.device(Platform.get_local_device(local_rank))
-            PartialState._shared_state['device'] = local_device
-            self.strategy.accelerator.state.device = local_device
-            self.model = self.strategy.wrap_model(self.model)
-        self.add_adapter_to_model(MultiLoraTransformersModel.DUMMY_ADAPTER_NAME, LoraConfig(r=1, target_modules='all-linear'))
-        self._inited = True
-
-    @contextmanager
-    def _no_ddp_context(self):
-        origin_local_rank = os.environ['LOCAL_RANK']
-        origin_world_size = os.environ['WORLD_SIZE']
-        os.environ['WORLD_SIZE'] = '1'
-        os.environ['LOCAL_RANK'] = '-1'
-        yield int(origin_local_rank)
-        os.environ['LOCAL_RANK'] = origin_local_rank
-        os.environ['WORLD_SIZE'] = origin_world_size
+        self.multi_adapter = MultiLora()
+        self.model = self.multi_adapter.patch(self.model)
+        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
+        self.model = self.strategy.wrap_model(self.model)
+        self.multi_adapter.save_initial_weights()
 
     def _check_adapter_valid(self, adapter_name: str):
-        if self._inited:
-            assert adapter_name and adapter_name != MultiLoraTransformersModel.DUMMY_ADAPTER_NAME and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
-
-    def _activate_adapter(self, adapter_name: str):
-        self.multi_adapter.set_current_adapter_name(adapter_name)
+        assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
 
     def _lazy_wrap_model(self):
         pass
@@ -87,80 +57,81 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function(dispatch='slice_dp', collect='mean')
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        return super().forward(inputs=inputs, **kwargs)
+        optimizer_config = self.optimizer_group[kwargs.get("adapter_name")]
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            if isinstance(inputs, dict):
+                inputs = [inputs]
+            inputs = optimizer_config.template.batch_encode(inputs) # noqa
+        self.multi_adapter.check_length(inputs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            return super().forward(inputs=inputs, **kwargs)
 
     @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        return super().forward_only(inputs=inputs, **kwargs)
+        optimizer_config = self.optimizer_group[kwargs.get("adapter_name")]
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            if isinstance(inputs, dict):
+                inputs = [inputs]
+            inputs = optimizer_config.template.batch_encode(inputs) # noqa
+        self.multi_adapter.check_length(inputs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            return super().forward_only(inputs=inputs, **kwargs)
 
     @remote_function()
     def calculate_loss(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        return super().calculate_loss(**kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            return super().calculate_loss(**kwargs)
 
     @remote_function()
     def backward(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        super().backward(**kwargs)
-        self._reduce_adapter_grad(adapter_name=kwargs.get("adapter_name"))
-
-    def _reduce_adapter_grad(self, adapter_name: str):
-        from torch.distributed.tensor import DTensor
-        if adapter_name:
-            import torch.distributed as dist
-            for p in self._get_trainable_parameters(adapter_name).values():
-                if p.grad is None:
-                    continue
-
-                grad = p.grad
-                if isinstance(grad, DTensor):
-                    full_grad = grad.full_tensor()
-                    p.grad = full_grad
-                    grad = full_grad
-
-                if self.device_mesh.dp_world_size > 1:
-                    dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self.optimizer_group[adapter_name]._dp_group)
-            dist.barrier()
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            super().backward(**kwargs)
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
+
+    def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
+        with self.multi_adapter.adapter(adapter_name) as adapter_name:
+            return super()._create_param_group(adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
 
     @remote_function()
     def step(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        super().step(**kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            super().step(**kwargs)
 
     @remote_function()
     def zero_grad(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        super().zero_grad(**kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            super().zero_grad(**kwargs)
 
     @remote_function()
     def lr_step(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
-        super().lr_step(**kwargs)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")):
+            super().lr_step(**kwargs)
 
     @remote_function()
     def set_loss(self, loss_cls: Union[Type[Loss], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_loss(loss_cls, **kwargs)
 
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function()
@@ -176,51 +147,75 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config_or_dir.init_lora_weights = False
         config_or_dir.modules_to_save = None
         config_or_dir.trainable_token_indices = None
-        self._patch_adapter(adapter_name, config_or_dir, adapter_name, **kwargs)
-        self._activate_adapter(adapter_name)
-        self._prepare_adapter(adapter_name)
-
-    def _prepare_adapter(self, adapter_name: str):
-        self._check_adapter_valid(adapter_name)
-        pattern = re.compile(r'\.lora_\w+\.[^.]+\.')
-        unwrapped_model = self.strategy.unwrap_model(self.model)
-        for name, param in unwrapped_model.named_parameters():
-            if pattern.search(name):
-                param.requires_grad = True
+        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+        self.optimizer_group[adapter_name].adapter_name = adapter_name
+        self.optimizer_group[adapter_name].adapter_config = config_or_dir
+        _gas_default = kwargs.get('gradient_accumulation_steps', 1)
+        self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
+        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+        self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_lr_scheduler(scheduler_cls, **kwargs)
 
     @remote_function()
     def set_template(self, template_cls: Union[Type[template.Template], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_template(template_cls, **kwargs)
 
     @remote_function()
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
+
+    @remote_function()
+    def get_state_dict(self, **kwargs):
+        self._check_adapter_valid(kwargs.get("adapter_name"))
+        return self.multi_adapter.get_state_dict(kwargs.get("adapter_name"))
+
+    @remote_function()
+    def save(self, name, output_dir=None, interval=1, **kwargs):
+        self._check_adapter_valid(kwargs.get("adapter_name"))
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")):
+            return super().save(name, output_dir, interval, **kwargs)
+
+    @remote_function()
+    def load(self, name: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
+        adapter_name = kwargs.get("adapter_name")
+        self._check_adapter_valid(adapter_name)
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")):
+            load_optimizer = kwargs.get('load_optimizer', False)
+            if output_dir is None:
+                output_dir = 'output'
+            checkpoint_dir = os.path.join(output_dir, name)
+            model = self.strategy.unwrap_model(self.model)
+            if isinstance(model, PeftModel):
+                # Load to CPU to avoid safetensors device issues in Ray environment
+                adapter_weights = load_peft_weights(checkpoint_dir, device="cpu")
+                self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
+
+            if load_optimizer:
+                self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().set_grad_scaler(**kwargs)
 
     def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        self._activate_adapter(kwargs.get("adapter_name"))
         super().add_metric(metric_cls, **kwargs)
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
-        model = self.strategy.unwrap_model(self.model)
-        if isinstance(model, PeftModel):
-            model.base_model.delete_adapter(adapter_name=adapter_name)
+        self.multi_adapter.release_lora(adapter_name)
+
+    def _get_nb_trainable_parameters(self, adapter_name, model):
+        return self.multi_adapter.get_nb_trainable_parameters(adapter_name)
+
+    def _get_trainable_parameters_example(self, adapter_name, model):
+        return self.multi_adapter.get_trainable_parameters_example(adapter_name)

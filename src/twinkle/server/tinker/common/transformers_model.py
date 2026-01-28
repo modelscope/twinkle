@@ -4,7 +4,7 @@ from typing import List
 from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature
-
+from .io_utils import CheckpointManager
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
@@ -63,7 +63,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
     @remote_function(collect='sum')
     def calculate_loss(self, **kwargs):
         loss = super().calculate_loss(**kwargs)
-        return loss.item()
+        return loss
 
     @remote_function()
     def step(self, *, adam_params: types.AdamParams, **kwargs):
@@ -82,6 +82,21 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         super().step(optim_params=optim_params, **kwargs)
         # Zero gradients
         self.zero_grad(**kwargs)
+
+    @remote_function()
+    def load(self, checkpoint_dir: str, **kwargs):
+        # handle twinkle checkpoint format
+        tinker_path = CheckpointManager.parse_tinker_path(checkpoint_dir)
+        if not tinker_path:
+            raise ValueError(f"Invalid twinkle checkpoint path: {checkpoint_dir}")
+        # check adapter files
+        weight_path = CheckpointManager.get_ckpt_dir(tinker_path.training_run_id, tinker_path.checkpoint_id)
+        if (weight_path / 'adapter_config.json').exists():
+            return super().load(checkpoint_dir=weight_path.as_posix(), **kwargs)
+        elif (weight_path / tinker_path.training_run_id / 'adapter_config.json').exists():
+            return super().load(checkpoint_dir=(weight_path / tinker_path.training_run_id).as_posix(), **kwargs)
+        else:
+            return super().load(checkpoint_dir=checkpoint_dir, **kwargs)
 
     @staticmethod
     def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor) -> List[dict]:

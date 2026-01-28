@@ -26,7 +26,7 @@ def eval(model: MultiLoraTransformersModel):
     return metrics
 
 def train():
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(5000)))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
@@ -61,6 +61,8 @@ def train():
         #        model.save(f'checkpoint-{step}')
         #        loss_metric = float(metrics['loss'])
     model.save(f'last-checkpoint', adapter_name='default')
+    model.load(f'last-checkpoint', adapter_name='default')
+    model.remove_adapter('default')
 
 
 if __name__ == '__main__':
