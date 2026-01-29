@@ -503,7 +503,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         if vpp_size is None or vpp_size == 1:
             data_iter = iter(inputs)
         else:
-            data_iter = [iter(inputs) for _ in range(0, vpp_size)]
+            data_iter = [inputs] * vpp_size
+            data_iter = [iter(b) for b in data_iter]
+            # data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
         self._accumulate_metric(optimizer_config, is_training=True)
 

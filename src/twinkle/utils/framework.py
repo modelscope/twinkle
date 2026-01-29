@@ -218,4 +218,28 @@ class Torch(Framework):
         import torch
         if Torch.is_gpu_available():
             torch.cuda.synchronize(Platform.get_local_device())
+    
+    @staticmethod
+    def contains_nan(*args, **kwargs) -> bool:
+        def _check(obj: Any) -> bool:
+            if isinstance(obj, torch.Tensor):
+                return torch.isnan(obj).any().item()
+            
+            if isinstance(obj, dict):
+                return any(_check(v) for v in obj.values())
+            
+            if isinstance(obj, (list, tuple, set)):
+                return any(_check(item) for item in obj)
+            
+            return False
+
+        for arg in args:
+            if _check(arg):
+                return True
+
+        for value in kwargs.values():
+            if _check(value):
+                return True
+    
+        return False
 
