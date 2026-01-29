@@ -51,7 +51,7 @@ class MegatronOptimizerGroup:
     template: Template = None
     processor: InputProcessor = None
     gradient_accumulation_steps: int = 1
-    cur_step: int = -1
+    cur_step: int = 0
     _dp_group = None
     train_metrics: List[Metric] = field(default_factory=list)
     eval_metrics: List[Metric] = field(default_factory=list)
@@ -222,12 +222,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            assert len(self.optimizer_group) == 1
             self.model = self.strategy.wrap_model(self.model)
-            optimizer = self.optimizer_group[_default_adapter_name].optimizer
-            if optimizer is None:
-                optimizer = self._create_megatron_optimizer()
-                self.optimizer_group[_default_adapter_name].optimizer = optimizer
             self._model_wrapped = True
 
     @staticmethod
@@ -553,7 +548,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
             loss = loss_tensor.item()
 
-        optimizer_config.cur_step += (len(inputs) if isinstance(inputs, list) else 1)
+        optimizer_config.cur_step += (len(inputs) //micro_batch_size if isinstance(inputs, list) else 1)
 
         dp_world_size = mpu.get_data_parallel_world_size()
         if dp_world_size > 1:
@@ -973,7 +968,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         return self._get_trainable_parameters(adapter_name)
 
-    def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], train_group: str, **kwargs):
+    def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
         assert adapter_name, 'Use a non-empty adapter_name'
         model = self.strategy.unwrap_model(self.model)
@@ -1014,14 +1009,14 @@ class MegatronModel(TwinkleModel, nn.Module):
         self.model = _models
 
         # Create optimizer group for adapter
-        self.optimizer_group[train_group] = self._construct_default_optimizer_group()
-        self.optimizer_group[train_group].adapter_name = adapter_name
-        self.optimizer_group[train_group].adapter_config = config
+        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+        self.optimizer_group[adapter_name].adapter_name = adapter_name
+        self.optimizer_group[adapter_name].adapter_config = config
         self.optimizer_group[
-            train_group].gradient_accumulation_steps = kwargs.get(
+            adapter_name].gradient_accumulation_steps = kwargs.get(
             'gradient_accumulation_steps', 1)
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-        self._default_tokenizer = self.optimizer_group[train_group].template.processor
+        self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
 
     @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(
@@ -1037,7 +1032,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             config_or_dir: LoRA config or path to saved adapter.
             **kwargs: Additional arguments.
         """
-        self._patch_adapter(adapter_name, config_or_dir, _default_adapter_name, **kwargs)
+        self._patch_adapter(adapter_name, config_or_dir, **kwargs)
 
 
     @remote_function(dispatch='all')
