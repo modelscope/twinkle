@@ -412,6 +412,7 @@ class MultiLora(Patch):
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
+                    breakpoint()
                     name = name.replace(f'.{_lora.adapter_name}.', f'.{_lora.tenant_adapter_name}.')
                     src_tensor = state_dict[name]
                     if 'embedding_A' in name:

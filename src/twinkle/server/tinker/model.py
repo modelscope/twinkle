@@ -118,7 +118,7 @@ def build_model_app(model_id: str,
             async def _create_adapter():
                 if body.lora_config:
                     # TODO: support more lora config parameters, train_unembed, etc.
-                    lora_cfg = LoraConfig(r=body.lora_config.rank, )
+                    lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
 
                     with self.adapter_lock:
                         adapter_name = self.get_adapter_name(

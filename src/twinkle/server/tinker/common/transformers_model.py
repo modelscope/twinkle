@@ -40,7 +40,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
     with a ``MultiLoraTransformersModel`` instance without needing to know its
     internal input feature schema, output structure, or optimizer API.
     """
-    @remote_function(collect='flatten')
+    @remote_function(dispatch='slice_dp', collect='flatten')
     def forward(self, *, inputs: List[types.Datum], **kwargs):
         # Convert Datum to InputFeature
         input_features = [datum_to_input_feature(datum) for datum in inputs]
@@ -50,7 +50,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         results = self._get_forward_output(inputs, logits)
         return results
 
-    @remote_function(collect='flatten')
+    @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: List[types.Datum], **kwargs):
         # Convert Datum to InputFeature
         input_features = [datum_to_input_feature(datum) for datum in inputs]

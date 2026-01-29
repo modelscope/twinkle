@@ -27,7 +27,7 @@ for tr in response.training_runs:
     
 #%%
 if not resume_path:
-    base_model = "ms://Qwen/Qwen2.5-0.5B-Instruct"
+    base_model = "Qwen/Qwen2.5-0.5B-Instruct"
     training_client = service_client.create_lora_training_client(
         base_model=base_model
     )
@@ -51,7 +51,7 @@ from tinker import types
 from modelscope import AutoTokenizer
 # Get the tokenizer from the training client
 # tokenizer = training_client.get_tokenizer() # NOTE: network call huggingface
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
  
 def process_example(example: dict, tokenizer) -> types.Datum:
     # Format the input with Input/Output template

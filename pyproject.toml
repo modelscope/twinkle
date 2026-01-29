@@ -7,7 +7,7 @@ authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "datasets>=3.0,<4.0",
-  "numpy",
+  "numpy>=2.0.0,!=2.4.0,<3.0.0",
   "omegaconf>=2.3.0,<3.0.0",
   "fastapi",
   "modelscope[framework]",
@@ -22,7 +22,7 @@ transformers = [
   "torch>=2.6.0,<3.0.0",
   "torchvision",
 ]
-megatron = ["megatron-core>=0.12.0"]
+megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]"]
 ray = ["ray[serve]"]
 docs = [
   "sphinx>=5.3.0,<6.0.0",
