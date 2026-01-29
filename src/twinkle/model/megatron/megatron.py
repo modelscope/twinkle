@@ -66,7 +66,7 @@ class MegatronOptimizerGroup:
         """Check if gradient synchronization should happen."""
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
-        return self.cur_step % gradient_accumulation_steps == 0 and self.cur_step > 0
+        return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 0
 
 
     def __post_init__(self):
@@ -96,7 +96,7 @@ class MegatronOptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step})
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1})
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -548,7 +548,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
             loss = loss_tensor.item()
 
-        optimizer_config.cur_step += (len(inputs) //micro_batch_size if isinstance(inputs, list) else 1)
+        optimizer_config.cur_step += 1
 
         dp_world_size = mpu.get_data_parallel_world_size()
         if dp_world_size > 1:
