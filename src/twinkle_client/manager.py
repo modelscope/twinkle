@@ -242,18 +242,10 @@ class TwinkleClient:
         Raises:
             TwinkleManagerError: If checkpoint not found or access denied
         """
-        # Note: We need to use DELETE method, but http_utils only has get/post
-        # For now, we'll use requests directly
-        import requests
-        from .http.utils import TWINKLE_REQUEST_ID
-        
-        headers = {
-            "X-Ray-Serve-Request-Id": TWINKLE_REQUEST_ID,
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        from .http import http_delete
         
         url = self._get_url(f"/training_runs/{run_id}/checkpoints/{checkpoint_id}")
-        response = requests.delete(url, headers=headers, timeout=300)
+        response = http_delete(url)
         data = self._handle_response(response)
         return data.get("success", False)
 

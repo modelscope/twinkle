@@ -4,7 +4,7 @@ import threading
 import uuid
 from typing import Dict, Any
 import importlib
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ray import serve
 
@@ -166,6 +166,18 @@ def build_processor_app(nproc_per_node: int,
                     value = deserialize_object(value)
                     _kwargs[key] = value
 
+            # Special handling for __next__ to catch StopIteration
+            # We convert StopIteration to HTTP 410 (Gone) which semantically means
+            # "the resource (next item) is no longer available"
+            if function_name == '__next__':
+                try:
+                    result = function(**_kwargs)
+                    return {'result': result}
+                except StopIteration:
+                    # Use HTTP 410 Gone to indicate iterator exhausted
+                    # This is a clean signal that won't be confused with errors
+                    raise HTTPException(status_code=410, detail="Iterator exhausted")
+            
             result = function(**_kwargs)
             if function_name == '__iter__':
                 return {'result': 'ok'}

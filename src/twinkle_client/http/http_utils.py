@@ -1,7 +1,71 @@
 from numbers import Number
-from typing import Optional, Dict, Any, Mapping
-from .utils import TWINKLE_REQUEST_ID, get_base_url, get_api_key
+from typing import Optional, Dict, Any, Mapping, Callable
+from .utils import get_request_id, get_base_url, get_api_key
 import requests
+
+
+def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    Build HTTP headers with request ID and authorization.
+    
+    Args:
+        additional_headers: Additional headers to include
+        
+    Returns:
+        Dictionary of headers
+    """
+    headers = {
+        "X-Ray-Serve-Request-Id": get_request_id(),
+        "Authorization": 'Bearer ' + get_api_key(),
+    }
+    
+    if additional_headers:
+        headers.update(additional_headers)
+    
+    return headers
+
+
+def _serialize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Serialize parameters, handling special objects like processors.
+    
+    Args:
+        params: Parameters to serialize
+        
+    Returns:
+        Serialized parameters dictionary
+    """
+    serialized = {}
+    for key, value in params.items():
+        if hasattr(value, 'processor_id'):
+            serialized[key] = value.processor_id
+        elif hasattr(value, '__dict__'):
+            from twinkle.server.twinkle.serialize import serialize_object
+            serialized[key] = serialize_object(value)
+        else:
+            serialized[key] = value
+    return serialized
+
+
+def _handle_response(response: requests.Response) -> requests.Response:
+    """
+    Handle common response processing.
+    
+    Args:
+        response: Response object
+        
+    Returns:
+        Response object
+        
+    Raises:
+        StopIteration: When server returns HTTP 410 (iterator exhausted)
+    """
+    # Convert HTTP 410 Gone to StopIteration
+    # This indicates an iterator has been exhausted
+    if response.status_code == 410:
+        raise StopIteration(response.json().get('detail', 'Iterator exhausted'))
+    
+    return response
 
 
 def http_get(
@@ -23,31 +87,17 @@ def http_get(
         requests.Response object
     """
     url = url or get_base_url()
+    headers = _build_headers(additional_headers)
+    serialized_params = _serialize_params(params)
     
-    headers = {
-        "X-Ray-Serve-Request-Id": TWINKLE_REQUEST_ID,
-        "Authorization": 'Bearer ' + get_api_key(),
-    }
-    
-    if additional_headers:
-        headers.update(additional_headers)
-    _params = {}
-    for key, value in params.items():
-        if hasattr(value, 'processor_id'):
-            _params[key] = value.processor_id
-        elif hasattr(value, '__dict__'):
-            from twinkle.server.twinkle.serialize import serialize_object
-            _params[key] = serialize_object(value)
-        else:
-            _params[key] = value
     response = requests.get(
         url,
         headers=headers,
-        params=_params,
+        params=serialized_params,
         timeout=timeout,
     )
     
-    return response
+    return _handle_response(response)
 
 
 def http_post(
@@ -69,31 +119,52 @@ def http_post(
 
     Returns:
         requests.Response object
+        
+    Raises:
+        StopIteration: When server returns HTTP 410 (iterator exhausted)
     """
     url = url or get_base_url()
+    headers = _build_headers(additional_headers)
+    serialized_json = _serialize_params(json_data)
     
-    headers = {
-        "X-Ray-Serve-Request-Id": TWINKLE_REQUEST_ID,
-        "Authorization": 'Bearer ' + get_api_key(),
-    }
-    
-    if additional_headers:
-        headers.update(additional_headers)
-    _params = {}
-    for key, value in json_data.items():
-        if hasattr(value, 'processor_id'):
-            _params[key] = value.processor_id
-        elif hasattr(value, '__dict__'):
-            from twinkle.server.twinkle.common.serialize import serialize_object
-            _params[key] = serialize_object(value)
-        else:
-            _params[key] = value
     response = requests.post(
         url,
         headers=headers,
-        json=_params,
+        json=serialized_json,
         data=data,
         timeout=timeout,
     )
     
-    return response
+    return _handle_response(response)
+
+
+def http_delete(
+    url: Optional[str]=None,
+    params: Optional[Dict[str, Any]] = {},
+    additional_headers: Optional[Dict[str, str]] = {},
+    timeout: int = 300,
+) -> requests.Response:
+    """
+    Send HTTP DELETE request with required headers.
+
+    Args:
+        url: The target URL
+        params: Query parameters
+        additional_headers: Additional headers to include
+        timeout: Request timeout in seconds
+
+    Returns:
+        requests.Response object
+    """
+    url = url or get_base_url()
+    headers = _build_headers(additional_headers)
+    serialized_params = _serialize_params(params)
+    
+    response = requests.delete(
+        url,
+        headers=headers,
+        params=serialized_params,
+        timeout=timeout,
+    )
+    
+    return _handle_response(response)

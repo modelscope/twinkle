@@ -13,11 +13,11 @@ if TYPE_CHECKING:
 def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[str] = None, **kwargs) -> ServiceClient:
     requires('tinker')
     from tinker import ServiceClient
-    from twinkle_client.http.utils import TWINKLE_REQUEST_ID, TWINKLE_SERVER_TOKEN
+    from twinkle_client.http.utils import get_request_id, get_api_key()
     
     default_headers = {
-        "X-Ray-Serve-Request-Id": TWINKLE_REQUEST_ID,
-        "Authorization": 'Bearer ' + (api_key or TWINKLE_SERVER_TOKEN),
+        "X-Ray-Serve-Request-Id": get_request_id(),
+        "Authorization": 'Bearer ' + (api_key or get_api_key()),
     } | kwargs.pop("default_headers", {})
     
     return ServiceClient(base_url=base_url, api_key=api_key, default_headers=default_headers, **kwargs)
