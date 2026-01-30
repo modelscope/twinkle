@@ -670,14 +670,15 @@ def generate_samplers():
     client_module_path = src_client_path / 'sampler'
     client_module_path.mkdir(parents=True, exist_ok=True)
 
-    sampler_code = '''from typing import Any, Optional, List, Dict
+    sampler_code = '''from typing import Any, Optional, List, Dict, Union
 import uuid
-from client.http import TWINKLE_SERVER_URL
-from client.http import http_post, heartbeat_manager
+from twinkle_client.http import TWINKLE_SERVER_URL
+from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.types import SamplingParams, SampleResponse
 from twinkle import DeviceMesh
 from peft import PeftConfig
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, InputFeature
 import json
 
 
@@ -739,11 +740,29 @@ class VLLMSampler(Sampler):
         except:
             pass
     
-    def sample(self, trajectories: List[Trajectory], adapter_name: str = '') -> List[Trajectory]:
-        """Sample from the model using provided trajectories."""
+    def sample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        adapter_name: str = ''
+    ) -> SampleResponse:
+        """Sample from the model.
+        
+        Args:
+            inputs: List of Trajectory or InputFeature to sample from.
+            sampling_params: Sampling parameters dict.
+            adapter_name: Adapter name.
+            
+        Returns:
+            SampleResponse with sampled sequences.
+        """
         response = http_post(
             url=f'{self.server_url}/sample',
-            json_data={'trajectories': json.dumps(trajectories, ensure_ascii=False), 'adapter_name': adapter_name}
+            json_data={
+                'inputs': inputs,
+                'sampling_params': sampling_params,
+                'adapter_name': adapter_name
+            }
         )
         response.raise_for_status()
         return response.json()
@@ -754,6 +773,15 @@ class VLLMSampler(Sampler):
         response = http_post(
             url=f'{self.server_url}/sync_weights',
             json_data={'state_dict': state_dict, 'adapter_name': adapter}
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs):
+        """Set the template for encoding trajectories."""
+        response = http_post(
+            url=f'{self.server_url}/set_template',
+            json_data={'template_cls': template_cls, 'adapter_name': adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()
