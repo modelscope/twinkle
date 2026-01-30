@@ -149,6 +149,7 @@ result/
 images
 /custom/
 megatron_output/
+.qoder
 
 # Pytorch
 *.pth

@@ -650,8 +650,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """Load model state and optionally optimizer state from a checkpoint.
 
         Args:
-            name: The name of checkpoint to save.
-            output_dir: An output_dir to save the model.
+            name: The name of checkpoint to load.
+            output_dir: An output_dir to load the model.
             **kwargs:
                 adapter_name: Adapter to load.
                 load_optimizer: Whether to load optimizer and scheduler states.

@@ -3,7 +3,7 @@ import os
 from typing import Dict, Any, List, Literal
 from typing import Type, Optional, Union
 
-from peft import PeftConfig, LoraConfig, load_peft_weights, PeftModel
+from peft import PeftConfig, LoraConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -177,7 +177,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return self.multi_adapter.get_state_dict(kwargs.get("adapter_name"))
 
     @remote_function()
-    def save(self, name, output_dir=None, interval=1, **kwargs):
+    def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         with self.multi_adapter.save_context(kwargs.get("adapter_name")):
             return super().save(name, output_dir, interval, **kwargs)

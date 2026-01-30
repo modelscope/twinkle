@@ -1,3 +1,6 @@
+import dotenv
+dotenv.load_dotenv('.env')
+import os
 from peft import LoraConfig
 
 from twinkle import get_device_placement, get_logger
@@ -9,7 +12,7 @@ from twinkle_client import init_twinkle_client
 
 logger = get_logger()
 
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='tml-xxxx')
+client = init_twinkle_client(base_url=os.environ['EAS_URL'], api_key=os.environ['EAS_TOKEN'])
 # List all training runs
 runs = client.list_training_runs()
 

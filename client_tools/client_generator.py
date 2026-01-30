@@ -331,8 +331,8 @@ class {class_name}({inheritance}):
     """Client wrapper for {class_name} that calls server HTTP endpoints."""
 
     def __init__({init_params}):
-        assert TWINKLE_SERVER_URL
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
 
         response = http_post(
             url=f'{{self.server_url}}/processors/create',
@@ -451,7 +451,9 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
     
     def __init__(self, model_id: str, **kwargs):
         """Initialize model client."""
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
+        
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.server_url = f'{self.server_url}/models/{model_id}'
@@ -608,20 +610,20 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         response.raise_for_status()
         return response.json()['result']
     
-    def save(self, output_dir: str, **kwargs):
+    def save(self, name: str, **kwargs):
         """Save model checkpoint."""
         response = http_post(
             url=f'{self.server_url}/save',
-            json_data={'output_dir': output_dir, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
         
-    def load(self, input_dir: str, **kwargs):
+    def load(self, name: str, **kwargs):
         """Load model checkpoint."""
         response = http_post(
             url=f'{self.server_url}/load',
-            json_data={'input_dir': input_dir, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
@@ -691,7 +693,9 @@ class VLLMSampler(Sampler):
     
     def __init__(self, model_id: str, **kwargs):
         """Create the sampler instance on server."""
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
+        
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
