@@ -64,6 +64,7 @@ def train():
         #        model.save(f'checkpoint-{step}')
         #        loss_metric = float(metrics['loss'])
     model.save(f'last-checkpoint', adapter_name='default')
+    model.load(f'last-checkpoint', adapter_name='default')
     model.remove_adapter(adapter_name='default')
 
 

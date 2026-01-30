@@ -180,9 +180,9 @@ class MultiLoraMegatronModel(MegatronModel):
         with self.multi_adapter.adapter(kwargs.get("adapter_name")) as real_adapter_name:
             save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
             if save_format == 'hf':
-                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.lora_converter)
+                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
             else:
-                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.lora_converter)
+                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=kwargs.get("adapter_name"))
             import torch.distributed as dist
@@ -195,8 +195,9 @@ class MultiLoraMegatronModel(MegatronModel):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
         bridge = self._bridge
-        for _model in self.model:
-            bridge.load_weights(_model, checkpoint_dir, True, lora_converter=self.multi_adapter.load_lora_converter)
+        with self.multi_adapter.adapter(kwargs.get("adapter_name")) as adapter_name:
+            for _model in self.strategy.unwrap_model(self.model):
+                bridge.load_weights(_model, checkpoint_dir, True, adapter_name=adapter_name, lora_converter=self.multi_adapter.load_lora_converter)
 
         if dist.is_initialized():
             dist.barrier()
