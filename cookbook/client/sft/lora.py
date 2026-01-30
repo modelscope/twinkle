@@ -10,7 +10,18 @@ from twinkle_client import init_twinkle_client
 logger = get_logger()
 
 client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='tml-xxxx')
+# List all training runs
+runs = client.list_training_runs()
 
+resume_path = None
+for run in runs:
+    logger.info(run.model_dump_json(indent=2))
+    # Get checkpoints for a run
+    checkpoints = client.list_checkpoints(run.training_run_id)
+
+    for checkpoint in checkpoints:
+        logger.info(checkpoint.model_dump_json(indent=2))
+        resume_path = checkpoint.twinkle_path
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
@@ -30,7 +41,9 @@ def train():
     model.set_loss('CrossEntropyLoss')
     model.set_optimizer('AdamW', lr=1e-4)
     model.set_lr_scheduler('LinearLR')
-    # logger.info(get_device_placement())
+    # Resume training if resume_path is provided
+    if resume_path:
+        model.load(resume_path, load_optimizer=True)
     logger.info(model.get_train_configs())
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch)

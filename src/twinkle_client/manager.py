@@ -1,28 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Twinkle Client Manager
-
-This module provides a client-side manager for interacting with the Twinkle
-REST API server. It allows users to:
-- List training runs
-- List checkpoints
-- Get checkpoint paths for resume training
-- Delete checkpoints
-
-Usage example:
-    from twinkle_client import TwinkleManager
-    
-    manager = TwinkleManager(base_url="http://localhost:8000")
-    
-    # List all training runs
-    runs = manager.list_training_runs()
-    
-    # Get checkpoints for a run
-    checkpoints = manager.list_checkpoints(runs[0].training_run_id)
-    
-    # Get checkpoint path for loading
-    path = manager.get_checkpoint_path(run_id, checkpoint_id)
-"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -59,14 +35,14 @@ class TwinkleClient:
         base_url: Base URL of the Twinkle server (e.g., "http://localhost:8000").
         api_key: API key for authentication. If not provided, uses
                  TWINKLE_SERVER_TOKEN environment variable
-        route_prefix: API route prefix (default: "/api/v1")
+        route_prefix: API route prefix (default: "/server")
     """
 
     def __init__(
         self,
         base_url: str = None,
         api_key: str = None,
-        route_prefix: Optional[str] = 'server'
+        route_prefix: Optional[str] = '/server'
     ):
         self.base_url = base_url
         self.api_key = api_key

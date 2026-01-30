@@ -3,6 +3,7 @@ from .heartbeat import heartbeat_manager
 from .utils import (
     TWINKLE_SERVER_URL, 
     TWINKLE_SERVER_TOKEN, 
+    TWINKLE_REQUEST_ID,
     set_base_url, 
     get_base_url, 
     clear_base_url,
@@ -17,6 +18,7 @@ __all__ = [
     'heartbeat_manager',
     'TWINKLE_SERVER_URL',
     'TWINKLE_SERVER_TOKEN',
+    'TWINKLE_REQUEST_ID',
     'set_base_url',
     'get_base_url',
     'clear_base_url',

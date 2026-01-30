@@ -396,11 +396,28 @@ def build_model_app(model_id: str,
             
             # Construct the checkpoint path and validate access
             if body.name:
-                # User provided a checkpoint name
-                checkpoint_id = f"weights/{body.name}"
+                # Check if body.name is a twinkle:// path or a simple checkpoint name
+                if body.name.startswith("twinkle://"):
+                    # Parse twinkle:// path
+                    parsed = CheckpointManager.parse_twinkle_path(body.name)
+                    if not parsed:
+                        raise ValueError(f"Invalid twinkle path format: {body.name}")
+                    
+                    # Extract the checkpoint name from the parsed path
+                    # parsed.checkpoint_id is like "weights/step-8"
+                    checkpoint_id = parsed.checkpoint_id
+                    checkpoint_name = parsed.checkpoint_id.split('/')[-1]  # Extract "step-8"
+                    
+                    # Use the training_run_id from the path as the model_id
+                    model_id_to_load = parsed.training_run_id
+                else:
+                    # User provided a simple checkpoint name
+                    checkpoint_id = f"weights/{body.name}"
+                    checkpoint_name = body.name
+                    model_id_to_load = adapter_name
                 
                 # Verify checkpoint exists and user has access
-                checkpoint = CheckpointManager.get(adapter_name, checkpoint_id, token)
+                checkpoint = CheckpointManager.get(model_id_to_load, checkpoint_id, token)
                 if not checkpoint:
                     raise ValueError(
                         f"Checkpoint not found or access denied: {body.name}"
@@ -408,13 +425,13 @@ def build_model_app(model_id: str,
                 
                 # Get the actual directory path
                 output_dir = CheckpointManager.get_save_dir(
-                    model_id=adapter_name,
+                    model_id=model_id_to_load,
                     token=token,
                     is_sampler=False
                 )
                 
                 ret = self.model.load(
-                    name=body.name,
+                    name=checkpoint_name,
                     output_dir=output_dir,
                     adapter_name=adapter_name, 
                     load_optimizer=body.load_optimizer, 

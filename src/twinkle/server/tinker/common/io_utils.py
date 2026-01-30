@@ -192,7 +192,7 @@ class TrainingRunManager(FileManager):
 
         runs = []
         for d in selected:
-            run = cls.get(d.name)
+            run = cls.get(d.name, token)
             if run:
                 runs.append(run)
 
