@@ -412,9 +412,19 @@ class MultiLora(Patch):
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    # breakpoint()
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.{_lora.tenant_adapter_name}.')
-                    src_tensor = state_dict[name]
+                    # Remove the internal adapter name from parameter name to match the saved state_dict key
+                    # Example: base_model.model.model.layers.0.self_attn.q_proj.lora_A.lora_0.weight
+                    # becomes: base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+                    state_dict_key = re.sub(rf'\.lora_([AB]|embedding_[AB])\.{re.escape(_lora.adapter_name)}\.', r'.lora_\1.', name)
+                    
+                    # Try to get the tensor from state_dict
+                    src_tensor = None
+                    if state_dict_key in state_dict:
+                        src_tensor = state_dict[state_dict_key]
+                    
+                    if src_tensor is None:
+                        continue
+                    
                     if 'embedding_A' in name:
                         r_saved = src_tensor.shape[1]
                         parameter.data[:, :r_saved].copy_(src_tensor)
@@ -453,7 +463,10 @@ class MultiLora(Patch):
                         _param = _param[:_lora.tenant_config.r, :]
                     elif '_B' in name:
                         _param = _param[:, :_lora.tenant_config.r]
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.{_lora.tenant_adapter_name}.')
+                    # Remove the adapter name from the key completely
+                    # Example: base_model.model.model.layers.0.self_attn.q_proj.lora_A.lora_0.weight
+                    # becomes: base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+                    name = re.sub(rf'\.lora_([AB]|embedding_[AB])\.{re.escape(_lora.adapter_name)}\.', r'.lora_\1.', name)
                     state_dict[name] = _param
             return state_dict
 
