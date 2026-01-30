@@ -779,6 +779,17 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
+    def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
+        if output_dir is None:
+            output_dir = 'output'
+        checkpoint_dir = os.path.join(output_dir, name)
+        bridge = self._bridge
+        for _model in self.model:
+            bridge.load_weights(_model, checkpoint_dir)
+
+        if dist.is_initialized():
+            dist.barrier()
+
     def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter = None):
         """Save in HuggingFace format using bridge adapter.
 

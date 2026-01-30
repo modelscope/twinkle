@@ -10,6 +10,9 @@ from .manager import TwinkleClient, TwinkleClientError
 if TYPE_CHECKING:
     from tinker import ServiceClient
 
+from .sampling_client import SamplingClient, create_sampling_client
+
+
 def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[str] = None, **kwargs) -> ServiceClient:
     requires('tinker')
     from tinker import ServiceClient

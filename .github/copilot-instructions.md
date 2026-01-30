@@ -45,7 +45,7 @@ These instructions help AI agents work productively in this repo. Focus on concr
     - `python cookbook/client/server.py`
     - Endpoints print on startup (default `localhost:8000`).
   - Model app binds `MultiLoraTransformersModel` and exposes routes like `/add_adapter_to_model`, `/forward`, `/calculate_loss`, etc. See [src/twinkle/server/twinkle/model.py](src/twinkle/server/twinkle/model.py).
-- **vLLM inference:** Use `VLLMSampler` with engine args; LoRA weight sync via `patch.vllm_lora_weights`. See [src/twinkle/sampler/vllm_sampler.py](src/twinkle/sampler/vllm_sampler.py).
+- **vLLM inference:** Use `VLLMEngine` with engine args; LoRA weight sync via `patch.vllm_lora_weights`. See [src/twinkle/sampler/vllm_engine.py](src/twinkle/sampler/vllm_engine.py).
 
 ## Conventions & Gotchas
 - **Safety:** Remote plugin code requires `trust_remote_code()` true; avoid loading arbitrary strings into adapter configs (enforced in Multi-LoRA).

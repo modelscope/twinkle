@@ -8,7 +8,7 @@ from peft import LoraConfig
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PretrainedConfig, AutoConfig
-
+import torch.distributed as dist
 from twinkle import DeviceMesh, remote_class, remote_function, template
 from twinkle import requires
 from twinkle import torch_util
@@ -177,18 +177,30 @@ class MultiLoraMegatronModel(MegatronModel):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
 
-        with self.multi_adapter.adapter(kwargs.get("adapter_name")) as real_adapter_name:
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")) as real_adapter_name:
             save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
             if save_format == 'hf':
-                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.lora_converter)
+                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
             else:
-                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.lora_converter)
+                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=kwargs.get("adapter_name"))
             import torch.distributed as dist
             # Final synchronization to ensure all ranks complete save
             if dist.is_initialized():
                 dist.barrier()
+
+    def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
+        if output_dir is None:
+            output_dir = 'output'
+        checkpoint_dir = os.path.join(output_dir, name)
+        bridge = self._bridge
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")) as adapter_name:
+            for _model in self.strategy.unwrap_model(self.model):
+                bridge.load_weights(_model, checkpoint_dir, True, adapter_name=adapter_name, lora_converter=self.multi_adapter.load_lora_converter)
+
+        if dist.is_initialized():
+            dist.barrier()
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):

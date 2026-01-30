@@ -1453,12 +1453,18 @@ class GPTBridge:
             hf_state_dict.update(origin_hf_state_dict)
         return hf_state_dict
 
-    def load_weights(self, mg_model, hf_model_dir: str, is_peft_format: bool = False, adapter_name: str = 'default'):
+    def load_weights(self, mg_model, hf_model_dir: str, is_peft_format: bool = False, adapter_name: str = 'default', lora_converter=None):
         self._is_peft_format = is_peft_format
         self._adapter_name = adapter_name
         hf_model_dir = HubOperation.download_model(hf_model_dir)
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, is_peft_format=is_peft_format) as loader:
             state_dict = loader.get_state_dict()
+            _state_dict = {}
+            for key, value in state_dict.items():
+                if lora_converter is not None:
+                    key, value = lora_converter(key, value)
+                _state_dict[key] = value
+            state_dict = _state_dict
             hf_prefix = 'base_model.model.' if is_peft_format else ''
             list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
 
@@ -1507,8 +1513,6 @@ class GPTBridge:
                         include_embedding='all-embedding' in args.target_modules,
                         exclude_router='all-router' not in args.target_modules)
                 else:
-                    assert not isinstance(peft_config.target_modules, str), (
-                        'target_regex is not currently supported for LoRA conversion. Please set `--merge_lora true`.')
                     peft_config.target_modules = self._peft_target_modules
                 peft_config.modules_to_save = self._peft_modules_to_save
                 peft_config.save_pretrained(output_dir)

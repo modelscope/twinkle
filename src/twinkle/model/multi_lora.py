@@ -68,11 +68,12 @@ class MultiLora(Patch):
     
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
-        adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        _lora = self.find_lora_by_tenant(tenant_adapter_name)
+        adapter_name = _lora.adapter_name
 
         def _before(_module):
             peft_config = _module.peft_config
-            config_dict = {tenant_adapter_name: _module.peft_config[adapter_name]}
+            config_dict = {tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config}
             _module.peft_config = config_dict
             _module._peft_config_origin = peft_config
             active_adapter = _module.active_adapter
@@ -88,7 +89,7 @@ class MultiLora(Patch):
                 _before(_module)
         else:
             _before(self.module)
-        yield
+        yield adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
                 _after(_module)
@@ -404,8 +405,41 @@ class MultiLora(Patch):
                     _store_weights(_module)
             else:
                 _store_weights(self.module)
+
+    def load_lora_converter(self, name, parameter):
+
+        def convert_param(name, parameter):
+            if 'embedding_A' in name:
+                r_saved = parameter.shape[1]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(parameter.shape[0], self.max_r-r_saved).to(parameter.dtype)), dim=1)
+            elif 'embedding_B' in name:
+                r_saved = parameter.shape[0]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(self.max_r - r_saved, parameter.shape[1]).to(parameter.dtype)), dim=0)
+            elif '_A' in name:
+                r_saved = parameter.shape[0]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(self.max_r - r_saved, parameter.shape[1]).to(parameter.dtype)), dim=0)
+            elif '_B' in name:
+                r_saved = parameter.shape[1]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(parameter.shape[0], self.max_r - r_saved).to(parameter.dtype)), dim=1)
+            return name, parameter
+
+        if isinstance(parameter, torch.Tensor):
+            return convert_param(name, parameter)
+        elif 'lazytensor' in parameter.__class__.__name__.lower():
+            
+            def _loader(self):
+                tensor = self.loader_origin()
+                return convert_param(name, tensor)[1]
+            
+            parameter.loader_origin = parameter.loader
+            parameter.loader = MethodType(_loader, parameter)
+            return name, parameter
     
-    def lora_converter(self, name, parameter, adapter_name):
+    def save_lora_converter(self, name, parameter, adapter_name):
         _lora = self.find_lora(adapter_name)
         pattern = re.compile(rf'\.lora_\w+\.{adapter_name}\.')
         pattern_no_adapter = re.compile(rf'\.lora_\w+\.weight')
