@@ -341,7 +341,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             if isinstance(arg, list):
                 _args = []
                 for i in range(n):
-                    _args.append(arg[device_mesh.get_slice(len(arg), i)])
+                    _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
                 return _args
             else:
                 return [arg] * n
@@ -446,8 +446,13 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name:
-                    # If it's a remote component, device_mesh is required
-                    assert device_mesh is not None
+                    if remote_group:
+                        if device_mesh is None:
+                            if _device_mesh is not None:
+                                device_mesh = _device_mesh
+                                kwargs[device_mesh_name] = device_mesh
+                            else:
+                                raise ValueError('Set device_mesh=DeviceMesh(...) to enable ray.')
 
                     if execute == 'first':
                         # Manually create a device_mesh because there is only one worker

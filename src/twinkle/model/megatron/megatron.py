@@ -381,7 +381,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
-        self._accumulate_metric(optimizer_config, is_training=True)
+        self._accumulate_metric(optimizer_config, is_training=not forward_only)
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
