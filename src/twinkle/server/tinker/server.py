@@ -39,6 +39,8 @@ def build_server_app(
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
             ]
+            # sampling engine instance
+            self.sampler = kwargs.get("sampler", None)
 
         async def _proxy(self, request: Request, target_path: str) -> Response:
             # Construct target URL on the same host
@@ -114,7 +116,39 @@ def build_server_app(
         @app.post("/asample")
         async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
             async def _do_sample():
-                return self._sample_output()
+                sampler = self.sampler
+                if sampler is None:
+                    return self._sample_output()
+                
+                # Extract prompt token IDs from ModelInput
+                prompt_token_ids = body.prompt.to_ints()
+                
+                # Determine adapter URI from model_path
+                adapter_uri = body.model_path if body.model_path else None
+                
+                response = await sampler.engine.sample(
+                    prompt_token_ids=prompt_token_ids,
+                    sampling_params=body.sampling_params,
+                    num_samples=body.num_samples,
+                    logprobs=True,
+                    include_prompt_logprobs=body.prompt_logprobs or False,
+                    topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
+                    adapter_uri=adapter_uri,
+                )
+                # Convert twinkle SampleResponse to tinker types.SampleResponse
+                tinker_sequences = [
+                    types.SampledSequence(
+                        stop_reason=seq.stop_reason,
+                        tokens=list(seq.tokens),
+                        logprobs=list(seq.logprobs) if seq.logprobs else None,
+                    )
+                    for seq in response.sequences
+                ]
+                return types.SampleResponse(
+                    sequences=tinker_sequences,
+                    prompt_logprobs=response.prompt_logprobs,
+                    topk_prompt_logprobs=response.topk_prompt_logprobs,
+                )
 
             return await schedule_task(self.state, _do_sample())
 
@@ -123,12 +157,20 @@ def build_server_app(
             self, request: Request, body: types.SaveWeightsForSamplerRequest
         ) -> types.UntypedAPIFuture:
             suffix = body.path or f"sampler-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            path = f"tinker://{body.model_id}/{suffix}"
             sampling_session_id = None
             if body.sampling_session_seq_id is not None:
                 sampling_session_id = f"sampling_{body.sampling_session_seq_id}"
 
             async def _do_save():
+                sampler = self.sampler
+                if sampler is None or not sampler.engine.enable_lora:
+                    path = f"twinkle://{body.model_id}/{suffix}"
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=path, sampling_session_id=sampling_session_id
+                    )
+                
+                user_id = body.model_id
+                path = sampler.engine.adapter_manager.get_uri(user_id) if sampler.engine.adapter_manager else f"twinkle://{body.model_id}/{suffix}"
                 return types.SaveWeightsForSamplerResponseInternal(
                     path=path, sampling_session_id=sampling_session_id
                 )

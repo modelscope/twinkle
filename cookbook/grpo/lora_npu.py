@@ -9,7 +9,9 @@ from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
+from twinkle.sampler.types import SamplingParams
 from twinkle.weight_loader import NativeLoader
+from twinkle.rl import compute_advantages
 
 # Environment variable setup
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')
@@ -118,22 +120,13 @@ def get_eos_token_ids():
         return []
 
 
-def apply_generation_config(batch_list, eos_token_ids):
-    default_gen_config = {
-        'max_tokens': 128,
-        'temperature': 0.2,
-        'top_p': 0.95,
-        'stop': ['\n', '<|im_end|>'],
-        'min_tokens': 8,
-        'ignore_eos': True,
-    }
-
-    if eos_token_ids:
-        default_gen_config['logit_bias'] = {int(tid): -100.0 for tid in eos_token_ids}
-
-    for record in batch_list:
-        if isinstance(record, dict):
-            record.setdefault('generation_config', {}).update(default_gen_config)
+def get_sampling_params(eos_token_ids) -> SamplingParams:
+    """Create SamplingParams for generation."""
+    return SamplingParams(
+        max_tokens=128,
+        temperature=1,
+        top_p=0.95,
+    )
 
 
 def debug_print_rollout(step, trajectories, ground_truths, rewards=None):
@@ -203,7 +196,7 @@ class ActorGroup:
                 raise ValueError("engine_args is required for VLLMSampler.")
             self.sampler = VLLMSampler(
                 model_path,
-                engine_args,
+                engine_args=engine_args,
                 device_mesh=actor_device_mesh,
             )
         self.sampler.add_adapter_to_sampler(adapter_name, lora_config)
@@ -219,11 +212,9 @@ class ActorGroup:
         
         self.model.set_loss(
             'GRPOLoss',
-            loss_type='grpo',
             epsilon=0.2,
             beta=kl_beta,
             num_generations=num_generations,
-            scale_rewards='group',
         )
         
         self.model.set_optimizer('AdamW', lr=1e-6)
@@ -236,8 +227,8 @@ class ActorGroup:
         self.lora_config = lora_config
     
     @remote_function(collect='flatten')
-    def sample(self, batch):
-        return self.sampler.sample(batch, adapter_name=self.adapter_name)
+    def sample(self, batch, sampling_params: SamplingParams = None):
+        return self.sampler.sample(batch, sampling_params=sampling_params, adapter_name=self.adapter_name)
     
     @remote_function()
     def forward(self, inputs, **kwargs):
@@ -350,9 +341,9 @@ def train():
             batch_list = list(batch)
         ground_truths = batch_list.copy()
         
-        apply_generation_config(batch_list, eos_token_ids)
+        sampling_params = get_sampling_params(eos_token_ids)
         
-        trajectories = actor_group.sample(batch_list)
+        trajectories = actor_group.sample(batch_list, sampling_params)
         if callable(trajectories):
             trajectories = trajectories()
 
@@ -370,8 +361,10 @@ def train():
         if callable(rewards):
             rewards = rewards()
 
-        for trajectory, reward_value in zip(trajectories, rewards):
-            trajectory['rewards'] = reward_value
+        # Updated: compute advantages from rewards and store in trajectory
+        advantages = compute_advantages(rewards, num_generations=num_generations)
+        for trajectory, advantage in zip(trajectories, advantages.tolist()):
+            trajectory['advantages'] = advantage
 
         # Debug: print reward statistics (enable via TWINKLE_DEBUG=1)
         debug_print_rollout(step, trajectories, ground_truths, rewards=rewards)
