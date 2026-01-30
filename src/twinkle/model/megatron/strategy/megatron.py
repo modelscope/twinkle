@@ -223,7 +223,7 @@ class MegatronStrategy:
             'labels': batch_labels,
         }
 
-    def gather_loss_for_cp(self, output_tensor, labels):
+    def gather_loss_for_cp(self, local_loss_sum, local_count, logits):
         import torch
         from megatron.core import parallel_state as mpu
         cp_size = mpu.get_context_parallel_world_size()

@@ -23,7 +23,7 @@ from twinkle import requires
 from twinkle import torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss
+from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
 from twinkle.metric import Metric, LossMetric, Accuracy, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
@@ -186,6 +186,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
+            loss_instance=VocabParallelCrossEntropyLoss(),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh),
             _device_mesh=self.device_mesh,
@@ -259,23 +260,24 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
 
-        vpp_size = self.device_mesh.vpp_size
-        if vpp_size is None or vpp_size == 1:
-            micro_batch_size = None
-        else:
-            micro_batch_size = 1
-
-        if isinstance(inputs, dict) and self._not_encoded(inputs):
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+            # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
-            inputs = optimizer_config.template.encode(inputs)  # noqa
-        if isinstance(inputs, list) and self._not_encoded(inputs[0]):
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
+            if isinstance(inputs, dict):
+                inputs = [inputs]
+            inputs = optimizer_config.template.batch_encode(inputs) # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
+
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size is None or vpp_size == 1:
+            inputs = [processor(inputs)]
+            micro_batch_size = inputs[0]['input_ids'].shape[0]
+        else:
+            if micro_batch_size is None:
+                micro_batch_size = 1
+            inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -284,9 +286,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if self.variable_seq_lengths:
             seq_length = None
         else:
-            _example = inputs[0] if isinstance(inputs, list) else inputs
-            original_seq_length = _example['input_ids'].shape[1] if 'input_ids' in _example else _example[
-                'input_embedding'].shape[1]
+            original_seq_length = inputs[0]['input_ids'].shape[1]
             if cp_size > 1:
                 divisor = 2 * cp_size
             elif self.strategy.sequence_parallel and self.device_mesh.tp_world_size > 1:
@@ -300,10 +300,9 @@ class MegatronModel(TwinkleModel, nn.Module):
                 seq_length = original_seq_length
 
         def post_loss_function(output_tensor, inputs):
-            if loss_instance is not None:
-                # TODO
-                loss = loss_instance(inputs, output_tensor)
-            return self.strategy.gather_loss_for_cp(output_tensor, inputs['labels'])
+            outputs['logits'] = output_tensor
+            losses = loss_instance(inputs, outputs)
+            return self.strategy.gather_loss_for_cp(losses, inputs['labels'])
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -316,6 +315,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             batch_labels = batch.get('labels')
 
             extra_kwargs = self.get_extra_vlm_kwargs(batch)
+
             # Forward pass with labels - Megatron will compute loss internally
             # This uses Megatron's compute_language_model_loss which properly handles
             # vocab parallel cross entropy
@@ -323,7 +323,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                labels=batch_labels,  # Pass labels to let Megatron compute loss
+                # labels=batch_labels,  # Pass labels to let Megatron compute loss
                 **extra_kwargs,
             )
             return output_tensor, partial(post_loss_function, inputs=batch)
@@ -336,11 +336,11 @@ class MegatronModel(TwinkleModel, nn.Module):
         vpp_size = self.device_mesh.vpp_size
 
         if vpp_size is None or vpp_size == 1:
-            data_iter = [iter(inputs)]
+            data_iter = iter(inputs)
         else:
             data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
-        self._accumulate_metric(optimizer_config, is_training=False)
+        self._accumulate_metric(optimizer_config, is_training=True)
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
@@ -348,35 +348,56 @@ class MegatronModel(TwinkleModel, nn.Module):
             forward_step_func=forward_step_func,
             data_iterator=data_iter,
             model=self.model,
-            num_microbatches=len(inputs) if isinstance(inputs, list) else 1,
+            num_microbatches=len(inputs),
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             forward_only=True,
         )
 
         # Extract loss from results (only last PP stage returns non-empty)
-        logits = None
-
+        loss = torch.tensor(0.0).to(Platform.get_local_device())
+        count = 0
         if losses:
             for loss_dict in losses:
-                if isinstance(loss_dict, torch.Tensor):
-                    logits = loss_dict
-                    break
+                if isinstance(loss_dict, dict) and 'loss' in loss_dict:
+                    loss += loss_dict['loss']
+                    count += 1
+                elif isinstance(loss_dict, torch.Tensor):
+                    loss += loss_dict
+                    count += 1
+        
+        if count > 0:
+            loss /= count
 
-        # Critical: Synchronize all DP replicas before returning
-        # This ensures all DP replicas complete the same training step before
-        # moving to the next batch, preventing P2P communication deadlocks
+        # For PP > 1, broadcast loss from last PP stage to all ranks
+        # Note: mpu is imported at module level, no need to reimport
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            loss_tensor = loss.detach().clone()
+            # Broadcast from last PP stage (rank with pipeline_model_parallel_rank == pp_size - 1)
+            src_rank = mpu.get_pipeline_model_parallel_last_rank()
+            pp_group = mpu.get_pipeline_model_parallel_group()
+
+            torch.distributed.broadcast(loss_tensor,
+                                        src=src_rank,
+                                        group=pp_group)
+
+            loss = loss_tensor.item()
+
         dp_world_size = mpu.get_data_parallel_world_size()
         if dp_world_size > 1:
-            # Use barrier on DP+CP group to synchronize all replicas
+            if isinstance(loss, (int, float)):
+                loss = torch.tensor(loss, device=Platform.get_local_device())
+            # Average loss across DP group (with CP if enabled)
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-            dist.barrier(group=dp_cp_group)
+            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         optimizer_config.inputs = inputs
         optimizer_config.outputs = {
-            'loss': loss
+            'loss': loss,
         }
-        return logits
+        if isinstance(loss, torch.Tensor):
+            return loss.detach().cpu().float().numpy()
+        return float(loss)
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -464,10 +485,10 @@ class MegatronModel(TwinkleModel, nn.Module):
                 seq_length = original_seq_length
 
         def post_loss_function(output_tensor, inputs):
-            if loss_instance is not None:
-                # TODO
-                loss = loss_instance(inputs, output_tensor)
-            return self.strategy.gather_loss_for_cp(output_tensor, inputs['labels'])
+            outputs = {}
+            outputs['logits'] = output_tensor
+            losses = loss_instance(inputs, outputs)
+            return self.strategy.gather_loss_for_cp(losses, inputs['labels'])
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -488,7 +509,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                labels=batch_labels,  # Pass labels to let Megatron compute loss
+                # labels=batch_labels,  # Pass labels to let Megatron compute loss
                 **extra_kwargs,
             )
             return output_tensor, partial(post_loss_function, inputs=batch)
@@ -503,9 +524,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if vpp_size is None or vpp_size == 1:
             data_iter = iter(inputs)
         else:
-            data_iter = [inputs] * vpp_size
-            data_iter = [iter(b) for b in data_iter]
-            # data_iter = [iter(inputs) for _ in range(0, vpp_size)]
+            data_iter = [iter(inputs) for _ in range(0, vpp_size)]
 
         self._accumulate_metric(optimizer_config, is_training=True)
 
