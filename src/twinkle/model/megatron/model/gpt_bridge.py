@@ -1513,8 +1513,6 @@ class GPTBridge:
                         include_embedding='all-embedding' in args.target_modules,
                         exclude_router='all-router' not in args.target_modules)
                 else:
-                    assert not isinstance(peft_config.target_modules, str), (
-                        'target_regex is not currently supported for LoRA conversion. Please set `--merge_lora true`.')
                     peft_config.target_modules = self._peft_target_modules
                 peft_config.modules_to_save = self._peft_modules_to_save
                 peft_config.save_pretrained(output_dir)

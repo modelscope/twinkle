@@ -68,11 +68,12 @@ class MultiLora(Patch):
     
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
-        adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        _lora = self.find_lora_by_tenant(tenant_adapter_name)
+        adapter_name = _lora.adapter_name
 
         def _before(_module):
             peft_config = _module.peft_config
-            config_dict = {tenant_adapter_name: _module.peft_config[adapter_name]}
+            config_dict = {tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config}
             _module.peft_config = config_dict
             _module._peft_config_origin = peft_config
             active_adapter = _module.active_adapter
@@ -88,7 +89,7 @@ class MultiLora(Patch):
                 _before(_module)
         else:
             _before(self.module)
-        yield
+        yield adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
                 _after(_module)
