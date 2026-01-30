@@ -21,13 +21,13 @@ from ray import serve
 from .common.state import get_server_state, ServerStateProxy
 from .common.validation import verify_request_token, get_token_from_request
 from .common.io_utils import (
-    TrainingRunManager,
-    CheckpointManager,
     TrainingRun,
     TrainingRunsResponse,
     CheckpointsListResponse,
     WeightsInfoResponse,
     validate_user_path,
+    create_training_run_manager,
+    create_checkpoint_manager,
 )
 
 
@@ -116,36 +116,29 @@ def build_server_app(
 
         # ----- Training Runs Endpoints -----
 
+
         @app.get("/training_runs", response_model=TrainingRunsResponse)
         async def get_training_runs(
             self,
             request: Request,
             limit: int = 20,
-            offset: int = 0,
-            all_users: bool = False
+            offset: int = 0
         ) -> TrainingRunsResponse:
             """
             List training runs.
             
-            By default, only returns training runs owned by the current user.
-            Set all_users=True to see all runs (if permission allows).
+            Returns training runs owned by the current user.
             
             Args:
                 limit: Maximum number of results (default: 20)
                 offset: Offset for pagination (default: 0)
-                all_users: If True, return all runs regardless of owner
                 
             Returns:
                 TrainingRunsResponse with list of training runs and pagination info
             """
             token = self._get_user_token(request)
-            # Only filter by token if not requesting all users
-            filter_token = None if all_users else token
-            return TrainingRunManager.list_runs(
-                limit=limit,
-                offset=offset,
-                token=filter_token
-            )
+            training_run_manager = create_training_run_manager(token)
+            return training_run_manager.list_runs(limit=limit, offset=offset)
 
         @app.get("/training_runs/{run_id}", response_model=TrainingRun)
         async def get_training_run(
@@ -168,7 +161,8 @@ def build_server_app(
                 HTTPException 404 if run not found or not owned by user
             """
             token = self._get_user_token(request)
-            run = TrainingRunManager.get_with_permission(run_id, token)
+            training_run_manager = create_training_run_manager(token)
+            run = training_run_manager.get_with_permission(run_id)
             if not run:
                 raise HTTPException(
                     status_code=404,
@@ -197,7 +191,8 @@ def build_server_app(
                 HTTPException 404 if run not found or not owned by user
             """
             token = self._get_user_token(request)
-            response = CheckpointManager.list_checkpoints(run_id, token=token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            response = checkpoint_manager.list_checkpoints(run_id)
             if response is None:
                 raise HTTPException(
                     status_code=404,
@@ -239,7 +234,8 @@ def build_server_app(
                     detail="Invalid checkpoint path: path traversal not allowed"
                 )
             
-            success = CheckpointManager.delete(run_id, checkpoint_id, token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            success = checkpoint_manager.delete(run_id, checkpoint_id)
             if not success:
                 raise HTTPException(
                     status_code=404,
@@ -272,7 +268,8 @@ def build_server_app(
                 HTTPException 404 if weights not found or not owned by user
             """
             token = self._get_user_token(request)
-            response = CheckpointManager.get_weights_info(body.twinkle_path, token=token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            response = checkpoint_manager.get_weights_info(body.twinkle_path)
             if response is None:
                 raise HTTPException(
                     status_code=404,
@@ -314,8 +311,11 @@ def build_server_app(
                     detail="Invalid checkpoint path: path traversal not allowed"
                 )
             
+            training_run_manager = create_training_run_manager(token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            
             # Check ownership
-            run = TrainingRunManager.get(run_id, token)
+            run = training_run_manager.get(run_id)
             if not run:
                 raise HTTPException(
                     status_code=404,
@@ -323,7 +323,7 @@ def build_server_app(
                 )
             
             # Get checkpoint with token-based path
-            checkpoint = CheckpointManager.get(run_id, checkpoint_id, token)
+            checkpoint = checkpoint_manager.get(run_id, checkpoint_id)
             if not checkpoint:
                 raise HTTPException(
                     status_code=404,
@@ -331,7 +331,7 @@ def build_server_app(
                 )
             
             # Return the filesystem path
-            ckpt_dir = CheckpointManager.get_ckpt_dir(run_id, checkpoint_id, token)
+            ckpt_dir = checkpoint_manager.get_ckpt_dir(run_id, checkpoint_id)
             return {
                 "path": str(ckpt_dir),
                 "twinkle_path": checkpoint.twinkle_path

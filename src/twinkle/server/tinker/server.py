@@ -13,7 +13,7 @@ from tinker import types
 
 from twinkle.server.twinkle.common.validation import verify_request_token, get_token_from_request
 from twinkle.server.twinkle.common.state import get_server_state, schedule_task
-from .common.io_utils import TrainingRunManager, CheckpointManager
+from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 
 def build_server_app(
@@ -182,7 +182,8 @@ def build_server_app(
                 TrainingRunsResponse with user's training runs
             """
             token = get_token_from_request(request)
-            return TrainingRunManager.list_runs(limit=limit, offset=offset, token=token)
+            training_run_manager = create_training_run_manager(token)
+            return training_run_manager.list_runs(limit=limit, offset=offset)
 
         @app.get("/training_runs/{run_id}")
         async def get_training_run(self, request: Request, run_id: str) -> types.TrainingRun:
@@ -202,7 +203,8 @@ def build_server_app(
                 HTTPException 404 if run not found in user's token directory
             """
             token = get_token_from_request(request)
-            run = TrainingRunManager.get(run_id, token)
+            training_run_manager = create_training_run_manager(token)
+            run = training_run_manager.get(run_id)
             if not run:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -226,7 +228,8 @@ def build_server_app(
                 HTTPException 404 if run not found in user's token directory
             """
             token = get_token_from_request(request)
-            response = CheckpointManager.list_checkpoints(run_id, token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            response = checkpoint_manager.list_checkpoints(run_id)
             if not response:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -251,7 +254,8 @@ def build_server_app(
                 HTTPException 404 if checkpoint not found in user's token directory
             """
             token = get_token_from_request(request)
-            success = CheckpointManager.delete(run_id, checkpoint_id, token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            success = checkpoint_manager.delete(run_id, checkpoint_id)
             if not success:
                 raise HTTPException(
                     status_code=404,
@@ -277,8 +281,9 @@ def build_server_app(
                 HTTPException 404 if weights not found in user's token directory
             """
             token = get_token_from_request(request)
+            checkpoint_manager = create_checkpoint_manager(token)
             tinker_path = body.get("tinker_path")
-            response = CheckpointManager.get_weights_info(tinker_path, token)
+            response = checkpoint_manager.get_weights_info(tinker_path)
             if not response:
                 raise HTTPException(
                     status_code=404, detail=f"Weights at {tinker_path} not found")

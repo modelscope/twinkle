@@ -17,7 +17,7 @@ from twinkle.server.twinkle.common.state import get_server_state, ServerStatePro
 from twinkle.utils.logger import get_logger
 
 from .common import TwinkleCompatTransformersModel
-from .common.io_utils import (TrainingRunManager, CheckpointManager)
+from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
 
@@ -132,7 +132,8 @@ def build_model_app(model_id: str,
                     self.model.set_optimizer('AdamW',
                                              adapter_name=adapter_name)
 
-                TrainingRunManager.save(model_id, body, request.state.token)
+                training_run_manager = create_training_run_manager(request.state.token)
+                training_run_manager.save(model_id, body)
 
                 return types.CreateModelResponse(model_id=model_id)
 
@@ -144,13 +145,16 @@ def build_model_app(model_id: str,
         async def get_info(
                 self, request: Request,
                 body: types.GetInfoRequest) -> types.GetInfoResponse:
-            metadata = TrainingRunManager.get(str(body.model_id))
+            # Note: get_info doesn't require token for reading metadata in tinker
+            # Using a default token or None since this is read-only
+            training_run_manager = create_training_run_manager(request.state.token)
+            metadata = training_run_manager.get(str(body.model_id))
             model_name = metadata.base_model if metadata else model_id
             lora_rank = None
             is_lora = False
-            if metadata and metadata.get('lora_config'):
-                lora_rank = metadata['lora_config'].get('rank')
-                is_lora = True
+            if metadata and hasattr(metadata, 'lora_rank') and metadata.lora_rank:
+                lora_rank = metadata.lora_rank
+                is_lora = metadata.is_lora
             return types.GetInfoResponse(
                 model_data=types.ModelData(model_name=model_name),
                 model_id=body.model_id,
@@ -290,13 +294,12 @@ def build_model_app(model_id: str,
                     
                     # Extract token from request for user isolation
                     token = request.state.token
+                    checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
-                    checkpoint_name = CheckpointManager.get_ckpt_name(
-                        body.path)
-                    save_dir = CheckpointManager.get_save_dir(
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
+                    save_dir = checkpoint_manager.get_save_dir(
                         model_id=body.model_id,
-                        token=token,
                         is_sampler=False
                     )
 
@@ -305,8 +308,8 @@ def build_model_app(model_id: str,
                                     adapter_name=adapter_name,
                                     save_optimizer=True)
 
-                    tinker_path = CheckpointManager.save(
-                        body.model_id, name=checkpoint_name, token=token, is_sampler=False)
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=False)
 
                     return types.SaveWeightsResponse(path=tinker_path,
                                                      type='save_weights')

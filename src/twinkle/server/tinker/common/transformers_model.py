@@ -4,7 +4,7 @@ from typing import List
 from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature
-from .io_utils import CheckpointManager
+from .io_utils import create_checkpoint_manager
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
@@ -92,19 +92,23 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
             checkpoint_dir: The twinkle:// path to the checkpoint
             **kwargs: Additional keyword arguments including optional 'token'
         """
+        # Extract token from kwargs if provided (for user isolation)
+        token = kwargs.pop('token', None)
+        if not token:
+            raise ValueError("Token is required for loading checkpoints")
+        
+        # Create checkpoint manager with the token
+        checkpoint_manager = create_checkpoint_manager(token)
+        
         # handle twinkle checkpoint format
-        tinker_path = CheckpointManager.parse_tinker_path(checkpoint_dir)
+        tinker_path = checkpoint_manager.parse_tinker_path(checkpoint_dir)
         if not tinker_path:
             raise ValueError(f"Invalid twinkle checkpoint path: {checkpoint_dir}")
         
-        # Extract token from kwargs if provided (for user isolation)
-        token = kwargs.get('token', None)
-        
         # check adapter files with token-based path
-        weight_path = CheckpointManager.get_ckpt_dir(
+        weight_path = checkpoint_manager.get_ckpt_dir(
             tinker_path.training_run_id, 
-            tinker_path.checkpoint_id,
-            token
+            tinker_path.checkpoint_id
         )
         if not weight_path or not weight_path.exists():
             raise ValueError(f"Checkpoint not found at {weight_path}")

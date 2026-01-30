@@ -17,7 +17,12 @@ from twinkle.data_format import InputFeature, Trajectory
 from .common.validation import verify_request_token
 from .common.state import get_server_state, ServerStateProxy
 from .common.serialize import deserialize_object
-from .common.io_utils import TrainingRunManager, CheckpointManager, CreateModelRequest
+from .common.io_utils import (
+    CreateModelRequest,
+    LoraConfig as IoLoraConfig,
+    create_training_run_manager,
+    create_checkpoint_manager,
+)
 
 # 请求体模型定义
 class CreateRequest(BaseModel):
@@ -343,12 +348,12 @@ def build_model_app(model_id: str,
             
             # Extract token for directory isolation
             token = request.state.token
+            checkpoint_manager = create_checkpoint_manager(token)
             
             # Get checkpoint name and save directory with token-based path
-            checkpoint_name = CheckpointManager.get_ckpt_name(body.name)
-            save_dir = CheckpointManager.get_save_dir(
+            checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
+            save_dir = checkpoint_manager.get_save_dir(
                 model_id=adapter_name,
-                token=token,
                 is_sampler=False
             )
             
@@ -362,10 +367,9 @@ def build_model_app(model_id: str,
             )
             
             # Save checkpoint metadata
-            twinkle_path = CheckpointManager.save(
+            twinkle_path = checkpoint_manager.save(
                 adapter_name,
                 name=checkpoint_name,
-                token=token,
                 is_sampler=False
             )
             
@@ -393,13 +397,14 @@ def build_model_app(model_id: str,
             
             # Extract token for directory isolation
             token = request.state.token
+            checkpoint_manager = create_checkpoint_manager(token)
             
             # Construct the checkpoint path and validate access
             if body.name:
                 # Check if body.name is a twinkle:// path or a simple checkpoint name
                 if body.name.startswith("twinkle://"):
                     # Parse twinkle:// path
-                    parsed = CheckpointManager.parse_twinkle_path(body.name)
+                    parsed = checkpoint_manager.parse_twinkle_path(body.name)
                     if not parsed:
                         raise ValueError(f"Invalid twinkle path format: {body.name}")
                     
@@ -417,16 +422,15 @@ def build_model_app(model_id: str,
                     model_id_to_load = adapter_name
                 
                 # Verify checkpoint exists and user has access
-                checkpoint = CheckpointManager.get(model_id_to_load, checkpoint_id, token)
+                checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
                 if not checkpoint:
                     raise ValueError(
                         f"Checkpoint not found or access denied: {body.name}"
                     )
                 
                 # Get the actual directory path
-                output_dir = CheckpointManager.get_save_dir(
+                output_dir = checkpoint_manager.get_save_dir(
                     model_id=model_id_to_load,
-                    token=token,
                     is_sampler=False
                 )
                 
@@ -472,6 +476,7 @@ def build_model_app(model_id: str,
             
             # Extract token for metadata storage
             token = request.state.token
+            training_run_manager = create_training_run_manager(token)
             
             with self.adapter_lock:
                 self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
@@ -484,7 +489,6 @@ def build_model_app(model_id: str,
             # Create a training run config from the adapter configuration
             lora_config = None
             if isinstance(config, LoraConfig):
-                from .common.io_utils import LoraConfig as IoLoraConfig
                 lora_config = IoLoraConfig(
                     rank=config.r,
                     train_unembed=False,  # Default values
@@ -499,7 +503,7 @@ def build_model_app(model_id: str,
             )
             
             # Save training run metadata with token-based isolation
-            TrainingRunManager.save(adapter_name, run_config, token)
+            training_run_manager.save(adapter_name, run_config)
             
             return {'status': 'ok', 'adapter_name': adapter_name}
 
