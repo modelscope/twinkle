@@ -12,6 +12,7 @@ from .listwise_reranker import ListwiseRerankerLoss
 from .listwise_generative_reranker import ListwiseGenerativeRerankerLoss
 from .grpo import GRPOLoss, GSPOLoss, SAPOLoss, CISPOLoss, BNPOLoss, DRGRPOLoss
 from .base import Loss
+from .vocab_parallel_cross_entropy import VocabParallelCrossEntropyLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -25,6 +26,7 @@ torch_loss_mapping = {
     'reranker': RerankerLoss,
     'listwise_reranker': ListwiseRerankerLoss,
     'listwise_generative_reranker': ListwiseGenerativeRerankerLoss,
+    'vocab_parallel_cross_entropy': VocabParallelCrossEntropyLoss,
     # RL losses
     'grpo': GRPOLoss,
     'gspo': GSPOLoss,

@@ -41,6 +41,7 @@ class AccelerateStrategy:
 
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):
+        # TODO should test with transformers v5.0
         from accelerate import ParallelismConfig
         if device_mesh is None:
             return None

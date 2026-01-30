@@ -121,16 +121,16 @@ class Dataset(TorchDataset):
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
         if isinstance(dataset_meta.data_slice, Iterable) and hasattr(dataset, '__len__'):
+            
+            iter_list = []
+            _data_len = len(dataset)
+            for idx in dataset_meta.data_slice:
+                if idx >= _data_len:
+                    # Prevent out of range, repeat sampling
+                    idx = idx % _data_len
+                iter_list.append(idx)
 
-            def _iter():
-                # Prevent out of range, repeat sampling
-                _data_len = len(dataset)
-                for idx in dataset_meta.data_slice:
-                    if idx >= _data_len:
-                        idx = idx % _data_len
-                    yield idx
-
-            dataset = dataset.select(_iter())
+            dataset = dataset.select(iter_list)
         return dataset
 
     @remote_function()

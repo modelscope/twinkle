@@ -3,7 +3,7 @@
 
 import math
 from copy import copy
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Callable
 
 import megatron.core
 import torch
@@ -1453,12 +1453,18 @@ class GPTBridge:
             hf_state_dict.update(origin_hf_state_dict)
         return hf_state_dict
 
-    def load_weights(self, mg_model, hf_model_dir: str, is_peft_format: bool = False, adapter_name: str = 'default'):
+    def load_weights(self, mg_model, hf_model_dir: str, is_peft_format: bool = False, adapter_name: str = 'default', lora_converter=None):
         self._is_peft_format = is_peft_format
         self._adapter_name = adapter_name
         hf_model_dir = HubOperation.download_model(hf_model_dir)
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, is_peft_format=is_peft_format) as loader:
             state_dict = loader.get_state_dict()
+            _state_dict = {}
+            for key, value in state_dict.items():
+                if lora_converter is not None:
+                    key, value = lora_converter(key, value)
+                _state_dict[key] = value
+            state_dict = _state_dict
             hf_prefix = 'base_model.model.' if is_peft_format else ''
             list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
 
@@ -1479,7 +1485,7 @@ class GPTBridge:
         with torch.no_grad():
             yield from self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc)
 
-    def save_weights(self, mg_models, output_dir: str, is_peft_format: bool = False, adapter_name: str = 'default') -> None:
+    def save_weights(self, mg_models, output_dir: str, is_peft_format: bool = False, adapter_name: str = 'default', lora_converter: Callable = None) -> None:
         """Save the mg_model checkpoint in HF format"""
         torch.cuda.empty_cache()
         saver = StreamingSafetensorSaver(
@@ -1487,7 +1493,10 @@ class GPTBridge:
         for k, v in self.export_weights(
                 mg_models, target_device='cpu', only_last_rank=True, is_peft_format=is_peft_format,
                 adapter_name=adapter_name, tqdm_desc='Saving: '):
-            saver.add_tensor(k, v)
+            if lora_converter is not None:
+                k, v = lora_converter(k, v, adapter_name)
+            if k is not None and v is not None:
+                saver.add_tensor(k, v)
         saver.finalize()
         args = self.args
         if is_last_rank():

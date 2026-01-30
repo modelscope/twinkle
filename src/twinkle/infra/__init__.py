@@ -79,8 +79,9 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                     name='default',
                     ranks=list(range(Platform.get_world_size())),
                     device_type=Platform.get_platform().device_prefix(),
-                )
-            ]
+                )]
+            
+        assert Platform.get_world_size() == _device_mesh.world_size
     else:
         requires('ray')
         from ._ray import RayHelper

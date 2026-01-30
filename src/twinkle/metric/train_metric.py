@@ -17,12 +17,9 @@ class TrainMetric(Metric):
         self.lr = ''
         self.step = 0
         self.last_step = 0
-        self.time = None
+        self.time = time.time()
 
     def accumulate(self, inputs, outputs):
-        if self.time is None:
-            self.time = time.time()
-            self.last_step = self.step
         lr = outputs.get('lr')
         if isinstance(lr, list):
             lr = [f'{x:.2e}' for x in lr]
@@ -33,9 +30,8 @@ class TrainMetric(Metric):
         self.step = outputs.get('step')
 
     def reset(self):
-        self.time = None
-        self.step = 0
-        self.last_step = 0
+        self.time = time.time()
+        self.last_step = self.step
 
     def calculate(self):
         results = {}
