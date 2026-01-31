@@ -172,9 +172,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            assert len(self.optimizer_group) == 1
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
-            assert optimizer_groups == 1
+            assert len(optimizer_groups) == 1
             optimizer_group = optimizer_groups[0]
             optimizer = optimizer_group.optimizer
             assert optimizer 
