@@ -254,7 +254,7 @@ class Template:
                 encoded = self._apply_chat_template(trajectory, add_generation_prompt=True)
                 input_ids = encoded.pop('input_ids')
                 if hasattr(input_ids, 'squeeze'):
-                    input_ids = input_ids.squeeze(0)  # Remove batch dim
+                    input_ids = input_ids.squeeze(0)
                 labels = np.full_like(input_ids, -100)  # No labels for inference
             elif self._template_support_assistant_tokens_mask:
                 encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=True)
