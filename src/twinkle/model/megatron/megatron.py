@@ -312,6 +312,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if micro_batch_size is None:
             assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
             micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
+        processor.use_megatron = True
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting

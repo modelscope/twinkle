@@ -35,7 +35,7 @@ class MegatronModelMeta:
             self.bridge_cls = MultimodalGPTBridge if self.is_multimodal else GPTBridge
         if self.model_cls is None:
             from .mm_gpt_model import MultimodalGPTModel
-            from megatron.core.models.gpt import GPTModel
+            from .gpt_model import GPTModel
             self.model_cls = MultimodalGPTModel if self.is_multimodal else GPTModel
         if self.auto_model_cls is None:
             from transformers import AutoModelForCausalLM, AutoModel
