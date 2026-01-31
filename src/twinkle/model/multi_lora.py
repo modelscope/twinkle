@@ -47,11 +47,13 @@ class MultiLora(Patch):
         adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
-                _module.enable_adapter_layers()
-                _module.set_adapter(adapter_name)
+                # _module.enable_adapter_layers()
+                if _module.active_adapter != adapter_name:
+                    _module.set_adapter(adapter_name)
         else:
-            self.module.enable_adapter_layers()
-            self.module.set_adapter(adapter_name)
+            # self.module.enable_adapter_layers()
+            if self.module.active_adapter != adapter_name:
+                self.module.set_adapter(adapter_name)
 
     def deactivate_adapter(self):
         if isinstance(self.module, list):
@@ -95,7 +97,7 @@ class MultiLora(Patch):
                 _after(_module)
         else:
             _after(self.module)
-        self.deactivate_adapter()
+        # self.deactivate_adapter()
 
     def check_length(self, inputs: InputFeature):
         total_length = sum(len(_input['input_ids']) for _input in inputs)
