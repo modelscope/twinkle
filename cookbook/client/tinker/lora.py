@@ -20,7 +20,7 @@ for tr in response.training_runs:
     chpts = rest_client.list_checkpoints(tr.training_run_id).result()
     for chpt in chpts.checkpoints:
         print("  " + chpt.model_dump_json(indent=2))
-        resume_path = chpt.tinker_path  # Just get the last one for demo purposes
+        # resume_path = chpt.tinker_path  # Just get the last one for demo purposes
     
 #%%
 if not resume_path:
