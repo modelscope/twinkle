@@ -40,7 +40,7 @@ def find_all_linears(model: nn.Module) -> List[str]:
         TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
     )
     def _cond(name: str, module: nn.Module) -> bool:
-        if name == 'output_layer':
+        if name == 'output_layer' or 'lora' in name:
             return False
         if isinstance(module, (TELinear, TELayerNormColumnParallelLinear, TEGroupedLinear, nn.Linear)):
             return True
@@ -61,7 +61,7 @@ def find_router(model: nn.Module) -> List[str]:
         List of router layer names.
     """
     from megatron.core.transformer.moe.router import TopKRouter
-    return find_layers(model, lambda name, module: isinstance(module, TopKRouter))
+    return find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
 
 
 def find_embedding(model: nn.Module) -> List[str]:
@@ -76,7 +76,7 @@ def find_embedding(model: nn.Module) -> List[str]:
         List of embedding layer names.
     """
     from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-    return find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding))
+    return find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
 
 
 def get_target_modules(model: nn.Module, target_modules: List[str]) -> List[str]:

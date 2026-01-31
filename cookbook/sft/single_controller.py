@@ -1,77 +1,85 @@
-from functools import partial
-
-import numpy as np
 from peft import LoraConfig
-
 import twinkle
-from twinkle import get_device_placement, get_logger, DeviceGroup, Platform, DeviceMesh
+import os
+import numpy as np
+import torch
+from tqdm import tqdm
+from twinkle import DeviceMesh, Platform, DeviceGroup
+from twinkle import get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, IterablePackingDataset
-from twinkle.model import TransformersModel
+from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
+from twinkle.model import MultiLoraMegatronModel, MegatronModel
+from twinkle.preprocessor import SelfCognitionProcessor
+
+device_group = [
+        DeviceGroup(
+            name='default',
+            ranks=16,
+            device_type='cuda',
+        )
+    ]
+
+device_mesh = DeviceMesh.from_sizes(pp_size=2, dp_size=2, tp_size=2, cp_size=2)
+twinkle.initialize(mode='ray', nproc_per_node=16, groups=device_group, global_device_mesh=device_mesh)
 
 logger = get_logger()
 
-device_group = [
-    DeviceGroup(
-        name='model',
-        ranks=[0,1,2,3],
-        device_type=Platform.get_platform().device_prefix(),
-    )
-]
 
-
-device_mesh = DeviceMesh(
-    device_type='cuda',
-    mesh=np.array([[0,1], [2,3]]),
-    mesh_dim_names=('dp', 'fsdp')
-)
-
-twinkle.initialize(mode='ray', nproc_per_node=4, groups=device_group, global_device_mesh=device_mesh)
-
-
-def create_dataset(data_slice=None):
-    dataset = IterablePackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition',data_slice=data_slice))
-    dataset.set_template('Qwen3Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', truncation_strategy='left', max_length=1024)
-    dataset.map('SelfCognitionProcessor')
+def eval(model):
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+    dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
-    dataset.pack_dataset()
-    return dataset
-
-
-def eval(model: TransformersModel):
-    dataloader = DataLoader(dataset=partial(create_dataset, data_slice=range(20)), batch_size=8, drop_last=True)
-    for step, batch in enumerate(dataloader):
-        print(step, len(batch))
+    # dataset.pack_dataset()
+    dataloader = DataLoader(dataset=dataset, batch_size=8)
+    for step, batch in tqdm(enumerate(dataloader)):
         model.forward_only(inputs=batch)
         model.calculate_loss()
-    metrics = model.calculate_metric()
-    return metrics()
+    metrics = model.calculate_metric(is_training=False)
+    return metrics
 
 def train():
-    dataloader = DataLoader(dataset=partial(create_dataset, data_slice=None), batch_size=8, remote_group='model')
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(2000)))
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+    dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
+    dataset.encode(batched=True)
+    # dataset.pack_dataset()
+    dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='model')
+    model = MegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', mixed_precision='bf16', recompute_granularity='full', recompute_method='uniform', recompute_num_layers=1, remote_group='default')
 
     lora_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
         target_modules='all-linear'
     )
 
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
+    model.set_optimizer(optimizer_cls='default', lr=1e-4, adapter_name='default')
+    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=1, lr_decay_steps=len(dataloader), adapter_name='default')
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs())
+    logger.info(model.get_train_configs(adapter_name='default'))
+    logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
     for step, batch in enumerate(dataloader):
-        output = model.forward_backward(inputs=batch)
-        if step % 16 == 0:
-            logger.info(f'Current is step {step // 16}, loss: {output()}')
-        model.clip_grad_and_step()
-        if step % 50 == 0 and step > 0:
-            metrics = eval(model)
-            logger.info(f'Current is step {step // 16}, metrics: {metrics}')
-            metrics['step'] = step
-            if loss_metric > metrics['loss']:
-                model.save(f'checkpoint-{step}')
-                loss_metric = metrics['loss']
+        model.forward_backward(inputs=batch, adapter_name='default')
+        output = model.forward_only(inputs=batch, adapter_name='default')
+        output = output()
+        # outputs = model.forward_only(inputs=batch, adapter_name='default')
+        model.clip_grad_and_step(adapter_name='default')
+        if step % 5 == 0:
+            metric = model.calculate_metric(is_training=True, adapter_name='default')
+            logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
+        #if step > 0 and (step / 4) % 30 == 0:
+        #    metrics = eval(model)
+        #    logger.info(f'Eval metric: {metrics}')
+        #    metrics['step'] = step
+        #    if loss_metric > float(metrics['loss']):
+        #        model.save(f'checkpoint-{step}')
+        #        loss_metric = float(metrics['loss'])
+    model.save(f'last-checkpoint', adapter_name='default')
+    # model.load(f'last-checkpoint', adapter_name='default')
+    # model.remove_adapter(adapter_name='default')
 
 
 if __name__ == '__main__':

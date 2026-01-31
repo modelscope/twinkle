@@ -47,6 +47,6 @@ for app_config in config.applications:
 print("\nAll applications started!")
 print("Endpoints:")
 for app_config in config.applications:
-    print(f"  - http://localhost:8000{app_config.route_prefix}")
+    print(f"  - http://{config.http_options.host}:{config.http_options.port}{app_config.route_prefix}")
 
 input("\nPress Enter to stop the server...")

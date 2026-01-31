@@ -148,7 +148,7 @@ class InputProcessor:
             return self._collate_macro_batch(inputs)
         elif variable_seq_lengths:
             # each macro batch has its own length
-            assert len(inputs) > micro_batch_size
+            assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))

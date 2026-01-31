@@ -77,6 +77,7 @@ class TwinkleMegatronArgs:
     vocab_size: Optional[int] = None
     padded_vocab_size: Optional[int] = None
     kv_channels: Optional[int] = None  # head_dim
+    variable_seq_lengths: bool = True
     
     # =========================================================================
     # Parallelism settings
@@ -594,6 +595,7 @@ class TwinkleMegatronArgs:
             num_query_groups=num_query_groups,
             kv_channels=kv_channels,
             ffn_hidden_size=ffn_hidden_size,
+            moe_token_dispatcher_type='alltoall' if self.variable_seq_lengths else 'allgather',
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
             context_parallel_size=self.cp_size,
@@ -606,6 +608,7 @@ class TwinkleMegatronArgs:
             pipeline_dtype=self.params_dtype,  # Required when using pipeline parallelism
             use_cpu_initialization=self.use_cpu_initialization,
             add_qkv_bias=self.add_qkv_bias,
+            variable_seq_lengths=self.variable_seq_lengths,
             add_bias_linear=not mg_config_dict.get('disable_bias_linear',
                                                    True),
             gated_linear_unit=use_swiglu,

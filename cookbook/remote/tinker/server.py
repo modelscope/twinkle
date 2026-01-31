@@ -13,6 +13,10 @@ time.sleep(5)
 file_dir = os.path.abspath(os.path.dirname(__file__))
 config = OmegaConf.load(os.path.join(file_dir, 'server_config.yaml'))
 
+# Start Ray Serve with http_options from config
+http_options = OmegaConf.to_container(config.http_options, resolve=True)
+serve.start(http_options=http_options)
+
 APP_BUILDERS = {
     'main:build_server_app': build_server_app,
     'main:build_model_app': build_model_app,
@@ -34,7 +38,6 @@ for app_config in config.applications:
 
     app = builder(
         deploy_options=deploy_options,
-        route_prefix=app_config.route_prefix,
         **{k: v for k, v in args.items()}
     )
 

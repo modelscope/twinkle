@@ -4,15 +4,16 @@ import threading
 import uuid
 from typing import Dict, Any
 import importlib
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from ray import serve
 
 import twinkle
 from twinkle import get_logger
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.twinkle.serialize import deserialize_object
-from twinkle.server.twinkle.validation import verify_request_token, ConfigRegistryProxy, init_config_registry
+from .common.validation import verify_request_token
+from .common.state import get_server_state, ServerStateProxy
+from .common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -37,7 +38,8 @@ def build_processor_app(nproc_per_node: int,
                         ncpu_proc_per_node:int,
                         device_group: Dict[str, Any],
                         device_mesh: Dict[str, Any],
-                        deploy_options: Dict[str, Any]):
+                        deploy_options: Dict[str, Any],
+                        **kwargs):
     app = FastAPI()
 
     @app.middleware("http")
@@ -64,7 +66,7 @@ def build_processor_app(nproc_per_node: int,
             self.resource_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()
-            self.config_registry: ConfigRegistryProxy = init_config_registry()
+            self.state: ServerStateProxy = get_server_state()
             self.per_token_processor_limit = int(os.environ.get("TWINKLE_PER_USER_PROCESSOR_LIMIT", 20))
             self.key_token_dict = {}
 
@@ -85,18 +87,18 @@ def build_processor_app(nproc_per_node: int,
 
         def handle_processor_count(self, token: str, add: bool):
             user_key = token + '_' + 'processor'
-            cur_count = self.config_registry.get_config(user_key) or 0
+            cur_count = self.state.get_config(user_key) or 0
             if add:
                 if cur_count < self.per_token_processor_limit:
-                    self.config_registry.add_config(user_key, cur_count + 1)
+                    self.state.add_config(user_key, cur_count + 1)
                 else:
                     raise RuntimeError(f'Processor count limitation reached: {self.per_token_processor_limit}')
             else:
                 if cur_count > 0:
                     cur_count -= 1
-                    self.config_registry.add_config(user_key, cur_count)
+                    self.state.add_config(user_key, cur_count)
                 if cur_count <= 0:
-                    self.config_registry.pop(user_key)
+                    self.state.pop_config(user_key)
 
         @app.post("/create")
         def create(self, request: Request, body: CreateRequest):
@@ -164,6 +166,18 @@ def build_processor_app(nproc_per_node: int,
                     value = deserialize_object(value)
                     _kwargs[key] = value
 
+            # Special handling for __next__ to catch StopIteration
+            # We convert StopIteration to HTTP 410 (Gone) which semantically means
+            # "the resource (next item) is no longer available"
+            if function_name == '__next__':
+                try:
+                    result = function(**_kwargs)
+                    return {'result': result}
+                except StopIteration:
+                    # Use HTTP 410 Gone to indicate iterator exhausted
+                    # This is a clean signal that won't be confused with errors
+                    raise HTTPException(status_code=410, detail="Iterator exhausted")
+            
             result = function(**_kwargs)
             if function_name == '__iter__':
                 return {'result': 'ok'}

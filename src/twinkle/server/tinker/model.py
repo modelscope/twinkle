@@ -12,19 +12,19 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.twinkle.validation import (ConfigRegistryProxy,
-                                               init_config_registry,
-                                               verify_request_token)
+from twinkle.server.twinkle.common.validation import verify_request_token
+from twinkle.server.twinkle.common.state import get_server_state, ServerStateProxy, schedule_task
 from twinkle.utils.logger import get_logger
 
 from .common import TwinkleCompatTransformersModel
-from .common.io_utils import (TrainingRunManager, CheckpointManager)
-from .state import get_server_state, schedule_task
+from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
 
 
-def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
+def build_model_app(model_id: str,
+                    nproc_per_node: int, 
+                    device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any], **kwargs):
     app = FastAPI()
@@ -47,16 +47,19 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
                                groups=[self.device_group],
                                lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model: Optional[TwinkleCompatTransformersModel] = None
-            self.model_id: Optional[str] = None
-            self.kwargs = kwargs
+            # Initialize model immediately
+            self.model = TwinkleCompatTransformersModel(
+                model_id=model_id,
+                device_mesh=self.device_mesh,
+                remote_group=self.device_group.name,
+                **kwargs
+            )
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown,
                                               daemon=True)
             self.hb_thread.start()
             self.adapter_lock = threading.Lock()
-            self.config_registry: ConfigRegistryProxy = init_config_registry()
-            self.state = get_server_state()
+            self.state: ServerStateProxy = get_server_state()
             self.per_token_model_limit = int(
                 os.environ.get('TWINKLE_PER_USER_MODEL_LIMIT', 30))
             self.key_token_dict = {}
@@ -64,8 +67,6 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
         def countdown(self):
             while True:
                 time.sleep(1)
-                if not self.model:
-                    continue
                 for key in list(self.adapter_records.keys()):
                     self.adapter_records[key] += 1
                     if self.adapter_records[key] > self.COUNT_DOWN:
@@ -78,10 +79,10 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
 
         def handle_adapter_count(self, token: str, add: bool):
             user_key = token + '_' + 'model_adapter'
-            cur_count: int = self.config_registry.get_config(user_key) or 0
+            cur_count: int = self.state.get_config(user_key) or 0
             if add:
                 if cur_count < self.per_token_model_limit:
-                    self.config_registry.add_config(user_key, cur_count + 1)
+                    self.state.add_config(user_key, cur_count + 1)
                 else:
                     raise RuntimeError(
                         f'Model adapter count limitation reached: {self.per_token_model_limit}'
@@ -89,9 +90,9 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
             else:
                 if cur_count > 0:
                     cur_count -= 1
-                    self.config_registry.add_config(user_key, cur_count)
+                    self.state.add_config(user_key, cur_count)
                 if cur_count <= 0:
-                    self.config_registry.pop(user_key)
+                    self.state.pop_config(user_key)
 
         @staticmethod
         def get_adapter_name(request: Request, adapter_name: str) -> str:
@@ -108,27 +109,13 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
         async def create_model(
                 self, request: Request,
                 body: types.CreateModelRequest) -> types.UntypedAPIFuture:
-            # In case create_model called multiple times, we reuse the same model_id
-            model_id = self.model_id or self.state.register_model(
-                body.model_dump())
+            # Register a new model_id for each create_model call
+            model_id = self.state.register_model(body.model_dump())
 
-            self.model_id = model_id
-
-            async def _load_model():
-                if self.model is not None and self.model_id is not None:
-                    return types.CreateModelResponse(model_id=self.model_id)
-
-                extra_kwargs = body.user_metadata or {}
-                self.model = TwinkleCompatTransformersModel(
-                    model_id=body.base_model,
-                    device_mesh=self.device_mesh,
-                    remote_group=self.device_group.name,
-                    **extra_kwargs,
-                )
-
+            async def _create_adapter():
                 if body.lora_config:
                     # TODO: support more lora config parameters, train_unembed, etc.
-                    lora_cfg = LoraConfig(r=body.lora_config.rank, )
+                    lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
 
                     with self.adapter_lock:
                         adapter_name = self.get_adapter_name(
@@ -145,26 +132,29 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
                     self.model.set_optimizer('AdamW',
                                              adapter_name=adapter_name)
 
-                TrainingRunManager.save(model_id, body, request.state.token)
+                training_run_manager = create_training_run_manager(request.state.token)
+                training_run_manager.save(model_id, body)
 
                 return types.CreateModelResponse(model_id=model_id)
 
             return await schedule_task(self.state,
-                                       _load_model(),
+                                       _create_adapter(),
                                        model_id=model_id)
 
         @app.post('/get_info')
         async def get_info(
                 self, request: Request,
                 body: types.GetInfoRequest) -> types.GetInfoResponse:
-            metadata = TrainingRunManager.get(str(body.model_id))
-            model_name = metadata.base_model if metadata else str(
-                body.model_id)
+            # Note: get_info doesn't require token for reading metadata in tinker
+            # Using a default token or None since this is read-only
+            training_run_manager = create_training_run_manager(request.state.token)
+            metadata = training_run_manager.get(str(body.model_id))
+            model_name = metadata.base_model if metadata else model_id
             lora_rank = None
             is_lora = False
-            if metadata and metadata.get('lora_config'):
-                lora_rank = metadata['lora_config'].get('rank')
-                is_lora = True
+            if metadata and hasattr(metadata, 'lora_rank') and metadata.lora_rank:
+                lora_rank = metadata.lora_rank
+                is_lora = metadata.is_lora
             return types.GetInfoResponse(
                 model_data=types.ModelData(model_name=model_name),
                 model_id=body.model_id,
@@ -175,18 +165,21 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
 
         @app.post('/unload_model')
         async def unload_model(
-                self, request: Request,
+                self,
+                request: Request,
                 body: types.UnloadModelRequest) -> types.UntypedAPIFuture:
 
             async def _do_unload():
-                self.model = None
-                self.model_id = None
+                # Only remove adapter, not the base model
                 with self.adapter_lock:
                     adapter_name = self.get_adapter_name(
                         request=request, adapter_name=body.model_id)
-                    del self.adapter_records[adapter_name]
-                    del self.key_token_dict[adapter_name]
-                    self.handle_adapter_count(request.state.token, add=False)
+                    if adapter_name in self.adapter_records:
+                        self.model.remove_adapter(adapter_name)
+                        del self.adapter_records[adapter_name]
+                        token = self.key_token_dict.pop(adapter_name, None)
+                        if token:
+                            self.handle_adapter_count(token, add=False)
                 self.state.unload_model(body.model_id)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
@@ -200,12 +193,6 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
                 body: types.ForwardRequest) -> types.UntypedAPIFuture:
 
             async def _do_forward():
-                if not self.model:
-                    return types.RequestFailedResponse(
-                        error='Model not loaded, please load model first',
-                        category=types.RequestErrorCategory.User,
-                    )
-
                 try:
                     adapter_name = self.get_adapter_name(
                         request, adapter_name=body.model_id)
@@ -240,12 +227,6 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
                 body: types.ForwardBackwardRequest) -> types.UntypedAPIFuture:
 
             async def _do_forward_backward():
-                if not self.model:
-                    return types.RequestFailedResponse(
-                        error='Model not loaded, please load model first',
-                        category=types.RequestErrorCategory.User,
-                    )
-
                 try:
                     adapter_name = self.get_adapter_name(
                         request, adapter_name=body.model_id)
@@ -282,11 +263,6 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
 
             async def _do_optim():
                 try:
-                    if not self.model:
-                        return types.RequestFailedResponse(
-                            error='Model not loaded, please load model first',
-                            category=types.RequestErrorCategory.User,
-                        )
                     adapter_name = self.get_adapter_name(
                         request, adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
@@ -312,21 +288,18 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
 
             async def _do_save():
                 try:
-                    if self.model is None or self.model_id is None:
-                        return types.RequestFailedResponse(
-                            error='Model not loaded, please load model first',
-                            category=types.RequestErrorCategory.User,
-                        )
-
                     adapter_name = self.get_adapter_name(
                         request, adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    # Extract token from request for user isolation
+                    token = request.state.token
+                    checkpoint_manager = create_checkpoint_manager(token)
 
-                    # get save dir
-                    checkpoint_name = CheckpointManager.get_ckpt_name(
-                        body.path)
-                    save_dir = CheckpointManager.get_save_dir(
-                        model_id=self.model_id,
+                    # get save dir with token-based isolation
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
+                    save_dir = checkpoint_manager.get_save_dir(
+                        model_id=body.model_id,
                         is_sampler=False
                     )
 
@@ -335,8 +308,8 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
                                     adapter_name=adapter_name,
                                     save_optimizer=True)
 
-                    tinker_path = CheckpointManager.save(
-                        self.model_id, name=checkpoint_name, is_sampler=False)
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=False)
 
                     return types.SaveWeightsResponse(path=tinker_path,
                                                      type='save_weights')
@@ -358,14 +331,22 @@ def build_model_app(nproc_per_node: int, device_group: Dict[str, Any],
 
             async def _do_load():
                 try:
+                    assert self.model is not None, 'Model not loaded, please load model first'
+                    
                     adapter_name = self.get_adapter_name(
                         request, adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    # Extract token from request for user isolation
+                    token = request.state.token
+                    
                     weight_path = body.path
                     load_optimizer = body.optimizer
+                    
                     self.model.load(checkpoint_dir=weight_path,
                                     load_optimizer=load_optimizer,
-                                    adapter_name=adapter_name)
+                                    adapter_name=adapter_name,
+                                    token=token)
                     return types.LoadWeightsResponse(path=body.path,
                                                      type='load_weights')
                 except Exception:

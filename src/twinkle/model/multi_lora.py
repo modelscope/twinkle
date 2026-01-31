@@ -47,11 +47,13 @@ class MultiLora(Patch):
         adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
-                _module.enable_adapter_layers()
-                _module.set_adapter(adapter_name)
+                # _module.enable_adapter_layers()
+                if _module.active_adapter != adapter_name:
+                    _module.set_adapter(adapter_name)
         else:
-            self.module.enable_adapter_layers()
-            self.module.set_adapter(adapter_name)
+            # self.module.enable_adapter_layers()
+            if self.module.active_adapter != adapter_name:
+                self.module.set_adapter(adapter_name)
 
     def deactivate_adapter(self):
         if isinstance(self.module, list):
@@ -64,15 +66,16 @@ class MultiLora(Patch):
     def adapter(self, tenant_adapter_name: str):
         self.activate_adapter(tenant_adapter_name)
         yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
-        self.deactivate_adapter()
+        # self.deactivate_adapter()
     
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
-        adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        _lora = self.find_lora_by_tenant(tenant_adapter_name)
+        adapter_name = _lora.adapter_name
 
         def _before(_module):
             peft_config = _module.peft_config
-            config_dict = {tenant_adapter_name: _module.peft_config[adapter_name]}
+            config_dict = {tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config}
             _module.peft_config = config_dict
             _module._peft_config_origin = peft_config
             active_adapter = _module.active_adapter
@@ -88,13 +91,13 @@ class MultiLora(Patch):
                 _before(_module)
         else:
             _before(self.module)
-        yield
+        yield adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
                 _after(_module)
         else:
             _after(self.module)
-        self.deactivate_adapter()
+        # self.deactivate_adapter()
 
     def check_length(self, inputs: InputFeature):
         total_length = sum(len(_input['input_ids']) for _input in inputs)
@@ -359,21 +362,21 @@ class MultiLora(Patch):
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
-                if _config.target_modules:
-                    if isinstance(_config.target_modules, str):
-                        target_modules = [_config.target_modules]
-                    else:
-                        target_modules = list(_config.target_modules)
-
-                    from .megatron.tuners.utils import get_target_modules
-                    expanded_modules = get_target_modules(_module, target_modules)
-                    _config.target_modules = expanded_modules
 
                 from .megatron.tuners.utils import patch_deepcopy
                 with patch_deepcopy():
                     if isinstance(_module, PeftModel):
                         _module.add_adapter(lora_tenant.adapter_name, _config)
                     else:
+                        if _config.target_modules:
+                            if isinstance(_config.target_modules, str):
+                                target_modules = [_config.target_modules]
+                            else:
+                                target_modules = list(_config.target_modules)
+
+                            from .megatron.tuners.utils import get_target_modules
+                            expanded_modules = get_target_modules(_module, target_modules)
+                            _config.target_modules = expanded_modules
                         _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
 
                     for name, submodule in _module.named_modules():
