@@ -34,6 +34,9 @@ class MultiLoraMegatronModel(MegatronModel):
                  load_weights: bool = True,
                  recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
                  recompute_modules: Optional[list] = None,  # Modules to recompute
+                 max_loras:int = 5,
+                 max_r:int = 32,
+                 max_length: int = 8192,
                  **kwargs,
                  ):
         requires('megatron_core')
@@ -89,7 +92,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
 
         MegatronPeft().patch()
-        self.multi_adapter = MultiLora()
+        self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.model = self.strategy.wrap_model(self.model)
         self._model_wrapped = True

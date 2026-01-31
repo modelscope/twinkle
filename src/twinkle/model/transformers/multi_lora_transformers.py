@@ -29,6 +29,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  grad_scaler_config: Dict[str, Any] = None,
+                 max_loras: int = 5,
+                 max_r: int = 32,
+                 max_length: int = 8192,
                  **kwargs):
         assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -42,7 +45,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        self.multi_adapter = MultiLora()
+        self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
         self.model = self.strategy.wrap_model(self.model)
