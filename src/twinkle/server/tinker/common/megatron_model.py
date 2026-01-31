@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import numpy as np
 import torch
 from tinker import types
 from typing import List
@@ -6,6 +7,33 @@ from twinkle.model.megatron import MultiLoraMegatronModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature
 from .io_utils import create_checkpoint_manager
+
+
+def _collect_forward_backward_results(results):
+    """Custom collect function for forward_backward that handles tuple (outputs, loss).
+    
+    Args:
+        results: List of tuples from each worker, where each tuple is (outputs_list, loss_float)
+        
+    Returns:
+        Tuple of (flattened_outputs, averaged_loss)
+    """
+    if not results:
+        return results
+    
+    # results is a list of tuples: [(outputs1, loss1), (outputs2, loss2), ...]
+    # Flatten outputs (first element of each tuple)
+    all_outputs = []
+    all_losses = []
+    for result in results:
+        outputs, loss = result
+        all_outputs.extend(outputs)
+        all_losses.append(loss)
+    
+    # Average the losses
+    avg_loss = float(np.mean(all_losses))
+    
+    return all_outputs, avg_loss
 
 
 @remote_class(execute='all')
@@ -35,7 +63,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel):
     This wrapper provides a direct forward_backward interface.
     """
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
+    @remote_function(dispatch='slice_dp', collect=_collect_forward_backward_results)
     def forward_backward(self, *, inputs: List[types.Datum], **kwargs):
         """Combined forward and backward pass.
         

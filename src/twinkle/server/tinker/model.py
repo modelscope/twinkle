@@ -264,7 +264,7 @@ def build_model_app(model_id: str,
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type='CrossEntropyLossReturn',
                         loss_fn_outputs=output,
-                        metrics={'loss:sum': loss},
+                        metrics={'loss:avg': loss},
                     )
                 except Exception:
                     logger.error(traceback.format_exc())

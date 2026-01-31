@@ -60,7 +60,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         results = self._get_forward_output(inputs, logits)
         return results
 
-    @remote_function(collect='sum')
+    @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         loss = super().calculate_loss(**kwargs)
         return loss
