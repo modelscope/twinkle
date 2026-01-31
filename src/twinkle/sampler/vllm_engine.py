@@ -196,6 +196,8 @@ class VLLMEngine(BaseSamplerEngine):
         logprobs_mode: Optional[str] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
     ):
+        from twinkle.hub import HubOperation
+        model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization

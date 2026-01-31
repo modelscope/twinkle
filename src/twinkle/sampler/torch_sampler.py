@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """PyTorch native sampler using TransformersEngine."""
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Union, Optional, Type, Union
 
 import torch
 from peft import PeftConfig, get_peft_model
+from transformers import AutoModelForCausalLM, PreTrainedModel
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from .base import Sampler
 from .types import SamplingParams, SampleResponse, SampledSequence
@@ -22,6 +24,7 @@ class TorchSampler(Sampler):
         device_mesh: DeviceMesh = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = True,
+        model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
         **kwargs
     ):
         super().__init__()
@@ -43,6 +46,7 @@ class TorchSampler(Sampler):
             model_id=model_id,
             torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
+            model_cls=model_cls,
             **kwargs
         )
         self.model = self.engine.model
@@ -102,10 +106,33 @@ class TorchSampler(Sampler):
             input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_tensor)
             
+            # Build model inputs including multimodal data
+            model_inputs = {
+                'input_ids': input_tensor,
+                'attention_mask': attention_mask,
+            }
+            
+            # Add extra inputs for multimodal models (pixel_values, image_grid_thw, etc.)
+            # These are typically produced by template.encode() for VLM models
+            extra_keys = ['pixel_values', 'image_grid_thw', 'video_grid_thw', 
+                         'pixel_values_videos', 'second_per_grid_ts']
+            for key in extra_keys:
+                if key in feat:
+                    value = feat[key]
+                    if hasattr(value, 'to'):
+                        model_inputs[key] = value.to(device)
+                    elif isinstance(value, (list, tuple)) and len(value) > 0:
+                        # Handle list of tensors
+                        if hasattr(value[0], 'to'):
+                            model_inputs[key] = [v.to(device) for v in value]
+                        else:
+                            model_inputs[key] = value
+                    else:
+                        model_inputs[key] = value
+            
             with torch.no_grad():
                 outputs = self.model.generate(
-                    input_ids=input_tensor,
-                    attention_mask=attention_mask,
+                    **model_inputs,
                     **gen_kwargs
                 )
             

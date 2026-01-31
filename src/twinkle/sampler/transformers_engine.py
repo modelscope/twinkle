@@ -12,11 +12,12 @@ import logging
 import os
 import uuid
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from twinkle import remote_class, remote_function
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from .base_engine import BaseSamplerEngine
 from .types import SampleResponse, SampledSequence, SamplingParams
@@ -36,6 +37,7 @@ class TransformersEngine(BaseSamplerEngine):
         enable_lora: bool = False,
         max_lora_rank: int = 64,
         model_kwargs: Optional[Dict[str, Any]] = None,
+        model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
     ):
         self._model_id = model_id
         self.torch_dtype = torch_dtype
@@ -46,7 +48,7 @@ class TransformersEngine(BaseSamplerEngine):
         self._model_kwargs = model_kwargs or {}
         
         # Load model and tokenizer
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = model_cls.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
             device_map=device_map,

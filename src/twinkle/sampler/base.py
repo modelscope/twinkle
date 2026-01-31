@@ -91,13 +91,13 @@ class Sampler(ABC):
                 return template
         return self.template
 
-    def encode_trajectory(self, trajectory: Trajectory, adapter_name: str = '') -> InputFeature:
-        """Encode a trajectory to InputFeature format."""
+    def encode_trajectory(self, trajectory: Trajectory, adapter_name: str = '', 
+                          add_generation_prompt: bool = True) -> InputFeature:
         template = self._get_template(adapter_name)
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
         
-        encoded = template.encode(trajectory)
+        encoded = template.encode(trajectory, add_generation_prompt=add_generation_prompt)
         
         input_ids = encoded.get('input_ids')
         if input_ids is None:

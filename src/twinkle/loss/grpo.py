@@ -62,7 +62,10 @@ class GRPOLoss(Loss):
         """Extract advantages from trajectories."""
         advantages_list = []
         for trajectory in trajectories:
-            adv = getattr(trajectory, 'advantages', None)
+            if isinstance(trajectory, dict):
+                adv = trajectory.get('advantages', None)
+            else:
+                adv = getattr(trajectory, 'advantages', None)
             assert adv is not None, "advantages must be present in trajectory"
             advantages_list.append(float(adv))
         return torch.tensor(advantages_list, dtype=torch.float32, device=device)

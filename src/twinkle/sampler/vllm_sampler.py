@@ -37,6 +37,75 @@ class VLLMSampler(Sampler):
         
         VLLMLoraWeights().patch(self)
 
+    def encode_trajectory_for_vllm(self, trajectory: Trajectory, adapter_name: str = '') -> InputFeature:
+        """Encode trajectory for vLLM - does not expand image tokens.
+
+        Args:
+            trajectory: The trajectory to encode.
+            adapter_name: Optional LoRA adapter name.
+            
+        Returns:
+            InputFeature with input_ids suitable for vLLM (unexpanded image tokens).
+        """
+        template = self._get_template(adapter_name)
+        if template is None:
+            raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+        
+        # For vLLM: tokenize without passing images to the processor
+        # This gives us the text with placeholder tokens, which vLLM will expand
+        messages = [dict(msg) for msg in trajectory['messages']]
+        
+        # Preprocess images for vLLM (load as PIL Images)
+        # vLLM expects PIL Images, not URLs
+        images = []
+        if trajectory.get('images'):
+            images = template.preprocess_images(trajectory['images'])
+        videos = []
+        if trajectory.get('videos'):
+            videos = template.preprocess_videos(trajectory['videos'])
+        
+        # Apply chat template without images (to get unexpanded tokens)
+        # We need to convert <image> placeholders to the model's native format
+        for msg in messages:
+            content = msg.get('content', '')
+            if isinstance(content, str) and template.is_mm:
+                # Convert placeholders to standard format for tokenization
+                if template.image_placeholder in content:
+                    # Split content by image placeholder and rebuild with proper format
+                    parts = content.split(template.image_placeholder)
+                    new_content = []
+                    for i, part in enumerate(parts):
+                        if i > 0:
+                            # Add image token structure (vLLM will expand this)
+                            new_content.append({'type': 'image'})
+                        if part.strip():
+                            new_content.append({'type': 'text', 'text': part})
+                    msg['content'] = new_content if new_content else [{'type': 'text', 'text': ''}]
+        
+        encoded = template.processor.apply_chat_template(
+            conversation=messages,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors='pt',
+        )
+        
+        input_ids = encoded['input_ids']
+        if hasattr(input_ids, 'squeeze'):
+            input_ids = input_ids.squeeze(0)
+        if hasattr(input_ids, 'tolist'):
+            input_ids = input_ids.tolist()
+        
+        result = InputFeature(input_ids=input_ids)
+        
+        # Attach preprocessed images/videos for vLLM
+        if images:
+            result['images'] = images
+        if videos:
+            result['videos'] = videos
+        
+        return result
+
     async def _sample_single(
         self,
         feat: Dict[str, Any],
@@ -103,7 +172,10 @@ class VLLMSampler(Sampler):
             template = self._get_template(adapter_name)
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
-            encoded_inputs = [self.encode_trajectory(traj, adapter_name) for traj in inputs_list]
+            encoded_inputs = [
+                self.encode_trajectory_for_vllm(traj, adapter_name) 
+                for traj in inputs_list
+            ]
         else:
             encoded_inputs = inputs_list
         
