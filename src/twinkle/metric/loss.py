@@ -24,18 +24,20 @@ class LossMetric(Metric):
         if 'loss' not in outputs:
             return
         loss = outputs["loss"]
+        labels = inputs["labels"]
         grad_norm = outputs.get("grad_norm")
         if grad_norm is not None:
             self.grad_norm = grad_norm
 
         self.total_loss += loss.item() if hasattr(loss, "item") else loss
         self.total_count += 1
-        self.num_tokens = outputs.get("num_tokens", 0)
+        self.num_tokens += (labels >= 0).sum().item()
 
     def reset(self):
         self.total_loss = 0
         self.total_count = 0
         self.grad_norm = 0
+        self.num_tokens = 0
 
     def calculate(self):
         local_results = [
@@ -48,10 +50,7 @@ class LossMetric(Metric):
         total_count = sum(r["count"] for r in all_results)
         grad_norm = max(r["grad_norm"] for r in all_results)
         num_tokens = sum(r["num_tokens"] for r in all_results)
-        if num_tokens > 0:
-            avg_loss = total_loss / num_tokens
-        else:
-            avg_loss = total_loss / total_count if total_count > 0 else np.nan
+        avg_loss = total_loss / num_tokens
         self.reset()
         results = {}
         if avg_loss is not None:

@@ -60,7 +60,9 @@ class OptimizerGroup:
     def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
-        return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 0
+        else:
+            self.gradient_accumulation_steps = gradient_accumulation_steps
+        return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
         if self._device_mesh.data_world_size > 1:
@@ -91,7 +93,7 @@ class OptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step, 'num_tokens': self.num_tokens})
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -342,10 +344,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
+            return
+
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler
         outputs = optimizer_config.outputs
-
         context = contextlib.nullcontext
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
@@ -356,17 +360,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 scaler.unscale_(optimizer)
 
             num_tokens = optimizer_config.num_tokens
-            num_tokens = torch_util.gather_object(num_tokens, self.device_mesh, optimizer_config._dp_group)
+            num_tokens = torch_util.gather_object([num_tokens], self.device_mesh, optimizer_config._dp_group)
             num_tokens = sum(num_tokens)
             parameters = self._get_trainable_parameters(adapter_name).values()
             for p in parameters:
-                if p.grad:
+                if p.grad is not None:
                     p.grad.div_(num_tokens)
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
             # Convert DTensor to local tensor for FSDP2 compatibility
             grad_norm = torch_util.to_local_tensor(grad_norm)
             grad_norm = grad_norm.item()
             outputs['grad_norm'] = grad_norm
+            optimizer_config.num_tokens = 0
             return grad_norm
 
     @remote_function(dispatch='all')
@@ -604,6 +609,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         save_kwargs = {}
 
         for key, value in state_dict.items():
+            key = key.replace(f'.{adapter_name}.', '.')
             processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         if isinstance(model, PeftModel):

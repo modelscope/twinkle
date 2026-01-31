@@ -2,7 +2,7 @@ from peft import LoraConfig
 import twinkle
 import os
 from tqdm import tqdm
-from twinkle import Platform
+from twinkle import Platform, DeviceMesh
 from twinkle import get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
@@ -16,7 +16,9 @@ if Platform.get_rank() == 0:
         project="TransformersModel",
     )
 
-twinkle.initialize(mode='local')
+device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2)
+
+twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
 
@@ -40,7 +42,7 @@ def train():
     dataset.map(SelfCognitionProcessor('swift-robot', 'swift'))
     dataset.encode(batched=True)
     # dataset.pack_dataset()
-    dataloader = DataLoader(dataset=dataset, batch_size=2, num_workers=4)
+    dataloader = DataLoader(dataset=dataset, batch_size=4, num_workers=4)
 
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
@@ -60,7 +62,7 @@ def train():
     for step, batch in enumerate(dataloader):
         model.forward_backward(inputs=batch, adapter_name='default')
         model.clip_grad_and_step(adapter_name='default')
-        if step % 8 == 0:
+        if step % 40 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
             _metrics = {}
             for key, value in metric.items():
