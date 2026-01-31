@@ -488,9 +488,7 @@ class TwinkleMegatronArgs:
         # For PEFT/LoRA models, we use a custom implementation that handles non-DDP models.
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
 
-        def finalize_model_grads_for_lora(model,
-                                          num_tokens=None,
-                                          pg_collection=None):
+        def finalize_model_grads_for_lora(model, num_tokens=None, **kwargs):
             from peft import PeftModel as _PeftModel
             from megatron.core.distributed import DistributedDataParallel as MegatronDDP
             
@@ -504,8 +502,7 @@ class TwinkleMegatronArgs:
             base_model = _get_base_model(model[0])
             if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'ddp_config'):
                 # Use native implementation for DDP models
-                return _native_finalize_model_grads(model, num_tokens,
-                                                    pg_collection)
+                return _native_finalize_model_grads(model, num_tokens, **kwargs)
 
             return
 
