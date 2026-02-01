@@ -293,7 +293,7 @@ class VLLMEngine(BaseSamplerEngine):
     # Core Sampling API
     # =========================================================================
     
-    @remote_function(collect='flatten')
+    @remote_function()
     async def sample(
         self,
         prompt_token_ids: List[int],
