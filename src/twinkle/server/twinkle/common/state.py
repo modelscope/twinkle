@@ -148,6 +148,10 @@ class ServerState:
         }
         return _sampling_session_id
 
+    def get_sampling_session(self, sampling_session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a sampling session by ID."""
+        return self.sampling_sessions.get(sampling_session_id)
+
     # ----- Future Management -----
 
     def store_future(self, request_id: str, result: Any,
@@ -254,6 +258,10 @@ class ServerStateProxy:
             sampling_session_id: Optional[str] = None) -> str:
         return ray.get(
             self._actor.create_sampling_session.remote(payload, sampling_session_id))
+
+    def get_sampling_session(self, sampling_session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a sampling session by ID."""
+        return ray.get(self._actor.get_sampling_session.remote(sampling_session_id))
 
     # ----- Future Management -----
 

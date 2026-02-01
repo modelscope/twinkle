@@ -166,12 +166,24 @@ def build_server_app(
             This endpoint first tries to use a local sampler if available.
             Otherwise, it proxies the request to the sampler service.
             """
-            # Try to proxy to sampler service if model_path is provided
-            base_model = None
-            if body.model_path:
-                # Extract base_model from model_path (twinkle://{model_id}/...)
-                base_model = self._get_base_model(body.model_path)
-            base_model = base_model or body.base_model
+            model_path = body.model_path
+            base_model = body.base_model
+            
+            # If both are None, look up from sampling session
+            if not model_path and not base_model and body.sampling_session_id:
+                session = self.state.get_sampling_session(body.sampling_session_id)
+                if session:
+                    model_path = session.get('model_path')
+                    base_model = session.get('base_model')
+            
+            # Extract base_model from model_path if needed
+            if model_path and not base_model:
+                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
+                path = model_path.replace("twinkle://", "").replace("tinker://", "")
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    base_model = f"{parts[0]}/{parts[1]}"
+            
             return await self._proxy_to_sampler(request, "asample", base_model)
             
         @app.post("/save_weights_for_sampler")
