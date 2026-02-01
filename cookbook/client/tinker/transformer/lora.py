@@ -110,16 +110,5 @@ for epoch in range(2):
     save_result = save_future.result()
     print(f"Saved checkpoint for epoch {epoch} to {save_result.path}")
 
-#%%
-# First, create a sampling client. We need to transfer weights
 sampling_client = training_client.save_weights_and_get_sampling_client(name='pig-latin-model')
  
-# Now, we can sample from the model.
-prompt = types.ModelInput.from_ints(tokenizer.encode("English: coffee break\nPig Latin:"))
-params = types.SamplingParams(max_tokens=20, temperature=0.0, stop=["\n"]) # Greedy sampling
-future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
-result = future.result()
-print("Responses:")
-for i, seq in enumerate(result.sequences):
-    print(f"{i}: {repr(tokenizer.decode(seq.tokens))}")
-# %%

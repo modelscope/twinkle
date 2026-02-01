@@ -46,6 +46,36 @@ applications:
         logging_config:
           log_level: DEBUG
 
+  - name: sampler-Qwen2.5-0.5B-Instruct
+    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct
+    import_path: main:build_sampler_app
+    args:
+      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
+      nproc_per_node: 1
+      sampler_type: vllm  # or 'torch' for TorchSampler
+      engine_args:
+        max_model_len: 4096
+        gpu_memory_utilization: 0.9
+        enable_lora: false
+      device_group:
+        name: sampler
+        ranks: [2]
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [2]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+        logging_config:
+          log_level: DEBUG
+
   # Example: Add more models as needed
   # - name: models-Qwen2.5-7B-Instruct
   #   route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
@@ -63,6 +93,33 @@ applications:
   #       mesh_dim_names: ['dp']
   #   deployments:
   #     - name: ModelManagement
+  #       autoscaling_config:
+  #         min_replicas: 1
+  #         max_replicas: 1
+  #         target_ongoing_requests: 16
+  #       ray_actor_options:
+  #         num_cpus: 0.1
+  #       logging_config:
+  #         log_level: DEBUG
+
+  # Example: Sampler with TorchSampler
+  # - name: sampler-torch-Qwen2.5-0.5B-Instruct
+  #   route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct-torch
+  #   import_path: main:build_sampler_app
+  #   args:
+  #     model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
+  #     nproc_per_node: 1
+  #     sampler_type: torch  # Use TorchSampler instead of VLLMSampler
+  #     device_group:
+  #       name: sampler_torch
+  #       ranks: [0]
+  #       device_type: cuda
+  #     device_mesh:
+  #       device_type: cuda
+  #       mesh: [0]
+  #       mesh_dim_names: ['dp']
+  #   deployments:
+  #     - name: SamplerManagement
   #       autoscaling_config:
   #         min_replicas: 1
   #         max_replicas: 1

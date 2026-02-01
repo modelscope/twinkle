@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import traceback
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -343,6 +344,61 @@ def build_model_app(model_id: str,
 
             return await schedule_task(self.state,
                                        _do_save(),
+                                       model_id=body.model_id)
+
+        @app.post('/save_weights_for_sampler')
+        async def save_weights_for_sampler(
+                self, request: Request,
+                body: types.SaveWeightsForSamplerRequest) -> types.UntypedAPIFuture:
+            """Save/convert weights for inference use.
+            
+            Args:
+                request: FastAPI request object.
+                body: SaveWeightsForSamplerRequest containing model_id, path, etc.
+                
+            Returns:
+                UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal.
+            """
+            sampling_session_id = self.state.create_sampling_session( body.model_dump())
+            async def _do_save_for_sampler():
+                try:
+                    adapter_name = self.get_adapter_name(
+                        request, adapter_name=body.model_id)
+                    self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    # Extract token from request for user isolation
+                    token = request.state.token
+                    checkpoint_manager = create_checkpoint_manager(token)
+
+                    # get save dir with token-based isolation
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(suffix)
+                    save_dir = checkpoint_manager.get_save_dir(
+                        model_id=body.model_id,
+                        is_sampler=True
+                    )
+
+                    # Save weights with save_optimizer=False for sampler use
+                    self.model.save(name=checkpoint_name,
+                                    output_dir=save_dir,
+                                    adapter_name=adapter_name,
+                                    save_optimizer=False)
+
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=True)
+
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=tinker_path,
+                        sampling_session_id=sampling_session_id
+                    )
+                except Exception:
+                    logger.error(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
+
+            return await schedule_task(self.state,
+                                       _do_save_for_sampler(),
                                        model_id=body.model_id)
 
         @app.post('/load_weights')
