@@ -11,7 +11,7 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model import MultiLoraTransformersModel
+from twinkle.model import MultiLoraTransformersModel, MultiLoraMegatronModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from .common.validation import verify_request_token
@@ -116,6 +116,7 @@ def build_model_app(model_id: str,
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
+                    use_megatron: bool = False,
                     **kwargs):
     app = FastAPI()
 
@@ -133,12 +134,20 @@ def build_model_app(model_id: str,
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model = MultiLoraTransformersModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                **kwargs
-            )
+            if use_megatron:
+                self.model = MultiLoraMegatronModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
+            else:
+                self.model = MultiLoraTransformersModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()

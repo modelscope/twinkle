@@ -1,0 +1,68 @@
+proxy_location: EveryNode
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+applications:
+  - name: server
+    route_prefix: /server
+    import_path: main:build_server_app
+    args:
+
+    deployments:
+      - name: TwinkleServer
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+        logging_config:
+          log_level: DEBUG
+
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+    import_path: main:model_qwen25_7B
+    args:
+      use_megatron: true
+      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
+      nproc_per_node: 2
+      device_group:
+        name: model
+        ranks: [0,1]
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0,1]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: processor
+    route_prefix: /processors
+    import_path: main:processor_app
+    args:
+      nproc_per_node: 2
+      ncpu_proc_per_node: 2
+      device_group:
+        name: model
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        mesh: [0,1]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1

@@ -24,6 +24,7 @@ applications:
     route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
     import_path: main:model_qwen25_7B
     args:
+      use_megatron: false
       model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
       nproc_per_node: 2
       device_group:
