@@ -906,6 +906,14 @@ class MegatronModel(TwinkleModel, nn.Module):
                     _model = get_peft_model(_model,
                                            config,
                                            adapter_name=adapter_name)
+                # setting average_gradients_across_tp_domain
+                for m in _model.modules():
+                    if isinstance(m, LoraLinear):
+                        # just check
+                        assert args.is_multimodal and not isinstance(m, LoraParallelLinear)
+                        for p in m.parameters():
+                            if p.requires_grad:
+                                p.average_gradients_across_tp_domain = True
             _models.append(_model)
         self.model = _models
 
