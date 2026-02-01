@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 from peft import PeftModel, PeftConfig
+from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoConfig
