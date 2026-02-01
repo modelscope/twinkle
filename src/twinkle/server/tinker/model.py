@@ -371,7 +371,7 @@ def build_model_app(model_id: str,
                     checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
-                    checkpoint_name = checkpoint_manager.get_ckpt_name(suffix)
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
                     save_dir = checkpoint_manager.get_save_dir(
                         model_id=body.model_id,
                         is_sampler=True
