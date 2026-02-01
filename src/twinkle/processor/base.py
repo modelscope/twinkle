@@ -84,6 +84,18 @@ class InputProcessor:
             padded_sequences.append(padded_seq)
         return torch.stack(padded_sequences)
 
+    def _create_megatron_attention_mask(self, attention_mask):
+        import torch
+        seq_lens = [s.shape[0] for s in attention_mask]
+        max_len = max(seq_lens)
+        attention_mask = torch.tril(torch.ones(
+            (len(seq_lens), max_len, max_len), dtype=torch.bool)).view(len(seq_lens), 1, max_len, max_len)
+        assert attention_mask.dtype is torch.bool, f'attention_mask.dtype: {attention_mask.dtype}'
+        for i, seq_len in enumerate(seq_lens):
+            attention_mask[i, :, :, seq_len:] = 0
+        attention_mask = ~attention_mask
+        return attention_mask
+
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
 
@@ -101,6 +113,8 @@ class InputProcessor:
         text_keys = list(dict.fromkeys(key for inp in text_inputs for key in inp.keys()))
 
         result = {}
+        use_megatron = getattr(self, 'use_megatron', False)
+
         if self.padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
@@ -119,8 +133,10 @@ class InputProcessor:
         else:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
-
-                if isinstance(values[0], np.ndarray):
+                if use_megatron and key == 'attention_mask':
+                    values = [torch.tensor(v) for v in values]
+                    result[key] = self._create_megatron_attention_mask(values)
+                elif isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                 elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):

@@ -312,6 +312,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if micro_batch_size is None:
             assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
             micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
+        processor.use_megatron = True
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -392,21 +393,16 @@ class MegatronModel(TwinkleModel, nn.Module):
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
         logits = []
-        count = 0
         if losses:
             for loss_dict in losses:
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
-                        count += 1
                     if 'logits' in loss_dict:
                         logits.append(loss_dict['logits'])
                 elif isinstance(loss_dict, torch.Tensor):
                     loss += loss_dict
                     count += 1
-        
-        if count > 0:
-            loss /= count
 
         # For PP > 1, broadcast loss from last PP stage to all ranks
         # Note: mpu is imported at module level, no need to reimport
@@ -779,7 +775,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         checkpoint_dir = os.path.join(output_dir, name)
         bridge = self._bridge
         for _model in self.model:
-            bridge.load_weights(_model, checkpoint_dir)
+            bridge.load_weights(self.strategy.unwrap_model([_model])[0], checkpoint_dir)
 
         if dist.is_initialized():
             dist.barrier()

@@ -34,6 +34,7 @@ class MultiLoraMegatronModel(MegatronModel):
                  load_weights: bool = True,
                  recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
                  recompute_modules: Optional[list] = None,  # Modules to recompute
+                 sequence_parallel: bool = False,
                  max_loras:int = 5,
                  max_r:int = 32,
                  max_length: int = 8192,
@@ -60,7 +61,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.optimizer_group = {}
         torch_util.set_device()
 
-        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
+        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=sequence_parallel, mixed_precision=mixed_precision, **kwargs)
 
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
