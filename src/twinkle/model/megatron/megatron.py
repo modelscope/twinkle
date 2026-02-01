@@ -775,7 +775,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         checkpoint_dir = os.path.join(output_dir, name)
         bridge = self._bridge
         for _model in self.model:
-            bridge.load_weights(_model, checkpoint_dir)
+            bridge.load_weights(self.strategy.unwrap_model([_model])[0], checkpoint_dir)
 
         if dist.is_initialized():
             dist.barrier()
