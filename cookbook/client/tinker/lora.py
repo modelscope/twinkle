@@ -12,6 +12,7 @@ rest_client = service_client.create_rest_client()
 
 future = rest_client.list_training_runs(limit=50)
 response = future.result()
+# resume_path = "twinkle://20260131_170251-Qwen_Qwen2_5-0_5B-Instruct-7275126c/weights/pig-latin-lora-epoch-1"
 resume_path = ""
 print(f"Found {len(response.training_runs)} training runs")
 for tr in response.training_runs:
@@ -23,8 +24,8 @@ for tr in response.training_runs:
         # resume_path = chpt.tinker_path  # Just get the last one for demo purposes
     
 #%%
+base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 if not resume_path:
-    base_model = "Qwen/Qwen2.5-0.5B-Instruct"
     training_client = service_client.create_lora_training_client(
         base_model=base_model
     )
