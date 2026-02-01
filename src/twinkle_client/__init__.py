@@ -17,6 +17,10 @@ def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[
     requires('tinker')
     from tinker import ServiceClient
     from twinkle_client.http.utils import get_request_id, get_api_key
+    from twinkle_client.utils.patch_tinker import patch_tinker
+    
+    # Apply patch to bypass tinker:// prefix validation
+    patch_tinker()
     
     default_headers = {
         "X-Ray-Serve-Request-Id": get_request_id(),
@@ -25,7 +29,6 @@ def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[
 
     service_client = ServiceClient(base_url=base_url, api_key=api_key, default_headers=default_headers, **kwargs)
     
-    service_client.create_sampling_client = create_sampling_client
     return service_client
 
 def init_twinkle_client(base_url: Optional[str] = None, api_key: Optional[str] = None, **kwargs) -> TwinkleClient:
