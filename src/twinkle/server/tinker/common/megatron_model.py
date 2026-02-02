@@ -2,11 +2,20 @@
 import numpy as np
 import torch
 from tinker import types
-from typing import List
-from twinkle.model.megatron import MultiLoraMegatronModel
+from typing import List, TYPE_CHECKING
 from twinkle import remote_class, remote_function
+from twinkle.utils import exists, requires
 from .datum import datum_to_input_feature
 from .io_utils import create_checkpoint_manager
+
+if TYPE_CHECKING:
+    from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
+elif exists('megatron_core'):
+    from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
+else:
+    class _MegatronBase:
+        def __init__(self, *args, **kwargs):
+            requires('megatron_core')
 
 
 def _collect_forward_backward_results(results):
@@ -37,7 +46,7 @@ def _collect_forward_backward_results(results):
 
 
 @remote_class(execute='all')
-class TwinkleCompatMegatronModel(MultiLoraMegatronModel):
+class TwinkleCompatMegatronModel(_MegatronBase):
     """
     Compatibility wrapper around :class:`MultiLoraMegatronModel` for Twinkle/Tinker.
 

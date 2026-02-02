@@ -5,12 +5,10 @@ import math
 from copy import copy
 from typing import List, Optional, Union, Callable
 
-import megatron.core
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
-from megatron.core import mpu
 from twinkle.model.megatron.args import get_args  # Use twinkle's get_args
 from packaging import version
 from peft.utils import ModulesToSaveWrapper
@@ -18,17 +16,14 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer, AutoConfig
 from transformers.modeling_utils import custom_object_save, PreTrainedModel
 
-from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger, 
-                            get_multimodal_target_regex, get_modules_to_not_convert)
+from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger,
+                           get_multimodal_target_regex, get_modules_to_not_convert, requires)
 from twinkle.hub import HubOperation
-
-from ..tuners import LoraParallelLinear
 
 import os
 
 logger = get_logger()
 
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 from twinkle.utils.platform import is_last_rank
 
 
@@ -45,6 +40,13 @@ class GPTBridge:
 
     def __init__(self, disable_tqmd: bool = False):
         from .register import get_megatron_model_meta
+        requires('megatron_core')
+        import megatron.core as megatron_core
+        from megatron.core import mpu
+        from ..tuners import LoraParallelLinear
+        self.megatron_core = megatron_core
+        self.mpu = mpu
+        self.LoraParallelLinear = LoraParallelLinear
         self.args = get_args()
         self.disable_tqmd = disable_tqmd or not is_last_rank()
         self._target_device = None
@@ -57,7 +59,8 @@ class GPTBridge:
         # Get HF layers if model was loaded, otherwise None
         self.hf_layers = deep_getattr(self.hf_model, self.hf_layers_prefix) if self.hf_model is not None else None
         self.module_mapping = {}
-        self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
+        self.mcore_013 = version.parse(self.megatron_core.__version__) >= version.parse('0.13.0rc0')
+        self.mcore_014 = version.parse(self.megatron_core.__version__) >= version.parse('0.14.0rc0')
         megatron_model_meta = get_megatron_model_meta(self.args.hf_model_type)
         if self.args.is_multimodal and megatron_model_meta.visual_cls is not None:
             self.module_mapping = megatron_model_meta.visual_cls.module_mapping
@@ -66,21 +69,21 @@ class GPTBridge:
         self.etp_size = self.args.expert_tensor_parallel_size
         self.ep_size = self.args.expert_model_parallel_size
 
-        self.tp_group = mpu.get_tensor_model_parallel_group()
-        self.pp_group = mpu.get_pipeline_model_parallel_group()
-        self.etp_group = mpu.get_expert_tensor_parallel_group()
-        self.ep_group = mpu.get_expert_model_parallel_group()
+        self.tp_group = self.mpu.get_tensor_model_parallel_group()
+        self.pp_group = self.mpu.get_pipeline_model_parallel_group()
+        self.etp_group = self.mpu.get_expert_tensor_parallel_group()
+        self.ep_group = self.mpu.get_expert_model_parallel_group()
         self.is_transformers_5 = version.parse(transformers.__version__) >= version.parse('5.0.0.dev')
-        self.tp_rank = mpu.get_tensor_model_parallel_rank()
-        self.pp_rank = mpu.get_pipeline_model_parallel_rank()
-        self.etp_rank = mpu.get_expert_tensor_parallel_rank()
-        self.ep_rank = mpu.get_expert_model_parallel_rank()
+        self.tp_rank = self.mpu.get_tensor_model_parallel_rank()
+        self.pp_rank = self.mpu.get_pipeline_model_parallel_rank()
+        self.etp_rank = self.mpu.get_expert_tensor_parallel_rank()
+        self.ep_rank = self.mpu.get_expert_model_parallel_rank()
 
         self._fp8_quantizer = None
         self.mxfp4_quantizer = MxFp4Dequantizer()
 
         dp_size = dist.get_world_size() // self.etp_size // self.ep_size // self.pp_size
-        expert_decoder_rank_generator = mpu.RankGenerator(
+        expert_decoder_rank_generator = self.mpu.RankGenerator(
             tp=self.etp_size,
             ep=self.ep_size,
             dp=dp_size,
@@ -91,7 +94,7 @@ class GPTBridge:
         )
         rank = dist.get_rank()
         for ranks in expert_decoder_rank_generator.get_ranks('ep-pp'):
-            group = mpu.create_group(
+            group = self.mpu.create_group(
                 ranks,
                 group_desc='EP-PP-GROUP',
             )
@@ -454,7 +457,7 @@ class GPTBridge:
         else:
             hf_module_key, hf_param_key = hf_key, None
         sub_module = deep_getattr(mg_module, module_key)
-        is_lora = isinstance(sub_module, LoraParallelLinear)
+        is_lora = isinstance(sub_module, self.LoraParallelLinear)
         is_modules_to_save = isinstance(sub_module, ModulesToSaveWrapper)
         if not to_mcore:
             state = torch.tensor([is_lora, is_modules_to_save], dtype=torch.bool, device='cuda')
@@ -546,7 +549,7 @@ class GPTBridge:
         num_query_groups = (args.num_query_groups if args.group_query_attention else args.num_attention_heads)
         hidden_size_block = args.hidden_size // self.fp8_block_size
         if to_mcore:
-            if isinstance(mg_attn.linear_qkv, LoraParallelLinear):
+            if isinstance(mg_attn.linear_qkv, self.LoraParallelLinear):
                 lora_A = hf_state_dict['q_proj.lora_A.weight'].load()
                 assert (lora_A == hf_state_dict['k_proj.lora_A.weight'].load()).all() and (
                     lora_A == hf_state_dict['v_proj.lora_A.weight'].load()
@@ -588,7 +591,7 @@ class GPTBridge:
             q_block = q_dim // self.fp8_block_size
             kv_block = kv_dim // self.fp8_block_size
             is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
-                                                               LoraParallelLinear) and self._is_peft_format
+                                                               self.LoraParallelLinear) and self._is_peft_format
             is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
@@ -763,7 +766,7 @@ class GPTBridge:
         # linear_fc1
         if to_mcore:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())
-            if isinstance(mg_mlp.linear_fc1, LoraParallelLinear):
+            if isinstance(mg_mlp.linear_fc1, self.LoraParallelLinear):
                 mg_lora_B = mg_mlp.linear_fc1.lora_B[self._adapter_name]
                 mg_lora_B = [getattr(mg_lora_B, f'weight{i}')
                              for i in range(num_local_experts)] if is_expert else mg_lora_B.weight
@@ -907,7 +910,7 @@ class GPTBridge:
                         fc1_bias, gate_up_proj_bias, 'linear_fc1.bias', is_expert=is_expert, hf_scale_inv=None)
         else:
             is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc1,
-                                                              LoraParallelLinear) and self._is_peft_format
+                                                              self.LoraParallelLinear) and self._is_peft_format
             is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
             if is_expert and self.ep_pp_size > 1:
                 dist.all_reduce(is_lora, group=self.ep_pp_group)
@@ -973,7 +976,7 @@ class GPTBridge:
                 else:
                     if is_expert:
                         linear_fc1 = mg_mlp.linear_fc1
-                        if isinstance(linear_fc1, LoraParallelLinear):
+                        if isinstance(linear_fc1, self.LoraParallelLinear):
                             linear_fc1 = linear_fc1.base_layer
                         fc1_weight = [getattr(linear_fc1, f'weight{i}') for i in range(num_local_experts)]
                         if args.add_bias_linear:
@@ -1060,7 +1063,7 @@ class GPTBridge:
         # linear_fc2
         if is_expert:
             if to_mcore:
-                if isinstance(mg_mlp.linear_fc2, LoraParallelLinear):
+                if isinstance(mg_mlp.linear_fc2, self.LoraParallelLinear):
                     mg_lora_A = mg_mlp.linear_fc2.lora_A[self._adapter_name]
                     mg_lora_A = [getattr(mg_lora_A, f'weight{i}')
                                  for i in range(num_local_experts)] if is_expert else mg_lora_A.weight
@@ -1130,7 +1133,7 @@ class GPTBridge:
                             fc2_bias, down_proj_bias, 'linear_fc2.bias', is_expert=is_expert, hf_scale_inv=None)
             else:
                 is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc2,
-                                                                  LoraParallelLinear) and self._is_peft_format
+                                                                  self.LoraParallelLinear) and self._is_peft_format
                 is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
                 if is_expert and self.ep_pp_size > 1:
                     dist.all_reduce(is_lora, group=self.ep_pp_group)
@@ -1169,7 +1172,7 @@ class GPTBridge:
                         fc2_weight = None
                     else:
                         linear_fc2 = mg_mlp.linear_fc2
-                        if isinstance(linear_fc2, LoraParallelLinear):
+                        if isinstance(linear_fc2, self.LoraParallelLinear):
                             linear_fc2 = linear_fc2.base_layer
                         fc2_weight = [getattr(linear_fc2, f'weight{i}') for i in range(num_local_experts)]
                         if args.add_bias_linear:
@@ -1341,12 +1344,12 @@ class GPTBridge:
             hf_state_dict = {}
         mg_models = iter(mg_models)
         mg_model = next(mg_models)
-        if mcore_013:
-            is_pp_first_stage = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
-            is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
+        if self.mcore_013:
+            is_pp_first_stage = self.mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
+            is_pp_last_stage = self.mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
         else:
-            is_pp_first_stage = mpu.is_pipeline_first_stage()
-            is_pp_last_stage = mpu.is_pipeline_last_stage()
+            is_pp_first_stage = self.mpu.is_pipeline_first_stage()
+            is_pp_last_stage = self.mpu.is_pipeline_last_stage()
         if not to_mcore or is_pp_first_stage:
             hf_state_dict.update(self._convert_pre_process(mg_model, hf_state_dict, '', to_mcore))
         if to_mcore:

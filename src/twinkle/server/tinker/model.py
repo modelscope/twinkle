@@ -17,7 +17,7 @@ from twinkle.server.twinkle.common.validation import verify_request_token
 from twinkle.server.twinkle.common.state import get_server_state, ServerStateProxy, schedule_task
 from twinkle.utils.logger import get_logger
 
-from .common import TwinkleCompatTransformersModel, TwinkleCompatMegatronModel
+from .common import TwinkleCompatTransformersModel
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
@@ -53,6 +53,7 @@ def build_model_app(model_id: str,
             self.use_megatron = use_megatron
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
+                from .common.megatron_model import TwinkleCompatMegatronModel
                 self.model = TwinkleCompatMegatronModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
