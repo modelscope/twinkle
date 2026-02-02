@@ -403,6 +403,7 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
+    visible_devices: Optional[str] = None  # Optional: explicitly set visible devices (e.g., "8,9")
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
 

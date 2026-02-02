@@ -3,9 +3,15 @@ Reference: swift/swift/megatron/trainers/utils.py
 """
 from typing import Optional
 import torch
-from megatron.core import mpu
+from twinkle import exists, requires
+
+mpu = None
+if exists('megatron_core'):
+    from megatron.core import mpu  # type: ignore
 
 def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: Optional[torch.Tensor], dim: int):
+    if mpu is None:
+        requires('megatron_core')
     if dim < 0:
         dim = (dim + inputs.ndim) % inputs.ndim
     new_inputs = []

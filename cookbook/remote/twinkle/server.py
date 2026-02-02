@@ -1,5 +1,6 @@
 import os
 os.environ['RAY_DEBUG'] = '1'
+
 import ray
 from omegaconf import OmegaConf
 from ray import serve
@@ -29,6 +30,12 @@ for app_config in config.applications:
 
     builder = APP_BUILDERS[app_config.import_path]
     args = OmegaConf.to_container(app_config.args, resolve=True) if app_config.args else {}
+
+    # Ray Serve replica processes do not reliably inherit the launching script's env vars.
+    # Therefore explicitly inject the visible devices into the device_group config so Twinkle can set visibility inside each worker.
+    visible_devices = os.environ.get('ASCEND_RT_VISIBLE_DEVICES') or os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible_devices and 'device_group' in args:
+        args['device_group']['visible_devices'] = visible_devices
 
     deploy_options = {}
     deploy_config = app_config.deployments[0]

@@ -487,6 +487,20 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # not remote_group: Ray mode with local component
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
+                    visible_env = os.environ.get('TWINKLE_VISIBLE_ENV')
+                    visible_devices = os.environ.get('TWINKLE_VISIBLE_DEVICES')
+                    if visible_env and visible_devices:
+                        # Restore the real visible devices inside the worker process.
+                        os.environ[visible_env] = visible_devices
+
+                    # Ensure each worker selects the correct local device early.
+                    # This must happen before any model/distributed init; otherwise torch_npu
+                    # may default multiple ranks to device 0.
+                    try:
+                        from twinkle.utils.framework import Torch
+                        Torch.set_device()
+                    except Exception:
+                        pass
                     seed = int(os.environ.get('TWINKLE_SEED', _seed))
                     determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
                     framework_util.seed_everything(seed, bool(determinism))

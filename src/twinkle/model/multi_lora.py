@@ -155,7 +155,13 @@ class MultiLora(Patch):
         return False
 
     def _patch_lora_forward(_self, name, base_layer: LoraLayer):
-        from twinkle.model.megatron.tuners import LoraParallelLinear
+        # Note: The Transformers backend also reaches this point to apply the LoRA forward patch.
+        # Megatron is an optional dependency; if megatron-core/megatron is missing,
+        # we must not crash the entire service just because we try to import megatron modules.
+        try:
+            from twinkle.model.megatron.tuners import LoraParallelLinear as _LoraParallelLinear
+        except Exception:  # noqa: broad-except
+            _LoraParallelLinear = ()
 
         if isinstance(base_layer, Linear):
             def _linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -222,7 +228,7 @@ class MultiLora(Patch):
             base_layer.forward = MethodType(_embedding_forward, base_layer)
             base_layer.layer_name = name
 
-        elif isinstance(base_layer, LoraParallelLinear):
+        elif isinstance(base_layer, _LoraParallelLinear):
 
             def _megatron_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
                 from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TELinear, \
