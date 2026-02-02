@@ -368,16 +368,19 @@ class MultiLora(Patch):
                     if isinstance(_module, PeftModel):
                         _module.add_adapter(lora_tenant.adapter_name, _config)
                     else:
+                        # TODO first wrap needs parse target_modules, need to fix later
+                        _origin_target_modules = _config.target_modules
                         if _config.target_modules:
-                            if isinstance(_config.target_modules, str):
-                                target_modules = [_config.target_modules]
+                            if isinstance(_origin_target_modules, str):
+                                target_modules = [_origin_target_modules]
                             else:
-                                target_modules = list(_config.target_modules)
+                                target_modules = list(_origin_target_modules)
 
                             from .megatron.tuners.utils import get_target_modules
-                            expanded_modules = get_target_modules(_module, target_modules)
-                            _config.target_modules = expanded_modules
+                            _config.target_modules = get_target_modules(_module, target_modules)
                         _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
+                        # set back _origin_target_modules(maybe `all-linear`) to avoid changed to a list.
+                        _config.target_modules = _origin_target_modules
 
                     for name, submodule in _module.named_modules():
                         if isinstance(submodule, LoraLayer):

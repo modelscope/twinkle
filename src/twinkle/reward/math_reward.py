@@ -63,7 +63,7 @@ class MathReward(Reward):
         return value
 
     @remote_function()
-    def calculate(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
+    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
         def _last_content(traj):
             # Trajectories can be dicts after serialization in distributed runs.

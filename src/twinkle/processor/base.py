@@ -32,10 +32,13 @@ class InputProcessor:
         'grid_thws',
     }
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, **kwargs):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None,
+                 padding_free: bool = False,
+                 **kwargs):
         self.device_mesh = device_mesh
         self.padding_side = kwargs.get('padding_side', 'right')
         self.padding_free = padding_free
+        self.return_4d_attention_mask = kwargs.get('return_4d_attention_mask', False)
 
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
@@ -72,19 +75,20 @@ class InputProcessor:
         if padding_side == 'right':
             from torch.nn.utils.rnn import pad_sequence
             return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+        else:
+            # left padding
+            import torch
+            max_len = max([s.shape[0] for s in sequences])
 
-        import torch
-        max_len = max([s.shape[0] for s in sequences])
+            padded_sequences = []
+            for seq in sequences:
+                pad_length = max_len - seq.shape[0]
+                pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
+                padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), 'constant', padding_value)
+                padded_sequences.append(padded_seq)
+            return torch.stack(padded_sequences)
 
-        padded_sequences = []
-        for seq in sequences:
-            pad_length = max_len - seq.shape[0]
-            pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
-            padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), 'constant', padding_value)
-            padded_sequences.append(padded_seq)
-        return torch.stack(padded_sequences)
-
-    def _create_megatron_attention_mask(self, attention_mask):
+    def _create_4d_attention_mask(self, attention_mask):
         import torch
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
@@ -113,11 +117,13 @@ class InputProcessor:
         text_keys = list(dict.fromkeys(key for inp in text_inputs for key in inp.keys()))
 
         result = {}
-        use_megatron = getattr(self, 'use_megatron', False)
 
         if self.padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
+                if self.return_4d_attention_mask and key == 'attention_mask':
+                    # padding_free & 4D attention_mask is not needed
+                    continue
                 if isinstance(values[0], np.ndarray):
                     value = np.expand_dims(np.concatenate(values, axis=0), axis=0)
                     value = torch.from_numpy(value)
@@ -133,9 +139,9 @@ class InputProcessor:
         else:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
-                if use_megatron and key == 'attention_mask':
+                if self.return_4d_attention_mask and key == 'attention_mask':
                     values = [torch.tensor(v) for v in values]
-                    result[key] = self._create_megatron_attention_mask(values)
+                    result[key] = self._create_4d_attention_mask(values)
                 elif isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
