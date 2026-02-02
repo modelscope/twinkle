@@ -10,8 +10,8 @@ from ray import serve
 
 from tinker import types
 
-from twinkle.server.twinkle.common.validation import verify_request_token, get_token_from_request
-from twinkle.server.twinkle.common.state import get_server_state, schedule_task
+from twinkle.server.utils.validation import verify_request_token, get_token_from_request
+from twinkle.server.utils.state import get_server_state, schedule_task
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 

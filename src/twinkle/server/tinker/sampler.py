@@ -9,8 +9,8 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.twinkle.common.validation import verify_request_token
-from twinkle.server.twinkle.common.state import get_server_state, ServerStateProxy, schedule_task
+from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.state import get_server_state, ServerStateProxy, schedule_task
 from twinkle.sampler.types import SamplingParams as TwinkleSamplingParams
 from twinkle.utils.logger import get_logger
 

@@ -14,8 +14,8 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.model import MultiLoraTransformersModel, MultiLoraMegatronModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
-from .common.validation import verify_request_token
-from .common.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from .common.serialize import deserialize_object
 from .common.io_utils import (
     CreateModelRequest,

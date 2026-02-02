@@ -11,8 +11,8 @@ from ray import serve
 import twinkle
 from twinkle import get_logger
 from twinkle import DeviceGroup, DeviceMesh
-from .common.validation import verify_request_token
-from .common.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from .common.serialize import deserialize_object
 
 logger = get_logger()
