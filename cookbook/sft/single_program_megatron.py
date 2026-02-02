@@ -41,11 +41,11 @@ def eval(model):
     return metrics
 
 def train():
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    dataset = PackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(5000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
-    # dataset.pack_dataset()
+    dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
     model = MultiLoraMegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', mixed_precision='bf16', recompute_granularity='full', recompute_method='uniform', recompute_num_layers=1)
