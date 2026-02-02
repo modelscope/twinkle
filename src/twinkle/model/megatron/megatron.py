@@ -188,7 +188,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         return MegatronOptimizerGroup(
             loss_instance=VocabParallelCrossEntropyLoss(),
             template=Template(self.tokenizer_id),
-            processor=InputProcessor(self.device_mesh),
+            processor=InputProcessor(self.device_mesh, return_4d_attention_mask=True),
             _device_mesh=self.device_mesh,
         )
 
@@ -313,7 +313,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         if micro_batch_size is None:
             assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
             micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
-        processor.use_megatron = True
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -894,6 +893,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 config = config_or_dir
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
+                _origin_target_modules = config.target_modules
                 if config.target_modules:
                     if isinstance(config.target_modules, str):
                         target_modules = [config.target_modules]
@@ -907,6 +907,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                     _model = get_peft_model(_model,
                                            config,
                                            adapter_name=adapter_name)
+                config.target_modules = _origin_target_modules
                 # setting average_gradients_across_tp_domain
                 for m in _model.modules():
                     if isinstance(m, LoraLinear):
@@ -967,6 +968,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        # Megatron use 4d attention mask
+        kwargs['return_4d_attention_mask'] = True
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
     @remote_function(execute='first')
