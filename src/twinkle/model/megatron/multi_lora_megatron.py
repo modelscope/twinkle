@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union, Callable
 
 import torch
 import torch.nn as nn
@@ -244,7 +244,7 @@ class MultiLoraMegatronModel(MegatronModel):
         super().set_template(template_cls, **kwargs)
 
     @remote_function()
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, Callable], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
 

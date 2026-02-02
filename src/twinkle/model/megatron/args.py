@@ -585,6 +585,8 @@ class TwinkleMegatronArgs:
         # Note: Only works with TransformerEngine and no bias in linear layers
         has_bias = not mg_config_dict.get('disable_bias_linear', True)
         bias_activation_fusion = use_swiglu and not has_bias
+        if 'moe_token_dispatcher_type' not in moe_kwargs:
+            moe_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
         config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=mg_config_dict['hidden_size'],
@@ -592,7 +594,6 @@ class TwinkleMegatronArgs:
             num_query_groups=num_query_groups,
             kv_channels=kv_channels,
             ffn_hidden_size=ffn_hidden_size,
-            moe_token_dispatcher_type='alltoall' if self.variable_seq_lengths else 'allgather',
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
             context_parallel_size=self.cp_size,

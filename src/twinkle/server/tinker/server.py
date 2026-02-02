@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -39,8 +38,6 @@ def build_server_app(
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
             ]
-            # sampling engine instance
-            self.sampler = kwargs.get("sampler", None)
 
         def _validate_base_model(self, base_model: str) -> None:
             """Validate that base_model is in supported_models list."""
@@ -69,6 +66,36 @@ def build_server_app(
             prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
             base_url = f"{request.url.scheme}://{request.url.netloc}"
             target_url = f"{base_url}{prefix}/model/{base_model}/{endpoint}"
+
+            headers = dict(request.headers)
+            headers.pop("host", None)
+            headers.pop("content-length", None)
+
+            try:
+                rp_ = await self.client.request(
+                    method=request.method,
+                    url=target_url,
+                    content=body_bytes,
+                    headers=headers,
+                    params=request.query_params,
+                )
+                return Response(
+                    content=rp_.content,
+                    status_code=rp_.status_code,
+                    headers=dict(rp_.headers),
+                    media_type=rp_.headers.get("content-type"),
+                )
+            except Exception as e:
+                return Response(content=f"Proxy Error: {str(e)}", status_code=502)
+
+        async def _proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
+            """Proxy request to sampler endpoint."""
+            body_bytes = await request.body()
+
+            # Construct target URL: /sampler/{base_model}/{endpoint}
+            prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
+            base_url = f"{request.url.scheme}://{request.url.netloc}"
+            target_url = f"{base_url}{prefix}/sampler/{base_model}/{endpoint}"
 
             headers = dict(request.headers)
             headers.pop("host", None)
@@ -133,68 +160,43 @@ def build_server_app(
             return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
         @app.post("/asample")
-        async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
-            async def _do_sample():
-                sampler = self.sampler
-                if sampler is None:
-                    return self._sample_output()
-                
-                # Extract prompt token IDs from ModelInput
-                prompt_token_ids = body.prompt.to_ints()
-                
-                # Determine adapter URI from model_path
-                adapter_uri = body.model_path if body.model_path else None
-                
-                response = await sampler.engine.sample(
-                    prompt_token_ids=prompt_token_ids,
-                    sampling_params=body.sampling_params,
-                    num_samples=body.num_samples,
-                    logprobs=True,
-                    include_prompt_logprobs=body.prompt_logprobs or False,
-                    topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
-                    adapter_uri=adapter_uri,
-                )
-                # Convert twinkle SampleResponse to tinker types.SampleResponse
-                tinker_sequences = [
-                    types.SampledSequence(
-                        stop_reason=seq.stop_reason,
-                        tokens=list(seq.tokens),
-                        logprobs=list(seq.logprobs) if seq.logprobs else None,
-                    )
-                    for seq in response.sequences
-                ]
-                return types.SampleResponse(
-                    sequences=tinker_sequences,
-                    prompt_logprobs=response.prompt_logprobs,
-                    topk_prompt_logprobs=response.topk_prompt_logprobs,
-                )
-
-            return await schedule_task(self.state, _do_sample())
-
+        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
+            """Execute text generation (inference).
+            
+            This endpoint first tries to use a local sampler if available.
+            Otherwise, it proxies the request to the sampler service.
+            """
+            model_path = body.model_path
+            base_model = body.base_model
+            
+            # If both are None, look up from sampling session
+            if not model_path and not base_model and body.sampling_session_id:
+                session = self.state.get_sampling_session(body.sampling_session_id)
+                if session:
+                    model_path = session.get('model_path')
+                    base_model = session.get('base_model')
+            
+            # Extract base_model from model_path if needed
+            if model_path and not base_model:
+                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
+                path = model_path.replace("twinkle://", "").replace("tinker://", "")
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    base_model = f"{parts[0]}/{parts[1]}"
+            
+            return await self._proxy_to_sampler(request, "asample", base_model)
+            
         @app.post("/save_weights_for_sampler")
         async def save_weights_for_sampler(
             self, request: Request, body: types.SaveWeightsForSamplerRequest
-        ) -> types.UntypedAPIFuture:
-            suffix = body.path or f"sampler-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            sampling_session_id = None
-            if body.sampling_session_seq_id is not None:
-                sampling_session_id = f"sampling_{body.sampling_session_seq_id}"
-
-            async def _do_save():
-                sampler = self.sampler
-                if sampler is None or not sampler.engine.enable_lora:
-                    path = f"twinkle://{body.model_id}/{suffix}"
-                    return types.SaveWeightsForSamplerResponseInternal(
-                        path=path, sampling_session_id=sampling_session_id
-                    )
-                
-                user_id = body.model_id
-                path = sampler.engine.adapter_manager.get_uri(user_id) if sampler.engine.adapter_manager else f"twinkle://{body.model_id}/{suffix}"
-                return types.SaveWeightsForSamplerResponseInternal(
-                    path=path, sampling_session_id=sampling_session_id
-                )
-
-            return await schedule_task(self.state, _do_save(), model_id=body.model_id)
+        ) -> Any:
+            """Save/convert weights for inference use.
+            
+            This endpoint proxies to the model service to save weights for sampler.
+            """
+            # Proxy to model service for save_weights_for_sampler
+            base_model = self._get_base_model(body.model_id)
+            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
 
         @app.post("/retrieve_future")
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:

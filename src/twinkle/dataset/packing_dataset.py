@@ -2,7 +2,7 @@
 import multiprocessing as mp
 from itertools import chain
 from typing import List, TypeVar
-
+import os
 import numpy as np
 from tqdm import tqdm
 
@@ -25,6 +25,7 @@ class PackingDataset(Dataset):
     PACKING_BATCH_SIZE = 1000
 
     def __init__(self, dataset_meta: DatasetMeta, packing_num_proc: int = 1, **kwargs):
+        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self.packing_num_proc = packing_num_proc
         super().__init__(dataset_meta, **kwargs)
         self._out_queue = mp.Queue()

@@ -4,7 +4,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Literal
+from typing import Dict, Any, List, Literal, Callable
 from typing import overload, Type, Optional, Union
 
 import torch
@@ -32,6 +32,7 @@ from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.model.base import TwinkleModel
 from twinkle.model.transformers.strategy import AccelerateStrategy
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
 
@@ -93,7 +94,7 @@ class OptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -166,6 +167,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
                                            fsdp_config=fsdp_config, device_mesh=device_mesh)
+        enable_sp = False
+        if device_mesh is not None:
+            sp_size = device_mesh.ulysses_size
+            enable_sp = bool(sp_size and sp_size > 1)
+        self.sp_strategy = (
+            SequenceParallelStrategy(
+                device_mesh,
+                {},
+                model=self.model,
+                tokenizer_id=self.tokenizer_id,
+            )
+            if enable_sp
+            else None
+        )
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
@@ -182,6 +197,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_group = optimizer_groups[0]
             optimizer = optimizer_group.optimizer
             assert optimizer 
+            if self.sp_strategy is not None:
+                self.sp_strategy.initialize()
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             optimizer_group.optimizer = optimizer
             self._model_wrapped = True
@@ -218,11 +235,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
+        if self.sp_strategy is not None:
+            inputs = self.sp_strategy.preprocess_inputs(inputs)
         labels: torch.Tensor = inputs.pop('labels', None)
         if labels is not None:
             optimizer_config.num_tokens += (labels >= 0).sum().item()
         self._accumulate_metric(optimizer_config, is_training=True)
         outputs = self.model(**inputs)
+        if self.sp_strategy is not None:
+            outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
@@ -253,9 +274,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
+            if self.sp_strategy is not None:
+                inputs = self.sp_strategy.preprocess_inputs(inputs)
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config, is_training=False)
             outputs = self.model(**inputs)
+            if self.sp_strategy is not None:
+                outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
@@ -771,7 +796,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config.template = template
 
     @remote_function()
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor], **kwargs):
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
         """Set task processor to prepare the task inputs.
         Args:
             processor_cls: A processor_cls class name, a processor_cls plugin id, or a processor_cls class type/instance.

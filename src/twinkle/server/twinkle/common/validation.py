@@ -10,7 +10,7 @@ async def verify_request_token(request: Request, call_next):
     Middleware to verify request token and extract request metadata.
     
     This middleware:
-    1. Extracts the Bearer token from Authorization header
+    1. Extracts the Bearer token from Twinkle-Authorization header
     2. Validates the token
     3. Extracts X-Ray-Serve-Request-Id for sticky sessions
     4. Stores token and request_id in request.state for later use
@@ -22,7 +22,7 @@ async def verify_request_token(request: Request, call_next):
     Returns:
         JSONResponse with error if validation fails, otherwise the response from call_next
     """
-    authorization = request.headers.get("Authorization")
+    authorization = request.headers.get("Twinkle-Authorization")
     token = authorization[7:] if authorization and authorization.startswith("Bearer ") else authorization
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={"detail": "Invalid token"})

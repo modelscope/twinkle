@@ -43,3 +43,17 @@ class SelfCognitionProcessor(Preprocessor):
             Message(role='assistant', content=solution),
         ]
         return Trajectory(messages=messages)
+
+
+class AlpacaProcessor(Preprocessor):
+
+    def __call__(self, row) -> Trajectory:
+        instruction = row.get('instruction') or ''
+        input_text = row.get('input') or ''
+        output_text = row.get('output') or ''
+        prompt = instruction if not input_text else f"{instruction}\n{input_text}"
+        messages = [
+            Message(role='user', content=prompt),
+            Message(role='assistant', content=output_text),
+        ]
+        return Trajectory(messages=messages)

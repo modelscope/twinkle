@@ -454,6 +454,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
         
+        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.server_url = f'{self.server_url}/models/{model_id}'
@@ -632,7 +633,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         """Set the template for data processing."""
         response = http_post(
             url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': self.model_id, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
@@ -642,6 +643,24 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         response = http_post(
             url=f'{self.server_url}/set_processor',
             json_data={'processor_cls': processor_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
+    def calculate_metric(self, is_training: bool = True, **kwargs):
+        """Calculate metrics from model outputs."""
+        response = http_post(
+            url=f'{self.server_url}/calculate_metric',
+            json_data={'is_training': is_training, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
+    def get_state_dict(self, **kwargs):
+        """Get model state dictionary."""
+        response = http_post(
+            url=f'{self.server_url}/get_state_dict',
+            json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']

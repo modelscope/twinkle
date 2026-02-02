@@ -6,5 +6,5 @@ from twinkle.data_format import Trajectory
 
 class Reward:
 
-    def calculate(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
+    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         ...

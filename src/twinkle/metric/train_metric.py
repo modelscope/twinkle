@@ -14,7 +14,7 @@ class TrainMetric(Metric):
 
     def __init__(self, device_mesh, process_group, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)
-        self.lr = ''
+        self.lr = None
         self.step = 0
         self.last_step = 0
         self.gradient_accumulation_steps = 1
@@ -25,7 +25,6 @@ class TrainMetric(Metric):
         lr = outputs.get('lr')
         if isinstance(lr, list):
             lr = [f'{x:.2e}' for x in lr]
-            lr = ','.join(lr)
         else:
             lr = f'{lr:.2e}'
         self.lr = lr
@@ -39,9 +38,15 @@ class TrainMetric(Metric):
     def calculate(self):
         results = {}
         if self.lr is not None:
-            results['last lr(by param_groups)'] = self.lr
+            if isinstance(self.lr, list) and len(self.lr) == 1:
+                self.lr = self.lr[0]
+            if isinstance(self.lr, list):
+                for idx, lr in enumerate(self.lr):
+                    results[f'learning rate(param group {idx+1})'] = lr
+            else:
+                results[f'learning rate'] = self.lr
         if self.step is not None:
-            results['iters'] = (self.step - 1) // self.gradient_accumulation_steps
+            results['iters'] = self.step // self.gradient_accumulation_steps
             interval = time.time() - self.time
             speed = (self.step - self.last_step) / interval / self.gradient_accumulation_steps
             if interval < 60:

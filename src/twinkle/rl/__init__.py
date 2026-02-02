@@ -1,3 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 
-from twinkle.rl.advantages import compute_advantages, compute_advantages_rloo
+from .base import Advantage
+from .grpo import GRPOAdvantage
+from .rloo import RLOOAdvantage

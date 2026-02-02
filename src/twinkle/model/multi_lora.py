@@ -312,11 +312,11 @@ class MultiLora(Patch):
                             lora_A, TEGroupedLinear) else lora_A.weight.dtype
                         x = x.to(dtype)
 
-                        lora_result = _lora_A(dropout(x))
+                        lora_result = _lora_A(dropout(x), *args, **kwargs)
                         if isinstance(lora_result, tuple):
                             lora_result = lora_result[0]
 
-                        lora_result = _lora_B(lora_result)
+                        lora_result = _lora_B(lora_result, *args, **kwargs)
                         if isinstance(lora_result, tuple):
                             lora_result = lora_result[0]
 
@@ -368,6 +368,7 @@ class MultiLora(Patch):
                     if isinstance(_module, PeftModel):
                         _module.add_adapter(lora_tenant.adapter_name, _config)
                     else:
+                        # TODO first wrap needs parse target_modules, need to fix later
                         if _config.target_modules:
                             if isinstance(_config.target_modules, str):
                                 target_modules = [_config.target_modules]
@@ -375,8 +376,7 @@ class MultiLora(Patch):
                                 target_modules = list(_config.target_modules)
 
                             from .megatron.tuners.utils import get_target_modules
-                            expanded_modules = get_target_modules(_module, target_modules)
-                            _config.target_modules = expanded_modules
+                            _config.target_modules = get_target_modules(_module, target_modules)
                         _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
 
                     for name, submodule in _module.named_modules():

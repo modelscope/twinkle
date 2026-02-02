@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import traceback
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -16,7 +17,7 @@ from twinkle.server.twinkle.common.validation import verify_request_token
 from twinkle.server.twinkle.common.state import get_server_state, ServerStateProxy, schedule_task
 from twinkle.utils.logger import get_logger
 
-from .common import TwinkleCompatTransformersModel
+from .common import TwinkleCompatTransformersModel, TwinkleCompatMegatronModel
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
@@ -26,7 +27,9 @@ def build_model_app(model_id: str,
                     nproc_per_node: int, 
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
-                    deploy_options: Dict[str, Any], **kwargs):
+                    deploy_options: Dict[str, Any],
+                    use_megatron: bool = False,
+                    **kwargs):
     app = FastAPI()
 
     @app.middleware('http')
@@ -40,20 +43,29 @@ def build_model_app(model_id: str,
         COUNT_DOWN = 60 * 30
 
         def __init__(self, nproc_per_node: int, device_group: Dict[str, Any],
-                     device_mesh: Dict[str, Any], **kwargs):
+                     device_mesh: Dict[str, Any], use_megatron: bool = False, **kwargs):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray',
                                nproc_per_node=nproc_per_node,
                                groups=[self.device_group],
                                lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            # Initialize model immediately
-            self.model = TwinkleCompatTransformersModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                **kwargs
-            )
+            self.use_megatron = use_megatron
+            # Initialize model immediately - choose backend based on use_megatron
+            if use_megatron:
+                self.model = TwinkleCompatMegatronModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
+            else:
+                self.model = TwinkleCompatTransformersModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown,
                                               daemon=True)
@@ -127,9 +139,11 @@ def build_model_app(model_id: str,
                         self.handle_adapter_count(request.state.token, True)
                     self.model.set_processor('InputProcessor',
                                              adapter_name=adapter_name)
-                    self.model.set_loss('CrossEntropyLoss',
+                    # When use_megatron is True, we don't need to set the loss
+                    if not self.use_megatron:
+                        self.model.set_loss('CrossEntropyLoss',
                                         adapter_name=adapter_name)
-                    self.model.set_optimizer('AdamW',
+                    self.model.set_optimizer('Adam',
                                              adapter_name=adapter_name)
 
                 training_run_manager = create_training_run_manager(request.state.token)
@@ -235,15 +249,23 @@ def build_model_app(model_id: str,
                     datum_list = body.forward_backward_input.data
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
-                    output = self.model.forward(inputs=datum_list,
-                                                adapter_name=adapter_name)
-                    loss = self.model.calculate_loss(adapter_name=adapter_name,
-                                                     **loss_fn_config)
-                    self.model.backward(adapter_name=adapter_name)
+                    if self.use_megatron:
+                        # Megatron uses combined forward_backward, no separate backward/calculate_loss
+                        output, loss = self.model.forward_backward(
+                            inputs=datum_list,
+                            adapter_name=adapter_name,
+                            **loss_fn_config)
+                    else:
+                        # Transformers uses separate forward, calculate_loss, backward
+                        output = self.model.forward(inputs=datum_list,
+                                                    adapter_name=adapter_name)
+                        loss = self.model.calculate_loss(adapter_name=adapter_name,
+                                                         **loss_fn_config)
+                        self.model.backward(adapter_name=adapter_name)
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type='CrossEntropyLossReturn',
                         loss_fn_outputs=output,
-                        metrics={'loss:sum': loss},
+                        metrics={'loss:avg': loss},
                     )
                 except Exception:
                     logger.error(traceback.format_exc())
@@ -324,6 +346,61 @@ def build_model_app(model_id: str,
                                        _do_save(),
                                        model_id=body.model_id)
 
+        @app.post('/save_weights_for_sampler')
+        async def save_weights_for_sampler(
+                self, request: Request,
+                body: types.SaveWeightsForSamplerRequest) -> types.UntypedAPIFuture:
+            """Save/convert weights for inference use.
+            
+            Args:
+                request: FastAPI request object.
+                body: SaveWeightsForSamplerRequest containing model_id, path, etc.
+                
+            Returns:
+                UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal.
+            """
+            sampling_session_id = self.state.create_sampling_session( body.model_dump())
+            async def _do_save_for_sampler():
+                try:
+                    adapter_name = self.get_adapter_name(
+                        request, adapter_name=body.model_id)
+                    self.assert_adapter_exists(adapter_name=adapter_name)
+                    
+                    # Extract token from request for user isolation
+                    token = request.state.token
+                    checkpoint_manager = create_checkpoint_manager(token)
+
+                    # get save dir with token-based isolation
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
+                    save_dir = checkpoint_manager.get_save_dir(
+                        model_id=body.model_id,
+                        is_sampler=True
+                    )
+
+                    # Save weights with save_optimizer=False for sampler use
+                    self.model.save(name=checkpoint_name,
+                                    output_dir=save_dir,
+                                    adapter_name=adapter_name,
+                                    save_optimizer=False)
+
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=True)
+
+                    return types.SaveWeightsForSamplerResponseInternal(
+                        path=tinker_path,
+                        sampling_session_id=sampling_session_id
+                    )
+                except Exception:
+                    logger.error(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
+
+            return await schedule_task(self.state,
+                                       _do_save_for_sampler(),
+                                       model_id=body.model_id)
+
         @app.post('/load_weights')
         async def load_weights(
                 self, request: Request,
@@ -361,4 +438,4 @@ def build_model_app(model_id: str,
                                        model_id=body.model_id)
 
     return ModelManagement.options(**deploy_options).bind(
-        nproc_per_node, device_group, device_mesh, **kwargs)
+        nproc_per_node, device_group, device_mesh, use_megatron, **kwargs)

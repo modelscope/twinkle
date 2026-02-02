@@ -43,6 +43,7 @@ def train():
     model.set_lr_scheduler('LinearLR')
     # Resume training if resume_path is provided
     if resume_path:
+        logger.info(f'Resuming training from {resume_path}')
         model.load(resume_path, load_optimizer=True)
     logger.info(model.get_train_configs())
     for step, batch in enumerate(dataloader):

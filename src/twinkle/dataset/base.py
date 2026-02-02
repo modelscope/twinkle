@@ -78,6 +78,8 @@ class Dataset(TorchDataset):
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
         kwargs['batched'] = True # Only supported batched, because a single row may explode to several rows
+        if 'load_from_cache_file' not in kwargs:
+            kwargs['load_from_cache_file'] = False
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
             self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
@@ -145,6 +147,8 @@ class Dataset(TorchDataset):
             **kwargs: The kwargs of the `datasets.map`.
         """
         init_args = init_args or {}
+        if 'load_from_cache_file' not in kwargs:
+            kwargs['load_from_cache_file'] = False
         preprocess_func = construct_class(preprocess_func, Preprocessor, twinkle.preprocessor, **init_args)
         if dataset_meta is None:
             assert len(self.datasets) == 1

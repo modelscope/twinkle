@@ -11,7 +11,7 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model import MultiLoraTransformersModel
+from twinkle.model import MultiLoraTransformersModel, MultiLoraMegatronModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from .common.validation import verify_request_token
@@ -110,12 +110,26 @@ class SetProcessorRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     adapter_name: str
 
+class CalculateMetricRequest(BaseModel):
+    adapter_name: str
+    is_training: bool = True
+
+    class Config:
+        extra = "allow"
+
+class GetStateDictRequest(BaseModel):
+    adapter_name: str
+
+    class Config:
+        extra = "allow"
+
 
 def build_model_app(model_id: str,
                     nproc_per_node: int,
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
+                    use_megatron: bool = False,
                     **kwargs):
     app = FastAPI()
 
@@ -133,12 +147,20 @@ def build_model_app(model_id: str,
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
-            self.model = MultiLoraTransformersModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                **kwargs
-            )
+            if use_megatron:
+                self.model = MultiLoraMegatronModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
+            else:
+                self.model = MultiLoraTransformersModel(
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    **kwargs
+                )
             self.adapter_records: Dict[str, int] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()
@@ -529,5 +551,21 @@ def build_model_app(model_id: str,
             self.assert_adapter_exists(adapter_name=adapter_name)
             self.adapter_records[adapter_name] = 0
             return {'status': 'ok'}
+
+        @app.post("/calculate_metric")
+        def calculate_metric(self, request: Request, body: CalculateMetricRequest):
+            adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
+            self.assert_adapter_exists(adapter_name=adapter_name)
+            extra_kwargs = body.model_extra or {}
+            ret = self.model.calculate_metric(is_training=body.is_training, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
+
+        @app.post("/get_state_dict")
+        def get_state_dict(self, request: Request, body: GetStateDictRequest):
+            adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
+            self.assert_adapter_exists(adapter_name=adapter_name)
+            extra_kwargs = body.model_extra or {}
+            ret = self.model.get_state_dict(adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
     return ModelManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh)

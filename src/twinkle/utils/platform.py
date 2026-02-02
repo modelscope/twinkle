@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
+from itertools import product
 from functools import lru_cache
 from typing import Optional, Dict
 from typing import Type
@@ -44,12 +45,13 @@ class DeviceMesh:
     etp_size: Optional[int] = None
     vpp_size: Optional[int] = None
     ulysses_size: Optional[int] = None
+    sequence_parallel: bool = False
     device_type: str = 'cuda'
 
     @staticmethod
     def from_sizes(world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda') -> "DeviceMesh":
+                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
 
         origin_world_size = world_size
         mesh_dim_names = []
@@ -97,13 +99,14 @@ class DeviceMesh:
             ep_size=ep_size,
             etp_size=etp_size,
             ulysses_size=ulysses_size,
+            sequence_parallel=sequence_parallel,
         )
 
     def __post_init__(self):
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {"dp", "fsdp", "tp", "pp", "sp", "cp"}
+        valid_dim_names = {"dp", "fsdp", "tp", "pp", "sp", "cp", "ep"}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(
@@ -124,6 +127,46 @@ class DeviceMesh:
 
         ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
         return dist.new_group(ranks=ranks)
+
+    def get_dim_group(self, dims):
+        if isinstance(dims, str):
+            dims = (dims,)
+        if len(dims) != 1:
+            return self.create_process_group(dims)
+
+        dim_name = dims[0]
+        dim_idx = self._get_dim_index(dim_name)
+        if dim_idx is None:
+            raise ValueError(f"Dimension '{dim_name}' not found in mesh_dim_names")
+
+        cache = getattr(self, "_dim_group_cache", {})
+        if dim_name in cache:
+            coord = self._get_coord()
+            key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
+            return cache[dim_name][key]
+
+        other_shape = [self.mesh.shape[i] for i in range(self.mesh.ndim) if i != dim_idx]
+        group_map = {}
+        for other_coord in product(*[range(s) for s in other_shape]):
+            ranks = []
+            for dim_val in range(self.mesh.shape[dim_idx]):
+                full_coord = []
+                other_iter = iter(other_coord)
+                for i in range(self.mesh.ndim):
+                    if i == dim_idx:
+                        full_coord.append(dim_val)
+                    else:
+                        full_coord.append(next(other_iter))
+                ranks.append(int(self.mesh[tuple(full_coord)]))
+            group = dist.new_group(ranks=ranks)
+            group_map[other_coord] = group
+
+        cache[dim_name] = group_map
+        setattr(self, "_dim_group_cache", cache)
+
+        coord = self._get_coord()
+        key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
+        return group_map[key]
 
     @property
     def order(self):
@@ -203,6 +246,10 @@ class DeviceMesh:
         return self._get_rank_for_dim("cp")
 
     @property
+    def ep_rank(self) -> Optional[int]:
+        return self._get_rank_for_dim("ep")
+
+    @property
     def dp_world_size(self) -> int:
         return self._get_world_size_for_dim("dp")
 
@@ -221,6 +268,10 @@ class DeviceMesh:
     @property
     def cp_world_size(self) -> int:
         return self._get_world_size_for_dim("cp")
+
+    @property
+    def ep_world_size(self) -> Optional[int]:
+        return self._get_world_size_for_dim("ep")
 
     @property
     def etp_world_size(self) -> int:
@@ -295,6 +346,8 @@ class DeviceMesh:
 
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
+        if world_size == 1:
+            return slice(0, total_length)
         if rank is None:
             rank = self.data_rank
             if rank is None:

@@ -26,6 +26,7 @@ class LossMetric(Metric):
             return
         loss = outputs["loss"]
         if self.loss_reduction == 'sum':
+            # `Transformers` models may use reduction=sum, to average grads before step
             labels = inputs["labels"]
             self.num_tokens += (labels >= 0).sum().item()
         grad_norm = outputs.get("grad_norm")
