@@ -31,8 +31,15 @@ class VLLMLoraWeights(Patch):
 
     def patch(self, sampler, **kwargs):
         requires('vllm>=0.11')
-        # Fix: use .processor instead of .tokenizer - Template class uses self.processor
-        tokenizer = sampler.template.tokenizer
+        
+        _sampler_ref = sampler
+        
+        def _get_tokenizer():
+            """Get tokenizer lazily from sampler's template."""
+            if _sampler_ref.template is not None:
+                return _sampler_ref.template.tokenizer
+            return None
+        
         from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
         try:
             from vllm.lora.models import LoRAModel
@@ -115,6 +122,11 @@ class VLLMLoraWeights(Patch):
 
         def patched_get_lora_tokenizer(self: TokenizerGroup, lora_request: LoRARequest):
             # since we pass dummy path, skip get tokenizer from path
+            # Use lazy tokenizer access
+            tokenizer = _get_tokenizer()
+            if tokenizer is None:
+                # Fallback to the original method if tokenizer not available
+                return self._old_get_lora_tokenizer(lora_request)
             return tokenizer
 
         if not hasattr(LRUCacheWorkerLoRAManager, '_old_load_adapter'):

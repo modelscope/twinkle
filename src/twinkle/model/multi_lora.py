@@ -47,11 +47,13 @@ class MultiLora(Patch):
         adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
-                _module.enable_adapter_layers()
-                _module.set_adapter(adapter_name)
+                # _module.enable_adapter_layers()
+                if _module.active_adapter != adapter_name:
+                    _module.set_adapter(adapter_name)
         else:
-            self.module.enable_adapter_layers()
-            self.module.set_adapter(adapter_name)
+            # self.module.enable_adapter_layers()
+            if self.module.active_adapter != adapter_name:
+                self.module.set_adapter(adapter_name)
 
     def deactivate_adapter(self):
         if isinstance(self.module, list):
@@ -64,15 +66,16 @@ class MultiLora(Patch):
     def adapter(self, tenant_adapter_name: str):
         self.activate_adapter(tenant_adapter_name)
         yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
-        self.deactivate_adapter()
+        # self.deactivate_adapter()
     
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
-        adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+        _lora = self.find_lora_by_tenant(tenant_adapter_name)
+        adapter_name = _lora.adapter_name
 
         def _before(_module):
             peft_config = _module.peft_config
-            config_dict = {tenant_adapter_name: _module.peft_config[adapter_name]}
+            config_dict = {tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config}
             _module.peft_config = config_dict
             _module._peft_config_origin = peft_config
             active_adapter = _module.active_adapter
@@ -88,13 +91,13 @@ class MultiLora(Patch):
                 _before(_module)
         else:
             _before(self.module)
-        yield
+        yield adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
                 _after(_module)
         else:
             _after(self.module)
-        self.deactivate_adapter()
+        # self.deactivate_adapter()
 
     def check_length(self, inputs: InputFeature):
         total_length = sum(len(_input['input_ids']) for _input in inputs)
@@ -309,11 +312,11 @@ class MultiLora(Patch):
                             lora_A, TEGroupedLinear) else lora_A.weight.dtype
                         x = x.to(dtype)
 
-                        lora_result = _lora_A(dropout(x))
+                        lora_result = _lora_A(dropout(x), *args, **kwargs)
                         if isinstance(lora_result, tuple):
                             lora_result = lora_result[0]
 
-                        lora_result = _lora_B(lora_result)
+                        lora_result = _lora_B(lora_result, *args, **kwargs)
                         if isinstance(lora_result, tuple):
                             lora_result = lora_result[0]
 
@@ -359,22 +362,25 @@ class MultiLora(Patch):
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
-                if _config.target_modules:
-                    if isinstance(_config.target_modules, str):
-                        target_modules = [_config.target_modules]
-                    else:
-                        target_modules = list(_config.target_modules)
-
-                    from .megatron.tuners.utils import get_target_modules
-                    expanded_modules = get_target_modules(_module, target_modules)
-                    _config.target_modules = expanded_modules
 
                 from .megatron.tuners.utils import patch_deepcopy
                 with patch_deepcopy():
                     if isinstance(_module, PeftModel):
                         _module.add_adapter(lora_tenant.adapter_name, _config)
                     else:
+                        # TODO first wrap needs parse target_modules, need to fix later
+                        _origin_target_modules = _config.target_modules
+                        if _config.target_modules:
+                            if isinstance(_origin_target_modules, str):
+                                target_modules = [_origin_target_modules]
+                            else:
+                                target_modules = list(_origin_target_modules)
+
+                            from .megatron.tuners.utils import get_target_modules
+                            _config.target_modules = get_target_modules(_module, target_modules)
                         _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
+                        # set back _origin_target_modules(maybe `all-linear`) to avoid changed to a list.
+                        _config.target_modules = _origin_target_modules
 
                     for name, submodule in _module.named_modules():
                         if isinstance(submodule, LoraLayer):
@@ -405,6 +411,58 @@ class MultiLora(Patch):
             else:
                 _store_weights(self.module)
 
+    def load_lora_converter(self, name, parameter):
+
+        def convert_param(name, parameter):
+            if 'embedding_A' in name:
+                r_saved = parameter.shape[1]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(parameter.shape[0], self.max_r-r_saved).to(parameter.dtype)), dim=1)
+            elif 'embedding_B' in name:
+                r_saved = parameter.shape[0]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(self.max_r - r_saved, parameter.shape[1]).to(parameter.dtype)), dim=0)
+            elif '_A' in name:
+                r_saved = parameter.shape[0]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(self.max_r - r_saved, parameter.shape[1]).to(parameter.dtype)), dim=0)
+            elif '_B' in name:
+                r_saved = parameter.shape[1]
+                parameter = torch.cat(
+                    (parameter, torch.zeros(parameter.shape[0], self.max_r - r_saved).to(parameter.dtype)), dim=1)
+            return name, parameter
+
+        if isinstance(parameter, torch.Tensor):
+            return convert_param(name, parameter)
+        elif 'lazytensor' in parameter.__class__.__name__.lower():
+            
+            def _loader(self):
+                tensor = self.loader_origin()
+                return convert_param(name, tensor)[1]
+            
+            parameter.loader_origin = parameter.loader
+            parameter.loader = MethodType(_loader, parameter)
+            return name, parameter
+    
+    def save_lora_converter(self, name, parameter, adapter_name):
+        _lora = self.find_lora(adapter_name)
+        pattern = re.compile(rf'\.lora_\w+\.{adapter_name}\.')
+        pattern_no_adapter = re.compile(rf'\.lora_\w+\.weight')
+        if (pattern.search(name) or pattern_no_adapter.search(name)) and self.match_target_modules(name, _lora.tenant_config.target_modules):
+            _param = torch_util.to_local_tensor(parameter)
+            if 'embedding_A' in name:
+                _param = _param[:, :_lora.tenant_config.r]
+            elif 'embedding_B' in name:
+                _param = _param[:_lora.tenant_config.r, :]
+            elif '_A' in name:
+                _param = _param[:_lora.tenant_config.r, :]
+            elif '_B' in name:
+                _param = _param[:, :_lora.tenant_config.r]
+            name = name.replace(f'.{_lora.adapter_name}.', f'.')
+            return name, _param
+        else:
+            return None, None
+
     def set_state_dict(self, tenant_adapter_name, state_dict):
         _lora = self.find_lora_by_tenant(tenant_adapter_name)
         pattern = re.compile(rf'\.lora_\w+\.{re.escape(_lora.adapter_name)}\.')
@@ -412,7 +470,7 @@ class MultiLora(Patch):
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.{_lora.tenant_adapter_name}.')
+                    name = name.replace(f'.{_lora.adapter_name}.', f'.')
                     src_tensor = state_dict[name]
                     if 'embedding_A' in name:
                         r_saved = src_tensor.shape[1]
@@ -452,7 +510,7 @@ class MultiLora(Patch):
                         _param = _param[:_lora.tenant_config.r, :]
                     elif '_B' in name:
                         _param = _param[:, :_lora.tenant_config.r]
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.{_lora.tenant_adapter_name}.')
+                    name = name.replace(f'.{_lora.adapter_name}.', f'.')
                     state_dict[name] = _param
             return state_dict
 

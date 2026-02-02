@@ -1,16 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import re
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union, Callable
 
 import torch
 import torch.nn as nn
 from peft import LoraConfig
-from peft import PeftModel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PretrainedConfig, AutoConfig
-
+import torch.distributed as dist
 from twinkle import DeviceMesh, remote_class, remote_function, template
 from twinkle import requires
 from twinkle import torch_util
@@ -36,10 +34,15 @@ class MultiLoraMegatronModel(MegatronModel):
                  load_weights: bool = True,
                  recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
                  recompute_modules: Optional[list] = None,  # Modules to recompute
+                 sequence_parallel: bool = False,
+                 max_loras:int = 5,
+                 max_r:int = 32,
+                 max_length: int = 8192,
                  **kwargs,
                  ):
         requires('megatron_core')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -54,11 +57,11 @@ class MultiLoraMegatronModel(MegatronModel):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
         torch_util.set_device()
 
-        self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
+        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=sequence_parallel, mixed_precision=mixed_precision, **kwargs)
 
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
@@ -90,7 +93,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
 
         MegatronPeft().patch()
-        self.multi_adapter = MultiLora()
+        self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.model = self.strategy.wrap_model(self.model)
         self._model_wrapped = True
@@ -178,18 +181,30 @@ class MultiLoraMegatronModel(MegatronModel):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
 
-        with self.multi_adapter.adapter(kwargs.get("adapter_name")) as tenant_adapter_name:
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")) as real_adapter_name:
             save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
             if save_format == 'hf':
-                self._save_hf_format(checkpoint_dir, tenant_adapter_name)
+                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
             else:
-                self._save_megatron_format(checkpoint_dir, tenant_adapter_name)
+                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=kwargs.get("adapter_name"))
             import torch.distributed as dist
             # Final synchronization to ensure all ranks complete save
             if dist.is_initialized():
                 dist.barrier()
+
+    def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
+        if output_dir is None:
+            output_dir = 'output'
+        checkpoint_dir = os.path.join(output_dir, name)
+        bridge = self._bridge
+        with self.multi_adapter.save_context(kwargs.get("adapter_name")) as adapter_name:
+            for _model in self.strategy.unwrap_model(self.model):
+                bridge.load_weights(_model, checkpoint_dir, True, adapter_name=adapter_name, lora_converter=self.multi_adapter.load_lora_converter)
+
+        if dist.is_initialized():
+            dist.barrier()
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
@@ -229,7 +244,7 @@ class MultiLoraMegatronModel(MegatronModel):
         super().set_template(template_cls, **kwargs)
 
     @remote_function()
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, Callable], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
 

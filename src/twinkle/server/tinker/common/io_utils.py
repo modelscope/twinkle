@@ -1,293 +1,153 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Tinker-specific IO utilities for managing training runs and checkpoints.
+
+This module extends the base IO utilities with Tinker-specific implementations.
+It uses types from the tinker package for compatibility with the Tinker API.
+"""
 from datetime import datetime
-import json
-import os
-import re
-import shutil
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tinker import types
 
-TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR',
-                                          './outputs')
-
-TRAIN_RUN_INFO_FILENAME = 'tinker_metadata.json'
-CHECKPOINT_INFO_FILENAME = 'checkpoint_metadata.json'
-
-
-class FileManager:
-    @staticmethod
-    def get_dir_size(path: Path) -> int:
-        total = 0
-        if path.exists():
-            for p in path.rglob('*'):
-                if p.is_file():
-                    total += p.stat().st_size
-        return total
+from twinkle.server.utils.io_utils import (
+    TWINKLE_DEFAULT_SAVE_DIR,
+    CHECKPOINT_INFO_FILENAME,
+    TRAIN_RUN_INFO_FILENAME,
+    BaseTrainingRunManager,
+    BaseCheckpointManager,
+    validate_user_path,
+    validate_ownership,
+)
 
 
-class TrainingRunManager(FileManager):
+# ----- Tinker Training Run Manager -----
 
-    @staticmethod
-    def get_base_dir() -> Path:
-        return Path(TWINKLE_DEFAULT_SAVE_DIR)
-
-    @staticmethod
-    def get_model_dir(model_id: str) -> Path:
-        return TrainingRunManager.get_base_dir() / model_id
-
-    @staticmethod
-    def _read_info(model_id: str) -> Dict[str, Any]:
-        metadata_path = TrainingRunManager.get_model_dir(
-            model_id) / TRAIN_RUN_INFO_FILENAME
-        if not metadata_path.exists():
-            return {}
-        try:
-            with open(metadata_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    @staticmethod
-    def _write_info(model_id: str, data: Dict[str, Any]):
-        model_dir = TrainingRunManager.get_model_dir(model_id)
-        model_dir.mkdir(parents=True, exist_ok=True)
-        metadata_path = model_dir / TRAIN_RUN_INFO_FILENAME
-        with open(metadata_path, 'w') as f:
-            json.dump(data, f, indent=2)
-
-    @classmethod
-    def save(cls, model_id: str, run_config: types.CreateModelRequest,
-             token: str):
+class TrainingRunManager(BaseTrainingRunManager):
+    """Tinker-specific training run manager using tinker.types models."""
+    
+    @property
+    def train_run_info_filename(self) -> str:
+        return TRAIN_RUN_INFO_FILENAME
+    
+    def _create_training_run(self, model_id: str, run_config: types.CreateModelRequest) -> Dict[str, Any]:
+        """Create training run data from model_id and run_config."""
         lora_config = run_config.lora_config
         train_run_data = types.TrainingRun(
             training_run_id=model_id,
             base_model=run_config.base_model,
-            model_owner=token,
+            model_owner=self.token,
             is_lora=True if lora_config else False,
             corrupted=False,
             lora_rank=lora_config.rank if lora_config else None,
             last_request_time=datetime.now(),
-            last_checkpoint=None,  # Will be updated by checkpoint manager if needed
+            last_checkpoint=None,
             last_sampler_checkpoint=None,
-            user_metadata=run_config.user_metadata)
+            user_metadata=run_config.user_metadata
+        )
 
         new_data = train_run_data.model_dump(mode='json')
-        # Store lora config details separately if needed, though they aren't in types.TrainingRun
+        # Store lora config details separately if needed
         if lora_config:
             new_data['train_unembed'] = lora_config.train_unembed
             new_data['train_mlp'] = lora_config.train_mlp
             new_data['train_attn'] = lora_config.train_attn
 
-        cls._write_info(model_id, new_data)
-
-    @classmethod
-    def get(cls, model_id: str) -> Optional[types.TrainingRun]:
-        data = cls._read_info(model_id)
-        if not data:
-            return None
-        # Clean up fields that might be stored
-        # but not in the pydantic model if strict parsing issues arise
+        return new_data
+    
+    def _parse_training_run(self, data: Dict[str, Any]) -> types.TrainingRun:
+        """Parse training run data into TrainingRun model."""
         return types.TrainingRun(**data)
-
-    @classmethod
-    def update(cls, model_id: str, updates: Dict[str, Any]):
-        info = cls._read_info(model_id)
-        if info:
-            info.update(updates)
-            cls._write_info(model_id, info)
-
-    @classmethod
-    def list_runs(cls, limit: int = 20,
-                  offset: int = 0) -> types.TrainingRunsResponse:
-        base_dir = cls.get_base_dir()
-        if not base_dir.exists():
-            return types.TrainingRunsResponse(training_runs=[],
-                                              cursor=types.Cursor(
-                                                  limit=limit,
-                                                  offset=offset,
-                                                  total_count=0))
-
-        candidates = []
-        for d in base_dir.iterdir():
-            if d.is_dir() and (d / TRAIN_RUN_INFO_FILENAME).exists():
-                candidates.append(d)
-
-        candidates.sort(
-            key=lambda d: (d / TRAIN_RUN_INFO_FILENAME).stat().st_mtime,
-            reverse=True)
-
-        total = len(candidates)
-        selected = candidates[offset:offset + limit]
-
-        runs = []
-        for d in selected:
-            run = cls.get(d.name)
-            if run:
-                runs.append(run)
-
-        return types.TrainingRunsResponse(training_runs=runs,
-                                          cursor=types.Cursor(
-                                              limit=limit,
-                                              offset=offset,
-                                              total_count=total))
+    
+    def _create_training_runs_response(
+        self, runs: List[types.TrainingRun], limit: int, offset: int, total: int
+    ) -> types.TrainingRunsResponse:
+        """Create a training runs response."""
+        return types.TrainingRunsResponse(
+            training_runs=runs,
+            cursor=types.Cursor(limit=limit, offset=offset, total_count=total)
+        )
 
 
-class CheckpointManager(FileManager):
+# ----- Tinker Checkpoint Manager -----
 
-    @staticmethod
-    def get_ckpt_dir(model_id: str, checkpoint_id: str) -> Path:
-        return TrainingRunManager.get_model_dir(model_id) / checkpoint_id
-
-    @staticmethod
-    def get_save_dir(model_id: str, is_sampler=False) -> str:
-        weights_type = 'sampler_weights' if is_sampler else 'weights'
-        checkpoint_id = Path(model_id) / weights_type
-        save_path = Path(TWINKLE_DEFAULT_SAVE_DIR) / checkpoint_id
-        return save_path.as_posix()
-
-    @staticmethod
-    def get_ckpt_name(name: Optional[str]) -> str:
-        if name:
-            # Normalize name to avoid issues with filesystem
-            name = re.sub(r'[^\w\-]', '_', name)
-            return name
-        return datetime.now().strftime('%Y%m%d_%H%M%S')
-
-    @classmethod
-    def _read_ckpt_info(cls, model_id: str,
-                        checkpoint_id: str) -> Optional[Dict[str, Any]]:
-        meta_path = cls.get_ckpt_dir(model_id,
-                                     checkpoint_id) / CHECKPOINT_INFO_FILENAME
-        if not meta_path.exists():
-            return None
-        try:
-            with open(meta_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    @classmethod
-    def _write_ckpt_info(cls, model_id: str, checkpoint_id: str, data: Dict[str, Any]):
-        ckpt_dir = cls.get_ckpt_dir(model_id, checkpoint_id)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        meta_path = ckpt_dir / CHECKPOINT_INFO_FILENAME
-        with open(meta_path, 'w') as f:
-            json.dump(data, f, indent=2)
-
-    @classmethod
-    def save(cls, model_id: str, name: str, is_sampler=False, public=False) -> str:
-        weights_type = 'sampler_weights' if is_sampler else 'weights'
-        checkpoint_type = 'sampler' if is_sampler else 'training'
-        checkpoint_id = f'{weights_type}/{name}'
-        tinker_path = f"twinkle://{model_id}/{checkpoint_id}"
-        checkpoint_path = cls.get_ckpt_dir(model_id, checkpoint_id)
+class CheckpointManager(BaseCheckpointManager):
+    """Tinker-specific checkpoint manager using tinker.types models."""
+    
+    @property
+    def path_prefix(self) -> str:
+        return "twinkle://"
+    
+    @property
+    def path_field_name(self) -> str:
+        return "tinker_path"
+    
+    def _create_checkpoint(
+        self, checkpoint_id: str, checkpoint_type: str, 
+        path: str, size_bytes: int, public: bool
+    ) -> Dict[str, Any]:
+        """Create checkpoint data."""
         checkpoint = types.Checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
             time=datetime.now(),
-            tinker_path=tinker_path,
-            size_bytes=cls.get_dir_size(checkpoint_path),
+            tinker_path=path,
+            size_bytes=size_bytes,
             public=public
         )
-        ckpt_data = checkpoint.model_dump(mode='json')
-        cls._write_ckpt_info(model_id, checkpoint.checkpoint_id, ckpt_data)
-
-        # Optionally update last_checkpoint in run info
-        TrainingRunManager.update(model_id, {'last_checkpoint': ckpt_data})
-        return tinker_path
-
-    @classmethod
-    def get(cls, model_id: str,
-            checkpoint_id: str) -> Optional[types.Checkpoint]:
-        data = cls._read_ckpt_info(model_id, checkpoint_id)
-        if not data:
-            return None
+        return checkpoint.model_dump(mode='json')
+    
+    def _parse_checkpoint(self, data: Dict[str, Any]) -> types.Checkpoint:
+        """Parse checkpoint data into Checkpoint model."""
         return types.Checkpoint(**data)
-
-    @classmethod
-    def list_checkpoints(
-            cls, model_id: str) -> Optional[types.CheckpointsListResponse]:
-        run_dir = TrainingRunManager.get_model_dir(model_id)
-        if not run_dir.exists():
-            return None
-
-        checkpoints: List[types.Checkpoint] = []
-        # Iterate over weights and sampler_weights directories
-        for weights_type in ["weights", "sampler_weights"]:
-            type_dir = run_dir / weights_type
-            if not type_dir.exists() or not type_dir.is_dir():
-                continue
-            for d in type_dir.iterdir():
-                if d.is_dir() and (d / CHECKPOINT_INFO_FILENAME).exists():
-                    checkpoint_id = f"{weights_type}/{d.name}"
-                    ckpt = cls.get(model_id, checkpoint_id)
-                    if ckpt:
-                        checkpoints.append(ckpt)
-
-        # Sort by creation time
-        checkpoints.sort(key=lambda x: x.time)
-
-        return types.CheckpointsListResponse(checkpoints=checkpoints,
-                                             cursor=None)
-
-    @classmethod
-    def delete(cls, model_id: str, checkpoint_id: str) -> bool:
-        # Basic safety check to prevent directory traversal
-        if '..' in checkpoint_id:
-            return False
-
-        ckpt_dir = cls.get_ckpt_dir(model_id, checkpoint_id)
-
-        if ckpt_dir.exists():
-            if ckpt_dir.is_dir():
-                shutil.rmtree(ckpt_dir)
-            else:
-                ckpt_dir.unlink()  # Should likely act on dir, but keeping safety
-
-            # If we deleted the "last_checkpoint", we should strictly re-evaluate it
-            # But finding true last requires listing all.
-            # For simplicity, we can just clear it or leave it stale if acceptable.
-            # To be correct:
-            all_ckpts = cls.list_checkpoints(model_id)
-            last_ckpt = all_ckpts.checkpoints[-1] if all_ckpts and all_ckpts.checkpoints else None
-            TrainingRunManager.update(
-                model_id, {
-                    'last_checkpoint':
-                    last_ckpt.model_dump(mode='json') if last_ckpt else None
-                })
-            return True
-        return False
-
-    @classmethod
-    def parse_tinker_path(cls, tinker_path: str) -> Optional[types.ParsedCheckpointTinkerPath]:
-        if not tinker_path.startswith("twinkle://"):
-            return None
-        parts = tinker_path[10:].split("/")
-        if len(parts) != 3:
-            return None
-        if parts[1] not in ["weights", "sampler_weights"]:
-            return None
-        checkpoint_type = "training" if parts[1] == "weights" else "sampler"
+    
+    def _create_checkpoints_response(self, checkpoints: List[types.Checkpoint]) -> types.CheckpointsListResponse:
+        """Create a checkpoints list response."""
+        return types.CheckpointsListResponse(checkpoints=checkpoints, cursor=None)
+    
+    def _create_parsed_path(
+        self, path: str, training_run_id: str, 
+        checkpoint_type: str, checkpoint_id: str
+    ) -> types.ParsedCheckpointTinkerPath:
+        """Create a parsed path model."""
         return types.ParsedCheckpointTinkerPath(
-            tinker_path=tinker_path,
-            training_run_id=parts[0],
+            tinker_path=path,
+            training_run_id=training_run_id,
             checkpoint_type=checkpoint_type,
-            checkpoint_id="/".join(parts[1:]),
+            checkpoint_id=checkpoint_id,
         )
-
-    @classmethod
-    def get_weights_info(cls,
-                         checkpoint_path: str) -> Optional[types.WeightsInfoResponse]:
-        tinker_path = cls.parse_tinker_path(checkpoint_path)
-        if not tinker_path:
-            return None
-        ckpt_info = cls.get(tinker_path.training_run_id,
-                            tinker_path.checkpoint_id)
-        if not ckpt_info:
-            return None
-        # weight info is stored in the training run info
-        run_info = TrainingRunManager._read_info(tinker_path.training_run_id)
-        if not run_info:
-            return None
+    
+    def _create_weights_info(self, run_info: Dict[str, Any]) -> types.WeightsInfoResponse:
+        """Create weights info from run info."""
         return types.WeightsInfoResponse(**run_info)
+    
+    def parse_tinker_path(self, tinker_path: str) -> Optional[types.ParsedCheckpointTinkerPath]:
+        """Parse a twinkle:// path into its components (alias for parse_path)."""
+        return self.parse_path(tinker_path)
+
+
+# ----- Factory Functions -----
+
+def create_training_run_manager(token: str) -> TrainingRunManager:
+    """Create a TrainingRunManager for the given token."""
+    return TrainingRunManager(token)
+
+
+def create_checkpoint_manager(token: str) -> CheckpointManager:
+    """Create a CheckpointManager for the given token."""
+    training_run_manager = TrainingRunManager(token)
+    return CheckpointManager(token, training_run_manager)
+
+
+# Re-export for backward compatibility
+__all__ = [
+    'TWINKLE_DEFAULT_SAVE_DIR',
+    'TRAIN_RUN_INFO_FILENAME',
+    'CHECKPOINT_INFO_FILENAME',
+    'TrainingRunManager',
+    'CheckpointManager',
+    'validate_user_path',
+    'validate_ownership',
+    'create_training_run_manager',
+    'create_checkpoint_manager',
+]

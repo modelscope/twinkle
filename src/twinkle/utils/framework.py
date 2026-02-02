@@ -7,7 +7,6 @@ from typing import Literal, Union, Optional, Any
 from functools import lru_cache
 
 import numpy as np
-from accelerate import PartialState
 
 from .platform import Platform, DeviceMesh
 
@@ -60,8 +59,10 @@ class Framework(ABC):
     @staticmethod
     def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):
         import torch
-        output_objects = [None for _ in range(device_mesh.data_world_size)]
-        torch.distributed.all_gather_object(output_objects, object, group=process_group)
+        output_objects = [object]
+        if device_mesh.data_world_size > 1:
+            output_objects = [None for _ in range(device_mesh.data_world_size)]
+            torch.distributed.all_gather_object(output_objects, object, group=process_group)
         _x = []
         for y in output_objects:
             if y is not None:
@@ -218,4 +219,29 @@ class Torch(Framework):
         import torch
         if Torch.is_gpu_available():
             torch.cuda.synchronize(Platform.get_local_device())
+    
+    @staticmethod
+    def contains_nan(*args, **kwargs) -> bool:
+        import torch
+        def _check(obj: Any) -> bool:
+            if isinstance(obj, torch.Tensor):
+                return torch.isnan(obj).any().item()
+            
+            if isinstance(obj, dict):
+                return any(_check(v) for v in obj.values())
+            
+            if isinstance(obj, (list, tuple, set)):
+                return any(_check(item) for item in obj)
+            
+            return False
+
+        for arg in args:
+            if _check(arg):
+                return True
+
+        for value in kwargs.values():
+            if _check(value):
+                return True
+    
+        return False
 

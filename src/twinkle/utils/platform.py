@@ -302,6 +302,31 @@ class DeviceMesh:
         if data_rank is None:
             return None
         return data_rank // ulysses_size
+    
+    def get_data_rank_from_global_rank(self, global_rank: int) -> int:
+        coord = self._get_coord_for_rank(global_rank)
+        if coord is None:
+            return 0
+        
+        dp_idx = self._get_dim_index("dp")
+        fsdp_idx = self._get_dim_index("fsdp")
+        
+        dp_rank = coord[dp_idx] if dp_idx is not None else None
+        fsdp_rank = coord[fsdp_idx] if fsdp_idx is not None else None
+        fsdp_world_size = self.fsdp_world_size if fsdp_idx is not None else 0
+        
+        data_rank = dp_rank
+        if fsdp_world_size > 1:
+            if dp_rank is not None and fsdp_rank is not None:
+                data_rank = dp_rank * fsdp_world_size + fsdp_rank
+            elif fsdp_rank is not None:
+                data_rank = fsdp_rank
+        
+        if data_rank is None:
+            data_rank = 0
+        
+        ulysses_size = self.ulysses_size or 1
+        return data_rank // ulysses_size
 
     @property
     def data_world_size(self) -> int:
@@ -606,17 +631,6 @@ class MPS(Platform):
 def is_last_rank():
     if not dist.is_initialized():
         return True
-
-    from megatron.core import parallel_state as mpu
-    if mpu.is_initialized():
-        # Only DP rank 0 writes
-        dp_rank = mpu.get_data_parallel_rank()
-        if dp_rank != 0:
-            return False
-        # For PP, only last stage needs to write certain weights
-        # (handled separately in export_weights)
-        return True
-
     return dist.get_rank() == dist.get_world_size() - 1
 
 def is_master():

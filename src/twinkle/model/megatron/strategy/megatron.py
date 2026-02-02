@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Literal, Optional, Tuple, List
+from typing import Literal, Optional, List
 
 import torch
 import torch.nn as nn
-from peft import PeftModel
+from twinkle import DeviceMesh
+from ..args import get_args
 
-from twinkle import DeviceMesh, Platform
-from twinkle.model.megatron.args import get_args
 
 class MegatronStrategy:
 
@@ -27,36 +26,27 @@ class MegatronStrategy:
     
     def _check_device_mesh(self):
         from megatron.core import parallel_state as mpu
-        import warnings
-        
-        # Note: DeviceMesh uses numpy C-order (row-major) while Megatron uses
-        # its 'order' parameter to define rank mapping. These may differ.
-        # We skip rank comparison as Megatron mpu is the source of truth.
-        
+
+        assert self.device_mesh.dp_world_size == mpu.get_data_parallel_world_size()
+        assert self.device_mesh.dp_rank == mpu.get_data_parallel_rank()
+
         # Only validate world sizes match
-        if self.device_mesh.tp_world_size is not None and self.device_mesh.tp_world_size > 1:
-            mpu_tp_size = mpu.get_tensor_model_parallel_world_size()
-            if self.device_mesh.tp_world_size != mpu_tp_size:
-                warnings.warn(
-                    f"tp_world_size mismatch: device_mesh={self.device_mesh.tp_world_size} vs mpu={mpu_tp_size}. "
-                    "Using Megatron mpu as source of truth."
-                )
+        if self.device_mesh.tp_world_size > 1:
+            assert self.device_mesh.tp_world_size == mpu.get_tensor_model_parallel_world_size()
+            assert self.device_mesh.tp_rank == mpu.get_tensor_model_parallel_rank()
         
-        if self.device_mesh.pp_world_size is not None and self.device_mesh.pp_world_size > 1:
-            mpu_pp_size = mpu.get_pipeline_model_parallel_world_size()
-            if self.device_mesh.pp_world_size != mpu_pp_size:
-                warnings.warn(
-                    f"pp_world_size mismatch: device_mesh={self.device_mesh.pp_world_size} vs mpu={mpu_pp_size}. "
-                    "Using Megatron mpu as source of truth."
-                )
+        if self.device_mesh.pp_world_size > 1:
+            assert self.device_mesh.pp_world_size == mpu.get_pipeline_model_parallel_world_size()
+            assert self.device_mesh.pp_rank == mpu.get_pipeline_model_parallel_rank()
+            assert self.device_mesh.is_pp_last_rank() == mpu.is_pipeline_last_stage()
+            assert self.device_mesh.is_pp_first_rank() == mpu.is_pipeline_first_stage()
+
+        if self.device_mesh.cp_world_size > 1:
+            assert self.device_mesh.cp_world_size == mpu.get_context_parallel_world_size()
+            assert self.device_mesh.cp_rank == mpu.get_context_parallel_rank()
         
         if self.device_mesh.vpp_size is not None and self.device_mesh.vpp_size > 1:
-            mpu_vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-            if self.device_mesh.vpp_size != mpu_vpp_size:
-                warnings.warn(
-                    f"vpp_size mismatch: device_mesh={self.device_mesh.vpp_size} vs mpu={mpu_vpp_size}. "
-                    "Using Megatron mpu as source of truth."
-                )
+            assert self.device_mesh.vpp_size == mpu.get_virtual_pipeline_model_parallel_world_size()
 
     @property
     def params_type(self) -> torch.dtype:
@@ -73,29 +63,6 @@ class MegatronStrategy:
         elif self.mixed_precision == 'fp16':
             return torch.float16
         return torch.float32
-
-    @staticmethod
-    @DeprecationWarning
-    def _get_transformer_config(model: nn.Module):
-
-        def _valid_config(_config):
-            return _config is not None and hasattr(_config, 'tensor_model_parallel_size')
-
-        def _search_config(module: nn.Module, paths: Optional[List[str]] = None):
-            paths = paths or ['']
-            for path in paths:
-                try:
-                    sub_module = module.get_submodule(path) if path else module
-                    _config = getattr(sub_module, 'config', None)
-                    if _valid_config(_config):
-                        return _config
-                except AttributeError:
-                    pass
-            return None
-
-        config = _search_config(model, ['base_model', 'model', 'base_model.model'])
-        assert config is not None, 'Cannot find valid config on megatron model.'
-        return config
 
     def wrap_model(
         self,
@@ -144,8 +111,6 @@ class MegatronStrategy:
                 use_distributed_optimizer=use_distributed_optimizer,
             )
 
-            # Wrap with MegatronDDP
-            # TODO: multi-tenant ddp
             wrapped_model = MegatronDDP(
                 config=config,
                 ddp_config=ddp_config,
@@ -166,7 +131,7 @@ class MegatronStrategy:
         from megatron.core import parallel_state as mpu
         cp_size = self.device_mesh.cp_world_size
         tp_size = self.device_mesh.tp_world_size
-        cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
+        cp_rank = self.device_mesh.cp_rank
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         attention_mask = inputs.get('attention_mask')
@@ -258,28 +223,16 @@ class MegatronStrategy:
             'labels': batch_labels,
         }
 
-    def gather_loss_for_cp(self, output_tensor, labels):
+    def gather_loss_for_cp(self, local_loss_sum, local_count, logits):
         import torch
         from megatron.core import parallel_state as mpu
         cp_size = mpu.get_context_parallel_world_size()
-        labels_for_mask = labels
-        # output_tensor is per-token loss [batch, seq]
-        # Create loss mask from labels (ignore -100)
-        loss_mask = (labels_for_mask != -100).float()
-
-        # Flatten and compute mean
-        losses = output_tensor.float().view(-1)
-        loss_mask_flat = loss_mask.view(-1)
-
-        # Compute local sum and count
-        local_loss_sum = torch.sum(losses * loss_mask_flat)
-        local_count = loss_mask_flat.sum()
 
         # For CP > 1, aggregate loss across CP ranks
         if cp_size > 1:
             # All-reduce the count across CP ranks
             total_count = local_count.clone()
-            torch.distributed.all_reduce(
+            torch.distributed.nn.all_reduce(
                 total_count,
                 op=torch.distributed.ReduceOp.SUM,
                 group=mpu.get_context_parallel_group()
@@ -287,7 +240,7 @@ class MegatronStrategy:
 
             # All-reduce the loss sum
             total_loss_sum = local_loss_sum.clone()
-            torch.distributed.all_reduce(
+            torch.distributed.nn.all_reduce(
                 total_loss_sum,
                 op=torch.distributed.ReduceOp.SUM,
                 group=mpu.get_context_parallel_group()
@@ -298,7 +251,7 @@ class MegatronStrategy:
         else:
             loss = local_loss_sum / local_count.clamp(min=1)
 
-        return loss, {'loss': loss.detach(), 'logits': output_tensor.detach()}
+        return loss, {'loss': loss.detach(), 'logits': logits.detach()}
 
     def get_model_config(
         self,

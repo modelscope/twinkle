@@ -38,6 +38,7 @@ class SelfCognitionProcessor(Preprocessor):
         problem = row['query'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
         solution = row['response'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
         messages = [
+            Message(role='system', content='You are a helpful assistant.'),
             Message(role='user', content=problem),
             Message(role='assistant', content=solution),
         ]

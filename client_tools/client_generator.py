@@ -331,8 +331,8 @@ class {class_name}({inheritance}):
     """Client wrapper for {class_name} that calls server HTTP endpoints."""
 
     def __init__({init_params}):
-        assert TWINKLE_SERVER_URL
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
 
         response = http_post(
             url=f'{{self.server_url}}/processors/create',
@@ -451,7 +451,10 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
     
     def __init__(self, model_id: str, **kwargs):
         """Initialize model client."""
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
+        
+        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
         self.server_url = f'{self.server_url}/models/{model_id}'
@@ -608,20 +611,20 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         response.raise_for_status()
         return response.json()['result']
     
-    def save(self, output_dir: str, **kwargs):
+    def save(self, name: str, **kwargs):
         """Save model checkpoint."""
         response = http_post(
             url=f'{self.server_url}/save',
-            json_data={'output_dir': output_dir, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
         
-    def load(self, input_dir: str, **kwargs):
+    def load(self, name: str, **kwargs):
         """Load model checkpoint."""
         response = http_post(
             url=f'{self.server_url}/load',
-            json_data={'input_dir': input_dir, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
@@ -630,7 +633,7 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         """Set the template for data processing."""
         response = http_post(
             url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': self.model_id, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
@@ -640,6 +643,24 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         response = http_post(
             url=f'{self.server_url}/set_processor',
             json_data={'processor_cls': processor_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
+    def calculate_metric(self, is_training: bool = True, **kwargs):
+        """Calculate metrics from model outputs."""
+        response = http_post(
+            url=f'{self.server_url}/calculate_metric',
+            json_data={'is_training': is_training, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+        return response.json()['result']
+
+    def get_state_dict(self, **kwargs):
+        """Get model state dictionary."""
+        response = http_post(
+            url=f'{self.server_url}/get_state_dict',
+            json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()['result']
@@ -670,14 +691,15 @@ def generate_samplers():
     client_module_path = src_client_path / 'sampler'
     client_module_path.mkdir(parents=True, exist_ok=True)
 
-    sampler_code = '''from typing import Any, Optional, List, Dict
+    sampler_code = '''from typing import Any, Optional, List, Dict, Union
 import uuid
-from client.http import TWINKLE_SERVER_URL
-from client.http import http_post, heartbeat_manager
+from twinkle_client.http import TWINKLE_SERVER_URL
+from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.types import SamplingParams, SampleResponse
 from twinkle import DeviceMesh
 from peft import PeftConfig
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, InputFeature
 import json
 
 
@@ -690,7 +712,9 @@ class VLLMSampler(Sampler):
     
     def __init__(self, model_id: str, **kwargs):
         """Create the sampler instance on server."""
-        self.server_url = TWINKLE_SERVER_URL
+        from twinkle_client.http import get_base_url
+        self.server_url = get_base_url()
+        
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -739,11 +763,29 @@ class VLLMSampler(Sampler):
         except:
             pass
     
-    def sample(self, trajectories: List[Trajectory], adapter_name: str = '') -> List[Trajectory]:
-        """Sample from the model using provided trajectories."""
+    def sample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        adapter_name: str = ''
+    ) -> SampleResponse:
+        """Sample from the model.
+        
+        Args:
+            inputs: List of Trajectory or InputFeature to sample from.
+            sampling_params: Sampling parameters dict.
+            adapter_name: Adapter name.
+            
+        Returns:
+            SampleResponse with sampled sequences.
+        """
         response = http_post(
             url=f'{self.server_url}/sample',
-            json_data={'trajectories': json.dumps(trajectories, ensure_ascii=False), 'adapter_name': adapter_name}
+            json_data={
+                'inputs': inputs,
+                'sampling_params': sampling_params,
+                'adapter_name': adapter_name
+            }
         )
         response.raise_for_status()
         return response.json()
@@ -754,6 +796,15 @@ class VLLMSampler(Sampler):
         response = http_post(
             url=f'{self.server_url}/sync_weights',
             json_data={'state_dict': state_dict, 'adapter_name': adapter}
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs):
+        """Set the template for encoding trajectories."""
+        response = http_post(
+            url=f'{self.server_url}/set_template',
+            json_data={'template_cls': template_cls, 'adapter_name': adapter_name, **kwargs}
         )
         response.raise_for_status()
         return response.json()

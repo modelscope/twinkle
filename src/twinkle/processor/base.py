@@ -32,10 +32,13 @@ class InputProcessor:
         'grid_thws',
     }
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, **kwargs):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None,
+                 padding_free: bool = False,
+                 **kwargs):
         self.device_mesh = device_mesh
         self.padding_side = kwargs.get('padding_side', 'right')
         self.padding_free = padding_free
+        self.return_4d_attention_mask = kwargs.get('return_4d_attention_mask', False)
 
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
@@ -72,17 +75,30 @@ class InputProcessor:
         if padding_side == 'right':
             from torch.nn.utils.rnn import pad_sequence
             return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+        else:
+            # left padding
+            import torch
+            max_len = max([s.shape[0] for s in sequences])
 
+            padded_sequences = []
+            for seq in sequences:
+                pad_length = max_len - seq.shape[0]
+                pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
+                padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), 'constant', padding_value)
+                padded_sequences.append(padded_seq)
+            return torch.stack(padded_sequences)
+
+    def _create_4d_attention_mask(self, attention_mask):
         import torch
-        max_len = max([s.shape[0] for s in sequences])
-
-        padded_sequences = []
-        for seq in sequences:
-            pad_length = max_len - seq.shape[0]
-            pad_tuple = [0] * ((seq.dim() - 1) * 2) + [pad_length, 0]
-            padded_seq = torch.nn.functional.pad(seq, tuple(pad_tuple), 'constant', padding_value)
-            padded_sequences.append(padded_seq)
-        return torch.stack(padded_sequences)
+        seq_lens = [s.shape[0] for s in attention_mask]
+        max_len = max(seq_lens)
+        attention_mask = torch.tril(torch.ones(
+            (len(seq_lens), max_len, max_len), dtype=torch.bool)).view(len(seq_lens), 1, max_len, max_len)
+        assert attention_mask.dtype is torch.bool, f'attention_mask.dtype: {attention_mask.dtype}'
+        for i, seq_len in enumerate(seq_lens):
+            attention_mask[i, :, :, seq_len:] = 0
+        attention_mask = ~attention_mask
+        return attention_mask
 
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
@@ -101,9 +117,13 @@ class InputProcessor:
         text_keys = list(dict.fromkeys(key for inp in text_inputs for key in inp.keys()))
 
         result = {}
+
         if self.padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
+                if self.return_4d_attention_mask and key == 'attention_mask':
+                    # padding_free & 4D attention_mask is not needed
+                    continue
                 if isinstance(values[0], np.ndarray):
                     value = np.expand_dims(np.concatenate(values, axis=0), axis=0)
                     value = torch.from_numpy(value)
@@ -119,8 +139,10 @@ class InputProcessor:
         else:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
-
-                if isinstance(values[0], np.ndarray):
+                if self.return_4d_attention_mask and key == 'attention_mask':
+                    values = [torch.tensor(v) for v in values]
+                    result[key] = self._create_4d_attention_mask(values)
+                elif isinstance(values[0], np.ndarray):
                     values = [torch.from_numpy(v) for v in values]
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                 elif isinstance(values[0], list) and isinstance(values[0][0], (int, float, np.number)):
@@ -148,7 +170,7 @@ class InputProcessor:
             return self._collate_macro_batch(inputs)
         elif variable_seq_lengths:
             # each macro batch has its own length
-            assert len(inputs) > micro_batch_size
+            assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))

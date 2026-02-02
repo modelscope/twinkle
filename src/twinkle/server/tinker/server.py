@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -11,9 +10,9 @@ from ray import serve
 
 from tinker import types
 
-from twinkle.server.twinkle.validation import verify_request_token
-from .state import get_server_state, schedule_task
-from .common.io_utils import TrainingRunManager, CheckpointManager
+from twinkle.server.twinkle.common.validation import verify_request_token, get_token_from_request
+from twinkle.server.twinkle.common.state import get_server_state, schedule_task
+from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 
 def build_server_app(
@@ -40,15 +39,34 @@ def build_server_app(
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
             ]
 
-        async def _proxy(self, request: Request, target_path: str) -> Response:
-            # Construct target URL on the same host
-            # Ensure we respect the current route prefix (e.g. /api/v1)
-            # when forwarding to sub-routes like /api/v1/model/...
+        def _validate_base_model(self, base_model: str) -> None:
+            """Validate that base_model is in supported_models list."""
+            supported_model_names = [
+                m.model_name for m in self.supported_models]
+            if base_model not in supported_model_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Base model '{base_model}' is not supported. "
+                    f"Supported models: {', '.join(supported_model_names)}"
+                )
+
+        def _get_base_model(self, model_id: str) -> str:
+            """Get base_model for a model_id from state metadata."""
+            metadata = self.state.get_model_metadata(model_id)
+            if metadata and metadata.get('base_model'):
+                return metadata['base_model']
+            raise HTTPException(
+                status_code=404, detail=f"Model {model_id} not found")
+
+        async def _proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
+            """Proxy request to model endpoint."""
+            body_bytes = await request.body()
+
+            # Construct target URL
             prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
             base_url = f"{request.url.scheme}://{request.url.netloc}"
-            target_url = f"{base_url}{prefix}{target_path}"
+            target_url = f"{base_url}{prefix}/model/{base_model}/{endpoint}"
 
-            # Prepare headers
             headers = dict(request.headers)
             headers.pop("host", None)
             headers.pop("content-length", None)
@@ -57,7 +75,37 @@ def build_server_app(
                 rp_ = await self.client.request(
                     method=request.method,
                     url=target_url,
-                    content=await request.body(),
+                    content=body_bytes,
+                    headers=headers,
+                    params=request.query_params,
+                )
+                return Response(
+                    content=rp_.content,
+                    status_code=rp_.status_code,
+                    headers=dict(rp_.headers),
+                    media_type=rp_.headers.get("content-type"),
+                )
+            except Exception as e:
+                return Response(content=f"Proxy Error: {str(e)}", status_code=502)
+
+        async def _proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
+            """Proxy request to sampler endpoint."""
+            body_bytes = await request.body()
+
+            # Construct target URL: /sampler/{base_model}/{endpoint}
+            prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
+            base_url = f"{request.url.scheme}://{request.url.netloc}"
+            target_url = f"{base_url}{prefix}/sampler/{base_model}/{endpoint}"
+
+            headers = dict(request.headers)
+            headers.pop("host", None)
+            headers.pop("content-length", None)
+
+            try:
+                rp_ = await self.client.request(
+                    method=request.method,
+                    url=target_url,
+                    content=body_bytes,
                     headers=headers,
                     params=request.query_params,
                 )
@@ -112,28 +160,43 @@ def build_server_app(
             return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
         @app.post("/asample")
-        async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
-            async def _do_sample():
-                return self._sample_output()
-
-            return await schedule_task(self.state, _do_sample())
-
+        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
+            """Execute text generation (inference).
+            
+            This endpoint first tries to use a local sampler if available.
+            Otherwise, it proxies the request to the sampler service.
+            """
+            model_path = body.model_path
+            base_model = body.base_model
+            
+            # If both are None, look up from sampling session
+            if not model_path and not base_model and body.sampling_session_id:
+                session = self.state.get_sampling_session(body.sampling_session_id)
+                if session:
+                    model_path = session.get('model_path')
+                    base_model = session.get('base_model')
+            
+            # Extract base_model from model_path if needed
+            if model_path and not base_model:
+                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
+                path = model_path.replace("twinkle://", "").replace("tinker://", "")
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    base_model = f"{parts[0]}/{parts[1]}"
+            
+            return await self._proxy_to_sampler(request, "asample", base_model)
+            
         @app.post("/save_weights_for_sampler")
         async def save_weights_for_sampler(
             self, request: Request, body: types.SaveWeightsForSamplerRequest
-        ) -> types.UntypedAPIFuture:
-            suffix = body.path or f"sampler-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            path = f"tinker://{body.model_id}/{suffix}"
-            sampling_session_id = None
-            if body.sampling_session_seq_id is not None:
-                sampling_session_id = f"sampling_{body.sampling_session_seq_id}"
-
-            async def _do_save():
-                return types.SaveWeightsForSamplerResponseInternal(
-                    path=path, sampling_session_id=sampling_session_id
-                )
-
-            return await schedule_task(self.state, _do_save(), model_id=body.model_id)
+        ) -> Any:
+            """Save/convert weights for inference use.
+            
+            This endpoint proxies to the model service to save weights for sampler.
+            """
+            # Proxy to model service for save_weights_for_sampler
+            base_model = self._get_base_model(body.model_id)
+            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
 
         @app.post("/retrieve_future")
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
@@ -149,11 +212,43 @@ def build_server_app(
 
         @app.get("/training_runs")
         async def get_training_runs(self, request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
-            return TrainingRunManager.list_runs(limit=limit, offset=offset)
+            """
+            List training runs for the current user.
+            
+            Uses token-based isolation to only show runs owned by the requesting user.
+            
+            Args:
+                request: FastAPI request with token in state
+                limit: Maximum number of results
+                offset: Pagination offset
+                
+            Returns:
+                TrainingRunsResponse with user's training runs
+            """
+            token = get_token_from_request(request)
+            training_run_manager = create_training_run_manager(token)
+            return training_run_manager.list_runs(limit=limit, offset=offset)
 
         @app.get("/training_runs/{run_id}")
         async def get_training_run(self, request: Request, run_id: str) -> types.TrainingRun:
-            run = TrainingRunManager.get(run_id)
+            """
+            Get a specific training run.
+            
+            Uses token-based isolation to verify user owns the run.
+            
+            Args:
+                request: FastAPI request with token in state
+                run_id: The training run identifier
+                
+            Returns:
+                TrainingRun details
+                
+            Raises:
+                HTTPException 404 if run not found in user's token directory
+            """
+            token = get_token_from_request(request)
+            training_run_manager = create_training_run_manager(token)
+            run = training_run_manager.get(run_id)
             if not run:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -161,7 +256,24 @@ def build_server_app(
 
         @app.get("/training_runs/{run_id}/checkpoints")
         async def get_run_checkpoints(self, request: Request, run_id: str) -> types.CheckpointsListResponse:
-            response = CheckpointManager.list_checkpoints(run_id)
+            """
+            List checkpoints for a training run.
+            
+            Uses token-based isolation to verify user owns the run.
+            
+            Args:
+                request: FastAPI request with token in state
+                run_id: The training run identifier
+                
+            Returns:
+                CheckpointsListResponse with list of checkpoints
+                
+            Raises:
+                HTTPException 404 if run not found in user's token directory
+            """
+            token = get_token_from_request(request)
+            checkpoint_manager = create_checkpoint_manager(token)
+            response = checkpoint_manager.list_checkpoints(run_id)
             if not response:
                 raise HTTPException(
                     status_code=404, detail=f"Training run {run_id} not found")
@@ -169,14 +281,53 @@ def build_server_app(
 
         @app.delete("/training_runs/{run_id}/checkpoints/{checkpoint_id:path}")
         async def delete_run_checkpoint(self, request: Request, run_id: str, checkpoint_id: str) -> Any:
-            CheckpointManager.delete(run_id, checkpoint_id)
-            # We return 200 (null) even if not found to be idempotent, or could raise 404
+            """
+            Delete a checkpoint from a training run.
+            
+            Uses token-based isolation to verify user owns the checkpoint.
+            
+            Args:
+                request: FastAPI request with token in state
+                run_id: The training run identifier
+                checkpoint_id: The checkpoint identifier (path)
+                
+            Returns:
+                None (200 OK) if successful
+                
+            Raises:
+                HTTPException 404 if checkpoint not found in user's token directory
+            """
+            token = get_token_from_request(request)
+            checkpoint_manager = create_checkpoint_manager(token)
+            success = checkpoint_manager.delete(run_id, checkpoint_id)
+            if not success:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Checkpoint {checkpoint_id} not found for run {run_id}"
+                )
             return None
 
         @app.post("/weights_info")
         async def weights_info(self, request: Request, body: Dict[str, Any]) -> types.WeightsInfoResponse:
+            """
+            Get weights information from a tinker path.
+            
+            Uses token-based isolation to verify user owns the weights.
+            
+            Args:
+                request: FastAPI request with token in state
+                body: Dict with 'tinker_path' key
+                
+            Returns:
+                WeightsInfoResponse with weight details
+                
+            Raises:
+                HTTPException 404 if weights not found in user's token directory
+            """
+            token = get_token_from_request(request)
+            checkpoint_manager = create_checkpoint_manager(token)
             tinker_path = body.get("tinker_path")
-            response = CheckpointManager.get_weights_info(tinker_path)
+            response = checkpoint_manager.get_weights_info(tinker_path)
             if not response:
                 raise HTTPException(
                     status_code=404, detail=f"Weights at {tinker_path} not found")
@@ -187,35 +338,36 @@ def build_server_app(
     # --- Model Proxy Endpoints ----------------------------------------
 
         @app.post("/create_model")
-        async def create_model(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/create_model")
+        async def create_model(self, request: Request, body: types.CreateModelRequest) -> Any:
+            self._validate_base_model(body.base_model)
+            return await self._proxy_to_model(request, "create_model", body.base_model)
 
         @app.post("/get_info")
-        async def get_info(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/get_info")
+        async def get_info(self, request: Request, body: types.GetInfoRequest) -> Any:
+            return await self._proxy_to_model(request, "get_info", self._get_base_model(body.model_id))
 
         @app.post("/unload_model")
-        async def unload_model(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/unload_model")
+        async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> Any:
+            return await self._proxy_to_model(request, "unload_model", self._get_base_model(body.model_id))
 
         @app.post("/forward")
-        async def forward(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/forward")
+        async def forward(self, request: Request, body: types.ForwardRequest) -> Any:
+            return await self._proxy_to_model(request, "forward", self._get_base_model(body.model_id))
 
         @app.post("/forward_backward")
-        async def forward_backward(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/forward_backward")
+        async def forward_backward(self, request: Request, body: types.ForwardBackwardRequest) -> Any:
+            return await self._proxy_to_model(request, "forward_backward", self._get_base_model(body.model_id))
 
         @app.post("/optim_step")
-        async def optim_step(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/optim_step")
+        async def optim_step(self, request: Request, body: types.OptimStepRequest) -> Any:
+            return await self._proxy_to_model(request, "optim_step", self._get_base_model(body.model_id))
 
         @app.post("/save_weights")
-        async def save_weights(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/save_weights")
+        async def save_weights(self, request: Request, body: types.SaveWeightsRequest) -> Any:
+            return await self._proxy_to_model(request, "save_weights", self._get_base_model(body.model_id))
 
         @app.post("/load_weights")
-        async def load_weights(self, request: Request) -> Any:
-            return await self._proxy(request, "/model/load_weights")
+        async def load_weights(self, request: Request, body: types.LoadWeightsRequest) -> Any:
+            return await self._proxy_to_model(request, "load_weights", self._get_base_model(body.model_id))
 
     return TinkerCompatServer.options(**deploy_options).bind(supported_models=supported_models, **kwargs)

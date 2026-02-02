@@ -2,30 +2,8 @@
 """Utility functions for Megatron-Core integration."""
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
-import threading
 
-import torch
 import torch.nn as nn
-import torch.distributed as dist
-
-import megatron.core
-from megatron.core import parallel_state as mpu
-from megatron.core.extensions.transformer_engine import (
-    TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
-)
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
-from packaging import version
-from peft import LoraConfig, get_peft_model
-
-from twinkle import Platform
-# Import lora module to register dispatch_megatron with peft
-from . import lora as _ 
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 def find_layers(model: nn.Module, cond_fn) -> List[str]:
@@ -58,8 +36,11 @@ def find_all_linears(model: nn.Module) -> List[str]:
     Returns:
         List of layer names suitable for LoRA.
     """
+    from megatron.core.extensions.transformer_engine import (
+        TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+    )
     def _cond(name: str, module: nn.Module) -> bool:
-        if name == 'output_layer':
+        if name == 'output_layer' or 'lora' in name:
             return False
         if isinstance(module, (TELinear, TELayerNormColumnParallelLinear, TEGroupedLinear, nn.Linear)):
             return True
@@ -79,7 +60,8 @@ def find_router(model: nn.Module) -> List[str]:
     Returns:
         List of router layer names.
     """
-    return find_layers(model, lambda name, module: isinstance(module, TopKRouter))
+    from megatron.core.transformer.moe.router import TopKRouter
+    return find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
 
 
 def find_embedding(model: nn.Module) -> List[str]:
@@ -93,7 +75,8 @@ def find_embedding(model: nn.Module) -> List[str]:
     Returns:
         List of embedding layer names.
     """
-    return find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding))
+    from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+    return find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
 
 
 def get_target_modules(model: nn.Module, target_modules: List[str]) -> List[str]:
@@ -127,6 +110,9 @@ def set_linear_is_expert(model: nn.Module):
     Args:
         model: The Megatron model.
     """
+    from megatron.core.extensions.transformer_engine import (
+        TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+    )
     for name, module in model.named_modules():
         if '.local_experts.' in name and isinstance(
             module, (TELinear, TELayerNormColumnParallelLinear)
@@ -207,6 +193,7 @@ def tuners_sharded_state_dict(
     Returns:
         Sharded state dictionary.
     """
+    from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
     sharded_state_dict = {}
     # Save parameters
     module._save_to_state_dict(sharded_state_dict, '', keep_vars=True)

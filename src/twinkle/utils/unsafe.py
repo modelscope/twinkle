@@ -22,4 +22,4 @@ def check_unsafe(*args, **kwargs):
 
 
 def trust_remote_code():
-    return os.environ.get("TWINKLE_TRUST_REMOTE_CODE", "0") != "0"
+    return os.environ.get("TWINKLE_TRUST_REMOTE_CODE", "1") != "0"

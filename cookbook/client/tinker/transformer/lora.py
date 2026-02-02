@@ -1,7 +1,4 @@
 #%%
-import dotenv
-dotenv.load_dotenv(".env")
-
 from twinkle_client import init_tinker_compat_client
 service_client = init_tinker_compat_client(base_url='http://localhost:8000')
 
@@ -15,6 +12,7 @@ rest_client = service_client.create_rest_client()
 
 future = rest_client.list_training_runs(limit=50)
 response = future.result()
+# resume_path = "twinkle://20260131_170251-Qwen_Qwen2_5-0_5B-Instruct-7275126c/weights/pig-latin-lora-epoch-1"
 resume_path = ""
 print(f"Found {len(response.training_runs)} training runs")
 for tr in response.training_runs:
@@ -23,11 +21,11 @@ for tr in response.training_runs:
     chpts = rest_client.list_checkpoints(tr.training_run_id).result()
     for chpt in chpts.checkpoints:
         print("  " + chpt.model_dump_json(indent=2))
-        resume_path = chpt.tinker_path  # Just get the last one for demo purposes
+        # resume_path = chpt.tinker_path  # Just get the last one for demo purposes
     
 #%%
+base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 if not resume_path:
-    base_model = "ms://Qwen/Qwen2.5-0.5B-Instruct"
     training_client = service_client.create_lora_training_client(
         base_model=base_model
     )
@@ -51,7 +49,7 @@ from tinker import types
 from modelscope import AutoTokenizer
 # Get the tokenizer from the training client
 # tokenizer = training_client.get_tokenizer() # NOTE: network call huggingface
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
  
 def process_example(example: dict, tokenizer) -> types.Datum:
     # Format the input with Input/Output template
@@ -112,16 +110,5 @@ for epoch in range(2):
     save_result = save_future.result()
     print(f"Saved checkpoint for epoch {epoch} to {save_result.path}")
 
-#%%
-# First, create a sampling client. We need to transfer weights
 sampling_client = training_client.save_weights_and_get_sampling_client(name='pig-latin-model')
  
-# Now, we can sample from the model.
-prompt = types.ModelInput.from_ints(tokenizer.encode("English: coffee break\nPig Latin:"))
-params = types.SamplingParams(max_tokens=20, temperature=0.0, stop=["\n"]) # Greedy sampling
-future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
-result = future.result()
-print("Responses:")
-for i, seq in enumerate(result.sequences):
-    print(f"{i}: {repr(tokenizer.decode(seq.tokens))}")
-# %%

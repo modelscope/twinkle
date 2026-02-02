@@ -11,10 +11,8 @@ else:
 
 
 class Trajectory(TypedDict, total=False):
-    """The input messages"""
     messages: List[Message]
     extend_message: List[Tuple[str, List[Message]]]
     tools: List[Tool]
-    generation_config: List[Tuple[str, Any]]
-    rewards: List[float]
+    advantages: float
     user_data: List[Tuple[str, Any]]

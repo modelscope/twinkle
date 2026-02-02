@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Dict, Any, List, Literal
+from typing import Dict, Any, List, Literal, Callable
 from typing import Type, Optional, Union
 
-from peft import PeftConfig, LoraConfig, load_peft_weights, PeftModel
+from peft import PeftConfig, LoraConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
@@ -29,6 +29,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  grad_scaler_config: Dict[str, Any] = None,
+                 max_loras: int = 5,
+                 max_r: int = 32,
+                 max_length: int = 8192,
                  **kwargs):
         assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -42,7 +45,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        self.multi_adapter = MultiLora()
+        self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
         self.model = self.strategy.wrap_model(self.model)
@@ -103,8 +106,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
 
     def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
-        with self.multi_adapter.adapter(adapter_name) as adapter_name:
-            return super()._create_param_group(adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
+        return super()._create_param_group(adapter_name=adapter_name, lr=lr, weight_decay=weight_decay, **kwargs)
 
     @remote_function()
     def step(self, **kwargs):
@@ -167,7 +169,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         super().set_template(template_cls, **kwargs)
 
     @remote_function()
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, Callable], **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
 
@@ -177,7 +179,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return self.multi_adapter.get_state_dict(kwargs.get("adapter_name"))
 
     @remote_function()
-    def save(self, name, output_dir=None, interval=1, **kwargs):
+    def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         with self.multi_adapter.save_context(kwargs.get("adapter_name")):
             return super().save(name, output_dir, interval, **kwargs)
@@ -216,7 +218,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter.release_lora(adapter_name)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
-        return self.multi_adapter.get_nb_trainable_parameters(adapter_name)
+        with self.multi_adapter.adapter(adapter_name):
+            return self.multi_adapter.get_nb_trainable_parameters(adapter_name)
 
     def _get_trainable_parameters_example(self, adapter_name, model):
-        return self.multi_adapter.get_trainable_parameters_example(adapter_name)
+        with self.multi_adapter.adapter(adapter_name):
+            return self.multi_adapter.get_trainable_parameters_example(adapter_name)
+    
+    def _get_trainable_parameters(self, adapter_name):
+        with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
+            return super()._get_trainable_parameters(real_adapter_name)
+

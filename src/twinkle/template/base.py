@@ -236,17 +236,27 @@ class Template:
         trajectory['messages'] = new_messages
         return [trajectory]
 
-    def _apply_chat_template(self, trajectory: Trajectory, **kwargs):
+    def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory['messages']]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
         inputs = self.processor.apply_chat_template(conversation=messages, tools=tools, padding=False,
                                            tokenize=True, return_dict=True,
-                                           add_generation_prompt=False, return_tensors='pt', **kwargs)
+                                           add_generation_prompt=add_generation_prompt, return_tensors='pt', **kwargs)
         return inputs
 
-    def encode(self, trajectory: Trajectory) -> InputFeature:
+    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
+        if self.is_mm:
+            trajectory = self._build_mm_messages(trajectory)[0]
+        
         if self.use_chat_template:
-            if self._template_support_assistant_tokens_mask:
+            if add_generation_prompt:
+                # For inference: just get input_ids with generation prompt, no labels needed
+                encoded = self._apply_chat_template(trajectory, add_generation_prompt=True)
+                input_ids = encoded.pop('input_ids')
+                if hasattr(input_ids, 'squeeze'):
+                    input_ids = input_ids.squeeze(0)
+                labels = np.full_like(input_ids, -100)  # No labels for inference
+            elif self._template_support_assistant_tokens_mask:
                 encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=True)
                 input_ids = encoded.pop('input_ids')
                 assistant_masks = encoded.pop('assistant_masks')
