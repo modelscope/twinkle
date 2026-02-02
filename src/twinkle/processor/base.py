@@ -104,13 +104,13 @@ class InputProcessor:
             # 2. For sequence_parallel with TP > 1: seq_len must be divisible by TP size
             cp_size = self.device_mesh.cp_world_size
             tp_size = self.device_mesh.tp_world_size
-            input_ids = _input.get('input_ids')
             position_ids = _input.get('position_ids')
-            attention_mask = _input.get('attention_mask')
-            batch_labels = _input.get('labels')
 
-            if input_ids is not None:
-                seq_len = input_ids.shape[1]
+            def pad_cp_inputs(input_tensor: torch.Tensor, padding_value: int) -> torch.Tensor:
+                if input_tensor is None:
+                    return input_tensor
+
+                seq_len = input_tensor.shape[1]
 
                 # Calculate required divisor based on parallelism settings
                 if cp_size > 1:
@@ -122,28 +122,29 @@ class InputProcessor:
 
                 if divisor > 1 and seq_len % divisor != 0:
                     pad_len = divisor - (seq_len % divisor)
-                    # Pad input_ids
-                    input_ids = torch.nn.functional.pad(input_ids,
+                    input_tensor = torch.nn.functional.pad(input_tensor,
                                                         (0, pad_len),
-                                                        value=0)
-                    # Pad labels if present
-                    if batch_labels is not None:
-                        batch_labels = torch.nn.functional.pad(batch_labels,
-                                                               (0, pad_len),
-                                                               value=-100)
-                    # Pad attention_mask if present
-                    if attention_mask is not None:
-                        attention_mask = torch.nn.functional.pad(
-                            attention_mask, (0, pad_len), value=0)
-                    # Pad position_ids if present
-                    if position_ids is not None:
-                        position_ids = torch.nn.functional.pad(position_ids,
-                                                               (0, pad_len),
-                                                               value=0)
-            _input['input_ids'] = input_ids
-            _input['position_ids'] = position_ids
-            _input['attention_mask'] = attention_mask
-            _input['labels'] = batch_labels
+                                                        value=padding_value)
+                return input_tensor
+
+            if cp_size > 1:
+                position_ids_f = position_ids.flatten()
+                indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
+                cu_seqlens = torch.cat([
+                    indices_q[position_ids_f == 0],
+                    torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
+                ])
+
+                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
+                    value = _input[key]
+                    result = []
+                    for i in range(cu_seqlens.shape[0]):
+                        if i == cu_seqlens.shape[0] - 1:
+                            break
+                        _value_slice = value[:, cu_seqlens[i]:cu_seqlens[i + 1]]
+                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map[key]))
+                    value = torch.cat(result, dim=1)
+                    _input[key] = value
             return _input
 
         return [_pad_cp(_inp) for _inp in inputs]
@@ -158,44 +159,40 @@ class InputProcessor:
             position_ids = inputs.get('position_ids')
             attention_mask = inputs.get('attention_mask')
             batch_labels = inputs.get('labels')
+            packed_seq_params: PackedSeqParams = inputs.get('packed_seq_params')
+            if packed_seq_params is not None:
+                cu_seqlens_q = getattr(packed_seq_params, 'cu_seqlens_q', None)
+            else:
+                cu_seqlens_q = None
 
-            def split_tensor_for_cp(tensor, dim=-1):
-                """
-                Split tensor along sequence dimension for Context Parallel.
-
-                With causal masking, split into 2*CP chunks and assign alternating
-                chunks to balance workload across CP ranks.
-                For CP rank i: chunks [i, 2*CP-1-i]
-                """
-                if tensor is None or cp_size <= 1:
-                    return tensor
-
+            def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: Optional[torch.Tensor], dim: int):
+                if inputs is None:
+                    return inputs
                 if dim < 0:
-                    dim = (dim + tensor.ndim) % tensor.ndim
-
-                seq_len = tensor.shape[dim]
-
-                # Reshape to [batch, 2*cp_size, seq_per_chunk, ...]
-                view_shape = list(tensor.shape)
-                view_shape[dim:dim + 1] = [2 * cp_size, seq_len // (2 * cp_size)]
-                reshaped = tensor.view(*view_shape)
-
-                # Select chunks [cp_rank, 2*cp_size-1-cp_rank]
-                index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)],
-                                     device='cpu',
-                                     pin_memory=True).cuda(non_blocking=True)
-                selected = reshaped.index_select(dim, index)
-
-                # Reshape back: [batch, 2*seq_per_chunk, ...]
-                out_shape = list(tensor.shape)
-                out_shape[dim] = seq_len // cp_size
-                return selected.reshape(*out_shape)
+                    dim = (dim + inputs.ndim) % inputs.ndim
+                new_inputs = []
+                for i in range(1 if cu_seqlens is None else (cu_seqlens.shape[0] - 1)):
+                    if cu_seqlens is None:
+                        val = inputs
+                    else:
+                        slices = [slice(None)] * inputs.ndim
+                        slices[dim] = slice(cu_seqlens[i], cu_seqlens[i + 1])
+                        val = inputs[tuple(slices)]
+                    view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] // (2 * cp_size),
+                                  *inputs.shape[dim + 1:])
+                    val = val.view(view_shape)
+                    index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
+                                         pin_memory=True).cuda(non_blocking=True)
+                    val = val.index_select(dim, index)
+                    view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
+                    new_inputs.append(val.view(view_shape))
+                return torch.cat(new_inputs, dim=dim)
 
             if cp_size > 1:
-                input_ids = split_tensor_for_cp(input_ids, dim=-1)
-                position_ids = split_tensor_for_cp(position_ids, dim=-1)
-                attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
-                batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
+                input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
+                position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=1)
+                attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
+                batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
             inputs['input_ids'] = input_ids
             inputs['position_ids'] = position_ids
