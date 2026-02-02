@@ -183,6 +183,107 @@ class InputProcessor:
                 output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
         return output
 
+    def _split_cp(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+
+        cp_size = self.device_mesh.cp_world_size
+        cp_rank = self.device_mesh.cp_rank
+        input_ids = inputs.get('input_ids')
+        position_ids = inputs.get('position_ids')
+        attention_mask = inputs.get('attention_mask')
+        batch_labels = inputs.get('labels')
+
+        def split_tensor_for_cp(tensor, dim=-1):
+            """
+            Split tensor along sequence dimension for Context Parallel.
+
+            With causal masking, split into 2*CP chunks and assign alternating
+            chunks to balance workload across CP ranks.
+            For CP rank i: chunks [i, 2*CP-1-i]
+            """
+            if tensor is None or cp_size <= 1:
+                return tensor
+
+            if dim < 0:
+                dim = (dim + tensor.ndim) % tensor.ndim
+
+            seq_len = tensor.shape[dim]
+
+            # Reshape to [batch, 2*cp_size, seq_per_chunk, ...]
+            view_shape = list(tensor.shape)
+            view_shape[dim:dim + 1] = [2 * cp_size, seq_len // (2 * cp_size)]
+            reshaped = tensor.view(*view_shape)
+
+            # Select chunks [cp_rank, 2*cp_size-1-cp_rank]
+            index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)],
+                                 device='cpu',
+                                 pin_memory=True).cuda(non_blocking=True)
+            selected = reshaped.index_select(dim, index)
+
+            # Reshape back: [batch, 2*seq_per_chunk, ...]
+            out_shape = list(tensor.shape)
+            out_shape[dim] = seq_len // cp_size
+            return selected.reshape(*out_shape)
+
+        if cp_size > 1:
+            input_ids = split_tensor_for_cp(input_ids, dim=-1)
+            position_ids = split_tensor_for_cp(position_ids, dim=-1)
+            attention_mask = split_tensor_for_cp(attention_mask, dim=-1)
+            batch_labels = split_tensor_for_cp(batch_labels, dim=-1)
+
+        inputs['input_ids'] = input_ids
+        inputs['position_ids'] = position_ids
+        inputs['attention_mask'] = attention_mask
+        inputs['labels'] = batch_labels
+        return inputs
+
+    def _pad_cp(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # Pad sequence for parallel compatibility
+        # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
+        # 2. For sequence_parallel with TP > 1: seq_len must be divisible by TP size
+        cp_size = self.device_mesh.cp_world_size
+        tp_size = self.device_mesh.tp_world_size
+        input_ids = inputs.get('input_ids')
+        position_ids = inputs.get('position_ids')
+        attention_mask = inputs.get('attention_mask')
+        batch_labels = inputs.get('labels')
+
+        if input_ids is not None:
+            seq_len = input_ids.shape[1]
+
+            # Calculate required divisor based on parallelism settings
+            if cp_size > 1:
+                divisor = 2 * cp_size
+            elif self.device_mesh.sequence_parallel and tp_size > 1:
+                divisor = tp_size
+            else:
+                divisor = 1
+
+            if divisor > 1 and seq_len % divisor != 0:
+                pad_len = divisor - (seq_len % divisor)
+                # Pad input_ids
+                input_ids = torch.nn.functional.pad(input_ids,
+                                                    (0, pad_len),
+                                                    value=0)
+                # Pad labels if present
+                if batch_labels is not None:
+                    batch_labels = torch.nn.functional.pad(batch_labels,
+                                                           (0, pad_len),
+                                                           value=-100)
+                # Pad attention_mask if present
+                if attention_mask is not None:
+                    attention_mask = torch.nn.functional.pad(
+                        attention_mask, (0, pad_len), value=0)
+                # Pad position_ids if present
+                if position_ids is not None:
+                    position_ids = torch.nn.functional.pad(position_ids,
+                                                           (0, pad_len),
+                                                           value=0)
+        inputs['input_ids'] = input_ids
+        inputs['position_ids'] = position_ids
+        inputs['attention_mask'] = attention_mask
+        inputs['labels'] = batch_labels
+        return inputs
+
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> Dict[str, Any]:
         import torch
 
@@ -220,7 +321,6 @@ class InputProcessor:
                     value = values
                 result[key] = value
             result = InputFeature(**result)
-            result['packed_seq_params'] = InputProcessor._get_packed_seq_params(result['position_ids'])
         else:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
@@ -246,6 +346,10 @@ class InputProcessor:
                 elif isinstance(values[0], torch.Tensor):
                     result[field] = torch.cat(values, dim=0)
 
+        result = self._pad_cp(result)
+        if padding_free:
+            result['packed_seq_params'] = InputProcessor._get_packed_seq_params(result['position_ids'])
+        result = self._split_cp(result)
         return result
 
     @remote_function()

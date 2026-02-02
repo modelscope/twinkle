@@ -344,11 +344,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
-            batch = self.strategy.split_inputs_for_cp(batch)
             input_ids = batch.get('input_ids')
             position_ids = batch.get('position_ids')
             attention_mask = batch.get('attention_mask')
-            batch_labels = batch.get('labels')
 
             extra_kwargs = self.get_extra_vlm_kwargs(batch)
 
