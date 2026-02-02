@@ -344,22 +344,11 @@ class MegatronModel(TwinkleModel, nn.Module):
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
-            input_ids = batch.get('input_ids')
-            position_ids = batch.get('position_ids')
-            attention_mask = batch.get('attention_mask')
-
-            extra_kwargs = self.get_extra_vlm_kwargs(batch)
-
-            # Forward pass with labels - Megatron will compute loss internally
-            # This uses Megatron's compute_language_model_loss which properly handles
-            # vocab parallel cross entropy
+            labels = batch.pop('labels', None)
             output_tensor = model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                # labels=batch_labels,  # Pass labels to let Megatron compute loss
-                **extra_kwargs,
+                **batch
             )
+            batch['labels'] = labels
             return output_tensor, partial(post_loss_function, inputs=batch)
 
         # Get Megatron's forward-backward function
@@ -1006,14 +995,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         expr += f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n'
 
         return expr
-
-    def get_extra_vlm_kwargs(self, batch):
-        extra_kwargs = {}
-        for key in ['pixel_values', 'pixel_values_videos', 'image_grid_thw', 
-                    'video_grid_thw', 'packed_seq_params']:
-            if key in batch and batch[key] is not None:
-                extra_kwargs[key] = batch[key]
-        return extra_kwargs
 
     def initialize(self, **kwargs) -> None:
         if self._initialized:
