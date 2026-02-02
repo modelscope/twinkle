@@ -14,10 +14,11 @@ from tinker import types
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.validation import verify_request_token
-from twinkle.server.utils.state import get_server_state, ServerStateProxy, schedule_task
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.utils.logger import get_logger
 
 from .common import TwinkleCompatTransformersModel, TwinkleCompatMegatronModel
+from .common.task_queue import TaskQueueMixin, TaskQueueConfig
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
@@ -29,6 +30,7 @@ def build_model_app(model_id: str,
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
+                    queue_config: Optional[Dict[str, Any]] = None,
                     **kwargs):
     app = FastAPI()
 
@@ -38,12 +40,13 @@ def build_model_app(model_id: str,
 
     @serve.deployment(name='ModelManagement')
     @serve.ingress(app)
-    class ModelManagement():
+    class ModelManagement(TaskQueueMixin):
 
         COUNT_DOWN = 60 * 30
 
         def __init__(self, nproc_per_node: int, device_group: Dict[str, Any],
-                     device_mesh: Dict[str, Any], use_megatron: bool = False, **kwargs):
+                     device_mesh: Dict[str, Any], use_megatron: bool = False,
+                     queue_config: Optional[Dict[str, Any]] = None, **kwargs):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray',
                                nproc_per_node=nproc_per_node,
@@ -72,6 +75,7 @@ def build_model_app(model_id: str,
             self.hb_thread.start()
             self.adapter_lock = threading.Lock()
             self.state: ServerStateProxy = get_server_state()
+            self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
             self.per_token_model_limit = int(
                 os.environ.get('TWINKLE_PER_USER_MODEL_LIMIT', 30))
             self.key_token_dict = {}
@@ -151,9 +155,11 @@ def build_model_app(model_id: str,
 
                 return types.CreateModelResponse(model_id=model_id)
 
-            return await schedule_task(self.state,
-                                       _create_adapter(),
-                                       model_id=model_id)
+            return await self.schedule_task(
+                _create_adapter(),
+                model_id=model_id,
+                token=request.state.token,
+            )
 
         @app.post('/get_info')
         async def get_info(
@@ -197,9 +203,11 @@ def build_model_app(model_id: str,
                 self.state.unload_model(body.model_id)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
-            return await schedule_task(self.state,
-                                       _do_unload(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_unload(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/forward')
         async def forward(
@@ -231,9 +239,16 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_forward(),
-                                       model_id=body.model_id)
+            # Calculate input tokens for rate limiting
+            input_tokens = sum(
+                len(d.model_input.to_ints()) for d in body.forward_input.data
+            )
+            return await self.schedule_task(
+                _do_forward(),
+                model_id=body.model_id,
+                token=request.state.token,
+                input_tokens=input_tokens,
+            )
 
         @app.post('/forward_backward')
         async def forward_backward(
@@ -274,9 +289,16 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_forward_backward(),
-                                       model_id=body.model_id)
+            # Calculate input tokens for rate limiting
+            input_tokens = sum(
+                len(d.model_input.to_ints()) for d in body.forward_backward_input.data
+            )
+            return await self.schedule_task(
+                _do_forward_backward(),
+                model_id=body.model_id,
+                token=request.state.token,
+                input_tokens=input_tokens,
+            )
 
         @app.post('/optim_step')
         async def optim_step(
@@ -299,9 +321,11 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_optim(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_optim(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/save_weights')
         async def save_weights(
@@ -342,9 +366,11 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_save(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_save(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/save_weights_for_sampler')
         async def save_weights_for_sampler(
@@ -397,9 +423,11 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_save_for_sampler(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_save_for_sampler(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/load_weights')
         async def load_weights(
@@ -433,9 +461,11 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_load(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_load(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
     return ModelManagement.options(**deploy_options).bind(
-        nproc_per_node, device_group, device_mesh, use_megatron, **kwargs)
+        nproc_per_node, device_group, device_mesh, use_megatron, queue_config, **kwargs)

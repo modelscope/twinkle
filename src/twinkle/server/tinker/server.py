@@ -11,7 +11,7 @@ from ray import serve
 from tinker import types
 
 from twinkle.server.utils.validation import verify_request_token, get_token_from_request
-from twinkle.server.utils.state import get_server_state, schedule_task
+from twinkle.server.utils.state import get_server_state
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 
@@ -159,51 +159,46 @@ def build_server_app(
                 body.model_dump())
             return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
-        @app.post("/asample")
-        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
-            """Execute text generation (inference).
-            
-            This endpoint first tries to use a local sampler if available.
-            Otherwise, it proxies the request to the sampler service.
-            """
-            model_path = body.model_path
-            base_model = body.base_model
-            
-            # If both are None, look up from sampling session
-            if not model_path and not base_model and body.sampling_session_id:
-                session = self.state.get_sampling_session(body.sampling_session_id)
-                if session:
-                    model_path = session.get('model_path')
-                    base_model = session.get('base_model')
-            
-            # Extract base_model from model_path if needed
-            if model_path and not base_model:
-                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
-                path = model_path.replace("twinkle://", "").replace("tinker://", "")
-                parts = path.split("/")
-                if len(parts) >= 2:
-                    base_model = f"{parts[0]}/{parts[1]}"
-            
-            return await self._proxy_to_sampler(request, "asample", base_model)
-            
-        @app.post("/save_weights_for_sampler")
-        async def save_weights_for_sampler(
-            self, request: Request, body: types.SaveWeightsForSamplerRequest
-        ) -> Any:
-            """Save/convert weights for inference use.
-            
-            This endpoint proxies to the model service to save weights for sampler.
-            """
-            # Proxy to model service for save_weights_for_sampler
-            base_model = self._get_base_model(body.model_id)
-            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
-
         @app.post("/retrieve_future")
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
+            """Retrieve the result of an async task.
+            
+            This endpoint handles task lifecycle states:
+            - 404: Task not found (request_id doesn't exist)
+            - 408: Task still processing (pending/queued/running) - client should retry
+            - 429: Rate limited - client should back off
+            - 200: Task completed (success or failure)
+            
+            Returns:
+                Task result on success, or appropriate HTTP error.
+            """
             record = self.state.get_future(body.request_id)
             if record is None:
                 raise HTTPException(status_code=404, detail="Future not found")
-            result = record["result"]
+            
+            status = record.get("status")
+            
+            # Task is still being processed - return 408 to indicate client should retry
+            if status in ("pending", "queued", "running"):
+                raise HTTPException(
+                    status_code=408,
+                    detail="Request still pending",
+                    headers={"X-Queue-State": status}
+                )
+            
+            # Task was rejected due to rate limiting
+            if status == "rate_limited":
+                reason = record.get("reason", "Rate limit exceeded")
+                raise HTTPException(
+                    status_code=429,
+                    detail=reason,
+                    headers={"X-Queue-State": "paused_rate_limit", "X-Queue-State-Reason": reason}
+                )
+            
+            # Task completed (either successfully or with error) - return the result
+            result = record.get("result")
+            if result is None:
+                raise HTTPException(status_code=500, detail="Task completed but no result found")
             if hasattr(result, "model_dump"):
                 return result.model_dump()
             return result
@@ -369,5 +364,46 @@ def build_server_app(
         @app.post("/load_weights")
         async def load_weights(self, request: Request, body: types.LoadWeightsRequest) -> Any:
             return await self._proxy_to_model(request, "load_weights", self._get_base_model(body.model_id))
+
+    # --- Sampler Proxy Endpoints ----------------------------------------
+    
+        @app.post("/asample")
+        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
+            """Execute text generation (inference).
+            
+            This endpoint first tries to use a local sampler if available.
+            Otherwise, it proxies the request to the sampler service.
+            """
+            model_path = body.model_path
+            base_model = body.base_model
+            
+            # If both are None, look up from sampling session
+            if not model_path and not base_model and body.sampling_session_id:
+                session = self.state.get_sampling_session(body.sampling_session_id)
+                if session:
+                    model_path = session.get('model_path')
+                    base_model = session.get('base_model')
+            
+            # Extract base_model from model_path if needed
+            if model_path and not base_model:
+                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
+                path = model_path.replace("twinkle://", "").replace("tinker://", "")
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    base_model = f"{parts[0]}/{parts[1]}"
+            
+            return await self._proxy_to_sampler(request, "asample", base_model)
+            
+        @app.post("/save_weights_for_sampler")
+        async def save_weights_for_sampler(
+            self, request: Request, body: types.SaveWeightsForSamplerRequest
+        ) -> Any:
+            """Save/convert weights for inference use.
+            
+            This endpoint proxies to the model service to save weights for sampler.
+            """
+            # Proxy to model service for save_weights_for_sampler
+            base_model = self._get_base_model(body.model_id)
+            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
 
     return TinkerCompatServer.options(**deploy_options).bind(supported_models=supported_models, **kwargs)

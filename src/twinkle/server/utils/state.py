@@ -1,13 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-import asyncio
 import re
 import time
-import traceback
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import ray
 
@@ -177,6 +175,56 @@ class ServerState:
         """Retrieve a stored future result."""
         return self.futures.get(request_id)
 
+    def store_future_status(
+        self,
+        request_id: str,
+        status: str,
+        model_id: Optional[str],
+        reason: Optional[str] = None,
+        result: Any = None,
+    ) -> None:
+        """Store task status with optional result.
+        
+        This method supports the full task lifecycle:
+        - PENDING: Task created, waiting to be processed
+        - QUEUED: Task in queue waiting for execution
+        - RUNNING: Task currently executing
+        - COMPLETED: Task completed successfully (result required)
+        - FAILED: Task failed with error (result contains error payload)
+        - RATE_LIMITED: Task rejected due to rate limiting (reason required)
+        
+        Args:
+            request_id: Unique identifier for the request.
+            status: Task status string (pending/queued/running/completed/failed/rate_limited).
+            model_id: Optional associated model_id.
+            reason: Optional reason string (used for rate_limited status).
+            result: Optional result data (used for completed/failed status).
+        """
+        # Serialize result if it has model_dump method
+        if result is not None and hasattr(result, 'model_dump'):
+            result = result.model_dump()
+        
+        future_data: Dict[str, Any] = {
+            'status': status,
+            'model_id': model_id,
+            'updated_at': datetime.now().isoformat(),
+        }
+        
+        # Include reason for rate_limited status
+        if reason is not None:
+            future_data['reason'] = reason
+        
+        # Include result for completed/failed status
+        if result is not None:
+            future_data['result'] = result
+        
+        # Update or create the future entry
+        if request_id in self.futures:
+            self.futures[request_id].update(future_data)
+        else:
+            future_data['created_at'] = datetime.now().isoformat()
+            self.futures[request_id] = future_data
+
     # ----- Config Management (from ConfigRegistry) -----
 
     def add_config(self, key: str, value: Any):
@@ -273,6 +321,19 @@ class ServerStateProxy:
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_future.remote(request_id))
 
+    def store_future_status(
+        self,
+        request_id: str,
+        status: str,
+        model_id: Optional[str],
+        reason: Optional[str] = None,
+        result: Any = None,
+    ) -> None:
+        """Store task status with optional result (synchronous)."""
+        ray.get(self._actor.store_future_status.remote(
+            request_id, status, model_id, reason, result
+        ))
+
     # ----- Config Management -----
 
     def add_config(self, key: str, value: Any):
@@ -325,41 +386,3 @@ def init_config_registry(actor_name: str = 'twinkle_server_state') -> ServerStat
     init_config_registry from validation.py.
     """
     return get_server_state(actor_name)
-
-
-async def schedule_task(
-    state: ServerStateProxy,
-    coro: Any,
-    model_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Schedule an async task and store its result in state.
-    
-    This function wraps an async coroutine, executes it in the background,
-    and stores the result (or error) in the server state for later retrieval.
-    
-    Args:
-        state: The ServerStateProxy to store results in
-        coro: The coroutine to execute
-        model_id: Optional model_id to associate with the result
-        
-    Returns:
-        A dict containing request_id and model_id for future retrieval
-    """
-    request_id = f"req_{uuid.uuid4().hex}"
-
-    async def _runner():
-        try:
-            val = await coro
-            await state.store_future(request_id, val, model_id)
-        except Exception:
-            # Structure the error so the client SDK can interpret it
-            err_payload = {
-                'error': traceback.format_exc(),
-                'category': 'Server'
-            }
-            await state.store_future(request_id, err_payload, model_id)
-
-    # Schedule execution in the background
-    asyncio.create_task(_runner())
-    return {'request_id': request_id, 'model_id': model_id}
