@@ -31,8 +31,7 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.model.base import TwinkleModel
-from twinkle.model.moe import apply_expert_parallel
-from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
+from twinkle.model.transformers.strategy import AccelerateStrategy
 from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
 
@@ -66,7 +65,7 @@ class OptimizerGroup:
         return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
-        if self._device_mesh.data_world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+        if self._device_mesh.data_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
         self.train_metrics = [
             LossMetric(self._device_mesh, self._dp_group, loss_reduction='sum'),
@@ -152,8 +151,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                  **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         super(PreTrainedModel, self).__init__()
-        gradient_accumulation_steps = kwargs.pop('gradient_accumulation_steps', None)
-        tokenizer_id = kwargs.pop('tokenizer_id', None)
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
@@ -162,26 +159,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             model_id = HubOperation.download_model(model_id)
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
-        self.tokenizer_id = tokenizer_id or self.model_id
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.ddp_config = ddp_config
-        self.fsdp_config = fsdp_config
-        use_native_fsdp = device_mesh is not None and device_mesh.has_dim("ep") and device_mesh.ep_world_size > 1
-        if use_native_fsdp:
-            self.strategy = NativeFSDPStrategy(mixed_precision=mixed_precision,
-                                               fsdp_config=fsdp_config,
-                                               device_mesh=device_mesh)
-        else:
-            self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
-                                               fsdp_config=fsdp_config, device_mesh=device_mesh)
+        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
+                                           fsdp_config=fsdp_config, device_mesh=device_mesh)
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
-        if gradient_accumulation_steps is not None:
-            self.optimizer_group[_default_adapter_name].gradient_accumulation_steps = gradient_accumulation_steps
 
     @staticmethod
     def _not_encoded(inputs):
@@ -190,43 +177,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            if (self.device_mesh is not None
-                    and getattr(self.device_mesh, "mesh", None) is not None
-                    and self.device_mesh.mesh.size > 1
-                    and torch.distributed.is_available()
-                    and not torch.distributed.is_initialized()):
-                if torch.cuda.is_available():
-                    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-                    torch.cuda.set_device(local_rank)
-                    backend = 'nccl'
-                else:
-                    backend = 'gloo'
-                torch.distributed.init_process_group(backend=backend)
-            if torch.cuda.is_available():
-                device = torch.device("cuda", torch.cuda.current_device())
-                if self.mixed_precision == "bf16":
-                    self.model.to(device=device, dtype=torch.bfloat16)
-                elif self.mixed_precision == "fp16":
-                    self.model.to(device=device, dtype=torch.float16)
-                else:
-                    self.model.to(device=device)
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
             assert len(optimizer_groups) == 1
             optimizer_group = optimizer_groups[0]
             optimizer = optimizer_group.optimizer
             assert optimizer 
-            if self.device_mesh is not None and self.device_mesh.has_dim("ep") and self.device_mesh.ep_world_size > 1:
-                ep_config = None
-                if self.fsdp_config is not None:
-                    ep_config = self.fsdp_config.get("expert_parallel") or self.fsdp_config.get("ep_config")
-                if ep_config is None:
-                    ep_config = {
-                        "enabled": True,
-                        "router_dtype": "fp32",
-                        "all_to_all": "torch",
-                        "keep_router_logits": False,
-                    }
-                apply_expert_parallel(self.model, self.device_mesh, config=ep_config)
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             optimizer_group.optimizer = optimizer
             self._model_wrapped = True
@@ -404,7 +359,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             if scaler is not None:
                 scaler.unscale_(optimizer)
 
+            num_tokens = optimizer_config.num_tokens
+            num_tokens = torch_util.gather_object([num_tokens], self.device_mesh, optimizer_config._dp_group)
+            num_tokens = sum(num_tokens)
             parameters = self._get_trainable_parameters(adapter_name).values()
+            for p in parameters:
+                if p.grad is not None:
+                    p.grad.div_(num_tokens)
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, norm_type=norm_type)
             # Convert DTensor to local tensor for FSDP2 compatibility
             grad_norm = torch_util.to_local_tensor(grad_norm)
@@ -453,17 +414,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 "params": [
                     p for n, p in params.items() if (n in decay_parameters and p.requires_grad)
                 ],
-                "param_names": [
-                    n for n, p in params.items() if (n in decay_parameters and p.requires_grad)
-                ],
                 "weight_decay": weight_decay, 'lr': lr
             },
             {
                 "params": [
                     p for n, p in params.items() if (n not in decay_parameters and p.requires_grad)
-                ],
-                "param_names": [
-                    n for n, p in params.items() if (n not in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": 0.0, 'lr': lr
             },
@@ -491,8 +446,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
             context = implicit_replication
-        elif self.device_mesh is not None and getattr(self.device_mesh, "mesh", None) is not None and self.device_mesh.mesh.size > 1:
-            context = torch._C.DisableTorchFunction
 
         optim_params = kwargs.pop('optim_params', {})
         if optim_params:

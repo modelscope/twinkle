@@ -89,11 +89,11 @@ def main():
     parser.add_argument("--model-id", type=str,
                         required=True, help="Local path or HF ID")
     parser.add_argument("--dataset-id", type=str,
-                        default=os.environ.get("QWEN3_DATASET_ID", "ms://modelscope/competition_math"))
+                        default=os.environ.get("QWEN3_DATASET_ID", "path/to/alpaca/dataset"))
     parser.add_argument("--num-layers", type=int, default=1,
                         help="Override num_hidden_layers (default: 1)")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--seq-len", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--grad-accum-steps", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -152,7 +152,7 @@ def main():
         model.parameters(), lr=args.lr, foreach=False)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id, trust_remote_code=True, local_files_only=args.local_files_only)
+        args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -244,7 +244,8 @@ def main():
             dist.all_reduce(loss_val, op=dist.ReduceOp.SUM)
             loss_val = loss_val / world_size
             if rank == 0:
-                print(f"[step {step // args.grad_accum_steps}] loss={loss_val.item():.6f}")
+                print(
+                    f"[step {step // args.grad_accum_steps}] loss={loss_val.item():.6f}")
 
     dist.barrier()
     dist.destroy_process_group()
