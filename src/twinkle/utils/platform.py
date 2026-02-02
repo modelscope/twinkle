@@ -403,6 +403,7 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
+    gpus_per_worker: int = 1
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
 
