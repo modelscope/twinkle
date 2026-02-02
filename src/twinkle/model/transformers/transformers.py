@@ -249,7 +249,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_config.num_tokens += (labels >= 0).sum().item()
         self._accumulate_metric(optimizer_config, is_training=True)
         outputs = self.model(**inputs)
-        if self.sp_strategy is not None:
+        if self.sp_strategy is not None and labels is None:
             outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
@@ -286,7 +286,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config, is_training=False)
             outputs = self.model(**inputs)
-            if self.sp_strategy is not None:
+            if self.sp_strategy is not None and labels is None:
                 outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
