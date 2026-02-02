@@ -121,6 +121,7 @@ def build_sampler_app(model_id: str,
             self.adapter_records[full_adapter_name] = 0
             self.key_token_dict[full_adapter_name] = request.state.token
 
+        # TODO: check if this is needed
         @app.post("/sync_weights")
         def sync_weights(self, request, *, state_dict: Dict[str, Any], adapter_name: str = ''):
             self.assert_adapter_valid(adapter_name)

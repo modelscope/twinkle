@@ -4,7 +4,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Type, Union, Callable
+from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Type, Union, Callable
 
 import torch
 import torch.distributed as dist
@@ -866,6 +866,42 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         return self._get_trainable_parameters(adapter_name)
+
+    def get_hf_state_dict(self, adapter_name: str = '') -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get model weights in HuggingFace format as a generator.
+        
+        This method exports Megatron model weights to HuggingFace format using
+        the bridge's export_weights method. Returns a generator to avoid OOM
+        for large models - weights are converted one by one.
+        
+        This is the preferred method for weight synchronization to vLLM, as it:
+        1. Converts Megatron format to HF format on-the-fly
+        2. Uses generator pattern to avoid loading all weights into memory
+        3. Works with IPCWeightLoader's bucket-based transfer
+        
+        Args:
+            adapter_name: Name of the adapter. Empty string for base model.
+            
+        Yields:
+            Tuple of (parameter_name, tensor) in HuggingFace format.
+            
+        Example:
+            >>> for name, tensor in model.get_hf_state_dict():
+            ...     print(f"{name}: {tensor.shape}")
+        """
+        is_peft_format = bool(adapter_name)
+        model = self.strategy.unwrap_model(self.model)
+        
+        # Use bridge's export_weights which returns a generator
+        # This converts Megatron format to HF format on-the-fly
+        yield from self._bridge.export_weights(
+            model,
+            target_device=None,  # Keep on current device for IPC transfer
+            only_last_rank=False,  # All ranks participate in weight sync
+            is_peft_format=is_peft_format,
+            adapter_name=adapter_name if adapter_name else 'default',
+            tqdm_desc='Weight sync: ',
+        )
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy

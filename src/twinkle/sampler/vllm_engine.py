@@ -632,6 +632,15 @@ class VLLMEngine(BaseSamplerEngine):
         elif hasattr(self.engine, 'reset_mm_cache'):
             await self.engine.reset_mm_cache() # Do we need this?
 
+    async def update_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        adapter_name: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        # not use, TODO: remove this method
+        await self.engine.model_runner.model.load_weights(weights)
+
     async def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""
         await self.engine.abort(request_id)
