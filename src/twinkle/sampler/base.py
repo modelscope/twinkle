@@ -12,7 +12,7 @@ from twinkle.sampler.types import SamplingParams, SampleResponse
 import twinkle
 
 from twinkle.utils import construct_class
-
+from twinkle import remote_function
 
 @dataclass
 class SampleGroup:
@@ -120,6 +120,7 @@ class Sampler(ABC):
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
         return template.decode(token_ids)
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
@@ -128,12 +129,14 @@ class Sampler(ABC):
         if adapter_name == '' or self.template is None:
             self.template = template
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs):
         adapter_name = kwargs.pop("adapter_name", None) or ''
         self._check_adapter_valid(adapter_name)
         processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
         self.sample_group[adapter_name].processor = processor
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig) -> None:
         if adapter_name in self.sample_group and adapter_name != self._default_adapter_name:
             return
@@ -152,6 +155,7 @@ class Sampler(ABC):
     def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
         pass
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def remove_adapter(self, adapter_name: str) -> None:
         if adapter_name and adapter_name in self.sample_group:
             self.sample_group.pop(adapter_name)

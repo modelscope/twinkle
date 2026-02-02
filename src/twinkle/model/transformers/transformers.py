@@ -32,6 +32,7 @@ from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.model.base import TwinkleModel
 from twinkle.model.transformers.strategy import AccelerateStrategy
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
 
@@ -166,6 +167,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.mixed_precision = mixed_precision
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
                                            fsdp_config=fsdp_config, device_mesh=device_mesh)
+        enable_sp = False
+        if device_mesh is not None:
+            sp_size = device_mesh.ulysses_size
+            enable_sp = bool(sp_size and sp_size > 1)
+        self.sp_strategy = (
+            SequenceParallelStrategy(
+                device_mesh,
+                {},
+                model=self.model,
+                tokenizer_id=self.tokenizer_id,
+            )
+            if enable_sp
+            else None
+        )
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
@@ -182,6 +197,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_group = optimizer_groups[0]
             optimizer = optimizer_group.optimizer
             assert optimizer 
+            if self.sp_strategy is not None:
+                self.sp_strategy.initialize()
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             optimizer_group.optimizer = optimizer
             self._model_wrapped = True
@@ -218,11 +235,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
+        if self.sp_strategy is not None:
+            inputs = self.sp_strategy.preprocess_inputs(inputs)
         labels: torch.Tensor = inputs.pop('labels', None)
         if labels is not None:
             optimizer_config.num_tokens += (labels >= 0).sum().item()
         self._accumulate_metric(optimizer_config, is_training=True)
         outputs = self.model(**inputs)
+        if self.sp_strategy is not None:
+            outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
@@ -253,9 +274,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs)
+            if self.sp_strategy is not None:
+                inputs = self.sp_strategy.preprocess_inputs(inputs)
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config, is_training=False)
             outputs = self.model(**inputs)
+            if self.sp_strategy is not None:
+                outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs

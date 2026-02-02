@@ -891,7 +891,6 @@ class MegatronModel(TwinkleModel, nn.Module):
                 config = config_or_dir
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
-                _origin_target_modules = config.target_modules
                 if config.target_modules:
                     if isinstance(config.target_modules, str):
                         target_modules = [config.target_modules]
@@ -905,7 +904,6 @@ class MegatronModel(TwinkleModel, nn.Module):
                     _model = get_peft_model(_model,
                                            config,
                                            adapter_name=adapter_name)
-                config.target_modules = _origin_target_modules
                 # setting average_gradients_across_tp_domain
                 for m in _model.modules():
                     if isinstance(m, LoraLinear):

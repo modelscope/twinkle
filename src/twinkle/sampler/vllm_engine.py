@@ -14,6 +14,8 @@ from twinkle import remote_class, remote_function
 from .base_engine import BaseSamplerEngine
 from .types import StopReason, SamplingParams, SampleResponse, SampledSequence
 
+import inspect
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,7 +196,7 @@ class VLLMEngine(BaseSamplerEngine):
         quantization: Optional[str] = None,
         load_format: str = "auto",
         logprobs_mode: Optional[str] = None,
-        engine_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
         from twinkle.hub import HubOperation
         model_id = HubOperation.download_model(model_id)
@@ -214,7 +216,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.quantization = quantization
         self.load_format = load_format
         self.logprobs_mode = logprobs_mode
-        self.engine_kwargs = engine_kwargs or {}
+        self.engine_kwargs = kwargs or {}
         
         # LoRA adapter manager for multi-tenant mode
         self.adapter_manager = LoRAAdapterManager(model_id, max_loras) if enable_lora else None
@@ -269,10 +271,19 @@ class VLLMEngine(BaseSamplerEngine):
             engine_config["max_loras"] = self.max_loras
             engine_config["max_lora_rank"] = get_vllm_max_lora_rank(self.max_lora_rank)
         
-        engine_config.update(self.engine_kwargs)
+        # Enable worker extension for weight synchronization
+        engine_config["worker_extension_cls"] = (
+            "twinkle.sampler.vllm_worker_extension.TwinkleWorkerExtension"
+        )
         
+        engine_config.update(self.engine_kwargs)
+        valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
+        filtered_engine_config = {k: v for k, v in engine_config.items() if k in valid_args}
+        invalid_args = set(engine_config.keys()) - set(valid_args)
+        if invalid_args:
+            logger.warning(f"VLLMEngine: Filtered out invalid arguments: {invalid_args}")
         # Create engine using vLLM v1 API
-        engine_args = AsyncEngineArgs(**engine_config)
+        engine_args = AsyncEngineArgs(**filtered_engine_config)
         vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
         
         engine = AsyncLLM.from_vllm_config(
@@ -293,7 +304,7 @@ class VLLMEngine(BaseSamplerEngine):
     # Core Sampling API
     # =========================================================================
     
-    @remote_function(collect='flatten')
+    @remote_function()
     async def sample(
         self,
         prompt_token_ids: List[int],
@@ -457,40 +468,6 @@ class VLLMEngine(BaseSamplerEngine):
         )
 
     @remote_function()
-    async def update_weights(
-        self,
-        weights: Union[Dict[str, torch.Tensor], Generator[Tuple[str, torch.Tensor], None, None]],
-    ) -> None:
-        """
-        Update model weights directly.
-        
-        This uses vLLM's native load_weights via collective_rpc.
-        Suitable for colocated training scenarios (same process).
-        
-        For disaggregated training (different processes), use CUDA IPC via
-        the checkpoint engine pattern (see verl for reference).
-        
-        Args:
-            weights: Dict or generator of (name, tensor) pairs.
-        """
-        # Convert generator to list if needed
-        if not isinstance(weights, dict):
-            weights = list(weights)
-        else:
-            weights = list(weights.items())
-        
-        # Use collective_rpc to update weights on all workers
-        await self.engine.collective_rpc(
-            method="load_weights",
-            args=(weights,),
-        )
-        
-        # Reset prefix cache after weight update
-        await self.clear_kv_cache()
-        
-        logger.info(f"Updated {len(weights)} weight tensors")
-    
-    @remote_function()
     async def save_weights_for_sampler(
         self,
         user_id: str,
@@ -612,10 +589,10 @@ class VLLMEngine(BaseSamplerEngine):
             logger.warning("sleep_mode not enabled, skipping sleep")
             return
         
-        await self.engine.collective_rpc("sleep", kwargs={"level": level})
+        await self.engine.sleep(level=level)
         logger.debug(f"Engine sleeping at level {level}")
     
-    async def wake_up(self, tags: Optional[List[str]] = None) -> None:
+    async def wake_up(self, tags: Optional[List[str]] = None, reload_weights: bool = False) -> None:
         """
         Resume weights and/or KV cache to GPU memory.
         
@@ -624,6 +601,9 @@ class VLLMEngine(BaseSamplerEngine):
         Args:
             tags: What to resume. Options: ['weights', 'kv_cache'].
                   If None, resumes both.
+            reload_weights: If True and level 2 sleep was used (weights discarded),
+                  reload weights from disk via collective_rpc("reload_weights").
+
         """
         if not self.enable_sleep_mode:
             logger.warning("sleep_mode not enabled, skipping wake_up")
@@ -633,6 +613,14 @@ class VLLMEngine(BaseSamplerEngine):
             tags = ["weights", "kv_cache"]
         
         await self.engine.wake_up(tags=tags)
+        
+        if reload_weights and "weights" in tags:
+            try:
+                await self.engine.collective_rpc("reload_weights")
+                logger.debug("Weights reloaded after wake_up")
+            except Exception as e:
+                logger.warning(f"Failed to reload weights: {e}")
+        
         await self.clear_kv_cache()
         
         logger.debug(f"Engine waking up with tags: {tags}")

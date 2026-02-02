@@ -124,7 +124,6 @@ class InputProcessor:
 
     @staticmethod
     def _get_packed_seq_params(position_ids):
-        position_ids = position_ids.squeeze()
         assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
         position_ids_f = position_ids.flatten()
         indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
@@ -156,7 +155,7 @@ class InputProcessor:
             # multiple 0/1, multiple sequences
             zero_count = np.sum(position_ids == 0)
             one_count = np.sum(position_ids == 1)
-            is_padding_free = is_padding_free and (zero_count > 1 and one_count > 1)
+            is_padding_free = is_padding_free or (zero_count > 1 and one_count > 1)
         return is_padding_free
 
     @staticmethod
@@ -180,7 +179,10 @@ class InputProcessor:
                  'logits_to_keep', 'num_items_in_batch', 'packed_seq_params']
         for key in list(feature.keys()):
             if key in _keys:
-                output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
+                if key != 'packed_seq_params':
+                    output[key] = np.array(feature[key]) if not isinstance(feature[key], torch.Tensor) else feature[key]
+                else:
+                    output[key] = feature[key]
         return output
 
     def _split_cp(self, inputs: Dict[str, Any]) -> Dict[str, Any]:

@@ -1,5 +1,6 @@
 import os
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 from peft import LoraConfig
 import twinkle
 from tqdm import tqdm
@@ -40,7 +41,7 @@ def eval(model):
     return metrics
 
 def train():
-    dataset = PackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)

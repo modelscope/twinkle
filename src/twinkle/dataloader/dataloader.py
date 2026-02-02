@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from functools import partial
 from typing import Callable, Union, Optional, Type
-
+import os
 import twinkle.processor
 from twinkle import DeviceMesh, remote_function, framework_util
 from twinkle import remote_class

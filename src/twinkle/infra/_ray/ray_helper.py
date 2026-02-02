@@ -314,6 +314,10 @@ class RayHelper:
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
 
+                # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
+                # This is critical for multi-GPU workers (gpus_per_worker > 1)
+                env_vars['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
+                
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
