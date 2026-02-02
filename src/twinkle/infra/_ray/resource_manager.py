@@ -104,16 +104,14 @@ class ResourceManager:
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
-                
+
                 if gpus_per_worker > 1:
-                    # Multi-GPU per worker mode: group consecutive GPUs together
-                    # This is useful for vLLM with tensor parallelism
                     if len(ranks) % gpus_per_worker != 0:
                         raise ValueError(
                             f"DeviceGroup '{group.name}': number of ranks ({len(ranks)}) "
                             f"must be divisible by gpus_per_worker ({gpus_per_worker})"
                         )
-                    
+
                     num_workers = len(ranks) // gpus_per_worker
                     for worker_idx in range(num_workers):
                         # Get the GPU ranks for this worker
@@ -138,7 +136,6 @@ class ResourceManager:
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
-                    # Original behavior: one GPU per worker
                     for rank in ranks:
                         node_rank = rank // nproc_per_node
                         gpu_rank = rank % nproc_per_node
