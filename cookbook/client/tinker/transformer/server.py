@@ -1,5 +1,8 @@
 import os
 os.environ['RAY_DEBUG'] = '1'
+# from  swift.megatron.init import init_megatron
+# os.environ['MEGATRON_LM_PATH'] = '/mnt/nas2/hujinghan.hjh/Megatron-LM'
+# init_megatron()
 import ray
 from omegaconf import OmegaConf
 from ray import serve

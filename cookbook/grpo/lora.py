@@ -282,6 +282,59 @@ def wait_result(result):
         return result()
     return result
 
+def log(msg):
+    """Print message with timestamp."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+from twinkle import remote_class
+@remote_class()
+class HybridModelSamplerActor:
+    """Hybrid actor that fuses training model and sampler in same process.
+    
+    This simulates the Hybrid mode where:
+    - Training model (TransformersModel) holds the real weights
+    - vLLM Sampler starts with dummy/random weights
+    - Weight sync happens via IPCWeightLoader (CUDA IPC + ZMQ)
+    """
+
+    def __init__(
+        self, 
+        model_id: str, 
+        device_mesh: DeviceMesh = None,
+        remote_group: str = None,
+        **kwargs
+    ):
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        log(f"[Rank {rank}] Initializing HybridModelSamplerActor...")
+        
+        # Initialize sampler with dummy weights (random initialization)
+        self.sampler = VLLMSampler(
+            model_id=model_id,
+            engine_args={
+                'load_format': 'dummy',  # Random weights
+                'gpu_memory_utilization': 0.4,
+                'max_model_len': 2048,
+                'enforce_eager': True,
+                'enable_sleep_mode': True,
+            },
+        )
+        self.sampler.set_template(Template, model_id=model_id)
+        log(f"[Rank {rank}] VLLMSampler initialized with dummy weights")
+        
+        # Initialize training model with real weights
+        self.model = TransformersModel(model_id=model_id, device_mesh=device_mesh)
+        log(f"[Rank {rank}] TransformersModel initialized with real weights")
+        
+        # Initialize weight loader for Hybrid mode (CUDA IPC)
+        self.weight_loader = IPCWeightLoader(
+            model=self.model,
+            sampler=self.sampler,
+            bucket_size_mb=512,
+        )
+        log(f"[Rank {rank}] IPCWeightLoader initialized")
 
 # ========== Main ==========
 def main():
@@ -307,6 +360,11 @@ def main():
     
     # Dataset
     dataset = create_countdown_dataset()
+    hybrid_actor = HybridModelSamplerActor(
+        model_id=MODEL_ID,
+        device_mesh=device_mesh,
+        remote_group='hybrid',
+    )
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=BATCH_SIZE,
@@ -315,12 +373,7 @@ def main():
         num_workers=0,
     )
     
-    # Actor model
-    actor_model = TransformersModel(
-        model_id=MODEL_ID,
-        device_mesh=device_mesh,
-        remote_group='hybrid',
-    )
+    actor_model = hybrid_actor.model
     lora_config = LoraConfig(target_modules="all-linear")
     actor_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=8)
     actor_model.set_optimizer('AdamW', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
@@ -331,17 +384,7 @@ def main():
     logger.info(actor_model.get_train_configs(adapter_name=ADAPTER_NAME))
     
     # Sampler (with sleep mode for hybrid)
-    sampler = VLLMSampler(
-        model_id=MODEL_ID,
-        engine_args={
-            'gpu_memory_utilization': 0.4,
-            'max_model_len': 8192,
-            'enable_sleep_mode': True,
-            'load_format': 'dummy',  # Weights will be synced via IPC
-        },
-        device_mesh=device_mesh,
-        remote_group='hybrid',
-    )
+    sampler = hybrid_actor.sampler
     sampler.set_template('Template', model_id=MODEL_ID)
     
     # Tokenizer

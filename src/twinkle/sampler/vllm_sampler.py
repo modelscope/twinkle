@@ -273,7 +273,8 @@ class VLLMSampler(Sampler):
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
-        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        # adapter_name: str = '',
         *,
         num_samples: int = 1,
     ) -> SampleResponse:

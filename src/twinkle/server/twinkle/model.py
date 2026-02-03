@@ -11,7 +11,6 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model import MultiLoraTransformersModel, MultiLoraMegatronModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.utils.validation import verify_request_token
@@ -148,6 +147,8 @@ def build_model_app(model_id: str,
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
             if use_megatron:
+                from twinkle.model import MultiLoraMegatronModel
+
                 self.model = MultiLoraMegatronModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
@@ -155,6 +156,7 @@ def build_model_app(model_id: str,
                     **kwargs
                 )
             else:
+                from twinkle.model import MultiLoraTransformersModel
                 self.model = MultiLoraTransformersModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
