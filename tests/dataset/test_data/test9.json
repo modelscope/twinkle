@@ -1,0 +1,14 @@
+[
+  {"student_id": "S001", "name": "Alice", "age": 20, "major": "Computer Science", "gpa": 3.8, "courses": ["CS101", "MATH201", "PHYS101"], "enrollment_year": 2022},
+  {"student_id": "S002", "name": "Bob", "age": 21, "major": "Mathematics", "gpa": 3.9, "courses": ["MATH201", "MATH301", "STAT201"], "enrollment_year": 2021},
+  {"student_id": "S003", "name": "Charlie", "age": 19, "major": "Physics", "gpa": 3.7, "courses": ["PHYS101", "PHYS201", "MATH201"], "enrollment_year": 2023},
+  {"student_id": "S004", "name": "Diana", "age": 20, "major": "Computer Science", "gpa": 3.95, "courses": ["CS101", "CS201", "MATH201"], "enrollment_year": 2022},
+  {"student_id": "S005", "name": "Eve", "age": 22, "major": "Mathematics", "gpa": 3.6, "courses": ["MATH301", "MATH401", "STAT201"], "enrollment_year": 2020},
+  {"student_id": "S006", "name": "Frank", "age": 20, "major": "Physics", "gpa": 3.85, "courses": ["PHYS201", "PHYS301", "MATH301"], "enrollment_year": 2022},
+  {"student_id": "S007", "name": "Grace", "age": 21, "major": "Computer Science", "gpa": 3.75, "courses": ["CS201", "CS301", "MATH201"], "enrollment_year": 2021},
+  {"student_id": "S008", "name": "Henry", "age": 19, "major": "Mathematics", "gpa": 3.9, "courses": ["MATH201", "MATH301", "CS101"], "enrollment_year": 2023},
+  {"student_id": "S009", "name": "Ivy", "age": 20, "major": "Physics", "gpa": 3.8, "courses": ["PHYS101", "PHYS201", "MATH201"], "enrollment_year": 2022},
+  {"student_id": "S010", "name": "Jack", "age": 21, "major": "Computer Science", "gpa": 3.7, "courses": ["CS101", "CS201", "PHYS101"], "enrollment_year": 2021},
+  {"student_id": "S011", "name": "Kate", "age": 20, "major": "Mathematics", "gpa": 3.95, "courses": ["MATH301", "MATH401", "CS201"], "enrollment_year": 2022},
+  {"student_id": "S012", "name": "Leo", "age": 22, "major": "Physics", "gpa": 3.65, "courses": ["PHYS301", "PHYS401", "MATH301"], "enrollment_year": 2020}
+]

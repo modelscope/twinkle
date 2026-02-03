@@ -1,0 +1,15 @@
+{"transaction_id": "T001", "customer_id": "C001", "amount": 150.50, "currency": "USD", "payment_method": "credit_card", "status": "completed", "timestamp": "2024-01-01T09:00:00Z", "items": ["item1", "item2"]}
+{"transaction_id": "T002", "customer_id": "C002", "amount": 75.25, "currency": "EUR", "payment_method": "paypal", "status": "completed", "timestamp": "2024-01-01T09:15:00Z", "items": ["item3"]}
+{"transaction_id": "T003", "customer_id": "C001", "amount": 200.00, "currency": "USD", "payment_method": "debit_card", "status": "pending", "timestamp": "2024-01-01T09:30:00Z", "items": ["item4", "item5"]}
+{"transaction_id": "T004", "customer_id": "C003", "amount": 50.75, "currency": "GBP", "payment_method": "credit_card", "status": "completed", "timestamp": "2024-01-01T09:45:00Z", "items": ["item6"]}
+{"transaction_id": "T005", "customer_id": "C002", "amount": 300.00, "currency": "EUR", "payment_method": "paypal", "status": "failed", "timestamp": "2024-01-01T10:00:00Z", "items": ["item7", "item8"]}
+{"transaction_id": "T006", "customer_id": "C004", "amount": 125.50, "currency": "USD", "payment_method": "credit_card", "status": "completed", "timestamp": "2024-01-01T10:15:00Z", "items": ["item9"]}
+{"transaction_id": "T007", "customer_id": "C001", "amount": 80.25, "currency": "USD", "payment_method": "debit_card", "status": "completed", "timestamp": "2024-01-01T10:30:00Z", "items": ["item10", "item11"]}
+{"transaction_id": "T008", "customer_id": "C005", "amount": 250.00, "currency": "EUR", "payment_method": "credit_card", "status": "completed", "timestamp": "2024-01-01T10:45:00Z", "items": ["item12"]}
+{"transaction_id": "T009", "customer_id": "C003", "amount": 95.50, "currency": "GBP", "payment_method": "paypal", "status": "pending", "timestamp": "2024-01-01T11:00:00Z", "items": ["item13", "item14"]}
+{"transaction_id": "T010", "customer_id": "C002", "amount": 175.75, "currency": "EUR", "payment_method": "debit_card", "status": "completed", "timestamp": "2024-01-01T11:15:00Z", "items": ["item15"]}
+{"transaction_id": "T011", "customer_id": "C006", "amount": 60.00, "currency": "USD", "payment_method": "credit_card", "status": "completed", "timestamp": "2024-01-01T11:30:00Z", "items": ["item16"]}
+{"transaction_id": "T012", "customer_id": "C001", "amount": 220.50, "currency": "USD", "payment_method": "paypal", "status": "completed", "timestamp": "2024-01-01T11:45:00Z", "items": ["item17", "item18"]}
+{"transaction_id": "T013", "customer_id": "C004", "amount": 140.25, "currency": "EUR", "payment_method": "debit_card", "status": "completed", "timestamp": "2024-01-01T12:00:00Z", "items": ["item19"]}
+{"transaction_id": "T014", "customer_id": "C007", "amount": 90.00, "currency": "GBP", "payment_method": "credit_card", "status": "failed", "timestamp": "2024-01-01T12:15:00Z", "items": ["item20"]}
+{"transaction_id": "T015", "customer_id": "C002", "amount": 110.75, "currency": "EUR", "payment_method": "paypal", "status": "completed", "timestamp": "2024-01-01T12:30:00Z", "items": ["item21", "item22"]}
