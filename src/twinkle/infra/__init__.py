@@ -1,11 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
+import logging
 import os
 from typing import Literal, List, Optional, Union, Callable, Any
 from typing import TypeVar
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform
 from twinkle.utils import requires, framework_util, check_unsafe
@@ -86,6 +89,16 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         requires('ray')
         from ._ray import RayHelper
         assert groups is not None
+        # Auto-fill visible_devices from env if missing (mirrors server-side builder wrapper).
+        for group in groups:
+            if getattr(group, 'visible_devices', None):
+                continue
+            device_type = (group.device_type or '').upper()
+            if device_type == 'CPU':
+                continue
+            visible_devices = Platform.resolve_visible_devices(device_type)
+            if visible_devices:
+                group.visible_devices = visible_devices
         # groups is needed for ray
         _device_group = groups
         RayHelper.initialize(nproc_per_node=nproc_per_node,
@@ -484,11 +497,61 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # not remote_group: Ray mode with local component
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
+                    visible_env = os.environ.get('TWINKLE_VISIBLE_ENV')
+                    visible_devices = os.environ.get('TWINKLE_VISIBLE_DEVICES')
+                    if visible_env and visible_devices:
+                        # Restore the real visible devices inside the worker process.
+                        os.environ[visible_env] = visible_devices
+
+                    # Ensure each worker selects the correct local device early.
+                    # This must happen before any model/distributed init; otherwise torch_npu
+                    # may default multiple ranks to device 0.
+                    try:
+                        from twinkle.utils.framework import Torch
+                        Torch.set_device()
+                    except Exception:
+                        pass
                     seed = int(os.environ.get('TWINKLE_SEED', _seed))
                     determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
                     framework_util.seed_everything(seed, bool(determinism))
                     # Ensure torch.distributed is initialized inside Ray workers.
                     if os.environ.get('WORKER_NAME'):
+                        try:
+                            import torch
+                            import torch.distributed as dist
+                            if dist.is_available() and not dist.is_initialized():
+                                if torch.cuda.is_available():
+                                    backend = 'nccl'
+                                elif hasattr(torch, 'npu') and torch.npu.is_available():
+                                    try:
+                                        import torch_npu  # noqa: F401
+                                        backend = 'hccl'
+                                    except Exception:
+                                        # torch_npu not available, fall back to gloo
+                                        logger.warning(
+                                            "torch.npu is available but torch_npu import failed, "
+                                            "falling back to gloo backend"
+                                        )
+                                        backend = 'gloo'
+                                else:
+                                    backend = 'gloo'
+                                dist.init_process_group(backend=backend, init_method='env://')
+                            if os.environ.get("TWINKLE_DEBUG_WORLD_SIZE", "0") == "1":
+                                try:
+                                    ws = dist.get_world_size() if dist.is_initialized() else None
+                                except Exception:
+                                    ws = None
+                                logger.info(
+                                    "dist status: initialized=%s world_size=%s RANK=%s LOCAL_RANK=%s WORLD_SIZE=%s",
+                                    dist.is_initialized(),
+                                    ws,
+                                    os.environ.get("RANK"),
+                                    os.environ.get("LOCAL_RANK"),
+                                    os.environ.get("WORLD_SIZE"),
+                                )
+                        except Exception:
+                            pass
+
                         # This will depress the warnings of megatron and reduce overhead
                         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
                         # This will prevent the unlimited threads started by torch

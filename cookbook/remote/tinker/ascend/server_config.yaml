@@ -1,0 +1,97 @@
+proxy_location: EveryNode
+http_options:
+  host: 0.0.0.0
+  port: 9009
+
+applications:
+  - name: server
+    route_prefix: /api/v1
+    import_path: main:build_server_app
+    args:
+      supported_models:
+        - model_name: "Qwen/Qwen3-0.6B"
+
+    deployments:
+      - name: TwinkleServer
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+        logging_config:
+          log_level: DEBUG
+
+  - name: models-Qwen2.5-7B-Instruct
+    # route_prefix 需要是 HTTP 路径前缀；不要用本地文件路径
+    route_prefix: /api/v1/model/Qwen/Qwen3-0.6B
+    import_path: main:model_qwen25_7B
+    args:
+      model_id: "/home/zyh/model/Qwen3-0.6B"
+      nproc_per_node: 2
+      device_group:
+        name: model
+        # 这里的 ranks 是 Twinkle/Ray 的"逻辑 rank"，不是物理 NPU 号。
+        # 物理卡选择由 ASCEND_RT_VISIBLE_DEVICES 控制；显式写入可见设备，避免 worker 环境丢失。
+        ranks: [0,1]
+        device_type: npu
+        visible_devices: "8,9"
+      device_mesh:
+        device_type: npu
+        mesh: [0,1]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: sampler-Qwen3-0.6B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3-0.6B
+    import_path: main:build_sampler_app
+    args:
+      model_id: "/home/zyh/model/Qwen3-0.6B"
+      nproc_per_node: 1
+      sampler_type: torch
+      device_group:
+        name: sampler
+        ranks: 1
+        device_type: CPU
+      device_mesh:
+        device_type: cpu
+        mesh: [0]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  # - name: processor
+  #   route_prefix: /processors
+  #   import_path: main:processor_app
+  #   args:
+  #     nproc_per_node: 2
+  #     ncpu_proc_per_node: 2
+  #     device_group:
+  #       name: model
+  #       ranks: 2
+  #       device_type: CPU
+  #     device_mesh:
+  #       device_type: CPU
+  #       mesh: [0,1]
+  #       mesh_dim_names: ['dp']
+  #   deployments:
+  #     - name: ProcessorManagement
+  #       autoscaling_config:
+  #         min_replicas: 1
+  #         max_replicas: 1
+  #         target_ongoing_requests: 128
+  #       ray_actor_options:
+  #         num_cpus: 0.1

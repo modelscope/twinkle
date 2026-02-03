@@ -1,10 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import logging
 import math
+import os
 from typing import Dict, List
 
 from twinkle import DeviceGroup
 from twinkle import Platform
 
+logger = logging.getLogger(__name__)
 
 class ResourceManager:
 
@@ -12,6 +15,16 @@ class ResourceManager:
                  nproc_per_node: int,
                  ncpu_proc_per_node: int,
                  groups: List[DeviceGroup]):
+        # CPU placement group default strategy:
+        # - Old approach: use node_cpu//4 as CPU bundle per node, even if only 1~2 CPU processes are needed,
+        #   this creates a huge PG (e.g., 640 CPU node requests 160 CPU PG).
+        # - Ray PG uses "PACK" scheduling: once cluster has scattered CPU usage by other actors,
+        #   such large CPU PGs may stay pending forever, causing Serve replica's __init__ to hang.
+        # - New strategy: request based on "actual CPU processes needed on node * CPUs per process",
+        #   with node_cpu//4 as the upper bound.
+        cpu_pg_cpus_per_proc = int(os.environ.get("TWINKLE_CPU_PG_CPUS_PER_PROC", 1))
+        cpu_pg_cpus_per_proc = max(cpu_pg_cpus_per_proc, 1)
+
         import ray
         from ray.util.placement_group import PlacementGroup
         all_ranks = []
@@ -63,27 +76,48 @@ class ResourceManager:
 
         bundles = []
         cpu_bundles = []
+
+        # GPU/NPU placement groups: keep existing strategy (CPU= node_cpu//2) to avoid affecting training/inference throughput assumptions.
         for i in range(self.nnodes):
             node = self.nodes[i]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
-            cpu_bundles.append({'CPU': max(node_cpu // 4, 1)})
+
+        # CPU placement groups: only create when there are actual CPU processes to allocate.
+        cpu_nnodes = 0
+        if cpu_proc_count > 0:
+            cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
+            assert cpu_nnodes <= len(self.nodes), (
+                f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
+                f'available: {len(self.nodes)}'
+            )
+            for i in range(cpu_nnodes):
+                node = self.nodes[i]
+                node_cpu = int(node['Resources']['CPU'])
+                # How many CPU processes will actually be placed on this node (last node may have fewer than ncpu_proc_per_node)
+                procs_on_node = min(
+                    ncpu_proc_per_node,
+                    max(cpu_proc_count - i * ncpu_proc_per_node, 0),
+                )
+                # Use node_cpu//4 as the upper bound of "at most 1/4 CPU usage", but don't request 160 CPU for just 1~2 processes.
+                node_cap = max(node_cpu // 4, 1)
+                need = max(procs_on_node * cpu_pg_cpus_per_proc, 1)
+                cpu_bundles.append({'CPU': min(node_cap, need)})
 
         self.cpu_node_map = {}
         for i in range(cpu_proc_count):
             node_idx = i // ncpu_proc_per_node
-            cpu_cnt = cpu_bundles[node_idx]['CPU']
-            cpu_per_proc = cpu_cnt // ncpu_proc_per_node # cpus per process
-            assert cpu_per_proc >= 1
-            self.cpu_node_map[i] = (node_idx, cpu_per_proc)
+            # We don't strictly assert CPU per proc >= 1 here because for tail nodes with fewer processes,
+            # the allocated CPU might be small (e.g. 1 process needs 1 CPU, but ncpu_proc_per_node=8).
+            self.cpu_node_map[i] = (node_idx, 1)
 
         self.placement_groups = [ray.util.placement_group([bundle]) for bundle in bundles]
         self.cpu_placement_groups = [ray.util.placement_group([bundle]) for bundle in cpu_bundles]
-        cpu_bundles.sort(key=lambda bundle: bundle['CPU'], reverse=True)
         if self.placement_groups:
             ray.get([pg.ready() for pg in self.placement_groups])
-        ray.get([pg.ready() for pg in self.cpu_placement_groups])
+        if self.cpu_placement_groups:
+            ray.get([pg.ready() for pg in self.cpu_placement_groups])
 
         self.node_ranks = []
         if self.placement_groups:
@@ -103,31 +137,33 @@ class ResourceManager:
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
+                # ranks is only used to declare "how many processes/devices", should not participate in physical device mapping.
+                # When visible devices are already trimmed by ASCEND_RT_VISIBLE_DEVICES etc.,
+                # logical ranks may be non-contiguous like [8,9], need to normalize them in order.
+                normalized_ranks = list(range(len(ranks)))
 
                 if gpus_per_worker > 1:
-                    # For vllm, a single process may occupy multiple gpus
-                    if len(ranks) % gpus_per_worker != 0:
+                    if len(normalized_ranks) % gpus_per_worker != 0:
                         raise ValueError(
-                            f"DeviceGroup '{group.name}': number of ranks ({len(ranks)}) "
+                            f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
                             f"must be divisible by gpus_per_worker ({gpus_per_worker})"
                         )
 
-                    num_workers = len(ranks) // gpus_per_worker
+                    num_workers = len(normalized_ranks) // gpus_per_worker
                     for worker_idx in range(num_workers):
-                        # Get the GPU ranks for this worker
                         start_idx = worker_idx * gpus_per_worker
-                        worker_ranks = ranks[start_idx:start_idx + gpus_per_worker]
-                        
+                        worker_ranks = normalized_ranks[start_idx:start_idx + gpus_per_worker]
+
                         # All GPUs for a worker should be on the same node
                         node_ranks = [r // nproc_per_node for r in worker_ranks]
                         gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
-                        
+
                         if len(set(node_ranks)) > 1:
                             raise ValueError(
                                 f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
                                 f"Each worker's GPUs must be on the same node."
                             )
-                        
+
                         node_rank = node_ranks[0]
                         local_device_groups.append(
                             dict(
@@ -136,17 +172,24 @@ class ResourceManager:
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
-                    for rank in ranks:
-                        node_rank = rank // nproc_per_node
-                        gpu_rank = rank % nproc_per_node
+                    for alloc_rank in normalized_ranks:
+                        node_rank = alloc_rank // nproc_per_node
+                        gpu_rank = alloc_rank % nproc_per_node
                         local_device_groups.append(
                             dict(
                                 node_rank=node_rank,
                                 gpu_rank=[gpu_rank],
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
-                
+
                 self.device_groups[group.name] = local_device_groups
+                if os.environ.get("TWINKLE_DEBUG_GPW", "0") == "1":
+                    logger.info(
+                        "DeviceGroup '%s' gpus_per_worker=%s local_device_groups=%s",
+                        group.name,
+                        gpus_per_worker,
+                        local_device_groups,
+                    )
                 
                 # Update the group's ranks to reflect actual worker count
                 if gpus_per_worker > 1:

@@ -152,7 +152,6 @@ def build_sampler_app(model_id: str,
                     sampling_params = None
                     if body.sampling_params:
                         sampling_params = TwinkleSamplingParams(
-                            num_samples=body.num_samples or 1,
                             max_tokens=body.sampling_params.max_tokens or 256,
                             temperature=body.sampling_params.temperature or 1.0,
                             top_p=body.sampling_params.top_p,
@@ -160,25 +159,38 @@ def build_sampler_app(model_id: str,
                             stop=body.sampling_params.stop,
                         )
                     
+                    # Only request logprobs when the client asks for them. Some backends may
+                    # return None entries in logprobs, which breaks pydantic validation.
+                    want_logprobs = bool(body.prompt_logprobs) or (body.topk_prompt_logprobs or 0) > 0
                     response = await self.sampler.engine.sample(
                         prompt_token_ids=prompt_token_ids,
                         sampling_params=sampling_params,
                         num_samples=body.num_samples or 1,
-                        logprobs=True,
+                        logprobs=want_logprobs,
                         include_prompt_logprobs=body.prompt_logprobs or False,
                         topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
                         adapter_uri=adapter_uri,
                     )
                     
                     # Convert twinkle SampleResponse to tinker types.SampleResponse
-                    tinker_sequences = [
-                        types.SampledSequence(
-                            stop_reason=seq.stop_reason,
-                            tokens=list(seq.tokens),
-                            logprobs=list(seq.logprobs) if seq.logprobs else None,
+                    tinker_sequences = []
+                    for seq in response.sequences:
+                        logprobs = None
+                        if seq.logprobs is not None:
+                            if any(lp is None for lp in seq.logprobs):
+                                # Fix: backend can emit None logprobs for some tokens, which triggers
+                                # pydantic "Input should be a valid number" errors in SampleResponse.
+                                # We drop the field to keep the response valid.
+                                logprobs = None
+                            else:
+                                logprobs = list(seq.logprobs)
+                        tinker_sequences.append(
+                            types.SampledSequence(
+                                stop_reason=seq.stop_reason,
+                                tokens=list(seq.tokens),
+                                logprobs=logprobs,
+                            )
                         )
-                        for seq in response.sequences
-                    ]
                     return types.SampleResponse(
                         sequences=tinker_sequences,
                         prompt_logprobs=response.prompt_logprobs,
