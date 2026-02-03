@@ -231,10 +231,6 @@ def build_model_app(model_id: str,
                             self.adapter_records[adapter_name] = 0
                         self.model.set_processor('InputProcessor',
                                                  adapter_name=adapter_name)
-                        # When use_megatron is True, we don't need to set the loss
-                        if not self.use_megatron:
-                            self.model.set_loss('CrossEntropyLoss',
-                                            adapter_name=adapter_name)
                         self.model.set_optimizer('Adam',
                                                  adapter_name=adapter_name)
 
