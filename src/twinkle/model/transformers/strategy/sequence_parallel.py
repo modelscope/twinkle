@@ -74,6 +74,43 @@ def _get_sp_group_from_device_mesh(
     device_mesh: Optional[DeviceMesh],
     sp_size: int,
 ) -> Optional[dist.ProcessGroup]:
+    """Return the SP (sequence-parallel) process group for the current rank.
+
+    If the mesh defines an explicit "sp" dimension, use it directly. Otherwise,
+    derive SP groups by chunking data-parallel ranks (dp/fsdp) while keeping
+    all other mesh dimensions (tp/pp/ep/etc.) fixed.
+
+    Example (no explicit "sp" dim, sp_size=2):
+        mesh_dim_names = ("dp", "fsdp", "tp")
+        mesh = np.arange(8).reshape(2, 2, 2)
+        # coords are (dp, fsdp, tp). dp/fsdp are "data" dims; tp is "non-data".
+        # raw_data_rank = dp * fsdp_world_size + fsdp, so ranges [0..3].
+        # group_id = raw_data_rank // sp_size partitions data ranks into 2 groups.
+        #
+        # For tp=0:
+        #   data ranks 0,1 -> group_id=0  => ranks at coords:
+        #     (dp=0,fsdp=0,tp=0) -> rank 0
+        #     (dp=0,fsdp=1,tp=0) -> rank 2
+        #   data ranks 2,3 -> group_id=1  => ranks at coords:
+        #     (dp=1,fsdp=0,tp=0) -> rank 4
+        #     (dp=1,fsdp=1,tp=0) -> rank 6
+        #
+        # For tp=1:
+        #   data ranks 0,1 -> group_id=0  => ranks at coords:
+        #     (dp=0,fsdp=0,tp=1) -> rank 1
+        #     (dp=0,fsdp=1,tp=1) -> rank 3
+        #   data ranks 2,3 -> group_id=1  => ranks at coords:
+        #     (dp=1,fsdp=0,tp=1) -> rank 5
+        #     (dp=1,fsdp=1,tp=1) -> rank 7
+        #
+        # Final SP groups (keyed by (group_id, non_data_key)):
+        #   (0, (tp=0)) -> [0, 2]
+        #   (1, (tp=0)) -> [4, 6]
+        #   (0, (tp=1)) -> [1, 3]
+        #   (1, (tp=1)) -> [5, 7]
+        #
+        # Each SP group has size=2 and never crosses tp.
+    """
     if device_mesh is None or sp_size <= 1:
         return None
     if device_mesh.has_dim("sp"):
@@ -99,6 +136,7 @@ def _get_sp_group_from_device_mesh(
                 continue
             non_data_indices.append(i)
 
+    # Group ranks by (data-parallel chunk, non-data mesh coordinates).
     groups: Dict[Tuple[int, Tuple[int, ...]], list[int]] = {}
     for r in device_mesh.mesh.flatten().tolist():
         r = int(r)
@@ -148,6 +186,7 @@ class GatherLoss(torch.autograd.Function):
         if position_ids is not None:
             position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
         ctx.position_ids = position_ids
+        # Gather split losses/labels to compute aux losses on full sequence length.
         output = sequence_parallel.gather(loss, dim=ctx.gather_idx, position_ids=position_ids)
         if labels is not None:
             labels_output = sequence_parallel.gather(labels, dim=ctx.gather_idx, position_ids=position_ids)
@@ -157,6 +196,7 @@ class GatherLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_output):
+        # Split grads back to local sequence chunk; scale for all-gather semantics.
         _grad = grad_output[0] * sequence_parallel.world_size
         if sequence_parallel.world_size > 1 and sequence_parallel._sp_group is not None:
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
@@ -248,6 +288,7 @@ class _SeqAllToAll(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
+        # Reverse scatter/gather in backward to match forward layout transform.
         return None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None
 
 
@@ -271,7 +312,7 @@ class DistributedAttention(torch.nn.Module):
         if self.sequence_parallel.world_size == 1:
             return self.local_attn(query, key, value, attention_mask, *args, **kwargs)
 
-        # gather ulysses
+        # All-to-all to assemble full sequence for attention, then split back after.
         if self.sequence_parallel.sp_world_size > 1:
             query_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, query, self.scatter_idx, self.gather_idx)
             key_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, key, self.scatter_idx, self.gather_idx)
@@ -300,7 +341,7 @@ class DistributedAttention(torch.nn.Module):
 
         return output
 
-
+# main content copied from ms-swift
 class SequenceParallel:
 
     _global_inited: bool = False
@@ -328,6 +369,7 @@ class SequenceParallel:
 
             _origin_flash_attention_mask = masking_utils.flash_attention_mask
 
+            # Patch attention masks for SP: avoid masking when full sequence is reconstructed.
             def flash_attention_mask(batch_size,
                                      cache_position,
                                      kv_length,
@@ -353,6 +395,7 @@ class SequenceParallel:
                                                                                                      cache_position,
                                                                                                      kv_length, *args,
                                                                                                      **kwargs)
+                # Rebuild cache positions from real (full) position ids.
                 device = cache_position.device
                 cache_position = self.real_position_ids[0]
                 cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
@@ -476,6 +519,7 @@ class SequenceParallel:
         def pre_forward_split_hook(_self, args, kwargs):
             if self.world_size == 1:
                 return args, kwargs
+            # Pad to multiple of SP size and split inputs per SP rank before forward.
             input_ids = kwargs.get('input_ids', None)
             inputs_embeds = kwargs.get('inputs_embeds', None)
             position_ids = kwargs['position_ids']
@@ -586,19 +630,12 @@ class SequenceParallel:
         if not self.padding_free:
             pass
 
-    def _mask_qkv(self, query, key, value, mask):
-        mask = mask.unsqueeze(2).unsqueeze(3)
-        query = query * mask
-        value = value * mask
-        mask = (~mask) * -1e5  # for bf16
-        key = key + mask.to(key.dtype)
-        return query, key, value
-
     def pad(self, tensor, padding_value, position_ids=None, dim=1):
         """Pad tensor for sequence parallel"""
         world_size = self.world_size
 
         def _do_pad(tensor):
+            # Ensure seq length is divisible by SP size to allow even split.
             length = tensor.shape[dim]
             pad_num = world_size - (length % world_size)
             if pad_num == 0 or pad_num == world_size:
@@ -621,6 +658,7 @@ class SequenceParallel:
         if self.world_size == 1:
             return local_output
 
+        # Gather local chunks from each SP rank and concatenate along sequence dim.
         gathered_sp = torch.empty(
             [local_output.shape[0] * self.sp_world_size] + list(local_output.shape[1:]),
             dtype=local_output.dtype,
@@ -634,6 +672,7 @@ class SequenceParallel:
         if self.world_size == 1:
             return input
 
+        # Split along sequence dimension; each rank keeps its local slice.
         rank = dist.get_rank(self._sp_group) if self._sp_group is not None else 0
         dim_size = input.size(dim)
         assert dim_size % self.sp_world_size == 0, (
@@ -736,6 +775,7 @@ class SequenceParallel:
         if input_embeds is not None:
             input_embeds = self.split(input_embeds, dim=1, position_ids=real_position_ids)
         if labels is not None:
+            # Align next-token labels before splitting so each rank sees local targets.
             labels = torch.roll(labels, shifts=-1, dims=-1)
             labels = self.split(labels, dim=-1, position_ids=real_position_ids)
         if loss_scale is not None:
@@ -881,6 +921,7 @@ class SequenceParallelStrategy:
             or not self.sp_config.get("gather_logits", True)
         ):
             return outputs
+        # Optionally reassemble full-seq logits for downstream consumers.
         logits = None
         if hasattr(outputs, "logits"):
             logits = outputs.logits
@@ -910,6 +951,7 @@ class SequenceParallelStrategy:
             return loss
         if labels is None or sequence_parallel._sp_group is None:
             return loss
+        # Reduce loss with token-count normalization across SP ranks.
         num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
         reduced_loss = loss * num_valid_tokens
         dist.all_reduce(reduced_loss, group=sequence_parallel._sp_group)

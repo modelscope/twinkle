@@ -73,9 +73,9 @@ def eval(model: TransformersModel):
         remote_group="model",
     )
     for step, batch in enumerate(dataloader):
-        model.forward_only(inputs=batch)
-        model.calculate_loss()
-    metrics = model.calculate_metric(is_training=False)
+        model.forward_only(inputs=batch, adapter_name="default")
+        model.calculate_loss(adapter_name="default")
+    metrics = model.calculate_metric(is_training=False, adapter_name="default")
     return metrics()
 
 
@@ -99,8 +99,9 @@ def train():
 
     lora_config = LoraConfig(target_modules="all-linear")
     model.add_adapter_to_model("default", lora_config, gradient_accumulation_steps=1)
+    model.set_optimizer("AdamW", lr=1e-4, adapter_name="default")
     logger.info(get_device_placement())
-    logger.info(model.get_train_configs())
+    logger.info(model.get_train_configs(adapter_name="default"))
 
     loss_metric = 99.0
     logger.info("[train] start iter")
@@ -111,11 +112,11 @@ def train():
         if step == 0:
             logger.info("[train] first batch received")
         logger.info(f"[train] step {step} forward_backward start")
-        output = model.forward_backward(inputs=batch)
+        output = model.forward_backward(inputs=batch, adapter_name="default")
         logger.info(f"[train] step {step} forward_backward done")
         loss_value = output() if callable(output) else output
         logger.info(f"step {step}, loss: {loss_value}")
-        model.clip_grad_and_step()
+        model.clip_grad_and_step(adapter_name="default")
         if step % 50 == 0 and step > 0:
             metrics = eval(model)
             logger.info(f"Current is step {step // 16}, metrics: {metrics}")

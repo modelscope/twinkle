@@ -31,7 +31,7 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.model.base import TwinkleModel
-from twinkle.model.transformers.strategy import AccelerateStrategy
+from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
@@ -124,6 +124,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         model_id: The model id or path, this argument will be used in `from_pretrained`.
         device_mesh: The model device mesh to follow.
         mixed_precision: The mixed precision type.
+        strategy: The training strategy to use.
         ddp_config: The DDP config to use.
         fsdp_config: The fsdp config to use.
         grad_scaler_config: The gradient scaler config to use.
@@ -146,6 +147,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                  config: Optional[PretrainedConfig] = None,
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+                 strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
                  ddp_config: Dict[str, Any] = None,
                  fsdp_config: Dict[str, Any] = None,
                  grad_scaler_config: Dict[str, Any] = None,
@@ -165,8 +167,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
-        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
-                                           fsdp_config=fsdp_config, device_mesh=device_mesh)
+        if strategy == 'native_fsdp':
+            self.strategy = NativeFSDPStrategy(mixed_precision=mixed_precision,
+                                               fsdp_config=fsdp_config,
+                                               device_mesh=device_mesh)
+        else:
+            self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, ddp_config=ddp_config,
+                                               fsdp_config=fsdp_config, device_mesh=device_mesh)
         enable_sp = False
         if device_mesh is not None:
             sp_size = device_mesh.ulysses_size
@@ -242,7 +249,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_config.num_tokens += (labels >= 0).sum().item()
         self._accumulate_metric(optimizer_config, is_training=True)
         outputs = self.model(**inputs)
-        if self.sp_strategy is not None:
+        if self.sp_strategy is not None and labels is None:
             outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.inputs = inputs
@@ -279,7 +286,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             labels = inputs.pop('labels', None)
             self._accumulate_metric(optimizer_config, is_training=False)
             outputs = self.model(**inputs)
-            if self.sp_strategy is not None:
+            if self.sp_strategy is not None and labels is None:
                 outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
@@ -309,6 +316,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         outputs = optimizer_config.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         loss_value: torch.Tensor = loss_instance(inputs, outputs, **kwargs)
+        if self.sp_strategy is not None and 'labels' in inputs:
+            loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value = loss_value
         return loss_value.item()
 
@@ -434,17 +443,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         forbidden_name_patterns = [r"bias", r"layernorm", r"rmsnorm", r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)"]
         decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm], forbidden_name_patterns)
         params = self._get_trainable_parameters(adapter_name)
+        decay_param_names = [
+            n for n, p in params.items() if n in decay_parameters and p.requires_grad
+        ]
+        no_decay_param_names = [
+            n for n, p in params.items() if n not in decay_parameters and p.requires_grad
+        ]
         optimizer_grouped_parameters = [
             {
-                "params": [
-                    p for n, p in params.items() if (n in decay_parameters and p.requires_grad)
-                ],
+                "params": [params[n] for n in decay_param_names],
+                "param_names": decay_param_names,
                 "weight_decay": weight_decay, 'lr': lr
             },
             {
-                "params": [
-                    p for n, p in params.items() if (n not in decay_parameters and p.requires_grad)
-                ],
+                "params": [params[n] for n in no_decay_param_names],
+                "param_names": no_decay_param_names,
                 "weight_decay": 0.0, 'lr': lr
             },
         ]
