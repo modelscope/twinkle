@@ -383,7 +383,7 @@ class Template:
 
         return embed_fn(input_ids)
 
-    def _get_vision_embeddings(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> Optional['torch.Tensor']:
+    def _get_vision_embeddings(self, model: 'torch.nn.Module', inputs: Dict[str, Any]) -> Optional['torch.Tensor']:
         """Get vision embeddings. Override in subclass."""
         return None
 
