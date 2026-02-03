@@ -1,10 +1,8 @@
+import json
 import os
 from functools import partial
 from typing import Literal
-
-import json
-from safetensors.torch import safe_open, save_file
-from .platform import Platform, is_last_rank, is_master
+from .platform import is_last_rank, is_master
 
 
 class LazyTensor:
@@ -31,6 +29,7 @@ class SafetensorLazyLoader:
 
     def _open_file(self, filename: str):
         """Open a safetensors file if not already open."""
+        from safetensors.torch import safe_open, save_file
         if filename not in self._file_handles:
             file_path = os.path.join(self.hf_model_dir, filename)
             self._file_handles[filename] = safe_open(file_path, framework='pt')
@@ -38,6 +37,7 @@ class SafetensorLazyLoader:
 
     def _load_index(self):
         """Load the model index file to get weight map."""
+        from safetensors.torch import safe_open, save_file
         index_path = os.path.join(self.hf_model_dir, 'model.safetensors.index.json')
 
         if os.path.exists(index_path):
@@ -115,6 +115,7 @@ class StreamingSafetensorSaver:
         self.current_shard_size += tensor_size
 
     def _save_current_shard(self, shard_filename: str = None):
+        from safetensors.torch import safe_open, save_file
         if not self.current_shard:
             return
         if shard_filename is None:

@@ -21,7 +21,7 @@ class CompetitionMathGRPOProcessor(Preprocessor):
         problem = row['problem']
         solution = row['solution']
         messages = [
-            Message(role='system', content='You are a helpful math assistant. Respond with only the final answer in the form \boxed{...} and nothing else.'),
+            Message(role='system', content='You are a helpful math assistant. Respond with only the final answer in the form \\boxed{...} and nothing else.'),
             Message(role='user', content=problem),
             Message(role='assistant', content=''),
         ]

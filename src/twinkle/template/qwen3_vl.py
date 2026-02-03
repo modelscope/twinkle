@@ -17,6 +17,7 @@ class Qwen3VLTemplate(Template):
     """
 
     def __init__(self, *args, **kwargs):
+        # TODO untested code
         super().__init__(*args, **kwargs)
         # Cache processor config for preprocessing
         self._patch_size: Optional[int] = None

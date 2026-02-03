@@ -1,8 +1,10 @@
-import torch
-from typing import Any, Union, Mapping
+from typing import Any, Union, Mapping, TYPE_CHECKING
+if TYPE_CHECKING:
+    import torch
 
 def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
+    import torch
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
     elif isinstance(data, (tuple, list)):

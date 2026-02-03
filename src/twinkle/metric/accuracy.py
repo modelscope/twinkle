@@ -51,7 +51,7 @@ class Accuracy(Metric):
             {"correct": self.total_correct, "total": self.total_count}
         ]
 
-        all_results = torch_util.gather_object(local_results, self.device_mesh, self.process_group)
+        all_results = self.gather_results(local_results)
 
         total_correct = sum(r["correct"] for r in all_results)
         total_count = sum(r["total"] for r in all_results)

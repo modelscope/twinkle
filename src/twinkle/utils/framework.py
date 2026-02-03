@@ -1,14 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
 import os
-from abc import ABC, abstractmethod
 import random
-from typing import Literal, Union, Optional, Any
+from abc import ABC, abstractmethod
 from functools import lru_cache
+from typing import Union, Optional, Any, TYPE_CHECKING
 
 import numpy as np
 
 from .platform import Platform, DeviceMesh
+
+if TYPE_CHECKING:
+    import torch
 
 
 class Framework(ABC):
@@ -32,27 +35,6 @@ class Framework(ABC):
         ...
 
     @staticmethod
-    def get_framework(module) -> Literal['torch', 'other']:
-        """Get the framework"""
-        if "torch" in type(module).__module__ or hasattr(module, "parameters"):
-            return "torch"
-        return 'other'
-
-    @staticmethod
-    def get_library(module) -> Literal['transformers', 'megatron', 'other']:
-        """Get The library of one module
-
-        Args:
-            module: A torch.nn.Module instance
-
-        Returns:
-            A string representing the library, supports `transformers` or `megatron` or `other`
-        """
-        if Framework.get_framework(module) == 'torch':
-            return Torch.get_library(module)
-        return 'other'
-
-    @staticmethod
     def seed_everything(seed: Optional[int] = 42, full_determinism: bool = False):
         Torch.seed_everything(int(seed), full_determinism)
 
@@ -71,16 +53,6 @@ class Framework(ABC):
 
 
 class Torch(Framework):
-
-    @staticmethod
-    def get_library(module) -> Literal['transformers', 'megatron', 'other']:
-        module_path = type(module).__module__
-        if "transformers" in module_path:
-            return "transformers"
-        elif "megatron" in module_path:
-            return "megatron"
-        else:
-            return "other"
 
     @staticmethod
     @lru_cache
@@ -254,5 +226,6 @@ class Torch(Framework):
             import torch
             torch.cuda.ipc_collect()
         elif Torch.is_npu_available():
+            import torch
             import torch_npu
             torch.npu.ipc_collect()

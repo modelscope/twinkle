@@ -1,13 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from typing import Iterable
-
-import torch
-import torch.distributed as dist
-
+from typing import Iterable, TYPE_CHECKING
 from twinkle import Platform
 from twinkle.utils import torch_util
+if TYPE_CHECKING:
+    import torch
 
 
 def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
@@ -16,6 +14,8 @@ def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
                                  max_grad_norm: float,
                                  norm_type: float,
                                  group=None) -> float:
+    import torch
+    import torch.distributed as dist
     parameters = list(parameters)
     if num_tokens <= 0:
         num_tokens = 1

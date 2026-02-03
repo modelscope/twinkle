@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Optional, Literal, List
-import torch
-
+from typing import Dict, Optional, List
 from twinkle.loss.base import Loss
 from twinkle.data_format import Trajectory
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 class GRPOLoss(Loss):
@@ -31,8 +33,9 @@ class GRPOLoss(Loss):
         self.temperature = temperature
 
     @staticmethod
-    def selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    def selective_log_softmax(logits: 'torch.Tensor', index: 'torch.Tensor') -> 'torch.Tensor':
         """Compute log probabilities for selected tokens."""
+        import torch
         if logits.dtype in [torch.float32, torch.float64]:
             selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
             logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -47,18 +50,19 @@ class GRPOLoss(Loss):
         return per_token_logps
 
     def _get_per_token_logps(
-        self, 
-        logits: torch.Tensor, 
-        input_ids: torch.Tensor, 
+        self,
+        logits: 'torch.Tensor',
+        input_ids: 'torch.Tensor',
         logits_to_keep: int,
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """Extract per-token log probabilities for completion tokens."""
         logits_shifted = logits[:, -(logits_to_keep + 1):-1, :] / self.temperature
         input_ids_shifted = input_ids[:, -logits_to_keep:]
         per_token_logps = self.selective_log_softmax(logits_shifted, input_ids_shifted)
         return per_token_logps
 
-    def _extract_advantages(self, trajectories: List[Trajectory], device: torch.device) -> torch.Tensor:
+    def _extract_advantages(self, trajectories: List[Trajectory], device: 'torch.device') -> 'torch.Tensor':
+        import torch
         """Extract advantages from trajectories."""
         advantages_list = []
         for trajectory in trajectories:
@@ -72,13 +76,13 @@ class GRPOLoss(Loss):
 
     def _compute_log_importance_weights(
         self,
-        log_ratio: torch.Tensor,
-        per_token_logps: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        log_ratio: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
+    ) -> 'torch.Tensor':
         """
         Compute log importance sampling weights.
-        
+
         Override this method in subclasses for different IS strategies.
         Default: token-level importance sampling.
         """
@@ -86,15 +90,16 @@ class GRPOLoss(Loss):
 
     def _compute_per_token_loss(
         self,
-        ratio: torch.Tensor,
-        advantages: torch.Tensor,
-        per_token_logps: torch.Tensor,
-    ) -> torch.Tensor:
+        ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+    ) -> 'torch.Tensor':
         """
         Compute per-token loss with PPO clipping.
-        
+
         Override this method in subclasses for different loss formulations.
         """
+        import torch
         advantages_expanded = advantages.unsqueeze(1)
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         loss1 = ratio * advantages_expanded
@@ -103,31 +108,30 @@ class GRPOLoss(Loss):
 
     def _aggregate_loss(
         self,
-        per_token_loss: torch.Tensor,
-        completion_mask: torch.Tensor,
+        per_token_loss: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
         num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """
         Aggregate per-token loss to scalar.
-        
+
         Override this method in subclasses for different normalization.
         Default: mean over sequences, then mean over batch.
         """
         return (
-            (per_token_loss * completion_mask).sum(-1) 
+            (per_token_loss * completion_mask).sum(-1)
             / completion_mask.sum(-1).clamp(min=1.0)
         ).mean()
 
-    def __call__(
-        self,
-        inputs: Dict,
-        outputs: Dict,
-        *,
-        old_logits: torch.Tensor,
-        trajectories: List[Trajectory],
-        ref_logits: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
+    def __call__(self,
+                    inputs: Dict,
+                    outputs: Dict,
+                    *,
+                    old_logits: 'torch.Tensor',
+                    trajectories: List[Trajectory],
+                    ref_logits: Optional['torch.Tensor'] = None,
+                    **kwargs,
+                ) -> 'torch.Tensor':
         """
         Compute GRPO loss.
 
@@ -141,6 +145,7 @@ class GRPOLoss(Loss):
         Returns:
             loss: Scalar loss value
         """
+        import torch
         logits = outputs['logits']
         input_ids = inputs['input_ids']
 
@@ -192,8 +197,8 @@ class GRPOLoss(Loss):
         per_token_kl = None
         if self.beta > 0.0 and ref_per_token_logps is not None:
             per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) 
-                - (ref_per_token_logps - per_token_logps) 
+                torch.exp(ref_per_token_logps - per_token_logps)
+                - (ref_per_token_logps - per_token_logps)
                 - 1
             )
 
@@ -218,10 +223,10 @@ class GRPOLoss(Loss):
 
     def compute_metrics(
         self,
-        ratio: torch.Tensor,
-        advantages: torch.Tensor,
-        completion_mask: torch.Tensor,
-        per_token_kl: Optional[torch.Tensor] = None,
+        ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
+        per_token_kl: Optional['torch.Tensor'] = None,
     ) -> Dict[str, float]:
         """Compute training metrics."""
         completion_token_count = completion_mask.sum().clamp(min=1.0)
@@ -249,16 +254,16 @@ class GRPOLoss(Loss):
 class GSPOLoss(GRPOLoss):
     """
     GRPO with sequence-level importance sampling.
-    
+
     Instead of per-token IS weights, uses the average log ratio over the sequence.
     """
 
     def _compute_log_importance_weights(
         self,
-        log_ratio: torch.Tensor,
-        per_token_logps: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        log_ratio: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
+    ) -> 'torch.Tensor':
         """Sequence-level importance sampling: use mean log ratio."""
         seq_level_log_weights = (
             (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
@@ -269,7 +274,7 @@ class GSPOLoss(GRPOLoss):
 class SAPOLoss(GRPOLoss):
     """
     SAPO (Soft-gated Advantage Policy Optimization) Loss.
-    
+
     Uses soft gating instead of hard clipping.
     """
 
@@ -288,11 +293,12 @@ class SAPOLoss(GRPOLoss):
 
     def _compute_per_token_loss(
         self,
-        ratio: torch.Tensor,
-        advantages: torch.Tensor,
-        per_token_logps: torch.Tensor,
-    ) -> torch.Tensor:
+        ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+    ) -> 'torch.Tensor':
         """Soft-gated loss."""
+        import torch
         advantages_expanded = advantages.unsqueeze(1)
         gate_pos = torch.sigmoid(self.tau_pos * (ratio - 1)) * (4.0 / self.tau_pos)
         gate_neg = torch.sigmoid(self.tau_neg * (ratio - 1)) * (4.0 / self.tau_neg)
@@ -303,7 +309,7 @@ class SAPOLoss(GRPOLoss):
 class CISPOLoss(GRPOLoss):
     """
     CISPO (Clipped Importance Sampling Policy Optimization) Loss.
-    
+
     Clamps the IS weight and uses policy gradient.
     """
 
@@ -318,21 +324,22 @@ class CISPOLoss(GRPOLoss):
 
     def _compute_per_token_loss(
         self,
-        ratio: torch.Tensor,
-        advantages: torch.Tensor,
-        per_token_logps: torch.Tensor,
-    ) -> torch.Tensor:
+        ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+    ) -> 'torch.Tensor':
         """Clamped ratio * advantage * log_prob."""
+        import torch
         advantages_expanded = advantages.unsqueeze(1)
         clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
         return -clamped_ratios * advantages_expanded * per_token_logps
 
     def _aggregate_loss(
         self,
-        per_token_loss: torch.Tensor,
-        completion_mask: torch.Tensor,
+        per_token_loss: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
         num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """Sum over all tokens, divide by num_items_in_batch."""
         if num_items_in_batch is None:
             num_items_in_batch = completion_mask.sum()
@@ -342,16 +349,16 @@ class CISPOLoss(GRPOLoss):
 class BNPOLoss(GRPOLoss):
     """
     BNPO (Batch-Normalized Policy Optimization) Loss.
-    
+
     Normalizes by total completion tokens across batch.
     """
 
     def _aggregate_loss(
         self,
-        per_token_loss: torch.Tensor,
-        completion_mask: torch.Tensor,
+        per_token_loss: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
         num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         return (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
 
 
@@ -369,10 +376,10 @@ class DRGRPOLoss(GRPOLoss):
 
     def _aggregate_loss(
         self,
-        per_token_loss: torch.Tensor,
-        completion_mask: torch.Tensor,
+        per_token_loss: 'torch.Tensor',
+        completion_mask: 'torch.Tensor',
         num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """Normalize by batch_size * max_completion_length."""
         batch_size = completion_mask.shape[0]
         return (per_token_loss * completion_mask).sum() / (batch_size * self.max_completion_length)
