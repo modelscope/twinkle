@@ -19,8 +19,8 @@ serve.start(http_options=http_options)
 
 APP_BUILDERS = {
     'main:build_server_app': build_server_app,
-    'main:build_model_app': build_model_app,
-    # 'main:build_sampler_app': build_sampler_app,
+    # 'main:build_model_app': build_model_app,
+    'main:build_sampler_app': build_sampler_app,
 }
 
 for app_config in config.applications:

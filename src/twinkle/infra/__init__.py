@@ -413,7 +413,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
-                if device_mesh_name:
+                if device_mesh_name and _device_group is not None:
                     if device_mesh is None:
                         # Local mode can safely assign the default device mesh
                         device_mesh = _device_mesh

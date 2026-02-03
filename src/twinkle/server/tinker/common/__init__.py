@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .datum import datum_to_input_feature
+from .datum import datum_to_input_feature, input_feature_to_datum
 from .transformers_model import TwinkleCompatTransformersModel
 from .megatron_model import TwinkleCompatMegatronModel
 from .rate_limiter import RateLimiter
