@@ -16,11 +16,8 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Coroutine, Dict, List, Optional, Tuple
-
-import yaml
 
 if TYPE_CHECKING:
     from twinkle.server.utils.state import ServerStateProxy
@@ -80,57 +77,6 @@ class TaskQueueConfig:
                 config.queue_timeout = float(config_dict['queue_timeout'])
             if 'enabled' in config_dict:
                 config.enabled = bool(config_dict['enabled'])
-        return config
-    
-    @classmethod
-    def from_env_or_yaml(cls, yaml_path: Optional[str] = None) -> 'TaskQueueConfig':
-        """Load configuration from environment variables or YAML file.
-        
-        Priority: Environment variables > YAML > Default values
-        
-        Environment variables:
-            - TWINKLE_RPS_LIMIT: requests per second limit
-            - TWINKLE_TPS_LIMIT: input tokens per second limit
-            - TWINKLE_QUEUE_TIMEOUT: queue timeout in seconds
-            - TWINKLE_RATE_LIMIT_ENABLED: enable/disable rate limiting (true/false)
-            
-        Args:
-            yaml_path: Optional path to YAML configuration file.
-            
-        Returns:
-            TaskQueueConfig instance with loaded configuration.
-        """
-        config = cls()
-        
-        # Load from YAML if provided
-        if yaml_path and os.path.exists(yaml_path):
-            try:
-                with open(yaml_path, 'r') as f:
-                    yaml_config = yaml.safe_load(f) or {}
-                    rate_limit_config = yaml_config.get('rate_limit', {})
-                    if 'rps_limit' in rate_limit_config:
-                        config.rps_limit = float(rate_limit_config['rps_limit'])
-                    if 'tps_limit' in rate_limit_config:
-                        config.tps_limit = float(rate_limit_config['tps_limit'])
-                    if 'window_seconds' in rate_limit_config:
-                        config.window_seconds = float(rate_limit_config['window_seconds'])
-                    if 'queue_timeout' in rate_limit_config:
-                        config.queue_timeout = float(rate_limit_config['queue_timeout'])
-                    if 'enabled' in rate_limit_config:
-                        config.enabled = bool(rate_limit_config['enabled'])
-            except Exception:
-                pass  # Use defaults if YAML parsing fails
-        
-        # Override with environment variables (highest priority)
-        if os.environ.get('TWINKLE_RPS_LIMIT'):
-            config.rps_limit = float(os.environ['TWINKLE_RPS_LIMIT'])
-        if os.environ.get('TWINKLE_TPS_LIMIT'):
-            config.tps_limit = float(os.environ['TWINKLE_TPS_LIMIT'])
-        if os.environ.get('TWINKLE_QUEUE_TIMEOUT'):
-            config.queue_timeout = float(os.environ['TWINKLE_QUEUE_TIMEOUT'])
-        if os.environ.get('TWINKLE_RATE_LIMIT_ENABLED'):
-            config.enabled = os.environ['TWINKLE_RATE_LIMIT_ENABLED'].lower() in ('true', '1', 'yes')
-            
         return config
 
 
@@ -260,7 +206,7 @@ class TaskQueueMixin:
         class MyService(TaskQueueMixin):
             def __init__(self):
                 self.state = get_server_state()
-                self._init_task_queue(TaskQueueConfig.from_env_or_yaml())
+                self._init_task_queue(TaskQueueConfig.from_dict(config_dict))
                 
             async def my_endpoint(self, request, body):
                 async def _do_work():
@@ -280,9 +226,9 @@ class TaskQueueMixin:
         """Initialize the task queue system.
         
         Args:
-            config: Optional TaskQueueConfig. If None, loads from env/yaml.
+            config: Optional TaskQueueConfig. If None, uses default config.
         """
-        self._task_queue_config = config or TaskQueueConfig.from_env_or_yaml()
+        self._task_queue_config = config or TaskQueueConfig()
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._rate_limiter = RateLimiter(
             rps_limit=self._task_queue_config.rps_limit,
@@ -291,12 +237,24 @@ class TaskQueueMixin:
         )
         self._worker_task: Optional[asyncio.Task] = None
         self._worker_started = False
+        self._worker_start_lock = asyncio.Lock()
     
     async def _ensure_worker_started(self) -> None:
-        """Ensure the background worker is running."""
-        if not self._worker_started:
-            self._worker_task = asyncio.create_task(self._queue_worker())
-            self._worker_started = True
+        """Ensure the background worker is running.
+        
+        Thread-safe: Uses asyncio.Lock to prevent race conditions when
+        multiple concurrent requests try to start the worker simultaneously.
+        """
+        # Fast path: avoid lock if already started
+        if self._worker_started:
+            return
+        
+        # Slow path: acquire lock to safely check and start
+        async with self._worker_start_lock:
+            # Double-check after acquiring lock (another coroutine might have started it)
+            if not self._worker_started:
+                self._worker_task = asyncio.create_task(self._queue_worker())
+                self._worker_started = True
     
     async def _queue_worker(self) -> None:
         """Background worker that processes tasks from the queue serially.

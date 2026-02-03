@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import uuid
@@ -24,7 +25,9 @@ class ServerState:
     All methods are designed to be used with Ray actors for distributed state.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, 
+                 expiration_timeout: float = 86400.0,  # 24 hours in seconds
+                 cleanup_interval: float = 3600.0) -> None:  # 1 hour in seconds
         # Session tracking
         self.sessions: Dict[str, Dict[str, Any]] = {}
         # Model registration
@@ -35,6 +38,12 @@ class ServerState:
         self.futures: Dict[str, Dict[str, Any]] = {}
         # Configuration storage
         self.config: Dict[str, Any] = {}
+        
+        # Cleanup configuration
+        self.expiration_timeout = expiration_timeout
+        self.cleanup_interval = cleanup_interval
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_running = False
 
     # ----- Session Management -----
 
@@ -265,6 +274,182 @@ class ServerState:
         """Clear all configuration values."""
         self.config.clear()
 
+    # ----- Resource Cleanup -----
+
+    def _parse_timestamp(self, timestamp_str: str) -> float:
+        """Parse ISO format timestamp to unix timestamp.
+        
+        Args:
+            timestamp_str: ISO format timestamp string
+            
+        Returns:
+            Unix timestamp (seconds since epoch)
+        """
+        try:
+            dt = datetime.fromisoformat(timestamp_str)
+            return dt.timestamp()
+        except (ValueError, AttributeError):
+            # If parsing fails, return current time to avoid keeping invalid entries
+            return time.time()
+
+    def cleanup_expired_resources(self) -> Dict[str, int]:
+        """Clean up expired sessions, models, sampling_sessions, and futures.
+        
+        Resources are considered expired if they haven't been accessed for longer
+        than the expiration_timeout period. For sessions, we check last_heartbeat
+        (or created_at if no heartbeat exists). For other resources, we check created_at.
+        
+        Returns:
+            Dict with counts of cleaned up resources by type
+        """
+        current_time = time.time()
+        cutoff_time = current_time - self.expiration_timeout
+        
+        cleanup_stats = {
+            'sessions': 0,
+            'models': 0,
+            'sampling_sessions': 0,
+            'futures': 0,
+        }
+        
+        # Clean up expired sessions
+        expired_session_ids = []
+        for session_id, session_data in self.sessions.items():
+            # Use last_heartbeat if available, otherwise created_at
+            last_activity = session_data.get('last_heartbeat')
+            if last_activity is None:
+                created_at_str = session_data.get('created_at')
+                if created_at_str:
+                    last_activity = self._parse_timestamp(created_at_str)
+                else:
+                    last_activity = 0
+            
+            if last_activity < cutoff_time:
+                expired_session_ids.append(session_id)
+        
+        for session_id in expired_session_ids:
+            del self.sessions[session_id]
+            cleanup_stats['sessions'] += 1
+        
+        # Clean up expired models (check by session_id association or created_at)
+        expired_model_ids = []
+        for model_id, model_data in self.models.items():
+            # First check if the model's session has been cleaned up
+            session_id = model_data.get('session_id')
+            if session_id and session_id in expired_session_ids:
+                expired_model_ids.append(model_id)
+            else:
+                # Check if model itself is expired by created_at
+                created_at_str = model_data.get('created_at')
+                if created_at_str:
+                    created_at = self._parse_timestamp(created_at_str)
+                    if created_at < cutoff_time:
+                        expired_model_ids.append(model_id)
+        
+        for model_id in expired_model_ids:
+            del self.models[model_id]
+            cleanup_stats['models'] += 1
+        
+        # Clean up expired sampling sessions
+        expired_sampling_ids = []
+        for sampling_id, sampling_data in self.sampling_sessions.items():
+            # Check by session_id association or created_at
+            session_id = sampling_data.get('session_id')
+            if session_id and session_id in expired_session_ids:
+                expired_sampling_ids.append(sampling_id)
+            else:
+                created_at_str = sampling_data.get('created_at')
+                if created_at_str:
+                    created_at = self._parse_timestamp(created_at_str)
+                    if created_at < cutoff_time:
+                        expired_sampling_ids.append(sampling_id)
+        
+        for sampling_id in expired_sampling_ids:
+            del self.sampling_sessions[sampling_id]
+            cleanup_stats['sampling_sessions'] += 1
+        
+        # Clean up expired futures (use created_at or updated_at)
+        expired_future_ids = []
+        for request_id, future_data in self.futures.items():
+            # Use updated_at if available, otherwise created_at
+            timestamp_str = future_data.get('updated_at') or future_data.get('created_at')
+            if timestamp_str:
+                timestamp = self._parse_timestamp(timestamp_str)
+                if timestamp < cutoff_time:
+                    expired_future_ids.append(request_id)
+        
+        for request_id in expired_future_ids:
+            del self.futures[request_id]
+            cleanup_stats['futures'] += 1
+        
+        return cleanup_stats
+
+    async def _cleanup_loop(self) -> None:
+        """Background task that periodically cleans up expired resources.
+        
+        This task runs continuously and triggers cleanup at regular intervals
+        defined by cleanup_interval.
+        """
+        while self._cleanup_running:
+            try:
+                await asyncio.sleep(self.cleanup_interval)
+                stats = self.cleanup_expired_resources()
+                # Log cleanup stats (in production, you might want to use proper logging)
+                if any(stats.values()):
+                    print(f"[ServerState Cleanup] Removed expired resources: {stats}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log but don't crash the cleanup task
+                print(f"[ServerState Cleanup] Error during cleanup: {e}")
+                continue
+
+    def start_cleanup_task(self) -> bool:
+        """Start the background cleanup task.
+        
+        Returns:
+            True if task was started, False if already running
+        """
+        if self._cleanup_running:
+            return False
+        
+        self._cleanup_running = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        return True
+
+    def stop_cleanup_task(self) -> bool:
+        """Stop the background cleanup task.
+        
+        Returns:
+            True if task was stopped, False if not running
+        """
+        if not self._cleanup_running:
+            return False
+        
+        self._cleanup_running = False
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            self._cleanup_task = None
+        return True
+
+    def get_cleanup_stats(self) -> Dict[str, Any]:
+        """Get current cleanup configuration and status.
+        
+        Returns:
+            Dict with cleanup configuration and task status
+        """
+        return {
+            'expiration_timeout': self.expiration_timeout,
+            'cleanup_interval': self.cleanup_interval,
+            'cleanup_running': self._cleanup_running,
+            'resource_counts': {
+                'sessions': len(self.sessions),
+                'models': len(self.models),
+                'sampling_sessions': len(self.sampling_sessions),
+                'futures': len(self.futures),
+            }
+        }
+
 
 class ServerStateProxy:
     """
@@ -351,8 +536,43 @@ class ServerStateProxy:
     def clear_config(self):
         return ray.get(self._actor.clear_config.remote())
 
+    # ----- Resource Cleanup -----
 
-def get_server_state(actor_name: str = 'twinkle_server_state') -> ServerStateProxy:
+    def cleanup_expired_resources(self) -> Dict[str, int]:
+        """Manually trigger cleanup of expired resources.
+        
+        Returns:
+            Dict with counts of cleaned up resources by type
+        """
+        return ray.get(self._actor.cleanup_expired_resources.remote())
+
+    def start_cleanup_task(self) -> bool:
+        """Start the background cleanup task.
+        
+        Returns:
+            True if task was started, False if already running
+        """
+        return ray.get(self._actor.start_cleanup_task.remote())
+
+    def stop_cleanup_task(self) -> bool:
+        """Stop the background cleanup task.
+        
+        Returns:
+            True if task was stopped, False if not running
+        """
+        return ray.get(self._actor.stop_cleanup_task.remote())
+
+    def get_cleanup_stats(self) -> Dict[str, Any]:
+        """Get current cleanup configuration and status.
+        
+        Returns:
+            Dict with cleanup configuration and task status
+        """
+        return ray.get(self._actor.get_cleanup_stats.remote())
+
+
+def get_server_state(actor_name: str = 'twinkle_server_state',
+                     auto_start_cleanup: bool = True) -> ServerStateProxy:
     """
     Get or create the ServerState Ray actor.
     
@@ -361,28 +581,25 @@ def get_server_state(actor_name: str = 'twinkle_server_state') -> ServerStatePro
     
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state')
+        auto_start_cleanup: Whether to automatically start the cleanup task (default: True)
         
     Returns:
         A ServerStateProxy for interacting with the actor
     """
-    _ServerState = ray.remote(ServerState)
     try:
         actor = ray.get_actor(actor_name)
     except ValueError:
         try:
+            _ServerState = ray.remote(ServerState)
             actor = _ServerState.options(name=actor_name, lifetime='detached').remote()
+            # Start cleanup task for newly created actor
+            if auto_start_cleanup:
+                try:
+                    ray.get(actor.start_cleanup_task.remote())
+                except Exception as e:
+                    print(f"[ServerState] Warning: Failed to start cleanup task: {e}")
         except ValueError:
             actor = ray.get_actor(actor_name)
     assert actor is not None
     return ServerStateProxy(actor)
 
-
-# Alias for backward compatibility with ConfigRegistry usage
-def init_config_registry(actor_name: str = 'twinkle_server_state') -> ServerStateProxy:
-    """
-    Initialize config registry (alias for get_server_state for backward compatibility).
-    
-    This function provides backward compatibility for code that was using
-    init_config_registry from validation.py.
-    """
-    return get_server_state(actor_name)
