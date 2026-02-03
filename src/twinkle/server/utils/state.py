@@ -7,9 +7,10 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
-
+from twinkle.utils.logger import get_logger
 import ray
 
+logger = get_logger()
 
 class ServerState:
     """
@@ -387,12 +388,12 @@ class ServerState:
                 stats = self.cleanup_expired_resources()
                 # Log cleanup stats (in production, you might want to use proper logging)
                 if any(stats.values()):
-                    print(f"[ServerState Cleanup] Removed expired resources: {stats}")
+                    logger.debug(f"[ServerState Cleanup] Removed expired resources: {stats}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 # Log but don't crash the cleanup task
-                print(f"[ServerState Cleanup] Error during cleanup: {e}")
+                logger.warning(f"[ServerState Cleanup] Error during cleanup: {e}")
                 continue
 
     def start_cleanup_task(self) -> bool:
@@ -585,7 +586,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
                 try:
                     ray.get(actor.start_cleanup_task.remote())
                 except Exception as e:
-                    print(f"[ServerState] Warning: Failed to start cleanup task: {e}")
+                    logger.debug(f"[ServerState] Warning: Failed to start cleanup task: {e}")
         except ValueError:
             actor = ray.get_actor(actor_name)
     assert actor is not None

@@ -4,9 +4,8 @@ Task Queue Management for Tinker Server.
 
 This module provides:
 1. TaskStatus - Enum for tracking task lifecycle states
-2. RateLimiter - Sliding window rate limiter supporting rps and tps
-3. TaskQueueConfig - Configuration for rate limits and queue behavior
-4. TaskQueueMixin - Mixin class for serial task execution with rate limiting
+2. TaskQueueConfig - Configuration for rate limits and queue behavior
+3. TaskQueueMixin - Mixin class for serial task execution with rate limiting
 """
 from __future__ import annotations
 
@@ -18,7 +17,9 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Coroutine, Dict, List, Optional, Tuple
+
 from twinkle.utils.logger import get_logger
+from .rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
     from twinkle.server.utils.state import ServerStateProxy
@@ -57,12 +58,16 @@ class TaskQueueConfig:
         window_seconds: Time window for rate limiting calculations.
         queue_timeout: Maximum time a task can wait in queue (seconds).
         enabled: Whether rate limiting is enabled.
+        token_cleanup_multiplier: Multiplier for token cleanup threshold.
+        token_cleanup_interval: How often to run cleanup task (seconds).
     """
     rps_limit: float = 10.0           # 10 requests per second
     tps_limit: float = 10000.0        # 10000 input tokens per second
     window_seconds: float = 1.0       # 1 second sliding window
     queue_timeout: float = 300.0      # 5 minutes queue timeout
     enabled: bool = True              # Rate limiting enabled by default
+    token_cleanup_multiplier: float = 10.0  # Remove tokens after 10x window inactivity
+    token_cleanup_interval: float = 60.0    # Run cleanup every 60 seconds
     
     @classmethod
     def from_dict(cls, config_dict: Optional[Dict[str, Any]] = None) -> 'TaskQueueConfig':
@@ -75,6 +80,8 @@ class TaskQueueConfig:
                 - window_seconds: sliding window duration
                 - queue_timeout: queue timeout in seconds
                 - enabled: whether rate limiting is enabled
+                - token_cleanup_multiplier: multiplier for token cleanup threshold
+                - token_cleanup_interval: cleanup task interval in seconds
                 
         Returns:
             TaskQueueConfig instance with values from dict merged with defaults.
@@ -91,116 +98,11 @@ class TaskQueueConfig:
                 config.queue_timeout = float(config_dict['queue_timeout'])
             if 'enabled' in config_dict:
                 config.enabled = bool(config_dict['enabled'])
+            if 'token_cleanup_multiplier' in config_dict:
+                config.token_cleanup_multiplier = float(config_dict['token_cleanup_multiplier'])
+            if 'token_cleanup_interval' in config_dict:
+                config.token_cleanup_interval = float(config_dict['token_cleanup_interval'])
         return config
-
-
-class RateLimiter:
-    """Sliding window rate limiter supporting both rps and tps limits.
-    
-    This rate limiter tracks request history per user token and enforces
-    both requests-per-second (rps) and tokens-per-second (tps) limits.
-    
-    Attributes:
-        rps_limit: Maximum requests per second.
-        tps_limit: Maximum input tokens per second.
-        window_seconds: Time window for rate calculations.
-    """
-    
-    def __init__(self, rps_limit: float, tps_limit: float, window_seconds: float = 1.0):
-        """Initialize the rate limiter.
-        
-        Args:
-            rps_limit: Maximum requests per second per user token.
-            tps_limit: Maximum input tokens per second per user token.
-            window_seconds: Time window for rate limiting (default 1.0s).
-        """
-        self.rps_limit = rps_limit
-        self.tps_limit = tps_limit
-        self.window_seconds = window_seconds
-        # Dict mapping user token -> list of (timestamp, token_count) tuples
-        self._token_requests: Dict[str, List[Tuple[float, int]]] = {}
-        self._lock = asyncio.Lock()
-    
-    def _cleanup_old_requests(self, token: str, current_time: float) -> None:
-        """Remove requests outside the sliding window.
-        
-        Args:
-            token: User token to clean up.
-            current_time: Current timestamp.
-        """
-        if token not in self._token_requests:
-            return
-        cutoff_time = current_time - self.window_seconds
-        self._token_requests[token] = [
-            (ts, count) for ts, count in self._token_requests[token]
-            if ts > cutoff_time
-        ]
-    
-    async def check_and_record(
-        self, token: str, input_tokens: int
-    ) -> Tuple[bool, Optional[str]]:
-        """Check if request is allowed and record it if so.
-        
-        Args:
-            token: User token for rate limiting.
-            input_tokens: Number of input tokens in this request.
-            
-        Returns:
-            Tuple of (allowed: bool, reason: Optional[str]).
-            If allowed is False, reason contains the rate limit explanation.
-        """
-        async with self._lock:
-            current_time = time.time()
-            
-            # Clean up old requests
-            self._cleanup_old_requests(token, current_time)
-            
-            # Initialize if needed
-            if token not in self._token_requests:
-                self._token_requests[token] = []
-            
-            requests = self._token_requests[token]
-            
-            # Count current window stats
-            request_count = len(requests)
-            token_count = sum(count for _, count in requests)
-            
-            # Check rps limit
-            if request_count >= self.rps_limit:
-                return False, f"RPS limit exceeded: {request_count}/{self.rps_limit} requests/s"
-            
-            # Check tps limit
-            if token_count + input_tokens > self.tps_limit:
-                return False, f"TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s"
-            
-            # Record this request
-            self._token_requests[token].append((current_time, input_tokens))
-            return True, None
-    
-    def get_stats(self, token: str) -> Dict[str, Any]:
-        """Get current rate limiting stats for a token.
-        
-        Args:
-            token: User token to get stats for.
-            
-        Returns:
-            Dict with current rps, tps, and limits.
-        """
-        current_time = time.time()
-        self._cleanup_old_requests(token, current_time)
-        
-        requests = self._token_requests.get(token, [])
-        request_count = len(requests)
-        token_count = sum(count for _, count in requests)
-        
-        return {
-            'current_rps': request_count,
-            'current_tps': token_count,
-            'rps_limit': self.rps_limit,
-            'tps_limit': self.tps_limit,
-            'rps_available': self.rps_limit - request_count,
-            'tps_available': self.tps_limit - token_count,
-        }
 
 
 class TaskQueueMixin:
@@ -248,7 +150,11 @@ class TaskQueueMixin:
             rps_limit=self._task_queue_config.rps_limit,
             tps_limit=self._task_queue_config.tps_limit,
             window_seconds=self._task_queue_config.window_seconds,
+            token_cleanup_multiplier=self._task_queue_config.token_cleanup_multiplier,
+            token_cleanup_interval=self._task_queue_config.token_cleanup_interval,
         )
+        # Start the cleanup task to prevent memory leaks
+        self._rate_limiter.start_cleanup_task()
         self._worker_task: Optional[asyncio.Task] = None
         self._worker_started = False
         self._worker_start_lock = asyncio.Lock()
@@ -316,12 +222,11 @@ class TaskQueueMixin:
                     self._task_queue.task_done()
                     
             except asyncio.CancelledError:
-                logger.debug(f"[TaskQueue] Worker cancelled")
+                logger.warning(f"[TaskQueue] Worker cancelled")
                 break
             except Exception:
                 # Log but don't crash the worker
-                import logging
-                logging.exception("Error in task queue worker")
+                logger.warning("Error in task queue worker")
                 continue
     
     async def schedule_task(
@@ -416,3 +321,30 @@ class TaskQueueMixin:
             Dict with current and available rate limits.
         """
         return self._rate_limiter.get_stats(token)
+    
+    def get_rate_limiter_memory_stats(self) -> Dict[str, Any]:
+        """Get memory usage statistics from the rate limiter.
+        
+        Returns:
+            Dict with active token count and cleanup configuration.
+        """
+        return self._rate_limiter.get_memory_stats()
+    
+    async def shutdown_task_queue(self) -> None:
+        """Gracefully shutdown the task queue and cleanup tasks.
+        
+        This should be called when shutting down the server to ensure
+        proper cleanup of background tasks.
+        """
+        # Stop the rate limiter cleanup task
+        await self._rate_limiter.stop_cleanup_task()
+        
+        # Cancel the worker task if running
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.debug("[TaskQueue] Task queue shutdown complete")
