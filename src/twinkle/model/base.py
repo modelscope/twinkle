@@ -5,6 +5,7 @@ from typing import Dict, Any, Union, Type, Optional
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from twinkle.loss.base import Loss
+from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 
@@ -32,6 +33,10 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
+    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        ...
+
+    @abstractmethod
     def step(self, **kwargs):
         ...
 
@@ -41,6 +46,10 @@ class TwinkleModel(ABC):
 
     @abstractmethod
     def lr_step(self, **kwargs):
+        ...
+
+    @abstractmethod
+    def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
         ...
 
     @abstractmethod
@@ -65,6 +74,10 @@ class TwinkleModel(ABC):
 
     @abstractmethod
     def get_state_dict(self, **kwargs):
+        ...
+
+    @abstractmethod
+    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
         ...
 
     @abstractmethod
