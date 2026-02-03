@@ -81,7 +81,7 @@ class GRPOLoss(Loss):
         Returns:
             log_weights: [batch, seq_len] log importance weights
         """
-        import torchs
+        import torch
         log_ratio = per_token_logps - per_token_old_logps
         # Clamp for numerical stability
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
@@ -115,7 +115,7 @@ class GRPOLoss(Loss):
     def _aggregate_loss(
         self,
         per_token_loss: 'torch.Tensor',
-        loss_mask: torch.Tensor,
+        loss_mask: 'torch.Tensor',
         **kwargs,
     ) -> 'torch.Tensor':
         """
@@ -297,7 +297,7 @@ class GSPOLoss(GRPOLoss):
         per_token_logps: 'torch.Tensor',
         per_token_old_logps: 'torch.Tensor',
         loss_mask: 'torch.Tensor',
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """Sequence-level importance sampling: use mean log ratio."""
         import torch
         log_ratio = per_token_logps - per_token_old_logps
@@ -357,6 +357,7 @@ class CISPOLoss(GRPOLoss):
         per_token_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
         """Clamped ratio * advantage * log_prob."""
+        import torch
         clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
         return -clamped_ratios * advantages * per_token_logps
 

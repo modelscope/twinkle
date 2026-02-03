@@ -423,29 +423,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if self.sp_strategy is not None and 'labels' in inputs:
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value = loss_value
-        return self._loss_for_logging(loss_value, inputs, loss_instance, adapter_name)
-
-    def _loss_for_logging(self, loss_value: torch.Tensor, inputs: Dict[str, Any], loss_instance: Loss, adapter_name: str) -> float:
-        detached_loss = torch_util.to_local_tensor(loss_value.detach())
-        loss_item = detached_loss.float().item()
-        if getattr(loss_instance, "reduction", None) != "sum":
-            return loss_item
-
-        labels = inputs.get("labels", None)
-        if not isinstance(labels, torch.Tensor):
-            return loss_item
-        valid_tokens = int((labels >= 0).sum().item())
-        if valid_tokens <= 0:
-            return loss_item
-        optimizer_group = self.optimizer_group[adapter_name]
-        if self.device_mesh.dp_world_size > 1:
-            local_results = [
-                {"loss_item": loss_item, "valid_tokens": valid_tokens}
-            ]
-            all_results = torch_util.gather_object(local_results, self.device_mesh, optimizer_group._dp_group)
-            loss_item = sum(r["loss_item"] for r in all_results)
-            valid_tokens = sum(r["valid_tokens"] for r in all_results)
-        return loss_item / valid_tokens
+        return loss_value.item()
 
     @remote_function()
     def backward(self, **kwargs):
@@ -881,6 +859,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name=adapter_name)
             else:
                 set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        else:
+            raise NotImplementedError
         
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
@@ -901,7 +881,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             state_dict = torch.load(scheduler_path, map_location='cpu')
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
-    @remote_function(execute='first')
+    @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', _default_adapter_name))
 

@@ -32,6 +32,7 @@ class RLOOAdvantage(Advantage):
         Returns:
             advantages: Tensor of shape [batch_size]
         """
+        import torch
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 

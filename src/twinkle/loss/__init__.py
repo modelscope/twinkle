@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .mse import MSELoss
 from .cross_entropy import CrossEntropyLoss
-from .chunked_cross_entropy import ChunkedCrossEntropyLoss, ChunkedCrossEntropyLossFunc
+from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .grpo import GRPOLoss, GSPOLoss, SAPOLoss, CISPOLoss, BNPOLoss, DRGRPOLoss
 from .base import Loss
 from .vocab_parallel_cross_entropy import VocabParallelCrossEntropyLoss
