@@ -227,8 +227,21 @@ class VLLMSampler(Sampler):
         sampling_params: SamplingParams,
         adapter_uri: Optional[str] = None,
         request_seed: Optional[int] = None,
+        *,
+        num_samples: int = 1,
     ) -> List[SampledSequence]:
-        """Sample a single input asynchronously."""
+        """Sample a single input asynchronously.
+        
+        Args:
+            feat: Encoded input features containing 'input_ids' and optionally 'images'/'videos'.
+            sampling_params: Sampling parameters.
+            adapter_uri: Optional LoRA adapter URI.
+            request_seed: Optional seed for reproducibility.
+            num_samples: Number of completions to generate for this prompt.
+            
+        Returns:
+            List of num_samples SampledSequence objects.
+        """
         input_ids = feat['input_ids']
         if hasattr(input_ids, 'tolist'):
             input_ids = input_ids.tolist()
@@ -239,11 +252,13 @@ class VLLMSampler(Sampler):
         response = await self.engine.sample(
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
+            num_samples=num_samples,
             adapter_uri=adapter_uri,
             images=images,
             videos=videos,
         )
         
+        # response.sequences contains num_samples sequences for this prompt
         return [
             SampledSequence(
                 stop_reason=seq.stop_reason,
@@ -259,6 +274,8 @@ class VLLMSampler(Sampler):
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
+        *,
+        num_samples: int = 1,
     ) -> SampleResponse:
         """Sample responses for given inputs.
         
@@ -268,9 +285,12 @@ class VLLMSampler(Sampler):
                 - Trajectory: Must contain 'messages'. Requires template to be set.
             sampling_params: Sampling parameters.
             adapter_name: Optional LoRA adapter name.
+            num_samples: Number of completions to generate per input prompt.
+                        When > 1, returns num_samples sequences for each input.
             
         Returns:
             SampleResponse containing sampled sequences.
+            Total sequences = len(inputs) * num_samples.
             
         Note:
             In Ray mode with multiple workers (DP > 1):
@@ -311,14 +331,14 @@ class VLLMSampler(Sampler):
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
             tasks = [
-                self._sample_single(feat, sampling_params, adapter_uri)
+                self._sample_single(feat, sampling_params, adapter_uri, num_samples=num_samples)
                 for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)
         
         results = self._run_in_loop(_sample_all())
         
-        # Flatten results
+        # Flatten results (each result contains num_samples sequences)
         all_sequences = []
         for seqs in results:
             all_sequences.extend(seqs)

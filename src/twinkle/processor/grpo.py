@@ -1,56 +1,34 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+GRPO Processor for RL training.
+
+This processor is a simple pass-through that uses the base InputProcessor.
+The GRPO loss now operates on logps directly and computes loss_mask from labels,
+so no special preprocessing is needed.
+
+This file is kept for backward compatibility but can be replaced with InputProcessor.
+"""
 from typing import Optional
 
-from twinkle import DeviceMesh, remote_class, remote_function
-from twinkle.data_format import InputFeature
+from twinkle import DeviceMesh, remote_class
 from twinkle.processor import InputProcessor
 
-
+# TODO: remove
 @remote_class()
 class GRPOLossProcessor(InputProcessor):
     """
-    Processor for preparing inputs required by GRPOLoss.
+    Processor for GRPO training.
     
-    This processor computes intermediate variables from raw data (input_ids, labels):
-    - completion_mask: Boolean mask for completion tokens
-    - logits_to_keep: Number of completion tokens to keep
-    - num_items_in_batch: Total completion tokens (for DAPO/CISPO normalization)
+    This is now a thin wrapper around InputProcessor since the GRPO loss
+    computes loss_mask directly from labels. It exists for backward compatibility
+    and can be used interchangeably with InputProcessor.
     
-    The processor infers completion positions from labels:
-    - labels == -100: prompt tokens (ignored in loss)
-    - labels != -100: completion tokens (used in loss)
+    The GRPO loss expects:
+    - inputs['labels']: [batch, seq_len] target tokens, -100 for ignored positions
+    - outputs['logps']: [batch, seq_len] log probabilities from current policy
+    
+    These are provided by the standard template encoding and model forward.
     """
     
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, ignore_index: int = -100, **kwargs):
+    def __init__(self, device_mesh: Optional[DeviceMesh] = None, **kwargs):
         super(GRPOLossProcessor, self).__init__(device_mesh=device_mesh, **kwargs)
-        self.ignore_index = ignore_index
-
-    @remote_function()
-    def prepare_inputs(self, inputs: InputFeature) -> InputFeature:
-        """Compute GRPO-specific fields from labels."""
-        import torch
-        labels = inputs['labels']
-        # Inputs may arrive as dict/array; ensure tensor ops work.
-        # After Ray serialization, inputs can be plain dicts, so inputs.labels would raise
-        # AttributeError (e.g., 'dict' object has no attribute 'labels').
-        if not isinstance(labels, torch.Tensor):
-            labels = torch.as_tensor(labels)
-            inputs['labels'] = labels
-        # Compute logits_to_keep: maximum completion length across batch
-        non_ignored = (labels != self.ignore_index).int()
-        first_non_ignored = non_ignored.argmax(dim=-1)
-        seq_len = labels.shape[-1]
-        logits_to_keep = (seq_len - first_non_ignored).max().item()
-
-        # Create completion mask for the last logits_to_keep positions
-        completion_mask = (labels[:, -logits_to_keep:] != self.ignore_index).float()
-
-        # Compute num_items_in_batch: total completion tokens
-        num_items_in_batch = completion_mask.sum().int().item()
-
-        # Update inputs with GRPO-specific fields
-        inputs['completion_mask'] = completion_mask
-        inputs['logits_to_keep'] = logits_to_keep
-        inputs['num_items_in_batch'] = num_items_in_batch
-
-        return super().prepare_inputs(inputs)

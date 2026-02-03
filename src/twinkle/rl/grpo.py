@@ -2,7 +2,7 @@
 from typing import Union, List, Literal
 
 import torch
-from base import Advantage
+from .base import Advantage
 
 
 class GRPOAdvantage(Advantage):

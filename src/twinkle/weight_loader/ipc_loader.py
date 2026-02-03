@@ -25,6 +25,7 @@ Limitations:
     - CUDA IPC only works on the same physical GPU
     - For STANDALONE mode (different GPUs), use NCCLWeightLoader instead
 """
+import concurrent.futures
 import gc
 import logging
 import os
@@ -167,7 +168,7 @@ class IPCWeightLoader(WeightLoader):
         
         # Step 2: Trigger vLLM worker to start receiving (non-blocking)
         # Worker will connect to ZMQ and wait for data
-        self._trigger_receiver(peft_config)
+        receiver_future = self._trigger_receiver(peft_config)
         
         # Give worker time to connect
         import time
@@ -179,6 +180,17 @@ class IPCWeightLoader(WeightLoader):
             
             # Step 4: Send weights in buckets (streaming, no full list)
             count = self._send_weights_in_buckets(socket, buffer, weights_source)
+            
+            # Step 5: Wait for receiver to complete processing
+            # This ensures the collective_rpc is fully done before returning
+            try:
+                receiver_future.result(timeout=60)  # 60s timeout
+            except Exception as e:
+                logger.warning(f"Receiver future completed with: {e}")
+            
+            # Step 6: Clear KV cache after weight update
+            # This is necessary because the model weights have changed
+            self._clear_kv_cache()
             
             logger.info(f"CUDA IPC weight sync completed: {count} tensors")
             
@@ -220,7 +232,7 @@ class IPCWeightLoader(WeightLoader):
                 # Already an iterator/generator
                 return state_dict
     
-    def _trigger_receiver(self, peft_config: Optional[Dict]) -> None:
+    def _trigger_receiver(self, peft_config: Optional[Dict]) -> "concurrent.futures.Future":
         """Trigger vLLM worker to start receiving weights.
         
         This calls the sampler's engine to invoke collective_rpc on all
@@ -229,6 +241,9 @@ class IPCWeightLoader(WeightLoader):
         IMPORTANT: This method triggers the receiver in a non-blocking way.
         The collective_rpc call starts the worker method but doesn't wait for
         it to complete, allowing the sender to start sending data.
+        
+        Returns:
+            Future that can be awaited after sending weights.
         """
         import asyncio
         
@@ -237,10 +252,8 @@ class IPCWeightLoader(WeightLoader):
         engine = self.sampler.engine
         
         # Run the async trigger in the sampler's event loop
-        # We use asyncio.create_task to run non-blocking (don't await)
         async def _trigger():
-            # collective_rpc call - returns a future but we don't wait for it
-            # The worker will start receiving and wait on ZMQ socket
+            # collective_rpc call - worker will start receiving and wait on ZMQ socket
             return await engine.engine.collective_rpc(
                 "update_weights_from_ipc",
                 kwargs={"peft_config": peft_config, "use_shm": self.use_shm},
@@ -252,8 +265,8 @@ class IPCWeightLoader(WeightLoader):
             _trigger(), 
             self.sampler._async_loop
         )
-        # Don't wait for future.result() here - that would cause deadlock
-        # The receiver is now waiting on ZMQ, sender can proceed
+        # Return future so caller can wait after sending weights
+        return future
     
     def _create_buffer(self, socket) -> Tuple[torch.Tensor, Any]:
         """Create transfer buffer and send handle to receiver."""
@@ -343,6 +356,28 @@ class IPCWeightLoader(WeightLoader):
         socket.recv()
         
         return count
+    
+    def _clear_kv_cache(self) -> None:
+        """Clear KV cache after weight update.
+        
+        This is necessary because the model weights have changed and
+        any cached KV pairs are now invalid.
+        """
+        import asyncio
+        
+        engine = self.sampler.engine
+        
+        async def _clear():
+            await engine.clear_kv_cache()
+        
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                _clear(), 
+                self.sampler._async_loop
+            )
+            future.result(timeout=10)
+        except Exception as e:
+            logger.warning(f"Failed to clear KV cache: {e}")
     
     def __call__(
         self,

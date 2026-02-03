@@ -16,15 +16,22 @@ class SamplingParams:
     top_p: float = 1.0
     repetition_penalty: float = 1.0
     
-    def to_vllm(self, *, logprobs: bool = True, prompt_logprobs: int = 0):
-        """Convert to vLLM SamplingParams."""
+    def to_vllm(self, *, num_samples: int = 1, logprobs: bool = True, prompt_logprobs: int = 0):
+        """Convert to vLLM SamplingParams.
+        
+        Args:
+            num_samples: Number of completions per prompt (vLLM's 'n' parameter).
+            logprobs: Whether to return logprobs for generated tokens.
+            prompt_logprobs: Number of prompt token logprobs to return.
+        """
         from vllm import SamplingParams as VLLMSamplingParams
         
         kwargs = {
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "n": num_samples,
         }
-        
+
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         
@@ -51,7 +58,11 @@ class SamplingParams:
         if prompt_logprobs > 0:
             kwargs["prompt_logprobs"] = prompt_logprobs
         
-        return VLLMSamplingParams(**kwargs)
+        vllm_params = VLLMSamplingParams(**kwargs)
+        if num_samples > 1:
+            from vllm.sampling_params import RequestOutputKind
+            vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
+        return vllm_params
     
     def to_transformers(self, tokenizer=None) -> Dict[str, Any]:
         """Convert to transformers generate() kwargs."""

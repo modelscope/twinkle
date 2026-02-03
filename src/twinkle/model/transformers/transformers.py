@@ -728,29 +728,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
-        """Get trainable parameters state dict.
-        
-        Args:
-            **kwargs:
-                adapter_name: Lora adapter name.
-                full: If True, returns all model parameters (for weight sync).
-                      Default is False, which returns only trainable parameters.
-        
-        Returns:
-            Dict of parameter name to tensor.
-        """
-        full = kwargs.pop('full', False)
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        
-        if full:
-            # Return all model parameters for full weight sync
-            model = self.strategy.unwrap_model(self.model)
-            params = {}
-            for name, param in model.named_parameters():
-                params[name] = param.data
-            return params
-        else:
-            return self._get_trainable_parameters(adapter_name)
+        return self._get_trainable_parameters(kwargs.pop('adapter_name', _default_adapter_name))
 
     @remote_function(collect='first')
     def calculate_metric(self, is_training, **kwargs):

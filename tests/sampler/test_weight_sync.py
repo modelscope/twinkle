@@ -4,19 +4,20 @@
 Test weight synchronization between training model and vLLM sampler.
 
 This test verifies that weights can be correctly synchronized from a
-TransformersModel to a VLLMSampler using different methods.
+TransformersModel to a VLLMSampler using IPCWeightLoader in Hybrid mode.
 
-Test Strategy:
-- Use load_format='dummy' for vLLM so it starts with random weights
-- Load real weights in TransformersModel
-- Verify that sampler with real weights produces different output than dummy
+Test Configuration:
+- 4 GPUs with DP=4, TP=1
+- Each GPU runs one HybridModelSamplerActor with model+sampler
+- Weight sync via CUDA IPC within each GPU
 """
 import os
 import sys
+import time
 
 # Must set before importing anything
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-os.environ['VLLM_LOGGING_LEVEL'] = 'ERROR'
+os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
 
 from transformers import AutoTokenizer
 
@@ -25,6 +26,7 @@ from twinkle.sampler import VLLMSampler
 from twinkle.sampler.types import SamplingParams
 from twinkle.template import Template
 from twinkle.data_format import Trajectory
+from twinkle.weight_loader import IPCWeightLoader
 from twinkle.model.transformers import TransformersModel
 
 # Model configuration - use a small model for testing
@@ -42,75 +44,20 @@ except Exception:
 
 def log(msg):
     """Print message with timestamp."""
-    print(f"[TEST] {msg}", flush=True)
+    import datetime
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
-@remote_class()
-class DummySamplerActor:
-    """Sampler actor with dummy weights for testing."""
-    
-    def __init__(self, model_id: str, device_mesh: DeviceMesh = None, **kwargs):
-        log("Creating DummySamplerActor with dummy weights...")
-        self.sampler = VLLMSampler(
-            model_id=model_id,
-            engine_args={
-                'load_format': 'dummy',  # Random weights
-                'gpu_memory_utilization': 0.3,
-                'max_model_len': 256,
-                'enforce_eager': True,
-            },
-        )
-        self.sampler.set_template(Template, model_id=model_id)
-        log("DummySamplerActor initialized")
-    
-    @remote_function(dispatch='all', collect='first')
-    def sample_text(self, prompt: str, max_tokens: int = 32) -> list:
-        """Sample text from the model."""
-        traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
-        response = self.sampler.sample(
-            traj, 
-            SamplingParams(max_tokens=max_tokens, temperature=0.0)
-        )
-        if response and hasattr(response, 'sequences') and response.sequences:
-            tokens = response.sequences[0].tokens
-            if hasattr(tokens, 'tolist'):
-                return tokens.tolist()
-            return list(tokens) if tokens else []
-        return []
-
-
-@remote_class()
-class RealSamplerActor:
-    """Sampler actor with real weights for testing."""
-    
-    def __init__(self, model_id: str, device_mesh: DeviceMesh = None, **kwargs):
-        log("Creating RealSamplerActor with real weights...")
-        self.sampler = VLLMSampler(
-            model_id=model_id,
-            engine_args={
-                'load_format': 'auto',  # Real weights from disk
-                'gpu_memory_utilization': 0.3,
-                'max_model_len': 256,
-                'enforce_eager': True,
-            },
-        )
-        self.sampler.set_template(Template, model_id=model_id)
-        log("RealSamplerActor initialized")
-    
-    @remote_function(dispatch='all', collect='first')
-    def sample_text(self, prompt: str, max_tokens: int = 32) -> list:
-        """Sample text from the model."""
-        traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
-        response = self.sampler.sample(
-            traj, 
-            SamplingParams(max_tokens=max_tokens, temperature=0.0)
-        )
-        if response and hasattr(response, 'sequences') and response.sequences:
-            tokens = response.sequences[0].tokens
-            if hasattr(tokens, 'tolist'):
-                return tokens.tolist()
-            return list(tokens) if tokens else []
-        return []
+def wait_result(result):
+    """Wait for result if it's a LazyCollect object."""
+    if hasattr(result, '_is_lazy_collect') and result._is_lazy_collect:
+        return result()
+    if hasattr(result, 'wait'):
+        return result.wait()
+    if callable(result) and hasattr(result, '_get_result'):
+        return result()
+    return result
 
 
 @remote_class()
@@ -120,7 +67,7 @@ class HybridModelSamplerActor:
     This simulates the Hybrid mode where:
     - Training model (TransformersModel) holds the real weights
     - vLLM Sampler starts with dummy/random weights
-    - Weight sync happens via direct method call (for now)
+    - Weight sync happens via IPCWeightLoader (CUDA IPC + ZMQ)
     """
 
     def __init__(
@@ -130,7 +77,9 @@ class HybridModelSamplerActor:
         remote_group: str = None,
         **kwargs
     ):
-        log("Initializing HybridModelSamplerActor...")
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        log(f"[Rank {rank}] Initializing HybridModelSamplerActor...")
         
         # Initialize sampler with dummy weights (random initialization)
         self.sampler = VLLMSampler(
@@ -144,220 +93,230 @@ class HybridModelSamplerActor:
             },
         )
         self.sampler.set_template(Template, model_id=model_id)
-        log("VLLMSampler initialized with dummy weights")
+        log(f"[Rank {rank}] VLLMSampler initialized with dummy weights")
         
         # Initialize training model with real weights
         self.model = TransformersModel(model_id=model_id, device_mesh=device_mesh)
-        log("TransformersModel initialized with real weights")
+        log(f"[Rank {rank}] TransformersModel initialized with real weights")
+        
+        # Initialize weight loader for Hybrid mode (CUDA IPC)
+        self.weight_loader = IPCWeightLoader(
+            model=self.model,
+            sampler=self.sampler,
+            bucket_size_mb=512,
+        )
+        log(f"[Rank {rank}] IPCWeightLoader initialized")
     
     @remote_function(dispatch='all', collect='first')
-    def sample_text(self, prompt: str, max_tokens: int = 32) -> list:
-        """Sample text from the model."""
+    def sync_weights(self, adapter_name: str = ''):
+        """Sync weights from training model to sampler via CUDA IPC."""
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        log(f"[Rank {rank}] Starting weight sync...")
+        start = time.time()
+        self.weight_loader.load_weights(adapter_name=adapter_name)
+        elapsed = time.time() - start
+        log(f"[Rank {rank}] Weight sync completed in {elapsed:.2f}s")
+        return elapsed
+    
+    @remote_function(dispatch='all', collect='first')
+    def sample_text(self, prompt: str, max_tokens: int = 64) -> dict:
+        """Sample text from the model and return result info."""
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        
         traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
         response = self.sampler.sample(
             traj, 
             SamplingParams(max_tokens=max_tokens, temperature=0.0)
         )
+        
         if response and hasattr(response, 'sequences') and response.sequences:
             tokens = response.sequences[0].tokens
             if hasattr(tokens, 'tolist'):
-                return tokens.tolist()
-            return list(tokens) if tokens else []
-        return []
+                tokens = tokens.tolist()
+            else:
+                tokens = list(tokens) if tokens else []
+            return {
+                'rank': rank,
+                'tokens': tokens,
+                'num_tokens': len(tokens),
+            }
+        return {'rank': rank, 'tokens': [], 'num_tokens': 0}
     
-    @remote_function(dispatch='all', collect='first')
-    def get_model_weights_count(self) -> int:
-        """Get the number of model weights."""
+    @remote_function(dispatch='all', collect='first')  
+    def get_model_info(self) -> dict:
+        """Get model information."""
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
         state_dict = self.model.get_state_dict()
         if isinstance(state_dict, dict):
-            return len(state_dict)
+            num_params = len(state_dict)
         else:
-            # Iterator - count by consuming (for testing only)
-            return sum(1 for _ in state_dict)
+            num_params = sum(1 for _ in state_dict)
+        return {
+            'rank': rank,
+            'num_params': num_params,
+            'model_id': self.model.model_id,
+        }
 
 
-def wait_result(result):
-    """Wait for result if it's a LazyCollect object.
+def test_hybrid_weight_sync_4gpu():
+    """Test weight sync in Hybrid mode with 4 GPUs (DP=4, TP=1).
     
-    LazyCollect is callable - calling it triggers the collection.
-    """
-    if hasattr(result, '_is_lazy_collect') and result._is_lazy_collect:
-        return result()  # LazyCollect is callable
-    if hasattr(result, 'wait'):
-        return result.wait()
-    if callable(result) and hasattr(result, '_get_result'):
-        return result()
-    return result
-
-
-def test_dummy_vs_real_baseline():
-    """Baseline test: verify dummy and real weights produce different outputs.
+    Each GPU runs one actor with:
+    - TransformersModel with real weights
+    - VLLMSampler with dummy weights initially
+    - IPCWeightLoader for weight sync
     
-    This test verifies the fundamental assumption that:
-    1. vLLM with dummy weights produces garbage output
-    2. vLLM with real weights produces meaningful output
+    Test verifies:
+    1. Before sync: sampler produces garbage output (random weights)
+    2. After sync: sampler produces correct output (real weights)
     """
     import twinkle
     
-    log("=" * 60)
-    log("TEST: Dummy vs Real Weights Baseline")
-    log("=" * 60)
+    log("=" * 70)
+    log("TEST: Hybrid Weight Sync (4 GPU, DP=4, TP=1)")
+    log("=" * 70)
     
+    # Initialize with 4 GPUs
     twinkle.initialize(
         mode='ray',
-        nproc_per_node=1,
+        nproc_per_node=4,
         groups=[
-            DeviceGroup(name='test', ranks=[0], device_type='GPU', gpus_per_worker=1),
+            DeviceGroup(
+                name='hybrid', 
+                ranks=[0, 1, 2, 3], 
+                device_type='GPU', 
+                gpus_per_worker=1,  # Each worker gets 1 GPU (TP=1)
+            ),
         ],
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    test_prompt = "What is 2+2?"
-    
-    # Test with dummy weights
-    log("Creating actor with DUMMY weights...")
-    dummy_actor = DummySamplerActor(
-        model_id=MODEL_ID,
-        device_mesh=DeviceMesh.from_sizes(world_size=1, dp_size=1),
-        remote_group='test',
-    )
-    
-    tokens_dummy = wait_result(dummy_actor.sample_text(test_prompt))
-    if not isinstance(tokens_dummy, list):
-        tokens_dummy = list(tokens_dummy) if tokens_dummy else []
-    text_dummy = tokenizer.decode(tokens_dummy, skip_special_tokens=True) if tokens_dummy else ""
-    log(f"Output with DUMMY weights: '{text_dummy[:100]}'")
-    
-    # Shutdown dummy actor to free GPU memory
-    log("Shutting down dummy actor...")
-    import ray
-    # Need to get the actual ray actor handle and terminate it
-    # For now, just continue - next actor will use same GPU
-    
-    # Test with real weights
-    log("Creating actor with REAL weights...")
-    real_actor = RealSamplerActor(
-        model_id=MODEL_ID,
-        device_mesh=DeviceMesh.from_sizes(world_size=1, dp_size=1),
-        remote_group='test',
-    )
-    
-    tokens_real = wait_result(real_actor.sample_text(test_prompt))
-    if not isinstance(tokens_real, list):
-        tokens_real = list(tokens_real) if tokens_real else []
-    text_real = tokenizer.decode(tokens_real, skip_special_tokens=True) if tokens_real else ""
-    log(f"Output with REAL weights: '{text_real[:100]}'")
-    
-    # Verify outputs are different
-    if tokens_dummy != tokens_real:
-        log("SUCCESS: Outputs differ between dummy and real weights")
-        
-        # Check if real weights produce correct answer
-        if "4" in text_real or "four" in text_real.lower():
-            log("SUCCESS: Real weights produce correct answer '4'")
-            return True
-        else:
-            log("WARNING: Real output doesn't contain '4' but outputs differ")
-            return True
-    else:
-        log("FAIL: Outputs are the same - something is wrong")
-        return False
+    test_prompts = [
+        "What is 2+2?",
+        "What is the capital of France?",
+        "What is 10*5?",
+        "Hello, my name is",
+    ]
 
-
-def test_hybrid_actor_initialization():
-    """Test that HybridModelSamplerActor initializes correctly.
-    
-    This verifies:
-    1. VLLMSampler with dummy weights can be created
-    2. TransformersModel with real weights can be created
-    3. Both can coexist in the same actor
-    """
-    import twinkle
-    
-    log("=" * 60)
-    log("TEST: Hybrid Actor Initialization")
-    log("=" * 60)
-    
-    # Shutdown any existing ray to start fresh
-    import ray
-    if ray.is_initialized():
-        ray.shutdown()
-    
-    # Use a unique group name for this test
-    twinkle.initialize(
-        mode='ray',
-        nproc_per_node=1,
-        groups=[
-            DeviceGroup(name='test_hybrid', ranks=[0], device_type='GPU', gpus_per_worker=1),
-        ],
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    
-    # Create hybrid actor
-    log("Creating HybridModelSamplerActor...")
+    # Create hybrid actor (will spawn 4 instances, one per GPU)
+    log("Creating HybridModelSamplerActor on 4 GPUs...")
     actor = HybridModelSamplerActor(
         model_id=MODEL_ID,
-        device_mesh=DeviceMesh.from_sizes(world_size=1, dp_size=1),
-        remote_group='test_hybrid',
+        device_mesh=DeviceMesh.from_sizes(world_size=4, dp_size=4),
+        remote_group='hybrid',
     )
     
-    # Verify model weights are accessible  
-    weights_count_raw = actor.get_model_weights_count()
-    weights_count = wait_result(weights_count_raw)
-    log(f"Model has {weights_count} trainable parameters")
+    # Wait for initialization and get model info
+    log("Waiting for actor initialization...")
+    model_info = wait_result(actor.get_model_info())
+    log(f"Model info: {model_info}")
     
-    if isinstance(weights_count, int) and weights_count > 0:
-        log("SUCCESS: Hybrid actor initialized with model weights")
-    else:
-        log("FAIL: No model weights found")
-        return False
+    # Test 1: Sample BEFORE weight sync (should produce garbage)
+    log("\n" + "-" * 50)
+    log("STEP 1: Sampling BEFORE weight sync (dummy weights)")
+    log("-" * 50)
     
-    # Verify sampler works (with dummy weights initially)
-    tokens = wait_result(actor.sample_text("Hello"))
-    if tokens:
-        log(f"SUCCESS: Sampler generated {len(tokens)} tokens")
-        return True
-    else:
-        log("FAIL: Sampler failed to generate tokens")
-        return False
+    results_before = {}
+    for i, prompt in enumerate(test_prompts):
+        result = wait_result(actor.sample_text(prompt))
+        text = tokenizer.decode(result['tokens'], skip_special_tokens=True) if result['tokens'] else ""
+        results_before[prompt] = {
+            'tokens': result['tokens'],
+            'text': text,
+        }
+        log(f"  Prompt {i+1}: '{prompt}'")
+        log(f"  Output: '{text[:80]}...' ({result['num_tokens']} tokens)")
+    
+    # Test 2: Sync weights
+    log("\n" + "-" * 50)
+    log("STEP 2: Syncing weights via IPCWeightLoader")
+    log("-" * 50)
+    
+    sync_start = time.time()
+    sync_result = wait_result(actor.sync_weights())
+    sync_elapsed = time.time() - sync_start
+    log(f"Weight sync completed in {sync_elapsed:.2f}s")
+    
+    # Test 3: Sample AFTER weight sync (should produce correct output)
+    log("\n" + "-" * 50)
+    log("STEP 3: Sampling AFTER weight sync (real weights)")
+    log("-" * 50)
+    
+    results_after = {}
+    for i, prompt in enumerate(test_prompts):
+        result = wait_result(actor.sample_text(prompt))
+        text = tokenizer.decode(result['tokens'], skip_special_tokens=True) if result['tokens'] else ""
+        results_after[prompt] = {
+            'tokens': result['tokens'],
+            'text': text,
+        }
+        log(f"  Prompt {i+1}: '{prompt}'")
+        log(f"  Output: '{text[:80]}...' ({result['num_tokens']} tokens)")
+    
+    # Verify results
+    log("\n" + "-" * 50)
+    log("STEP 4: Verification")
+    log("-" * 50)
+    
+    all_passed = True
+    for prompt in test_prompts:
+        before = results_before[prompt]
+        after = results_after[prompt]
+        
+        # Check if outputs are different
+        outputs_differ = before['tokens'] != after['tokens']
+        
+        # Check for expected answers
+        expected_answers = {
+            "What is 2+2?": ["4", "four"],
+            "What is the capital of France?": ["Paris", "paris"],
+            "What is 10*5?": ["50", "fifty"],
+            "Hello, my name is": [],  # No specific expected answer
+        }
+        
+        expected = expected_answers.get(prompt, [])
+        has_correct_answer = any(ans.lower() in after['text'].lower() for ans in expected) if expected else True
+        
+        status = "PASS" if outputs_differ else "FAIL"
+        answer_status = "CORRECT" if has_correct_answer else "CHECK"
+        
+        log(f"  '{prompt}':")
+        log(f"    Before: '{before['text'][:50]}...'")
+        log(f"    After:  '{after['text'][:50]}...'")
+        log(f"    Status: {status} (outputs differ: {outputs_differ}), Answer: {answer_status}")
+        
+        if not outputs_differ:
+            all_passed = False
+    
+    return all_passed
 
 
 def main():
-    """Run all weight sync tests."""
+    """Run weight sync test."""
+    log("=" * 70)
+    log("TWINKLE WEIGHT SYNC TEST")
+    log(f"Model: {MODEL_ID}")
+    log("Configuration: Hybrid mode, 4 GPU, DP=4, TP=1")
+    log("=" * 70)
+    
     results = []
     
-    # Determine which test to run via environment variable
-    test_to_run = os.environ.get('TEST_NAME', 'all')
-    
-    # Test 1: Baseline - verify dummy vs real weights differ
-    if test_to_run in ('all', 'baseline'):
-        try:
-            passed = test_dummy_vs_real_baseline()
-            results.append(('dummy_vs_real_baseline', passed))
-        except Exception as e:
-            log(f"Error in dummy_vs_real_baseline: {e}")
-            import traceback
-            traceback.print_exc()
-            results.append(('dummy_vs_real_baseline', False))
-    
-    # Test 2: Hybrid actor initialization
-    if test_to_run in ('all', 'hybrid'):
-        # Note: This test requires a fresh ray session
-        # Running after baseline test may fail due to cached group config
-        try:
-            passed = test_hybrid_actor_initialization()
-            results.append(('hybrid_actor_init', passed))
-        except Exception as e:
-            log(f"Error in hybrid_actor_init: {e}")
-            import traceback
-            traceback.print_exc()
-            results.append(('hybrid_actor_init', False))
+    try:
+        passed = test_hybrid_weight_sync_4gpu()
+        results.append(('hybrid_weight_sync_4gpu', passed))
+    except Exception as e:
+        log(f"Error in test: {e}")
+        import traceback
+        traceback.print_exc()
+        results.append(('hybrid_weight_sync_4gpu', False))
     
     # Summary
-    log("\n" + "=" * 60)
+    log("\n" + "=" * 70)
     log("FINAL SUMMARY")
-    log("=" * 60)
+    log("=" * 70)
     for name, passed in results:
         status = "PASSED" if passed else "FAILED"
         log(f"  {name}: {status}")

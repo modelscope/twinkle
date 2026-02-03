@@ -350,7 +350,11 @@ class VLLMEngine(BaseSamplerEngine):
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = topk_prompt_logprobs if topk_prompt_logprobs > 0 else (1 if include_prompt_logprobs else 0)
-        vllm_params = sampling_params.to_vllm(logprobs=logprobs, prompt_logprobs=prompt_logprobs_k)
+        vllm_params = sampling_params.to_vllm(
+            num_samples=num_samples,
+            logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs_k,
+        )
         
         # Build request
         if request_id is None:

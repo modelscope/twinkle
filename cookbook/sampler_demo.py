@@ -8,7 +8,7 @@ from twinkle.data_format import Trajectory
 
 MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
 VLLM_TP = 2  # Tensor parallelism for vLLM (GPUs per worker)
-VLLM_DP = 4  # Data parallelism (number of workers)
+VLLM_DP = 2  # Data parallelism (number of workers)
 NUM_GPUS = VLLM_TP * VLLM_DP  # Total GPUs = 8
 
 if __name__ == '__main__':
@@ -36,10 +36,16 @@ if __name__ == '__main__':
     )
     sampler.set_template(Template, model_id=MODEL_ID)
     trajectory = Trajectory(messages=[{'role': 'user', 'content': 'Hello! Tell a joke.'}])
-    response = sampler.sample([trajectory] * 1, SamplingParams(max_tokens=128, temperature=1.0))
+    
+    num_prompts = 4
+    num_samples = 2  # Generate 2 completions per prompt
+    sampling_params = SamplingParams(max_tokens=128, temperature=1.0)
+    
+    # Pass num_samples to sample() method (aligned with tinker's API)
+    response = sampler.sample([trajectory] * num_prompts, sampling_params, num_samples=num_samples)
     if callable(response):
         response = response()
-    
+
     for i, seq in enumerate(response.sequences):
         text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
-        print(f"{i}: {text}")
+        print(f"{i}:\n {text}")

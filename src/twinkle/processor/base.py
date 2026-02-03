@@ -282,8 +282,7 @@ class InputProcessor:
         results = []
         for _input in inputs:
             output = {}
-            _keys = ['input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask',
-                     'logits_to_keep', 'num_items_in_batch']
+            _keys = ['input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask']
             for key in list(_input.keys()):
                 if key in _keys:
                     output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]
