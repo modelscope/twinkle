@@ -267,7 +267,6 @@ class ActorGroup:
         self.model.set_template('Template', **build_template_kwargs(include_model_id=False))
         self.model.set_processor('GRPOLossProcessor')
         
-        self.weight_loader = NativeLoader()
         self.adapter_name = adapter_name
         self.lora_config = lora_config
     
@@ -308,11 +307,6 @@ class ActorGroup:
     @remote_function()
     def lr_step(self):
         return self.model.lr_step()
-    
-    @remote_function()
-    def sync_weights(self):
-        self.weight_loader(self.model, self.sampler, self.adapter_name)
-
 
 def create_dataset():
     """Create math dataset for RL training."""
