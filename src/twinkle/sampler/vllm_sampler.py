@@ -1,20 +1,71 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""vLLM-based sampler using VLLMEngine (AsyncLLM)."""
+"""vLLM-based sampler using VLLMEngine (AsyncLLM).
+
+Device Configuration:
+    VLLMSampler automatically detects the number of available GPUs from
+    CUDA_VISIBLE_DEVICES environment variable (set by twinkle's ResourceManager)
+    and configures vLLM's tensor_parallel_size accordingly.
+    
+    To use tensor parallelism, configure DeviceGroup with gpus_per_worker > 1:
+    
+        # DP2 with TP2 (4 GPUs total, 2 workers, each with 2 GPUs)
+        DeviceGroup(name='sampler', ranks=[0,1,2,3], gpus_per_worker=2)
+        
+        # TP4 (4 GPUs, 1 worker with all 4 GPUs)
+        DeviceGroup(name='sampler', ranks=[0,1,2,3], gpus_per_worker=4)
+
+Data Flow:
+    When multiple VLLMSampler workers exist (DP > 1):
+    - Data is dispatched via dispatch='slice_dp' (each worker gets a slice)
+    - Results are collected via collect='flatten' (merged into single list)
+"""
 import asyncio
+import logging
 import os
+import threading
 from dataclasses import asdict
 from typing import List, Dict, Any, Union, Optional
 
 from .base import Sampler
 from .types import SamplingParams, SampleResponse, SampledSequence
 from twinkle import remote_function, remote_class, DeviceMesh, requires
+from twinkle.utils.platform import Platform
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
+
+logger = logging.getLogger(__name__)
+
+
+def _collect_sample_responses(results: List[SampleResponse]) -> SampleResponse:
+    """Custom collect function to merge multiple SampleResponse objects.
+    
+    Args:
+        results: List of SampleResponse from each DP worker.
+        
+    Returns:
+        Merged SampleResponse with all sequences combined.
+    """
+    if not results:
+        return SampleResponse(sequences=[])
+    
+    if len(results) == 1:
+        return results[0]
+    
+    all_sequences = []
+    for resp in results:
+        if resp is not None and hasattr(resp, 'sequences'):
+            all_sequences.extend(resp.sequences)
+    
+    return SampleResponse(sequences=all_sequences)
 
 
 @remote_class()
 class VLLMSampler(Sampler):
-    """A vLLM-based sampler using VLLMEngine (AsyncLLM)."""
+    """A vLLM-based sampler using VLLMEngine (AsyncLLM).
+    
+    This sampler automatically configures vLLM based on available GPUs.
+    When gpus_per_worker > 1 is set in DeviceGroup, tensor parallelism is used.
+    """
 
     def __init__(
         self,
@@ -23,6 +74,16 @@ class VLLMSampler(Sampler):
         device_mesh: DeviceMesh = None,
         **kwargs
     ):
+        """Initialize VLLMSampler.
+        
+        Args:
+            model_id: HuggingFace model ID or local path.
+            engine_args: Arguments passed to VLLMEngine. If tensor_parallel_size
+                is not specified, it will be automatically set based on the
+                number of visible GPUs (from CUDA_VISIBLE_DEVICES).
+            device_mesh: Parallel configuration for data parallelism.
+            **kwargs: Additional arguments.
+        """
         os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
         os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '86400'
         super().__init__()
@@ -31,11 +92,65 @@ class VLLMSampler(Sampler):
         self.model_id = model_id
         self.device_mesh = device_mesh
         
+        # Create a dedicated background event loop for vLLM async operations.
+        # This is necessary because:
+        # 1. vLLM's AsyncLLM requires its async methods to run in the same event loop
+        #    where the engine was created (due to background output_handler task)
+        # 2. Ray workers use uvloop which is already running, so we can't use
+        #    run_until_complete() or asyncio.run() directly
+        # 3. By creating engine in the background thread's event loop, all async
+        #    operations stay in the same loop context
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_event_loop,
+            daemon=True,
+            name="VLLMSampler-EventLoop"
+        )
+        self._async_thread.start()
+        
         from .vllm_engine import VLLMEngine
-        engine_kwargs = engine_args or {}
-        self.engine = VLLMEngine(model_id=model_id, **engine_kwargs)
+        engine_kwargs = engine_args.copy() if engine_args else {}
+        
+        # Auto-detect tensor_parallel_size from CUDA_VISIBLE_DEVICES
+        if 'tensor_parallel_size' not in engine_kwargs:
+            tp_size = 1
+            visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            if visible_devices:
+                num_gpus = len([d for d in visible_devices.split(',') if d.strip()])
+                if num_gpus > 0:
+                    tp_size = num_gpus
+            engine_kwargs['tensor_parallel_size'] = tp_size
+        
+        # Set unique seed per engine based on rank for diverse sampling across DP workers
+        # User can override by passing 'seed' in engine_args
+        engine_seed = engine_kwargs.get('seed', None)
+        if engine_seed is None:
+            rank = Platform.get_rank()
+            engine_seed = 42 + rank
+            # set different seed to get different results
+            engine_kwargs['seed'] = engine_seed
+        
+        # Create engine in the background event loop so all async operations
+        # (including vLLM's internal background tasks) run in the same loop
+        self.engine = self._run_in_loop(
+            self._create_engine_async(VLLMEngine, model_id, engine_kwargs)
+        )
         
         VLLMLoraWeights().patch(self)
+    
+    def _run_event_loop(self):
+        """Run the event loop in background thread."""
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+    
+    def _run_in_loop(self, coro):
+        """Run a coroutine in the background event loop and wait for result."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        return future.result()
+    
+    async def _create_engine_async(self, engine_cls, model_id, engine_kwargs):
+        """Create engine in async context to ensure output_handler starts correctly."""
+        return engine_cls(model_id=model_id, **engine_kwargs)
 
     def encode_trajectory_for_vllm(self, trajectory: Trajectory, adapter_name: str = '') -> InputFeature:
         """Encode trajectory for vLLM - does not expand image tokens.
@@ -111,6 +226,7 @@ class VLLMSampler(Sampler):
         feat: Dict[str, Any],
         sampling_params: SamplingParams,
         adapter_uri: Optional[str] = None,
+        request_seed: Optional[int] = None,
     ) -> List[SampledSequence]:
         """Sample a single input asynchronously."""
         input_ids = feat['input_ids']
@@ -137,7 +253,7 @@ class VLLMSampler(Sampler):
             for seq in response.sequences
         ]
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect=_collect_sample_responses, lazy_collect=False)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -155,6 +271,12 @@ class VLLMSampler(Sampler):
             
         Returns:
             SampleResponse containing sampled sequences.
+            
+        Note:
+            In Ray mode with multiple workers (DP > 1):
+            - Data is automatically sliced by DP rank (dispatch='slice_dp')
+            - Results are merged using _collect_sample_responses
+            - Each worker receives already-sliced inputs (e.g., DP4 with 8 inputs -> 2 per worker)
         """
         self._check_adapter_valid(adapter_name)
         
@@ -186,7 +308,7 @@ class VLLMSampler(Sampler):
             if group.lora_ready and self.engine.adapter_manager:
                 adapter_uri = self.engine.adapter_manager.get_uri(adapter_name)
         
-        # Sample all inputs in parallel using asyncio.gather
+        # Sample all inputs in parallel using background event loop
         async def _sample_all():
             tasks = [
                 self._sample_single(feat, sampling_params, adapter_uri)
@@ -194,11 +316,7 @@ class VLLMSampler(Sampler):
             ]
             return await asyncio.gather(*tasks)
         
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(_sample_all())
-        finally:
-            loop.close()
+        results = self._run_in_loop(_sample_all())
         
         # Flatten results
         all_sequences = []
@@ -207,13 +325,16 @@ class VLLMSampler(Sampler):
         
         return SampleResponse(sequences=all_sequences)
 
+    @remote_function(dispatch='all', collect='first')
     def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
+        """Sync weights from training to vLLM engine.
+        
+        Args:
+            state_dict: Model state dict to sync.
+            adapter_name: If provided, sync as LoRA adapter. Otherwise sync base model.
+        """
         if not adapter_name:
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(self.engine.update_weights(state_dict))
-            finally:
-                loop.close()
+            self._run_in_loop(self.engine.update_weights(state_dict))
         else:
             self._check_adapter_valid(adapter_name)
             group = self.sample_group[adapter_name]
@@ -249,3 +370,28 @@ class VLLMSampler(Sampler):
                     except TypeError:
                         remove_lora(group.lora_int_id)
             self.sample_group.pop(adapter_name)
+    
+    @remote_function(dispatch='all', collect='first')
+    def sleep(self, level: int = 2) -> None:
+        """Release GPU memory for colocate mode.
+        
+        Call this before training to free up GPU memory used by vLLM.
+        
+        Args:
+            level: Sleep level (1=light, 2=deep). Default 2 releases most memory.
+        """
+        self._run_in_loop(self.engine.sleep(level))
+    
+    @remote_function(dispatch='all', collect='first')
+    def wake_up(self, tags: List[str] = None, reload_weights: bool = True) -> None:
+        """Resume GPU memory for colocate mode.
+        
+        Call this before sampling to reload weights/KV cache into GPU.
+        
+        Args:
+            tags: Optional list of memory types to resume (e.g., ['weights', 'kv_cache']).
+                  If None, resumes all.
+            reload_weights: If True, reload weights from disk after wake_up.
+                  Required after level 2 sleep which discards weights.
+        """
+        self._run_in_loop(self.engine.wake_up(tags=tags, reload_weights=reload_weights))

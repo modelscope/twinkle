@@ -127,7 +127,7 @@ class TransformersEngine(BaseSamplerEngine):
         
         return gen_kwargs
     
-    @remote_function(collect='flatten')
+    @remote_function()
     async def sample(
         self,
         prompt_token_ids: List[int],

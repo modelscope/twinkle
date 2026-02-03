@@ -102,18 +102,58 @@ class ResourceManager:
         for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
+                gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
-                for rank in ranks:
-                    node_rank = rank // nproc_per_node
-                    gpu_rank = rank % nproc_per_node
-                    local_device_groups.append(
-                        dict(
-                            node_rank=node_rank,
-                            gpu_rank=[gpu_rank],
-                            placement_group=self.node2pg[node_rank],
-                            ray_address=ray_address))
+
+                if gpus_per_worker > 1:
+                    if len(ranks) % gpus_per_worker != 0:
+                        raise ValueError(
+                            f"DeviceGroup '{group.name}': number of ranks ({len(ranks)}) "
+                            f"must be divisible by gpus_per_worker ({gpus_per_worker})"
+                        )
+
+                    num_workers = len(ranks) // gpus_per_worker
+                    for worker_idx in range(num_workers):
+                        # Get the GPU ranks for this worker
+                        start_idx = worker_idx * gpus_per_worker
+                        worker_ranks = ranks[start_idx:start_idx + gpus_per_worker]
+                        
+                        # All GPUs for a worker should be on the same node
+                        node_ranks = [r // nproc_per_node for r in worker_ranks]
+                        gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
+                        
+                        if len(set(node_ranks)) > 1:
+                            raise ValueError(
+                                f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
+                                f"Each worker's GPUs must be on the same node."
+                            )
+                        
+                        node_rank = node_ranks[0]
+                        local_device_groups.append(
+                            dict(
+                                node_rank=node_rank,
+                                gpu_rank=gpu_ranks_local,
+                                placement_group=self.node2pg[node_rank],
+                                ray_address=ray_address))
+                else:
+                    for rank in ranks:
+                        node_rank = rank // nproc_per_node
+                        gpu_rank = rank % nproc_per_node
+                        local_device_groups.append(
+                            dict(
+                                node_rank=node_rank,
+                                gpu_rank=[gpu_rank],
+                                placement_group=self.node2pg[node_rank],
+                                ray_address=ray_address))
+                
                 self.device_groups[group.name] = local_device_groups
+                
+                # Update the group's ranks to reflect actual worker count
+                if gpus_per_worker > 1:
+                    # Create virtual ranks for workers (not GPUs)
+                    group.ranks = list(range(len(local_device_groups)))
             else:
+                assert getattr(group, 'gpus_per_worker', 1) == 1
                 ranks = group.ranks
                 local_device_groups = []
                 global_cpu_proc_idx = 0

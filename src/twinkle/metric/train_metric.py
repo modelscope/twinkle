@@ -38,11 +38,13 @@ class TrainMetric(Metric):
     def calculate(self):
         results = {}
         if self.lr is not None:
+            if isinstance(self.lr, list) and len(self.lr) == 1:
+                self.lr = self.lr[0]
             if isinstance(self.lr, list):
                 for idx, lr in enumerate(self.lr):
-                    results[f'LR(param group {idx+1})'] = lr
+                    results[f'learning rate(param group {idx+1})'] = lr
             else:
-                results[f'LR'] = self.lr
+                results[f'learning rate'] = self.lr
         if self.step is not None:
             results['iters'] = self.step // self.gradient_accumulation_steps
             interval = time.time() - self.time

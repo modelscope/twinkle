@@ -20,7 +20,7 @@ if Platform.get_rank() == 0:
         project="megatron-swift",
     )
 
-device_mesh = DeviceMesh.from_sizes(vpp_size=2, cp_size=2, pp_size=2, tp_size=2, dp_size=2)
+device_mesh = DeviceMesh.from_sizes(cp_size=2, pp_size=2, tp_size=2, dp_size=2)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
