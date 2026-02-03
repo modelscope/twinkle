@@ -423,10 +423,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if self.sp_strategy is not None and 'labels' in inputs:
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value = loss_value
-        return self._loss_for_logging(loss_value, inputs, loss_instance)
+        return self._loss_for_logging(loss_value, inputs, loss_instance, adapter_name)
 
-    @staticmethod
-    def _loss_for_logging(loss_value: torch.Tensor, inputs: Dict[str, Any], loss_instance: Loss) -> float:
+    def _loss_for_logging(self, loss_value: torch.Tensor, inputs: Dict[str, Any], loss_instance: Loss, adapter_name: str) -> float:
         detached_loss = torch_util.to_local_tensor(loss_value.detach())
         loss_item = detached_loss.float().item()
         if getattr(loss_instance, "reduction", None) != "sum":
@@ -438,6 +437,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         valid_tokens = int((labels >= 0).sum().item())
         if valid_tokens <= 0:
             return loss_item
+        optimizer_group = self.optimizer_group[adapter_name]
+        if self.device_mesh.dp_world_size > 1:
+            local_results = [
+                {"loss_item": loss_item, "valid_tokens": valid_tokens}
+            ]
+            all_results = torch_util.gather_object(local_results, self.device_mesh, optimizer_group._dp_group)
+            loss_item = sum(r["loss_item"] for r in all_results)
+            valid_tokens = sum(r["valid_tokens"] for r in all_results)
         return loss_item / valid_tokens
 
     @remote_function()
