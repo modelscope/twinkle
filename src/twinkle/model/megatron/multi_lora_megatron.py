@@ -194,6 +194,7 @@ class MultiLoraMegatronModel(MegatronModel):
             if dist.is_initialized():
                 dist.barrier()
 
+    @remote_function(dispatch='all')
     def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
             output_dir = 'output'

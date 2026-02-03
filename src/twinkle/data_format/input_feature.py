@@ -47,6 +47,7 @@ class InputFeature(TypedDict, total=False):
     videos: List[Any]
 
 
+
 def to_transformers_dict(feature: InputFeature) -> dict:
     """Transfer the InputFeature object to a dict needed by `transformers` models."""
     import torch

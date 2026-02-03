@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import logging
+import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -14,6 +16,7 @@ from twinkle.server.twinkle.common.validation import verify_request_token, get_t
 from twinkle.server.twinkle.common.state import get_server_state, schedule_task
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
+logger = logging.getLogger(__name__)
 
 def build_server_app(
     deploy_options: Dict[str, Any],
@@ -43,7 +46,8 @@ def build_server_app(
     class TinkerCompatServer:
         def __init__(self, supported_models: Optional[List[types.SupportedModel]] = None, **kwargs) -> None:
             self.state = get_server_state()
-            self.client = httpx.AsyncClient(timeout=None)
+            # Disable proxy for internal requests to avoid routing through external proxies
+            self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get("route_prefix", "/api/v1")
             self.supported_models = supported_models or [
                 types.SupportedModel(model_name="Qwen/Qwen2.5-0.5B-Instruct"),
@@ -84,6 +88,11 @@ def build_server_app(
             headers.pop("content-length", None)
 
             try:
+                if os.environ.get("TWINKLE_DEBUG_PROXY", "0") == "1":
+                    logger.info(
+                        "proxy_to_model endpoint=%s target_url=%s x-ray-serve-request-id=%s",
+                        endpoint, target_url, headers.get('x-ray-serve-request-id')
+                    )
                 rp_ = await self.client.request(
                     method=request.method,
                     url=target_url,
@@ -91,6 +100,11 @@ def build_server_app(
                     headers=headers,
                     params=request.query_params,
                 )
+                if os.environ.get("TWINKLE_DEBUG_PROXY", "0") == "1":
+                    logger.info(
+                        "proxy_to_model response status=%s body=%s",
+                        rp_.status_code, rp_.text[:200]
+                    )
                 return Response(
                     content=rp_.content,
                     status_code=rp_.status_code,
@@ -214,8 +228,13 @@ def build_server_app(
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
             record = self.state.get_future(body.request_id)
             if record is None:
-                raise HTTPException(status_code=404, detail="Future not found")
+                if os.environ.get("TWINKLE_DEBUG_FUTURES", "0") == "1":
+                    logger.info("retrieve_future miss request_id=%s", body.request_id)
+                # Return a retry hint instead of 404 to avoid client failures during async scheduling.
+                return {"type": "try_again"}
             result = record["result"]
+            if os.environ.get("TWINKLE_DEBUG_FUTURES", "0") == "1":
+                logger.info("retrieve_future hit request_id=%s", body.request_id)
             if hasattr(result, "model_dump"):
                 return result.model_dump()
             return result

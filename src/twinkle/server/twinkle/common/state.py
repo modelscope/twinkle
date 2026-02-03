@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import logging
 import re
 import time
 import traceback
@@ -11,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import ray
 
+logger = logging.getLogger(__name__)
 
 class ServerState:
     """
@@ -294,13 +297,13 @@ class ServerStateProxy:
 def get_server_state(actor_name: str = 'twinkle_server_state') -> ServerStateProxy:
     """
     Get or create the ServerState Ray actor.
-    
+
     This function ensures only one ServerState actor exists with the given name.
     It uses a detached actor so the state persists across driver restarts.
-    
+
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state')
-        
+
     Returns:
         A ServerStateProxy for interacting with the actor
     """
@@ -347,6 +350,9 @@ async def schedule_task(
         A dict containing request_id and model_id for future retrieval
     """
     request_id = f"req_{uuid.uuid4().hex}"
+    # Store a placeholder so retrieve_future won't 404 before the task finishes.
+    # The client treats {"type": "try_again"} as a polling signal.
+    await state.store_future(request_id, {"type": "try_again"}, model_id)
 
     async def _runner():
         try:
@@ -360,6 +366,10 @@ async def schedule_task(
             }
             await state.store_future(request_id, err_payload, model_id)
 
-    # Schedule execution in the background
-    asyncio.create_task(_runner())
+    if os.environ.get("TWINKLE_SYNC_FUTURE", "0") == "1":
+        # Run inline for debugging to avoid background task starvation.
+        await _runner()
+    else:
+        # Schedule execution in the background
+        asyncio.create_task(_runner())
     return {'request_id': request_id, 'model_id': model_id}

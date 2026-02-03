@@ -219,6 +219,9 @@ class Torch(Framework):
         import torch
         if Torch.is_gpu_available():
             torch.cuda.synchronize(Platform.get_local_device())
+        elif Torch.is_npu_available():
+            import torch_npu
+            torch.npu.synchronize(Platform.get_local_device())
     
     @staticmethod
     def contains_nan(*args, **kwargs) -> bool:
@@ -245,3 +248,11 @@ class Torch(Framework):
     
         return False
 
+    @staticmethod
+    def ipc_collect():
+        if Torch.is_gpu_available():
+            import torch
+            torch.cuda.ipc_collect()
+        elif Torch.is_npu_available():
+            import torch_npu
+            torch.npu.ipc_collect()

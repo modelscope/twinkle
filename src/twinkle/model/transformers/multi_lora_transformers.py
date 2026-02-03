@@ -44,6 +44,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.mixed_precision = mixed_precision
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
+        self.sp_strategy = None
+        # MultiLoRA does not support expert parallel; keep flags consistent with base class.
+        self._expert_parallel_config = None
+        self._enable_expert_parallel = False
+        self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
@@ -228,4 +233,3 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
             return super()._get_trainable_parameters(real_adapter_name)
-

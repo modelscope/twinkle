@@ -126,6 +126,8 @@ def build_model_app(model_id: str,
             model_id = self.state.register_model(body.model_dump())
 
             async def _create_adapter():
+                if os.environ.get("TWINKLE_DEBUG_CREATE_MODEL", "0") == "1":
+                    logger.info("[twinkle][create_model] start model_id=%s", model_id)
                 if body.lora_config:
                     # TODO: support more lora config parameters, train_unembed, etc.
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
@@ -149,6 +151,8 @@ def build_model_app(model_id: str,
 
                 training_run_manager = create_training_run_manager(request.state.token)
                 training_run_manager.save(model_id, body)
+                if os.environ.get("TWINKLE_DEBUG_CREATE_MODEL", "0") == "1":
+                    logger.info("[twinkle][create_model] done model_id=%s", model_id)
 
                 return types.CreateModelResponse(model_id=model_id)
 

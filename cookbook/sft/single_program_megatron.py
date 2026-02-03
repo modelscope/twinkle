@@ -1,5 +1,6 @@
 import os
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 from peft import LoraConfig
 import twinkle
 from tqdm import tqdm
@@ -20,15 +21,15 @@ if Platform.get_rank() == 0:
     )
 
 
-device_mesh = DeviceMesh.from_sizes(ep_size=2, cp_size=2, pp_size=2, tp_size=2, dp_size=2)
+device_mesh = DeviceMesh.from_sizes(cp_size=2, pp_size=2, tp_size=2, dp_size=2, sequence_parallel=True)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
 
 
 def eval(model):
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-30B-A3B', max_length=512)
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500), max_length=256))
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
     dataset.encode(batched=True, load_from_cache_file=False)
     # dataset.pack_dataset()
@@ -41,13 +42,13 @@ def eval(model):
 
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-30B-A3B', max_length=512)
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
     # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = MultiLoraMegatronModel(model_id='ms://Qwen/Qwen3-30B-A3B', mixed_precision='bf16', recompute_granularity='full', recompute_method='uniform', sequence_parallel=True, recompute_num_layers=1)
+    model = MultiLoraMegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', mixed_precision='bf16', recompute_granularity='full', recompute_method='uniform', recompute_num_layers=1)
 
     lora_config = LoraConfig(
         r=8,

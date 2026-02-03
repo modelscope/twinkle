@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import logging
 import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
 
@@ -8,6 +9,7 @@ from .resource_manager import ResourceManager
 from twinkle import DeviceGroup, Platform, find_node_ip, find_free_port, requires
 
 T = TypeVar('T')
+logger = logging.getLogger(__name__)
 
 
 class RayHelper:
@@ -51,10 +53,7 @@ class RayHelper:
             RayHelper._registry = ray.get_actor('config_registry')
         except ValueError:
             try:
-                RayHelper._registry = WorkerRegistry.options(
-                    name='config_registry',
-                    lifetime='detached',
-                ).remote()
+                RayHelper._registry = WorkerRegistry.options(name='config_registry', lifetime='detached').remote()
             except ValueError:
                 RayHelper._registry = ray.get_actor('config_registry')
         assert RayHelper._registry is not None
@@ -332,6 +331,10 @@ class RayHelper:
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
 
+                # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
+                # This is critical for multi-GPU workers (gpus_per_worker > 1)
+                env_vars['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
+                
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {

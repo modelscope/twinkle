@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import logging
 import math
 import os
 from typing import Dict, List
@@ -9,6 +10,7 @@ from ray.util.placement_group import PlacementGroup
 from twinkle import DeviceGroup
 from twinkle import Platform
 
+logger = logging.getLogger(__name__)
 
 class ResourceManager:
 
@@ -134,21 +136,68 @@ class ResourceManager:
         for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
+                gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
                 # ranks is only used to declare "how many processes/devices", should not participate in physical device mapping.
                 # When visible devices are already trimmed by ASCEND_RT_VISIBLE_DEVICES etc.,
                 # logical ranks may be non-contiguous like [8,9], need to normalize them in order.
-                for alloc_rank, _ in enumerate(ranks):
-                    node_rank = alloc_rank // nproc_per_node
-                    gpu_rank = alloc_rank % nproc_per_node
-                    local_device_groups.append(
-                        dict(
-                            node_rank=node_rank,
-                            gpu_rank=[gpu_rank],
-                            placement_group=self.node2pg[node_rank],
-                            ray_address=ray_address))
+                normalized_ranks = list(range(len(ranks)))
+
+                if gpus_per_worker > 1:
+                    if len(normalized_ranks) % gpus_per_worker != 0:
+                        raise ValueError(
+                            f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
+                            f"must be divisible by gpus_per_worker ({gpus_per_worker})"
+                        )
+
+                    num_workers = len(normalized_ranks) // gpus_per_worker
+                    for worker_idx in range(num_workers):
+                        start_idx = worker_idx * gpus_per_worker
+                        worker_ranks = normalized_ranks[start_idx:start_idx + gpus_per_worker]
+
+                        # All GPUs for a worker should be on the same node
+                        node_ranks = [r // nproc_per_node for r in worker_ranks]
+                        gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
+
+                        if len(set(node_ranks)) > 1:
+                            raise ValueError(
+                                f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
+                                f"Each worker's GPUs must be on the same node."
+                            )
+
+                        node_rank = node_ranks[0]
+                        local_device_groups.append(
+                            dict(
+                                node_rank=node_rank,
+                                gpu_rank=gpu_ranks_local,
+                                placement_group=self.node2pg[node_rank],
+                                ray_address=ray_address))
+                else:
+                    for alloc_rank in normalized_ranks:
+                        node_rank = alloc_rank // nproc_per_node
+                        gpu_rank = alloc_rank % nproc_per_node
+                        local_device_groups.append(
+                            dict(
+                                node_rank=node_rank,
+                                gpu_rank=[gpu_rank],
+                                placement_group=self.node2pg[node_rank],
+                                ray_address=ray_address))
+
                 self.device_groups[group.name] = local_device_groups
+                if os.environ.get("TWINKLE_DEBUG_GPW", "0") == "1":
+                    logger.info(
+                        "DeviceGroup '%s' gpus_per_worker=%s local_device_groups=%s",
+                        group.name,
+                        gpus_per_worker,
+                        local_device_groups,
+                    )
+                
+                # Update the group's ranks to reflect actual worker count
+                if gpus_per_worker > 1:
+                    # Create virtual ranks for workers (not GPUs)
+                    group.ranks = list(range(len(local_device_groups)))
             else:
+                assert getattr(group, 'gpus_per_worker', 1) == 1
                 ranks = group.ranks
                 local_device_groups = []
                 global_cpu_proc_idx = 0

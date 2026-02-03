@@ -188,7 +188,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         return MegatronOptimizerGroup(
             loss_instance=VocabParallelCrossEntropyLoss(),
             template=Template(self.tokenizer_id),
-            processor=InputProcessor(self.device_mesh),
+            processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,
         )
 
@@ -313,7 +313,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         if micro_batch_size is None:
             assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
             micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
-        processor.use_megatron = True
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -345,24 +344,11 @@ class MegatronModel(TwinkleModel, nn.Module):
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
-            batch = self.strategy.split_inputs_for_cp(batch)
-            input_ids = batch.get('input_ids')
-            position_ids = batch.get('position_ids')
-            attention_mask = batch.get('attention_mask')
-            batch_labels = batch.get('labels')
-
-            extra_kwargs = self.get_extra_vlm_kwargs(batch)
-
-            # Forward pass with labels - Megatron will compute loss internally
-            # This uses Megatron's compute_language_model_loss which properly handles
-            # vocab parallel cross entropy
+            labels = batch.pop('labels', None)
             output_tensor = model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                # labels=batch_labels,  # Pass labels to let Megatron compute loss
-                **extra_kwargs,
+                **batch
             )
+            batch['labels'] = labels
             return output_tensor, partial(post_loss_function, inputs=batch)
 
         # Get Megatron's forward-backward function
@@ -775,6 +761,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
+    @remote_function(dispatch='all')
     def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
             output_dir = 'output'
@@ -967,6 +954,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        # Megatron use 4d attention mask
+        kwargs['framework'] = 'megatron'
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
     @remote_function(execute='first')
@@ -1008,14 +997,6 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         return expr
 
-    def get_extra_vlm_kwargs(self, batch):
-        extra_kwargs = {}
-        for key in ['pixel_values', 'pixel_values_videos', 'image_grid_thw', 
-                    'video_grid_thw', 'packed_seq_params']:
-            if key in batch and batch[key] is not None:
-                extra_kwargs[key] = batch[key]
-        return extra_kwargs
-
     def initialize(self, **kwargs) -> None:
         if self._initialized:
             return
@@ -1023,7 +1004,17 @@ class MegatronModel(TwinkleModel, nn.Module):
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl', device_id=torch.device(Platform.get_local_device()))
+            if torch.cuda.is_available():
+                backend = "nccl"
+            elif hasattr(torch, "npu") and torch.npu.is_available():
+                try:
+                    import torch_npu  # noqa: F401
+                    backend = "hccl"
+                except Exception:
+                    backend = "gloo"
+            else:
+                backend = "gloo"
+            dist.init_process_group(backend=backend, device_id=torch.device(Platform.get_local_device()))
         args = get_args()
         init_kwargs = {
             'tensor_model_parallel_size': args.tensor_model_parallel_size,
