@@ -350,7 +350,11 @@ class VLLMEngine(BaseSamplerEngine):
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = topk_prompt_logprobs if topk_prompt_logprobs > 0 else (1 if include_prompt_logprobs else 0)
-        vllm_params = sampling_params.to_vllm(logprobs=logprobs, prompt_logprobs=prompt_logprobs_k)
+        vllm_params = sampling_params.to_vllm(
+            num_samples=num_samples,
+            logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs_k,
+        )
         
         # Build request
         if request_id is None:
@@ -631,6 +635,15 @@ class VLLMEngine(BaseSamplerEngine):
             await self.engine.reset_prefix_cache()
         elif hasattr(self.engine, 'reset_mm_cache'):
             await self.engine.reset_mm_cache() # Do we need this?
+
+    async def update_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        adapter_name: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        # not use, TODO: remove this method
+        await self.engine.model_runner.model.load_weights(weights)
 
     async def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""

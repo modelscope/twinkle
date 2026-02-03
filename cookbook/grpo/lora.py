@@ -1,597 +1,469 @@
-import ray
-# cookbook/grpo/lora.py
+"""
+GRPO Training Cookbook - Hybrid Mode with LoRA
+
+This cookbook demonstrates GRPO training using TransformersModel and VLLMSampler
+in hybrid mode (model and sampler colocated on same GPUs with IPC weight sync).
+
+Task: Countdown Game
+- Given numbers [a, b, c, d], find an equation using +, -, *, / that equals target
+- Rewards: format reward (<think>/<answer> tags) + accuracy reward (correct equation)
+
+Reference: swift/docs/source/BestPractices/GRPO.md
+
+Usage:
+    SWANLAB_API_KEY=xxx python lora.py
+"""
+
 import os
-import torch
+import re
+import time
+from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass, field
+from contextlib import contextmanager
 
-# -----------------------------------------------------------------------------
-# AttrDict: dict with attribute access (supports both .keys() and .labels usage)
-# -----------------------------------------------------------------------------
-class AttrDict(dict):
-    def __getattr__(self, name):
-        try:
-            return self[name]
-        except KeyError as e:
-            raise AttributeError(name) from e
-
-    def __setattr__(self, name, value):
-        self[name] = value
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
 from peft import LoraConfig
+import torch
 
 import twinkle
-from twinkle import DeviceMesh, get_device_placement
+from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
+from twinkle.data_format import Trajectory, Message
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
-from twinkle.processor import GRPOLossProcessor
-from twinkle.reward import MathReward
+from twinkle.processor import InputProcessor
+from twinkle.sampler import VLLMSampler
+from twinkle.sampler.types import SamplingParams, SampleResponse
+from twinkle.rl import GRPOAdvantage
+from twinkle.weight_loader import IPCWeightLoader
+from twinkle.template import Template
 
-# -----------------------------------------------------------------------------
-# Minimal shim for MathReward: it expects trajectory.messages[-1].content
-# Our sampler currently returns list[dict] like {"prompt": ..., "response": ...}.
-# This shim keeps Goal A minimal loop moving.
-# -----------------------------------------------------------------------------
-class _FakeMessage:
-    def __init__(self, content: str):
-        import os, torch
-        print("[ActorGroup init] pid="+str(os.getpid())+" CUDA_VISIBLE_DEVICES="+str(os.environ.get("CUDA_VISIBLE_DEVICES")))
-        print("[ActorGroup init] torch.cuda.is_available="+str(torch.cuda.is_available())+" count="+str(torch.cuda.device_count()))
-        if torch.cuda.is_available():
-            names=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            print("[ActorGroup init] current="+str(torch.cuda.current_device())+" names="+str(names))
-        import os, torch
-        print("[ActorGroup init] pid=%s CUDA_VISIBLE_DEVICES=%s" % (os.getpid(), os.environ.get("CUDA_VISIBLE_DEVICES")))
-        print("[ActorGroup init] torch.cuda.is_available=%s count=%s" % (torch.cuda.is_available(), torch.cuda.device_count()))
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            print("[ActorGroup init] current=%s name0=%s" % (torch.cuda.current_device(), torch.cuda.get_device_name(0)))
-        self.content = content
+from transformers import AutoTokenizer
+from twinkle.hub import HubOperation
 
-class _FakeTrajectory:
-    def __init__(self, prompt: str, response: str):
-        import os, torch
-        print("[ActorGroup init] pid="+str(os.getpid())+" CUDA_VISIBLE_DEVICES="+str(os.environ.get("CUDA_VISIBLE_DEVICES")))
-        print("[ActorGroup init] torch.cuda.is_available="+str(torch.cuda.is_available())+" count="+str(torch.cuda.device_count()))
-        if torch.cuda.is_available():
-            names=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            print("[ActorGroup init] current="+str(torch.cuda.current_device())+" names="+str(names))
-        import os, torch
-        print("[ActorGroup init] pid=%s CUDA_VISIBLE_DEVICES=%s" % (os.getpid(), os.environ.get("CUDA_VISIBLE_DEVICES")))
-        print("[ActorGroup init] torch.cuda.is_available=%s count=%s" % (torch.cuda.is_available(), torch.cuda.device_count()))
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            print("[ActorGroup init] current=%s name0=%s" % (torch.cuda.current_device(), torch.cuda.get_device_name(0)))
-        # only what MathReward.calculate() needs
-        self.messages = [_FakeMessage(prompt), _FakeMessage(response)]
-        self.prompt = prompt
-        self.response = response
+import swanlab
 
-def _wrap_trajectories_for_reward(trajs):
-    # If already Twinkle trajectories (have .messages), return as-is
-    if trajs and hasattr(trajs[0], "messages"):
-        return trajs
-    # If sampler returned dicts, wrap them
-    out = []
-    for t in trajs:
-        if isinstance(t, dict):
-            resp = t.get("response", None)
-            if resp is None:
-                for k in ("answer", "output", "solution", "target", "label", "ground_truth"):
-                    if k in t and t[k] is not None:
-                        resp = t[k]
-                        break
-            out.append(_FakeTrajectory(str(t.get("prompt", "")), str(resp if resp is not None else "")))
-        else:
-            # fallback: stringify
-            out.append(_FakeTrajectory("", str(t)))
-    return out
+logger = get_logger()
 
-# -----------------------------------------------------------------------------
-# Minimal shim for GRPOLossProcessor: it expects inputs.labels (and usually input_ids/attention_mask).
-# DataLoader here yields python list/dict; convert to an attribute-style object.
-# -----------------------------------------------------------------------------
-from types import SimpleNamespace
+# ========== Configuration ==========
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
+NUM_GPUS = int(os.environ.get('NUM_GPUS', 4))
+NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
+LEARNING_RATE = float(os.environ.get('LR', 5e-7))
+GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
+GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.001))
+MAX_STEPS = int(os.environ.get('MAX_STEPS', 2000))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
+TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
+WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 
-def _to_attr_inputs(batch, device=None):
-    """Convert list/dict batch to an object with attribute access: inputs.labels, inputs.input_ids, ..."""
-    if batch is None:
-        return SimpleNamespace()
-
-    # If already attribute-style
-    if hasattr(batch, "__dict__") and hasattr(batch, "labels"):
-        return batch
-
-    # dict -> namespace
-    if isinstance(batch, dict):
-        d = dict(batch)
-        # Ensure labels exists
-        if "labels" not in d:
-            if "label" in d:
-                d["labels"] = d["label"]
-            elif "input_ids" in d:
-                # minimal fallback: labels = input_ids (not semantically perfect but keeps loop alive)
-                try:
-                    d["labels"] = d["input_ids"].clone()
-                except Exception:
-                    d["labels"] = d["input_ids"]
-        ns = SimpleNamespace(**d)
-        return ns
-
-    # list[dict] -> collate into dict of tensors/lists then namespace
-    if isinstance(batch, list) and batch and isinstance(batch[0], dict):
-        keys = set(batch[0].keys())
-        for x in batch[1:]:
-            keys &= set(x.keys())
-        keys = list(keys)
-
-        collated = {}
-        for k in keys:
-            vals = [x.get(k) for x in batch]
-            v0 = vals[0]
-            # torch tensor: stack if same shape
-            if torch.is_tensor(v0):
-                try:
-                    collated[k] = torch.stack(vals, dim=0)
-                except Exception:
-                    collated[k] = vals
-            else:
-                collated[k] = vals
-
-        # Ensure labels exists
-        if "labels" not in collated:
-            if "label" in collated:
-                collated["labels"] = collated["label"]
-            elif "input_ids" in collated:
-                try:
-                    collated["labels"] = collated["input_ids"].clone()
-                except Exception:
-                    collated["labels"] = collated["input_ids"]
-
-        # Move tensors to device if given
-        if device is not None:
-            for k, v in list(collated.items()):
-                if torch.is_tensor(v):
-                    collated[k] = v.to(device)
-
-        return SimpleNamespace(**collated)
-
-    # fallback: wrap everything as text-like labels
-    return SimpleNamespace(labels=str(batch))
-
-
-# -----------------------------------------------------------------------------
-# Minimal shim for GRPOLossProcessor: it expects inputs.labels (and usually input_ids/attention_mask).
-# DataLoader here yields python list/dict; convert to an attribute-style object.
-# -----------------------------------------------------------------------------
-from types import SimpleNamespace
-
-def _to_attr_inputs(batch, device=None):
-    """Convert list/dict batch to an object with attribute access: inputs.labels, inputs.input_ids, ..."""
-    if batch is None:
-        return SimpleNamespace()
-
-    # If already attribute-style
-    if hasattr(batch, "__dict__") and hasattr(batch, "labels"):
-        return batch
-
-    # dict -> namespace
-    if isinstance(batch, dict):
-        d = dict(batch)
-        # Ensure labels exists
-        if "labels" not in d:
-            if "label" in d:
-                d["labels"] = d["label"]
-            elif "input_ids" in d:
-                # minimal fallback: labels = input_ids (not semantically perfect but keeps loop alive)
-                try:
-                    d["labels"] = d["input_ids"].clone()
-                except Exception:
-                    d["labels"] = d["input_ids"]
-        ns = SimpleNamespace(**d)
-        return ns
-
-    # list[dict] -> collate into dict of tensors/lists then namespace
-    if isinstance(batch, list) and batch and isinstance(batch[0], dict):
-        keys = set(batch[0].keys())
-        for x in batch[1:]:
-            keys &= set(x.keys())
-        keys = list(keys)
-
-        collated = {}
-        for k in keys:
-            vals = [x.get(k) for x in batch]
-            v0 = vals[0]
-            # torch tensor: stack if same shape
-            if torch.is_tensor(v0):
-                try:
-                    collated[k] = torch.stack(vals, dim=0)
-                except Exception:
-                    collated[k] = vals
-            else:
-                collated[k] = vals
-
-        # Ensure labels exists
-        if "labels" not in collated:
-            if "label" in collated:
-                collated["labels"] = collated["label"]
-            elif "input_ids" in collated:
-                try:
-                    collated["labels"] = collated["input_ids"].clone()
-                except Exception:
-                    collated["labels"] = collated["input_ids"]
-
-        # Move tensors to device if given
-        if device is not None:
-            for k, v in list(collated.items()):
-                if torch.is_tensor(v):
-                    collated[k] = v.to(device)
-
-        return SimpleNamespace(**collated)
-
-    # fallback: wrap everything as text-like labels
-    return SimpleNamespace(labels=str(batch))
-
-
-# -----------------------------------------------------------------------------
-# 0) Offline/local model path
-# -----------------------------------------------------------------------------
-LOCAL_MODEL_PATH = (
-    os.environ.get("TWINKLE_MODEL_PATH")
-    or os.environ.get("LOCAL_MODEL_PATH")
-    or "/root/torch/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137"
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. You first thinks about the reasoning process "
+    "in the mind and then provides the user with the answer."
 )
-assert os.path.isdir(LOCAL_MODEL_PATH), f"LOCAL_MODEL_PATH not found: {LOCAL_MODEL_PATH}"
-
-# -----------------------------------------------------------------------------
-# 1) Goal A: 2 GPUs total
-# -----------------------------------------------------------------------------
-device_groups = [
-    DeviceGroup(name="actor", ranks=[0], device_type="GPU"),
-    DeviceGroup(name="ref",   ranks=[1], device_type="GPU"),
-]
-
-actor_device_mesh = DeviceMesh(device_type="cuda", mesh=[0], mesh_dim_names=("dp",))
-ref_device_mesh   = DeviceMesh(device_type="cuda", mesh=[1], mesh_dim_names=("dp",))
+ADAPTER_NAME = 'default'
 
 
-def create_dataset():
-    dataset = Dataset(DatasetMeta("ms://modelscope/competition_math"))
-    dataset.set_template("Qwen3Template", model_id=LOCAL_MODEL_PATH)
-    dataset.map("CompetitionMathProcessor")
-    dataset.check(batched=True)
+# ========== Profiling Context ==========
+@contextmanager
+def profiling_context(name: str):
+    """Context manager for timing and logging."""
+    start_time = time.perf_counter()
+    yield
+    duration = time.perf_counter() - start_time
+    swanlab.log({f'profiling/Time taken: GRPOTrainer.{name}': duration})
+
+
+# ========== Metrics ==========
+@dataclass
+class TrainingMetrics:
+    """Metrics collected during training."""
+    generate_time: float = 0.0
+    weight_sync_time: float = 0.0
+    rewards: List[float] = field(default_factory=list)
+    format_rewards: List[float] = field(default_factory=list)
+    accuracy_rewards: List[float] = field(default_factory=list)
+    completion_lengths: List[int] = field(default_factory=list)
+    loss: float = 0.0
+    grad_norm: float = 0.0
+    
+    def reset(self):
+        self.generate_time = 0.0
+        self.weight_sync_time = 0.0
+        self.rewards = []
+        self.format_rewards = []
+        self.accuracy_rewards = []
+        self.completion_lengths = []
+        self.loss = 0.0
+        self.grad_norm = 0.0
+    
+    def to_log_dict(self, step: int) -> Dict[str, float]:
+        log_dict = {
+            'step': step,
+            'profiling/Time taken: GRPOTrainer._move_model_to_vllm': self.weight_sync_time,
+            'profiling/Time taken: GRPOTrainer.generate': self.generate_time,
+            'train/loss': self.loss,
+            'train/grad_norm': self.grad_norm,
+        }
+        
+        if self.rewards:
+            log_dict['train/reward'] = sum(self.rewards) / len(self.rewards)
+        
+        if self.format_rewards:
+            log_dict['train/rewards/FormatORM/mean'] = sum(self.format_rewards) / len(self.format_rewards)
+            log_dict['train/rewards/FormatORM/std'] = torch.tensor(self.format_rewards).std().item() if len(self.format_rewards) > 1 else 0.0
+        
+        if self.accuracy_rewards:
+            log_dict['train/rewards/CountdownORM/mean'] = sum(self.accuracy_rewards) / len(self.accuracy_rewards)
+            log_dict['train/rewards/CountdownORM/std'] = torch.tensor(self.accuracy_rewards).std().item() if len(self.accuracy_rewards) > 1 else 0.0
+        
+        if self.completion_lengths:
+            log_dict['train/completions/mean_length'] = sum(self.completion_lengths) / len(self.completion_lengths)
+        
+        return log_dict
+
+
+# ========== Reward Functions ==========
+def format_reward(completion: str) -> float:
+    """Format reward: checks <think> and <answer> tags."""
+    has_think = bool(re.search(r"<think>.*?</think>", completion, re.DOTALL))
+    has_answer = bool(re.search(r"<answer>.*?</answer>", completion, re.DOTALL))
+    return 1.0 if (has_think and has_answer) else 0.0
+
+
+def countdown_accuracy_reward(completion: str, target: int, nums: List[int]) -> float:
+    """Accuracy reward: checks if equation is correct."""
+    try:
+        match = re.search(r'<answer>(.*?)<\/answer>', completion)
+        if match is None:
+            return 0.0
+        
+        equation = match.group(1).strip()
+        if '=' in equation:
+            equation = equation.split('=')[0]
+        
+        used_numbers = [int(n) for n in re.findall(r'\d+', equation)]
+        if sorted(used_numbers) != sorted(nums):
+            return 0.0
+        
+        allowed_pattern = r'^[\d+\-*/().\s]+$'
+        if not re.match(allowed_pattern, equation):
+            return 0.0
+        
+        result = eval(equation, {'__builtins__': None}, {})
+        return 1.0 if abs(float(result) - float(target)) < 1e-5 else 0.0
+    except Exception:
+        return 0.0
+
+
+def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[float], List[float]]:
+    """Compute format and accuracy rewards from trajectories.
+    
+    Args:
+        trajectories: List of trajectories with 'messages' and 'user_data'.
+        
+    Returns:
+        Tuple of (total_rewards, format_rewards, accuracy_rewards).
+    """
+    total_rewards, format_rewards, accuracy_rewards = [], [], []
+    
+    for traj in trajectories:
+        messages = traj.get('messages', [])
+        completion = ""
+        for msg in reversed(messages):
+            if msg.get('role') == 'assistant':
+                completion = msg.get('content', '')
+                break
+        
+        user_data = traj.get('user_data', [{}])
+        data = user_data[0] if isinstance(user_data, list) and user_data else {}
+        target = data.get('target', 0)
+        nums = data.get('nums', [])
+        
+        fmt_reward = format_reward(completion)
+        acc_reward = countdown_accuracy_reward(completion, target, nums)
+        
+        format_rewards.append(fmt_reward)
+        accuracy_rewards.append(acc_reward)
+        total_rewards.append(fmt_reward + acc_reward)
+    
+    return total_rewards, format_rewards, accuracy_rewards
+
+
+# ========== Dataset ==========
+def create_countdown_dataset():
+    """Create Countdown Game dataset."""
+    def countdown_processor(row: Dict[str, Any]) -> Dict[str, Any]:
+        nums = row.get('nums', [])
+        target = row.get('response', row.get('target', 0))
+        
+        query = f"""Using the numbers {nums}, create an equation that equals {target}.
+You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
+Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags,
+for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
+        
+        return {
+            'messages': [
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': query},
+                {'role': 'assistant', 'content': ''},
+            ],
+            'user_data': [{'target': target, 'nums': nums}],
+        }
+    
+    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(5000)))
+    dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
+    dataset.map(countdown_processor)
     return dataset
 
 
-@remote_class()
-@ray.remote(num_gpus=1)
-class ActorGroup:
+# ========== Sample Processing ==========
+def process_samples(
+    prompts: List[Trajectory],
+    sample_response: SampleResponse,
+    tokenizer,
+    num_generations: int,
+) -> List[Tuple[Trajectory, List[float], int]]:
     """
-    Goal A: no vLLM. Sampling + training both inside this actor using transformers.
+    Process sampled responses into (trajectory, old_logps, length) tuples.
+    
+    Args:
+        prompts: List of original prompts (P prompts).
+        sample_response: Response containing sequences (P * num_generations sequences).
+        tokenizer: Tokenizer for decoding.
+        num_generations: Number of generations per prompt (G).
+        
+    Returns:
+        List of (trajectory, old_logps, length) tuples.
+        The list has P * G entries, organized as:
+        [prompt0_gen0, prompt0_gen1, ..., prompt1_gen0, prompt1_gen1, ...]
     """
-
-    def __init__(
-        self,
-        lora_config: LoraConfig,
-        adapter_name: str = "default",
-        max_new_tokens: int = 128,
-        temperature: float = 0.8,
-        top_p: float = 0.95,
-        **kwargs,
-    ):
-        self.adapter_name = adapter_name
-        self.max_new_tokens = int(max_new_tokens)
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-
-        # IMPORTANT: inside remote actor, don't pass remote_group again
-        self.model = TransformersModel(
-            pretrained_model_name_or_path=LOCAL_MODEL_PATH,
-            device_mesh=actor_device_mesh,
-        )
-
-        # ----- Adapter first -----
-        self.model.add_adapter_to_model(self.adapter_name, lora_config)
-
-        # ----- Optimizer group MUST exist before set_loss(adapter_name=...) -----
-        self.model.set_optimizer(
-            "AdamW",
-            lr=float(os.environ.get("TWINKLE_LR", "1e-6")),
-            adapter_name=self.adapter_name,
-        )
-        self.model.set_lr_scheduler("LinearLR", adapter_name=self.adapter_name)
-
-        # Now it is safe to set loss for this adapter
-        self.model.set_loss(
-            "GRPOLoss",
-            adapter_name=self.adapter_name,
-            loss_type="grpo",
-            epsilon=float(os.environ.get("TWINKLE_EPSILON", "0.2")),
-            beta=float(os.environ.get("TWINKLE_BETA", "0.04")),
-            num_generations=int(os.environ.get("TWINKLE_NUM_GENERATIONS", "1")),
-            scale_rewards="group",
-        )
-
-        self.model.set_processor("InputProcessor", adapter_name=self.adapter_name)
-        self.model.set_template("Qwen3Template", adapter_name=self.adapter_name)
-
-        from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            LOCAL_MODEL_PATH,
-            trust_remote_code=True,
-        )
-
-        self.loss_processor = GRPOLossProcessor()
-
-        # one-time flag for debugging batch structure
-        self._printed_batch_schema = False
-
-    def _get_torch_model_and_device(self):
-        torch_model = getattr(self.model, "model", None)
-        if torch_model is None:
-            raise RuntimeError("TransformersModel has no attribute `.model` (torch module).")
-        device = next(torch_model.parameters()).device
-        return torch_model, device
-
-    def _normalize_prompts(self, batch):
-        """
-        Convert various batch structures into list[str] for tokenizer.
-        Supported common shapes:
-          - str
-          - list[str]
-          - dict with key: prompts / prompt / input / text / question
-          - list[dict] where dict contains prompt/input/text/question
-          - list[tuple] (take first element)
-        Fallback: stringify items to keep the minimal loop running.
-        """
-        if batch is None:
-            return []
-
-        # dict batch
-        if isinstance(batch, dict):
-            if "prompts" in batch and isinstance(batch["prompts"], list):
-                return [str(x) for x in batch["prompts"]]
-
-            for k in ("prompt", "input", "text", "question"):
-                if k in batch and batch[k] is not None:
-                    v = batch[k]
-                    if isinstance(v, str):
-                        return [v]
-                    if isinstance(v, list):
-                        return [str(x) for x in v]
-                    return [str(v)]
-
-            # fallback
-            return [str(batch)]
-
-        # single string
-        if isinstance(batch, str):
-            return [batch]
-
-        # list batch
-        if isinstance(batch, list):
-            if len(batch) == 0:
-                return []
-            # list[str]
-            if all(isinstance(x, str) for x in batch):
-                return batch
-            # list[dict]
-            if all(isinstance(x, dict) for x in batch):
-                out = []
-                for x in batch:
-                    for k in ("prompt", "input", "text", "question"):
-                        if k in x and x[k] is not None:
-                            out.append(str(x[k]))
-                            break
-                    else:
-                        out.append(str(x))
-                return out
-
-            # mixed / tuple
-            out = []
-            for x in batch:
-                if isinstance(x, str):
-                    out.append(x)
-                elif isinstance(x, tuple) and len(x) > 0:
-                    out.append(str(x[0]))
-                elif isinstance(x, dict):
-                    for k in ("prompt", "input", "text", "question"):
-                        if k in x and x[k] is not None:
-                            out.append(str(x[k]))
-                            break
-                    else:
-                        out.append(str(x))
-                else:
-                    out.append(str(x))
-            return out
-
-        # fallback
-        return [str(batch)]
-
-    @torch.inference_mode()
-    def _sample_local(self, batch):
-        # One-time structural debug to know what DataLoader yields inside Ray actor
-        if not self._printed_batch_schema:
-            self._printed_batch_schema = True
-            try:
-                keys = list(batch.keys()) if isinstance(batch, dict) else None
-            except Exception:
-                keys = None
-            print(f"[sample_local] pid={os.getpid()} batch_type={type(batch)} batch_keys={keys} file={__file__}")
-
-        prompts = self._normalize_prompts(batch)
-        if len(prompts) == 0:
-            raise ValueError(f"Empty prompts after normalization. batch_type={type(batch)} batch={batch}")
-
-        # Optional: keep minimal loop stable by sampling just 1 prompt
-        # prompts = prompts[:1]
-
-        torch_model, device = self._get_torch_model_and_device()
-
-        inputs = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        out = torch_model.generate(
-            **inputs,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-        )
-        texts = self.tokenizer.batch_decode(out, skip_special_tokens=True)
-
-        n = min(len(prompts), len(texts))
-        return [{"prompt": prompts[i], "response": texts[i]} for i in range(n)]
-
-    def _build_train_inputs_from_batch(self, batch):
-        # Build a minimal LM training batch for GRPO processor: tensors on model device
-        prompts = self._normalize_prompts(batch)
-        if not prompts:
-            raise ValueError(f"Empty prompts for training inputs. batch_type={type(batch)}")
-        torch_model, device = self._get_torch_model_and_device()
-        enc = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-        # Minimal causal LM labels
-        enc["labels"] = enc["input_ids"].clone()
-        return AttrDict(enc)
-
-    @remote_function()
-    def sample(self, batch):
-        return self._sample_local(batch)
-
-    @remote_function()
-    def forward(self, inputs=None, **kwargs):
-        # TransformersModel.forward in this Twinkle build is kw-only.
-        if inputs is None:
-            return self.model.forward(**kwargs)
-        if isinstance(inputs, dict):
-            return self.model.forward(**inputs, **kwargs)
-        return self.model.forward(inputs=inputs, **kwargs)
-
-    @remote_function()
-    def forward_backward(self, inputs, trajectories, ref_logits, **kwargs):
-        # Ensure adapter_name always present
-        kwargs.setdefault("adapter_name", self.adapter_name)
-        torch_model, device = self._get_torch_model_and_device()
-        inputs = _to_attr_inputs(inputs, device=device)
-        inputs = self._build_train_inputs_from_batch(inputs)
-        inputs = self.loss_processor(inputs)
-
-        # forward_backward is also kw-only compatible
-        fb_kwargs = dict(kwargs)
-        fb_kwargs["trajectories"] = trajectories
-        if ref_logits is not None:
-            fb_kwargs["ref_logits"] = ref_logits
-
-        if isinstance(inputs, dict):
-            fb_kwargs.update(inputs)
-            fb_kwargs["inputs"] = inputs
-        return self.model.forward_backward(**fb_kwargs)
-
-        fb_kwargs["inputs"] = inputs
-        return self.model.forward_backward(**fb_kwargs)
-
-    @remote_function()
-    def step(self):
-        return self.model.step()
-
-    @remote_function()
-    def zero_grad(self):
-        return self.model.zero_grad()
-
-    @remote_function()
-    def lr_step(self):
-        return self.model.lr_step()
+    results = []
+    sequences = sample_response.sequences
+    
+    # Sequences are organized as: for each prompt, num_generations sequences
+    for i, prompt in enumerate(prompts):
+        for j in range(num_generations):
+            seq_idx = i * num_generations + j
+            if seq_idx >= len(sequences):
+                logger.warning(f"Expected {len(prompts) * num_generations} sequences, got {len(sequences)}")
+                break
+            
+            seq = sequences[seq_idx]
+            response_tokens = seq.tokens
+            response_logprobs = seq.logprobs if seq.logprobs else []
+            response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+            
+            # Build trajectory with response
+            messages = []
+            for msg in prompt.get('messages', []):
+                # Skip empty assistant placeholder
+                if msg.get('role') == 'assistant' and not msg.get('content', '').strip():
+                    continue
+                messages.append(msg)
+            messages.append(Message(role='assistant', content=response_text))
+            
+            # Copy user_data from prompt for reward computation
+            traj = Trajectory(messages=messages, user_data=prompt.get('user_data', []))
+            results.append((traj, response_logprobs, len(response_tokens)))
+    
+    return results
 
 
-def train():
-    dataset = create_dataset()
-    try:
-        dataloader = DataLoader(dataset, remote_group="actor", device_mesh=actor_device_mesh)
-        _ = iter(dataloader)
-    except Exception as e:
-        print(f"[WARN] DataLoader/dataset init failed, fallback to dummy batch. err={type(e).__name__}: {e}")
-        # minimal local fallback for 1-step closure
-        dataloader = [
-            [{"prompt": "Compute 1+1.", "answer": "2"}],
-        ]
-
-    adapter_name = "default"
-
-    lora_config = LoraConfig(
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        r=int(os.environ.get("LORA_R", "8")),
-        lora_alpha=int(os.environ.get("LORA_ALPHA", "16")),
-        lora_dropout=float(os.environ.get("LORA_DROPOUT", "0.05")),
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-
-    actor_group = ActorGroup.remote(
-        lora_config=lora_config,
-        remote_group="actor",
-        adapter_name=adapter_name,
-        max_new_tokens=int(os.environ.get("TWINKLE_MAX_NEW_TOKENS", "64")),
-    )
-
-    ref_model = TransformersModel(
-        pretrained_model_name_or_path=LOCAL_MODEL_PATH,
-        remote_group="ref",
-        device_mesh=ref_device_mesh,
-    )
-    ref_model.set_processor("InputProcessor")
-    ref_model.set_template("Qwen3Template")
-    # Ref model only needs forward; provide a dummy torch Optimizer to satisfy _lazy_wrap_model assertions
-    ref_model.set_optimizer("AdamW", lr=0.0)
-    ref_model.set_lr_scheduler("LinearLR")
-
-    reward = MathReward()
-
-    print("Device placement:", get_device_placement())
-    print("LOCAL_MODEL_PATH:", LOCAL_MODEL_PATH)
-
-    max_steps = int(os.environ.get("TWINKLE_MAX_STEPS", "1"))
-    step = 0
-
-    for batch in dataloader:
-        trajectories = ray.get(actor_group.sample.remote(batch))
-        ref_logits = None  # Goal A minimal loop: skip ref model to avoid OOM
-        trajectories_for_reward = _wrap_trajectories_for_reward(trajectories)
-        ground_truths_for_reward = _wrap_trajectories_for_reward(batch)
-        trajectories = reward.calculate(trajectories_for_reward, ground_truths_for_reward)
-
-        ray.get(actor_group.forward_backward.remote(batch, trajectories, ref_logits, adapter_name=adapter_name))
-        actor_group.step()
-        actor_group.zero_grad()
-        actor_group.lr_step()
-
-        step += 1
-        if step >= max_steps:
-            break
+def wait_result(result):
+    """Wait for lazy collect result if needed."""
+    if hasattr(result, '_is_lazy_collect') and result._is_lazy_collect:
+        return result()
+    if callable(result) and hasattr(result, '_get_result'):
+        return result()
+    return result
 
 
+# ========== Main ==========
 def main():
-    os.environ.setdefault("TWINKLE_SEED", "42")
-    os.environ.setdefault("TWINKLE_FULL_DETERMINISM", "0")
-    os.environ.setdefault("TRUST_REMOTE_CODE", "1")
-
-    twinkle.initialize(
-        mode="ray",
-        nproc_per_node=2,
-        groups=device_groups,
-        lazy_collect=False,
+    # SwanLab setup
+    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
+    swanlab.init(project="ms-swift", config={
+        'model_id': MODEL_ID,
+        'num_gpus': NUM_GPUS,
+        'num_generations': NUM_GENERATIONS,
+        'learning_rate': LEARNING_RATE,
+        'grpo_beta': GRPO_BETA,
+        'batch_size': BATCH_SIZE,
+    })
+    
+    # Hybrid mode: model and sampler on same GPUs
+    device_groups = [
+        DeviceGroup(name='hybrid', ranks=list(range(NUM_GPUS)), device_type='GPU', gpus_per_worker=1),
+    ]
+    device_mesh = DeviceMesh.from_sizes(world_size=NUM_GPUS, dp_size=NUM_GPUS)
+    
+    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
+    logger.info(get_device_placement())
+    
+    # Dataset
+    dataset = create_countdown_dataset()
+    dataloader = DataLoader(
+        dataset=dataset,
+        batch_size=BATCH_SIZE,
+        device_mesh=device_mesh,
+        remote_group='hybrid',
+        num_workers=0,
     )
+    
+    # Actor model
+    actor_model = TransformersModel(
+        model_id=MODEL_ID,
+        device_mesh=device_mesh,
+        remote_group='hybrid',
+    )
+    lora_config = LoraConfig(target_modules="all-linear")
+    actor_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=8)
+    actor_model.set_optimizer('AdamW', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
+    actor_model.set_lr_scheduler('LinearLR', adapter_name=ADAPTER_NAME)
+    actor_model.set_loss('GRPOLoss', adapter_name=ADAPTER_NAME, epsilon=GRPO_EPSILON, beta=GRPO_BETA)
+    actor_model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
+    actor_model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
+    logger.info(actor_model.get_train_configs(adapter_name=ADAPTER_NAME))
+    
+    # Sampler (with sleep mode for hybrid)
+    sampler = VLLMSampler(
+        model_id=MODEL_ID,
+        engine_args={
+            'gpu_memory_utilization': 0.4,
+            'max_model_len': 8192,
+            'enable_sleep_mode': True,
+            'load_format': 'dummy',  # Weights will be synced via IPC
+        },
+        device_mesh=device_mesh,
+        remote_group='hybrid',
+    )
+    sampler.set_template('Template', model_id=MODEL_ID)
+    
+    # Tokenizer
+    model_path = HubOperation.download_model(MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    # Weight loader for IPC sync
+    weight_loader = IPCWeightLoader(actor_model, sampler)
+    
+    # Advantage calculator
+    advantage_fn = GRPOAdvantage()
+    
+    # Metrics
+    metrics = TrainingMetrics()
+    
+    # Sampling params (num_samples passed to sample() method)
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        top_p=0.95,
+    )
+    
+    logger.info(f"Starting training for {MAX_STEPS} steps")
+    step = 0
+    
+    for batch in dataloader:
+        if step >= MAX_STEPS:
+            break
+        
+        metrics.reset()
+        
+        if callable(batch):
+            batch = batch()
+        prompts = batch if isinstance(batch, list) else [batch]
+        
+        # ========== 1. Weight Sync (before generation) ==========
+        if step % WEIGHT_SYNC_INTERVAL == 0:
+            with profiling_context('_move_model_to_vllm'):
+                weight_loader.load_weights(adapter_name=ADAPTER_NAME)
+        
+        # ========== 2. Generate samples ==========
+        # Pass num_samples to sample() to generate NUM_GENERATIONS completions per prompt
+        with profiling_context('generate'):
+            sampler.wake_up()
+            
+            gen_start = time.perf_counter()
+            sample_response = wait_result(
+                sampler.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
+            )
+            metrics.generate_time = time.perf_counter() - gen_start
+            
+            sampler.sleep()
+        
+        # ========== 3. Process samples ==========
+        samples = process_samples(prompts, sample_response, tokenizer, NUM_GENERATIONS)
+        
+        if not samples:
+            logger.warning(f"Step {step}: No valid samples, skipping")
+            step += 1
+            continue
+        
+        trajectories = [s[0] for s in samples]
+        old_logps_list = [s[1] for s in samples]
+        completion_lengths = [s[2] for s in samples]
+        
+        metrics.completion_lengths = completion_lengths
+        
+        # ========== 4. Compute rewards ==========
+        total_rewards, format_rewards, accuracy_rewards = compute_rewards(trajectories)
+        
+        metrics.rewards = total_rewards
+        metrics.format_rewards = format_rewards
+        metrics.accuracy_rewards = accuracy_rewards
+        
+        # ========== 5. Compute advantages and add to trajectories ==========
+        advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group')
+        
+        # Add advantages to trajectories (GRPOLoss extracts from trajectory['advantages'])
+        for i, traj in enumerate(trajectories):
+            traj['advantages'] = float(advantages[i])
+        
+        # Skip if all advantages are zero
+        if all(abs(adv) < 1e-8 for adv in advantages):
+            logger.info(f"Step {step}: All advantages are zero, skipping training")
+            step += 1
+            continue
+        
+        # ========== 6. Training step ==========
+        # GRPOLoss expects:
+        # - inputs: trajectories (with 'advantages' field)
+        # - old_logps: log probs from sampling policy
+        # - trajectories: passed as kwarg for advantage extraction
+        loss = wait_result(actor_model.forward_backward(
+            inputs=trajectories,
+            adapter_name=ADAPTER_NAME,
+            trajectories=trajectories,  # GRPOLoss extracts advantages from here
+            old_logps=old_logps_list,   # Log probs from sampling
+        ))
+        
+        grad_norm = wait_result(actor_model.clip_grad_and_step(adapter_name=ADAPTER_NAME))
+        
+        metrics.loss = float(loss) if loss else 0.0
+        metrics.grad_norm = float(grad_norm) if grad_norm else 0.0
+        
+        # ========== 7. Log metrics ==========
+        log_dict = metrics.to_log_dict(step)
+        swanlab.log(log_dict)
+        
+        logger.info(
+            f"Step {step}: loss={metrics.loss:.4f}, grad_norm={metrics.grad_norm:.4f}, "
+            f"reward={log_dict.get('train/reward', 0):.4f}, "
+            f"format={log_dict.get('train/rewards/FormatORM/mean', 0):.2f}, "
+            f"accuracy={log_dict.get('train/rewards/CountdownORM/mean', 0):.2f}, "
+            f"completion_len={log_dict.get('train/completions/mean_length', 0):.1f}"
+        )
+        
+        step += 1
+    
+    logger.info(f"Training completed. Total steps: {step}")
+    actor_model.save('grpo-countdown-checkpoint', adapter_name=ADAPTER_NAME)
+    swanlab.finish()
 
-    train()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

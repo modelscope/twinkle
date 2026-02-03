@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Union, List, Literal, TYPE_CHECKING
-from base import Advantage
+from .base import Advantage
 if TYPE_CHECKING:
     import torch
 

@@ -20,10 +20,7 @@ class InputFeature(TypedDict, total=False):
         attention_mask: The attention mask of the input_ids.
         position_ids: The position ids of the input_ids, can be used to distinguish sentences.
         labels: The labels of the input_ids, used to calculate loss.
-        completion_mask: Boolean array used in RL algorithms, matched with logits_to_keep 
-            to indicate which tokens need to calculate loss.
-        logits_to_keep: The logits to keep when calculating loss.
-        num_items_in_batch: The number of valid tokens in the batch.
+        completion_mask: Boolean array used in RL algorithms, indicate which tokens need to calculate loss.
         length: The length of input_ids.
 
     Multimodal fields (raw data, processed by engine/model):
@@ -39,9 +36,7 @@ class InputFeature(TypedDict, total=False):
     labels: InputType
     completion_mask: InputType
     length: int
-    logits_to_keep: Optional[int]
-    num_items_in_batch: Optional[int]
-    
+
     # Multimodal fields (raw data)
     images: List[Any]
     videos: List[Any]
