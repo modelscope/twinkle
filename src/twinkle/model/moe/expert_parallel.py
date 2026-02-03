@@ -309,7 +309,7 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
     shared = getattr(block, "shared_expert", None)
     if shared is None:
         return None
-    return shared(hidden_states_2d)
+    return _run_module_with_casting(shared, hidden_states_2d)
 
 
 def _is_moe_experts(experts: Any) -> bool:
@@ -328,14 +328,40 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
 
 
 def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> torch.Tensor:
+    input_dtype = expert_in.dtype
     if not getattr(block, "_ep_tensor_experts", False):
-        return block.experts[expert_id](expert_in)
+        expert = block.experts[expert_id]
+        return _run_module_with_casting(expert, expert_in)
     experts = block.experts
     gate_up = experts.gate_up_proj[expert_id]
     down = experts.down_proj[expert_id]
+    compute_dtype = gate_up.dtype
+    if expert_in.dtype != compute_dtype:
+        expert_in = expert_in.to(compute_dtype)
     gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
     out = experts.act_fn(gate) * up
-    return F.linear(out, down)
+    out = F.linear(out, down)
+    if out.dtype != input_dtype:
+        out = out.to(input_dtype)
+    return out
+
+
+def _module_compute_dtype(module: nn.Module, default: torch.dtype) -> torch.dtype:
+    for param in module.parameters():
+        if param.dtype.is_floating_point:
+            return param.dtype
+    return default
+
+
+def _run_module_with_casting(module: nn.Module, module_in: torch.Tensor) -> torch.Tensor:
+    input_dtype = module_in.dtype
+    compute_dtype = _module_compute_dtype(module, input_dtype)
+    if compute_dtype != input_dtype:
+        module_in = module_in.to(compute_dtype)
+    out = module(module_in)
+    if out.dtype != input_dtype:
+        out = out.to(input_dtype)
+    return out
 
 
 def _run_router(

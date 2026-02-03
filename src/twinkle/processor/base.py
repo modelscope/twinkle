@@ -269,7 +269,11 @@ class InputProcessor:
     def _any_packing_free(inputs):
         is_padding_free = False
         for _input in inputs:
-            position_ids = _input['position_ids']
+            position_ids = _input.get('position_ids')
+            # Packed/padding-free layout is represented as a single flattened row.
+            # Regular padded batches are [batch, seq] (batch > 1) and should not match here.
+            if position_ids.ndim >= 2 and position_ids.shape[0] != 1:
+                continue
             # multiple 0/1, multiple sequences
             zero_count = torch.sum(position_ids == 0).item()
             one_count = torch.sum(position_ids == 1).item()

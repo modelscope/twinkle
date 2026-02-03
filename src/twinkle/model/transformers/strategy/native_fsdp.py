@@ -6,7 +6,7 @@ from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 
-from twinkle.utils import DeviceMesh
+from twinkle.utils import DeviceMesh, Platform
 
 
 class NativeFSDPStrategy:
@@ -27,6 +27,7 @@ class NativeFSDPStrategy:
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             _ensure_moe_patched_if_needed(model, self.device_mesh)
+            _place_ep_experts_on_local_device(model, self.device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
             reshard_after_forward = self.fsdp_config.get("reshard_after_forward", True)
             ignored_params = _collect_expert_params(model)
@@ -101,6 +102,23 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     if not ep_patched:
         return None
     return ignored or None
+
+
+def _place_ep_experts_on_local_device(model: nn.Module, device_mesh: DeviceMesh) -> None:
+    ep_world_size = device_mesh.ep_world_size or 1
+    if ep_world_size <= 1:
+        return
+    local_device = torch.device(Platform.get_local_device())
+    for module in model.modules():
+        if not getattr(module, "_ep_patched", False):
+            continue
+        experts = getattr(module, "experts", None)
+        if experts is not None:
+            experts.to(local_device)
+        if getattr(module, "_ep_ignore_shared_experts", False):
+            shared = getattr(module, "shared_expert", None)
+            if shared is not None:
+                shared.to(local_device)
 
 
 def _ensure_moe_patched_if_needed(model: nn.Module, device_mesh: DeviceMesh) -> None:
