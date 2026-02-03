@@ -18,8 +18,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from ray import serve
 
-from .common.state import get_server_state, ServerStateProxy
-from .common.validation import verify_request_token, get_token_from_request
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.validation import verify_request_token, get_token_from_request
 from .common.io_utils import (
     TrainingRun,
     TrainingRunsResponse,

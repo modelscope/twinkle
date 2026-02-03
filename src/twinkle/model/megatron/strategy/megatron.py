@@ -3,8 +3,8 @@ from typing import Literal, Optional, List
 
 import torch
 import torch.nn as nn
+
 from twinkle import DeviceMesh
-from ..args import get_args
 
 
 class MegatronStrategy:

@@ -29,14 +29,7 @@ def get_args() -> 'TwinkleMegatronArgs':
     global _GLOBAL_ARGS
     if _GLOBAL_ARGS is not None:
         return _GLOBAL_ARGS
-    
-    # Fallback to megatron's get_args if available
-    try:
-        from megatron.training import get_args as megatron_get_args
-        return megatron_get_args()
-    except (ImportError, AssertionError):
-        pass
-    
+
     raise RuntimeError(
         "Twinkle args have not been initialized. "
     )

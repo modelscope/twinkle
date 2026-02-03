@@ -3,12 +3,12 @@ import math
 from typing import Any
 
 from .base import Loss
-import torch
 
 class ChunkedCrossEntropyLossFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, logits, labels, chunk_size):
+        import torch
         ctx.save_for_backward(logits, labels)
         ctx.chunk_size = chunk_size
 
@@ -28,6 +28,7 @@ class ChunkedCrossEntropyLossFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
+        import torch
         logits, labels = ctx.saved_tensors
         chunk_size = ctx.chunk_size
 

@@ -157,10 +157,6 @@ def get_device_placement(device_group=None) -> str:
 
         cell_w = max(4, len(str(mesh_array.max())) + 2)
 
-        # Column headers
-        col_label = dim_names[-1].upper() if dim_names else "COL"
-        row_label = dim_names[0].upper() if len(dim_names) >= 2 else "ROW"
-
         header = "      " + "".join(f"{i:^{cell_w}}" for i in range(show_cols))
         if cols > max_cols:
             header += " ⋯"
@@ -390,7 +386,7 @@ def _prepare_lazy_collect(args, kwargs):
     # if a worker received an actor handle,
     # lazy collect should be false to prevent any outer function receives an object ref
     from ._ray import RayHelper
-    if 'WORKER_NAME' not in os.environ:
+    if not os.environ.get('WORKER_NAME'):
         # If this is a driver
         return args, kwargs
     else:
@@ -465,8 +461,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         device_group = [dg for dg in _device_group if dg.name == remote_group][0]
                         device_group._device_mesh[self.__class__.__name__] = device_mesh
 
+                # This will solve the iterator cannot be passed through ray.
                 def __iter__(_self):
-                    if 'WORKER_NAME' in os.environ:
+                    if os.environ.get('WORKER_NAME'):
                         # This is a worker, iter keeps in the class, pass nothing to driver
                         _iter = _self.__iter_origin__()
                         assert _iter is not _self
@@ -490,6 +487,20 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     seed = int(os.environ.get('TWINKLE_SEED', _seed))
                     determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
                     framework_util.seed_everything(seed, bool(determinism))
+                    # Ensure torch.distributed is initialized inside Ray workers.
+                    if os.environ.get('WORKER_NAME'):
+                        # Initialize distributed
+                        import torch
+                        import torch.distributed as dist
+                        if dist.is_available() and not dist.is_initialized():
+                            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+                            dist.init_process_group(backend=backend, init_method='env://')
+                        # This will depress the warnings of megatron
+                        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+                        # This will prevent the unlimited threads opened by torch
+                        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+                        # Use parallelism mode
+                        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
                     if not device_mesh_name:
                         # pop the device_mesh
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]

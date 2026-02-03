@@ -158,3 +158,4 @@ megatron_output/
 # ast template
 ast_index_file.py
 test_cookbook/
+/test*.py

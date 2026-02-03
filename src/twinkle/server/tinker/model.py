@@ -1,9 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Tinker-compatible model management server.
+
+This module provides a Ray Serve deployment that manages distributed training models.
+It handles:
+1. Model and adapter lifecycle (create, load, unload)
+2. Training operations (forward, backward, optimizer steps)
+3. Checkpoint management (save/load weights)
+4. Multi-user support with token-based isolation
+"""
 import os
-import threading
-import time
 import traceback
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -13,37 +20,77 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.twinkle.common.validation import verify_request_token
-from twinkle.server.twinkle.common.state import get_server_state, ServerStateProxy, schedule_task
+from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.utils.logger import get_logger
 
 from .common import TwinkleCompatTransformersModel, TwinkleCompatMegatronModel
+from .common.task_queue import TaskQueueMixin, TaskQueueConfig
+from .common.adapter_manager import AdapterManagerMixin
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
 
 
 def build_model_app(model_id: str,
-                    nproc_per_node: int, 
+                    nproc_per_node: int,
                     device_group: Dict[str, Any],
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
+                    adapter_config: Dict[str, Any] = None,
+                    queue_config: Optional[Dict[str, Any]] = None,
                     **kwargs):
+    """Build a model management application for distributed training.
+
+    This factory function creates a Ray Serve deployment that manages a training model
+    with support for multiple adapters (LoRA) and multi-user isolation.
+
+    Args:
+        model_id: Base model identifier (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
+        nproc_per_node: Number of processes per node for distributed training
+        device_group: Device group configuration dict
+        device_mesh: Device mesh configuration dict for tensor parallelism
+        deploy_options: Ray Serve deployment options
+        use_megatron: Whether to use Megatron backend (vs Transformers)
+        queue_config: Task queue configuration (rate limiting, etc.)
+        **kwargs: Additional model initialization arguments
+
+    Returns:
+        Configured Ray Serve deployment bound with parameters
+    """
     app = FastAPI()
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
+        """Middleware to verify authentication token for all requests."""
         return await verify_request_token(request=request, call_next=call_next)
 
     @serve.deployment(name='ModelManagement')
     @serve.ingress(app)
-    class ModelManagement():
+    class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
+        """Model management service handling training operations.
 
-        COUNT_DOWN = 60 * 30
+        This class manages:
+        - Base model and multiple adapter instances (multi-user LoRA)
+        - Training operations (forward, backward, optimizer steps)
+        - Adapter lifecycle with automatic cleanup via AdapterManagerMixin
+        - Per-user adapter limits and tracking
+        """
 
         def __init__(self, nproc_per_node: int, device_group: Dict[str, Any],
-                     device_mesh: Dict[str, Any], use_megatron: bool = False, **kwargs):
+                     device_mesh: Dict[str, Any], use_megatron: bool = False,
+                     queue_config: Optional[Dict[str, Any]] = None, **kwargs):
+            """Initialize the model management service.
+
+            Args:
+                nproc_per_node: Number of processes per node
+                device_group: Device group configuration
+                device_mesh: Device mesh configuration for parallelism
+                use_megatron: Whether to use Megatron backend
+                queue_config: Task queue configuration dict
+                **kwargs: Additional model initialization arguments
+            """
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray',
                                nproc_per_node=nproc_per_node,
@@ -66,102 +113,102 @@ def build_model_app(model_id: str,
                     remote_group=self.device_group.name,
                     **kwargs
                 )
-            self.adapter_records: Dict[str, int] = {}
-            self.hb_thread = threading.Thread(target=self.countdown,
-                                              daemon=True)
-            self.hb_thread.start()
-            self.adapter_lock = threading.Lock()
             self.state: ServerStateProxy = get_server_state()
-            self.per_token_model_limit = int(
-                os.environ.get('TWINKLE_PER_USER_MODEL_LIMIT', 30))
-            self.key_token_dict = {}
 
-        def countdown(self):
-            while True:
-                time.sleep(1)
-                for key in list(self.adapter_records.keys()):
-                    self.adapter_records[key] += 1
-                    if self.adapter_records[key] > self.COUNT_DOWN:
-                        with self.adapter_lock:
-                            self.model.remove_adapter(key)
-                        self.adapter_records.pop(key, None)
-                        token = self.key_token_dict.pop(key, None)
-                        if token:
-                            self.handle_adapter_count(token, False)
+            # Initialize task queue
+            self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
-        def handle_adapter_count(self, token: str, add: bool):
-            user_key = token + '_' + 'model_adapter'
-            cur_count: int = self.state.get_config(user_key) or 0
-            if add:
-                if cur_count < self.per_token_model_limit:
-                    self.state.add_config(user_key, cur_count + 1)
-                else:
-                    raise RuntimeError(
-                        f'Model adapter count limitation reached: {self.per_token_model_limit}'
-                    )
-            else:
-                if cur_count > 0:
-                    cur_count -= 1
-                    self.state.add_config(user_key, cur_count)
-                if cur_count <= 0:
-                    self.state.pop_config(user_key)
-
-        @staticmethod
-        def get_adapter_name(request: Request, adapter_name: str) -> str:
-            return adapter_name
-
-        def assert_adapter_exists(self, adapter_name: str):
-            assert adapter_name and adapter_name in self.adapter_records, f"Adapter {adapter_name} not found"
-
-        def assert_adapter_valid(self, adapter_name: Optional[str]):
-            assert adapter_name is None or adapter_name == '' or adapter_name in self.adapter_records, \
-                f"Adapter {adapter_name} is invalid"
+            self._init_adapter_manager(**adapter_config)
+            self.start_adapter_countdown()
 
         @app.post('/create_model')
         async def create_model(
                 self, request: Request,
                 body: types.CreateModelRequest) -> types.UntypedAPIFuture:
+            """Create a new model adapter for training.
+
+            This endpoint:
+            1. Registers the model in server state
+            2. Creates a LoRA adapter with specified config
+            3. Sets up processor, loss, and optimizer for the adapter
+            4. Saves metadata to training run manager
+
+            Args:
+                request: FastAPI request with auth token
+                body: CreateModelRequest with base_model and lora_config
+
+            Returns:
+                UntypedAPIFuture wrapping CreateModelResponse with model_id
+            """
             # Register a new model_id for each create_model call
-            model_id = self.state.register_model(body.model_dump())
+            model_id = self.state.register_model(
+                body.model_dump(), token=request.state.token)
 
             async def _create_adapter():
-                if body.lora_config:
-                    # TODO: support more lora config parameters, train_unembed, etc.
-                    lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
+                try:
+                    if body.lora_config:
+                        # Check adapter limit before creating
+                        allowed, reason = self.check_adapter_limit(
+                            request.state.token, True)
+                        if not allowed:
+                            raise RuntimeError(reason)
 
-                    with self.adapter_lock:
+                        # TODO: support more lora config parameters, train_unembed, etc.
+                        lora_cfg = LoraConfig(
+                            r=body.lora_config.rank, target_modules='all-linear')
+
                         adapter_name = self.get_adapter_name(
-                            request=request, adapter_name=model_id)
+                            adapter_name=model_id)
                         self.model.add_adapter_to_model(
                             adapter_name=adapter_name, config_or_dir=lora_cfg)
-                        self.adapter_records[adapter_name] = 0
-                        self.key_token_dict[adapter_name] = request.state.token
-                        self.handle_adapter_count(request.state.token, True)
-                    self.model.set_processor('InputProcessor',
-                                             adapter_name=adapter_name)
-                    # When use_megatron is True, we don't need to set the loss
-                    if not self.use_megatron:
-                        self.model.set_loss('CrossEntropyLoss',
-                                        adapter_name=adapter_name)
-                    self.model.set_optimizer('Adam',
-                                             adapter_name=adapter_name)
 
-                training_run_manager = create_training_run_manager(request.state.token)
-                training_run_manager.save(model_id, body)
+                        # Register adapter with rate limiter for lifecycle tracking
+                        self.register_adapter(
+                            adapter_name, request.state.token)
 
-                return types.CreateModelResponse(model_id=model_id)
+                        self.model.set_processor('InputProcessor',
+                                                 adapter_name=adapter_name)
+                        self.model.set_optimizer('Adam',
+                                                 adapter_name=adapter_name)
 
-            return await schedule_task(self.state,
-                                       _create_adapter(),
-                                       model_id=model_id)
+                    training_run_manager = create_training_run_manager(
+                        request.state.token)
+                    training_run_manager.save(model_id, body)
+
+                    return types.CreateModelResponse(model_id=model_id)
+                except Exception:
+                    # If adapter creation fails, decrement the count
+                    self.check_adapter_limit(request.state.token, False)
+
+                    logger.error(traceback.format_exc())
+                    return types.RequestFailedResponse(
+                        error=traceback.format_exc(),
+                        category=types.RequestErrorCategory.Server,
+                    )
+
+            return await self.schedule_task(
+                _create_adapter(),
+                model_id=model_id,
+                token=request.state.token,
+            )
 
         @app.post('/get_info')
         async def get_info(
                 self, request: Request,
                 body: types.GetInfoRequest) -> types.GetInfoResponse:
+            """Get information about a model.
+
+            Args:
+                request: FastAPI request with auth token
+                body: GetInfoRequest with model_id
+
+            Returns:
+                GetInfoResponse with model metadata (name, lora_rank, etc.)
+            """
             # Note: get_info doesn't require token for reading metadata in tinker
             # Using a default token or None since this is read-only
-            training_run_manager = create_training_run_manager(request.state.token)
+            training_run_manager = create_training_run_manager(
+                request.state.token)
             metadata = training_run_manager.get(str(body.model_id))
             model_name = metadata.base_model if metadata else model_id
             lora_rank = None
@@ -182,37 +229,66 @@ def build_model_app(model_id: str,
                 self,
                 request: Request,
                 body: types.UnloadModelRequest) -> types.UntypedAPIFuture:
+            """Unload a model adapter from memory.
+
+            Removes the adapter and updates user adapter counts.
+
+            Args:
+                request: FastAPI request with auth token
+                body: UnloadModelRequest with model_id
+
+            Returns:
+                UntypedAPIFuture wrapping UnloadModelResponse
+            """
 
             async def _do_unload():
                 # Only remove adapter, not the base model
-                with self.adapter_lock:
-                    adapter_name = self.get_adapter_name(
-                        request=request, adapter_name=body.model_id)
-                    if adapter_name in self.adapter_records:
-                        self.model.remove_adapter(adapter_name)
-                        del self.adapter_records[adapter_name]
-                        token = self.key_token_dict.pop(adapter_name, None)
-                        if token:
-                            self.handle_adapter_count(token, add=False)
+                adapter_name = self.get_adapter_name(
+                    adapter_name=body.model_id)
+                if self.get_adapter_info(adapter_name):
+                    self.model.remove_adapter(adapter_name)
+                    # Unregister adapter from rate limiter
+                    self.unregister_adapter(adapter_name)
+                    # Decrement adapter count via rate limiter
+                    self.check_adapter_limit(request.state.token, False)
                 self.state.unload_model(body.model_id)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
-            return await schedule_task(self.state,
-                                       _do_unload(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_unload(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/forward')
         async def forward(
                 self, request: Request,
                 body: types.ForwardRequest) -> types.UntypedAPIFuture:
+            """Execute forward pass without backward pass.
+
+            Used for inference or evaluation without gradient computation.
+
+            Args:
+                request: FastAPI request with auth token
+                body: ForwardRequest with input data
+
+            Returns:
+                UntypedAPIFuture wrapping ForwardBackwardOutput with loss
+            """
 
             async def _do_forward():
                 try:
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
+
                     datum_list = body.forward_input.data
+                    assert len(
+                        datum_list) >= self.device_mesh.data_world_size, f"Batch size {len(datum_list)} must be greater than data world size {self.device_mesh.data_world_size}"
+
                     loss_fn_config = body.forward_input.loss_fn_config or {}
 
                     output = self.model.forward_only(inputs=datum_list,
@@ -231,22 +307,50 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_forward(),
-                                       model_id=body.model_id)
+            # Calculate input tokens for rate limiting
+            input_tokens = sum(
+                len(d.model_input.to_ints()) for d in body.forward_input.data
+            )
+            return await self.schedule_task(
+                _do_forward(),
+                model_id=body.model_id,
+                token=request.state.token,
+                input_tokens=input_tokens,
+            )
 
         @app.post('/forward_backward')
         async def forward_backward(
                 self, request: Request,
                 body: types.ForwardBackwardRequest) -> types.UntypedAPIFuture:
+            """Execute forward and backward pass for training.
+
+            This combines forward pass and gradient computation. The implementation
+            differs based on backend:
+            - Megatron: Uses combined forward_backward method
+            - Transformers: Separate forward, calculate_loss, backward calls
+
+            Args:
+                request: FastAPI request with auth token
+                body: ForwardBackwardRequest with training data
+
+            Returns:
+                UntypedAPIFuture wrapping ForwardBackwardOutput with loss and metrics
+            """
 
             async def _do_forward_backward():
                 try:
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
+
                     datum_list = body.forward_backward_input.data
+                    assert len(
+                        datum_list) >= self.device_mesh.data_world_size, f"Batch size {len(datum_list)} must be greater than data world size {self.device_mesh.data_world_size}"
+
+                    loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
                     if self.use_megatron:
@@ -257,6 +361,15 @@ def build_model_app(model_id: str,
                             **loss_fn_config)
                     else:
                         # Transformers uses separate forward, calculate_loss, backward
+                        # When use_megatron is True, we don't need to set the loss
+                        # Set loss first
+                        if loss_fn == 'cross_entropy':
+                            self.model.set_loss('CrossEntropyLoss',
+                                                adapter_name=adapter_name)
+                        else:
+                            raise ValueError(
+                                f'Unsupported loss function {loss_fn}')
+
                         output = self.model.forward(inputs=datum_list,
                                                     adapter_name=adapter_name)
                         loss = self.model.calculate_loss(adapter_name=adapter_name,
@@ -274,20 +387,41 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_forward_backward(),
-                                       model_id=body.model_id)
+            # Calculate input tokens for rate limiting
+            input_tokens = sum(
+                len(d.model_input.to_ints()) for d in body.forward_backward_input.data
+            )
+            return await self.schedule_task(
+                _do_forward_backward(),
+                model_id=body.model_id,
+                token=request.state.token,
+                input_tokens=input_tokens,
+            )
 
         @app.post('/optim_step')
         async def optim_step(
                 self, request: Request,
                 body: types.OptimStepRequest) -> types.UntypedAPIFuture:
+            """Execute optimizer step to update model weights.
+
+            Applies accumulated gradients to update adapter parameters.
+
+            Args:
+                request: FastAPI request with auth token
+                body: OptimStepRequest with optimizer parameters
+
+            Returns:
+                UntypedAPIFuture wrapping OptimStepResponse
+            """
 
             async def _do_optim():
                 try:
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
+
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
 
                     self.model.step(adam_params=body.adam_params,
                                     adapter_name=adapter_name)
@@ -299,27 +433,45 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_optim(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_optim(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/save_weights')
         async def save_weights(
                 self, request: Request,
                 body: types.SaveWeightsRequest) -> types.UntypedAPIFuture:
+            """Save model adapter weights to storage.
+
+            Saves both model weights and optimizer state for training resumption.
+            Uses token-based isolation for user-specific storage.
+
+            Args:
+                request: FastAPI request with auth token
+                body: SaveWeightsRequest with path and model_id
+
+            Returns:
+                UntypedAPIFuture wrapping SaveWeightsResponse with saved path
+            """
 
             async def _do_save():
                 try:
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
-                    
+
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
+
                     # Extract token from request for user isolation
                     token = request.state.token
                     checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
-                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(
+                        body.path)
                     save_dir = checkpoint_manager.get_save_dir(
                         model_id=body.model_id,
                         is_sampler=False
@@ -342,36 +494,47 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_save(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_save(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/save_weights_for_sampler')
         async def save_weights_for_sampler(
                 self, request: Request,
                 body: types.SaveWeightsForSamplerRequest) -> types.UntypedAPIFuture:
             """Save/convert weights for inference use.
-            
+
+            Saves adapter weights without optimizer state for use with sampler.
+            Creates a sampling session for tracking.
+
             Args:
-                request: FastAPI request object.
-                body: SaveWeightsForSamplerRequest containing model_id, path, etc.
-                
+                request: FastAPI request with auth token
+                body: SaveWeightsForSamplerRequest with model_id and path
+
             Returns:
-                UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal.
+                UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal
             """
-            sampling_session_id = self.state.create_sampling_session( body.model_dump())
+            sampling_session_id = self.state.create_sampling_session(
+                body.model_dump())
+
             async def _do_save_for_sampler():
                 try:
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
-                    
+
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
+
                     # Extract token from request for user isolation
                     token = request.state.token
                     checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
-                    checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
+                    checkpoint_name = checkpoint_manager.get_ckpt_name(
+                        body.path)
                     save_dir = checkpoint_manager.get_save_dir(
                         model_id=body.model_id,
                         is_sampler=True
@@ -397,29 +560,46 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_save_for_sampler(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_save_for_sampler(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
         @app.post('/load_weights')
         async def load_weights(
                 self, request: Request,
                 body: types.LoadWeightsRequest) -> types.UntypedAPIFuture:
+            """Load model adapter weights from storage.
+
+            Loads weights and optionally optimizer state for training resumption.
+            Uses token-based isolation for user-specific storage access.
+
+            Args:
+                request: FastAPI request with auth token
+                body: LoadWeightsRequest with path and optimizer flag
+
+            Returns:
+                UntypedAPIFuture wrapping LoadWeightsResponse
+            """
 
             async def _do_load():
                 try:
                     assert self.model is not None, 'Model not loaded, please load model first'
-                    
+
                     adapter_name = self.get_adapter_name(
-                        request, adapter_name=body.model_id)
+                        adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
-                    
+
+                    # Touch adapter to reset inactivity counter
+                    self.touch_adapter(adapter_name)
+
                     # Extract token from request for user isolation
                     token = request.state.token
-                    
+
                     weight_path = body.path
                     load_optimizer = body.optimizer
-                    
+
                     self.model.load(checkpoint_dir=weight_path,
                                     load_optimizer=load_optimizer,
                                     adapter_name=adapter_name,
@@ -433,9 +613,11 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            return await schedule_task(self.state,
-                                       _do_load(),
-                                       model_id=body.model_id)
+            return await self.schedule_task(
+                _do_load(),
+                model_id=body.model_id,
+                token=request.state.token,
+            )
 
     return ModelManagement.options(**deploy_options).bind(
-        nproc_per_node, device_group, device_mesh, use_megatron, **kwargs)
+        nproc_per_node, device_group, device_mesh, use_megatron, queue_config, **kwargs)

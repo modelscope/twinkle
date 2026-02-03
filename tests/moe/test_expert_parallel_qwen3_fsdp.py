@@ -20,7 +20,7 @@ import torch.multiprocessing as mp
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 
-from twinkle.model.moe import apply_expert_parallel
+from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh
 

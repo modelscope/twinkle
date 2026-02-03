@@ -1,11 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import shutil
 from contextlib import contextmanager
 
 from datasets.utils.filelock import FileLock
 
-shutil.rmtree('.locks', ignore_errors=True)
 os.makedirs('.locks', exist_ok=True)
 
 

@@ -44,6 +44,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.mixed_precision = mixed_precision
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
+        self.sp_strategy = None
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)

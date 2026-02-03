@@ -1,9 +1,9 @@
-import torch
-import torch.nn.functional as F
-from typing import Any, Union, Mapping, List, Optional
+from typing import Any, Union, Mapping, TYPE_CHECKING, List, Optional
+if TYPE_CHECKING:
+    import torch
+    import torch.nn.functional as F
 
-
-def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bool = False) -> Any:
+def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
@@ -16,11 +16,11 @@ def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bo
 
 
 def pad_sequence_to_length(
-    tensor: torch.Tensor,
+    tensor: 'torch.Tensor',
     max_seq_len: int,
     pad_value: float = 0.0,
     left_pad: bool = False,
-) -> torch.Tensor:
+) -> 'torch.Tensor':
     """
     Pad a 2D tensor in the last dimension to max_seq_len.
     
@@ -46,9 +46,9 @@ def pad_2d_list_to_tensor(
     max_length: Optional[int] = None,
     pad_value: float = 0.0,
     left_pad: bool = False,
-    dtype: torch.dtype = torch.float32,
-    device: Optional[Union[str, torch.device]] = None,
-) -> torch.Tensor:
+    dtype: 'torch.dtype' = torch.float32,
+    device: Optional[Union[str, 'torch.device']] = None,
+) -> 'torch.Tensor':
     """
     Pad a 2D list (e.g., list of logprobs) to a 2D tensor.
     
@@ -93,7 +93,7 @@ def pad_2d_list_to_tensor(
     
     return result
 
-def selective_log_softmax(logits, index) -> torch.Tensor:
+def selective_log_softmax(logits, index) -> 'torch.Tensor':
     """
     refer: trl/trainer/utils
 

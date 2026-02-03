@@ -1,4 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Tinker-compatible server implementation.
+
+This module provides a Ray Serve-based server that implements the Tinker API for distributed
+training and inference. It acts as a routing layer that:
+1. Handles client requests and validates tokens
+2. Manages training runs and checkpoints with user isolation
+3. Proxies requests to appropriate model or sampler deployments based on base_model
+"""
 
 from __future__ import annotations
 
@@ -10,9 +19,10 @@ from ray import serve
 
 from tinker import types
 
-from twinkle.server.twinkle.common.validation import verify_request_token, get_token_from_request
-from twinkle.server.twinkle.common.state import get_server_state, schedule_task
+from twinkle.server.utils.validation import verify_request_token, get_token_from_request
+from twinkle.server.utils.state import get_server_state
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
+from .common.task_queue import QueueState
 
 
 def build_server_app(
@@ -20,16 +30,45 @@ def build_server_app(
     supported_models: Optional[List[types.SupportedModel]] = None,
     **kwargs
 ):
+    """Build and configure the Tinker-compatible server application.
+    
+    This factory function creates a FastAPI application with Ray Serve deployment
+    that handles routing, authentication, and proxying for training and inference.
+    
+    Args:
+        deploy_options: Ray Serve deployment configuration (num_replicas, etc.)
+        supported_models: List of supported base models for validation
+        **kwargs: Additional keyword arguments (route_prefix, etc.)
+        
+    Returns:
+        Configured Ray Serve deployment bound with options
+    """
     app = FastAPI()
 
     @app.middleware("http")
     async def verify_token(request: Request, call_next):
+        """Middleware to verify authentication token for all requests."""
         return await verify_request_token(request=request, call_next=call_next)
 
     @serve.deployment(name="TinkerCompatServer")
     @serve.ingress(app)
     class TinkerCompatServer:
+        """Main server class handling Tinker API endpoints and request routing.
+        
+        This class manages:
+        - Server state and session management
+        - Request validation and authentication
+        - Proxying to model/sampler deployments
+        - Training run and checkpoint CRUD operations
+        """
+        
         def __init__(self, supported_models: Optional[List[types.SupportedModel]] = None, **kwargs) -> None:
+            """Initialize the Tinker-compatible server.
+            
+            Args:
+                supported_models: List of supported base models for validation
+                **kwargs: Additional configuration (route_prefix, etc.)
+            """
             self.state = get_server_state()
             self.client = httpx.AsyncClient(timeout=None)
             self.route_prefix = kwargs.get("route_prefix", "/api/v1")
@@ -40,7 +79,14 @@ def build_server_app(
             ]
 
         def _validate_base_model(self, base_model: str) -> None:
-            """Validate that base_model is in supported_models list."""
+            """Validate that base_model is in supported_models list.
+            
+            Args:
+                base_model: The base model name to validate
+                
+            Raises:
+                HTTPException: If base_model is not supported
+            """
             supported_model_names = [
                 m.model_name for m in self.supported_models]
             if base_model not in supported_model_names:
@@ -51,21 +97,43 @@ def build_server_app(
                 )
 
         def _get_base_model(self, model_id: str) -> str:
-            """Get base_model for a model_id from state metadata."""
+            """Get base_model for a model_id from state metadata.
+            
+            Args:
+                model_id: The model identifier to lookup
+                
+            Returns:
+                The base model name
+                
+            Raises:
+                HTTPException: If model_id not found in state
+            """
             metadata = self.state.get_model_metadata(model_id)
             if metadata and metadata.get('base_model'):
                 return metadata['base_model']
             raise HTTPException(
                 status_code=404, detail=f"Model {model_id} not found")
 
-        async def _proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
-            """Proxy request to model endpoint."""
+        async def _proxy_request(self, request: Request, endpoint: str, base_model: str, service_type: str) -> Response:
+            """Generic proxy method to forward requests to model or sampler services.
+            
+            This method consolidates the common proxy logic for both model and sampler endpoints.
+            
+            Args:
+                request: The incoming FastAPI request
+                endpoint: The target endpoint name (e.g., 'create_model', 'asample')
+                base_model: The base model name for routing
+                service_type: Either 'model' or 'sampler' to determine the target service
+                
+            Returns:
+                Proxied response from the target service
+            """
             body_bytes = await request.body()
 
-            # Construct target URL
+            # Construct target URL: /{service_type}/{base_model}/{endpoint}
             prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
             base_url = f"{request.url.scheme}://{request.url.netloc}"
-            target_url = f"{base_url}{prefix}/model/{base_model}/{endpoint}"
+            target_url = f"{base_url}{prefix}/{service_type}/{base_model}/{endpoint}"
 
             headers = dict(request.headers)
             headers.pop("host", None)
@@ -87,39 +155,44 @@ def build_server_app(
                 )
             except Exception as e:
                 return Response(content=f"Proxy Error: {str(e)}", status_code=502)
+
+        async def _proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
+            """Proxy request to model endpoint.
+            
+            Routes the request to the appropriate model deployment based on base_model.
+            
+            Args:
+                request: The incoming FastAPI request
+                endpoint: The target endpoint name (e.g., 'create_model', 'forward')
+                base_model: The base model name for routing
+                
+            Returns:
+                Proxied response from the model service
+            """
+            return await self._proxy_request(request, endpoint, base_model, 'model')
 
         async def _proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
-            """Proxy request to sampler endpoint."""
-            body_bytes = await request.body()
-
-            # Construct target URL: /sampler/{base_model}/{endpoint}
-            prefix = self.route_prefix.rstrip("/") if self.route_prefix else ""
-            base_url = f"{request.url.scheme}://{request.url.netloc}"
-            target_url = f"{base_url}{prefix}/sampler/{base_model}/{endpoint}"
-
-            headers = dict(request.headers)
-            headers.pop("host", None)
-            headers.pop("content-length", None)
-
-            try:
-                rp_ = await self.client.request(
-                    method=request.method,
-                    url=target_url,
-                    content=body_bytes,
-                    headers=headers,
-                    params=request.query_params,
-                )
-                return Response(
-                    content=rp_.content,
-                    status_code=rp_.status_code,
-                    headers=dict(rp_.headers),
-                    media_type=rp_.headers.get("content-type"),
-                )
-            except Exception as e:
-                return Response(content=f"Proxy Error: {str(e)}", status_code=502)
+            """Proxy request to sampler endpoint.
+            
+            Routes the request to the appropriate sampler deployment based on base_model.
+            
+            Args:
+                request: The incoming FastAPI request
+                endpoint: The target endpoint name (e.g., 'asample')
+                base_model: The base model name for routing
+                
+            Returns:
+                Proxied response from the sampler service
+            """
+            return await self._proxy_request(request, endpoint, base_model, 'sampler')
 
         @staticmethod
         def _sample_output() -> types.SampleResponse:
+            """Generate a sample output for testing purposes.
+            
+            Returns:
+                A mock SampleResponse with dummy data
+            """
             sequence = types.SampledSequence(stop_reason="stop", tokens=[
                                              1, 2, 3], logprobs=[-0.1, -0.2, -0.3])
             return types.SampleResponse(sequences=[sequence])
@@ -128,24 +201,59 @@ def build_server_app(
 
         @app.get("/healthz")
         async def healthz(self, request: Request) -> types.HealthResponse:
+            """Health check endpoint.
+            
+            Returns:
+                HealthResponse indicating server is operational
+            """
             return types.HealthResponse(status="ok")
 
         @app.get("/get_server_capabilities")
         async def get_server_capabilities(self, request: Request) -> types.GetServerCapabilitiesResponse:
+            """Get server capabilities including supported models.
+            
+            Returns:
+                GetServerCapabilitiesResponse with list of supported models
+            """
             return types.GetServerCapabilitiesResponse(supported_models=self.supported_models)
 
         @app.post("/telemetry")
         async def telemetry(self, request: Request, body: types.TelemetrySendRequest) -> types.TelemetryResponse:
-            # Telemetry is accepted but not persisted; this endpoint is intentionally lightweight.
+            """Accept telemetry data from clients.
+            
+            Note: Telemetry is accepted but not persisted; this endpoint is intentionally lightweight.
+            
+            Returns:
+                TelemetryResponse indicating data was accepted
+            """
             return types.TelemetryResponse(status="accepted")
 
         @app.post("/create_session")
         async def create_session(self, request: Request, body: types.CreateSessionRequest) -> types.CreateSessionResponse:
+            """Create a new training session.
+            
+            Args:
+                body: Session creation parameters
+                
+            Returns:
+                CreateSessionResponse with new session_id
+            """
             session_id = self.state.create_session(body.model_dump())
             return types.CreateSessionResponse(session_id=session_id)
 
         @app.post("/session_heartbeat")
         async def session_heartbeat(self, request: Request, body: types.SessionHeartbeatRequest) -> types.SessionHeartbeatResponse:
+            """Keep a session alive via heartbeat.
+            
+            Args:
+                body: Heartbeat request with session_id
+                
+            Returns:
+                SessionHeartbeatResponse if session is alive
+                
+            Raises:
+                HTTPException: If session not found
+            """
             alive = self.state.touch_session(body.session_id)
             if not alive:
                 raise HTTPException(status_code=404, detail="Unknown session")
@@ -155,55 +263,71 @@ def build_server_app(
         async def create_sampling_session(
             self, request: Request, body: types.CreateSamplingSessionRequest
         ) -> types.CreateSamplingSessionResponse:
+            """Create a new sampling (inference) session.
+            
+            Args:
+                body: Sampling session creation parameters
+                
+            Returns:
+                CreateSamplingSessionResponse with new sampling_session_id
+            """
             sampling_session_id = self.state.create_sampling_session(
                 body.model_dump())
             return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
-        @app.post("/asample")
-        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
-            """Execute text generation (inference).
-            
-            This endpoint first tries to use a local sampler if available.
-            Otherwise, it proxies the request to the sampler service.
-            """
-            model_path = body.model_path
-            base_model = body.base_model
-            
-            # If both are None, look up from sampling session
-            if not model_path and not base_model and body.sampling_session_id:
-                session = self.state.get_sampling_session(body.sampling_session_id)
-                if session:
-                    model_path = session.get('model_path')
-                    base_model = session.get('base_model')
-            
-            # Extract base_model from model_path if needed
-            if model_path and not base_model:
-                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
-                path = model_path.replace("twinkle://", "").replace("tinker://", "")
-                parts = path.split("/")
-                if len(parts) >= 2:
-                    base_model = f"{parts[0]}/{parts[1]}"
-            
-            return await self._proxy_to_sampler(request, "asample", base_model)
-            
-        @app.post("/save_weights_for_sampler")
-        async def save_weights_for_sampler(
-            self, request: Request, body: types.SaveWeightsForSamplerRequest
-        ) -> Any:
-            """Save/convert weights for inference use.
-            
-            This endpoint proxies to the model service to save weights for sampler.
-            """
-            # Proxy to model service for save_weights_for_sampler
-            base_model = self._get_base_model(body.model_id)
-            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
-
         @app.post("/retrieve_future")
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
+            """Retrieve the result of an async task.
+            
+            This endpoint returns tinker-compatible responses:
+            - 404: Task not found (request_id doesn't exist)
+            - 200 with {"type": "try_again"}: Task still processing (pending/queued/running)
+            - 200 with {"error": "...", "category": "..."}: Task failed
+            - 200 with result: Task completed successfully
+            
+            Returns:
+                Tinker-compatible response format.
+            """
             record = self.state.get_future(body.request_id)
             if record is None:
                 raise HTTPException(status_code=404, detail="Future not found")
-            result = record["result"]
+            
+            status = record.get("status")
+            
+            # Task is still being processed - return try_again response
+            if status in ("pending", "queued", "running"):
+                response_data = {"type": "try_again"}
+                
+                # Add queue_state and queue_state_reason if available
+                queue_state = record.get("queue_state")
+                queue_state_reason = record.get("queue_state_reason")
+                if queue_state:
+                    response_data["queue_state"] = queue_state
+                if queue_state_reason:
+                    response_data["queue_state_reason"] = queue_state_reason
+                
+                return response_data
+            
+            # Task was rejected due to rate limiting
+            if status == "rate_limited":
+                reason = record.get("reason", "Rate limit exceeded")
+                response_data = {"type": "try_again", "queue_state": QueueState.PAUSED_RATE_LIMIT.value}
+                if reason:
+                    response_data["queue_state_reason"] = reason
+                return response_data
+            
+            # Task failed - return error response
+            if status == "failed":
+                result = record.get("result", {})
+                return {
+                    "error": result.get("error", "Unknown error"),
+                    "category": result.get("category", "Server")
+                }
+            
+            # Task completed successfully - return the result
+            result = record.get("result")
+            if result is None:
+                raise HTTPException(status_code=500, detail="Task completed but no result found")
             if hasattr(result, "model_dump"):
                 return result.model_dump()
             return result
@@ -335,39 +459,156 @@ def build_server_app(
 
     # --- Proxy Endpoints ---------------------------------------------------------
 
-    # --- Model Proxy Endpoints ----------------------------------------
+        # --- Model Proxy Endpoints ----------------------------------------
 
         @app.post("/create_model")
         async def create_model(self, request: Request, body: types.CreateModelRequest) -> Any:
+            """Create a new model (adapter) for training.
+            
+            Args:
+                body: Model creation request with base_model and config
+                
+            Returns:
+                Proxied response from model service
+            """
             self._validate_base_model(body.base_model)
             return await self._proxy_to_model(request, "create_model", body.base_model)
 
         @app.post("/get_info")
         async def get_info(self, request: Request, body: types.GetInfoRequest) -> Any:
+            """Get information about a model.
+            
+            Args:
+                body: Info request with model_id
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "get_info", self._get_base_model(body.model_id))
 
         @app.post("/unload_model")
         async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> Any:
+            """Unload a model adapter from memory.
+            
+            Args:
+                body: Unload request with model_id
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "unload_model", self._get_base_model(body.model_id))
 
         @app.post("/forward")
         async def forward(self, request: Request, body: types.ForwardRequest) -> Any:
+            """Execute forward pass without backward.
+            
+            Args:
+                body: Forward request with inputs
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "forward", self._get_base_model(body.model_id))
 
         @app.post("/forward_backward")
         async def forward_backward(self, request: Request, body: types.ForwardBackwardRequest) -> Any:
+            """Execute forward and backward pass for training.
+            
+            Args:
+                body: Forward-backward request with inputs
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "forward_backward", self._get_base_model(body.model_id))
 
         @app.post("/optim_step")
         async def optim_step(self, request: Request, body: types.OptimStepRequest) -> Any:
+            """Execute optimizer step to update model weights.
+            
+            Args:
+                body: Optimizer step request with parameters
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "optim_step", self._get_base_model(body.model_id))
 
         @app.post("/save_weights")
         async def save_weights(self, request: Request, body: types.SaveWeightsRequest) -> Any:
+            """Save model weights to storage.
+            
+            Args:
+                body: Save weights request with path
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "save_weights", self._get_base_model(body.model_id))
 
         @app.post("/load_weights")
         async def load_weights(self, request: Request, body: types.LoadWeightsRequest) -> Any:
+            """Load model weights from storage.
+            
+            Args:
+                body: Load weights request with path
+                
+            Returns:
+                Proxied response from model service
+            """
             return await self._proxy_to_model(request, "load_weights", self._get_base_model(body.model_id))
+
+    # --- Sampler Proxy Endpoints ----------------------------------------
+    
+        @app.post("/asample")
+        async def asample(self, request: Request, body: types.SampleRequest) -> Any:
+            """Execute text generation (inference).
+            
+            This endpoint first tries to use a local sampler if available.
+            Otherwise, it proxies the request to the sampler service.
+            
+            Args:
+                body: Sample request with prompt and sampling parameters
+                
+            Returns:
+                Proxied response from sampler service
+            """
+            model_path = body.model_path
+            base_model = body.base_model
+            
+            # If both are None, look up from sampling session
+            if not model_path and not base_model and body.sampling_session_id:
+                session = self.state.get_sampling_session(body.sampling_session_id)
+                if session:
+                    model_path = session.get('model_path')
+                    base_model = session.get('base_model')
+            
+            # Extract base_model from model_path if needed
+            if model_path and not base_model:
+                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
+                path = model_path.replace("twinkle://", "").replace("tinker://", "")
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    base_model = f"{parts[0]}/{parts[1]}"
+            
+            return await self._proxy_to_sampler(request, "asample", base_model)
+            
+        @app.post("/save_weights_for_sampler")
+        async def save_weights_for_sampler(
+            self, request: Request, body: types.SaveWeightsForSamplerRequest
+        ) -> Any:
+            """Save/convert weights for inference use.
+            
+            This endpoint proxies to the model service to save weights for sampler.
+            
+            Args:
+                body: Save weights request with model_id
+                
+            Returns:
+                Proxied response from model service
+            """
+            # Proxy to model service for save_weights_for_sampler
+            base_model = self._get_base_model(body.model_id)
+            return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
 
     return TinkerCompatServer.options(**deploy_options).bind(supported_models=supported_models, **kwargs)

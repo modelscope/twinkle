@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Union, List, Literal
-
-import torch
+from typing import Union, List, Literal, TYPE_CHECKING
 from .base import Advantage
+if TYPE_CHECKING:
+    import torch
 
 
 class GRPOAdvantage(Advantage):

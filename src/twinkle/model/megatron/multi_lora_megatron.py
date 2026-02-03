@@ -189,11 +189,11 @@ class MultiLoraMegatronModel(MegatronModel):
                 self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=self.multi_adapter.save_lora_converter)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=kwargs.get("adapter_name"))
-            import torch.distributed as dist
             # Final synchronization to ensure all ranks complete save
             if dist.is_initialized():
                 dist.barrier()
 
+    @remote_function(dispatch='all')
     def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
             output_dir = 'output'

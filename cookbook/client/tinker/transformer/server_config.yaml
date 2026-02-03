@@ -35,6 +35,12 @@ applications:
         device_type: cuda
         mesh: [0, 1]
         mesh_dim_names: ['dp']
+      queue_config:
+        rps_limit: 100
+        tps_limit: 10000
+      adapter_config:
+        per_token_adapter_limit: 30
+        adapter_timeout: 1800
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -102,31 +108,3 @@ applications:
   #         num_cpus: 0.1
   #       logging_config:
   #         log_level: DEBUG
-
-  # Example: Sampler with TorchSampler
-  # - name: sampler-torch-Qwen2.5-0.5B-Instruct
-  #   route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct-torch
-  #   import_path: main:build_sampler_app
-  #   args:
-  #     model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
-  #     nproc_per_node: 1
-  #     sampler_type: torch  # Use TorchSampler instead of VLLMSampler
-  #     device_group:
-  #       name: sampler_torch
-  #       ranks: [0]
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       mesh: [0]
-  #       mesh_dim_names: ['dp']
-  #   deployments:
-  #     - name: SamplerManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
-  #       logging_config:
-  #         log_level: DEBUG
-

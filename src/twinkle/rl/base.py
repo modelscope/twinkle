@@ -1,5 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Literal, Union, List
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import torch
 
 
 class Advantage:
@@ -17,8 +20,8 @@ class Advantage:
         - compute_advantages_rloo: RLOO-style (leave-one-out baseline)
 
         Example:
-            >>> from twinkle.rl import compute_advantages
+            >>> from twinkle.rl import GRPOAdvantage
             >>> rewards = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # 2 prompts, 4 samples each
-            >>> advantages = compute_advantages(rewards, num_generations=4)
+            >>> advantages = GRPOAdvantage()(rewards, num_generations=4)
         """
         ...

@@ -1,6 +1,8 @@
 from typing import List
-import torch.nn as nn
 from twinkle.patch import Patch
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import torch.nn as nn
 
 
 class MegatronPeft(Patch):
@@ -14,7 +16,7 @@ class MegatronPeft(Patch):
 
         _origin_get_tied_target_modules = BaseTuner._get_tied_target_modules
 
-        def _get_tied_target_modules(self, model: nn.Module) -> List[str]:
+        def _get_tied_target_modules(self, model: 'nn.Module') -> List[str]:
             try:
                 return _origin_get_tied_target_modules(self, model)
             except AttributeError:

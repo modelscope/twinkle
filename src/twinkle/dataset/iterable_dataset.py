@@ -13,15 +13,18 @@ class IterableDataset(IterableDataset, Dataset):
         kwargs['streaming'] = True
         super(IterableDataset, self).__init__(dataset_meta, **kwargs)
 
+    @remote_function()
     def add_dataset(self,
                     dataset_meta: DatasetMeta,
                     **kwargs):
         kwargs['streaming'] = True
         return super().add_dataset(dataset_meta, **kwargs)
 
+    @remote_function()
     def __len__(self):
         raise NotImplementedError()
 
+    @remote_function()
     def __getitem__(self, idx):
         raise NotImplementedError()
 

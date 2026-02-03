@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from functools import partial
 from typing import Callable, Union, Optional, Type
-import os
+
 import twinkle.processor
 from twinkle import DeviceMesh, remote_function, framework_util
 from twinkle import remote_class
 from twinkle.dataset import Dataset
-from .retry_sampler import RetrySampler
-from .device_mesh_sampler import DeviceMeshSampler
-from .device_mesh_fetcher import DeviceMeshIterableFetcher
 from twinkle.processor import InputProcessor
 from twinkle.utils import construct_class
+from .device_mesh_fetcher import DeviceMeshIterableFetcher
+from .device_mesh_sampler import DeviceMeshSampler
+from .retry_sampler import RetrySampler
 
 
 @remote_class(execute='first')
@@ -67,10 +67,12 @@ class DataLoader:
         framework_util.seed_everything(worker_seed)
 
     @remote_function()
-    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor], **kwargs):
-        """Set task processor to prepare the task inputs.
+    def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
+        """Set task processor to collate data.
+
+        By default, this function will be used, the model will cover the data collate work.
         Args:
-            processor_cls: A processor_cls class name, a processor_cls plugin id, or a processor_cls class type/instance.
+            processor_cls: A processor_cls class name, a processor_cls plugin id, or a processor_cls class type/instance, or a callable.
             **kwargs: Any parameters needed to construct the processor_cls instance.
         """
         self.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
@@ -80,7 +82,7 @@ class DataLoader:
             from torch.utils.data import DataLoader as TorchDataLoader, IterableDataset
             if 'collate_fn' not in self.dataloader_params:
                 if self.processor is not None:
-                    self.dataloader_params['collate_fn'] = self.processor.__call__
+                    self.dataloader_params['collate_fn'] = self.processor
                 else:
                     self.dataloader_params['collate_fn'] = lambda x: x
             self.dataloader = TorchDataLoader(self.dataset, **self.dataloader_params)

@@ -2,7 +2,7 @@
 import os
 from collections.abc import Mapping
 from copy import deepcopy
-from typing import List, Optional, Dict, Any, Literal, Union
+from typing import List, Optional, Dict, Any, Literal, Union, TYPE_CHECKING, Callable
 
 import numpy as np
 from PIL import Image
@@ -10,7 +10,8 @@ from PIL import Image
 from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.hub import HubOperation
 from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
-import torch
+if TYPE_CHECKING:
+    import torch
 
 # Type aliases for multimodal data
 ImageInput = Union[str, Image.Image, "torch.Tensor"]
@@ -45,11 +46,11 @@ class Template:
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
-        self.pre_pipeline = [
+        self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
             self._add_default_system, # Add a default system field
             self._build_mm_messages, # turn to standard mm messages
         ]
-        self.post_pipeline = [
+        self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
             self._check_max_length, # Check and split input_features
             self._add_attention_fields, # Add useful fields
             self._roll_labels, # roll labels
@@ -96,7 +97,7 @@ class Template:
             else:
                 # Processor doesn't support return_dict properly
                 self._template_support_assistant_tokens_mask = False
-        except Exception:
+        except Exception: # noqa
             # If any error occurs during testing, fall back to not supporting
             self._template_support_assistant_tokens_mask = False
 
@@ -143,7 +144,6 @@ class Template:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':
                 trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
-            # Fix: use .get() to avoid KeyError - extend_message is optional in Trajectory (TypedDict total=False)
             for (_, messages) in trajectory.get('extend_message', []):
                 if messages and messages[0]['role'] == 'user':
                     messages.insert(0, Message(role='system', content=self.default_system))
@@ -180,6 +180,7 @@ class Template:
         return [input_feature]
 
     def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
+        # TODO code untested
         messages = trajectory['messages']
         # Get images/videos from trajectory level (common case) or message level
         traj_images = trajectory.get('images') or []
@@ -245,9 +246,6 @@ class Template:
         return inputs
 
     def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        if self.is_mm:
-            trajectory = self._build_mm_messages(trajectory)[0]
-        
         if self.use_chat_template:
             if add_generation_prompt:
                 # For inference: just get input_ids with generation prompt, no labels needed
@@ -289,7 +287,7 @@ class Template:
         return rows
 
     @staticmethod
-    def map_row_to_col(rows: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    def map_row_to_col(rows: List[Union[Dict[str, Any], InputFeature]]) -> Dict[str, List[Any]]:
         if not rows:
             return {}
 

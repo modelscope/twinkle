@@ -10,9 +10,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from twinkle.model.moe import apply_expert_parallel
+from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh
 

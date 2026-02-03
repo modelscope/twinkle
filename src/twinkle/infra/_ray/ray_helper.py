@@ -1,9 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
-
-import ray
-
 from .resource_manager import ResourceManager
 from twinkle import DeviceGroup, Platform, find_node_ip, find_free_port, requires
 
@@ -27,6 +24,7 @@ class RayHelper:
 
         @ray.remote
         class WorkerRegistry:
+            """A config center to store global configs"""
 
             def __init__(self):
                 self.config = {}
@@ -110,6 +108,7 @@ class RayHelper:
 
     @staticmethod
     def is_worker():
+        """Check if this process is the worker"""
         import ray
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
@@ -178,6 +177,7 @@ class RayHelper:
 
             def _get_result(self):
                 """Internal method to lazily collect and cache results"""
+                import ray
                 if self._result is None:
                     result = []
                     for future in self._futures:
@@ -236,6 +236,7 @@ class RayHelper:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
+        import ray
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -249,6 +250,10 @@ class RayHelper:
         assert len(placement_groups) == len(ranks)
         key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
         if execute == 'peer':
+            # Create the peer worker
+            # 0 1 2 3
+            # | | | |
+            # 0 1 2 3
             _slice = Platform.get_peer_index(len(ranks))
             placement_groups = placement_groups[_slice]
             ranks = ranks[_slice]

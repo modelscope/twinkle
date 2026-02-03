@@ -13,8 +13,8 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import Trajectory, InputFeature
 from twinkle.sampler import VLLMSampler, Sampler
-from .common.validation import verify_request_token
-from .common.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.sampler.types import SamplingParams, SampleResponse
 
 

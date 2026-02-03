@@ -79,6 +79,8 @@ class Dataset(TorchDataset):
         """
         kwargs['batched'] = True # Only supported batched, because a single row may explode to several rows
         if 'load_from_cache_file' not in kwargs:
+            # By default, we don't use load_from_cache_file, because read cache will not consider the changes in the same file,
+            # which will cause unexpected behaviors.
             kwargs['load_from_cache_file'] = False
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
@@ -148,6 +150,8 @@ class Dataset(TorchDataset):
         """
         init_args = init_args or {}
         if 'load_from_cache_file' not in kwargs:
+            # By default, we don't use load_from_cache_file, because read cache will not consider the changes in the same file,
+            # which will cause unexpected behaviors.
             kwargs['load_from_cache_file'] = False
         preprocess_func = construct_class(preprocess_func, Preprocessor, twinkle.preprocessor, **init_args)
         if dataset_meta is None:

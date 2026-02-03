@@ -50,6 +50,7 @@ class InputProcessor:
                  framework: Literal['transformers', 'megatron'] = 'transformers',
                  **kwargs):
         self.device_mesh = device_mesh
+        # right is always used in training, and is fit for megatron
         self.padding_side = kwargs.get('padding_side', 'right')
         self.padding_free = padding_free
         self.framework = framework
@@ -191,7 +192,7 @@ class InputProcessor:
             if cp_size > 1:
                 input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
                 position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=1)
-                attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
+                # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
             inputs['input_ids'] = input_ids
@@ -204,8 +205,8 @@ class InputProcessor:
 
     def add_extra_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
         for _inp in inputs:
-            padding_free = self.padding_free or self._any_packing_free([_inp])
-            if padding_free:
+            padding_free = self.padding_free or self._any_packing([_inp])
+            if padding_free and self.framework == 'megatron':
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
         return inputs
 
@@ -242,7 +243,7 @@ class InputProcessor:
 
     @staticmethod
     def _get_packed_seq_params(position_ids):
-        assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
+        assert position_ids.shape[0] == 1
         position_ids_f = position_ids.flatten()
         indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
 
@@ -266,14 +267,19 @@ class InputProcessor:
         return packed
 
     @staticmethod
-    def _any_packing_free(inputs):
+    def _any_packing(inputs: List[InputFeature]):
         is_padding_free = False
         for _input in inputs:
             position_ids = _input['position_ids']
-            # multiple 0/1, multiple sequences
-            zero_count = torch.sum(position_ids == 0).item()
-            one_count = torch.sum(position_ids == 1).item()
-            is_padding_free = is_padding_free or (zero_count > 1 and one_count > 1)
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            # Each row may contains multiple sequences
+            for i in range(position_ids.shape[0]):
+                _position_ids = position_ids[i]
+                # multiple 0/1, multiple sequences
+                zero_count = torch.sum(_position_ids == 0).item()
+                one_count = torch.sum(_position_ids == 1).item()
+                is_padding_free = is_padding_free or (zero_count > 1 and one_count > 1)
         return is_padding_free
 
     @staticmethod
@@ -312,7 +318,7 @@ class InputProcessor:
 
         result = {}
 
-        padding_free = self.padding_free or InputProcessor._any_packing_free(inputs)
+        padding_free = self.padding_free or self._any_packing(inputs)
         if padding_free:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]

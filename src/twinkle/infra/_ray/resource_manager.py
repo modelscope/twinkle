@@ -2,9 +2,6 @@
 import math
 from typing import Dict, List
 
-import ray
-from ray.util.placement_group import PlacementGroup
-
 from twinkle import DeviceGroup
 from twinkle import Platform
 
@@ -15,6 +12,8 @@ class ResourceManager:
                  nproc_per_node: int,
                  ncpu_proc_per_node: int,
                  groups: List[DeviceGroup]):
+        import ray
+        from ray.util.placement_group import PlacementGroup
         all_ranks = []
         last_rank = -1
         cpu_proc_count = 0
@@ -106,6 +105,7 @@ class ResourceManager:
                 local_device_groups = []
 
                 if gpus_per_worker > 1:
+                    # For vllm, a single process may occupy multiple gpus
                     if len(ranks) % gpus_per_worker != 0:
                         raise ValueError(
                             f"DeviceGroup '{group.name}': number of ranks ({len(ranks)}) "

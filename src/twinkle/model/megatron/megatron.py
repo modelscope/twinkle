@@ -25,7 +25,7 @@ from twinkle import torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
-from twinkle.metric import Metric, LossMetric, Accuracy, TrainMetric
+from twinkle.metric import Metric, LossMetric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -45,7 +45,7 @@ class MegatronOptimizerGroup:
     adapter_config: Any = None
     optimizer: Optimizer = None
     lr_scheduler: LRScheduler = None
-    inputs: Dict[str, Any] = None
+    inputs: List[InputFeature] = None
     outputs: Dict[str, Any] = None
     loss_instance: Loss = None
     loss_value: Any = None
@@ -97,7 +97,7 @@ class MegatronOptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1})
+                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -761,6 +761,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
+    @remote_function(dispatch='all')
     def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
             output_dir = 'output'
@@ -785,7 +786,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         - Saves in PEFT format (adapter_model.safetensors + adapter_config.json)
         """
         # Check if this is LoRA training
-        is_peft_format = isinstance(self.strategy.unwrap_model(self.model)[0], PeftModel)
+        is_peft_format = (adapter_name != _default_adapter_name)
 
         # Create output directory on rank 0 only
         from megatron.core import parallel_state as mpu
@@ -839,7 +840,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer_config = self.optimizer_group[adapter_name]
         template_ins = optimizer_config.template
         if template_ins is not None:
-            template_ins.tokenizer.save_pretrained(output_dir)
+            template_ins.processor.save_pretrained(output_dir)
         else:
             self._default_tokenizer.save_pretrained(output_dir)
 
@@ -892,7 +893,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             tqdm_desc='Weight sync: ',
         )
 
-    def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
+    def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
         assert adapter_name, 'Use a non-empty adapter_name'
         model = self.strategy.unwrap_model(self.model)
@@ -911,7 +912,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                                                       'is_trainable', True))
                 config = _model.peft_config
             else:
-                if not isinstance(config_or_dir, LoraConfig):
+                if isinstance(config_or_dir, dict):
                     config_or_dir = LoraConfig(**config_or_dir)
                 config = config_or_dir
 
@@ -933,6 +934,9 @@ class MegatronModel(TwinkleModel, nn.Module):
                 for m in _model.modules():
                     if isinstance(m, LoraLinear):
                         # just check
+                        # TODO untested code
+                        args = get_args()
+                        from .tuners import LoraParallelLinear
                         assert args.is_multimodal and not isinstance(m, LoraParallelLinear)
                         for p in m.parameters():
                             if p.requires_grad:
@@ -989,7 +993,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         """
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        # Megatron use 4d attention mask
         kwargs['framework'] = 'megatron'
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 

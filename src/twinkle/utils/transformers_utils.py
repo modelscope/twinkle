@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Callable, List, Optional
-import torch.nn as nn
+from typing import Callable, List, Optional, TYPE_CHECKING
 from .utils import deep_getattr
+if TYPE_CHECKING:
+    import torch.nn as nn
+
 
 def find_layers(
     model: nn.Module,
