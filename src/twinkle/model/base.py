@@ -104,7 +104,7 @@ class TwinkleModel(ABC):
     def _try_init_process_group(self):
         import torch
         import torch.distributed as dist
-        if not dist.is_available():
+        if not dist.is_initialized() and Platform.get_world_size() > 1:
             torch_util.set_device()
             backend = Platform.device_backend()
             init_kwargs = {
