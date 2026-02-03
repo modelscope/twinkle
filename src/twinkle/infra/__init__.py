@@ -490,6 +490,16 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     seed = int(os.environ.get('TWINKLE_SEED', _seed))
                     determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
                     framework_util.seed_everything(seed, bool(determinism))
+                    # Ensure torch.distributed is initialized inside Ray workers.
+                    if os.environ.get('WORKER_NAME'):
+                        try:
+                            import torch
+                            import torch.distributed as dist
+                            if dist.is_available() and not dist.is_initialized():
+                                backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+                                dist.init_process_group(backend=backend, init_method='env://')
+                        except Exception:
+                            pass
                     if not device_mesh_name:
                         # pop the device_mesh
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
