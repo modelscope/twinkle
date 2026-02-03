@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     import torch
 
 
-def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
+def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
                                  *,
                                  num_tokens: int,
                                  max_grad_norm: float,

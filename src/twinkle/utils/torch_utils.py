@@ -33,6 +33,7 @@ def pad_sequence_to_length(
     Returns:
         Padded tensor of shape [batch, max_seq_len]
     """
+    import torch.nn.functional as F
     if tensor.shape[-1] >= max_seq_len:
         return tensor
     pad_len = max_seq_len - tensor.shape[-1]

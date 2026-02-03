@@ -32,7 +32,8 @@ class GRPOAdvantage(Advantage):
             Example:
                 >>> rewards = torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
                 >>> advantages = compute_advantages(rewards, num_generations=4)
-            """
+        """
+        import torch
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 

@@ -76,6 +76,7 @@ def get_multimodal_target_regex(
     include_embedding: bool = False,
     exclude_router: bool = False,
 ) -> str:
+    import torch.nn as nn
     model_arch = model.model_meta.model_arch
     modules = []
     if not freeze_llm:

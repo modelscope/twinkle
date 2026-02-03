@@ -4,14 +4,12 @@ from twinkle.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
     from .base import TwinkleModel
-    from .utils import save_checkpoint
     from .transformers import TransformersModel, MultiLoraTransformersModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
 
 else:
     _import_structure = {
         'base': ['TwinkleModel'],
-        'utils': ['save_checkpoint'],
         'transformers': ['TransformersModel', 'MultiLoraTransformersModel'],
         'megatron': ['MegatronModel', 'MultiLoraMegatronModel'],
     }
