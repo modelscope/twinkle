@@ -342,7 +342,7 @@ class Template:
     def batch_decode(self, token_ids: List[List[int]], **kwargs) -> List[str]:
         return [self.processor.decode(_ids, **kwargs) for _ids in token_ids]
 
-    def post_encode(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def post_encode(self, model: 'torch.nn.Module', inputs: Dict[str, Any]) -> Dict[str, Any]:
         """
         Transform inputs for model forward.
 
@@ -367,7 +367,7 @@ class Template:
         result['inputs_embeds'] = inputs_embeds
         return result
 
-    def _get_text_embeddings(self, model: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    def _get_text_embeddings(self, model: 'torch.nn.Module', input_ids: 'torch.Tensor') -> 'torch.Tensor':
         """Get text embeddings from model."""
         embed_fn = None
         if hasattr(model, 'get_input_embeddings'):
@@ -382,7 +382,7 @@ class Template:
 
         return embed_fn(input_ids)
 
-    def _get_vision_embeddings(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def _get_vision_embeddings(self, model: 'torch.nn.Module', inputs: Dict[str, Any]) -> Optional['torch.Tensor']:
         """Get vision embeddings. Override in subclass."""
         return None
 
@@ -392,11 +392,11 @@ class Template:
 
     def _merge_vision_embeddings(
             self,
-            text_embeds: torch.Tensor,
-            vision_embeds: torch.Tensor,
-            input_ids: torch.Tensor,
+            text_embeds: 'torch.Tensor',
+            vision_embeds: 'torch.Tensor',
+            input_ids: 'torch.Tensor',
             inputs: Dict[str, Any]
-    ) -> torch.Tensor:
+    ) -> 'torch.Tensor':
         """Merge vision embeddings at placeholder positions."""
         vision_token_id = self._get_vision_token_id()
         if vision_token_id is None:
@@ -408,6 +408,6 @@ class Template:
 
         return text_embeds.masked_scatter(vision_mask, vision_embeds)
 
-    def _get_position_ids(self, inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def _get_position_ids(self, inputs: Dict[str, Any]) -> Optional['torch.Tensor']:
         """Get position_ids. Override for models with special position encoding."""
         return None

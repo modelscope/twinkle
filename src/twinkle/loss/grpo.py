@@ -38,6 +38,7 @@ class GRPOLoss(Loss):
         device: 'torch.device'
     ) -> 'torch.Tensor':
         """Extract advantages from trajectory objects."""
+        import torch
         advantages_list = []
         for traj in trajectories:
             if isinstance(traj, dict):
@@ -80,6 +81,7 @@ class GRPOLoss(Loss):
         Returns:
             log_weights: [batch, seq_len] log importance weights
         """
+        import torchs
         log_ratio = per_token_logps - per_token_old_logps
         # Clamp for numerical stability
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
@@ -104,6 +106,7 @@ class GRPOLoss(Loss):
         Returns:
             per_token_loss: [batch, seq_len] loss for each token
         """
+        import torch
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
@@ -162,6 +165,7 @@ class GRPOLoss(Loss):
         Returns:
             loss: Scalar loss value
         """
+        import torch
         labels = inputs.get('labels')
         assert labels is not None, "inputs must contain 'labels'"
         # todo: check data_collator return labels as tensor
@@ -238,6 +242,7 @@ class GRPOLoss(Loss):
         ref_logps: Optional['torch.Tensor'] = None,
     ) -> Dict[str, float]:
         """Compute training metrics."""
+        import torch
         # Ensure labels are shifted for loss_mask
         shift_labels = labels[:, 1:] if labels.shape[1] > per_token_logps.shape[1] else labels
         loss_mask = self._compute_loss_mask(shift_labels)
@@ -294,6 +299,7 @@ class GSPOLoss(GRPOLoss):
         loss_mask: 'torch.Tensor',
     ) -> torch.Tensor:
         """Sequence-level importance sampling: use mean log ratio."""
+        import torch
         log_ratio = per_token_logps - per_token_old_logps
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
         seq_level_log_weights = (
@@ -329,6 +335,7 @@ class SAPOLoss(GRPOLoss):
         per_token_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
         """Soft-gated loss."""
+        import torch
         gate_pos = torch.sigmoid(self.tau_pos * (ratio - 1)) * (4.0 / self.tau_pos)
         gate_neg = torch.sigmoid(self.tau_neg * (ratio - 1)) * (4.0 / self.tau_neg)
         is_positive = advantages > 0

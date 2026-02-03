@@ -1,10 +1,10 @@
 from typing import Any, Union, Mapping, TYPE_CHECKING, List, Optional
 if TYPE_CHECKING:
     import torch
-    import torch.nn.functional as F
 
 def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
+    import torch
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
     elif isinstance(data, (tuple, list)):
@@ -33,6 +33,7 @@ def pad_sequence_to_length(
     Returns:
         Padded tensor of shape [batch, max_seq_len]
     """
+    import torch.nn.functional as F
     if tensor.shape[-1] >= max_seq_len:
         return tensor
     pad_len = max_seq_len - tensor.shape[-1]
@@ -46,7 +47,7 @@ def pad_2d_list_to_tensor(
     max_length: Optional[int] = None,
     pad_value: float = 0.0,
     left_pad: bool = False,
-    dtype: 'torch.dtype' = torch.float32,
+    dtype: 'torch.dtype' = None,
     device: Optional[Union[str, 'torch.device']] = None,
 ) -> 'torch.Tensor':
     """
@@ -63,6 +64,9 @@ def pad_2d_list_to_tensor(
     Returns:
         Padded tensor of shape [batch, max_length]
     """
+    import torch
+    if dtype is None:
+        dtype = torch.float32
     if not data_list:
         return torch.tensor([], dtype=dtype, device=device)
     
@@ -114,6 +118,8 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
+    import torch
+    import torch.nn.functional as F
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
