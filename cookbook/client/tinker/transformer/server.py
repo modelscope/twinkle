@@ -20,12 +20,15 @@ serve.start(http_options=http_options)
 APP_BUILDERS = {
     'main:build_server_app': build_server_app,
     'main:build_model_app': build_model_app,
-    'main:build_sampler_app': build_sampler_app,
+    # 'main:build_sampler_app': build_sampler_app,
 }
 
 for app_config in config.applications:
     print(f"Starting {app_config.name} at {app_config.route_prefix}...")
 
+    if app_config.import_path not in APP_BUILDERS:
+        continue
+    
     builder = APP_BUILDERS[app_config.import_path]
     args = OmegaConf.to_container(app_config.args, resolve=True) if app_config.args else {}
 

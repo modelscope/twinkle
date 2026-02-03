@@ -330,6 +330,8 @@ class TaskQueueMixin:
         """
         request_id = f"req_{uuid.uuid4().hex}"
         
+        print(f"Scheduling task {request_id}")
+        
         # 1. Register PENDING status FIRST (fixes race condition)
         self.state.store_future_status(
             request_id, TaskStatus.PENDING.value, model_id

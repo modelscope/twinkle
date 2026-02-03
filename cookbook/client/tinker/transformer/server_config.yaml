@@ -35,6 +35,9 @@ applications:
         device_type: cuda
         mesh: [0, 1]
         mesh_dim_names: ['dp']
+      queue_config:
+        rps_limit: 0.5
+        tps_limit: 10
     deployments:
       - name: ModelManagement
         autoscaling_config:

@@ -110,5 +110,5 @@ for epoch in range(2):
     save_result = save_future.result()
     print(f"Saved checkpoint for epoch {epoch} to {save_result.path}")
 
-sampling_client = training_client.save_weights_and_get_sampling_client(name='pig-latin-model')
+# sampling_client = training_client.save_weights_and_get_sampling_client(name='pig-latin-model')
  

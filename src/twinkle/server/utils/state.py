@@ -161,25 +161,6 @@ class ServerState:
 
     # ----- Future Management -----
 
-    def store_future(self, request_id: str, result: Any,
-                     model_id: Optional[str]):
-        """
-        Store the result of an async operation.
-        
-        Args:
-            request_id: Unique identifier for the request
-            result: The result to store
-            model_id: Optional associated model_id
-        """
-        if hasattr(result, 'model_dump'):
-            result = result.model_dump()
-        self.futures[request_id] = {
-            'status': 'completed',
-            'result': result,
-            'model_id': model_id,
-            'created_at': datetime.now().isoformat(),
-        }
-
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored future result."""
         return self.futures.get(request_id)
@@ -497,11 +478,6 @@ class ServerStateProxy:
         return ray.get(self._actor.get_sampling_session.remote(sampling_session_id))
 
     # ----- Future Management -----
-
-    async def store_future(self, request_id: str, result: Any,
-                           model_id: Optional[str]):
-        """Store future result asynchronously."""
-        await self._actor.store_future.remote(request_id, result, model_id)
 
     def get_future(self, request_id: str) -> Optional[Dict[str, Any]]:
         return ray.get(self._actor.get_future.remote(request_id))
