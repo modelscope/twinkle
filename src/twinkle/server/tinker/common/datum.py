@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import numpy as np
 from twinkle.data_format.input_feature import InputFeature
-
-if TYPE_CHECKING:
-    from tinker import types
+from tinker import types
     
 def datum_to_input_feature(datum: types.Datum) -> InputFeature:
     """Convert a Datum to a dictionary of input features for model inference."""
@@ -27,3 +24,57 @@ def datum_to_input_feature(datum: types.Datum) -> InputFeature:
         input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
 
     return input_feature
+
+
+def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
+    """Convert an input feature dictionary to a Datum object.
+
+    This assumes a single sequence in ``input_ids``. ``labels`` values of
+    ``-100`` are treated as masked positions and will be encoded with
+    zero weights so that converting back via ``datum_to_input_feature``
+    reproduces the same labels.
+    """
+
+    # 1. Build ModelInput from input_ids
+    input_ids = input_feature["input_ids"]
+    if isinstance(input_ids, np.ndarray):
+        tokens = input_ids.astype(np.int64).flatten().tolist()
+    elif isinstance(input_ids, list):
+        # If it's a batched shape [B, T], take the first sequence by
+        # convention; otherwise treat it as a flat token list.
+        if input_ids and isinstance(input_ids[0], list):
+            tokens = [int(t) for t in input_ids[0]]
+        else:
+            tokens = [int(t) for t in input_ids]
+    else:
+        tokens = np.asarray(input_ids, dtype=np.int64).flatten().tolist()
+
+    model_input = types.ModelInput.from_ints(tokens)
+
+    # 2. Build loss_fn_inputs from labels (if present)
+    loss_fn_inputs: types.LossFnInputs = {}
+
+    if "labels" in input_feature and input_feature["labels"] is not None:
+        labels_raw = input_feature["labels"]
+        if isinstance(labels_raw, np.ndarray):
+            labels_arr = labels_raw.astype(np.int64)
+        else:
+            labels_arr = np.asarray(labels_raw, dtype=np.int64)
+
+        labels_arr = labels_arr.reshape(-1)
+
+        # Ensure labels length does not exceed token length to avoid shape
+        # mismatches; if shorter, we leave tokens as-is since extra tokens
+        # will simply not have associated loss.
+        if labels_arr.shape[0] > len(tokens):
+            labels_arr = labels_arr[: len(tokens)]
+
+        # Positions with label == -100 are considered padding/ignored.
+        weights_arr = (labels_arr != -100).astype(np.float32)
+        target_tokens_arr = np.where(labels_arr == -100, 0, labels_arr)
+
+        TensorData = types.TensorData
+        loss_fn_inputs["target_tokens"] = TensorData.from_numpy(target_tokens_arr)
+        loss_fn_inputs["weights"] = TensorData.from_numpy(weights_arr)
+
+    return types.Datum(loss_fn_inputs=loss_fn_inputs, model_input=model_input)

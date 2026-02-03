@@ -21,11 +21,11 @@ applications:
           log_level: DEBUG
 
   - name: models-Qwen2.5-0.5B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-0.5B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
     import_path: main:build_model_app
     args:
       use_megatron: false
-      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"
       nproc_per_node: 2
       device_group:
         name: model

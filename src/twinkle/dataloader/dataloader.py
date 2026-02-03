@@ -52,7 +52,7 @@ class DataLoader:
     def _set_work_init_fn(self):
         num_workers = self.dataloader_params.get('num_workers', 2)
         self.dataloader_params['worker_init_fn'] = partial(
-            DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_rank or 0)
+            DataLoader._seed_worker, num_workers=num_workers, rank=self.device_mesh.data_rank if self.device_mesh else 0)
     
     @remote_function()
     def __len__(self):

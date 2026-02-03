@@ -548,6 +548,11 @@ class Platform(ABC):
             idx = 0
         return platform.get_local_device(idx)
 
+    @staticmethod
+    def device_backend(platform: str = None):
+        platform = Platform.get_platform(platform)
+        return platform.device_backend()
+
 class GPU(Platform):
 
     @staticmethod
@@ -561,6 +566,10 @@ class GPU(Platform):
     @staticmethod
     def get_local_device(idx, **kwargs) -> str:
         return f'cuda:{idx}'
+
+    @staticmethod
+    def device_backend(platform: str = None):
+        return 'nccl'
 
 
 class NPU(Platform):
@@ -578,6 +587,10 @@ class NPU(Platform):
     def get_local_device(idx, **kwargs) -> str:
         return f'npu:{idx}'
 
+    @staticmethod
+    def device_backend(platform: str = None):
+        return 'hccl'
+
 
 class MPS(Platform):
 
@@ -592,6 +605,10 @@ class MPS(Platform):
     @staticmethod
     def get_local_device(idx, **kwargs) -> str:
         return f'mps'
+
+    @staticmethod
+    def device_backend(platform: str = None):
+        return 'gloo'
 
     @lru_cache
     @staticmethod

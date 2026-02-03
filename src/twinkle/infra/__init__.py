@@ -413,7 +413,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
-                if device_mesh_name:
+                if device_mesh_name and _device_group is not None:
                     if device_mesh is None:
                         # Local mode can safely assign the default device mesh
                         device_mesh = _device_mesh
@@ -489,17 +489,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                     framework_util.seed_everything(seed, bool(determinism))
                     # Ensure torch.distributed is initialized inside Ray workers.
                     if os.environ.get('WORKER_NAME'):
-                        # Initialize distributed
-                        import torch
-                        import torch.distributed as dist
-                        if dist.is_available() and not dist.is_initialized():
-                            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-                            dist.init_process_group(backend=backend, init_method='env://')
-                        # This will depress the warnings of megatron
+                        # This will depress the warnings of megatron and reduce overhead
                         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-                        # This will prevent the unlimited threads opened by torch
+                        # This will prevent the unlimited threads started by torch
                         os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-                        # Use parallelism mode
+                        # Use parallelism mode of tokenizers
                         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
                     if not device_mesh_name:
                         # pop the device_mesh

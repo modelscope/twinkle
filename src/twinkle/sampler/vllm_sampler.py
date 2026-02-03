@@ -198,7 +198,7 @@ class VLLMSampler(Sampler):
                     msg['content'] = new_content if new_content else [{'type': 'text', 'text': ''}]
         
         encoded = template.processor.apply_chat_template(
-            conversation=messages,
+            messages,
             tokenize=True,
             return_dict=True,
             add_generation_prompt=True,

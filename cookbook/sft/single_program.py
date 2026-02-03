@@ -3,6 +3,7 @@ os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 from peft import LoraConfig
 import twinkle
+import time
 from tqdm import tqdm
 from twinkle import DeviceMesh, Platform
 from twinkle import get_device_placement, get_logger
@@ -41,14 +42,14 @@ def eval(model):
     return metrics
 
 def train():
-    dataset = PackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
-    dataset.pack_dataset()
+    # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraMegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         r=8,
@@ -87,6 +88,7 @@ def train():
         #        model.save(f'checkpoint-{step}')
         #        loss_metric = float(metrics['loss'])
     model.save(f'last-checkpoint', adapter_name='default')
+    time.sleep(3)
     model.load(f'last-checkpoint', adapter_name='default')
     # model.remove_adapter(adapter_name='default')
 

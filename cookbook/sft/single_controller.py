@@ -10,15 +10,6 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
 from twinkle.model import MultiLoraMegatronModel, MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
-import torch
-torch._dynamo.disable()
-if Platform.get_rank() == 0:
-    import swanlab
-    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-
-    run = swanlab.init(
-        project="megatron-swift",
-    )
 
 
 device_group = [
@@ -36,7 +27,7 @@ logger = get_logger()
 
 
 def eval(model):
-    dataset = PackingDataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500), max_length=256))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500), max_length=256))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
     dataset.encode(batched=True, load_from_cache_file=False)
@@ -77,15 +68,6 @@ def train():
         model.clip_grad_and_step(adapter_name='default')
         if step % 5 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
-            _metrics = {}
-            for key, value in metric.items():
-                try:
-                    value = float(value)
-                    _metrics[key] = value
-                except:
-                    pass
-            if Platform.get_rank() == 0:
-                swanlab.log(_metrics)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         #if step > 0 and (step / 4) % 30 == 0:
         #    metrics = eval(model)

@@ -45,6 +45,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.sp_strategy = None
+        # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
+        self._expert_parallel_config = None
+        self._enable_expert_parallel = False
+        self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)

@@ -118,7 +118,10 @@ class Dataset(TorchDataset):
                 num_proc = kwargs.get('num_proc', 1)
                 ext = os.path.splitext(dataset_id)[1].lstrip('.')
                 file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
-                kwargs = {'split': 'train', 'streaming': streaming, 'num_proc': num_proc}
+                if streaming:
+                    kwargs = {'split': 'train', 'streaming': True}
+                else:
+                    kwargs = {'split': 'train', 'num_proc': num_proc}
                 if file_type == 'csv':
                     kwargs['na_filter'] = False
                 dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)

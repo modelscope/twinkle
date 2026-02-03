@@ -170,6 +170,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                  grad_scaler_config: Dict[str, Any] = None,
                  **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
@@ -258,7 +259,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def _maybe_apply_expert_parallel(self):
         if not self._enable_expert_parallel or self._expert_parallel_applied:
             return
-        self._ensure_dist_initialized_for_ep()
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
         apply_expert_parallel(
@@ -276,47 +276,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             optimizer_group._ensure_dp_group()
             if before is None and optimizer_group._dp_group is not None:
                 optimizer_group._build_metrics()
-
-    @staticmethod
-    def _ensure_dist_initialized_for_ep():
-        if dist.is_initialized():
-            return
-
-        rank = Platform.get_rank()
-        world_size = Platform.get_world_size()
-        if world_size <= 1:
-            raise RuntimeError(
-                "EP+FSDP requires distributed launch with WORLD_SIZE>1 "
-                "and initialized rank env vars."
-            )
-        if rank < 0 or rank >= world_size:
-            raise RuntimeError(
-                f"EP+FSDP requires a valid RANK in [0, {world_size - 1}], got {rank}."
-            )
-
-
-        local_rank = Platform.get_local_rank()
-        if local_rank < 0:
-            local_rank = 0
-        torch_util.set_device(local_rank)
-
-        device_type = Platform.device_prefix()
-        backend = "nccl" if device_type == "cuda" else ("hccl" if device_type == "npu" else "gloo")
-
-        init_kwargs = {
-            "backend": backend,
-            "init_method": "env://",
-            "rank": rank,
-            "world_size": world_size,
-        }
-        if backend in ("nccl", "hccl"):
-            init_kwargs["device_id"] = torch.device(Platform.get_local_device(local_rank))
-
-        try:
-            dist.init_process_group(**init_kwargs)
-        except TypeError:
-            init_kwargs.pop("device_id", None)
-            dist.init_process_group(**init_kwargs)
 
     def _construct_default_optimizer_group(self):
         return OptimizerGroup(

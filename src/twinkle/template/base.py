@@ -84,7 +84,7 @@ class Template:
             ]
         try:
             outputs = self.processor.apply_chat_template(
-                conversation=dummy_inputs,
+                dummy_inputs,
                 return_assistant_tokens_mask=True,
                 return_dict=True,
                 tokenize=True
@@ -241,7 +241,7 @@ class Template:
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory['messages']]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
-        inputs = self.processor.apply_chat_template(conversation=messages, tools=tools, padding=False,
+        inputs = self.processor.apply_chat_template(messages, tools=tools, padding=False,
                                            tokenize=True, return_dict=True,
                                            add_generation_prompt=add_generation_prompt, return_tensors='pt', **kwargs)
         return inputs

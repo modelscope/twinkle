@@ -1041,8 +1041,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        if not dist.is_initialized():
-            dist.init_process_group(backend='nccl', device_id=torch.device(Platform.get_local_device()))
+        self._try_init_process_group()
         args = get_args()
         init_kwargs = {
             'tensor_model_parallel_size': args.tensor_model_parallel_size,
