@@ -348,12 +348,14 @@ class DeviceMesh:
         dp_world_size = self.dp_world_size
         fsdp_world_size = self.fsdp_world_size
         if fsdp_world_size is not None and fsdp_world_size > 1:
-            if dp_world_size is not None:
+            if dp_world_size is not None and dp_world_size > 0:
                 return dp_world_size * fsdp_world_size
             else:
                 return fsdp_world_size
 
         ulysses_size = self.ulysses_size or 1
+        if dp_world_size is None or dp_world_size == 0:
+            return 1
         assert dp_world_size % ulysses_size == 0, f'dp_world_size: {dp_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
         return dp_world_size // ulysses_size
 

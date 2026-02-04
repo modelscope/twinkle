@@ -206,6 +206,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
+                enable_ep=self._enable_expert_parallel,
             )
         else:
             self.strategy = AccelerateStrategy(mixed_precision=self.mixed_precision, ddp_config=self._ddp_config,
