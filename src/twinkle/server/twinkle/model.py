@@ -78,6 +78,15 @@ class SaveRequest(BaseModel):
     class Config:
         extra = "allow"
 
+class UploadToHubRequest(BaseModel):
+    checkpoint_dir: str
+    hub_model_id: str
+    hub_token: Optional[str] = None
+    async_upload: bool = True
+
+    class Config:
+        extra = "allow"
+
 class LoadRequest(BaseModel):
     adapter_name: str
     load_optimizer: bool = False
@@ -380,15 +389,11 @@ def build_model_app(model_id: str,
             )
             
             # Save the model weights
-            self.model.save(
+            checkpoint_dir = self.model.save(
                 name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name, 
-                save_optimizer=body.save_optimizer, 
-                push_to_hub = extra_kwargs.pop('push_to_hub', False),
-                hub_model_id = extra_kwargs.pop('hub_model_id', None),
-                hub_token = extra_kwargs.pop('hub_token', token),
-                async_upload = extra_kwargs.pop('async_upload', True),
+                save_optimizer=body.save_optimizer,
                 **extra_kwargs
             )
             
@@ -399,7 +404,7 @@ def build_model_app(model_id: str,
                 is_sampler=False
             )
             
-            return {'result': twinkle_path}
+            return {'result': twinkle_path, 'checkpoint_dir': checkpoint_dir}
         
         @app.post("/load")
         def load(self, request: Request, body: LoadRequest):
@@ -471,6 +476,62 @@ def build_model_app(model_id: str,
                 )
             
             return {'result': ret}
+
+        @app.post("/upload_to_hub")
+        def upload_to_hub(self, request: Request, body: UploadToHubRequest):
+            """
+            Upload model checkpoint to hub.
+            
+            This endpoint uploads a previously saved checkpoint to a hub repository.
+            
+            Args:
+                request: FastAPI request object (contains token in state)
+                body: UploadToHubRequest with checkpoint_dir, hub_model_id, hub_token, and async_upload
+                
+            Returns:
+                Dict with success status and message
+            """
+            token = request.state.token
+            
+            # Check if body.name is a twinkle:// path or a simple checkpoint name
+            if body.checkpoint_dir.startswith("twinkle://"):
+                # Parse twinkle:// path
+                checkpoint_manager = create_checkpoint_manager(token)
+                parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
+                if not parsed:
+                    raise ValueError(f"Invalid twinkle path format: {body.checkpoint_dir}")
+                                # parsed.checkpoint_id is like "weights/step-8"
+                checkpoint_id = parsed.checkpoint_id
+                
+                # Use the training_run_id from the path as the model_id
+                model_id_to_load = parsed.training_run_id
+
+                # Verify checkpoint exists and user has access
+                checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
+                if not checkpoint:
+                    raise ValueError(
+                        f"Checkpoint not found or access denied: {body.checkpoint_dir}"
+                    )
+                
+                # Get the actual directory path for the specific checkpoint
+                checkpoint_dir = str(checkpoint_manager.get_ckpt_dir(
+                    model_id=model_id_to_load,
+                    checkpoint_id=checkpoint_id
+                ))
+            else:
+                checkpoint_dir = body.checkpoint_dir
+            
+            # Call the model's upload_to_hub method
+            self.model.upload_to_hub(
+                checkpoint_dir=checkpoint_dir,
+                hub_model_id=body.hub_model_id,
+                hub_token=body.hub_token or token,
+                async_upload=body.async_upload
+            )
+            
+            return {
+                'result': body.hub_model_id
+            }
 
         @app.post("/add_adapter_to_model")
         def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):

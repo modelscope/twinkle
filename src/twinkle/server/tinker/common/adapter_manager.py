@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Adapter Lifecycle Manager Mixin for Tinker Server.
+Adapter Lifecycle Manager Mixin for Twinkle Server.
 
 This module provides adapter lifecycle management as a mixin class that can be
 inherited directly by services. It tracks adapter activity and provides interfaces

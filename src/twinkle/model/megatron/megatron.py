@@ -761,16 +761,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
-        push_to_hub = kwargs.get('push_to_hub', False)
-        hub_model_id = kwargs.get('hub_model_id', None)
-        hub_token = kwargs.get('hub_token', None)
-        async_upload = kwargs.get('async_upload', True)
-        if push_to_hub:
-            assert hub_model_id is not None and hub_token is not None
-            if async_upload:
-                HubOperation.async_push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
-            else:
-                HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
+        return checkpoint_dir
 
 
     @remote_function(dispatch='all')

@@ -367,7 +367,7 @@ def build_server_app(
                 return result.model_dump()
             return result
 
-        # --- Training Runs Endpoints ------------------------------------------
+        # --- Restful Endpoints ------------------------------------------
 
         @app.get("/training_runs")
         async def get_training_runs(self, request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:

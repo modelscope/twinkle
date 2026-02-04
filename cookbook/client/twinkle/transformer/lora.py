@@ -18,7 +18,7 @@ client = init_twinkle_client(
 # List all training runs
 runs = client.list_training_runs()
 
-resume_path = 'AlexEz/twinkle-self-cognition'
+resume_path = None
 for run in runs:
     logger.info(run.model_dump_json(indent=2))
     # Get checkpoints for a run
@@ -66,12 +66,16 @@ def train():
         model.zero_grad()
         model.lr_step()
 
-    res = model.save(name=f'step-{step}',
-                    save_optimizer=True,
-                    push_to_hub=False, # whether to push to hub
-                    hub_model_id='AlexEz/twinkle-self-cognition',
-                    async_upload=True)
-    logger.info(f"Saved checkpoint: {res}")
+    twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
+    logger.info(f"Saved checkpoint: {twinkle_path}")
+    
+    hub_model_id = 'AlexEz/twinkle-self-cognition-2'
+    model.upload_to_hub(
+        checkpoint_dir=twinkle_path, 
+        hub_model_id=hub_model_id, 
+        async_upload=False
+    )
+    logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 
 
 if __name__ == '__main__':

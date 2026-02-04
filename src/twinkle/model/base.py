@@ -9,6 +9,7 @@ from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle import torch_util, Platform
+from twinkle.hub import HubOperation
 
 
 class TwinkleModel(ABC):
@@ -100,6 +101,30 @@ class TwinkleModel(ABC):
     @abstractmethod
     def get_train_configs(self, **kwargs):
         ...
+
+    def upload_to_hub(self, checkpoint_dir: str, hub_model_id: str, hub_token: Optional[str] = None, async_upload: bool = True):
+        """Upload model checkpoint to hub.
+        
+        Args:
+            checkpoint_dir: The directory path of the checkpoint to upload.
+            hub_model_id: The hub model id.
+            hub_token: The hub token (optional).
+            async_upload: Whether to use async upload (default: True).
+        """
+        if async_upload:
+            HubOperation.async_push_to_hub(
+                repo_id=hub_model_id,
+                folder_path=checkpoint_dir,
+                token=hub_token,
+                private=True
+            )
+        else:
+            HubOperation.push_to_hub(
+                repo_id=hub_model_id,
+                folder_path=checkpoint_dir,
+                token=hub_token,
+                private=True
+            )
 
     def _try_init_process_group(self):
         import torch

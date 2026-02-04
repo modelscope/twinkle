@@ -360,15 +360,15 @@ class MSHub(HubOperation):
             ignore_patterns = []
         if revision is None or revision == 'main':
             revision = 'master'
-        push_to_hub(
-            repo_id,
-            folder_path,
-            token or cls.ms_token,
-            private,
-            commit_message=commit_message,
-            ignore_file_pattern=ignore_patterns,
-            revision=revision,
-            tag=path_in_repo)
+        return push_to_hub(
+                repo_id,
+                folder_path,
+                token or cls.ms_token,
+                private,
+                commit_message=commit_message,
+                ignore_file_pattern=ignore_patterns,
+                revision=revision,
+                tag=path_in_repo)
 
     @classmethod
     def load_dataset(cls,
