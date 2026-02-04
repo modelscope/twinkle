@@ -41,14 +41,20 @@ class Framework(ABC):
     @staticmethod
     def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):
         import torch
+        import torch.distributed as dist
         output_objects = [object]
         if device_mesh.data_world_size > 1:
-            output_objects = [None for _ in range(device_mesh.data_world_size)]
-            torch.distributed.all_gather_object(output_objects, object, group=process_group)
+            group_size = dist.get_world_size(group=process_group)
+            output_objects = [None for _ in range(group_size)]
+            dist.all_gather_object(output_objects, object, group=process_group)
         _x = []
         for y in output_objects:
-            if y is not None:
+            if y is None:
+                continue
+            if isinstance(y, (list, tuple)):
                 _x.extend(y)
+            else:
+                _x.append(y)
         return _x
 
 
