@@ -21,6 +21,9 @@ class ExpertParallelConfig:
     keep_router_logits: bool = True
     pad_to_max: bool = False
     ignore_shared_experts: bool = False
+    efsdp: bool = False
+    efsdp_shard_dim: int = 1
+    efsdp_mesh_dim: str = "dp"
 
 
 def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: Optional[Dict[str, Any]] = None):
@@ -56,10 +59,32 @@ def _merge_config(config: Optional[Dict[str, Any]]) -> ExpertParallelConfig:
     if not config:
         return cfg
     for key, value in config.items():
+        if key == "efsdp":
+            _apply_efsdp_config(cfg, value)
+            continue
         if not hasattr(cfg, key):
             raise ValueError(f"Unknown expert parallel config: {key}")
         setattr(cfg, key, value)
+    if cfg.efsdp_shard_dim < 0:
+        raise ValueError(f"efsdp shard_dim must be >= 0, got {cfg.efsdp_shard_dim}.")
+    if not isinstance(cfg.efsdp_mesh_dim, str) or not cfg.efsdp_mesh_dim:
+        raise ValueError(f"efsdp mesh_dim must be a non-empty string, got {cfg.efsdp_mesh_dim!r}.")
     return cfg
+
+
+def _apply_efsdp_config(cfg: ExpertParallelConfig, value: Any) -> None:
+    if isinstance(value, dict):
+        unknown_keys = set(value.keys()) - {"enabled", "shard_dim", "mesh_dim"}
+        if unknown_keys:
+            unknown = ", ".join(sorted(unknown_keys))
+            raise ValueError(f"Unknown efsdp config: {unknown}")
+        cfg.efsdp = bool(value.get("enabled", True))
+        if "shard_dim" in value:
+            cfg.efsdp_shard_dim = int(value["shard_dim"])
+        if "mesh_dim" in value:
+            cfg.efsdp_mesh_dim = str(value["mesh_dim"])
+        return
+    cfg.efsdp = bool(value)
 
 
 def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
@@ -90,6 +115,12 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     local_start = ep_rank * experts_per_rank
     local_end = local_start + experts_per_rank
 
+    if cfg.efsdp and isinstance(block.experts, nn.ModuleList):
+        raise NotImplementedError(
+            f"eFSDP does not support ModuleList experts in {block.__class__.__name__}. "
+            "Please use tensorized experts (e.g. gate_up_proj/down_proj)."
+        )
+
     if isinstance(block.experts, nn.ModuleList):
         local_experts = nn.ModuleList(block.experts[local_start:local_end])
         block.experts = local_experts
@@ -105,6 +136,10 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     block._ep_rank = ep_rank
     block._ep_world_size = ep_world_size
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
+    block._ep_efsdp_enabled = cfg.efsdp
+    block._ep_efsdp_shard_dim = cfg.efsdp_shard_dim
+    block._ep_efsdp_mesh_dim = cfg.efsdp_mesh_dim
+    block._ep_expert_param_layout = _build_expert_param_layout(block.experts, cfg)
 
 
 def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:
@@ -325,6 +360,25 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
     experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
     if hasattr(experts, "num_experts"):
         experts.num_experts = end - start
+
+
+def _build_expert_param_layout(experts: nn.Module, cfg: ExpertParallelConfig) -> Dict[str, Dict[str, Any]]:
+    layout: Dict[str, Dict[str, Any]] = {}
+    if isinstance(experts, nn.ModuleList):
+        return layout
+
+    for param_name, param in experts.named_parameters():
+        layout[param_name] = {
+            "efsdp_shard_dim": cfg.efsdp_shard_dim,
+            "ndim": int(param.ndim),
+        }
+
+    # Preserve semantic tags for common tensorized expert formats.
+    if "gate_up_proj" in layout:
+        layout["gate_up_proj"]["kind"] = "gate_up_fused"
+    if "down_proj" in layout:
+        layout["down_proj"]["kind"] = "down_proj"
+    return layout
 
 
 def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> torch.Tensor:

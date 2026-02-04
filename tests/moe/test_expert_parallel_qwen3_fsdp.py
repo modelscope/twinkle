@@ -240,7 +240,7 @@ def _run_worker_ep_fsdp_pretrained(rank: int, world_size: int, port: int, model_
         device_mesh = DeviceMesh(
             device_type="cuda",
             mesh=np.arange(world_size).reshape(2, 2),
-            mesh_dim_names=("fsdp", "ep"),
+            mesh_dim_names=("dp", "ep"),
         )
         ep_group = device_mesh.get_dim_group("ep")
 
@@ -269,11 +269,17 @@ def _run_worker_ep_fsdp_pretrained(rank: int, world_size: int, port: int, model_
                 "router_dtype": "fp32",
                 "all_to_all": "torch",
                 "keep_router_logits": False,
+                "efsdp": {
+                    "enabled": True,
+                    "shard_dim": 1,
+                    "mesh_dim": "dp",
+                },
             },
         )
 
         strategy = NativeFSDPStrategy(device_mesh=device_mesh, mixed_precision="bf16", fsdp_config={})
         model.model, _ = strategy.wrap_model(model.model, optimizer=None)
+        _assert_efsdp_group_and_layout(model.model, device_mesh, expected_shard_dim=1)
 
         ep_router_logits, ep_handles = _capture_router_logits(model.model)
         ep_router_state, ep_state_handles = _capture_router_state(model.model)
@@ -399,6 +405,45 @@ def _run_worker_ep_fsdp_pretrained(rank: int, world_size: int, port: int, model_
                             assert rel.item() <= 1e-3
     finally:
         dist.destroy_process_group()
+
+
+def _maybe_to_dtensor(tensor):
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(tensor, nn.Parameter):
+        tensor = tensor.data
+    if isinstance(tensor, DTensor):
+        return tensor
+    return None
+
+
+def _assert_efsdp_group_and_layout(model: nn.Module, device_mesh: DeviceMesh, expected_shard_dim: int) -> None:
+    expected_ranks = tuple(sorted(device_mesh.get_ranks_in_dim("dp")))
+    blocks = _find_moe_blocks(model)
+    for block in blocks:
+        assert getattr(block, "_ep_efsdp_enabled", False), "eFSDP flag should be enabled on EP-patched blocks."
+        assert getattr(block, "_ep_efsdp_mesh_dim", None) == "dp"
+        assert int(getattr(block, "_ep_efsdp_shard_dim", -1)) == expected_shard_dim
+        assert tuple(getattr(block, "_ep_efsdp_ranks", ())) == expected_ranks
+
+        if isinstance(block.experts, nn.ModuleList):
+            continue
+
+        for name, param in block.experts.named_parameters():
+            dtensor = _maybe_to_dtensor(param)
+            assert dtensor is not None, f"Expert param {name} is not sharded as DTensor."
+            placements = getattr(dtensor, "placements", ())
+            assert placements, f"Expert param {name} has no DTensor placements."
+            shard = placements[0]
+            assert shard.__class__.__name__ == "Shard", (
+                f"Expert param {name} placement should be Shard, got {type(shard).__name__}."
+            )
+            assert int(getattr(shard, "dim", -1)) == expected_shard_dim, (
+                f"Expert param {name} shard dim mismatch: "
+                f"expect {expected_shard_dim}, got {getattr(shard, 'dim', None)}."
+            )
 
 
 class TestExpertParallelFSDPPretrained(unittest.TestCase):
