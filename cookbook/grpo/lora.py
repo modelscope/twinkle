@@ -59,9 +59,9 @@ NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
-GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))  # Aligned with swift: beta=0
+GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 2000))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))  # per_device_train_batch_size=4 in swift
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 8))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
@@ -224,7 +224,6 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
             'user_data': [{'target': target, 'nums': nums}],
         }
     
-    # Same dataset as swift: zouxuhong/Countdown-Tasks-3to4#50000
     dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
     dataset.set_template("Template", model_id=MODEL_ID, max_length=8192)
     dataset.map(countdown_processor)
@@ -381,13 +380,13 @@ class HybridModelSamplerActor:
             self.model.add_adapter_to_model(adapter_name, lora_config, 
                                             gradient_accumulation_steps=gradient_accumulation_steps)
         
-        # Set optimizer - aligned with swift: adamw_torch_fused
+        # Set optimizer
         self.model.set_optimizer('AdamW', lr=learning_rate, adapter_name=adapter_name)
         
         # Set lr scheduler - use LinearLR for simplicity
         self.model.set_lr_scheduler('LinearLR', adapter_name=adapter_name)
         
-        # Set loss - aligned with swift: grpo loss
+        # Set loss
         self.model.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=beta)
         
         # Set processor
@@ -490,7 +489,6 @@ def main():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
     logger.info(get_device_placement())
     
-    # LoRA config - aligned with swift defaults
     lora_config = LoraConfig(
         target_modules="all-linear",
         r=8,
@@ -535,7 +533,6 @@ def main():
     # Metrics
     metrics = TrainingMetrics()
     
-    # Sampling params - aligned with swift
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
@@ -612,7 +609,6 @@ def main():
                        f"acc_mean={sum(accuracy_rewards)/len(accuracy_rewards):.4f}")
         
         # ========== 5. Compute advantages and add to trajectories ==========
-        # Aligned with swift: scale_rewards=group
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group')
         
         # Add advantages to trajectories (GRPOLoss extracts from trajectory['advantages'])

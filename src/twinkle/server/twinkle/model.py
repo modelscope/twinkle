@@ -11,10 +11,6 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-<<<<<<< HEAD
-=======
-from twinkle.model import MultiLoraTransformersModel
->>>>>>> dev
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.utils.validation import verify_request_token
