@@ -118,7 +118,7 @@ class IPCWeightLoader(WeightLoader):
         
         self._zmq_ctx = None
         self._device_uuid = None
-        
+        self.base_sync_done = False
         if self.use_shm:
             logger.warning(
                 "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
@@ -147,7 +147,8 @@ class IPCWeightLoader(WeightLoader):
         
         Args:
             adapter_name: Name of the adapter (for LoRA)
-            peft_config: PEFT config for LoRA mode
+            peft_config: PEFT config for LoRA mode. When provided with base_sync_done=True,
+                        only LoRA weights are synced (assuming base model is already loaded in vLLM).
         """
         import zmq
         
@@ -168,7 +169,7 @@ class IPCWeightLoader(WeightLoader):
         
         # Step 2: Trigger vLLM worker to start receiving (non-blocking)
         # Worker will connect to ZMQ and wait for data
-        receiver_future = self._trigger_receiver(peft_config)
+        receiver_future = self._trigger_receiver(peft_config, base_sync_done=self.base_sync_done)
         
         # Give worker time to connect
         import time
@@ -232,7 +233,7 @@ class IPCWeightLoader(WeightLoader):
                 # Already an iterator/generator
                 return state_dict
     
-    def _trigger_receiver(self, peft_config: Optional[Dict]) -> "concurrent.futures.Future":
+    def _trigger_receiver(self, peft_config: Optional[Dict], base_sync_done: bool = False) -> "concurrent.futures.Future":
         """Trigger vLLM worker to start receiving weights.
         
         This calls the sampler's engine to invoke collective_rpc on all
@@ -241,6 +242,11 @@ class IPCWeightLoader(WeightLoader):
         IMPORTANT: This method triggers the receiver in a non-blocking way.
         The collective_rpc call starts the worker method but doesn't wait for
         it to complete, allowing the sender to start sending data.
+        
+        Args:
+            peft_config: PEFT config for LoRA mode.
+            base_sync_done: If True and peft_config provided, only sync LoRA weights.
+                           If False and peft_config provided, sync base model weights first.
         
         Returns:
             Future that can be awaited after sending weights.
@@ -256,7 +262,11 @@ class IPCWeightLoader(WeightLoader):
             # collective_rpc call - worker will start receiving and wait on ZMQ socket
             return await engine.engine.collective_rpc(
                 "update_weights_from_ipc",
-                kwargs={"peft_config": peft_config, "use_shm": self.use_shm},
+                kwargs={
+                    "peft_config": peft_config, 
+                    "use_shm": self.use_shm,
+                    "base_sync_done": base_sync_done,
+                },
             )
         
         # Schedule the task without waiting for completion
@@ -383,11 +393,14 @@ class IPCWeightLoader(WeightLoader):
         self,
         model: TwinkleModel = None,
         sampler: Sampler = None,
-        adapter_name: str = ''
+        adapter_name: str = '',
+        base_sync_done: Optional[bool] = None,
     ):
         """Callable interface for WeightLoader protocol."""
         if model is not None:
             self.model = model
         if sampler is not None:
             self.sampler = sampler
+        if base_sync_done is not None:
+            self.base_sync_done = base_sync_done
         self.load_weights(adapter_name=adapter_name)

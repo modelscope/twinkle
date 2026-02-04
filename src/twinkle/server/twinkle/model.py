@@ -148,7 +148,6 @@ def build_model_app(model_id: str,
             self.device_mesh = DeviceMesh(**device_mesh)
             if use_megatron:
                 from twinkle.model import MultiLoraMegatronModel
-
                 self.model = MultiLoraMegatronModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,

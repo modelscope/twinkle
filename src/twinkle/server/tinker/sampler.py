@@ -152,7 +152,6 @@ def build_sampler_app(model_id: str,
                     sampling_params = None
                     if body.sampling_params:
                         sampling_params = TwinkleSamplingParams(
-                            num_samples=body.num_samples or 1,
                             max_tokens=body.sampling_params.max_tokens or 256,
                             temperature=body.sampling_params.temperature or 1.0,
                             top_p=body.sampling_params.top_p,
