@@ -24,7 +24,7 @@ from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.utils.logger import get_logger
 
-from .common import TwinkleCompatTransformersModel, TwinkleCompatMegatronModel
+from .common import TwinkleCompatTransformersModel
 from .common.task_queue import TaskQueueMixin, TaskQueueConfig
 from .common.adapter_manager import AdapterManagerMixin
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
@@ -59,6 +59,11 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
+    # adapter_config can be None; expanding with ** would raise TypeError and break Serve init.
+    # Normalize to {} so AdapterManagerMixin uses its default timeout/limits.
+    if adapter_config is None:
+        adapter_config = {}
+
     app = FastAPI()
 
     @app.middleware('http')
@@ -100,6 +105,7 @@ def build_model_app(model_id: str,
             self.use_megatron = use_megatron
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
+                from .common.megatron_model import TwinkleCompatMegatronModel
                 self.model = TwinkleCompatMegatronModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
@@ -191,6 +197,7 @@ def build_model_app(model_id: str,
                 model_id=model_id,
                 token=request.state.token,
             )
+
 
         @app.post('/get_info')
         async def get_info(
@@ -549,8 +556,17 @@ def build_model_app(model_id: str,
                     tinker_path = checkpoint_manager.save(
                         body.model_id, name=checkpoint_name, is_sampler=True)
 
+                    # Create sampling session with resolved model_path/base_model.
+                    payload = body.model_dump()
+                    payload["model_path"] = tinker_path
+                    metadata = self.state.get_model_metadata(body.model_id) or {}
+                    if metadata.get("base_model"):
+                        payload["base_model"] = metadata["base_model"]
+                    sampling_session_id = self.state.create_sampling_session(payload)
+
+                    # Tinker client expects path to be None for ephemeral save.
                     return types.SaveWeightsForSamplerResponseInternal(
-                        path=tinker_path,
+                        path=None,
                         sampling_session_id=sampling_session_id
                     )
                 except Exception:

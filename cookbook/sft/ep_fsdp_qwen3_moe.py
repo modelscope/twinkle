@@ -106,12 +106,15 @@ def train():
     for step, batch in enumerate(dataloader):
         if callable(batch):
             batch = batch()
-        output = model.forward_backward(
+        model.forward_backward(
             inputs=batch, gradient_accumulation_steps=grad_accum_steps)
-        if step % grad_accum_steps == 0:
-            logger.info(
-                f'Current is step {step // grad_accum_steps}, loss: {output()}')
         model.clip_grad_and_step(gradient_accumulation_steps=grad_accum_steps)
+        if step % grad_accum_steps == 0:
+            metric = model.calculate_metric(is_training=True)
+            if callable(metric):
+                metric = metric()
+            logger.info(
+                f'Current is step {step // grad_accum_steps}, metric: {metric}')
         if step % 50 == 0:
             model.save('./output')
 

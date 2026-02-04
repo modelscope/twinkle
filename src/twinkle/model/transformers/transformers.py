@@ -91,6 +91,9 @@ class OptimizerGroup:
             return
         if not dist.is_available() or not dist.is_initialized():
             return
+        if dist.get_world_size() < self._device_mesh.data_world_size:
+            # World size is smaller than the requested dp group; skip to avoid crash.
+            return
         dims = [dim for dim in ('dp', 'fsdp') if self._device_mesh.has_dim(dim)]
         if not dims:
             return

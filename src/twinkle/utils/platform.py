@@ -7,9 +7,8 @@ from abc import ABC
 from dataclasses import dataclass, field
 from itertools import product
 from functools import lru_cache
-from typing import Optional, Dict
-from typing import Type
-from typing import Union, List
+from typing import Any, Dict, List, Optional, Type, Union
+import torch.distributed as dist
 import numpy as np
 
 
@@ -112,7 +111,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp"}
+        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep"}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(
@@ -348,16 +347,16 @@ class DeviceMesh:
         """Consider all dp/fsdp ranks, uses to determine how to distribute the data"""
         dp_world_size = self.dp_world_size
         fsdp_world_size = self.fsdp_world_size
-        if fsdp_world_size is not None and fsdp_world_size > 1:
-            if dp_world_size is not None:
-                return dp_world_size * fsdp_world_size
-            else:
-                return fsdp_world_size
-
         ulysses_size = self.ulysses_size or 1
-        assert dp_world_size % ulysses_size == 0, f'dp_world_size: {dp_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
-        return dp_world_size // ulysses_size
+        if fsdp_world_size is not None and fsdp_world_size > 1:
+            data_world_size = dp_world_size * fsdp_world_size if dp_world_size is not None else fsdp_world_size
+        else:
+            data_world_size = dp_world_size if dp_world_size is not None else 1
 
+        assert data_world_size % ulysses_size == 0, (
+            f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
+        )
+        return data_world_size // ulysses_size
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
         if world_size == 1:
@@ -432,11 +431,21 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
+    visible_devices: Optional[str] = None  # Optional: explicitly set visible devices (e.g., "8,9")
     gpus_per_worker: int = 1
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
 
 class Platform(ABC):
+
+    @staticmethod
+    def _ensure_npu_backend() -> None:
+        try:
+            import torch_npu  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "NPU backend is not available. Please install torch_npu/Ascend PyTorch."
+            ) from exc
 
     @staticmethod
     def visible_device_env() -> str:
@@ -451,9 +460,56 @@ class Platform(ABC):
         return ['GPU', 'NPU', 'MPS']
 
     @staticmethod
+    def resolve_visible_devices(
+        device_type: str,
+        *,
+        explicit: Any = None,
+        env_values: Optional[List[Any]] = None,
+        include_os_env: bool = True,
+    ) -> Optional[str]:
+        def _normalize(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                return ','.join(str(v) for v in value)
+            if isinstance(value, int):
+                return str(value)
+            if isinstance(value, str):
+                return value
+            return None
+
+        if not device_type:
+            return None
+        if device_type.upper() == "CPU":
+            return None
+
+        try:
+            visible_env = Platform.get_platform(device_type.upper()).visible_device_env()
+        except Exception:
+            visible_env = None
+        if not visible_env:
+            return None
+
+        normalized = _normalize(explicit)
+        if normalized:
+            return normalized
+
+        if env_values:
+            for value in env_values:
+                normalized = _normalize(value)
+                if normalized:
+                    return normalized
+
+        if include_os_env:
+            return _normalize(os.environ.get(visible_env))
+
+        return None
+
+    @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
         if platform is None:
             if shutil.which("npu-smi"):
+                Platform._ensure_npu_backend()
                 return NPU
             elif shutil.which("nvidia-smi"):
                 return GPU
@@ -464,6 +520,7 @@ class Platform(ABC):
         elif platform.upper() in ("GPU", "CUDA"):
             return GPU
         elif platform.upper() == "NPU":
+            Platform._ensure_npu_backend()
             return NPU
         elif platform.upper() == "MPS":
             return MPS

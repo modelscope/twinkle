@@ -53,12 +53,12 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
     reduce_device = None
     for grad in grads:
         local_grad = _local_grad(grad)
-        if local_grad.is_cuda:
+        if local_grad.is_cuda or getattr(local_grad, "is_npu", False):
             reduce_device = local_grad.device
             break
     if reduce_device is None:
         backend = dist.get_backend() if dist.is_initialized() else None
-        if backend == "nccl":
+        if backend in ("nccl", "hccl"):
             reduce_device = torch.device(Platform.get_local_device())
         else:
             reduce_device = torch.device("cpu")

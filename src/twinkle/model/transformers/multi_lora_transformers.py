@@ -233,4 +233,3 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
             return super()._get_trainable_parameters(real_adapter_name)
-

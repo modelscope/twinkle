@@ -11,6 +11,10 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+<<<<<<< HEAD
+=======
+from twinkle.model import MultiLoraTransformersModel
+>>>>>>> dev
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.utils.validation import verify_request_token
@@ -23,7 +27,7 @@ from .common.io_utils import (
     create_checkpoint_manager,
 )
 
-# 请求体模型定义
+# Request body model definitions
 class CreateRequest(BaseModel):
     class Config:
         extra = "allow"
@@ -250,6 +254,23 @@ def build_model_app(model_id: str,
                 inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
             ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
+
+        # ---- Fill in the TwinkleModel abstract methods ----
+        #
+        # Explanation:
+        # TwinkleModel (src/twinkle/model/base.py) defines get_state_dict and calculate_metric as abstract methods.
+        # However, the server-side ModelManagement used to only expose most of the training/inference methods via HTTP,
+        # so these abstract methods were never implemented, causing Ray Serve to error during deployment instantiation:
+        #   TypeError: Can't instantiate abstract class ModelManagement with abstract methods ...
+        #
+        # This meant run_server.sh could start the /server endpoint, but the model app never came up.
+        # Here we implement simple pass-throughs so the underlying MultiLoraTransformersModel/TransformersModel handles them.
+
+        def get_state_dict(self, **kwargs):
+            return self.model.get_state_dict(**kwargs)
+
+        def calculate_metric(self, is_training: bool, **kwargs):
+            return self.model.calculate_metric(is_training, **kwargs)
 
         @app.post("/calculate_loss")
         def calculate_loss(self, request: Request, body: AdapterRequest):

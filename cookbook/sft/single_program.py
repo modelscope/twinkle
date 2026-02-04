@@ -22,7 +22,7 @@ if Platform.get_rank() == 0:
     )
 
 
-device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2)
+device_mesh = DeviceMesh.from_sizes()
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
@@ -49,7 +49,7 @@ def train():
     # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = MultiLoraMegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         r=8,
