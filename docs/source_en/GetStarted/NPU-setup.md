@@ -177,7 +177,7 @@ Currently **verified** parallelism strategies on Twinkle NPU:
 - 🚧 To be verified: Theoretically supported but no NPU validation
 - ❌ Not supported: Currently unavailable
 
-### DP + FSDP Example (Verified)
+### DP + FSDP Example
 
 The following example is from `cookbook/sft/lora_npu.py`, verified on actual NPU environment:
 
@@ -235,11 +235,11 @@ Feature support matrix based on actual code verification:
 | FSDP Parallel | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified and working |
 | Ray Distributed | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified and working |
 | TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified and working |
+| VLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified and working |
 | Full Fine-tuning | ✅ | 🚧 | - | Theoretically supported, to be verified |
 | QLoRA | ✅ | ❌ | - | Quantization operators not supported |
 | DPO | ✅ | 🚧 | - | Theoretically supported, to be verified |
 | Megatron TP/PP | ✅ | 🚧 | - | Under adaptation and verification |
-| VLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified and working |
 | Flash Attention | ✅ | ⚠️ | - | Some operators unsupported |
 
 **Legend**:

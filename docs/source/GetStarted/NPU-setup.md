@@ -177,7 +177,7 @@ Twinkle 在 NPU 上目前支持以下**经过验证**的并行策略：
 - 🚧 待验证：理论上支持但暂无 NPU 验证示例
 - ❌ 不支持：当前版本不可用
 
-### DP + FSDP 示例（已验证）
+### DP + FSDP 示例
 
 以下示例来自 `cookbook/sft/lora_npu.py`，在实际 NPU 环境中验证通过：
 
@@ -235,11 +235,11 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 | FSDP 并行 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
 | Ray 分布式 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
 | TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
+| VLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
 | 全量微调 | ✅ | 🚧 | - | 理论支持，待验证 |
 | QLoRA | ✅ | ❌ | - | 量化算子暂不支持 |
 | DPO | ✅ | 🚧 | - | 理论支持，待验证 |
 | Megatron TP/PP | ✅ | 🚧 | - | 待适配和验证 |
-| VLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
 | Flash Attention | ✅ | ⚠️ | - | 部分算子不支持 |
 
 **图例说明**：
