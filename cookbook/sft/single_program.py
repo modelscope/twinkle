@@ -22,7 +22,7 @@ if Platform.get_rank() == 0:
     )
 
 
-device_mesh = DeviceMesh.from_sizes()
+device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
@@ -30,7 +30,7 @@ logger = get_logger()
 
 def eval(model):
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500), max_length=256))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
     dataset.encode(batched=True, load_from_cache_file=False)
     # dataset.pack_dataset()
@@ -43,13 +43,13 @@ def eval(model):
 
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=256)
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', max_length=256)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
     # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = TransformersModel(model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', fsdp_config={'transformer_cls_names_to_wrap':["Qwen3MoeSparseMoeBlock"]})
 
     lora_config = LoraConfig(
         r=8,
@@ -68,7 +68,7 @@ def train():
         model.forward_backward(inputs=batch, adapter_name='default')
         # outputs = model.forward_only(inputs=batch, adapter_name='default')
         model.clip_grad_and_step(adapter_name='default')
-        if step % 5 == 0:
+        if step % 1 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
             _metrics = {}
             for key, value in metric.items():
