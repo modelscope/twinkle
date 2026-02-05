@@ -58,17 +58,22 @@ pip install -e ".[transformers,ray]"
 
 ### 3. 安装 vLLM 和 vLLM-Ascend（可选）
 
-如果需要使用 VLLMSampler 进行高效推理，可以安装 vLLM 和 vLLM-Ascend：
+如果需要使用 VLLMSampler 进行高效推理，可以安装 vLLM 和 vLLM-Ascend。
+
+**安装步骤**（参考 [Swift 文档](https://swift.readthedocs.io/zh-cn/latest/BestPractices/NPU-support.html)）：
 
 ```bash
-# 安装 vLLM
-pip install vllm
+# 第一步：安装 vLLM
+pip install vllm==0.11.0
 
-# 安装 vLLM-Ascend（昇腾适配版本）
-# 请参考官方文档：https://github.com/vllm-project/vllm
+# 第二步：安装 vLLM-Ascend
+pip install vllm-ascend==0.11.0rc3
 ```
 
-**注意**：vLLM-Ascend 的安装可能需要特定的 CANN 版本配套，请参考 vLLM-Ascend 官方文档进行安装。
+**注意事项**：
+- 按照上述顺序安装，忽略可能的依赖冲突提示
+- 安装前确保已激活 CANN 环境：`source /usr/local/Ascend/ascend-toolkit/set_env.sh`
+- 推荐使用的版本为 vLLM 0.11.0 和 vLLM-Ascend 0.11.0rc3
 
 ### 4. 验证安装
 

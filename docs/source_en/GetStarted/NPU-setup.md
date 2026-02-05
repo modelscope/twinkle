@@ -58,17 +58,22 @@ pip install -e ".[transformers,ray]"
 
 ### 3. Install vLLM and vLLM-Ascend (Optional)
 
-If you need to use VLLMSampler for efficient inference, you can install vLLM and vLLM-Ascend:
+If you need to use VLLMSampler for efficient inference, you can install vLLM and vLLM-Ascend.
+
+**Installation Steps** (Reference: [Swift Documentation](https://swift.readthedocs.io/zh-cn/latest/BestPractices/NPU-support.html)):
 
 ```bash
-# Install vLLM
-pip install vllm
+# Step 1: Install vLLM
+pip install vllm==0.11.0
 
-# Install vLLM-Ascend (Ascend adaptation version)
-# Please refer to the official documentation: https://github.com/vllm-project/vllm
+# Step 2: Install vLLM-Ascend
+pip install vllm-ascend==0.11.0rc3
 ```
 
-**Note**: vLLM-Ascend installation may require specific CANN version compatibility. Please refer to the official vLLM-Ascend documentation for installation instructions.
+**Important Notes**:
+- Follow the installation order above and ignore potential dependency conflict warnings
+- Ensure CANN environment is activated before installation: `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
+- Recommended versions are vLLM 0.11.0 and vLLM-Ascend 0.11.0rc3
 
 ### 4. Verify Installation
 
