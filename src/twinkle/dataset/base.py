@@ -162,8 +162,9 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
+        kwargs['batched'] = False # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
-            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
+            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs).filter(lambda x: x is not None, **kwargs) # filter none rows
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
@@ -186,6 +187,7 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
+        kwargs['batched'] = False  # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
             self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
         if len(self.datasets) == 1:

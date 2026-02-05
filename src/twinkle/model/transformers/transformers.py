@@ -28,7 +28,7 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, CrossEntropyLoss
 from twinkle.metric import Metric
-from twinkle.patch import Patch
+from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
@@ -717,9 +717,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler], **kwargs)
         optimizer_config.lr_scheduler = scheduler
 
+    @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
-        patch_ins = construct_class(patch_cls, Patch, twinkle.patch)
-        patch_ins.patch(self.model, **kwargs)
+        apply_patch(self, patch_cls, **kwargs)
 
     def __del__(self):
         HubOperation.wait_for()
