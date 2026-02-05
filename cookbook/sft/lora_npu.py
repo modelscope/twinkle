@@ -48,7 +48,7 @@ twinkle.initialize(
 
 def create_dataset():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://modelscope/competition_math'))
-    dataset.set_template('Qwen3Template', model_id=MODEL_PATH)
+    dataset.set_template('Template', model_id=MODEL_PATH)
     dataset.map('CompetitionMathProcessor')
     dataset.encode(batched=True)
     return dataset
@@ -66,7 +66,7 @@ def train():
     )
 
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
-    model.set_template('Qwen3Template')
+    model.set_template('Template')
     model.set_processor(InputProcessor, padding_side='right')
     model.set_loss(CrossEntropyLoss)
     model.set_optimizer(AdamW, lr=1e-4)

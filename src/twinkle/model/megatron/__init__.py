@@ -5,6 +5,11 @@
 # submodules import this file first, which would crash even if the user only wants the transformers backend.
 # Follow the same LazyModule approach as `twinkle.model`: only import when those symbols are actually accessed.
 from typing import TYPE_CHECKING
+from transformers.utils import is_torch_npu_available
+
+if is_torch_npu_available():
+    # Enable Megatron on Ascend NPU
+    import mindspeed.megatron_adaptor  # F401
 
 from twinkle.utils.import_utils import _LazyModule
 

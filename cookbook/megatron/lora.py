@@ -151,7 +151,8 @@ def train():
 
     for step, batch in enumerate(dataloader):
         output = model.forward_backward(inputs=batch,
-                                        adapter_name=adapter_name)
+                                        adapter_name=adapter_name,
+                                        micro_batch_size=micro_batch_size)
         if step % GAS == 0:
             loss_value = output() if callable(output) else output
             logger.info(f'Step {step // GAS}, loss: {loss_value}')

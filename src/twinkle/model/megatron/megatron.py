@@ -35,7 +35,13 @@ from twinkle.utils import construct_class, exists
 from .args import get_args, set_args, TwinkleMegatronArgs
 from .model import get_megatron_model_meta, GPTBridge
 from twinkle.patch import Patch, apply_patch
+from transformers.utils import is_torch_npu_available
 
+if is_torch_npu_available():
+    # Enable Megatron on Ascend NPU
+    from mindspeed.megatron_adaptor import repatch
+else:
+    repatch = None
 
 @dataclass
 class MegatronOptimizerGroup:
@@ -176,6 +182,12 @@ class MegatronModel(TwinkleModel, nn.Module):
             sequence_parallel=self.strategy.sequence_parallel,
             **ac_kwargs,
         )
+
+        if repatch is not None:
+            from dataclasses import asdict
+            megatron_args = asdict(args)
+            repatch(megatron_args)
+
         set_args(args)
         self._initialized = False
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
@@ -652,7 +664,6 @@ class MegatronModel(TwinkleModel, nn.Module):
             clip_grad=kwargs.get('clip_grad', 1.0),
             bf16=kwargs.get('bf16', True),
             use_distributed_optimizer=use_distributed_optimizer,
-            overlap_param_gather=kwargs.get('overlap_param_gather', False),
             log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
             **kwargs,
         )
@@ -665,6 +676,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
+            use_gloo_process_groups=False if Platform.get_platform().device_prefix() == 'npu' else True
         )
         return optimizer
 
@@ -1060,6 +1072,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             'context_parallel_size': args.context_parallel_size,
             'virtual_pipeline_model_parallel_size': args.virtual_pipeline_model_parallel_size,
             'expert_model_parallel_size': args.expert_model_parallel_size,
+            'create_gloo_process_groups': False if Platform.get_platform().device_prefix() == 'npu' else True,
         }
 
         if args.order:
