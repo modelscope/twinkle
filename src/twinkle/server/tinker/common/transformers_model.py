@@ -89,7 +89,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         Load checkpoint with token-based isolation support.
         
         Args:
-            checkpoint_dir: The twinkle:// path to the checkpoint
+            checkpoint_dir: The twinkle:// path to the checkpoint or hub model ID
             **kwargs: Additional keyword arguments including optional 'token'
         """
         # Extract token from kwargs if provided (for user isolation)
@@ -100,25 +100,15 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         # Create checkpoint manager with the token
         checkpoint_manager = create_checkpoint_manager(token)
         
-        # handle twinkle checkpoint format
-        tinker_path = checkpoint_manager.parse_tinker_path(checkpoint_dir)
-        if not tinker_path:
-            raise ValueError(f"Invalid twinkle checkpoint path: {checkpoint_dir}")
+        # Use resolve_load_path to handle path resolution
+        resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
         
-        # check adapter files with token-based path
-        weight_path = checkpoint_manager.get_ckpt_dir(
-            tinker_path.training_run_id, 
-            tinker_path.checkpoint_id
-        )
-        if not weight_path or not weight_path.exists():
-            raise ValueError(f"Checkpoint not found at {weight_path}")
-        
-        if (weight_path / 'adapter_config.json').exists():
-            return super().load(name=weight_path.name, output_dir=weight_path.parent, **kwargs)
-        elif (weight_path / tinker_path.training_run_id / 'adapter_config.json').exists():
-            return super().load(name=weight_path.name, output_dir=weight_path.parent, **kwargs)
+        if resolved.is_twinkle_path:
+            # Load from twinkle checkpoint
+            return super().load(name=resolved.checkpoint_name, output_dir=str(resolved.checkpoint_dir), **kwargs)
         else:
-            raise ValueError(f"Adapter files not found in {weight_path}")
+            # Load from hub
+            return super().load(name=resolved.checkpoint_name, **kwargs)
 
     @staticmethod
     def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor) -> List[dict]:

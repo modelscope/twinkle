@@ -76,6 +76,23 @@ class BaseParsedCheckpointPath(BaseModel):
     checkpoint_id: str
 
 
+class ResolvedLoadPath(BaseModel):
+    """Result of resolving a load path.
+    
+    Attributes:
+        checkpoint_name: The name of the checkpoint (e.g., 'step-8' or hub model id)
+        checkpoint_dir: The directory containing the checkpoint, or None if loading from hub
+        is_twinkle_path: Whether the path was a twinkle:// path
+        training_run_id: The training run ID (only set for twinkle:// paths)
+        checkpoint_id: The checkpoint ID (only set for twinkle:// paths)
+    """
+    checkpoint_name: str
+    checkpoint_dir: Optional[str] = None
+    is_twinkle_path: bool = False
+    training_run_id: Optional[str] = None
+    checkpoint_id: Optional[str] = None
+
+
 class BaseWeightsInfoResponse(BaseModel):
     """Base model for weights info response."""
     training_run_id: str
@@ -725,3 +742,68 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             return None
         
         return self._create_weights_info(run_info)
+
+    def resolve_load_path(self, path: str, validate_exists: bool = True) -> ResolvedLoadPath:
+        """
+        Resolve a checkpoint load path.
+        
+        This method handles two types of paths:
+        1. twinkle:// paths: Parse, validate permissions, return checkpoint_name and checkpoint_dir
+        2. Hub model IDs: Return the path as checkpoint_name with checkpoint_dir=None
+        
+        Args:
+            path: The path to resolve (either twinkle:// format or hub model ID)
+            validate_exists: Whether to validate that the checkpoint exists (default: True)
+            
+        Returns:
+            ResolvedLoadPath with checkpoint_name and checkpoint_dir
+            
+        Raises:
+            ValueError: If the path format is invalid or checkpoint not found
+        """
+        # Check if path starts with twinkle:// prefix
+        if path.startswith(self.path_prefix):
+            # Parse the twinkle:// path
+            parsed = self.parse_path(path)
+            if not parsed:
+                raise ValueError(f"Invalid {self.path_prefix} path format: {path}")
+            
+            # Extract components
+            training_run_id = parsed.training_run_id
+            checkpoint_id = parsed.checkpoint_id
+            checkpoint_name = checkpoint_id.split('/')[-1]  # Extract name from "weights/step-8"
+            
+            if validate_exists:
+                # Verify checkpoint exists and user has access
+                checkpoint = self.get(training_run_id, checkpoint_id)
+                if not checkpoint:
+                    raise ValueError(
+                        f"Checkpoint not found or access denied: {path}"
+                    )
+            
+            # Get the checkpoint directory
+            checkpoint_dir = str(self.get_ckpt_dir(training_run_id, checkpoint_id))
+            
+            if validate_exists:
+                # Verify the directory exists
+                from pathlib import Path as PathLib
+                if not PathLib(checkpoint_dir).exists():
+                    raise ValueError(f"Checkpoint directory not found: {checkpoint_dir}")
+            
+            return ResolvedLoadPath(
+                checkpoint_name=checkpoint_name,
+                checkpoint_dir=checkpoint_dir,
+                is_twinkle_path=True,
+                training_run_id=training_run_id,
+                checkpoint_id=checkpoint_id
+            )
+        else:
+            # Not a twinkle:// path - treat as hub model ID
+            # Return the path as checkpoint_name with no checkpoint_dir
+            return ResolvedLoadPath(
+                checkpoint_name=path,
+                checkpoint_dir=None,
+                is_twinkle_path=False,
+                training_run_id=None,
+                checkpoint_id=None
+            )

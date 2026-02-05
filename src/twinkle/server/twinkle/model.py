@@ -428,47 +428,24 @@ def build_model_app(model_id: str,
             
             # Extract token for directory isolation
             token = request.state.token
+            checkpoint_manager = create_checkpoint_manager(token)
             
-            # Check if body.name is a twinkle:// path or a simple checkpoint name
-            if body.name.startswith("twinkle://"):
-                # Parse twinkle:// path
-                checkpoint_manager = create_checkpoint_manager(token)
-                parsed = checkpoint_manager.parse_twinkle_path(body.name)
-                if not parsed:
-                    raise ValueError(f"Invalid twinkle path format: {body.name}")
-                
-                # Extract the checkpoint name from the parsed path
-                # parsed.checkpoint_id is like "weights/step-8"
-                checkpoint_id = parsed.checkpoint_id
-                checkpoint_name = parsed.checkpoint_id.split('/')[-1]  # Extract "step-8"
-                
-                # Use the training_run_id from the path as the model_id
-                model_id_to_load = parsed.training_run_id
-
-                # Verify checkpoint exists and user has access
-                checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
-                if not checkpoint:
-                    raise ValueError(
-                        f"Checkpoint not found or access denied: {body.name}"
-                    )
-                
-                # Get the actual directory path
-                output_dir = checkpoint_manager.get_save_dir(
-                    model_id=model_id_to_load,
-                    is_sampler=False
-                )
-                
+            # Use resolve_load_path to handle path resolution
+            resolved = checkpoint_manager.resolve_load_path(body.name)
+            
+            if resolved.is_twinkle_path:
+                # Load from twinkle checkpoint directory
                 ret = self.model.load(
-                    name=checkpoint_name,
-                    output_dir=output_dir,
+                    name=resolved.checkpoint_name,
+                    output_dir=resolved.checkpoint_dir,
                     adapter_name=adapter_name, 
                     load_optimizer=body.load_optimizer, 
                     **extra_kwargs
                 )
             else:
-                # No twinkle checkpoint name provided - load from modelscope
+                # Load from hub (checkpoint_dir is None)
                 ret = self.model.load(
-                    name=body.name,
+                    name=resolved.checkpoint_name,
                     adapter_name=adapter_name, 
                     load_optimizer=body.load_optimizer, 
                     token=token,

@@ -112,7 +112,7 @@ def build_model_app(model_id: str,
                     **kwargs
                 )
             else:
-                from .common import TwinkleCompatTransformersModel
+                from .common.transformers_model import TwinkleCompatTransformersModel
                 self.model = TwinkleCompatTransformersModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
