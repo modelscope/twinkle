@@ -436,13 +436,11 @@ def generate_models():
 import uuid
 from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
-from twinkle.model.base import TwinkleModel
-from transformers import PreTrainedModel, PretrainedConfig
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 
 
-class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
+class MultiLoraTransformersModel:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
     
     This client manages adapters and sends training/inference requests to the model server.
@@ -664,6 +662,27 @@ class MultiLoraTransformersModel(TwinkleModel, PreTrainedModel):
         )
         response.raise_for_status()
         return response.json()['result']
+
+    def upload_to_hub(self, checkpoint_dir: str, hub_model_id: str, hub_token: Optional[str] = None, async_upload: bool = True):
+        """Upload model checkpoint to hub.
+        
+        Args:
+            checkpoint_dir: The directory path of the checkpoint to upload.
+            hub_model_id: The hub model id.
+            hub_token: The hub token (optional).
+            async_upload: Whether to use async upload (default: True).
+        """
+        response = http_post(
+            url=f'{self.server_url}/upload_to_hub',
+            json_data={
+                'checkpoint_dir': checkpoint_dir,
+                'hub_model_id': hub_model_id,
+                'hub_token': hub_token,
+                'async_upload': async_upload
+            }
+        )
+        response.raise_for_status()
+        return response.json()
 '''
 
     # Write the model client file

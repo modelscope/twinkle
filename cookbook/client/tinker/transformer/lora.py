@@ -24,7 +24,7 @@ for tr in response.training_runs:
         # resume_path = chpt.tinker_path  # Just get the last one for demo purposes
     
 #%%
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen2.5-7B-Instruct"
 if not resume_path:
     training_client = service_client.create_lora_training_client(
         base_model=base_model

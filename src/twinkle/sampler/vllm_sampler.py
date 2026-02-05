@@ -274,6 +274,7 @@ class VLLMSampler(Sampler):
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
         *,
         num_samples: int = 1,
     ) -> SampleResponse:
@@ -320,13 +321,6 @@ class VLLMSampler(Sampler):
             ]
         else:
             encoded_inputs = inputs_list
-        
-        # Get adapter URI if using LoRA
-        adapter_uri = None
-        if adapter_name:
-            group = self.sample_group[adapter_name]
-            if group.lora_ready and self.engine.adapter_manager:
-                adapter_uri = self.engine.adapter_manager.get_uri(adapter_name)
         
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
@@ -403,7 +397,7 @@ class VLLMSampler(Sampler):
         self._run_in_loop(self.engine.sleep(level))
     
     @remote_function(dispatch='all', collect='first')
-    def wake_up(self, tags: List[str] = None, reload_weights: bool = True) -> None:
+    def wake_up(self, tags: List[str] = None, reload_weights: bool = False) -> None:
         """Resume GPU memory for colocate mode.
         
         Call this before sampling to reload weights/KV cache into GPU.

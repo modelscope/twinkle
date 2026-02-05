@@ -761,11 +761,17 @@ class MegatronModel(TwinkleModel, nn.Module):
         if dist.is_initialized():
             dist.barrier()
 
+        return checkpoint_dir
+
+
     @remote_function(dispatch='all')
-    def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
-            output_dir = 'output'
-        checkpoint_dir = os.path.join(output_dir, name)
+            # load from hub
+            token = kwargs.pop('token', None)
+            checkpoint_dir = HubOperation.download_model(name, token=token)
+        else:
+            checkpoint_dir = os.path.join(output_dir, name)
         adapter_name = kwargs.get('adapter_name')
         bridge = self._bridge
         for _model in self.strategy.unwrap_model(self.model):

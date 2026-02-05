@@ -167,6 +167,110 @@ class TwinkleWorkerExtension:
         Torch.ipc_collect()
         Torch.empty_cache()
     
+    def _ensure_lora_patch_applied(self):
+        """Ensure VLLMLoraWeights patch is applied for tensor-based LoRA loading."""
+        if getattr(self, '_lora_patch_applied', False):
+            return
+        
+        # Apply patch directly to LRUCacheWorkerLoRAManager._load_adapter
+        # This is a simplified version that doesn't need sampler reference
+        # The full VLLMLoraWeights.patch() needs sampler for tokenizer, but
+        # for _load_adapter patch we only need the core tensor loading logic
+        
+        from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+        try:
+            from vllm.lora.models import LoRAModel
+        except ImportError:
+            from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.utils import get_adapter_absolute_path
+        from vllm.lora.peft_helper import PEFTHelper
+        from twinkle.patch.vllm_lora_weights import TensorLoRARequest
+        
+        def patched_load_adapter(manager: LRUCacheWorkerLoRAManager, lora_request) -> LoRAModel:
+            """Load LoRA adapter, supporting tensor-based loading for TensorLoRARequest."""
+            supported_lora_modules = manager._adapter_manager.supported_lora_modules
+            packed_modules_mapping = manager._adapter_manager.packed_modules_mapping
+            expected_lora_modules: list[str] = []
+            for module in supported_lora_modules:
+                if module in packed_modules_mapping:
+                    expected_lora_modules.extend(packed_modules_mapping[module])
+                else:
+                    expected_lora_modules.append(module)
+            expected_lora_modules = list(set(expected_lora_modules))
+            
+            lora_tensors = None
+            if isinstance(lora_request, TensorLoRARequest):
+                peft_config = lora_request.peft_config
+                lora_tensors = lora_request.lora_tensors
+                peft_helper = PEFTHelper.from_dict(peft_config)
+            else:
+                lora_path = get_adapter_absolute_path(lora_request.lora_path)
+                peft_helper = PEFTHelper.from_local_dir(lora_path, manager.max_position_embeddings)
+            
+            peft_helper.validate_legal(manager.lora_config)
+            model = manager._adapter_manager.model
+            hf_to_vllm_mapper = getattr(model, 'hf_to_vllm_mapper', None)
+            
+            if isinstance(lora_request, TensorLoRARequest):
+                lora = manager._lora_model_cls.from_lora_tensors(
+                    lora_model_id=lora_request.lora_int_id,
+                    tensors=lora_tensors,
+                    peft_helper=peft_helper,
+                    device='cpu',
+                    dtype=manager.lora_config.lora_dtype,
+                    embeddings=None,
+                    target_embedding_padding=manager.vocab_size + manager.lora_config.lora_extra_vocab_size,
+                    embedding_modules=manager.embedding_modules,
+                    embedding_padding_modules=manager.embedding_padding_modules,
+                    weights_mapper=hf_to_vllm_mapper,
+                )
+            else:
+                lora = manager._lora_model_cls.from_local_checkpoint(
+                    lora_path,
+                    expected_lora_modules,
+                    peft_helper=peft_helper,
+                    lora_model_id=lora_request.lora_int_id,
+                    device='cpu',
+                    dtype=manager.lora_config.lora_dtype,
+                    target_embedding_padding=manager.vocab_size + manager.lora_config.lora_extra_vocab_size,
+                    embedding_modules=manager.embedding_modules,
+                    embedding_padding_modules=manager.embedding_padding_modules,
+                    weights_mapper=hf_to_vllm_mapper,
+                )
+            
+            if lora.extra_vocab_size > manager.lora_config.lora_extra_vocab_size:
+                raise ValueError(f'LoRA added vocab size {lora.extra_vocab_size} is greater than '
+                                f'lora_extra_vocab_size {manager.lora_config.lora_extra_vocab_size}.')
+            return lora
+        
+        if not hasattr(LRUCacheWorkerLoRAManager, '_old_load_adapter'):
+            LRUCacheWorkerLoRAManager._old_load_adapter = LRUCacheWorkerLoRAManager._load_adapter
+            LRUCacheWorkerLoRAManager._load_adapter = patched_load_adapter
+        
+        self._lora_patch_applied = True
+        logger.info("LoRA tensor loading patch applied to LRUCacheWorkerLoRAManager")
+    
+    def _convert_peft_to_vllm_lora_name(self, name: str) -> str:
+        """Convert PEFT LoRA weight name to vLLM format.
+        
+        PEFT format: base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
+        vLLM format: base_model.model.layers.0.self_attn.q_proj.lora_A.weight
+        
+        Transformations:
+        1. base_model.model.model.X -> base_model.model.X (remove extra model.)
+        2. lora_A.default.weight -> lora_A.weight (remove .default)
+        """
+        # Remove extra 'model.' prefix if present
+        if name.startswith('base_model.model.model.'):
+            name = 'base_model.model.' + name[len('base_model.model.model.'):]
+        
+        # Remove '.default' from LoRA weight names
+        # e.g., lora_A.default.weight -> lora_A.weight
+        name = name.replace('.lora_A.default.', '.lora_A.')
+        name = name.replace('.lora_B.default.', '.lora_B.')
+        
+        return name
+    
     def _update_weights(
         self,
         weights: List[Tuple[str, torch.Tensor]],
@@ -175,21 +279,44 @@ class TwinkleWorkerExtension:
     ) -> None:
         """Load a batch of weights."""
         if peft_config and base_sync_done:
-            # LoRA mode
+            # LoRA mode - need patch for tensor-based loading
+            self._ensure_lora_patch_applied()
+            
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
             
-            weights_dict = dict(weights)
+            # Convert PEFT weight names to vLLM format
+            converted_weights = {}
+            for name, tensor in weights:
+                vllm_name = self._convert_peft_to_vllm_lora_name(name)
+                converted_weights[vllm_name] = tensor
+            
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
                 lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
-                lora_tensors=weights_dict,
+                lora_tensors=converted_weights,
             )
             self.add_lora(lora_request)
         else:
+            # Strip PEFT prefix from weight names if present
+            # PEFT uses 'base_model.model.model.' prefix while vLLM expects 'model.'
+            # Also filter out LoRA-specific weights (lora_A, lora_B) as they should
+            # be handled separately in LoRA mode
+            converted_weights = []
+            for name, tensor in weights:
+                # Skip LoRA-specific weights for base model sync
+                if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                    continue
+                # Remove PEFT wrapper prefixes
+                if name.startswith('base_model.model.model.'):
+                    name = 'model.' + name[len('base_model.model.model.'):]
+                elif name.startswith('base_model.model.'):
+                    name = name[len('base_model.model.'):]
+                converted_weights.append((name, tensor))
             # TODO: FP8 support
-            self.model_runner.model.load_weights(weights)
+            if converted_weights:
+                self.model_runner.model.load_weights(converted_weights)
     
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for IPC communication."""

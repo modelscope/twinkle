@@ -807,16 +807,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         if kwargs.get('save_optimizer', False):
             self._save_optimizer(checkpoint_dir, adapter_name=adapter_name)
 
-        push_to_hub = kwargs.get('push_to_hub', False)
-        hub_model_id = kwargs.get('hub_model_id', None)
-        hub_token = kwargs.get('hub_token', None)
-        async_upload = kwargs.get('async_upload', True)
-        if push_to_hub:
-            assert hub_model_id is not None and hub_token is not None
-            if async_upload:
-                HubOperation.async_push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
-            else:
-                HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
+        return checkpoint_dir
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -841,7 +832,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 self._default_tokenizer.save_pretrained(output_dir)
 
     @remote_function()
-    def load(self, name: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         """Load model state and optionally optimizer state from a checkpoint.
 
         Args:
@@ -853,12 +844,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         """
         load_optimizer = kwargs.get('load_optimizer', False)
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-        if name is None:
-            name = f'checkpoint-step-{optimizer_config.cur_step}'
+
         if output_dir is None:
-            output_dir = 'output'
-        checkpoint_dir = os.path.join(output_dir, name)
+            # load from hub
+            token = kwargs.pop('token', None)
+            checkpoint_dir = HubOperation.download_model(name, token=token)
+        else:
+            checkpoint_dir = os.path.join(output_dir, name)
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             adapter_weights = load_peft_weights(checkpoint_dir, device="cpu")

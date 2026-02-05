@@ -12,6 +12,7 @@ training and inference. It acts as a routing layer that:
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import asyncio
 import logging
 import os
 
@@ -23,6 +24,7 @@ from tinker import types
 
 from twinkle.server.utils.validation import verify_request_token, get_token_from_request
 from twinkle.server.utils.state import get_server_state
+from twinkle.hub import HubOperation
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 from .common.task_queue import QueueState
 
@@ -303,66 +305,70 @@ def build_server_app(
 
         @app.post("/retrieve_future")
         async def retrieve_future(self, request: Request, body: types.FutureRetrieveRequest) -> Any:
-            """Retrieve the result of an async task.
+            """Retrieve the result of an async task with long polling.
             
-            This endpoint returns tinker-compatible responses:
-            - 200 with {"type": "try_again"}: Task missing or still processing (pending/queued/running)
-            - 200 with {"error": "...", "category": "..."}: Task failed
-            - 200 with result: Task completed successfully
-            
-            Returns:
-                Tinker-compatible response format.
+            Server waits up to 30s for task completion instead of immediately returning try_again.
+            This reduces client polling frequency from ~100 req/s to ~1 req/30s.
             """
-            record = self.state.get_future(body.request_id)
-            if record is None:
-                if os.environ.get("TWINKLE_DEBUG_FUTURES", "0") == "1":
-                    logger.info("retrieve_future miss request_id=%s", body.request_id)
-                # Return a retry hint instead of 404 to avoid client failures during async scheduling.
+            request_id = body.request_id
+            max_wait = float(os.environ.get("TWINKLE_LONG_POLL_TIMEOUT", "30"))
+            poll_interval = float(os.environ.get("TWINKLE_POLL_INTERVAL", "0.5"))
+            start = asyncio.get_event_loop().time()
+            
+            # Long poll: wait for task completion or timeout
+            while True:
+                record = self.state.get_future(request_id)
+                
+                if record is None:
+                    return {"type": "try_again"}
+                
+                status = record.get("status")
+                
+                # Task finished, return immediately
+                if status not in ("pending", "queued", "running", "rate_limited"):
+                    break
+                
+                # Timeout, let client retry
+                if asyncio.get_event_loop().time() - start >= max_wait:
+                    response_data = {"type": "try_again"}
+                    if queue_state := record.get("queue_state"):
+                        response_data["queue_state"] = queue_state
+                    if queue_state_reason := record.get("queue_state_reason"):
+                        response_data["queue_state_reason"] = queue_state_reason
+                    return response_data
+                
+                await asyncio.sleep(poll_interval)
+            
+            # Handle final result
+            record = self.state.get_future(request_id)
+            if not record:
                 return {"type": "try_again"}
             
             status = record.get("status")
             
-            # Task is still being processed - return try_again response
-            if status in ("pending", "queued", "running"):
-                response_data = {"type": "try_again"}
-                
-                # Add queue_state and queue_state_reason if available
-                queue_state = record.get("queue_state")
-                queue_state_reason = record.get("queue_state_reason")
-                if queue_state:
-                    response_data["queue_state"] = queue_state
-                if queue_state_reason:
-                    response_data["queue_state_reason"] = queue_state_reason
-                
-                return response_data
-            
-            # Task was rejected due to rate limiting
             if status == "rate_limited":
-                reason = record.get("reason", "Rate limit exceeded")
-                response_data = {"type": "try_again", "queue_state": QueueState.PAUSED_RATE_LIMIT.value}
-                if reason:
-                    response_data["queue_state_reason"] = reason
-                return response_data
+                return {
+                    "type": "try_again",
+                    "queue_state": QueueState.PAUSED_RATE_LIMIT.value,
+                    "queue_state_reason": record.get("reason", "Rate limit exceeded")
+                }
             
-            # Task failed - return error response
             if status == "failed":
                 result = record.get("result", {})
                 return {
                     "error": result.get("error", "Unknown error"),
                     "category": result.get("category", "Server")
                 }
-
-            # Task completed successfully - return the result
+            
             result = record.get("result")
             if result is None:
                 raise HTTPException(status_code=500, detail="Task completed but no result found")
-            if os.environ.get("TWINKLE_DEBUG_FUTURES", "0") == "1":
-                logger.info("retrieve_future hit request_id=%s", body.request_id)
+            
             if hasattr(result, "model_dump"):
                 return result.model_dump()
             return result
 
-        # --- Training Runs Endpoints ------------------------------------------
+        # --- Restful Endpoints ------------------------------------------
 
         @app.get("/training_runs")
         async def get_training_runs(self, request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
@@ -486,6 +492,82 @@ def build_server_app(
                 raise HTTPException(
                     status_code=404, detail=f"Weights at {tinker_path} not found")
             return response
+
+        @app.post("/training_runs/{run_id}/checkpoints/{checkpoint_id:path}/publish")
+        async def publish_checkpoint(
+            self,
+            request: Request,
+            run_id: str,
+            checkpoint_id: str
+        ) -> Response:
+            """
+            Publish a checkpoint to the hub.
+            
+            This endpoint uploads a checkpoint to a hub repository. The hub_model_id
+            is automatically generated from the checkpoint content and user token.
+            The upload is performed asynchronously by default.
+            
+            Args:
+                request: FastAPI request object (contains token in state)
+                run_id: The training run identifier
+                checkpoint_id: The checkpoint identifier (can include path like weights/checkpoint_name)
+                
+            Returns:
+                Response with 204 No Content status
+                
+            Raises:
+                HTTPException 404 if checkpoint not found or access denied
+            """
+            token = get_token_from_request(request)
+            
+            training_run_manager = create_training_run_manager(token)
+            checkpoint_manager = create_checkpoint_manager(token)
+            
+            # Check ownership and get training run info
+            run = training_run_manager.get(run_id)
+            if not run:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Training run {run_id} not found or access denied"
+                )
+            
+            # Get checkpoint with token-based path
+            checkpoint = checkpoint_manager.get(run_id, checkpoint_id)
+            if not checkpoint:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Checkpoint {checkpoint_id} not found"
+                )
+            
+            # Get the filesystem path for the checkpoint
+            checkpoint_dir = str(checkpoint_manager.get_ckpt_dir(run_id, checkpoint_id))
+            
+            # Generate hub_model_id from checkpoint content and user token
+            # Format: {username}/{run_id}_{checkpoint_name}
+            try:
+                from modelscope.hub.api import HubApi, ModelScopeConfig
+                hub_api = HubApi(token=token)
+                hub_api.login() # Save user info to local
+                username = ModelScopeConfig.get_user_info()[0]
+            except Exception:
+                # Fallback to using sanitized token as username
+                import re
+                username = re.sub(r'[^\w\-]', '_', token)[:20]
+            
+            # Extract checkpoint name from checkpoint_id (e.g., "weights/step-8" -> "step-8")
+            checkpoint_name = checkpoint_id.split('/')[-1]
+            hub_model_id = f"{username}/{run_id}_{checkpoint_name}"
+            
+            # Upload to hub asynchronously with default async_upload=True
+            HubOperation.async_push_to_hub(
+                repo_id=hub_model_id,
+                folder_path=checkpoint_dir,
+                token=token,
+                private=True
+            )
+            
+            # Return 204 No Content (successful with no response body)
+            return Response(status_code=204)
 
     # --- Proxy Endpoints ---------------------------------------------------------
 

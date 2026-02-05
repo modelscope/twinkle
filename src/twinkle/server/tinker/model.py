@@ -523,8 +523,6 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal
             """
-            sampling_session_id = self.state.create_sampling_session(
-                body.model_dump())
 
             async def _do_save_for_sampler():
                 try:
@@ -564,9 +562,8 @@ def build_model_app(model_id: str,
                         payload["base_model"] = metadata["base_model"]
                     sampling_session_id = self.state.create_sampling_session(payload)
 
-                    # Tinker client expects path to be None for ephemeral save.
                     return types.SaveWeightsForSamplerResponseInternal(
-                        path=None,
+                        path=tinker_path,
                         sampling_session_id=sampling_session_id
                     )
                 except Exception:

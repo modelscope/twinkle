@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Adapter Lifecycle Manager Mixin for Tinker Server.
+Adapter Lifecycle Manager Mixin for Twinkle Server.
 
 This module provides adapter lifecycle management as a mixin class that can be
 inherited directly by services. It tracks adapter activity and provides interfaces
@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+if TYPE_CHECKING:
+    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.model import TwinkleModel
+    
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -36,6 +39,10 @@ class AdapterManagerMixin:
         model: Model instance for adapter operations (must be set by inheriting class).
     """
 
+    # Type hint for state attribute that inheriting classes must provide
+    state: 'ServerStateProxy'
+    model: 'TwinkleModel'
+    
     def _init_adapter_manager(self, adapter_timeout: float = 1800.0, per_token_adapter_limit: int = 30) -> None:
         """Initialize the adapter manager.
 
@@ -155,10 +162,9 @@ class AdapterManagerMixin:
         """
         try:
             # Remove adapter from model
-            if hasattr(self, 'model') and self.model:
-                self.model.remove_adapter(adapter_name)
-                logger.info(
-                    f"[AdapterManager] Removed expired adapter {adapter_name} for token {token[:8]}...")
+            self.model.remove_adapter(adapter_name)
+            logger.info(
+                f"[AdapterManager] Removed expired adapter {adapter_name} for token {token[:8]}...")
 
             # Decrement adapter count
             self.check_adapter_limit(token, False)
@@ -309,23 +315,24 @@ class AdapterManagerMixin:
             Tuple of (allowed: bool, reason: Optional[str]).
             If allowed is False, reason contains the explanation.
         """
+        user_key = token + '_' + 'model_adapter'
         with self._adapter_lock:
-            current_count = self._adapter_counts.get(token, 0)
+            current_count = self.state.get_config(user_key) or 0
 
             if add:
                 # Check if adding would exceed limit
                 if current_count >= self._per_token_adapter_limit:
                     return False, f"Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters"
-                # Increment count
-                self._adapter_counts[token] = current_count + 1
+                # Increment count in global state
+                self.state.add_config(user_key, current_count + 1)
                 return True, None
             else:
-                # Decrement count (remove adapter)
+                # Decrement count in global state
                 if current_count > 0:
-                    self._adapter_counts[token] = current_count - 1
-                    # Clean up if count reaches zero
-                    if self._adapter_counts[token] == 0:
-                        del self._adapter_counts[token]
+                    current_count -= 1
+                    self.state.add_config(user_key, current_count)
+                if current_count <= 0:
+                    self.state.pop_config(user_key)
                 return True, None
 
     def get_adapter_count(self, token: str) -> int:
@@ -337,5 +344,6 @@ class AdapterManagerMixin:
         Returns:
             Current number of adapters for this token.
         """
+        user_key = token + '_' + 'model_adapter'
         with self._adapter_lock:
-            return self._adapter_counts.get(token, 0)
+            return self.state.get_config(user_key) or 0

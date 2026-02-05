@@ -11,7 +11,6 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model import MultiLoraTransformersModel
 from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.utils.validation import verify_request_token
@@ -24,7 +23,7 @@ from .common.io_utils import (
     create_checkpoint_manager,
 )
 
-# Request body model definitions
+
 class CreateRequest(BaseModel):
     class Config:
         extra = "allow"
@@ -78,10 +77,19 @@ class SaveRequest(BaseModel):
     class Config:
         extra = "allow"
 
+class UploadToHubRequest(BaseModel):
+    checkpoint_dir: str
+    hub_model_id: str
+    hub_token: Optional[str] = None
+    async_upload: bool = True
+
+    class Config:
+        extra = "allow"
+
 class LoadRequest(BaseModel):
     adapter_name: str
     load_optimizer: bool = False
-    name: Optional[str] = None
+    name: str
 
     class Config:
         extra = "allow"
@@ -139,7 +147,7 @@ def build_model_app(model_id: str,
 
     @serve.deployment(name="ModelManagement")
     @serve.ingress(app)
-    class ModelManagement(TwinkleModel):
+    class ModelManagement:
 
         COUNT_DOWN = 60 * 30
 
@@ -148,7 +156,6 @@ def build_model_app(model_id: str,
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             self.device_mesh = DeviceMesh(**device_mesh)
             if use_megatron:
-                from twinkle.model import MultiLoraMegatronModel
                 self.model = MultiLoraMegatronModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
@@ -156,6 +163,7 @@ def build_model_app(model_id: str,
                     **kwargs
                 )
             else:
+                from twinkle.model import MultiLoraTransformersModel
                 self.model = MultiLoraTransformersModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
@@ -250,23 +258,6 @@ def build_model_app(model_id: str,
                 inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
             ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
-
-        # ---- Fill in the TwinkleModel abstract methods ----
-        #
-        # Explanation:
-        # TwinkleModel (src/twinkle/model/base.py) defines get_state_dict and calculate_metric as abstract methods.
-        # However, the server-side ModelManagement used to only expose most of the training/inference methods via HTTP,
-        # so these abstract methods were never implemented, causing Ray Serve to error during deployment instantiation:
-        #   TypeError: Can't instantiate abstract class ModelManagement with abstract methods ...
-        #
-        # This meant run_server.sh could start the /server endpoint, but the model app never came up.
-        # Here we implement simple pass-throughs so the underlying MultiLoraTransformersModel/TransformersModel handles them.
-
-        def get_state_dict(self, **kwargs):
-            return self.model.get_state_dict(**kwargs)
-
-        def calculate_metric(self, is_training: bool, **kwargs):
-            return self.model.calculate_metric(is_training, **kwargs)
 
         @app.post("/calculate_loss")
         def calculate_loss(self, request: Request, body: AdapterRequest):
@@ -398,22 +389,22 @@ def build_model_app(model_id: str,
             )
             
             # Save the model weights
-            self.model.save(
+            checkpoint_dir = self.model.save(
                 name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name, 
-                save_optimizer=body.save_optimizer, 
+                save_optimizer=body.save_optimizer,
                 **extra_kwargs
             )
             
             # Save checkpoint metadata
             twinkle_path = checkpoint_manager.save(
-                adapter_name,
+                model_id=adapter_name,
                 name=checkpoint_name,
                 is_sampler=False
             )
             
-            return {'result': twinkle_path}
+            return {'result': twinkle_path, 'checkpoint_dir': checkpoint_dir}
         
         @app.post("/load")
         def load(self, request: Request, body: LoadRequest):
@@ -437,30 +428,23 @@ def build_model_app(model_id: str,
             
             # Extract token for directory isolation
             token = request.state.token
-            checkpoint_manager = create_checkpoint_manager(token)
             
-            # Construct the checkpoint path and validate access
-            if body.name:
-                # Check if body.name is a twinkle:// path or a simple checkpoint name
-                if body.name.startswith("twinkle://"):
-                    # Parse twinkle:// path
-                    parsed = checkpoint_manager.parse_twinkle_path(body.name)
-                    if not parsed:
-                        raise ValueError(f"Invalid twinkle path format: {body.name}")
-                    
-                    # Extract the checkpoint name from the parsed path
-                    # parsed.checkpoint_id is like "weights/step-8"
-                    checkpoint_id = parsed.checkpoint_id
-                    checkpoint_name = parsed.checkpoint_id.split('/')[-1]  # Extract "step-8"
-                    
-                    # Use the training_run_id from the path as the model_id
-                    model_id_to_load = parsed.training_run_id
-                else:
-                    # User provided a simple checkpoint name
-                    checkpoint_id = f"weights/{body.name}"
-                    checkpoint_name = body.name
-                    model_id_to_load = adapter_name
+            # Check if body.name is a twinkle:// path or a simple checkpoint name
+            if body.name.startswith("twinkle://"):
+                # Parse twinkle:// path
+                checkpoint_manager = create_checkpoint_manager(token)
+                parsed = checkpoint_manager.parse_twinkle_path(body.name)
+                if not parsed:
+                    raise ValueError(f"Invalid twinkle path format: {body.name}")
                 
+                # Extract the checkpoint name from the parsed path
+                # parsed.checkpoint_id is like "weights/step-8"
+                checkpoint_id = parsed.checkpoint_id
+                checkpoint_name = parsed.checkpoint_id.split('/')[-1]  # Extract "step-8"
+                
+                # Use the training_run_id from the path as the model_id
+                model_id_to_load = parsed.training_run_id
+
                 # Verify checkpoint exists and user has access
                 checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
                 if not checkpoint:
@@ -482,15 +466,72 @@ def build_model_app(model_id: str,
                     **extra_kwargs
                 )
             else:
-                # No checkpoint name provided - use default behavior
+                # No twinkle checkpoint name provided - load from modelscope
                 ret = self.model.load(
                     name=body.name,
                     adapter_name=adapter_name, 
                     load_optimizer=body.load_optimizer, 
+                    token=token,
                     **extra_kwargs
                 )
             
             return {'result': ret}
+
+        @app.post("/upload_to_hub")
+        def upload_to_hub(self, request: Request, body: UploadToHubRequest):
+            """
+            Upload model checkpoint to hub.
+            
+            This endpoint uploads a previously saved checkpoint to a hub repository.
+            
+            Args:
+                request: FastAPI request object (contains token in state)
+                body: UploadToHubRequest with checkpoint_dir, hub_model_id, hub_token, and async_upload
+                
+            Returns:
+                Dict with success status and message
+            """
+            token = request.state.token
+            
+            # Check if body.name is a twinkle:// path or a simple checkpoint name
+            if body.checkpoint_dir.startswith("twinkle://"):
+                # Parse twinkle:// path
+                checkpoint_manager = create_checkpoint_manager(token)
+                parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
+                if not parsed:
+                    raise ValueError(f"Invalid twinkle path format: {body.checkpoint_dir}")
+                                # parsed.checkpoint_id is like "weights/step-8"
+                checkpoint_id = parsed.checkpoint_id
+                
+                # Use the training_run_id from the path as the model_id
+                model_id_to_load = parsed.training_run_id
+
+                # Verify checkpoint exists and user has access
+                checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
+                if not checkpoint:
+                    raise ValueError(
+                        f"Checkpoint not found or access denied: {body.checkpoint_dir}"
+                    )
+                
+                # Get the actual directory path for the specific checkpoint
+                checkpoint_dir = str(checkpoint_manager.get_ckpt_dir(
+                    model_id=model_id_to_load,
+                    checkpoint_id=checkpoint_id
+                ))
+            else:
+                checkpoint_dir = body.checkpoint_dir
+            
+            # Call the model's upload_to_hub method
+            self.model.upload_to_hub(
+                checkpoint_dir=checkpoint_dir,
+                hub_model_id=body.hub_model_id,
+                hub_token=body.hub_token or token,
+                async_upload=body.async_upload
+            )
+            
+            return {
+                'result': body.hub_model_id
+            }
 
         @app.post("/add_adapter_to_model")
         def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):

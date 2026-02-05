@@ -196,8 +196,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self.multi_adapter.save_context(kwargs.get("adapter_name")):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
-                output_dir = 'output'
-            checkpoint_dir = os.path.join(output_dir, name)
+                # load from hub
+                token = kwargs.pop('token', None)
+                checkpoint_dir = HubOperation.download_model(name, token=token)
+            else:
+                checkpoint_dir = os.path.join(output_dir, name)
             model = self.strategy.unwrap_model(self.model)
             if isinstance(model, PeftModel):
                 # Load to CPU to avoid safetensors device issues in Ray environment

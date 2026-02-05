@@ -30,6 +30,7 @@ import torch
 
 import twinkle
 from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
+from twinkle import remote_class, remote_function
 from twinkle.data_format import Trajectory, Message
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
@@ -44,7 +45,10 @@ from twinkle.template import Template
 from transformers import AutoTokenizer
 from twinkle.hub import HubOperation
 
-import swanlab
+# SwanLab is optional - only used if SWANLAB_API_KEY is set
+USE_SWANLAB = 'SWANLAB_API_KEY' in os.environ
+if USE_SWANLAB:
+    import swanlab
 
 logger = get_logger()
 
@@ -53,11 +57,12 @@ MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
 NUM_GPUS = int(os.environ.get('NUM_GPUS', 4))
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
-LEARNING_RATE = float(os.environ.get('LR', 5e-7))
+LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
-GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.001))
+GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 2000))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
+GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 8))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 
@@ -75,7 +80,8 @@ def profiling_context(name: str):
     start_time = time.perf_counter()
     yield
     duration = time.perf_counter() - start_time
-    swanlab.log({f'profiling/Time taken: GRPOTrainer.{name}': duration})
+    if USE_SWANLAB:
+        swanlab.log({f'profiling/Time taken: GRPOTrainer.{name}': duration})
 
 
 # ========== Metrics ==========
@@ -112,10 +118,11 @@ class TrainingMetrics:
         
         if self.rewards:
             log_dict['train/reward'] = sum(self.rewards) / len(self.rewards)
+            log_dict['train/reward_std'] = torch.tensor(self.rewards).std().item() if len(self.rewards) > 1 else 0.0
         
         if self.format_rewards:
-            log_dict['train/rewards/FormatORM/mean'] = sum(self.format_rewards) / len(self.format_rewards)
-            log_dict['train/rewards/FormatORM/std'] = torch.tensor(self.format_rewards).std().item() if len(self.format_rewards) > 1 else 0.0
+            log_dict['train/rewards/Format/mean'] = sum(self.format_rewards) / len(self.format_rewards)
+            log_dict['train/rewards/Format/std'] = torch.tensor(self.format_rewards).std().item() if len(self.format_rewards) > 1 else 0.0
         
         if self.accuracy_rewards:
             log_dict['train/rewards/CountdownORM/mean'] = sum(self.accuracy_rewards) / len(self.accuracy_rewards)
@@ -123,6 +130,8 @@ class TrainingMetrics:
         
         if self.completion_lengths:
             log_dict['train/completions/mean_length'] = sum(self.completion_lengths) / len(self.completion_lengths)
+            log_dict['train/completions/min_length'] = min(self.completion_lengths)
+            log_dict['train/completions/max_length'] = max(self.completion_lengths)
         
         return log_dict
 
@@ -215,8 +224,8 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
             'user_data': [{'target': target, 'nums': nums}],
         }
     
-    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(5000)))
-    dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
+    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
+    dataset.set_template("Template", model_id=MODEL_ID, max_length=8192)
     dataset.map(countdown_processor)
     return dataset
 
@@ -283,18 +292,193 @@ def wait_result(result):
     return result
 
 
+def log(msg):
+    """Print message with timestamp."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def _collect_sample_responses(results):
+    """Custom collect function to merge multiple SampleResponse objects from DP workers.
+    
+    Args:
+        results: List of SampleResponse from each DP worker.
+        
+    Returns:
+        Merged SampleResponse with all sequences combined.
+    """
+    if not results:
+        return SampleResponse(sequences=[])
+    
+    if len(results) == 1:
+        return results[0]
+    
+    all_sequences = []
+    for resp in results:
+        if resp is not None and hasattr(resp, 'sequences'):
+            all_sequences.extend(resp.sequences)
+    
+    return SampleResponse(sequences=all_sequences)
+
+
+# ========== Hybrid Actor ==========
+@remote_class()
+class HybridModelSamplerActor:
+    """Hybrid actor that fuses training model and sampler in same process.
+    
+    This simulates the Hybrid mode where:
+    - Training model (TransformersModel) holds the real weights
+    - vLLM Sampler starts with dummy/random weights
+    - Weight sync happens via IPCWeightLoader (CUDA IPC + ZMQ)
+    """
+
+    def __init__(
+        self, 
+        model_id: str, 
+        device_mesh: DeviceMesh = None,
+        lora_config = None,
+        adapter_name: str = 'default',
+        learning_rate: float = 1e-5,
+        gradient_accumulation_steps: int = 8,
+        epsilon: float = 0.2,
+        beta: float = 0.0,
+        remote_group: str = None,
+        **kwargs
+    ):
+        import torch
+        rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        log(f"[Rank {rank}] Initializing HybridModelSamplerActor...")
+        
+        self.adapter_name = adapter_name
+        self.model_id = model_id
+        self.lora_config = lora_config  # Store for weight sync
+        
+        # Initialize sampler with real model weights (not dummy)
+        # For LoRA training, vLLM loads base model weights, then we sync LoRA weights
+        self.sampler = VLLMSampler(
+            model_id=model_id,
+            engine_args={
+                'gpu_memory_utilization': 0.4,
+                'max_model_len': 2048,
+                'enforce_eager': True,
+                'enable_sleep_mode': True,
+                # Enable LoRA in vLLM
+                'enable_lora': True,
+                'max_lora_rank': 64,
+            },
+        )
+        self.sampler.set_template(Template, model_id=model_id)
+        log(f"[Rank {rank}] VLLMSampler initialized with real base weights")
+        
+        # Initialize training model with real weights
+        self.model = TransformersModel(model_id=model_id, device_mesh=device_mesh)
+        log(f"[Rank {rank}] TransformersModel initialized with real weights")
+        
+        # Add LoRA adapter
+        if lora_config is not None:
+            self.model.add_adapter_to_model(adapter_name, lora_config, 
+                                            gradient_accumulation_steps=gradient_accumulation_steps)
+        
+        # Set optimizer
+        self.model.set_optimizer('AdamW', lr=learning_rate, adapter_name=adapter_name)
+        
+        # Set lr scheduler - use LinearLR for simplicity
+        self.model.set_lr_scheduler('LinearLR', adapter_name=adapter_name)
+        
+        # Set loss
+        self.model.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=beta)
+        
+        # Set processor
+        self.model.set_processor(InputProcessor, adapter_name=adapter_name)
+        
+        # Set template
+        self.model.set_template('Template', model_id=model_id, adapter_name=adapter_name)
+        
+        log(f"[Rank {rank}] Model configured with LoRA, optimizer, scheduler, loss")
+        
+        # Initialize weight loader for Hybrid mode (CUDA IPC)
+        self.weight_loader = IPCWeightLoader(
+            model=self.model,
+            sampler=self.sampler,
+            bucket_size_mb=512,
+        )
+        log(f"[Rank {rank}] IPCWeightLoader initialized")
+    
+    @remote_function(dispatch='slice_dp', collect=_collect_sample_responses, lazy_collect=False)
+    def sample(self, batch, sampling_params: SamplingParams, num_samples: int = 1):
+        """Sample from the model."""
+        return self.sampler.sample(batch, sampling_params, num_samples=num_samples)
+    
+    @remote_function()
+    def wake_up(self):
+        """Wake up the sampler."""
+        self.sampler.wake_up()
+    
+    @remote_function()
+    def sleep(self):
+        """Put the sampler to sleep."""
+        self.sampler.sleep()
+    
+    @remote_function()
+    def load_weights(self):
+        """Sync LoRA weights from model to sampler.
+        
+        Since vLLM loads base model weights during initialization (not using load_format='dummy'),
+        we only need to sync LoRA weights with base_sync_done=True.
+        """
+        from dataclasses import asdict
+        peft_config = asdict(self.lora_config) if self.lora_config else None
+        # base_sync_done=True: vLLM has base model, only sync LoRA weights
+        self.weight_loader.load_weights(
+            adapter_name=self.adapter_name, 
+            peft_config=peft_config,
+            base_sync_done=True,
+        )
+    
+    @remote_function()
+    def forward_backward(self, inputs, trajectories=None, old_logps=None, **kwargs):
+        """Forward and backward pass."""
+        return self.model.forward_backward(
+            inputs=inputs,
+            adapter_name=self.adapter_name,
+            trajectories=trajectories,
+            old_logps=old_logps,
+            **kwargs,
+        )
+    
+    @remote_function()
+    def clip_grad_and_step(self):
+        """Clip gradients and step optimizer."""
+        return self.model.clip_grad_and_step(adapter_name=self.adapter_name)
+    
+    @remote_function()
+    def get_train_configs(self):
+        """Get training configs."""
+        return self.model.get_train_configs(adapter_name=self.adapter_name)
+    
+    @remote_function()
+    def save(self, path: str):
+        """Save model checkpoint."""
+        self.model.save(path, adapter_name=self.adapter_name)
+
+
 # ========== Main ==========
 def main():
-    # SwanLab setup
-    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-    swanlab.init(project="ms-swift", config={
-        'model_id': MODEL_ID,
-        'num_gpus': NUM_GPUS,
-        'num_generations': NUM_GENERATIONS,
-        'learning_rate': LEARNING_RATE,
-        'grpo_beta': GRPO_BETA,
-        'batch_size': BATCH_SIZE,
-    })
+    # SwanLab setup (optional)
+    if USE_SWANLAB:
+        swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
+        swanlab.init(project="ms-swift", config={
+            'model_id': MODEL_ID,
+            'num_gpus': NUM_GPUS,
+            'num_generations': NUM_GENERATIONS,
+            'learning_rate': LEARNING_RATE,
+            'grpo_beta': GRPO_BETA,
+            'batch_size': BATCH_SIZE,
+            'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
+        })
+    else:
+        logger.info("SWANLAB_API_KEY not set, running without experiment tracking")
     
     # Hybrid mode: model and sampler on same GPUs
     device_groups = [
@@ -304,6 +488,30 @@ def main():
     
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
     logger.info(get_device_placement())
+    
+    lora_config = LoraConfig(
+        target_modules="all-linear",
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.05,
+    )
+    
+    # Create hybrid actor with all configurations
+    hybrid_actor = HybridModelSamplerActor(
+        model_id=MODEL_ID,
+        device_mesh=device_mesh,
+        lora_config=lora_config,
+        adapter_name=ADAPTER_NAME,
+        learning_rate=LEARNING_RATE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        epsilon=GRPO_EPSILON,
+        beta=GRPO_BETA,
+        remote_group='hybrid',
+    )
+    
+    # Log training config
+    train_configs = wait_result(hybrid_actor.get_train_configs())
+    logger.info(f"Training configs: {train_configs}")
     
     # Dataset
     dataset = create_countdown_dataset()
@@ -315,41 +523,9 @@ def main():
         num_workers=0,
     )
     
-    # Actor model
-    actor_model = TransformersModel(
-        model_id=MODEL_ID,
-        device_mesh=device_mesh,
-        remote_group='hybrid',
-    )
-    lora_config = LoraConfig(target_modules="all-linear")
-    actor_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=8)
-    actor_model.set_optimizer('AdamW', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
-    actor_model.set_lr_scheduler('LinearLR', adapter_name=ADAPTER_NAME)
-    actor_model.set_loss('GRPOLoss', adapter_name=ADAPTER_NAME, epsilon=GRPO_EPSILON, beta=GRPO_BETA)
-    actor_model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
-    actor_model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
-    logger.info(actor_model.get_train_configs(adapter_name=ADAPTER_NAME))
-    
-    # Sampler (with sleep mode for hybrid)
-    sampler = VLLMSampler(
-        model_id=MODEL_ID,
-        engine_args={
-            'gpu_memory_utilization': 0.4,
-            'max_model_len': 8192,
-            'enable_sleep_mode': True,
-            'load_format': 'dummy',  # Weights will be synced via IPC
-        },
-        device_mesh=device_mesh,
-        remote_group='hybrid',
-    )
-    sampler.set_template('Template', model_id=MODEL_ID)
-    
     # Tokenizer
     model_path = HubOperation.download_model(MODEL_ID)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    # Weight loader for IPC sync
-    weight_loader = IPCWeightLoader(actor_model, sampler)
     
     # Advantage calculator
     advantage_fn = GRPOAdvantage()
@@ -357,7 +533,6 @@ def main():
     # Metrics
     metrics = TrainingMetrics()
     
-    # Sampling params (num_samples passed to sample() method)
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
@@ -365,6 +540,8 @@ def main():
     )
     
     logger.info(f"Starting training for {MAX_STEPS} steps")
+    logger.info(f"Config: batch_size={BATCH_SIZE}, num_generations={NUM_GENERATIONS}, "
+                f"lr={LEARNING_RATE}, beta={GRPO_BETA}, epsilon={GRPO_EPSILON}")
     step = 0
     
     for batch in dataloader:
@@ -379,21 +556,20 @@ def main():
         
         # ========== 1. Weight Sync (before generation) ==========
         if step % WEIGHT_SYNC_INTERVAL == 0:
-            with profiling_context('_move_model_to_vllm'):
-                weight_loader.load_weights(adapter_name=ADAPTER_NAME)
+            sync_start = time.perf_counter()
+            wait_result(hybrid_actor.load_weights())
+            metrics.weight_sync_time = time.perf_counter() - sync_start
         
         # ========== 2. Generate samples ==========
-        # Pass num_samples to sample() to generate NUM_GENERATIONS completions per prompt
-        with profiling_context('generate'):
-            sampler.wake_up()
-            
-            gen_start = time.perf_counter()
-            sample_response = wait_result(
-                sampler.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
-            )
-            metrics.generate_time = time.perf_counter() - gen_start
-            
-            sampler.sleep()
+        wait_result(hybrid_actor.wake_up())
+        
+        gen_start = time.perf_counter()
+        sample_response = wait_result(
+            hybrid_actor.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
+        )
+        metrics.generate_time = time.perf_counter() - gen_start
+        
+        wait_result(hybrid_actor.sleep())
         
         # ========== 3. Process samples ==========
         samples = process_samples(prompts, sample_response, tokenizer, NUM_GENERATIONS)
@@ -416,6 +592,22 @@ def main():
         metrics.format_rewards = format_rewards
         metrics.accuracy_rewards = accuracy_rewards
         
+        # Debug: print sample completions and rewards for first step
+        if step == 0:
+            logger.info(f"=== Debug: Step {step} sample completions ===")
+            for i, traj in enumerate(trajectories[:3]):  # Print first 3
+                messages = traj.get('messages', [])
+                completion = ""
+                for msg in reversed(messages):
+                    if msg.get('role') == 'assistant':
+                        completion = msg.get('content', '')[:200]  # First 200 chars
+                        break
+                logger.info(f"Sample {i}: format_reward={format_rewards[i]}, acc_reward={accuracy_rewards[i]}")
+                logger.info(f"  Completion: {completion}...")
+            logger.info(f"Total rewards stats: mean={sum(total_rewards)/len(total_rewards):.4f}, "
+                       f"format_mean={sum(format_rewards)/len(format_rewards):.4f}, "
+                       f"acc_mean={sum(accuracy_rewards)/len(accuracy_rewards):.4f}")
+        
         # ========== 5. Compute advantages and add to trajectories ==========
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group')
         
@@ -423,37 +615,38 @@ def main():
         for i, traj in enumerate(trajectories):
             traj['advantages'] = float(advantages[i])
         
+        # Check if all advantages are zero (frac_reward_zero_std indicator)
+        frac_zero_std = 1.0 if all(abs(adv) < 1e-8 for adv in advantages) else 0.0
+        
         # Skip if all advantages are zero
-        if all(abs(adv) < 1e-8 for adv in advantages):
+        if frac_zero_std == 1.0:
             logger.info(f"Step {step}: All advantages are zero, skipping training")
             step += 1
             continue
         
         # ========== 6. Training step ==========
-        # GRPOLoss expects:
-        # - inputs: trajectories (with 'advantages' field)
-        # - old_logps: log probs from sampling policy
-        # - trajectories: passed as kwarg for advantage extraction
-        loss = wait_result(actor_model.forward_backward(
+        loss = wait_result(hybrid_actor.forward_backward(
             inputs=trajectories,
-            adapter_name=ADAPTER_NAME,
-            trajectories=trajectories,  # GRPOLoss extracts advantages from here
-            old_logps=old_logps_list,   # Log probs from sampling
+            trajectories=trajectories,
+            old_logps=old_logps_list,
         ))
         
-        grad_norm = wait_result(actor_model.clip_grad_and_step(adapter_name=ADAPTER_NAME))
+        grad_norm = wait_result(hybrid_actor.clip_grad_and_step())
         
         metrics.loss = float(loss) if loss else 0.0
         metrics.grad_norm = float(grad_norm) if grad_norm else 0.0
         
         # ========== 7. Log metrics ==========
         log_dict = metrics.to_log_dict(step)
-        swanlab.log(log_dict)
+        log_dict['train/frac_reward_zero_std'] = frac_zero_std
+        
+        if USE_SWANLAB:
+            swanlab.log(log_dict)
         
         logger.info(
-            f"Step {step}: loss={metrics.loss:.4f}, grad_norm={metrics.grad_norm:.4f}, "
+            f"Step {step}: loss={metrics.loss:.6f}, grad_norm={metrics.grad_norm:.4f}, "
             f"reward={log_dict.get('train/reward', 0):.4f}, "
-            f"format={log_dict.get('train/rewards/FormatORM/mean', 0):.2f}, "
+            f"format={log_dict.get('train/rewards/Format/mean', 0):.2f}, "
             f"accuracy={log_dict.get('train/rewards/CountdownORM/mean', 0):.2f}, "
             f"completion_len={log_dict.get('train/completions/mean_length', 0):.1f}"
         )
@@ -461,8 +654,9 @@ def main():
         step += 1
     
     logger.info(f"Training completed. Total steps: {step}")
-    actor_model.save('grpo-countdown-checkpoint', adapter_name=ADAPTER_NAME)
-    swanlab.finish()
+    wait_result(hybrid_actor.save('grpo-countdown-checkpoint'))
+    if USE_SWANLAB:
+        swanlab.finish()
 
 
 if __name__ == '__main__':

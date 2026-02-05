@@ -3,10 +3,13 @@
 Patch tinker's internal_client_holder to bypass model_path prefix validation.
 
 This module patches the _create_sampling_session method to allow model_path
-without the 'tinker://' prefix requirement.
+without the 'tinker://' prefix requirement, and patches AsyncTinker.__init__
+to bypass the 'tml-' prefix validation for api_key.
 """
 
 from __future__ import annotations
+import os
+from typing import TYPE_CHECKING, Any, Mapping, Union
 
 _patched = False
 
@@ -29,12 +32,70 @@ async def _create_sampling_session(self, model_path: str | None = None, base_mod
         return result.sampling_session_id
 
 
+def _patched_async_tinker_init(
+    self,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: Union[float, Any, None, Any] = None,
+    max_retries: int = 2,
+    default_headers: Mapping[str, str] | None = None,
+    default_query: Mapping[str, object] | None = None,
+    http_client: Any | None = None,
+    _strict_response_validation: bool = False,
+) -> None:
+    """Patched version of AsyncTinker.__init__ that skips 'tml-' prefix validation."""
+    from tinker._exceptions import TinkerError
+    from tinker._types import NOT_GIVEN
+    
+    # Get api_key from environment if not provided
+    if api_key is None:
+        api_key = os.environ.get("TINKER_API_KEY")
+    if api_key is None:
+        raise TinkerError(
+            "The api_key client option must be set either by passing api_key to the client or by setting the TINKER_API_KEY environment variable"
+        )
+    # REMOVED: api_key 'tml-' prefix validation
+    # Original code:
+    # if not api_key.startswith("tml-"):
+    #     raise TinkerError("The api_key must start with the 'tml-' prefix")
+    
+    self.api_key = api_key
+
+    if base_url is None:
+        base_url = os.environ.get("TINKER_BASE_URL")
+    if base_url is None:
+        base_url = "https://tinker.thinkingmachines.dev/services/tinker-prod"
+
+    # Import the parent class and call its __init__
+    from tinker._base_client import AsyncAPIClient
+    from tinker._version import __version__
+    
+    if timeout is None:
+        timeout = NOT_GIVEN
+    
+    AsyncAPIClient.__init__(
+        self,
+        version=__version__,
+        base_url=base_url,
+        max_retries=max_retries,
+        timeout=timeout,
+        http_client=http_client,
+        custom_headers=default_headers,
+        custom_query=default_query,
+        _strict_response_validation=_strict_response_validation,
+    )
+
+    self._idempotency_header = "X-Idempotency-Key"
+
+
 def patch_tinker():
     """
     Apply patches to tinker library.
     
-    This function patches the InternalClientHolder._create_sampling_session
-    method to bypass the 'tinker://' prefix validation for model_path.
+    This function patches:
+    1. InternalClientHolder._create_sampling_session to bypass 'tinker://' prefix validation
+    2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
     
     This patch is idempotent - calling it multiple times has no additional effect.
     """
@@ -43,8 +104,14 @@ def patch_tinker():
         return
     
     try:
+        # Patch 1: bypass tinker:// prefix validation for model_path
         from tinker.lib.internal_client_holder import InternalClientHolder
         InternalClientHolder._create_sampling_session = _create_sampling_session
+        
+        # Patch 2: bypass tml- prefix validation for api_key
+        from tinker._client import AsyncTinker
+        AsyncTinker.__init__ = _patched_async_tinker_init
+        
         _patched = True
     except ImportError:
         # tinker not installed, skip patching

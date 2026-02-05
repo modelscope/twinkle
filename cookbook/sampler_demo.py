@@ -6,10 +6,11 @@ from twinkle.sampler.types import SamplingParams
 from twinkle.template import Template
 from twinkle.data_format import Trajectory
 
-MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
+MODEL_ID = 'Qwen/Qwen2.5-7B-Instruct'
 VLLM_TP = 2  # Tensor parallelism for vLLM (GPUs per worker)
 VLLM_DP = 2  # Data parallelism (number of workers)
 NUM_GPUS = VLLM_TP * VLLM_DP  # Total GPUs = 8
+URI = "twinkle://tml-EMPTY_TOKEN/20260203_211942-Qwen_Qwen2_5-7B-Instruct-11cdabc7/weights/twinkle-lora-2"
 
 if __name__ == '__main__':
     twinkle.initialize(
@@ -35,14 +36,14 @@ if __name__ == '__main__':
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=MODEL_ID)
-    trajectory = Trajectory(messages=[{'role': 'user', 'content': 'Hello! Tell a joke.'}])
+    trajectory = Trajectory(messages=[{'role': 'system', 'content': 'You are a helpful assistant.'}, {'role': 'user', 'content': 'Who are you?'}])
     
     num_prompts = 4
     num_samples = 2  # Generate 2 completions per prompt
     sampling_params = SamplingParams(max_tokens=128, temperature=1.0)
     
     # Pass num_samples to sample() method (aligned with tinker's API)
-    response = sampler.sample([trajectory] * num_prompts, sampling_params, num_samples=num_samples)
+    response = sampler.sample([trajectory] * num_prompts, sampling_params, adapter_uri=URI, num_samples=num_samples)
     if callable(response):
         response = response()
 

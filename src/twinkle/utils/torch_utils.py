@@ -1,10 +1,10 @@
 from typing import Any, Union, Mapping, TYPE_CHECKING, List, Optional
 if TYPE_CHECKING:
     import torch
-    import torch.nn.functional as F
 
 def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
+    import torch
     if isinstance(data, Mapping):
         return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
     elif isinstance(data, (tuple, list)):
@@ -119,6 +119,7 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
             Gathered log probabilities with the same shape as `index`.
     """
     import torch
+    import torch.nn.functional as F
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption

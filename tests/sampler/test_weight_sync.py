@@ -18,6 +18,10 @@ import time
 # Must set before importing anything
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
+# Model configuration - use a small model for testing
+MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
+WORLD_SIZE = 2
 
 from transformers import AutoTokenizer
 
@@ -29,8 +33,6 @@ from twinkle.data_format import Trajectory
 from twinkle.weight_loader import IPCWeightLoader
 from twinkle.model.transformers import TransformersModel
 
-# Model configuration - use a small model for testing
-MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
 
 # Resolve to local cache
 try:
@@ -161,8 +163,8 @@ class HybridModelSamplerActor:
         }
 
 
-def test_hybrid_weight_sync_4gpu():
-    """Test weight sync in Hybrid mode with 4 GPUs (DP=4, TP=1).
+def test_hybrid_weight_sync():
+    """Test weight sync in Hybrid mode with WORLD_SIZE GPUs (DP=WORLD_SIZE, TP=1).
     
     Each GPU runs one actor with:
     - TransformersModel with real weights
@@ -176,17 +178,17 @@ def test_hybrid_weight_sync_4gpu():
     import twinkle
     
     log("=" * 70)
-    log("TEST: Hybrid Weight Sync (4 GPU, DP=4, TP=1)")
+    log(f"TEST: Hybrid Weight Sync ({WORLD_SIZE} GPU, DP={WORLD_SIZE}, TP=1)")
     log("=" * 70)
     
-    # Initialize with 4 GPUs
+    # Initialize with WORLD_SIZE GPUs
     twinkle.initialize(
         mode='ray',
-        nproc_per_node=4,
+        nproc_per_node=WORLD_SIZE,
         groups=[
             DeviceGroup(
                 name='hybrid', 
-                ranks=[0, 1, 2, 3], 
+                ranks=[i for i in range(WORLD_SIZE)], 
                 device_type='GPU', 
                 gpus_per_worker=1,  # Each worker gets 1 GPU (TP=1)
             ),
@@ -201,11 +203,11 @@ def test_hybrid_weight_sync_4gpu():
         "Hello, my name is",
     ]
 
-    # Create hybrid actor (will spawn 4 instances, one per GPU)
-    log("Creating HybridModelSamplerActor on 4 GPUs...")
+    # Create hybrid actor (will spawn WORLD_SIZE instances, one per GPU)
+    log(f"Creating HybridModelSamplerActor on {WORLD_SIZE} GPUs...")
     actor = HybridModelSamplerActor(
         model_id=MODEL_ID,
-        device_mesh=DeviceMesh.from_sizes(world_size=4, dp_size=4),
+        device_mesh=DeviceMesh.from_sizes(world_size=WORLD_SIZE, dp_size=WORLD_SIZE),
         remote_group='hybrid',
     )
     
@@ -299,19 +301,19 @@ def main():
     log("=" * 70)
     log("TWINKLE WEIGHT SYNC TEST")
     log(f"Model: {MODEL_ID}")
-    log("Configuration: Hybrid mode, 4 GPU, DP=4, TP=1")
+    log(f"Configuration: Hybrid mode, {WORLD_SIZE} GPU, DP={WORLD_SIZE}, TP=1")
     log("=" * 70)
     
     results = []
     
     try:
-        passed = test_hybrid_weight_sync_4gpu()
-        results.append(('hybrid_weight_sync_4gpu', passed))
+        passed = test_hybrid_weight_sync()
+        results.append((f'hybrid_weight_sync_{WORLD_SIZE}gpu', passed))
     except Exception as e:
         log(f"Error in test: {e}")
         import traceback
         traceback.print_exc()
-        results.append(('hybrid_weight_sync_4gpu', False))
+        results.append((f'hybrid_weight_sync_{WORLD_SIZE}gpu', False))
     
     # Summary
     log("\n" + "=" * 70)

@@ -1,6 +1,10 @@
+import dotenv
+dotenv.load_dotenv('.env')
+
+import os
 from peft import LoraConfig
 
-from twinkle import get_device_placement, get_logger
+from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
@@ -9,7 +13,8 @@ from twinkle_client import init_twinkle_client
 
 logger = get_logger()
 
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='tml-xxxx')
+client = init_twinkle_client(
+    base_url='http://127.0.0.1:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 # List all training runs
 runs = client.list_training_runs()
 
@@ -21,21 +26,27 @@ for run in runs:
 
     for checkpoint in checkpoints:
         logger.info(checkpoint.model_dump_json(indent=2))
-        resume_path = checkpoint.twinkle_path
+        # resume_path = checkpoint.twinkle_path
+
+
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
-    dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'twinkle团队'})
+    dataset.set_template(
+        'Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+    dataset.map('SelfCognitionProcessor', init_args={
+                'model_name': 'twinkle模型', 'model_author': 'twinkle团队'})
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = MultiLoraTransformersModel(
+        model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
     lora_config = LoraConfig(
         target_modules='all-linear'
     )
 
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
+    model.add_adapter_to_model(
+        'default', lora_config, gradient_accumulation_steps=2)
     model.set_template('Template')
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('CrossEntropyLoss')
@@ -54,9 +65,17 @@ def train():
         model.step()
         model.zero_grad()
         model.lr_step()
-        if step > 0 and step % 8 == 0:
-            logger.info(f'Saving checkpoint at step {step}')
-            model.save(f'step-{step}', save_optimizer=True)
+
+    twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
+    logger.info(f"Saved checkpoint: {twinkle_path}")
+    
+    hub_model_id = 'AlexEz/twinkle-self-cognition-2'
+    model.upload_to_hub(
+        checkpoint_dir=twinkle_path, 
+        hub_model_id=hub_model_id, 
+        async_upload=False
+    )
+    logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 
 
 if __name__ == '__main__':

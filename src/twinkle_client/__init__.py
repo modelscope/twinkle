@@ -26,8 +26,6 @@ def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[
     if base_url and not base_url.startswith(("http://", "https://")):
         base_url = f"http://{base_url}"
     
-    api_key = api_key or get_api_key()
-    
     default_headers = {
         "X-Ray-Serve-Request-Id": get_request_id(),
         "Twinkle-Authorization": 'Bearer ' + api_key,

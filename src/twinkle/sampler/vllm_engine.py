@@ -1,12 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import hashlib
 import json
 import logging
 import os
-import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -17,10 +14,6 @@ from .types import StopReason, SamplingParams, SampleResponse, SampledSequence
 import inspect
 
 logger = logging.getLogger(__name__)
-
-
-
-
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
     """Get the nearest allowed vLLM LoRA rank."""
@@ -35,131 +28,6 @@ def get_vllm_max_lora_rank(lora_rank: int) -> int:
     except ImportError:
         # Fallback for older vLLM versions
         return lora_rank
-
-@dataclass
-class LoRAAdapter:
-    """Represents a loaded LoRA adapter."""
-    lora_int_id: int
-    lora_name: str
-    lora_path: str
-    peft_config: Dict[str, Any]
-    user_id: str
-    created_at: float
-    
-    def to_lora_request(self):
-        """Convert to vLLM LoRARequest."""
-        from vllm.lora.request import LoRARequest
-        return LoRARequest(
-            lora_name=self.lora_name,
-            lora_int_id=self.lora_int_id,
-            lora_path=self.lora_path,
-        )
-
-
-class LoRAAdapterManager:
-    def __init__(self, model_id: str, max_loras: int = 64):
-        self.model_id = model_id
-        self.max_loras = max_loras
-        
-        # user_id -> LoRAAdapter
-        self._adapters: Dict[str, LoRAAdapter] = {}
-        # lora_int_id -> user_id (for reverse lookup)
-        self._id_to_user: Dict[int, str] = {}
-        # Counter for generating unique lora_int_ids
-        self._next_lora_id = 1
-    
-    def _generate_lora_id(self) -> int:
-        """Generate a unique LoRA int ID."""
-        lora_id = self._next_lora_id
-        self._next_lora_id += 1
-        # Wrap around if needed (vLLM has limits)
-        if self._next_lora_id > 10000:
-            self._next_lora_id = 1
-        return lora_id
-    
-    def get_uri(self, user_id: str, version: Optional[int] = None) -> str:
-        """
-        Generate URI for a user's adapter.
-        
-        Args:
-            user_id: User identifier
-            version: Optional version number. If None, uses current adapter's lora_int_id
-        
-        Returns:
-            URI like: twinkle://{model_id}/lora/{user_id}/{version}
-        """
-        if version is None:
-            adapter = self._adapters.get(user_id)
-            version = adapter.lora_int_id if adapter else 0
-        return f"twinkle://{self.model_id}/lora/{user_id}/{version}"
-    
-    def parse_uri(self, uri: str) -> Optional[str]:
-        """
-        Parse user_id from URI. Returns None if invalid.
-        """
-        prefix = f"twinkle://{self.model_id}/lora/"
-        if uri.startswith(prefix):
-            remainder = uri[len(prefix):]
-            # Handle version suffix: user_id/version or just user_id
-            parts = remainder.split("/")
-            return parts[0] if parts else None
-        return None
-    
-    def get_adapter(self, user_id: str) -> Optional[LoRAAdapter]:
-        """Get adapter for a user."""
-        return self._adapters.get(user_id)
-    
-    def get_adapter_by_uri(self, uri: str) -> Optional[LoRAAdapter]:
-        """Get adapter by URI."""
-        user_id = self.parse_uri(uri)
-        if user_id:
-            return self.get_adapter(user_id)
-        return None
-    
-    def add_adapter(
-        self,
-        user_id: str,
-        peft_config: Dict[str, Any],
-        lora_path: str,
-    ) -> Tuple[LoRAAdapter, Optional[LoRAAdapter]]:
-        """
-        Add or replace adapter for a user.
-        
-        Returns:
-            (new_adapter, old_adapter_to_remove)
-        """
-        old_adapter = self._adapters.get(user_id)
-        
-        # Clean up old adapter tracking
-        if old_adapter:
-            del self._id_to_user[old_adapter.lora_int_id]
-        
-        # Create new adapter
-        lora_id = self._generate_lora_id()
-        new_adapter = LoRAAdapter(
-            lora_int_id=lora_id,
-            lora_name=f"lora_{user_id}_{lora_id}",
-            lora_path=lora_path,
-            peft_config=peft_config,
-            user_id=user_id,
-            created_at=time.time(),
-        )
-        
-        self._adapters[user_id] = new_adapter
-        self._id_to_user[lora_id] = user_id
-        
-        return new_adapter, old_adapter
-    
-    def remove_adapter(self, user_id: str) -> Optional[LoRAAdapter]:
-        """Remove adapter for a user."""
-        adapter = self._adapters.pop(user_id, None)
-        if adapter:
-            self._id_to_user.pop(adapter.lora_int_id, None)
-        return adapter
-    
-    def list_adapters(self) -> List[LoRAAdapter]:
-        """List all adapters."""
-        return list(self._adapters.values())
 
 @remote_class()
 class VLLMEngine(BaseSamplerEngine):
@@ -185,7 +53,7 @@ class VLLMEngine(BaseSamplerEngine):
         gpu_memory_utilization: float = 0.9,
         max_model_len: Optional[int] = None,
         max_num_seqs: int = 256,
-        enable_lora: bool = False,
+        enable_lora: bool = True,
         max_loras: int = 64,
         max_lora_rank: int = 64,
         enable_sleep_mode: bool = False,
@@ -218,12 +86,11 @@ class VLLMEngine(BaseSamplerEngine):
         self.logprobs_mode = logprobs_mode
         self.engine_kwargs = kwargs or {}
         
-        # LoRA adapter manager for multi-tenant mode
-        self.adapter_manager = LoRAAdapterManager(model_id, max_loras) if enable_lora else None
-        
-        # Temp directory for LoRA weights (required by vLLM)
-        self._lora_weights_dir = os.path.join("/tmp/twinkle_lora", hashlib.md5(model_id.encode()).hexdigest())
-        os.makedirs(self._lora_weights_dir, exist_ok=True)
+        # Simple LoRA tracking: user_id -> lora_int_id
+        # Only need to track which users have loaded LoRAs and their IDs
+        self._user_lora_ids: Dict[str, int] = {}
+        self._user_lora_paths: Dict[str, str] = {}
+        self._next_lora_id = 1
         
         # Initialize engine
         self.engine = self._create_engine()
@@ -319,7 +186,7 @@ class VLLMEngine(BaseSamplerEngine):
         *,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
-    ):
+    ) -> SampleResponse:
         """
         Sample completions from the model.
         
@@ -378,15 +245,8 @@ class VLLMEngine(BaseSamplerEngine):
         
         # Build LoRA request if adapter_uri provided
         lora_request = None
-        if adapter_uri and self.adapter_manager:
-            adapter = self.adapter_manager.get_adapter_by_uri(adapter_uri)
-            if adapter:
-                # Check if adapter is loaded in engine
-                loaded_loras = await self.engine.list_loras()
-                if adapter.lora_int_id in loaded_loras:
-                    lora_request = adapter.to_lora_request()
-                else:
-                    logger.warning(f"Adapter {adapter_uri} not loaded in engine, sampling without adapter")
+        if adapter_uri and self.enable_lora:
+            lora_request = await self._get_or_load_lora(adapter_uri)
         
         # Generate
         generator = self.engine.generate(
@@ -471,88 +331,101 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
 
-    @remote_function()
-    async def save_weights_for_sampler(
-        self,
-        user_id: str,
-        weights: Dict[str, torch.Tensor],
-        peft_config: Dict[str, Any],
-        *,
-        ttl_seconds: int = 604800,  # 7 days
-    ) -> str:
+    def _generate_lora_id(self) -> int:
+        """Generate a unique LoRA int ID."""
+        lora_id = self._next_lora_id
+        self._next_lora_id += 1
+        return lora_id
+
+    def _parse_adapter_uri(self, adapter_uri: str) -> tuple:
+        if adapter_uri.startswith('twinkle://'):
+            # Format: twinkle://{user_id}/{relative_path}
+            suffix = adapter_uri[len('twinkle://'):]
+            parts = suffix.split('/', 1)
+            if len(parts) == 2:
+                user_id, relative_path = parts
+                # Hardcoded base path for debug - will be replaced with actual storage logic
+                base_path = "/mnt/nas2/yunlin.myl/twinkle/outputs"
+                lora_path = os.path.join(base_path, user_id, relative_path)
+                return user_id, lora_path
+            else:
+                return 'default', suffix
+        else:
+            # Local path
+            return 'default', adapter_uri
+
+    async def _get_or_load_lora(self, adapter_uri: str):
         """
-        Save weights as a LoRA adapter for sampling (client-server mode).
+        Get or load a LoRA adapter from URI, return LoRARequest for sampling.
         
-        This is aligned with tinker's save_weights_for_sampler API.
-        For multi-tenant scenarios:
-        - Each user identified by user_id
-        - Old adapter for the same user is automatically removed
-        - Returns a URI that can be passed to sample()
+        This method:
+        1. Parses the URI to get user_id and path
+        2. Checks if already loaded for this user
+        3. Loads if needed
+        4. Returns the LoRARequest for vLLM
         
         Args:
-            user_id: Unique identifier for the user/training run.
-            weights: LoRA weight tensors.
-            peft_config: PEFT/LoRA configuration dict.
-            ttl_seconds: Time-to-live for the adapter (not enforced yet).
+            adapter_uri: The adapter URI (twinkle://... or local path)
             
         Returns:
-            URI string: twinkle://{model_id}/lora/{user_id}
+            LoRARequest or None if loading fails
         """
-        if not self.enable_lora or not self.adapter_manager:
-            raise RuntimeError("LoRA not enabled. Set enable_lora=True.")
+        from vllm.lora.request import LoRARequest
         
-        # Save weights to disk (vLLM requires file path)
-        adapter_dir = os.path.join(self._lora_weights_dir, user_id)
-        os.makedirs(adapter_dir, exist_ok=True)
+        user_id, lora_path = self._parse_adapter_uri(adapter_uri)
         
-        # Save adapter weights
-        import safetensors.torch
-        safetensors.torch.save_file(weights, os.path.join(adapter_dir, "adapter_model.safetensors"))
+        # Check if already loaded for this user
+        if user_id in self._user_lora_ids:
+            lora_int_id = self._user_lora_ids[user_id]
+            # Verify it's still loaded in engine
+            loaded_loras = await self.engine.list_loras()
+            if lora_int_id in loaded_loras:
+                if lora_path != self._user_lora_paths[user_id]:
+                    # reload the lora
+                    await self.remove_adapter(user_id)
+                    lora_request = await self._get_or_load_lora(adapter_uri)
+                    return lora_request
+                return LoRARequest(
+                    lora_name=f"lora_{user_id}",
+                    lora_int_id=lora_int_id,
+                    lora_path=lora_path,
+                )
+            else:
+                # Was unloaded, need to reload
+                del self._user_lora_ids[user_id]
         
-        # Save adapter config
-        with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
-            json.dump(peft_config, f)
+        # Load the LoRA adapter
+        if not os.path.exists(lora_path):
+            logger.error(f"LoRA path does not exist: {lora_path}")
+            return None
         
-        # Register adapter (removes old one for same user)
-        new_adapter, old_adapter = self.adapter_manager.add_adapter(
-            user_id=user_id,
-            peft_config=peft_config,
-            lora_path=adapter_dir,
+        config_path = os.path.join(lora_path, "adapter_config.json")
+        if not os.path.exists(config_path):
+            logger.error(f"adapter_config.json not found in {lora_path}")
+            return None
+        
+        # Generate new lora_int_id
+        lora_int_id = self._generate_lora_id()
+        lora_name = f"lora_{user_id}"
+        
+        lora_request = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
         )
         
-        # Remove old adapter from engine if exists
-        if old_adapter:
-            try:
-                loaded_loras = await self.engine.list_loras()
-                if old_adapter.lora_int_id in loaded_loras:
-                    await self.engine.collective_rpc(
-                        method="remove_lora",
-                        args=(old_adapter.lora_int_id,),
-                    )
-                    logger.info(f"Removed old adapter for user {user_id}")
-            except Exception as e:
-                logger.warning(f"Failed to remove old adapter: {e}")
-        
-        # Load new adapter into engine using TensorLoRARequest
-        from twinkle.patch.vllm_lora_weights import TensorLoRARequest
-        
-        lora_request = TensorLoRARequest(
-            lora_name=new_adapter.lora_name,
-            lora_int_id=new_adapter.lora_int_id,
-            lora_path=new_adapter.lora_path,
-            peft_config=peft_config,
-            lora_tensors=weights,
-        )
-        
-        await self.engine.collective_rpc(
-            method="add_lora",
-            args=(lora_request,),
-        )
-        
-        logger.info(f"Loaded LoRA adapter for user {user_id}: {len(weights)} tensors")
-        
-        return self.adapter_manager.get_uri(user_id)
-    
+        try:
+            # Use the proper add_lora API instead of collective_rpc
+            # This ensures LoRARequest is properly serialized/deserialized
+            await self.engine.add_lora(lora_request)
+            self._user_lora_ids[user_id] = lora_int_id
+            self._user_lora_paths[user_id] = lora_path
+            logger.info(f"Loaded LoRA adapter from {lora_path} for user {user_id} (id={lora_int_id})")
+            return lora_request
+        except Exception as e:
+            logger.error(f"Failed to load LoRA: {e}")
+            return None
+
     async def remove_adapter(self, user_id: str) -> bool:
         """
         Remove a LoRA adapter for a user.
@@ -563,20 +436,19 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             True if adapter was removed, False if not found.
         """
-        if not self.adapter_manager:
+        if user_id not in self._user_lora_ids:
             return False
-        
-        adapter = self.adapter_manager.remove_adapter(user_id)
-        if adapter:
-            try:
-                await self.engine.collective_rpc(
-                    method="remove_lora",
-                    args=(adapter.lora_int_id,),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to remove adapter from engine: {e}")
+
+        lora_int_id = self._user_lora_ids.pop(user_id)
+        self._user_lora_paths.pop(user_id, None)
+        try:
+            # Use the proper remove_lora API
+            await self.engine.remove_lora(lora_int_id)
+            logger.info(f"Removed LoRA adapter for user {user_id} (id={lora_int_id})")
             return True
-        return False
+        except Exception as e:
+            logger.warning(f"Failed to remove adapter from engine: {e}")
+            return False
 
     async def sleep(self, level: int = 2) -> None:
         """
@@ -648,19 +520,3 @@ class VLLMEngine(BaseSamplerEngine):
     async def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""
         await self.engine.abort(request_id)
-    
-    async def list_adapters(self) -> List[Dict[str, Any]]:
-        """List all loaded LoRA adapters."""
-        if not self.adapter_manager:
-            return []
-        
-        adapters = self.adapter_manager.list_adapters()
-        return [
-            {
-                "user_id": a.user_id,
-                "uri": self.adapter_manager.get_uri(a.user_id),
-                "lora_int_id": a.lora_int_id,
-                "created_at": a.created_at,
-            }
-            for a in adapters
-        ]

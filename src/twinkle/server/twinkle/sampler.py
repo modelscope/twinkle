@@ -37,7 +37,7 @@ def build_sampler_app(model_id: str,
 
     @serve.deployment(name="SamplerManagement")
     @serve.ingress(app)
-    class SamplerManagement(Sampler):
+    class SamplerManagement:
 
         COUNT_DOWN = 60 * 30
 

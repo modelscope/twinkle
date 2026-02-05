@@ -56,7 +56,7 @@ from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
 from twinkle.sampler.types import SamplingParams
 from twinkle.weight_loader import NativeLoader
-from twinkle.rl import compute_advantages
+from twinkle.rl import GRPOAdvantage
 
 # Environment variable setup
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')
@@ -499,15 +499,16 @@ def train_local():
 
         # Compute rewards
         print(f'[step {step}] Computing rewards...', flush=True)
-        rewards = reward.calculate(trajectories, ground_truths)
+        rewards = reward(trajectories, ground_truths)
         print(f'[step {step}] Rewards: {rewards}', flush=True)
 
         # Compute advantages
+        advantage_fn = GRPOAdvantage()
         # For single sample, use batch normalization
         if len(rewards) < num_generations:
-            advantages = compute_advantages(rewards, num_generations=1, scale='batch')
+            advantages = advantage_fn(rewards, num_generations=1, scale='batch')
         else:
-            advantages = compute_advantages(rewards, num_generations=num_generations)
+            advantages = advantage_fn(rewards, num_generations=num_generations)
         
         for trajectory, advantage in zip(trajectories, advantages.tolist()):
             trajectory['advantages'] = advantage
@@ -647,13 +648,14 @@ def train_ray():
         
         # Compute rewards
         print(f'[step {step}] Computing rewards...', flush=True)
-        rewards = reward.calculate(trajectories, ground_truths)
+        rewards = reward(trajectories, ground_truths)
         if callable(rewards):
             rewards = rewards()
         print(f'[step {step}] Rewards: {rewards}', flush=True)
 
         # Compute advantages
-        advantages = compute_advantages(rewards, num_generations=num_generations)
+        advantage_fn = GRPOAdvantage()
+        advantages = advantage_fn(rewards, num_generations=num_generations)
         for trajectory, advantage in zip(trajectories, advantages.tolist()):
             trajectory['advantages'] = advantage
 
