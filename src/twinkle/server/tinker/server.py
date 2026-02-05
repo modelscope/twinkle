@@ -95,6 +95,8 @@ def build_server_app(
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
             ]
+            # Lock for ModelScope config file operations (login writes, get_user_info reads)
+            self._modelscope_config_lock = asyncio.Lock()
 
         def _validate_base_model(self, base_model: str) -> None:
             """Validate that base_model is in supported_models list.
@@ -544,15 +546,19 @@ def build_server_app(
             
             # Generate hub_model_id from checkpoint content and user token
             # Format: {username}/{run_id}_{checkpoint_name}
-            try:
-                from modelscope.hub.api import HubApi, ModelScopeConfig
-                hub_api = HubApi(token=token)
-                hub_api.login() # Save user info to local
-                username = ModelScopeConfig.get_user_info()[0]
-            except Exception:
-                # Fallback to using sanitized token as username
-                import re
-                username = re.sub(r'[^\w\-]', '_', token)[:20]
+            # Use lock to prevent race conditions when multiple requests access ModelScope config file
+            async with self._modelscope_config_lock:
+                try:
+                    from modelscope.hub.api import HubApi, ModelScopeConfig
+                    hub_api = HubApi(token=token)
+                    hub_api.login()  # Save user info to local
+                    username = ModelScopeConfig.get_user_info()[0]
+                except Exception as e:
+                    logger.error(f"Failed to get username from ModelScope: {e}")
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Failed to get username from ModelScope. Please ensure your token is valid."
+                    )
             
             # Extract checkpoint name from checkpoint_id (e.g., "weights/step-8" -> "step-8")
             checkpoint_name = checkpoint_id.split('/')[-1]

@@ -89,6 +89,31 @@ def _patched_async_tinker_init(
     self._idempotency_header = "X-Idempotency-Key"
 
 
+def _patched_from_tinker_path(cls, tinker_path: str) -> Any:
+    """Patched version that supports both 'tinker://' and 'twinkle://' prefixes."""
+    prefix = None
+    if tinker_path.startswith("tinker://"):
+        prefix = "tinker://"
+    elif tinker_path.startswith("twinkle://"):
+        prefix = "twinkle://"
+    
+    if prefix is None:
+        raise ValueError(f"Invalid tinker path: {tinker_path}")
+    
+    parts = tinker_path[len(prefix):].split("/")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid tinker path: {tinker_path}")
+    if parts[1] not in ["weights", "sampler_weights"]:
+        raise ValueError(f"Invalid tinker path: {tinker_path}")
+    checkpoint_type = "training" if parts[1] == "weights" else "sampler"
+    return cls(
+        tinker_path=tinker_path,
+        training_run_id=parts[0],
+        checkpoint_type=checkpoint_type,
+        checkpoint_id="/".join(parts[1:]),
+    )
+
+
 def patch_tinker():
     """
     Apply patches to tinker library.
@@ -96,6 +121,7 @@ def patch_tinker():
     This function patches:
     1. InternalClientHolder._create_sampling_session to bypass 'tinker://' prefix validation
     2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
+    3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
     
     This patch is idempotent - calling it multiple times has no additional effect.
     """
@@ -111,6 +137,10 @@ def patch_tinker():
         # Patch 2: bypass tml- prefix validation for api_key
         from tinker._client import AsyncTinker
         AsyncTinker.__init__ = _patched_async_tinker_init
+        
+        # Patch 3: support both tinker:// and twinkle:// prefixes for checkpoint paths
+        from tinker.types.checkpoint import ParsedCheckpointTinkerPath
+        ParsedCheckpointTinkerPath.from_tinker_path = classmethod(_patched_from_tinker_path)
         
         _patched = True
     except ImportError:

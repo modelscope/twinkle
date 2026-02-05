@@ -1,6 +1,10 @@
 #%%
+import dotenv
+dotenv.load_dotenv('.env')
+
+import os
 from twinkle_client import init_tinker_compat_client
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+service_client = init_tinker_compat_client(base_url='http://localhost:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 
 print("Available models:")
 for item in service_client.get_server_capabilities().supported_models:
@@ -110,5 +114,7 @@ for epoch in range(2):
     save_result = save_future.result()
     print(f"Saved checkpoint for epoch {epoch} to {save_result.path}")
 
-# sampling_client = training_client.save_weights_and_get_sampling_client(name='pig-latin-model')
- 
+# NOTE: Need to set your modelscope token as api_key when initializing the service client
+# model name is {run_id}_{checkpoint_name}
+rest_client.publish_checkpoint_from_tinker_path(save_result.path).result()
+print("Published checkpoint")
