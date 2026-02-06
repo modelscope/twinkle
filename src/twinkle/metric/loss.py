@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
+from typing import List, Union
 
 from .base import Metric
-from twinkle import torch_util
+from twinkle.data_format import ModelOutput, InputFeature
 
 
 class LossMetric(Metric):
@@ -21,15 +21,18 @@ class LossMetric(Metric):
         self.num_tokens = 0
         self.loss_reduction = loss_reduction
 
-    def accumulate(self, inputs, outputs):
+    def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         if 'loss' not in outputs:
             return
         loss = outputs["loss"]
         if self.loss_reduction == 'sum':
-            # `Transformers` models may use reduction=sum, to average grads before step
-            labels = inputs["labels"]
-            self.num_tokens += (labels >= 0).sum().item()
-        grad_norm = outputs.get("grad_norm")
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+            for input in inputs:
+                # `Transformers` models may use reduction=sum, to average grads before step
+                labels = input["labels"]
+                self.num_tokens += (labels >= 0).sum().item()
+        grad_norm = kwargs.get("grad_norm")
         if grad_norm is not None:
             self.grad_norm = grad_norm
 

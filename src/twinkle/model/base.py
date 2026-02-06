@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import abstractmethod, ABC
-from typing import Dict, Any, Union, Type, Optional
+from typing import Dict, Any, Union, Type, Optional, Callable, TYPE_CHECKING
 
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
 from twinkle.patch import Patch
@@ -11,6 +10,11 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle import torch_util, Platform
 from twinkle.hub import HubOperation
+
+if TYPE_CHECKING:
+    import torch
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
 
 
 class TwinkleModel(ABC):
@@ -56,7 +60,7 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]], **kwargs):
         ...
 
     @abstractmethod

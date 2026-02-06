@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union
 
 from twinkle import torch_util
+from twinkle.data_format import InputFeature, ModelOutput
 
 
 class Metric:
@@ -10,7 +11,7 @@ class Metric:
         self.process_group = process_group
         self.device_mesh = device_mesh
 
-    def accumulate(self, inputs, outputs):
+    def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         ...
 
     def calculate(self):

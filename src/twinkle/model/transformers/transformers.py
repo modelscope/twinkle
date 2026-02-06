@@ -24,7 +24,7 @@ import twinkle
 import twinkle.module.scheduler
 from twinkle import Platform
 from twinkle import remote_class, remote_function, template, DeviceMesh
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, CrossEntropyLoss
 from twinkle.metric import Metric
@@ -45,13 +45,14 @@ class OptimizerGroup:
     adapter_config: PeftConfig = None
     optimizer: Optimizer = None
     lr_scheduler: LRScheduler = None
-    inputs: Optional[Dict[str, Any]] = None
-    outputs: Optional[Dict[str, Any]] = None
+    inputs: List[InputFeature] = None
+    outputs: ModelOutput = None
     loss_instance: Loss = CrossEntropyLoss
     loss_value: Any = None
     template: Template = None
     processor: InputProcessor = None
     scaler: GradScaler = None
+    _last_grad_norm: float = 0.0
     scaler_has_nan: bool = False
     gradient_accumulation_steps: int = 1
     cur_step: int = 0
@@ -115,7 +116,9 @@ class OptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
+                metric.accumulate(self.inputs, self.outputs, lr=self._get_lr(),
+                                  step=self.cur_step-1, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                                  grad_norm=self._last_grad_norm)
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -494,7 +497,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 norm_type=norm_type,
                 group=optimizer_config._dp_group,
             )
-            outputs['grad_norm'] = grad_norm
+            optimizer_config._last_grad_norm = grad_norm
             optimizer_config.num_tokens = 0
             return grad_norm
 
@@ -637,7 +640,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             lr_scheduler.step(**kwargs)
 
     @remote_function()
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]], **kwargs):
         """Set the loss instance.
 
         Args:
