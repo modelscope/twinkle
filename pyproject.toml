@@ -1,5 +1,5 @@
 [project]
-name = "twinkle"
+name = "twinkle-kit"
 version = "0.0.1"
 description = "Training API for large language models with efficient data handling and advanced optimization techniques."
 readme = "README.md"
