@@ -152,6 +152,7 @@ def _run_worker_single_attn(rank: int, world_size: int, port: int, padding: bool
         sp_size = 2
         device_mesh = DeviceMesh.from_sizes(dp_size=world_size, ulysses_size=sp_size, device_type="cuda")
         _setup_sp(device_mesh, sp_size)
+        sp_group = _get_sp_group_from_device_mesh(device_mesh, sp_size)
 
         batch_size = 2
         unpad_seq_len = 127 if padding else 128
@@ -166,9 +167,17 @@ def _run_worker_single_attn(rank: int, world_size: int, port: int, padding: bool
             x = sequence_parallel.pad(full_x, padding_value=0.0, position_ids=None, dim=1)
         else:
             x = full_x
+        pad_seq_len = x.size(1)
+        assert pad_seq_len % sp_size == 0
 
         dp_x = x.detach().requires_grad_(True)
         sp_x_local = sequence_parallel.split(x, dim=1, position_ids=None).detach().requires_grad_(True)
+        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+        local = pad_seq_len // sp_size
+        start = sp_rank * local
+        end = start + local
+        valid_end = min(end, unpad_seq_len)
+        local_valid = max(valid_end - start, 0)
 
         attn_sp = _SingleAttention(hidden_dim, num_heads, sp_enabled=True).to(device=device, dtype=torch.bfloat16)
         attn_dp = _SingleAttention(hidden_dim, num_heads, sp_enabled=False).to(device=device, dtype=torch.bfloat16)
@@ -183,24 +192,22 @@ def _run_worker_single_attn(rank: int, world_size: int, port: int, padding: bool
 
         torch.testing.assert_close(dp_out_full, sp_out_full, atol=2e-5, rtol=1e-5)
 
-        # backward (use local loss; sum grads across SP group)
-        sp_loss = sp_out_local.sum() * 2.0
+        # backward: compare *local-slice* gradients directly (avoid any extra scaling assumptions).
+        sp_loss = sp_out_local[:, :local_valid].sum() * 2.0
         sp_loss.backward()
-        sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
-        sp_o_grad = attn_sp.out_proj.weight.grad.detach().clone()
-        dist.all_reduce(sp_q_grad, group=sequence_parallel._sp_group)
-        dist.all_reduce(sp_o_grad, group=sequence_parallel._sp_group)
-        sp_x_grad_full = sequence_parallel.gather(sp_x_local.grad.detach(), dim=1, position_ids=None)[:, :unpad_seq_len]
+        sp_q_grad = attn_sp.q_proj.weight.grad.detach()
+        sp_o_grad = attn_sp.out_proj.weight.grad.detach()
+        sp_x_grad_local = sp_x_local.grad.detach()[:, :local_valid]
 
-        dp_loss = dp_out_full.sum() * 2.0
+        dp_loss = dp_out_full[:, start:valid_end].sum() * 2.0
         dp_loss.backward()
-        dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
-        dp_o_grad = attn_dp.out_proj.weight.grad.detach().clone()
-        dp_x_grad_full = dp_x.grad.detach()[:, :unpad_seq_len]
+        dp_q_grad = attn_dp.q_proj.weight.grad.detach()
+        dp_o_grad = attn_dp.out_proj.weight.grad.detach()
+        dp_x_grad_local = dp_x.grad.detach()[:, start:valid_end]
 
         torch.testing.assert_close(dp_o_grad, sp_o_grad, atol=2e-3, rtol=1e-4)
         torch.testing.assert_close(dp_q_grad, sp_q_grad, atol=2e-3, rtol=1e-4)
-        torch.testing.assert_close(dp_x_grad_full, sp_x_grad_full, atol=2e-5, rtol=1e-5)
+        torch.testing.assert_close(dp_x_grad_local, sp_x_grad_local, atol=2e-5, rtol=1e-5)
     finally:
         dist.destroy_process_group()
 
