@@ -7,29 +7,29 @@ Twinkle DOCUMENTATION
 
 .. toctree::
    :maxdepth: 2
-   :caption: Get Started
+   :caption: 使用指引
 
-   GetStarted/Quick-start.md
-   GetStarted/Installation.md
-   GetStarted/NPU-setup.md
+   使用指引/快速开始.md
+   使用指引/安装.md
+   使用指引/NPU的支持.md
 
 .. toctree::
    :maxdepth: 2
    :caption: 组件
 
-   Components/数据集/index.rst
-   Components/数据格式/index.rst
-   Components/模板/index.rst
-   Components/预处理器和过滤器/index.rst
-   Components/数据加载/index.rst
-   Components/任务处理器/index.rst
-   Components/模型/index.rst
-   Components/指标/index.rst
-   Components/损失/index.rst
-   Components/LRScheduler/index.rst
-   Components/补丁/index.rst
-   Components/组件化/index.rst
-   Components/训练中间件/index.rst
+   组件/数据集/index.rst
+   组件/数据格式/index.rst
+   组件/模板/index.rst
+   组件/预处理器和过滤器/index.rst
+   组件/数据加载/index.rst
+   组件/任务处理器/index.rst
+   组件/模型/index.rst
+   组件/指标/index.rst
+   组件/损失/index.rst
+   组件/LRScheduler/index.rst
+   组件/补丁/index.rst
+   组件/组件化/index.rst
+   组件/训练中间件/index.rst
 
 Indices and tables
 ==================
