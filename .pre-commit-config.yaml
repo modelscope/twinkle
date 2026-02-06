@@ -17,7 +17,6 @@ repos:
             (?x)^(
                 examples/|
                 tests/run.py|
-                swift/cli/sft.py
             )$
   - repo: https://github.com/google/yapf
     rev: v0.43.0

@@ -1,7 +1,7 @@
 #!/bin/bash
 MODELSCOPE_CACHE_DIR_IN_CONTAINER=/modelscope_cache
 CODE_DIR=$PWD
-CODE_DIR_IN_CONTAINER=/ms-swift
+CODE_DIR_IN_CONTAINER=/twinkle
 MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'
@@ -21,7 +21,7 @@ do
   flock -n "$lock_fd" || { echo "WARN: gpu $gpu is in use!" >&2; idx=$((idx+1)); continue; }
   echo "get gpu lock $gpu"
 
-  CONTAINER_NAME="swift-ci-$idx"
+  CONTAINER_NAME="twinkle-ci-$idx"
   let is_get_file_lock=true
 
   # pull image if there are update
