@@ -181,6 +181,7 @@ class VLLMEngine(BaseSamplerEngine):
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
         adapter_uri: Optional[str] = None,
+        lora_request: Optional[Any] = None,
         request_id: Optional[str] = None,
         priority: int = 0,
         *,
@@ -201,6 +202,8 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs: If > 0, returns top-k logprobs for each prompt token.
             adapter_uri: URI of LoRA adapter to use (for multi-tenant mode).
                          Format: twinkle://{model_id}/lora/{user_id}
+            lora_request: Pre-built LoRARequest for RL training weight sync.
+                         Takes precedence over adapter_uri.
             request_id: Optional request ID for tracking.
             priority: Request priority (higher = more urgent).
             images: Optional list of images for multimodal models.
@@ -243,9 +246,9 @@ class VLLMEngine(BaseSamplerEngine):
         else:
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         
-        # Build LoRA request if adapter_uri provided
-        lora_request = None
-        if adapter_uri and self.enable_lora:
+        # Build LoRA request: pre-built lora_request takes precedence,
+        # then adapter_uri for multi-tenant mode.
+        if lora_request is None and adapter_uri and self.enable_lora:
             lora_request = await self._get_or_load_lora(adapter_uri)
         
         # Generate
@@ -468,7 +471,7 @@ class VLLMEngine(BaseSamplerEngine):
         await self.engine.sleep(level=level)
         logger.debug(f"Engine sleeping at level {level}")
     
-    async def wake_up(self, tags: Optional[List[str]] = None, reload_weights: bool = False) -> None:
+    async def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
         Resume weights and/or KV cache to GPU memory.
         
@@ -490,15 +493,6 @@ class VLLMEngine(BaseSamplerEngine):
         
         await self.engine.wake_up(tags=tags)
         
-        if reload_weights and "weights" in tags:
-            try:
-                await self.engine.collective_rpc("reload_weights")
-                logger.debug("Weights reloaded after wake_up")
-            except Exception as e:
-                logger.warning(f"Failed to reload weights: {e}")
-        
-        await self.clear_kv_cache()
-        
         logger.debug(f"Engine waking up with tags: {tags}")
 
     async def clear_kv_cache(self) -> None:
@@ -508,15 +502,193 @@ class VLLMEngine(BaseSamplerEngine):
         elif hasattr(self.engine, 'reset_mm_cache'):
             await self.engine.reset_mm_cache() # Do we need this?
 
+    async def reset_prefix_cache(self) -> None:
+        await self.engine.reset_prefix_cache()
+
     async def update_weights(
         self,
         weights: Dict[str, torch.Tensor],
-        adapter_name: Optional[str] = None,
+        peft_config: Optional[dict] = None,
+        base_sync_done: bool = False,
+        bucket_size_mb: int = 2048,
         **kwargs,
     ) -> None:
-        # not use, TODO: remove this method
-        await self.engine.model_runner.model.load_weights(weights)
+        """Update model weights via ZMQ + CUDA IPC/SHM to worker extension.
+
+        vLLM v1 AsyncLLM runs the model in a separate ``WorkerProc`` subprocess.
+        We use a ZMQ REQ/REP + CUDA IPC (or SHM for CPU tensors) channel to
+        stream weights in buckets to the worker, avoiding pickle serialization
+        overhead for large tensor dicts.
+
+        LoRA-aware:
+        - ``base_sync_done=False``: Weights loaded via ``load_weights()``
+          in the vLLM worker (base model sync).
+        - ``base_sync_done=True`` with ``peft_config``: Weights loaded as
+          a LoRA adapter via ``add_lora()`` in the vLLM worker.
+
+        Args:
+            weights: Dict mapping weight names to tensors (GPU or CPU).
+            peft_config: PEFT config dict for LoRA adapter loading.
+            base_sync_done: If True with peft_config, load as LoRA adapter.
+            bucket_size_mb: Size of transfer bucket in MB.
+        """
+        import gc
+        import time
+        import zmq
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        from vllm.platforms import current_platform
+
+        start_time = time.time()
+
+        # Determine if weights are on GPU (use CUDA IPC) or CPU (use SHM)
+        first_weight = next(iter(weights.values()))
+        use_gpu_ipc = first_weight.is_cuda
+        use_shm = not use_gpu_ipc
+
+        # Get device UUID for ZMQ handle
+        device_uuid = current_platform.get_device_uuid(0)
+        zmq_handle = f"ipc:///tmp/twinkle-ipc-{device_uuid}.sock"
+
+        bucket_size = bucket_size_mb << 20
+
+        # Create transfer buffer
+        buffer = None
+        shm = None
+
+        if use_gpu_ipc:
+            from torch.multiprocessing.reductions import reduce_tensor
+            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_weight.device)
+            ipc_handle = reduce_tensor(buffer)
+        else:
+            from multiprocessing import shared_memory
+            shm_name = f"twinkle_weights_{uuid.uuid4().hex}"
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=bucket_size)
+            buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
+
+        # Setup ZMQ socket FIRST (bind before worker connects)
+        zmq_ctx = zmq.Context()
+        socket = zmq_ctx.socket(zmq.REQ)
+        socket.bind(zmq_handle)
+
+        def _send_weights_via_zmq():
+            """Send weights via ZMQ in a separate thread."""
+            if use_gpu_ipc:
+                socket.send_pyobj(ipc_handle)
+            else:
+                socket.send_pyobj({"name": shm_name, "size": bucket_size})
+            socket.recv()  # Wait for worker ready
+
+            offset = 0
+            bucket_meta = {}
+
+            for name, weight in weights.items():
+                if use_shm and weight.is_cuda:
+                    weight = weight.cpu()
+
+                if weight.nbytes > bucket_size:
+                    raise ValueError(
+                        f"Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds "
+                        f"bucket size ({bucket_size_mb} MB). Increase bucket_size_mb."
+                    )
+
+                if offset + weight.nbytes > bucket_size:
+                    torch.cuda.synchronize() if use_gpu_ipc else None
+                    socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                    socket.recv()
+                    bucket_meta = {}
+                    offset = 0
+
+                bucket_meta[name] = {
+                    "name": name,
+                    "shape": weight.shape,
+                    "dtype": weight.dtype,
+                    "offset": offset,
+                }
+                buffer[offset:offset + weight.nbytes].copy_(
+                    weight.view(-1).view(torch.uint8), non_blocking=True
+                )
+                offset += weight.nbytes
+
+            if use_gpu_ipc:
+                torch.cuda.synchronize()
+            socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
+            socket.recv()
+
+        # Run ZMQ communication and collective_rpc concurrently
+        loop = asyncio.get_event_loop()
+        worker_task = asyncio.create_task(
+            self.engine.collective_rpc(
+                "update_weights_from_ipc",
+                kwargs={
+                    "peft_config": peft_config,
+                    "base_sync_done": base_sync_done,
+                    "use_shm": use_shm,
+                },
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            await loop.run_in_executor(executor, _send_weights_via_zmq)
+
+        await worker_task
+
+        # Clean up
+        socket.close()
+        zmq_ctx.term()
+        del buffer
+        if shm is not None:
+            shm.close()
+            shm.unlink()
+            del shm
+        gc.collect()
+
+        elapsed = time.time() - start_time
+        mode = "LoRA" if base_sync_done and peft_config else "base"
+        logger.info(f"Updated {len(weights)} {mode} weights via "
+                     f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
 
     async def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""
         await self.engine.abort(request_id)
+    
+    async def shutdown(self) -> None:
+        """Shutdown the vLLM engine and release all resources.
+        
+        This method should be called before the process exits to ensure
+        proper cleanup of the vLLM AsyncLLM engine and its subprocesses.
+        """
+        import gc
+        
+        logger.info("Shutting down VLLMEngine...")
+        
+        if self.engine is not None:
+            try:
+                # vLLM v1 AsyncLLM has shutdown() method
+                if hasattr(self.engine, 'shutdown'):
+                    await self.engine.shutdown()
+                elif hasattr(self.engine, 'engine_core'):
+                    # For older versions, try to stop engine core
+                    if hasattr(self.engine.engine_core, 'shutdown'):
+                        await self.engine.engine_core.shutdown()
+            except Exception as e:
+                logger.warning(f"Error during engine shutdown: {e}")
+            finally:
+                self.engine = None
+        
+        # Clear LoRA state
+        self._user_lora_ids.clear()
+        self._user_lora_paths.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, 'ipc_collect'):
+                torch.cuda.ipc_collect()
+        
+        logger.info("VLLMEngine shutdown complete")
