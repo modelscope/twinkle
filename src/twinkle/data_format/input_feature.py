@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
-from typing import List, Union, Optional, Any
+from typing import List, Union, Any, TYPE_CHECKING
+
 import numpy as np
 
 if sys.version_info[:2] <= (3, 11):
@@ -9,7 +10,10 @@ if sys.version_info[:2] <= (3, 11):
 else:
     from typing import TypedDict
 
-InputType = Union[List[List[int]], List[int], np.ndarray, Any]
+if TYPE_CHECKING:
+    import torch
+
+InputType = Union[List[List[int]], List[int], np.ndarray, torch.Tensor]
 
 
 class InputFeature(TypedDict, total=False):

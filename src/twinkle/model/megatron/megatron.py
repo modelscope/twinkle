@@ -23,7 +23,7 @@ import twinkle.patch
 from twinkle import DeviceMesh, remote_class, remote_function, template, Platform
 from twinkle import requires
 from twinkle import torch_util
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
 from twinkle.metric import Metric, LossMetric, TrainMetric
@@ -48,7 +48,7 @@ class MegatronOptimizerGroup:
     optimizer: Optimizer = None
     lr_scheduler: LRScheduler = None
     inputs: List[InputFeature] = None
-    outputs: Dict[str, Any] = None
+    outputs: ModelOutput = None
     loss_instance: Loss = None
     loss_value: Any = None
     template: Template = None
@@ -99,7 +99,9 @@ class MegatronOptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
+                metric.accumulate(self.inputs, self.outputs, lr=self._get_lr(),
+                                  step=self.cur_step-1, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                                  grad_norm=self._last_grad_norm)
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -338,7 +340,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 seq_length = original_seq_length
 
         def post_loss_function(output_tensor, inputs):
-            outputs = {'logits': output_tensor}
+            outputs = ModelOutput(logits=output_tensor)
             losses, counts = loss_instance(inputs, outputs)
             return self.strategy.gather_loss_for_cp(losses, counts, output_tensor)
 
@@ -432,10 +434,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 'logits': logits,
             }
         else:
-            optimizer_config.outputs = {
-                'loss': loss,
-                'logits': logits,
-            }
+            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss)
             if isinstance(loss, torch.Tensor):
                 return loss.detach().cpu().float().numpy()
             return float(loss)
@@ -477,7 +476,6 @@ class MegatronModel(TwinkleModel, nn.Module):
         assert optimizer is not None, 'Set optimizer correctly before stepping'
         # Megatron optimizer step() returns (success, grad_norm, num_zeros)
         success, grad_norm, num_zeros = optimizer.step()
-        optimizer_config.outputs['grad_norm'] = grad_norm
         # Store grad_norm for later retrieval
         optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
         optimizer_config._last_step_success = success
@@ -544,7 +542,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             lr_scheduler.step(increment=increment)
 
     @remote_function(dispatch='all')
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]], **kwargs):
         """Set loss function.
 
         NOTE: For MegatronModel, the loss is computed internally by Megatron's

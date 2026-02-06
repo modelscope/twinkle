@@ -1,7 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import time
+from typing import Union, List
 
 from .base import Metric
+from ..data_format import InputFeature, ModelOutput
 
 
 class TrainMetric(Metric):
@@ -12,7 +14,7 @@ class TrainMetric(Metric):
         process_group: The process group to collect data from
     """
 
-    def __init__(self, device_mesh, process_group, **kwargs):
+    def __init__(self, device_mesh=None, process_group=None, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)
         self.lr = None
         self.step = 0
@@ -21,15 +23,15 @@ class TrainMetric(Metric):
         self.start_time = time.time()
         self.time = time.time()
 
-    def accumulate(self, inputs, outputs):
-        lr = outputs.get('lr')
+    def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
+        lr = kwargs.get('lr')
         if isinstance(lr, list):
             lr = [f'{x:.2e}' for x in lr]
         else:
             lr = f'{lr:.2e}'
         self.lr = lr
-        self.step = outputs.get('step')
-        self.gradient_accumulation_steps = outputs.get('gradient_accumulation_steps', 1)
+        self.step = kwargs.get('step')
+        self.gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', self.gradient_accumulation_steps)
 
     def reset(self):
         self.time = time.time()
