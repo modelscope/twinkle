@@ -38,10 +38,6 @@ from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
 from twinkle.metric import LossMetric, Accuracy, TrainMetric
 
-_debug_logger = twinkle.get_logger()
-_debug_enabled = os.environ.get("TWINKLE_TRANSFORMERS_DEBUG", "0") == "1"
-_debug_every = max(1, int(os.environ.get("TWINKLE_TRANSFORMERS_DEBUG_EVERY", "1")))
-
 
 @dataclass
 class OptimizerGroup:
@@ -122,12 +118,6 @@ class OptimizerGroup:
                 metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
 
     def calculate_metrics(self, is_training):
-        if _debug_enabled:
-            _debug_logger.info(
-                f"[TRANSFORMERS_DEBUG][rank={Platform.get_rank()} local_rank={Platform.get_local_rank()}/"
-                f"{Platform.get_world_size()}] cur_step={self.cur_step} "
-                f"calculate_metrics accumulate begin is_training={is_training}"
-            )
         self.accumulate_metrics(is_training)
         if is_training:
             metrics = self.train_metrics
@@ -135,20 +125,7 @@ class OptimizerGroup:
             metrics = self.eval_metrics
         results = {}
         for metric in metrics:
-            if _debug_enabled:
-                _debug_logger.info(
-                    f"[TRANSFORMERS_DEBUG][rank={Platform.get_rank()} local_rank={Platform.get_local_rank()}/"
-                    f"{Platform.get_world_size()}] cur_step={self.cur_step} "
-                    f"metric.calculate begin metric={metric.__class__.__name__} "
-                    f"pg_none={getattr(metric, 'process_group', None) is None}"
-                )
             results.update(metric.calculate())
-            if _debug_enabled:
-                _debug_logger.info(
-                    f"[TRANSFORMERS_DEBUG][rank={Platform.get_rank()} local_rank={Platform.get_local_rank()}/"
-                    f"{Platform.get_world_size()}] cur_step={self.cur_step} "
-                    f"metric.calculate done metric={metric.__class__.__name__}"
-                )
         self.inputs = None
         self.outputs = None
         return results
@@ -290,23 +267,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                 # maybe forward_only, no optimizer_group available
                 self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
-            self._debug_log("model wrapped by strategy", force=True)
-
-    def _debug_log(self, message: str, *, adapter_name: str = _default_adapter_name, force: bool = False):
-        if not _debug_enabled:
-            return
-        cur_step = -1
-        if adapter_name in self.optimizer_group:
-            cur_step = self.optimizer_group[adapter_name].cur_step
-            if not force and cur_step >= 0 and (cur_step % _debug_every != 0):
-                return
-        rank = Platform.get_rank()
-        local_rank = Platform.get_local_rank()
-        world_size = Platform.get_world_size()
-        _debug_logger.info(
-            f"[TRANSFORMERS_DEBUG][rank={rank} local_rank={local_rank}/{world_size}] "
-            f"cur_step={cur_step} {message}"
-        )
 
     @staticmethod
     def _should_enable_expert_parallel(expert_parallel_config: Optional[Dict[str, Any]],
@@ -491,7 +451,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.forward(inputs=inputs, **kwargs)
         loss = self.calculate_loss(**kwargs)
         self.backward(**kwargs)
-        self._debug_log("backward done", adapter_name=adapter_name)
         return loss
 
     @remote_function()
@@ -509,7 +468,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
-            self._debug_log("clip_grad_norm skipped(do_grad_sync=False)", adapter_name=adapter_name)
             return
 
         optimizer = optimizer_config.optimizer
@@ -526,21 +484,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
             optimizer_config._ensure_dp_group()
             num_tokens = optimizer_config.num_tokens
-            self._debug_log(
-                f"clip_grad_norm before gather_object local_num_tokens={num_tokens}",
-                adapter_name=adapter_name,
-            )
             num_tokens = torch_util.gather_object([num_tokens], self.device_mesh, optimizer_config._dp_group)
             num_tokens = sum(num_tokens)
-            self._debug_log(
-                f"clip_grad_norm after gather_object total_num_tokens={num_tokens}",
-                adapter_name=adapter_name,
-            )
             parameters = list(self._get_trainable_parameters(adapter_name).values())
-            self._debug_log(
-                f"clip_grad_norm before normalize_and_clip_grad_norm params={len(parameters)}",
-                adapter_name=adapter_name,
-            )
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,
                 num_tokens=num_tokens,
@@ -550,21 +496,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             )
             outputs['grad_norm'] = grad_norm
             optimizer_config.num_tokens = 0
-            self._debug_log(f"clip_grad_norm done grad_norm={grad_norm}", adapter_name=adapter_name)
             return grad_norm
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
-        adapter_name = kwargs.get('adapter_name', _default_adapter_name)
-        self._debug_log("clip_grad_and_step begin", adapter_name=adapter_name)
         grad_norm = self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
-        self._debug_log("clip_grad_norm returned", adapter_name=adapter_name)
         self.step(**kwargs)
-        self._debug_log("optimizer step done", adapter_name=adapter_name)
         self.zero_grad(**kwargs)
-        self._debug_log("zero_grad done", adapter_name=adapter_name)
         self.lr_step(**kwargs)
-        self._debug_log("lr_step done", adapter_name=adapter_name)
         return grad_norm
 
     def _create_param_group(self, adapter_name: str, lr: float=DEFAULT_LEARNING_RATE, weight_decay:float=DEFAULT_WEIGHT_DECAY, **kwargs):
