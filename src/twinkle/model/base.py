@@ -88,7 +88,7 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         ...
 
     @abstractmethod

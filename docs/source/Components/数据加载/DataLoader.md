@@ -46,3 +46,4 @@ DataLoader的dataset参数可以传入一个Callable来返回一个Dataset，这
 dataloader的`@remote_class`装饰器的执行范围也是`first`，这意味着它只会有一个worker用来取出数据。
 
 > 开发者无须担心dataloader返回的data占用driver内存，data通常是一个引用句柄，到了需要使用的worker才会实际传递并解包。
+> Dataloader默认不设置任何的collate_fn，而是将这个过程交由模型处理。

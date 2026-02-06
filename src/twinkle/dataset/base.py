@@ -169,7 +169,7 @@ class Dataset(TorchDataset):
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None,
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None,
                init_args: Dict[str, Any] = None,
                **kwargs) -> None:
         """An inplace method to operate or transform the dataset.

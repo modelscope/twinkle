@@ -964,11 +964,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         grad_scaler_config.update(kwargs)
         optimizer_config.scaler = GradScaler(**grad_scaler_config)
 
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
         Args:
             metric_cls: A metric class type or id.
+            is_training: Whether the metric is for training. If None, it will be used for both training and evaluation.
             **kwargs:
                 adapter_name: Lora adapter name.
                 Any parameters needed to construct the metric_cls instance.
@@ -977,7 +978,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
-        is_training = kwargs.pop('is_training', None)
         if is_training is None or is_training is True:
             optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
         if not is_training:
