@@ -86,6 +86,11 @@ class DeviceMesh:
             mesh_dim_sizes.append(dp_size)
         else:
             mesh_dim_sizes.append(-1)
+        if ep_size is not None:
+            mesh_dim_sizes.append(ep_size)
+            mesh_dim_names.append("ep")
+            if origin_world_size == 1:
+                world_size *= ep_size
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")

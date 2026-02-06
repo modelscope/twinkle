@@ -241,12 +241,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     def _get_default_group(self):
         """Get the only group has optimizer, else return the default one"""
+        if len(self.optimizer_group) == 1:
+            return next(iter(self.optimizer_group))
         names = [name for name, og in self.optimizer_group.items() if og.optimizer is not None]
         if names:
             assert len(names) == 1, 'Only one group is supported.'
             return names[0]
-        else:
-            return _default_adapter_name
+        return _default_adapter_name
 
     @staticmethod
     def _not_encoded(inputs):
@@ -897,7 +898,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
-        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
+        self.optimizer_group[adapter_name] = self.optimizer_group.pop(_default_adapter_name,
+                                                                       self._construct_default_optimizer_group())
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
