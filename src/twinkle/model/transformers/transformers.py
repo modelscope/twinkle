@@ -24,6 +24,7 @@ import twinkle
 import twinkle.module.scheduler
 from twinkle import Platform
 from twinkle import remote_class, remote_function, template, DeviceMesh
+from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, CrossEntropyLoss
@@ -60,6 +61,7 @@ class OptimizerGroup:
     num_tokens: int = 0
     train_metrics: List[Metric] = field(default_factory=list)
     eval_metrics: List[Metric] = field(default_factory=list)
+    checkpoint_engine: CheckpointEngine = None
     _dp_group = None
     _device_mesh: DeviceMesh = None
 
@@ -980,6 +982,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         kwargs['device_mesh'] = self.device_mesh
         processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
         optimizer_config.processor = processor
+
+    @remote_function()
+    def set_checkpoint_engine(self, checkpoint_engine_cls: Union[Type[CheckpointEngine], str, CheckpointEngine], **kwargs):
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.checkpoint_engine = construct_class(checkpoint_engine_cls, CheckpointEngine, twinkle.checkpoint_engine, **kwargs)
+        optimizer_config.checkpoint_engine.init_process_group(
+            rank=Platform.get_rank(),
+            world_size=Platform.get_world_size(),
+            master_metadata=master_metadata,
+        )
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):

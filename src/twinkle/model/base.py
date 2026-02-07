@@ -108,6 +108,10 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
+    def set_checkpoint_engine(self):
+        ...
+
+    @abstractmethod
     def get_train_configs(self, **kwargs) -> str:
         ...
 

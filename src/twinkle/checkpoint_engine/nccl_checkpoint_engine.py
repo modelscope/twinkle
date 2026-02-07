@@ -32,7 +32,7 @@ from twinkle.utils.network import (
     find_free_port,
     is_valid_ipv6_address,
 )
-from .base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from .base import CheckpointEngine, TensorMeta
 
 logger = get_logger()
 
@@ -117,7 +117,6 @@ class BroadcastOperation:
         return self.metadata
 
 
-@CheckpointEngineRegistry.register("nccl")
 class NCCLCheckpointEngine(CheckpointEngine):
     """NCCL checkpoint engine using torch.distributed ProcessGroupNCCL.
 

@@ -23,7 +23,7 @@ from twinkle.utils.network import (
     is_valid_ipv6_address,
     stateless_init_process_group,
 )
-from .base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from .base import CheckpointEngine, TensorMeta
 from twinkle import get_logger
 
 logger = get_logger()
@@ -92,7 +92,6 @@ class BroadcastOperation:
         return self.metadata
 
 
-@CheckpointEngineRegistry.register("hccl")
 class HCCLCheckpointEngine(CheckpointEngine):
     """HCCL checkpoint engine for Ascend NPU.
 
