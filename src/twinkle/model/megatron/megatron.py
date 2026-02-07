@@ -117,6 +117,43 @@ class MegatronOptimizerGroup:
 
 _default_adapter_name = ''
 
+_BASE_LAYER_SUFFIXES = [
+    ".q_proj.weight", ".q_proj.bias",
+    ".k_proj.weight", ".k_proj.bias",
+    ".v_proj.weight", ".v_proj.bias",
+    ".o_proj.weight", ".o_proj.bias",
+    ".gate_proj.weight", ".up_proj.weight",
+    ".down_proj.weight",
+    ".mlp.gate.weight", ".mlp.gate.bias",
+    ".mlp.gate.e_score_correction_bias",
+]
+
+
+def _add_base_layer_suffix(params):
+    """Insert ``.base_layer.`` before the final attribute for LoRA-target modules.
+
+    Converts plain HF names exported by the Megatron bridge into the format
+    expected by vLLM when ``enable_lora=True``::
+
+        model.layers.0.self_attn.q_proj.weight
+        -> model.layers.0.self_attn.q_proj.base_layer.weight
+
+    Non-matching names are yielded unchanged.
+
+    Args:
+        params: Iterable of ``(name, tensor)`` pairs.
+
+    Yields:
+        ``(name, tensor)`` with ``.base_layer.`` inserted where needed.
+    """
+    for name, param in params:
+        for suffix in _BASE_LAYER_SUFFIXES:
+            if name.endswith(suffix):
+                attr = suffix.rsplit(".", 1)[-1]  # 'weight' or 'bias'
+                name = f"{name[:-len(attr)]}base_layer.{attr}"
+                break
+        yield name, param
+
 
 @remote_class(execute='all')
 class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
@@ -899,38 +936,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             >>> for name, tensor in model.get_hf_state_dict():
             ...     print(f"{name}: {tensor.shape}")
         """
-        is_peft_format = bool(adapter_name)
         model = self.strategy.unwrap_model(self.model)
-        
-        # Use bridge's export_weights which returns a generator
-        # This converts Megatron format to HF format on-the-fly
         yield from self._bridge.export_weights(
             model,
             target_device=None,  # Keep on current device for IPC transfer
             only_last_rank=False,  # All ranks participate in weight sync
-            is_peft_format=is_peft_format,
+            is_peft_format=False,
             adapter_name=adapter_name if adapter_name else 'default',
             tqdm_desc='Weight sync: ',
         )
 
-    @remote_function(dispatch='all', collect='first', sync=True)
-    def export_weights_dict(self, adapter_name: str = '', lora_only: bool = False) -> Dict[str, torch.Tensor]:
-        """Export model weights as a dict via Ray object store.
-
-        Collects all weights from ``get_hf_state_dict()`` into a dict.
-        Used as an alternative to NCCL checkpoint engine for weight sync.
-
-        Args:
-            adapter_name: Adapter name for weight extraction.
-            lora_only: If True, only export LoRA adapter weights.
-
-        Returns:
-            Dict mapping parameter names to CPU tensors.
-        """
-        weights = {}
-        for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name if lora_only else ''):
-            weights[name] = tensor.cpu()
-        return weights
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
@@ -1164,19 +1179,24 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         logger = logging.getLogger(__name__)
         engine = self._get_or_create_checkpoint_engine()
 
+        is_peft_format = (adapter_name != _default_adapter_name)
+
         if base_sync_done and adapter_name:
             # ── LoRA-only mode ────────────────────────────────────────────
-            # Export only LoRA adapter weights via the bridge in PEFT format
+            # Export only LoRA adapter weights via the bridge.
+            # The bridge may also yield non-LoRA weights (e.g. embed_tokens
+            # for modules_to_save), filter to only lora_A/lora_B tensors.
             def weight_generator():
                 for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
-                    if name is not None and tensor is not None:
-                        yield name, tensor
+                    if name is None or tensor is None:
+                        continue
+                    if 'lora' not in name:
+                        continue
+                    yield name, tensor
 
             logger.info("Sending LoRA-only weights (Megatron)")
         else:
-            # ── Full model mode ───────────────────────────────────────────
-            # Export all base weights via the bridge (HF format)
-            def weight_generator():
+            def _raw_weights():
                 for name, tensor in self.get_hf_state_dict(adapter_name=''):
                     if name is None or tensor is None:
                         continue
@@ -1184,6 +1204,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
                     yield name, tensor
+
+            def weight_generator():
+                if is_peft_format:
+                    yield from _add_base_layer_suffix(_raw_weights())
+                else:
+                    yield from _raw_weights()
 
         async def _send():
             await engine.send_weights(weight_generator())
