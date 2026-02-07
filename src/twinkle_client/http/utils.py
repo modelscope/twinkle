@@ -5,12 +5,15 @@ from typing import Optional
 from datetime import datetime
 
 TWINKLE_SERVER_URL = os.environ.get("TWINKLE_SERVER_URL", "http://127.0.0.1:8000")
-TWINKLE_SERVER_TOKEN = os.environ.get("TWINKLE_SERVER_TOKEN", "tml-EMPTY_TOKEN") # Must start with tml-
+TWINKLE_SERVER_TOKEN = os.environ.get("TWINKLE_SERVER_TOKEN", "EMPTY_TOKEN")
 
 # Context variables for flexible configuration
 _base_url_context: ContextVar[Optional[str]] = ContextVar('base_url', default=None)
 _api_key_context: ContextVar[Optional[str]] = ContextVar('api_key', default=None)
-_request_id_context: ContextVar[Optional[str]] = ContextVar('request_id', default=None)
+
+# Global static request ID shared across all threads
+# This ensures heartbeat threads use the same request ID as the main training thread
+_global_request_id: Optional[str] = None
 
 
 def set_base_url(url: str):
@@ -44,21 +47,22 @@ def clear_api_key():
 
 
 def set_request_id(request_id: str):
-    """Set the request ID for HTTP requests in the current context."""
-    _request_id_context.set(request_id)
+    """Set the global request ID for HTTP requests (shared across all threads)."""
+    global _global_request_id
+    _global_request_id = request_id
 
 
 def get_request_id() -> str:
-    """Get the current request ID from context or generate and cache a new one."""
-    existing_id = _request_id_context.get()
-    if existing_id is not None:
-        return existing_id
-    # Generate a new request ID and cache it in context for consistency
-    new_id = datetime.now().strftime('%Y%m%d_%H%M%S') + '-' + str(uuid.uuid4().hex)[0:8]
-    _request_id_context.set(new_id)
-    return new_id
+    """Get the global request ID or generate and cache a new one."""
+    global _global_request_id
+    if _global_request_id is not None:
+        return _global_request_id
+    # Generate a new request ID and cache it globally for consistency across threads
+    _global_request_id = datetime.now().strftime('%Y%m%d_%H%M%S') + '-' + str(uuid.uuid4().hex)[0:8]
+    return _global_request_id
 
 
 def clear_request_id():
-    """Clear the request ID context."""
-    _request_id_context.set(None)
+    """Clear the global request ID."""
+    global _global_request_id
+    _global_request_id = None

@@ -34,7 +34,7 @@ class HubOperation:
     @contextmanager
     def patch_hub(cls):
         yield
-    
+
     @staticmethod
     def source_type(resource_name: str):
         resource_name = resource_name or ''
@@ -48,7 +48,7 @@ class HubOperation:
             # Preventing from hang
             raise ValueError(f'Using hf as hub backend is not supported.')
         return source_type
-    
+
     @staticmethod
     def remove_source_type(resource_name: str):
         if not resource_name:
@@ -60,6 +60,24 @@ class HubOperation:
             return parts[-1]
 
     @classmethod
+    def _get_hub_class(cls, resource_name: str) -> type:
+        """Get the appropriate Hub class based on resource name prefix.
+
+        Args:
+            resource_name: The resource name with optional prefix (hf:// or ms://)
+
+        Returns:
+            The Hub class (HFHub or MSHub)
+        """
+        source = cls.source_type(resource_name)
+        if source == 'hf':
+            return HFHub
+        elif source == 'ms':
+            return MSHub
+        else:
+            raise NotImplementedError(f'Unknown source type: {source}')
+
+    @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:
         """Try to log in to the hub
 
@@ -69,12 +87,8 @@ class HubOperation:
         Returns:
             bool: Whether login is successful
         """
-        if cls.source_type(token) == 'hf':
-            return HFHub.try_login(cls.remove_source_type(token))
-        elif cls.source_type(token) == 'ms':
-            return MSHub.try_login(cls.remove_source_type(token))
-        else:
-            raise NotImplementedError
+        hub = cls._get_hub_class(token)
+        return hub.try_login(cls.remove_source_type(token))
 
     @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False):
@@ -85,12 +99,8 @@ class HubOperation:
             token: The hub token to use
             private: If is a private repo
         """
-        if cls.source_type(repo_id) == 'hf':
-            return HFHub.create_model_repo(cls.remove_source_type(repo_id), token, private)
-        elif cls.source_type(repo_id) == 'ms':
-            return MSHub.create_model_repo(cls.remove_source_type(repo_id), token, private)
-        else:
-            raise NotImplementedError
+        hub = cls._get_hub_class(repo_id)
+        return hub.create_model_repo(cls.remove_source_type(repo_id), token, private)
 
     @classmethod
     def push_to_hub(cls,
@@ -117,30 +127,26 @@ class HubOperation:
             revision: The revision to push to
             ignore_patterns: The ignore file patterns
         """
-        if cls.source_type(repo_id) == 'hf':
-            return HFHub.push_to_hub(cls.remove_source_type(repo_id), folder_path, path_in_repo, commit_message,
-                                commit_description, token, private, revision, ignore_patterns, **kwargs)
-        elif cls.source_type(repo_id) == 'ms':
-            return MSHub.push_to_hub(cls.remove_source_type(repo_id), folder_path, path_in_repo, commit_message,
-                                commit_description, token, private, revision, ignore_patterns, **kwargs)
-        else:
-            raise NotImplementedError
+        hub = cls._get_hub_class(repo_id)
+        return hub.push_to_hub(
+            cls.remove_source_type(repo_id), folder_path, path_in_repo, commit_message,
+            commit_description, token, private, revision, ignore_patterns, **kwargs)
 
     @classmethod
     def async_push_to_hub(cls,
                           repo_id: str,
-                            folder_path: Union[str, Path],
-                            path_in_repo: Optional[str] = None,
-                            commit_message: Optional[str] = None,
-                            commit_description: Optional[str] = None,
-                            token: Optional[Union[str, bool]] = None,
-                            private: bool = False,
-                            revision: Optional[str] = 'master',
-                            ignore_patterns: Optional[Union[List[str], str]] = None,
-                            **kwargs):
+                          folder_path: Union[str, Path],
+                          path_in_repo: Optional[str] = None,
+                          commit_message: Optional[str] = None,
+                          commit_description: Optional[str] = None,
+                          token: Optional[Union[str, bool]] = None,
+                          private: bool = False,
+                          revision: Optional[str] = 'master',
+                          ignore_patterns: Optional[Union[List[str], str]] = None,
+                          **kwargs):
         future: Future = _executor.submit(HubOperation.push_to_hub, repo_id, folder_path, path_in_repo,
-                         commit_message, commit_description, token, private,
-                         revision, ignore_patterns, **kwargs)
+                                          commit_message, commit_description, token, private,
+                                          revision, ignore_patterns, **kwargs)
         _futures[repo_id] = future
 
     @classmethod
@@ -174,12 +180,8 @@ class HubOperation:
         Returns:
             The Dataset instance
         """
-        if cls.source_type(dataset_id) == 'hf':
-            return HFHub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
-        elif cls.source_type(dataset_id) == 'ms':
-            return MSHub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
-        else:
-            raise NotImplementedError()
+        hub = cls._get_hub_class(dataset_id)
+        return hub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
 
     @classmethod
     def download_model(cls,
@@ -187,6 +189,7 @@ class HubOperation:
                        revision: Optional[str] = None,
                        download_model: bool = True,
                        ignore_patterns: Optional[List[str]] = [],
+                       token: Optional[str] = None,
                        **kwargs) -> str:
         """Download model from the hub
 
@@ -196,21 +199,51 @@ class HubOperation:
             download_model: Whether downloading bin/safetensors files, this is usually useful when only
                 using tokenizer
             ignore_patterns: Custom ignore pattern
+            token: The hub token
             **kwargs:
                 ignore_model: If true, will ignore all `large_file_pattern` files
         Returns:
             The local dir
         """
         if kwargs.pop('ignore_model', False):
-            ignore_patterns = set(ignore_patterns or []) | set(large_file_pattern)
+            ignore_patterns = set(ignore_patterns or []
+                                  ) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
             return model_id_or_path
-        if cls.source_type(model_id_or_path) == 'hf':
-            return HFHub.download_model(cls.remove_source_type(model_id_or_path), revision, ignore_patterns, **kwargs)
-        elif cls.source_type(model_id_or_path) == 'ms':
-            return MSHub.download_model(cls.remove_source_type(model_id_or_path), revision, ignore_patterns, **kwargs)
-        else:
-            raise NotImplementedError
+        hub = cls._get_hub_class(model_id_or_path)
+        return hub.download_model(
+            model_id_or_path=cls.remove_source_type(model_id_or_path),
+            revision=revision,
+            ignore_patterns=ignore_patterns,
+            token=token,
+            **kwargs)
+
+    @classmethod
+    def download_file(cls,
+                      repo_id: str,
+                      repo_type: str = 'model',
+                      allow_patterns: Optional[Union[List[str], str]] = None,
+                      token: Optional[str] = None,
+                      **kwargs) -> str:
+        """Download specific files from the hub
+
+        Args:
+            repo_id: The repository id
+            repo_type: The type of repository, default is 'model'
+            allow_patterns: Patterns to filter which files to download
+            token: The hub token
+            **kwargs: Additional arguments passed to the download function
+
+        Returns:
+            The local directory path containing downloaded files
+        """
+        hub = cls._get_hub_class(repo_id)
+        return hub.download_file(
+            repo_id=cls.remove_source_type(repo_id),
+            repo_type=repo_type,
+            allow_patterns=allow_patterns,
+            token=token,
+            **kwargs)
 
 
 class MSHub(HubOperation):
@@ -284,7 +317,8 @@ class MSHub(HubOperation):
         assert repo_id is not None, 'Please enter a valid hub_model_id'
 
         if not cls.try_login(token):
-            raise ValueError('Please specify a token by `--hub_token` or `MODELSCOPE_API_TOKEN=xxx`')
+            raise ValueError(
+                'Please specify a token by `--hub_token` or `MODELSCOPE_API_TOKEN=xxx`')
         cls.ms_token = token
         visibility = ModelVisibility.PRIVATE if private else ModelVisibility.PUBLIC
         api = HubApi()
@@ -300,12 +334,14 @@ class MSHub(HubOperation):
         with tempfile.TemporaryDirectory() as temp_cache_dir:
             from modelscope.hub.repository import Repository
             repo = Repository(temp_cache_dir, repo_id)
-            cls.add_patterns_to_gitattributes(repo, ['*.safetensors', '*.bin', '*.pt'])
+            cls.add_patterns_to_gitattributes(
+                repo, ['*.safetensors', '*.bin', '*.pt'])
             # Add 'runs/' to .gitignore, ignore tensorboard files
             cls.add_patterns_to_gitignore(repo, ['runs/', 'images/'])
             cls.add_patterns_to_file(
                 repo,
-                'configuration.json', ['{"framework": "pytorch", "task": "text-generation", "allow_remote": true}'],
+                'configuration.json', [
+                    '{"framework": "pytorch", "task": "text-generation", "allow_remote": true}'],
                 ignore_push_error=True)
             # Add '*.sagemaker' to .gitignore if using SageMaker
             if os.environ.get('SM_TRAINING_ENV'):
@@ -333,7 +369,8 @@ class MSHub(HubOperation):
             commit_message = commit_message + '\n' + commit_description
         if not os.path.exists(os.path.join(folder_path, 'configuration.json')):
             with open(os.path.join(folder_path, 'configuration.json'), 'w', encoding='utf-8') as f:
-                f.write('{"framework": "pytorch", "task": "text-generation", "allow_remote": true}')
+                f.write(
+                    '{"framework": "pytorch", "task": "text-generation", "allow_remote": true}')
         if ignore_patterns:
             ignore_patterns = [p for p in ignore_patterns if p != '_*']
         if path_in_repo:
@@ -343,15 +380,15 @@ class MSHub(HubOperation):
             ignore_patterns = []
         if revision is None or revision == 'main':
             revision = 'master'
-        push_to_hub(
-            repo_id,
-            folder_path,
-            token or cls.ms_token,
-            private,
-            commit_message=commit_message,
-            ignore_file_pattern=ignore_patterns,
-            revision=revision,
-            tag=path_in_repo)
+        return push_to_hub(
+                repo_id,
+                folder_path,
+                token or cls.ms_token,
+                private,
+                commit_message=commit_message,
+                ignore_file_pattern=ignore_patterns,
+                revision=revision,
+                tag=path_in_repo)
 
     @classmethod
     def load_dataset(cls,
@@ -360,7 +397,8 @@ class MSHub(HubOperation):
                      split: str,
                      streaming: bool = False,
                      revision: Optional[str] = None,
-                     download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
+                     download_mode: Literal['force_redownload',
+                                            'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
                      token: Optional[str] = None,
                      **kwargs):
         requires('modelscope')
@@ -374,7 +412,7 @@ class MSHub(HubOperation):
             subset_name=subset_name,
             split=split,
             version=revision,
-            download_mode=download_mode, # noqa
+            download_mode=download_mode,  # noqa
             use_streaming=streaming,
             **load_kwargs,
         )
@@ -391,7 +429,73 @@ class MSHub(HubOperation):
         if revision is None or revision == 'main':
             revision = 'master'
         from modelscope import snapshot_download
-        return snapshot_download(model_id_or_path, revision, ignore_patterns=ignore_patterns, **kwargs)
+        import inspect
+        
+        # Build download arguments
+        download_kwargs = {
+            'model_id': model_id_or_path,
+            'revision': revision,
+            'ignore_patterns': ignore_patterns,
+            **kwargs
+        }
+        
+        # Add token parameter only if supported by the function signature
+        if token is not None:
+            sig = inspect.signature(snapshot_download)
+            if 'token' in sig.parameters:
+                download_kwargs['token'] = token
+            else:
+                print(
+                    'Token parameter is not supported by current modelscope version. '
+                    'Please upgrade to modelscope >= 1.34.0 for token-based authentication.'
+                )
+        
+        return snapshot_download(**download_kwargs)
+
+    @classmethod
+    def download_file(cls,
+                      repo_id: str,
+                      repo_type: str = 'model',
+                      allow_patterns: Optional[Union[List[str], str]] = None,
+                      token: Optional[str] = None,
+                      **kwargs) -> str:
+        """Download specific files from ModelScope hub
+
+        Args:
+            repo_id: The repository id
+            repo_type: The type of repository, default is 'model'
+            allow_patterns: Patterns to filter which files to download
+            token: The hub token
+            **kwargs: Additional arguments passed to _snapshot_download
+
+        Returns:
+            The local directory path containing downloaded files
+        """
+        requires('modelscope')
+        cls.try_login(token)
+        from modelscope.hub.snapshot_download import _snapshot_download
+        import inspect
+
+        # Build download arguments
+        download_kwargs = {
+            'repo_id': repo_id,
+            'repo_type': repo_type,
+            'allow_patterns': allow_patterns,
+            **kwargs
+        }
+
+        # Add token parameter only if supported by the function signature
+        if token is not None:
+            sig = inspect.signature(_snapshot_download)
+            if 'token' in sig.parameters:
+                download_kwargs['token'] = token
+            else:
+                print(
+                    'Token parameter is not supported by current modelscope version. '
+                    'Please upgrade to modelscope >= 1.34.0 for token-based authentication.'
+                )
+
+        return _snapshot_download(**download_kwargs)
 
     @staticmethod
     def add_patterns_to_file(repo,
@@ -434,7 +538,8 @@ class MSHub(HubOperation):
 
     @staticmethod
     def add_patterns_to_gitignore(repo, patterns: List[str], commit_message: Optional[str] = None) -> None:
-        MSHub.add_patterns_to_file(repo, '.gitignore', patterns, commit_message, ignore_push_error=True)
+        MSHub.add_patterns_to_file(
+            repo, '.gitignore', patterns, commit_message, ignore_push_error=True)
 
     @staticmethod
     def add_patterns_to_gitattributes(repo, patterns: List[str], commit_message: Optional[str] = None) -> None:
@@ -447,7 +552,8 @@ class MSHub(HubOperation):
         file_name = '.gitattributes'
         if commit_message is None:
             commit_message = f'Add `{patterns[0]}` patterns to {file_name}'
-        MSHub.add_patterns_to_file(repo, file_name, new_patterns, commit_message, ignore_push_error=True)
+        MSHub.add_patterns_to_file(
+            repo, file_name, new_patterns, commit_message, ignore_push_error=True)
 
 
 class HFHub(HubOperation):
@@ -497,7 +603,8 @@ class HFHub(HubOperation):
                      split: str,
                      streaming: bool = False,
                      revision: Optional[str] = None,
-                     download_mode: Literal['force_redownload', 'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
+                     download_mode: Literal['force_redownload',
+                                            'reuse_dataset_if_exists'] = 'reuse_dataset_if_exists',
                      num_proc: Optional[int] = None,
                      **kwargs):
         requires('huggingface_hub')
@@ -519,9 +626,45 @@ class HFHub(HubOperation):
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
                        ignore_patterns: Optional[List[str]] = None,
+                       token: Optional[str] = None,
                        **kwargs):
         if revision is None or revision == 'master':
             revision = 'main'
         from huggingface_hub import snapshot_download
         return snapshot_download(
-            model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns, **kwargs)
+            repo_id=model_id_or_path,
+            repo_type='model',
+            revision=revision,
+            ignore_patterns=ignore_patterns,
+            token=token,
+            **kwargs
+        )
+
+    @classmethod
+    def download_file(cls,
+                      repo_id: str,
+                      repo_type: str = 'model',
+                      allow_patterns: Optional[Union[List[str], str]] = None,
+                      token: Optional[str] = None,
+                      **kwargs) -> str:
+        """Download specific files from HuggingFace hub
+
+        Args:
+            repo_id: The repository id
+            repo_type: The type of repository, default is 'model'
+            allow_patterns: Patterns to filter which files to download
+            token: The hub token
+            **kwargs: Additional arguments passed to snapshot_download
+
+        Returns:
+            The local directory path containing downloaded files
+        """
+        requires('huggingface_hub')
+        from huggingface_hub import snapshot_download
+        return snapshot_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            allow_patterns=allow_patterns,
+            token=token,
+            **kwargs
+        )

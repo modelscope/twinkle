@@ -162,13 +162,14 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
+        kwargs['batched'] = False # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
-            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
+            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs).filter(lambda x: x is not None, **kwargs) # filter none rows
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None,
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None,
                init_args: Dict[str, Any] = None,
                **kwargs) -> None:
         """An inplace method to operate or transform the dataset.
@@ -186,6 +187,7 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
+        kwargs['batched'] = False  # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
             self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
         if len(self.datasets) == 1:

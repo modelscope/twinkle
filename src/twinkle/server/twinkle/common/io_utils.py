@@ -22,6 +22,7 @@ from twinkle.server.utils.io_utils import (
     BaseWeightsInfoResponse,
     BaseTrainingRunManager,
     BaseCheckpointManager,
+    ResolvedLoadPath,
     validate_user_path,
     validate_ownership,
 )
@@ -146,7 +147,14 @@ class CheckpointManager(BaseCheckpointManager):
     
     def _create_checkpoint(
         self, checkpoint_id: str, checkpoint_type: str, 
-        path: str, size_bytes: int, public: bool
+        path: str, size_bytes: int, public: bool,
+        base_model: Optional[str] = None,
+        is_lora: bool = False,
+        lora_rank: Optional[int] = None,
+        train_unembed: Optional[bool] = None,
+        train_mlp: Optional[bool] = None,
+        train_attn: Optional[bool] = None,
+        user_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Create checkpoint data."""
         checkpoint = Checkpoint(
@@ -155,13 +163,47 @@ class CheckpointManager(BaseCheckpointManager):
             time=datetime.now(),
             twinkle_path=path,
             size_bytes=size_bytes,
-            public=public
+            public=public,
+            base_model=base_model,
+            is_lora=is_lora,
+            lora_rank=lora_rank,
+            train_unembed=train_unembed,
+            train_mlp=train_mlp,
+            train_attn=train_attn,
+            user_metadata=user_metadata
         )
         return checkpoint.model_dump(mode='json')
     
     def _parse_checkpoint(self, data: Dict[str, Any]) -> Checkpoint:
         """Parse checkpoint data into Checkpoint model."""
+        data = data.copy()
+        # Transform tinker_path to twinkle_path if needed
+        if 'tinker_path' in data and 'twinkle_path' not in data:
+            data['twinkle_path'] = data.pop('tinker_path')
+        elif 'twinkle_path' not in data and 'path' in data:
+            data['twinkle_path'] = data.pop('path')
         return Checkpoint(**data)
+    
+    def get(self, model_id: str, checkpoint_id: str) -> Optional[Checkpoint]:
+        """
+        Get checkpoint metadata with backwards compatibility.
+        
+        Args:
+            model_id: The model identifier
+            checkpoint_id: The checkpoint identifier
+            
+        Returns:
+            Checkpoint object or None if not found
+        """
+        data = self._read_ckpt_info(model_id, checkpoint_id)
+        if not data:
+            return None
+        # Handle backwards compatibility: construct twinkle_path if missing
+        if 'twinkle_path' not in data and 'tinker_path' not in data and 'path' not in data:
+            if 'checkpoint_id' in data:
+                data = data.copy()
+                data['twinkle_path'] = f"{self.path_prefix}{model_id}/{data['checkpoint_id']}"
+        return self._parse_checkpoint(data)
     
     def _create_checkpoints_response(self, checkpoints: List[Checkpoint]) -> CheckpointsListResponse:
         """Create a checkpoints list response."""
@@ -208,24 +250,3 @@ def create_checkpoint_manager(token: str) -> CheckpointManager:
     return CheckpointManager(token, training_run_manager)
 
 
-# Re-export for backward compatibility
-__all__ = [
-    'TWINKLE_DEFAULT_SAVE_DIR',
-    'TRAIN_RUN_INFO_FILENAME', 
-    'CHECKPOINT_INFO_FILENAME',
-    'Cursor',
-    'Checkpoint',
-    'TrainingRun',
-    'TrainingRunsResponse',
-    'CheckpointsListResponse',
-    'ParsedCheckpointTwinklePath',
-    'WeightsInfoResponse',
-    'LoraConfig',
-    'CreateModelRequest',
-    'TrainingRunManager',
-    'CheckpointManager',
-    'validate_user_path',
-    'validate_ownership',
-    'create_training_run_manager',
-    'create_checkpoint_manager',
-]

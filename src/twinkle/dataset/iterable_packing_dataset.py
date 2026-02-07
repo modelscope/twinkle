@@ -40,6 +40,7 @@ class IterablePackingDataset(IterableDataset):
         self._out_queue = mp.Queue()
         self.workers = []
         self.cyclic = cyclic
+        self._packed_called = False
     
     @remote_function()
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
@@ -49,6 +50,7 @@ class IterablePackingDataset(IterableDataset):
     @remote_function()
     def pack_dataset(self):
         """Call to start packing dataset"""
+        self._packed_called = True
         for _ in range(self.packing_num_proc):
             worker = mp.Process(target=self._processor, daemon=True)
             worker.start()
@@ -90,6 +92,7 @@ class IterablePackingDataset(IterableDataset):
     @remote_function()
     def __iter__(self):
         assert self.template is not None, 'Set template first to do packing.'
+        assert self._packed_called, 'Call `pack_dataset()` first before index the sample.'
         try:
             next(iter(self.dataset))
         except StopIteration:

@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from itertools import product
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Type, Union
-import torch.distributed as dist
 import numpy as np
 
 
@@ -20,6 +19,7 @@ class DeviceMesh:
     - tp: Tensor Parallel
     - pp: Pipeline Parallel
     - ulysses: ulysses sequence parallel
+    - sequence_parallel: megatron sequence parallel
     - cp: Context Parallel
     - ep: Expert Parallel
     - vpp: Virtual Pipeline Parallel
@@ -46,7 +46,7 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
+                   etp_size: int = 1, vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
         """Create a default device mesh from the given sizes.
 
         Args:

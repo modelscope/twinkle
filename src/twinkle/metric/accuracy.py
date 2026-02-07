@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from typing import Union, List
+
 import numpy as np
 
 from .base import Metric
-from twinkle import torch_util
+from ..data_format import InputFeature, ModelOutput
 
 
 class Accuracy(Metric):
@@ -18,7 +20,8 @@ class Accuracy(Metric):
         self.total_correct = 0
         self.total_count = 0
 
-    def accumulate(self, inputs, outputs):
+    def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
+        assert not isinstance(inputs, list), 'Accuracy does not support list InputFeature yet.'
         labels = inputs["labels"]
         logits = outputs["logits"]
         output_token_ids = logits.argmax(dim=-1)

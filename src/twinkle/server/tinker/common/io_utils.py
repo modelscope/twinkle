@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Tinker-specific IO utilities for managing training runs and checkpoints.
+"""Tinker-specific IO utilities for managing training runs and checkpoints.
 
 This module extends the base IO utilities with Tinker-specific implementations.
 It uses types from the tinker package for compatibility with the Tinker API.
@@ -16,6 +15,7 @@ from twinkle.server.utils.io_utils import (
     TRAIN_RUN_INFO_FILENAME,
     BaseTrainingRunManager,
     BaseCheckpointManager,
+    ResolvedLoadPath,
     validate_user_path,
     validate_ownership,
 )
@@ -57,7 +57,35 @@ class TrainingRunManager(BaseTrainingRunManager):
     
     def _parse_training_run(self, data: Dict[str, Any]) -> types.TrainingRun:
         """Parse training run data into TrainingRun model."""
+        # Transform checkpoint data to ensure tinker_path field exists
+        data = self._transform_checkpoint_fields(data)
         return types.TrainingRun(**data)
+    
+    def _transform_checkpoint_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform checkpoint data to ensure compatibility with tinker types.
+        
+        Handles cases where:
+        - last_checkpoint/last_sampler_checkpoint might have twinkle_path instead of tinker_path
+        - Missing path field that needs to be constructed from other data
+        """
+        data = data.copy()
+        for field in ['last_checkpoint', 'last_sampler_checkpoint']:
+            if field in data and data[field] is not None:
+                ckpt = data[field].copy()
+                # If twinkle_path exists but tinker_path doesn't, use twinkle_path
+                if 'twinkle_path' in ckpt and 'tinker_path' not in ckpt:
+                    ckpt['tinker_path'] = ckpt.pop('twinkle_path')
+                # If neither exists, try to construct from checkpoint_id
+                elif 'tinker_path' not in ckpt:
+                    # Try to get path from any available path field
+                    path = ckpt.get('path') or ckpt.get('twinkle_path')
+                    if path:
+                        ckpt['tinker_path'] = path
+                    elif 'checkpoint_id' in ckpt and 'training_run_id' in data:
+                        # Construct path from components
+                        ckpt['tinker_path'] = f"twinkle://{data['training_run_id']}/{ckpt['checkpoint_id']}"
+                data[field] = ckpt
+        return data
     
     def _create_training_runs_response(
         self, runs: List[types.TrainingRun], limit: int, offset: int, total: int
@@ -84,9 +112,17 @@ class CheckpointManager(BaseCheckpointManager):
     
     def _create_checkpoint(
         self, checkpoint_id: str, checkpoint_type: str, 
-        path: str, size_bytes: int, public: bool
+        path: str, size_bytes: int, public: bool,
+        base_model: Optional[str] = None,
+        is_lora: bool = False,
+        lora_rank: Optional[int] = None,
+        train_unembed: Optional[bool] = None,
+        train_mlp: Optional[bool] = None,
+        train_attn: Optional[bool] = None,
+        user_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Create checkpoint data."""
+        # Create base checkpoint using tinker types
         checkpoint = types.Checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
@@ -95,10 +131,27 @@ class CheckpointManager(BaseCheckpointManager):
             size_bytes=size_bytes,
             public=public
         )
-        return checkpoint.model_dump(mode='json')
+        result = checkpoint.model_dump(mode='json')
+        
+        # Add training run info fields (may not be supported by external types.Checkpoint)
+        result['base_model'] = base_model
+        result['is_lora'] = is_lora
+        result['lora_rank'] = lora_rank
+        result['train_unembed'] = train_unembed
+        result['train_mlp'] = train_mlp
+        result['train_attn'] = train_attn
+        result['user_metadata'] = user_metadata
+        
+        return result
     
     def _parse_checkpoint(self, data: Dict[str, Any]) -> types.Checkpoint:
         """Parse checkpoint data into Checkpoint model."""
+        data = data.copy()
+        # Transform twinkle_path to tinker_path if needed
+        if 'twinkle_path' in data and 'tinker_path' not in data:
+            data['tinker_path'] = data.pop('twinkle_path')
+        elif 'tinker_path' not in data and 'path' in data:
+            data['tinker_path'] = data.pop('path')
         return types.Checkpoint(**data)
     
     def _create_checkpoints_response(self, checkpoints: List[types.Checkpoint]) -> types.CheckpointsListResponse:
@@ -138,16 +191,3 @@ def create_checkpoint_manager(token: str) -> CheckpointManager:
     training_run_manager = TrainingRunManager(token)
     return CheckpointManager(token, training_run_manager)
 
-
-# Re-export for backward compatibility
-__all__ = [
-    'TWINKLE_DEFAULT_SAVE_DIR',
-    'TRAIN_RUN_INFO_FILENAME',
-    'CHECKPOINT_INFO_FILENAME',
-    'TrainingRunManager',
-    'CheckpointManager',
-    'validate_user_path',
-    'validate_ownership',
-    'create_training_run_manager',
-    'create_checkpoint_manager',
-]

@@ -31,6 +31,7 @@ class PackingDataset(Dataset):
         self._out_queue = mp.Queue()
         self.packed_idx = []
         self.packed_length = []
+        self._packed_called = False
 
     @remote_function()
     def pack_dataset(self):
@@ -64,6 +65,7 @@ class PackingDataset(Dataset):
                 self.packed_length[rank] += [sum(x[1] for x in seq) for seq in sequences]
         self.packed_idx = list(chain.from_iterable(self.packed_idx))
         self.packed_length = list(chain.from_iterable(self.packed_length))
+        self._packed_called = True
 
     def create_packed_idx(self, rank, offset, lengths):
         data = [(i + offset, sum(length) if isinstance(length, list) else length) for i, length in enumerate(lengths)]
@@ -109,6 +111,7 @@ class PackingDataset(Dataset):
 
     @remote_function()
     def __getitem__(self, index):
+        assert self._packed_called, 'Call `pack_dataset()` first before index the sample.'
         sequence = self.packed_idx[index]
         rows = [self.dataset[i] for i in sequence]
         output = {}
@@ -120,4 +123,5 @@ class PackingDataset(Dataset):
 
     @remote_function()
     def __len__(self):
+        assert self._packed_called, 'Call `pack_dataset()` first before index the sample.'
         return len(self.packed_idx)

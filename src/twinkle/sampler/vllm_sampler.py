@@ -20,6 +20,7 @@ Data Flow:
     - Results are collected via collect='flatten' (merged into single list)
 """
 import asyncio
+import atexit
 import logging
 import os
 import threading
@@ -140,57 +141,14 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         )
         
         VLLMLoraWeights().patch(self)
-        
-        # Track if shutdown has been called
-        self._shutdown = False
-        
+
         # Track LoRA loaded via checkpoint engine sync.
         # When set, sampling automatically uses this LoRA request.
         self._ckpt_lora_loaded: bool = False
-    
-    @remote_function(dispatch='all', collect='first')
-    def shutdown(self):
-        """Shutdown the sampler and release all resources.
-        
-        This method should be called before the process exits to ensure
-        proper cleanup of vLLM engine and background event loop.
-        """
-        if self._shutdown:
-            return
-        self._shutdown = True
-        
-        logger.info("Shutting down VLLMSampler...")
-        
-        # Shutdown engine first
-        if hasattr(self, 'engine') and self.engine is not None:
-            try:
-                self._run_in_loop(self._shutdown_engine_async())
-            except Exception as e:
-                logger.warning(f"Error shutting down engine: {e}")
-        
-        # Stop the background event loop
-        if hasattr(self, '_async_loop') and self._async_loop is not None:
-            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
-            if hasattr(self, '_async_thread') and self._async_thread.is_alive():
-                self._async_thread.join(timeout=5.0)
-        
-        logger.info("VLLMSampler shutdown complete")
-    
-    async def _shutdown_engine_async(self):
-        """Shutdown the engine asynchronously."""
-        if hasattr(self.engine, 'shutdown'):
-            await self.engine.shutdown()
-        elif hasattr(self.engine, 'engine') and hasattr(self.engine.engine, 'shutdown'):
-            await self.engine.engine.shutdown()
-    
-    def __del__(self):
-        """Destructor to ensure resources are released."""
-        try:
-            if not getattr(self, '_shutdown', True):
-                self.shutdown()
-        except Exception:
-            pass  # Ignore errors during destruction
-    
+
+        self._shutdown_called = False
+        atexit.register(self.shutdown)
+
     def _run_event_loop(self):
         """Run the event loop in background thread."""
         asyncio.set_event_loop(self._async_loop)
@@ -574,3 +532,30 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
             return len(weights)
 
         return self._run_in_loop(_receive_and_load())
+
+    def shutdown(self):
+        """Gracefully shutdown the vLLM engine and background event loop.
+
+        Registered via atexit so it runs automatically on process exit,
+        before GC destroys objects in unpredictable order. Safe to call
+        multiple times (idempotent).
+        """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # 1. Shutdown vLLM engine (stops EngineCore process and output_handler)
+        try:
+            if hasattr(self, 'engine') and self.engine is not None:
+                self.engine.shutdown()
+        except Exception as e:
+            logger.warning(f"VLLMSampler engine shutdown error: {e}")
+
+        # 2. Stop the background event loop and join thread
+        try:
+            if hasattr(self, '_async_loop') and self._async_loop.is_running():
+                self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            if hasattr(self, '_async_thread') and self._async_thread.is_alive():
+                self._async_thread.join(timeout=5)
+        except Exception as e:
+            logger.warning(f"VLLMSampler event loop shutdown error: {e}")

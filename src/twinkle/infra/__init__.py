@@ -410,7 +410,7 @@ def _prepare_lazy_collect(args, kwargs):
                 arg._lazy_collect = False
         return args, kwargs
 
-def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
+def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
     """Patch each class used in remote clusters with this decorator.
 
     Use this decorator to wrap your class to enable it to execute in a remote cluster.

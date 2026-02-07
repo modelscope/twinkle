@@ -160,7 +160,16 @@ class VLLMEngine(BaseSamplerEngine):
         
         logger.info(f"VLLMEngine initialized: model={self.model_id}")
         return engine
-    
+
+    def shutdown(self):
+        """Shutdown the underlying vLLM AsyncLLM engine."""
+        if hasattr(self, 'engine') and self.engine is not None:
+            try:
+                self.engine.shutdown()
+                logger.info("VLLMEngine shutdown completed.")
+            except Exception as e:
+                logger.warning(f"VLLMEngine shutdown error: {e}")
+
     async def get_tokenizer(self):
         """Get the tokenizer asynchronously."""
         if self._tokenizer is None:
@@ -180,7 +189,8 @@ class VLLMEngine(BaseSamplerEngine):
         logprobs: bool = True,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
-        adapter_uri: Optional[str] = None,
+        adapter_path: Optional[str] = None,
+        adapter_user_id: Optional[str] = None,
         lora_request: Optional[Any] = None,
         request_id: Optional[str] = None,
         priority: int = 0,
@@ -200,10 +210,10 @@ class VLLMEngine(BaseSamplerEngine):
             logprobs: Whether to return log probabilities for generated tokens.
             include_prompt_logprobs: Whether to compute logprobs on prompt tokens.
             topk_prompt_logprobs: If > 0, returns top-k logprobs for each prompt token.
-            adapter_uri: URI of LoRA adapter to use (for multi-tenant mode).
-                         Format: twinkle://{model_id}/lora/{user_id}
+            adapter_path: Resolved filesystem path to LoRA adapter directory.
+            adapter_user_id: User identifier for the adapter (for tracking loaded adapters).
             lora_request: Pre-built LoRARequest for RL training weight sync.
-                         Takes precedence over adapter_uri.
+                         Takes precedence over adapter_path.
             request_id: Optional request ID for tracking.
             priority: Request priority (higher = more urgent).
             images: Optional list of images for multimodal models.
@@ -247,9 +257,9 @@ class VLLMEngine(BaseSamplerEngine):
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         
         # Build LoRA request: pre-built lora_request takes precedence,
-        # then adapter_uri for multi-tenant mode.
-        if lora_request is None and adapter_uri and self.enable_lora:
-            lora_request = await self._get_or_load_lora(adapter_uri)
+        # then adapter_path for multi-tenant mode.
+        if lora_request is None and adapter_path and self.enable_lora:
+            lora_request = await self._get_or_load_lora(adapter_path, adapter_user_id)
         
         # Generate
         generator = self.engine.generate(
@@ -340,42 +350,27 @@ class VLLMEngine(BaseSamplerEngine):
         self._next_lora_id += 1
         return lora_id
 
-    def _parse_adapter_uri(self, adapter_uri: str) -> tuple:
-        if adapter_uri.startswith('twinkle://'):
-            # Format: twinkle://{user_id}/{relative_path}
-            suffix = adapter_uri[len('twinkle://'):]
-            parts = suffix.split('/', 1)
-            if len(parts) == 2:
-                user_id, relative_path = parts
-                # Hardcoded base path for debug - will be replaced with actual storage logic
-                base_path = "/mnt/nas2/yunlin.myl/twinkle/outputs"
-                lora_path = os.path.join(base_path, user_id, relative_path)
-                return user_id, lora_path
-            else:
-                return 'default', suffix
-        else:
-            # Local path
-            return 'default', adapter_uri
-
-    async def _get_or_load_lora(self, adapter_uri: str):
+    async def _get_or_load_lora(self, lora_path: str, user_id: Optional[str] = None):
         """
-        Get or load a LoRA adapter from URI, return LoRARequest for sampling.
+        Get or load a LoRA adapter from path, return LoRARequest for sampling.
         
         This method:
-        1. Parses the URI to get user_id and path
+        1. Uses the provided user_id for tracking (or 'default' if not provided)
         2. Checks if already loaded for this user
         3. Loads if needed
         4. Returns the LoRARequest for vLLM
         
         Args:
-            adapter_uri: The adapter URI (twinkle://... or local path)
+            lora_path: Resolved filesystem path to the LoRA adapter directory
+            user_id: User identifier for tracking loaded adapters
             
         Returns:
             LoRARequest or None if loading fails
         """
         from vllm.lora.request import LoRARequest
         
-        user_id, lora_path = self._parse_adapter_uri(adapter_uri)
+        if user_id is None:
+            user_id = 'default'
         
         # Check if already loaded for this user
         if user_id in self._user_lora_ids:
@@ -386,7 +381,7 @@ class VLLMEngine(BaseSamplerEngine):
                 if lora_path != self._user_lora_paths[user_id]:
                     # reload the lora
                     await self.remove_adapter(user_id)
-                    lora_request = await self._get_or_load_lora(adapter_uri)
+                    lora_request = await self._get_or_load_lora(lora_path, user_id)
                     return lora_request
                 return LoRARequest(
                     lora_name=f"lora_{user_id}",

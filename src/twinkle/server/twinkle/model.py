@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import threading
-import time
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request
@@ -11,10 +9,11 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.model.base import TwinkleModel
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle.server.utils.adapter_manager import AdapterManagerMixin
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
+from twinkle.utils.logger import get_logger
 from .common.serialize import deserialize_object
 from .common.io_utils import (
     CreateModelRequest,
@@ -23,7 +22,9 @@ from .common.io_utils import (
     create_checkpoint_manager,
 )
 
-# Request body model definitions
+logger = get_logger()
+
+
 class CreateRequest(BaseModel):
     class Config:
         extra = "allow"
@@ -77,10 +78,19 @@ class SaveRequest(BaseModel):
     class Config:
         extra = "allow"
 
+class UploadToHubRequest(BaseModel):
+    checkpoint_dir: str
+    hub_model_id: str
+    hub_token: Optional[str] = None
+    async_upload: bool = True
+
+    class Config:
+        extra = "allow"
+
 class LoadRequest(BaseModel):
     adapter_name: str
     load_optimizer: bool = False
-    name: Optional[str] = None
+    name: str
 
     class Config:
         extra = "allow"
@@ -129,6 +139,7 @@ def build_model_app(model_id: str,
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
+                    adapter_config: Dict[str, Any] = None,
                     **kwargs):
     app = FastAPI()
 
@@ -138,9 +149,7 @@ def build_model_app(model_id: str,
 
     @serve.deployment(name="ModelManagement")
     @serve.ingress(app)
-    class ModelManagement(TwinkleModel):
-
-        COUNT_DOWN = 60 * 30
+    class ModelManagement(AdapterManagerMixin):
 
         def __init__(self, nproc_per_node: int, device_group: Dict[str, Any], device_mesh: Dict[str, Any]):
             self.device_group = DeviceGroup(**device_group)
@@ -162,52 +171,17 @@ def build_model_app(model_id: str,
                     remote_group=self.device_group.name,
                     **kwargs
                 )
-            self.adapter_records: Dict[str, int] = {}
-            self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
-            self.hb_thread.start()
-            self.adapter_lock = threading.Lock()
+            
+            # Initialize state before adapter manager (mixin needs self.state)
             self.state: ServerStateProxy = get_server_state()
-            self.per_token_model_limit = int(os.environ.get("TWINKLE_PER_USER_MODEL_LIMIT", 3))
-            self.key_token_dict = {}
 
-        def countdown(self):
-            while True:
-                time.sleep(1)
-                for key in list(self.adapter_records.keys()):
-                    self.adapter_records[key] += 1
-                    if self.adapter_records[key] > self.COUNT_DOWN:
-                        with self.adapter_lock:
-                            self.model.remove_adapter(key)
-                        self.adapter_records.pop(key, None)
-                        token = self.key_token_dict.pop(key, None)
-                        if token:
-                            self.handle_adapter_count(token, False)
-
-        def handle_adapter_count(self, token: str, add: bool):
-            user_key = token + '_' + 'model_adapter'
-            cur_count = self.state.get_config(user_key) or 0
-            if add:
-                if cur_count < self.per_token_model_limit:
-                    self.state.add_config(user_key, cur_count + 1)
-                else:
-                    raise RuntimeError(f'Model adapter count limitation reached: {self.per_token_model_limit}')
-            else:
-                if cur_count > 0:
-                    cur_count -= 1
-                    self.state.add_config(user_key, cur_count)
-                if cur_count <= 0:
-                    self.state.pop_config(user_key)
+            # Initialize adapter manager from mixin
+            self._init_adapter_manager(**adapter_config)
+            self.start_adapter_countdown()
 
         @app.post("/create")
         def create(self, request: Request, body: CreateRequest):
             return {'status': 'ok'}
-
-        def assert_adapter_exists(self, adapter_name: str):
-            assert adapter_name and adapter_name in self.adapter_records, f"Adapter {adapter_name} not found"
-
-        def assert_adapter_valid(self, adapter_name: Optional[str]):
-            assert adapter_name is None or adapter_name == '' or adapter_name in self.adapter_records, \
-                f"Adapter {adapter_name} is invalid"
 
         @staticmethod
         def get_adapter_name(request: Request, adapter_name: Optional[str]) -> Optional[str]:
@@ -250,23 +224,6 @@ def build_model_app(model_id: str,
                 inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
             ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
-
-        # ---- Fill in the TwinkleModel abstract methods ----
-        #
-        # Explanation:
-        # TwinkleModel (src/twinkle/model/base.py) defines get_state_dict and calculate_metric as abstract methods.
-        # However, the server-side ModelManagement used to only expose most of the training/inference methods via HTTP,
-        # so these abstract methods were never implemented, causing Ray Serve to error during deployment instantiation:
-        #   TypeError: Can't instantiate abstract class ModelManagement with abstract methods ...
-        #
-        # This meant run_server.sh could start the /server endpoint, but the model app never came up.
-        # Here we implement simple pass-throughs so the underlying MultiLoraTransformersModel/TransformersModel handles them.
-
-        def get_state_dict(self, **kwargs):
-            return self.model.get_state_dict(**kwargs)
-
-        def calculate_metric(self, is_training: bool, **kwargs):
-            return self.model.calculate_metric(is_training, **kwargs)
 
         @app.post("/calculate_loss")
         def calculate_loss(self, request: Request, body: AdapterRequest):
@@ -398,22 +355,22 @@ def build_model_app(model_id: str,
             )
             
             # Save the model weights
-            self.model.save(
+            checkpoint_dir = self.model.save(
                 name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name, 
-                save_optimizer=body.save_optimizer, 
+                save_optimizer=body.save_optimizer,
                 **extra_kwargs
             )
             
             # Save checkpoint metadata
             twinkle_path = checkpoint_manager.save(
-                adapter_name,
+                model_id=adapter_name,
                 name=checkpoint_name,
                 is_sampler=False
             )
             
-            return {'result': twinkle_path}
+            return {'result': twinkle_path, 'checkpoint_dir': checkpoint_dir}
         
         @app.post("/load")
         def load(self, request: Request, body: LoadRequest):
@@ -439,58 +396,76 @@ def build_model_app(model_id: str,
             token = request.state.token
             checkpoint_manager = create_checkpoint_manager(token)
             
-            # Construct the checkpoint path and validate access
-            if body.name:
-                # Check if body.name is a twinkle:// path or a simple checkpoint name
-                if body.name.startswith("twinkle://"):
-                    # Parse twinkle:// path
-                    parsed = checkpoint_manager.parse_twinkle_path(body.name)
-                    if not parsed:
-                        raise ValueError(f"Invalid twinkle path format: {body.name}")
-                    
-                    # Extract the checkpoint name from the parsed path
-                    # parsed.checkpoint_id is like "weights/step-8"
-                    checkpoint_id = parsed.checkpoint_id
-                    checkpoint_name = parsed.checkpoint_id.split('/')[-1]  # Extract "step-8"
-                    
-                    # Use the training_run_id from the path as the model_id
-                    model_id_to_load = parsed.training_run_id
-                else:
-                    # User provided a simple checkpoint name
-                    checkpoint_id = f"weights/{body.name}"
-                    checkpoint_name = body.name
-                    model_id_to_load = adapter_name
+            # Use resolve_load_path to handle path resolution
+            resolved = checkpoint_manager.resolve_load_path(body.name)
+            
+            # Load from twinkle checkpoint directory
+            ret = self.model.load(
+                name=resolved.checkpoint_name,
+                output_dir=resolved.checkpoint_dir,
+                adapter_name=adapter_name, 
+                load_optimizer=body.load_optimizer,
+                token=token,
+                **extra_kwargs
+            )
+            
+            return {'result': ret}
+
+        @app.post("/upload_to_hub")
+        def upload_to_hub(self, request: Request, body: UploadToHubRequest):
+            """
+            Upload model checkpoint to hub.
+            
+            This endpoint uploads a previously saved checkpoint to a hub repository.
+            
+            Args:
+                request: FastAPI request object (contains token in state)
+                body: UploadToHubRequest with checkpoint_dir, hub_model_id, hub_token, and async_upload
                 
+            Returns:
+                Dict with success status and message
+            """
+            token = request.state.token
+            
+            # Check if body.name is a twinkle:// path or a simple checkpoint name
+            if body.checkpoint_dir.startswith("twinkle://"):
+                # Parse twinkle:// path
+                checkpoint_manager = create_checkpoint_manager(token)
+                parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
+                if not parsed:
+                    raise ValueError(f"Invalid twinkle path format: {body.checkpoint_dir}")
+                                # parsed.checkpoint_id is like "weights/step-8"
+                checkpoint_id = parsed.checkpoint_id
+                
+                # Use the training_run_id from the path as the model_id
+                model_id_to_load = parsed.training_run_id
+
                 # Verify checkpoint exists and user has access
                 checkpoint = checkpoint_manager.get(model_id_to_load, checkpoint_id)
                 if not checkpoint:
                     raise ValueError(
-                        f"Checkpoint not found or access denied: {body.name}"
+                        f"Checkpoint not found or access denied: {body.checkpoint_dir}"
                     )
                 
-                # Get the actual directory path
-                output_dir = checkpoint_manager.get_save_dir(
+                # Get the actual directory path for the specific checkpoint
+                checkpoint_dir = str(checkpoint_manager.get_ckpt_dir(
                     model_id=model_id_to_load,
-                    is_sampler=False
-                )
-                
-                ret = self.model.load(
-                    name=checkpoint_name,
-                    output_dir=output_dir,
-                    adapter_name=adapter_name, 
-                    load_optimizer=body.load_optimizer, 
-                    **extra_kwargs
-                )
+                    checkpoint_id=checkpoint_id
+                ))
             else:
-                # No checkpoint name provided - use default behavior
-                ret = self.model.load(
-                    name=body.name,
-                    adapter_name=adapter_name, 
-                    load_optimizer=body.load_optimizer, 
-                    **extra_kwargs
-                )
+                checkpoint_dir = body.checkpoint_dir
             
-            return {'result': ret}
+            # Call the model's upload_to_hub method
+            self.model.upload_to_hub(
+                checkpoint_dir=checkpoint_dir,
+                hub_model_id=body.hub_model_id,
+                hub_token=body.hub_token or token,
+                async_upload=body.async_upload
+            )
+            
+            return {
+                'result': body.hub_model_id
+            }
 
         @app.post("/add_adapter_to_model")
         def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
@@ -518,12 +493,16 @@ def build_model_app(model_id: str,
             token = request.state.token
             training_run_manager = create_training_run_manager(token)
             
-            with self.adapter_lock:
+            with self._adapter_lock:
                 self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
             
-            self.adapter_records[adapter_name] = 0
-            self.key_token_dict[adapter_name] = token
-            self.handle_adapter_count(token, True)
+            # Register adapter for lifecycle tracking
+            self.register_adapter(adapter_name, token)
+            
+            # Check adapter limit (raises if exceeded)
+            allowed, reason = self.check_adapter_limit(token, True)
+            if not allowed:
+                raise RuntimeError(reason)
             
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration
@@ -567,7 +546,7 @@ def build_model_app(model_id: str,
         def heartbeat(self, request: Request, body: HeartbeatRequest):
             adapter_name = self.get_adapter_name(request, adapter_name=body.adapter_name)
             self.assert_adapter_exists(adapter_name=adapter_name)
-            self.adapter_records[adapter_name] = 0
+            self.touch_adapter(adapter_name)
             return {'status': 'ok'}
 
         @app.post("/calculate_metric")

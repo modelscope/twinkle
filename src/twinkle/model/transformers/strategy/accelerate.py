@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 from typing import Dict, Any, Optional, Literal
 from twinkle import DeviceMesh
 
@@ -106,6 +107,9 @@ class AccelerateStrategy:
             reshard_after_forward=fsdp_config.pop('reshard_after_forward', True),
             **fsdp_config,
         )
+        # Enable memory efficient model loading in transformers(see `is_fsdp_enabled` in transformers)
+        # os.environ['ACCELERATE_USE_FSDP'] = '1'
+        # os.environ['FSDP_CPU_RAM_EFFICIENT_LOADING'] = '1'
         return fsdp_plugin
 
     def wrap_model(self, model, *args):

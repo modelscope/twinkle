@@ -34,7 +34,6 @@ class MultiLoraMegatronModel(MegatronModel):
                  load_weights: bool = True,
                  recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
                  recompute_modules: Optional[list] = None,  # Modules to recompute
-                 sequence_parallel: bool = False,
                  max_loras:int = 5,
                  max_r:int = 32,
                  max_length: int = 8192,
@@ -61,7 +60,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.optimizer_group = {}
         torch_util.set_device()
 
-        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=sequence_parallel, mixed_precision=mixed_precision, **kwargs)
+        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=self.device_mesh.sequence_parallel, mixed_precision=mixed_precision, **kwargs)
 
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
@@ -192,12 +191,17 @@ class MultiLoraMegatronModel(MegatronModel):
             # Final synchronization to ensure all ranks complete save
             if dist.is_initialized():
                 dist.barrier()
+            
+            return checkpoint_dir
 
     @remote_function(dispatch='all')
-    def load(self, name: Optional[str], output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         if output_dir is None:
-            output_dir = 'output'
-        checkpoint_dir = os.path.join(output_dir, name)
+            # load from hub
+            token = kwargs.pop('token', None)
+            checkpoint_dir = HubOperation.download_model(name, token=token)
+        else:
+            checkpoint_dir = os.path.join(output_dir, name)
         bridge = self._bridge
         with self.multi_adapter.save_context(kwargs.get("adapter_name")) as adapter_name:
             for _model in self.strategy.unwrap_model(self.model):
@@ -248,9 +252,9 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
 
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        super().add_metric(metric_cls, **kwargs)
+        super().add_metric(metric_cls, is_training, **kwargs)
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):

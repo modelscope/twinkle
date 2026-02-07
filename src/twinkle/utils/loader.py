@@ -33,7 +33,7 @@ class Plugin:
             sys.path.insert(0, plugin_dir)
         plugin_file = os.path.join(plugin_dir, '__init__.py')
         assert os.path.isfile(plugin_file), f'Plugin file {plugin_file} does not exist.'
-        plugin_module = importlib.import_module(plugin_file)
+        plugin_module = importlib.import_module('__init__')
         module_classes = {
             name: plugin_cls
             for name, plugin_cls in inspect.getmembers(plugin_module,
@@ -42,7 +42,7 @@ class Plugin:
         sys.path.remove(plugin_dir)
         for name, plugin_cls in module_classes.items():
             if plugin_base in plugin_cls.__mro__[
-                        1:] and plugin_cls.__module__ == plugin_file:
+                        1:] and plugin_cls.__module__ == '__init__':
                 return plugin_cls
         raise ValueError(f'Cannot find any subclass of {plugin_base.__name__}.')
 

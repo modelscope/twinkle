@@ -844,8 +844,6 @@ def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -
         return 1
     if getattr(device_mesh, "ulysses_size", None) is not None:
         return int(device_mesh.ulysses_size)
-    if getattr(device_mesh, "has_dim", None) and device_mesh.has_dim("sp"):
-        return device_mesh.get_dim_size("sp")
     return 1
 
 

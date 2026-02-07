@@ -19,14 +19,46 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.validation import verify_request_token, get_token_from_request
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
 from twinkle.sampler.types import SamplingParams as TwinkleSamplingParams
 from twinkle.utils.logger import get_logger
+from .common.io_utils import create_checkpoint_manager
 
-from .common.task_queue import TaskQueueMixin, TaskQueueConfig
 
 logger = get_logger()
+
+
+def parse_adapter_uri(adapter_uri: str, token: str) -> tuple:
+    """Parse adapter URI to extract user_id and resolved lora_path.
+    
+    Args:
+        adapter_uri: The adapter URI, supports formats:
+            - twinkle://{training_run_id}/weights/{checkpoint_name} or sampler_weights/{name}
+            - Local filesystem path
+        token: User token for resolving the base output directory
+        
+    Returns:
+        Tuple of (user_id, lora_path) where lora_path is the resolved filesystem path
+    """
+    if adapter_uri.startswith('twinkle://'):
+        # Use CheckpointManager to parse and resolve the path
+        checkpoint_manager = create_checkpoint_manager(token)
+        parsed = checkpoint_manager.parse_path(adapter_uri)
+        if parsed:
+            # Get the filesystem path using get_ckpt_dir
+            lora_path = str(checkpoint_manager.get_ckpt_dir(
+                parsed.training_run_id, parsed.checkpoint_id
+            ))
+            return parsed.training_run_id, lora_path
+        else:
+            # Fallback: parse manually for non-standard formats
+            suffix = adapter_uri[len('twinkle://'):]
+            return 'default', suffix
+    else:
+        # Local path
+        return 'default', adapter_uri
 
 
 def build_sampler_app(model_id: str,
@@ -145,8 +177,19 @@ def build_sampler_app(model_id: str,
                     # Extract prompt token IDs from ModelInput
                     prompt_token_ids = body.prompt.to_ints()
                     
-                    # Determine adapter URI from model_path
-                    adapter_uri = body.model_path if body.model_path else None
+                    # Get model_path: use body.model_path or look up from sampling session
+                    model_path = body.model_path
+                    if not model_path and body.sampling_session_id:
+                        session = self.state.get_sampling_session(body.sampling_session_id)
+                        if session:
+                            model_path = session.get('model_path')
+                    
+                    # Parse and resolve adapter URI from model_path
+                    adapter_uri = None
+                    user_id = None
+                    if model_path:
+                        token = request.state.token
+                        user_id, adapter_uri = parse_adapter_uri(model_path, token)
                     
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
@@ -169,7 +212,8 @@ def build_sampler_app(model_id: str,
                         logprobs=want_logprobs,
                         include_prompt_logprobs=body.prompt_logprobs or False,
                         topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
-                        adapter_uri=adapter_uri,
+                        adapter_path=adapter_uri,
+                        adapter_user_id=user_id,
                     )
                     
                     # Convert twinkle SampleResponse to tinker types.SampleResponse
