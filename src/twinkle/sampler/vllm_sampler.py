@@ -140,7 +140,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
             self._create_engine_async(VLLMEngine, model_id, engine_kwargs)
         )
         
-        VLLMLoraWeights().patch(self)
+        VLLMLoraWeights()(self)
 
         # Track LoRA loaded via checkpoint engine sync.
         # When set, sampling automatically uses this LoRA request.
@@ -236,7 +236,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         self,
         feat: Dict[str, Any],
         sampling_params: SamplingParams,
-        adapter_uri: Optional[str] = None,
+        adapter_path: Optional[str] = None,
         request_seed: Optional[int] = None,
         *,
         num_samples: int = 1,
@@ -246,7 +246,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         Args:
             feat: Encoded input features containing 'input_ids' and optionally 'images'/'videos'.
             sampling_params: Sampling parameters.
-            adapter_uri: Optional LoRA adapter URI.
+            adapter_path: Optional LoRA adapter path.
             request_seed: Optional seed for reproducibility.
             num_samples: Number of completions to generate for this prompt.
             
@@ -261,10 +261,9 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         videos = feat.get('videos')
         
         # If a LoRA adapter was loaded via checkpoint engine sync and
-        # no explicit adapter_uri is provided, use the synced LoRA.
-        effective_adapter_uri = adapter_uri
+        # no explicit adapter_path is provided, use the synced LoRA.
         lora_request = None
-        if not effective_adapter_uri and self._ckpt_lora_loaded:
+        if not adapter_path and self._ckpt_lora_loaded:
             from vllm.lora.request import LoRARequest
             from twinkle.sampler.vllm_worker_extension import (
                 VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
@@ -279,7 +278,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
             num_samples=num_samples,
-            adapter_uri=effective_adapter_uri,
+            adapter_path=adapter_path,
             lora_request=lora_request,
             images=images,
             videos=videos,
@@ -301,7 +300,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
-        adapter_uri: Optional[str] = None,
+        adapter_path: Optional[str] = None,
         *,
         num_samples: int = 1,
         return_type: Literal['sample_response', 'trajectory', 'InputFeature'] = 'sample_response', # TODO:enum
@@ -314,6 +313,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
                 - Trajectory: Must contain 'messages'. Requires template to be set.
             sampling_params: Sampling parameters.
             adapter_name: Optional LoRA adapter name.
+            adapter_path: Optional LoRA adapter path.
             num_samples: Number of completions to generate per input prompt.
                         When > 1, returns num_samples sequences for each input.
             
@@ -353,7 +353,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
             tasks = [
-                self._sample_single(feat, sampling_params, adapter_uri, num_samples=num_samples)
+                self._sample_single(feat, sampling_params, adapter_path, num_samples=num_samples)
                 for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)

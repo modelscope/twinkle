@@ -85,7 +85,7 @@ class TwinkleWorkerExtension:
     def __new__(cls, *args, **kwargs):
         from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
         set_death_signal()
-        VLLMLoraWeights().patch(cls)
+        VLLMLoraWeights()(None)
         return super().__new__(cls)
 
     # -----------------------------------------------------------------
