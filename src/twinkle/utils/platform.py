@@ -19,6 +19,7 @@ class DeviceMesh:
     - tp: Tensor Parallel
     - pp: Pipeline Parallel
     - ulysses: ulysses sequence parallel
+    - sequence_parallel: megatron sequence parallel
     - cp: Context Parallel
     - ep: Expert Parallel
     - vpp: Virtual Pipeline Parallel
@@ -45,7 +46,7 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
+                   etp_size: int = 1, vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
         """Create a default device mesh from the given sizes.
 
         Args:
@@ -85,11 +86,6 @@ class DeviceMesh:
             mesh_dim_sizes.append(dp_size)
         else:
             mesh_dim_sizes.append(-1)
-        if ep_size is not None:
-            mesh_dim_sizes.append(ep_size)
-            mesh_dim_names.append("ep")
-            if origin_world_size == 1:
-                world_size *= ep_size
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")

@@ -11,7 +11,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-if Platform.get_rank() == 0:
+if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     # rank0 recording
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
@@ -22,7 +22,7 @@ if Platform.get_rank() == 0:
 
 
 # Construct a device_mesh, tp=pp=cp=ep=2, dp=1
-device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, cp_size=2, ep_size=2, sequence_parallel=True)
+device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, cp_size=2, ep_size=2)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
@@ -74,8 +74,7 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # lora: 10G * 8
-    # full: 40G * 8
+    # lora: 23G * 8
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
@@ -84,7 +83,7 @@ def train():
         if step % 5 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
-            if Platform.get_rank() == 0:
+            if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 20 == 0:

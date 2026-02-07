@@ -11,7 +11,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-if Platform.get_rank() == 0:
+if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     # rank0 recording
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
@@ -21,8 +21,8 @@ if Platform.get_rank() == 0:
     )
 
 
-# Construct a device_mesh, fsdp=2, dp=2
-device_mesh = DeviceMesh.from_sizes(fsdp_size=4)
+# Construct a device_mesh, fsdp=4, dp=2
+device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
@@ -53,7 +53,7 @@ def train():
     # Encode dataset
     dataset.encode()
     # Global batch size = 4, for GPUs, so 1 sample per GPU
-    dataloader = DataLoader(dataset=dataset, batch_size=4)
+    dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
@@ -64,7 +64,8 @@ def train():
     )
 
     # Add a lora to model, with name `default`
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=4)
+    # Comment this to use full-parameter training
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
     # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
     # Add LRScheduler for lora `default`
@@ -84,7 +85,7 @@ def train():
         if step % 20 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
-            if Platform.get_rank() == 0:
+            if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 40 == 0:

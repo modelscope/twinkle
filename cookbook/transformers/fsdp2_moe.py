@@ -11,7 +11,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-if Platform.get_rank() == 0:
+if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     # rank0 recording
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
@@ -65,6 +65,7 @@ def train():
     )
 
     # Add a lora to model, with name `default`
+    # Comment this to use full-parameter training
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
     # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
@@ -75,8 +76,7 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # lora: 18G * 4
-    # full: 50G * 4
+    # lora: 34G * 8
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
@@ -85,7 +85,7 @@ def train():
         if step % 20 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
-            if Platform.get_rank() == 0:
+            if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 40 == 0:
