@@ -160,7 +160,16 @@ class VLLMEngine(BaseSamplerEngine):
         
         logger.info(f"VLLMEngine initialized: model={self.model_id}")
         return engine
-    
+
+    def shutdown(self):
+        """Shutdown the underlying vLLM AsyncLLM engine."""
+        if hasattr(self, 'engine') and self.engine is not None:
+            try:
+                self.engine.shutdown()
+                logger.info("VLLMEngine shutdown completed.")
+            except Exception as e:
+                logger.warning(f"VLLMEngine shutdown error: {e}")
+
     async def get_tokenizer(self):
         """Get the tokenizer asynchronously."""
         if self._tokenizer is None:

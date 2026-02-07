@@ -9,7 +9,7 @@ from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
-from twinkle.sampler.types import SamplingParams
+from twinkle.sampler.types import SamplingParams, SampleResponse
 from twinkle.weight_loader import NativeLoader
 from twinkle.rl import compute_advantages
 
@@ -17,6 +17,7 @@ from twinkle.rl import compute_advantages
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')
 os.environ.setdefault('TWINKLE_SEED', '42')
 os.environ.setdefault('TWINKLE_FULL_DETERMINISM', '1')
+os.environ.setdefault('RAY_TMPDIR', os.path.expanduser('~/tmp/ray'))
 
 # Training configuration
 use_ref_model = os.environ.get('TWINKLE_USE_REF_MODEL', '1') != '0'
@@ -129,6 +130,29 @@ def get_sampling_params(eos_token_ids) -> SamplingParams:
     )
 
 
+def build_trajectories_from_sample_response(sample_response: SampleResponse, batch_list, tokenizer):
+    """Convert sampler output into GRPO trajectories."""
+    if not sample_response or not getattr(sample_response, 'sequences', None):
+        return []
+    if not batch_list:
+        return []
+
+    trajectories = []
+    for i, seq in enumerate(sample_response.sequences):
+        src_batch = batch_list[i % len(batch_list)]
+        src_messages = [dict(msg) for msg in src_batch.get('messages', [])]
+        if src_messages and src_messages[-1].get('role') == 'assistant':
+            # Remove reference answer and append sampled assistant reply.
+            src_messages = src_messages[:-1]
+
+        response_text = tokenizer.decode(seq.tokens, skip_special_tokens=True) if tokenizer is not None else ''
+        trajectories.append({
+            'messages': src_messages + [{'role': 'assistant', 'content': response_text}],
+            'user_data': list(src_batch.get('user_data', [])),
+        })
+    return trajectories
+
+
 def debug_print_rollout(step, trajectories, ground_truths, rewards=None):
     """Debug helper that prints rollout intermediates (sampling, rewards, etc.).
 
@@ -182,6 +206,19 @@ def debug_print_rollout(step, trajectories, ground_truths, rewards=None):
         )
 
 
+def _collect_sample_responses(results):
+    """Custom collect function to merge multiple SampleResponse objects."""
+    if not results:
+        return SampleResponse(sequences=[])
+    if len(results) == 1:
+        return results[0]
+    all_sequences = []
+    for resp in results:
+        if resp is not None and hasattr(resp, 'sequences'):
+            all_sequences.extend(resp.sequences)
+    return SampleResponse(sequences=all_sequences)
+
+
 @remote_class()
 class ActorGroup:
     
@@ -226,7 +263,7 @@ class ActorGroup:
         self.adapter_name = adapter_name
         self.lora_config = lora_config
     
-    @remote_function(collect='flatten')
+    @remote_function(collect=_collect_sample_responses)
     def sample(self, batch, sampling_params: SamplingParams = None):
         return self.sampler.sample(batch, sampling_params=sampling_params, adapter_name=self.adapter_name)
     
@@ -293,6 +330,11 @@ def train():
     )
     
     eos_token_ids = get_eos_token_ids()
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        tokenizer = None
     
     engine_args = {
         'model': model_path,
@@ -339,13 +381,18 @@ def train():
             batch_list = [batch]
         else:
             batch_list = list(batch)
-        ground_truths = batch_list.copy()
-        
         sampling_params = get_sampling_params(eos_token_ids)
         
-        trajectories = actor_group.sample(batch_list, sampling_params)
-        if callable(trajectories):
-            trajectories = trajectories()
+        sample_response = actor_group.sample(batch_list, sampling_params)
+        if callable(sample_response):
+            sample_response = sample_response()
+        trajectories = build_trajectories_from_sample_response(sample_response, batch_list, tokenizer)
+        if not trajectories:
+            print(f'[step {step}] empty sampled trajectories, skip.', flush=True)
+            continue
+
+        # Expand ground truths to align with sampled trajectory count.
+        ground_truths = [batch_list[i % len(batch_list)] for i in range(len(trajectories))]
 
         ref_logits = None
         if use_ref_model:
@@ -357,14 +404,19 @@ def train():
             else:
                 ref_logits = ref_outputs['logits'] if isinstance(ref_outputs, dict) else ref_outputs.logits
         
-        rewards = reward.calculate(trajectories, ground_truths)
+        rewards = reward(trajectories, ground_truths)
         if callable(rewards):
             rewards = rewards()
 
-        # Updated: compute advantages from rewards and store in trajectory
-        advantages = compute_advantages(rewards, num_generations=num_generations)
+        effective_num_generations = num_generations if len(rewards) % num_generations == 0 else 1
+        scale = 'group' if effective_num_generations > 1 else 'batch'
+        advantages = compute_advantages(
+            rewards,
+            num_generations=effective_num_generations,
+            scale=scale,
+        )
         for trajectory, advantage in zip(trajectories, advantages.tolist()):
-            trajectory['advantages'] = advantage
+            trajectory['advantages'] = float(advantage)
 
         # Debug: print reward statistics (enable via TWINKLE_DEBUG=1)
         debug_print_rollout(step, trajectories, ground_truths, rewards=rewards)
@@ -381,6 +433,7 @@ def train():
         
         if max_steps and step >= max_steps:
             break
+
 
 
 if __name__ == '__main__':

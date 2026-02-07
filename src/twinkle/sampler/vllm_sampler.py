@@ -20,6 +20,7 @@ Data Flow:
     - Results are collected via collect='flatten' (merged into single list)
 """
 import asyncio
+import atexit
 import logging
 import os
 import threading
@@ -137,7 +138,10 @@ class VLLMSampler(Sampler):
         )
         
         VLLMLoraWeights().patch(self)
-    
+
+        self._shutdown_called = False
+        atexit.register(self.shutdown)
+
     def _run_event_loop(self):
         """Run the event loop in background thread."""
         asyncio.set_event_loop(self._async_loop)
@@ -409,3 +413,30 @@ class VLLMSampler(Sampler):
                   Required after level 2 sleep which discards weights.
         """
         self._run_in_loop(self.engine.wake_up(tags=tags, reload_weights=reload_weights))
+
+    def shutdown(self):
+        """Gracefully shutdown the vLLM engine and background event loop.
+
+        Registered via atexit so it runs automatically on process exit,
+        before GC destroys objects in unpredictable order. Safe to call
+        multiple times (idempotent).
+        """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # 1. Shutdown vLLM engine (stops EngineCore process and output_handler)
+        try:
+            if hasattr(self, 'engine') and self.engine is not None:
+                self.engine.shutdown()
+        except Exception as e:
+            logger.warning(f"VLLMSampler engine shutdown error: {e}")
+
+        # 2. Stop the background event loop and join thread
+        try:
+            if hasattr(self, '_async_loop') and self._async_loop.is_running():
+                self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            if hasattr(self, '_async_thread') and self._async_thread.is_alive():
+                self._async_thread.join(timeout=5)
+        except Exception as e:
+            logger.warning(f"VLLMSampler event loop shutdown error: {e}")
