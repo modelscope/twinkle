@@ -11,6 +11,7 @@ Twinkle DOCUMENTATION
 
    使用指引/快速开始.md
    使用指引/安装.md
+   使用指引/服务端和客户端/index.rst
    使用指引/NPU的支持.md
 
 .. toctree::
