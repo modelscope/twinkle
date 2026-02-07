@@ -36,7 +36,7 @@ class VLLMLoraWeights(Patch):
         
         def _get_tokenizer():
             """Get tokenizer lazily from sampler's template."""
-            if _sampler_ref.template is not None:
+            if _sampler_ref and _sampler_ref.template is not None:
                 return _sampler_ref.template.tokenizer
             return None
         

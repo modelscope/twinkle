@@ -13,7 +13,6 @@ from typing import Optional
 from twinkle import DeviceMesh, remote_class
 from twinkle.processor import InputProcessor
 
-# TODO: remove
 @remote_class()
 class GRPOLossProcessor(InputProcessor):
     """

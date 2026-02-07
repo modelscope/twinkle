@@ -315,6 +315,7 @@ def create_dataset():
 
 
 def train():
+    raise NotImplementedError("Not implemented")
     nproc_per_node, actor_ranks, ref_ranks = parse_device_config()
     
     device_groups = create_device_groups(actor_ranks, ref_ranks)

@@ -33,6 +33,7 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import torch_util, construct_class
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.model.base import TwinkleModel
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
@@ -139,7 +140,7 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
 
 @remote_class()
-class TransformersModel(TwinkleModel, PreTrainedModel):
+class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
 
     Args:
@@ -197,6 +198,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             model_id = HubOperation.download_model(model_id)
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         # Construct sequence-parallel strategy lazily during wrapping to reduce init-time side effects.
+        self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
@@ -325,6 +327,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        self.model.train()
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -364,6 +367,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        self.model.eval()
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -867,7 +871,29 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
-        return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
+        return self.strategy.unwrap_model(self.model).state_dict()
+
+    @remote_function(collect='first')
+    def get_peft_config_dict(self, adapter_name: str = None) -> dict:
+        """Return the PEFT config as a dict for vLLM's PEFTHelper.
+
+        Used by CheckpointEngineManager to pass peft_config to the sampler
+        when doing LoRA-only weight sync.
+
+        Returns:
+            PEFT config dict, or None if the model has no LoRA adapter.
+        """
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is None or optimizer_config.adapter_config is None:
+            return None
+        config = optimizer_config.adapter_config
+        # PeftConfig can be a dict-like mapping (e.g. {adapter_name: LoraConfig})
+        # or a single LoraConfig.  Normalize to a single config.
+        if isinstance(config, dict):
+            config = config.get(adapter_name, next(iter(config.values())))
+        return config.to_dict() if hasattr(config, 'to_dict') else dict(config)
 
     @remote_function(collect='first')
     def calculate_metric(self, is_training, **kwargs):
@@ -1027,3 +1053,97 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
                      f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}%\n'
                      )
         return expr
+
+    # =========================================================================
+    # Checkpoint Engine — Weight Sync (from CheckpointEngineMixin)
+    # =========================================================================
+    # prepare_checkpoint_engine, init_checkpoint_process_group, and
+    # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
+    # Only send_weights_via_checkpoint_engine is model-specific.
+
+    @remote_function(dispatch='all')
+    def send_weights_via_checkpoint_engine(
+        self,
+        adapter_name: str = '',
+        base_sync_done: bool = False,
+    ):
+        """Send model weights via NCCL broadcast.
+
+        Called on ALL model workers:
+        - Rank 0 (master): Collects weights and broadcasts via NCCL.
+        - Other ranks (rank=-1): Consume the generator without sending.
+
+        LoRA-aware sending (follows verl's design):
+        - ``base_sync_done=False``: Send ALL base weights from the full state
+          dict.  Names are sent as-is (including ``.base_layer`` for PEFT
+          models); the **sampler** side handles stripping ``.base_layer``
+          based on its vLLM ``enable_lora`` setting.
+          LoRA-specific weights (lora_A, lora_B) are filtered out.
+        - ``base_sync_done=True`` and ``adapter_name`` is set: Send only LoRA
+          adapter weights via ``get_peft_model_state_dict()``.  The sampler
+          converts names to vLLM LoRA format for ``add_lora()``.
+
+        Args:
+            adapter_name: Adapter name for LoRA weight identification.
+            base_sync_done: If True, only send LoRA adapter weights.
+        """
+        import asyncio
+        import threading
+        from twinkle.utils.framework import Torch
+
+        engine = self._get_or_create_checkpoint_engine()
+
+        # Get state dict from unwrapped model
+        model = self.strategy.unwrap_model(self.model)
+
+        if base_sync_done and adapter_name:
+            # ── LoRA-only mode: send only adapter weights ────────────────
+            # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
+            from peft.utils import get_peft_model_state_dict
+            lora_state_dict = get_peft_model_state_dict(model)
+
+            def weight_generator():
+                for name, tensor in lora_state_dict.items():
+                    tensor = Torch.to_local_tensor(tensor)
+                    yield name, tensor
+
+        else:
+            # ── Full model mode: send all weights (base model sync) ──────
+            state_dict = model.state_dict()
+
+            def weight_generator():
+                for name, tensor in state_dict.items():
+                    # Skip LoRA-specific weights for base model sync
+                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                        continue
+                    tensor = Torch.to_local_tensor(tensor)
+                    # Keep original names (including .base_layer for PEFT models).
+                    # The sampler side will strip .base_layer based on whether
+                    # vLLM has enable_lora=True/False.
+                    yield name, tensor
+
+        # Run async send_weights in a dedicated event loop thread.
+        # We cannot use the Ray worker's event loop because it may already
+        # be occupied, and send_weights uses run_in_executor internally.
+        async def _send():
+            await engine.send_weights(weight_generator())
+
+        result_container = {'error': None}
+
+        def _run():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_send())
+                finally:
+                    loop.close()
+            except Exception as e:
+                result_container['error'] = e
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+
+        if result_container['error'] is not None:
+            raise result_container['error']
