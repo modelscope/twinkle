@@ -5,7 +5,7 @@ from twinkle.checkpoint_engine.base import CheckpointEngine
 
 class CheckpointEngineMixin:
 
-    _checkpoint_engine: "CheckpointEngine | None" = None
+    _checkpoint_engine: CheckpointEngine = None
     _bucket_size: int = 2048 << 20  # 2 GB
 
     def _get_or_create_checkpoint_engine(self) -> "CheckpointEngine":
@@ -17,17 +17,15 @@ class CheckpointEngineMixin:
             elif Platform.get_platform().__name__ == 'NPU':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
                 self._checkpoint_engine = HCCLCheckpointEngine(self._bucket_size)
-            self._checkpoint_engine.is_master = Platform.is_master()
-            self._checkpoint_engine.prepare()
         return self._checkpoint_engine
 
-    @remote_function(dispatch='all')
-    def prepare_checkpoint_engine(self):
+    @remote_function(collect='first', lazy_collect=False)
+    def prepare_checkpoint_engine(self, is_master):
         engine = self._get_or_create_checkpoint_engine()
-        engine.is_master = Platform.is_master()
+        engine.is_master = is_master
         return engine.prepare()
 
-    @remote_function(dispatch='all')
+    @remote_function(dispatch='all', lazy_collect=False)
     def init_checkpoint_process_group(self, rank: int, world_size: int, master_metadata):
         """Initialize process group for weight synchronization."""
         engine = self._get_or_create_checkpoint_engine()
@@ -37,7 +35,7 @@ class CheckpointEngineMixin:
             master_metadata=master_metadata,
         )
 
-    @remote_function(dispatch='all')
+    @remote_function(dispatch='all', lazy_collect=False)
     def finalize_checkpoint_engine(self):
         """Finalize checkpoint engine: release buffers, optionally destroy group."""
         if self._checkpoint_engine is not None:

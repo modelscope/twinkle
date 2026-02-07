@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 class TwinkleModel(ABC):
 
+    _checkpoint_engine = None
+
     @abstractmethod
     def forward(self, *, inputs: Dict[str, Any], **kwargs):
         ...
@@ -108,7 +110,9 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def set_checkpoint_engine(self):
+    def send_weights(self,
+                    adapter_name: str = '',
+                    base_sync_done: bool = False,):
         ...
 
     @abstractmethod

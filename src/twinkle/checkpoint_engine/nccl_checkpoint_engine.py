@@ -118,25 +118,10 @@ class BroadcastOperation:
 
 
 class NCCLCheckpointEngine(CheckpointEngine):
-    """NCCL checkpoint engine using torch.distributed ProcessGroupNCCL.
-
-    All heavy resources (NCCL process group, ZMQ sockets, GPU buffers) are
-    **persistent** — they are created once during the first ``prepare()`` /
-    ``init_process_group()`` call and reused across subsequent syncs.
-    ``finalize()`` only releases buffers by default; set ``rebuild_group=True``
-    if you need to tear everything down each sync.
-
-    Args:
-        bucket_size: Bucket size in bytes for weight transfer.
-            Note: Memory overhead is 2 * bucket_size due to double buffering.
-        group_name: Name of the NCCL process group.
-        rebuild_group: Whether to destroy the NCCL group after each sync.
-        rollout_dtype: Target dtype for weights.
-    """
 
     def __init__(
         self,
-        bucket_size: int,
+        bucket_size: int = 2048 << 20,
         group_name: str = "twinkle_ckpt",
         rebuild_group: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
