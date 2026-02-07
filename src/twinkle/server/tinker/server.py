@@ -216,17 +216,6 @@ def build_server_app(
             """
             return await self._proxy_request(request, endpoint, base_model, 'sampler')
 
-        @staticmethod
-        def _sample_output() -> types.SampleResponse:
-            """Generate a sample output for testing purposes.
-            
-            Returns:
-                A mock SampleResponse with dummy data
-            """
-            sequence = types.SampledSequence(stop_reason="stop", tokens=[
-                                             1, 2, 3], logprobs=[-0.1, -0.2, -0.3])
-            return types.SampleResponse(sequences=[sequence])
-
         # --- Endpoints ---------------------------------------------------------
 
         @app.get("/healthz")
@@ -682,8 +671,8 @@ def build_server_app(
         async def asample(self, request: Request, body: types.SampleRequest) -> Any:
             """Execute text generation (inference).
             
-            This endpoint first tries to use a local sampler if available.
-            Otherwise, it proxies the request to the sampler service.
+            Proxies the request to the sampler service based on base_model.
+            The sampler handles model_path resolution from sampling session.
             
             Args:
                 body: Sample request with prompt and sampling parameters
@@ -691,23 +680,13 @@ def build_server_app(
             Returns:
                 Proxied response from sampler service
             """
-            model_path = body.model_path
             base_model = body.base_model
             
-            # If both are None, look up from sampling session
-            if not model_path and not base_model and body.sampling_session_id:
+            # If base_model not provided, look up from sampling session
+            if not base_model and body.sampling_session_id:
                 session = self.state.get_sampling_session(body.sampling_session_id)
                 if session:
-                    model_path = session.get('model_path')
                     base_model = session.get('base_model')
-            
-            # Extract base_model from model_path if needed
-            if model_path and not base_model:
-                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
-                path = model_path.replace("twinkle://", "").replace("tinker://", "")
-                parts = path.split("/")
-                if len(parts) >= 2:
-                    base_model = f"{parts[0]}/{parts[1]}"
             
             return await self._proxy_to_sampler(request, "asample", base_model)
             

@@ -53,34 +53,34 @@ applications:
         logging_config:
           log_level: DEBUG
 
-  # - name: sampler-Qwen2.5-0.5B-Instruct
-  #   route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct
-  #   import_path: sampler
-  #   args:
-  #     model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
-  #     nproc_per_node: 1
-  #     sampler_type: vllm  # or 'torch' for TorchSampler
-  #     engine_args:
-  #       max_model_len: 4096
-  #       gpu_memory_utilization: 0.5
-  #       enable_lora: false
-  #     device_group:
-  #       name: sampler
-  #       ranks: [0]
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       mesh: [0]
-  #       mesh_dim_names: ['dp']
-  #   deployments:
-  #     - name: SamplerManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
-  #         num_gpus: 1
-  #       logging_config:
-  #         log_level: DEBUG
+  - name: sampler-Qwen2.5-0.5B-Instruct
+    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
+      nproc_per_node: 1
+      sampler_type: vllm  # or 'torch' for TorchSampler
+      engine_args:
+        max_model_len: 4096
+        gpu_memory_utilization: 0.5
+        enable_lora: false
+      device_group:
+        name: sampler
+        ranks: [0]
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          num_gpus: 1
+        logging_config:
+          log_level: DEBUG
 

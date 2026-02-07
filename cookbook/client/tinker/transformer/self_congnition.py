@@ -46,7 +46,7 @@ def train():
         print(f"Saved checkpoint to {save_result.path}")
 
 def eval():
-    weight_path = "twinkle://20260203_194633-Qwen_Qwen2_5-0_5B-Instruct-03aa3f06/weights/twinkle-lora"
+    weight_path = "twinkle://20260207_110850-Qwen_Qwen2_5-0_5B-Instruct-ce7e819f/weights/twinkle-lora-2"
 
     service_client = init_tinker_compat_client(base_url='http://localhost:8000')
     sampling_client = service_client.create_sampling_client(
@@ -56,6 +56,10 @@ def eval():
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
 
     inputs = [
+        {
+            'role': 'system',
+            'content': 'You are a helpful assistant.'
+        },
         {
             'role': 'user',
             'content': 'what is your name?'
@@ -78,5 +82,5 @@ def eval():
         print(f"{i}: {repr(tokenizer.decode(seq.tokens))}")
 
 if __name__ == "__main__":
-    train()
-    # eval()
+    # train()
+    eval()

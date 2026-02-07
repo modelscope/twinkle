@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Tinker-specific IO utilities for managing training runs and checkpoints.
+"""Tinker-specific IO utilities for managing training runs and checkpoints.
 
 This module extends the base IO utilities with Tinker-specific implementations.
 It uses types from the tinker package for compatibility with the Tinker API.
