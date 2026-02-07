@@ -1,15 +1,10 @@
 """
-GRPO Training Cookbook - Standalone Mode with LoRA
+GRPO Training Cookbook - MegatronModel with LoRA (Standalone Mode)
 
-This cookbook demonstrates GRPO training using TransformersModel and VLLMSampler
-in standalone mode (model and sampler on different GPUs with NCCL weight sync).
-
-Task: Countdown Game
-- Given numbers [a, b, c, d], find an equation using +, -, *, / that equals target
-- Rewards: format reward (<think>/<answer> tags) + accuracy reward (correct equation)
+Tests MegatronModel RL training with the same Countdown Game task as lora.py.
 
 Usage:
-    SWANLAB_API_KEY=xxx python cookbook/grpo/lora.py
+    python cookbook/grpo/megatron_lora.py
 """
 
 import os
@@ -18,7 +13,6 @@ import time
 import numpy as np
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass, field
-from contextlib import contextmanager
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
@@ -31,47 +25,40 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import Trajectory, Message, InputFeature
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.model import TransformersModel
+from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import VLLMSampler
 from twinkle.sampler.types import SamplingParams, SampleResponse
 from twinkle.rl import GRPOAdvantage
-from twinkle.checkpoint_engine import CheckpointEngineManager
+import ray
 from twinkle.template import Template
 
 from transformers import AutoTokenizer
 from twinkle.hub import HubOperation
 
-# SwanLab is optional - only used if SWANLAB_API_KEY is set
-USE_SWANLAB = 'SWANLAB_API_KEY' in os.environ
-if USE_SWANLAB:
-    import swanlab
-
 logger = get_logger()
 
 # ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
-NUM_GPUS = int(os.environ.get('NUM_GPUS', 4))
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', NUM_GPUS // 2))
-SAMPLER_GPUS = NUM_GPUS - MODEL_GPUS
-NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 4))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
-LEARNING_RATE = float(os.environ.get('LR', 1e-5))
-GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
-GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 2000))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
-GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
-TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
-WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
-
+NUM_GPUS = 4
+MODEL_GPUS = 2
+SAMPLER_GPUS = 2
+NUM_GENERATIONS = 4
+MAX_NEW_TOKENS = 1024
+LEARNING_RATE = 1e-5
+GRPO_EPSILON = 0.2
+GRPO_BETA = 0.0
+MAX_STEPS = 20
+BATCH_SIZE = 2
+GRADIENT_ACCUMULATION_STEPS = 1
+TEMPERATURE = 1.0
+WEIGHT_SYNC_INTERVAL = 1
 ADAPTER_NAME = 'default'
 
 
 # ========== Metrics ==========
 @dataclass
 class TrainingMetrics:
-    """Metrics collected during training."""
     generate_time: float = 0.0
     weight_sync_time: float = 0.0
     rewards: List[float] = field(default_factory=list)
@@ -91,36 +78,15 @@ class TrainingMetrics:
         self.loss = 0.0
         self.grad_norm = 0.0
 
-    def to_log_dict(self, step: int) -> Dict[str, float]:
-        log_dict = {
-            'step': step,
-            'profiling/Time taken: GRPOTrainer._move_model_to_vllm': self.weight_sync_time,
-            'profiling/Time taken: GRPOTrainer.generate': self.generate_time,
-            'train/loss': self.loss,
-            'train/grad_norm': self.grad_norm,
-        }
-        if self.rewards:
-            log_dict['train/reward'] = sum(self.rewards) / len(self.rewards)
-            log_dict['train/reward_std'] = torch.tensor(self.rewards).std().item() if len(self.rewards) > 1 else 0.0
-        if self.format_rewards:
-            log_dict['train/rewards/Format/mean'] = sum(self.format_rewards) / len(self.format_rewards)
-        if self.accuracy_rewards:
-            log_dict['train/rewards/CountdownORM/mean'] = sum(self.accuracy_rewards) / len(self.accuracy_rewards)
-        if self.completion_lengths:
-            log_dict['train/completions/mean_length'] = sum(self.completion_lengths) / len(self.completion_lengths)
-        return log_dict
-
 
 # ========== Rewards ==========
 def format_reward(completion: str) -> float:
-    """Format reward: checks <think> and <answer> tags."""
     has_think = bool(re.search(r"<think>.*?</think>", completion, re.DOTALL))
     has_answer = bool(re.search(r"<answer>.*?</answer>", completion, re.DOTALL))
     return 1.0 if (has_think and has_answer) else 0.0
 
 
 def countdown_accuracy_reward(completion: str, target: int, nums: List[int]) -> float:
-    """Accuracy reward: checks if equation is correct."""
     try:
         match = re.search(r'<answer>(.*?)<\/answer>', completion)
         if match is None:
@@ -141,7 +107,6 @@ def countdown_accuracy_reward(completion: str, target: int, nums: List[int]) -> 
 
 # ========== Dataset ==========
 def create_countdown_dataset():
-    """Create Countdown Game dataset."""
     from twinkle.preprocessor import CountdownProcessor
     dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
     dataset.set_template("Template", model_id=MODEL_ID, max_length=8192)
@@ -157,14 +122,7 @@ def process_samples(
     num_generations: int,
     template: Template,
 ) -> Tuple[List[Trajectory], List[InputFeature], List[List[float]], List[int]]:
-    """Process sampled responses.
-
-    Builds ``InputFeature`` directly by concatenating prompt token ids with
-    the sampler's raw response token ids, avoiding decode/re-encode drift.
-
-    Returns:
-        (trajectories, input_features, old_logps_list, completion_lengths)
-    """
+    """Process sampled responses — same logic as lora.py."""
     trajectories: List[Trajectory] = []
     input_features: List[InputFeature] = []
     old_logps_list: List[List[float]] = []
@@ -192,10 +150,6 @@ def process_samples(
         for j in range(num_generations):
             seq_idx = i * num_generations + j
             if seq_idx >= len(sequences):
-                logger.warning(
-                    f"Expected {len(prompts) * num_generations} sequences, "
-                    f"got {len(sequences)}"
-                )
                 break
 
             seq = sequences[seq_idx]
@@ -203,7 +157,6 @@ def process_samples(
             response_logprobs = seq.logprobs if seq.logprobs else []
             response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
 
-            # Trajectory (for reward computation only)
             messages = [
                 msg for msg in prompt.get('messages', [])
                 if not (msg.get('role') == 'assistant'
@@ -215,7 +168,6 @@ def process_samples(
                 user_data=prompt.get('user_data', []),
             ))
 
-            # InputFeature (exact token alignment with sampler)
             input_ids = prompt_ids + response_tokens
             labels = [-100] * len(prompt_ids) + response_tokens
             input_feature = InputFeature(
@@ -232,7 +184,6 @@ def process_samples(
 
 
 def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[float], List[float]]:
-    """Compute format and accuracy rewards."""
     total_rewards, format_rewards, accuracy_rewards = [], [], []
     for traj in trajectories:
         messages = traj.get('messages', [])
@@ -254,7 +205,6 @@ def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[f
 
 
 def wait_result(result):
-    """Wait for lazy collect result if needed."""
     if hasattr(result, '_is_lazy_collect') and result._is_lazy_collect:
         return result()
     if callable(result) and hasattr(result, '_get_result'):
@@ -262,24 +212,54 @@ def wait_result(result):
     return result
 
 
+class SimpleWeightSync:
+    """Sync weights from MegatronModel to VLLMSampler via Ray object store.
+
+    Avoids ray.util.collective NCCL, which conflicts with Megatron's
+    torch.distributed NCCL (Megatron's initialize_model_parallel creates
+    NCCL communicators that are incompatible with cupy's NCCL bindings
+    used by ray.util.collective).
+    """
+
+    def __init__(self, model, sampler, adapter_name: str = ''):
+        self.model = model
+        self.sampler = sampler
+        self.adapter_name = adapter_name
+        self.base_sync_done = False
+
+    def sync_weights(self, adapter_name: str = ''):
+        """Sync model weights to sampler via Ray object store."""
+        adapter_name = adapter_name or self.adapter_name
+
+        if not self.base_sync_done:
+            # First sync: all base weights
+            weights_dict = wait_result(
+                self.model.export_weights_dict(adapter_name=adapter_name)
+            )
+            peft_config = None
+        else:
+            # Subsequent syncs: LoRA weights only
+            weights_dict = wait_result(
+                self.model.export_weights_dict(adapter_name=adapter_name, lora_only=True)
+            )
+            peft_config = wait_result(
+                self.model.get_peft_config_dict(adapter_name=adapter_name)
+            )
+
+        # Load into sampler
+        wait_result(self.sampler.import_weights_dict(
+            weights=weights_dict,
+            peft_config=peft_config,
+            base_sync_done=self.base_sync_done,
+        ))
+
+        # TODO: remove this after lora sync is implemented
+        # if not self.base_sync_done:
+        #     self.base_sync_done = True
+
+
 # ========== Main ==========
 def main():
-    if USE_SWANLAB:
-        swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-        swanlab.init(project="ms-swift", config={
-            'model_id': MODEL_ID,
-            'num_gpus': NUM_GPUS,
-            'model_gpus': MODEL_GPUS,
-            'sampler_gpus': SAMPLER_GPUS,
-            'num_generations': NUM_GENERATIONS,
-            'learning_rate': LEARNING_RATE,
-            'grpo_beta': GRPO_BETA,
-            'batch_size': BATCH_SIZE,
-            'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
-        })
-    else:
-        logger.info("SWANLAB_API_KEY not set, running without experiment tracking")
-
     # ── Device setup ──────────────────────────────────────────────────
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)),
@@ -287,7 +267,10 @@ def main():
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)),
                     device_type='GPU', gpus_per_worker=1),
     ]
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    # MegatronModel: DP=2, TP=1, PP=1 for 2 GPUs
+    model_mesh = DeviceMesh.from_sizes(
+        dp_size=MODEL_GPUS, tp_size=1, pp_size=1,
+    )
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
 
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
@@ -297,16 +280,22 @@ def main():
         target_modules="all-linear", r=8, lora_alpha=32, lora_dropout=0.05,
     )
 
-    # ── Model (training) ──────────────────────────────────────────────
-    model = TransformersModel(
-        model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model',
+    # ── MegatronModel (training) ──────────────────────────────────────
+    model = MegatronModel(
+        model_id=MODEL_ID,
+        device_mesh=model_mesh,
+        remote_group='model',
+        mixed_precision='bf16',
+        recompute_granularity='selective',
     )
     model.add_adapter_to_model(
         ADAPTER_NAME, lora_config,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     )
-    model.set_optimizer('AdamW', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
-    model.set_lr_scheduler('LinearLR', adapter_name=ADAPTER_NAME)
+    # MegatronModel uses Megatron's distributed optimizer and scheduler
+    model.set_optimizer('default', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
+    model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE,
+                           adapter_name=ADAPTER_NAME)
     model.set_loss('GRPOLoss', adapter_name=ADAPTER_NAME,
                    epsilon=GRPO_EPSILON, beta=GRPO_BETA)
     model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
@@ -316,18 +305,20 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'load_format': 'dummy',
-            'gpu_memory_utilization': 0.7,
+            'gpu_memory_utilization': 0.3,
             'max_model_len': 2048,
             'enforce_eager': True,
             'enable_sleep_mode': False,
-            'enable_lora': True,
+            'enable_lora': False, # sync lora todo
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=MODEL_ID)
 
-    ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
+    # Use SimpleWeightSync instead of CheckpointEngineManager to avoid
+    # NCCL conflict between Megatron's torch.distributed and cupy NCCL.
+    weight_sync = SimpleWeightSync(model, sampler, adapter_name=ADAPTER_NAME)
     dataset = create_countdown_dataset()
     dataloader = DataLoader(
         dataset=dataset, batch_size=BATCH_SIZE,
@@ -356,7 +347,7 @@ def main():
         # ========== 1. Weight Sync ==========
         if step % WEIGHT_SYNC_INTERVAL == 0:
             sync_start = time.perf_counter()
-            ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
+            weight_sync.sync_weights(adapter_name=ADAPTER_NAME)
             metrics.weight_sync_time = time.perf_counter() - sync_start
 
         # ========== 2. Generate ==========
@@ -386,7 +377,6 @@ def main():
 
         # ========== 5. Compute advantages ==========
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group')
-        # Convert to list so dispatch='slice_dp' slices it in sync with inputs
         advantages = advantages.tolist()
 
         frac_zero_std = 1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
@@ -396,8 +386,7 @@ def main():
             continue
 
         # ========== 6. Training step ==========
-        # Pass InputFeature list directly (exact token alignment with sampler).
-        # advantages and old_logps are lists, sliced in sync by dispatch.
+        # MegatronModel.forward_backward returns float loss directly
         loss = wait_result(model.forward_backward(
             inputs=input_features,
             adapter_name=ADAPTER_NAME,
@@ -405,37 +394,34 @@ def main():
             old_logps=old_logps_list,
         ))
 
-        grad_norm = wait_result(model.clip_grad_and_step(adapter_name=ADAPTER_NAME))
-        metrics.loss = float(loss) if loss else 0.0
-        if isinstance(grad_norm, list):
-            grad_norm = grad_norm[0]
-        metrics.grad_norm = float(grad_norm) if isinstance(grad_norm, (int, float)) else 0.0
+        # MegatronModel: step/zero_grad/lr_step separately
+        # step() stores grad_norm internally
+        wait_result(model.step(adapter_name=ADAPTER_NAME))
+        wait_result(model.zero_grad(adapter_name=ADAPTER_NAME))
+        wait_result(model.lr_step(adapter_name=ADAPTER_NAME))
 
-        from twinkle.utils.framework import Torch
+        metrics.loss = float(loss) if loss is not None else 0.0
+        # grad_norm is not directly returned; it's stored in optimizer_config
+        # For now, log loss only; grad_norm can be retrieved if needed
+        metrics.grad_norm = 0.0
+
         import gc
+        from twinkle.utils.framework import Torch
         gc.collect()
         Torch.empty_cache()
 
         # ========== 7. Log ==========
-        log_dict = metrics.to_log_dict(step)
-        log_dict['train/frac_reward_zero_std'] = frac_zero_std
-        if USE_SWANLAB:
-            swanlab.log(log_dict)
-
         logger.info(
             f"Step {step}: loss={metrics.loss:.6f}, grad_norm={metrics.grad_norm:.7f}, "
-            f"reward={log_dict.get('train/reward', 0):.4f}, "
-            f"format={log_dict.get('train/rewards/Format/mean', 0):.2f}, "
-            f"accuracy={log_dict.get('train/rewards/CountdownORM/mean', 0):.2f}, "
-            f"completion_len={log_dict.get('train/completions/mean_length', 0):.1f}"
+            f"reward={sum(metrics.rewards) / max(len(metrics.rewards), 1):.4f}, "
+            f"format={sum(metrics.format_rewards) / max(len(metrics.format_rewards), 1):.2f}, "
+            f"accuracy={sum(metrics.accuracy_rewards) / max(len(metrics.accuracy_rewards), 1):.2f}, "
+            f"completion_len={sum(metrics.completion_lengths) / max(len(metrics.completion_lengths), 1):.1f}"
         )
 
         step += 1
 
     logger.info(f"Training completed. Total steps: {step}")
-    wait_result(model.save('grpo-countdown-checkpoint', adapter_name=ADAPTER_NAME))
-    if USE_SWANLAB:
-        swanlab.finish()
 
 
 if __name__ == '__main__':

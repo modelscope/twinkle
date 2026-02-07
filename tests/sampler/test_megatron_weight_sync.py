@@ -1,26 +1,30 @@
 #!/usr/bin/env python
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Test STANDALONE weight synchronization between training model and vLLM sampler.
+"""Test STANDALONE weight synchronization between MegatronModel and vLLM sampler.
 
-This script serves as both a test and a minimal demo of the weight sync flow
-used during RL training:
+This script tests the checkpoint engine weight sync flow when the training
+model uses Megatron-Core (with TP/PP parallelism) and the inference sampler
+uses vLLM:
 
-    1. Create TransformersModel (with real weights) and VLLMSampler (with dummy weights)
+    1. Create MegatronModel (with real weights, TP=2) and VLLMSampler (with dummy weights)
     2. Sample with dummy weights → garbage output
-    3. Sync weights from Model → Sampler via CheckpointEngineManager (NCCL broadcast)
+    3. Sync weights from MegatronModel → VLLMSampler via CheckpointEngineManager
     4. Sample with synced weights → coherent output
     5. Verify that outputs differ (proof that weights were synced)
 
+The Megatron bridge internally handles TP allgather during export, converting
+Megatron-format weights to HuggingFace format on-the-fly.
+
 Usage:
-    # 2 model GPUs + 2 sampler GPUs (requires 4 GPUs)
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python tests/sampler/test_weight_sync.py --model-gpus 2 --sampler-gpus 2
+    # 2 Megatron GPUs (TP=2) + 2 sampler GPUs (4 GPUs total, using GPUs 4-7)
+    CUDA_VISIBLE_DEVICES=4,5,6,7 python tests/sampler/test_megatron_weight_sync.py
 
-    # 1 model GPU + 1 sampler GPU (requires 2 GPUs)
-    CUDA_VISIBLE_DEVICES=0,1 python tests/sampler/test_weight_sync.py
+    # 2 Megatron GPUs (TP=2) + 1 sampler GPU (3 GPUs total)
+    CUDA_VISIBLE_DEVICES=4,5,6 python tests/sampler/test_megatron_weight_sync.py --sampler-gpus 1
 
-Note:
-    - Requires Ray and multiple GPUs
-    - Set TEST_MODEL_ID environment variable to use a different model
+    # Custom model
+    CUDA_VISIBLE_DEVICES=4,5,6,7 TEST_MODEL_ID=Qwen/Qwen2.5-7B-Instruct \
+        python tests/sampler/test_megatron_weight_sync.py --tp-size 2
 """
 
 import os
@@ -33,7 +37,6 @@ import logging
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
 # Prevent hanging during NCCL weight sync in disaggregated mode
-# See: https://docs.vllm.ai/en/latest/usage/troubleshooting.html#known-issues
 os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
 # Model configuration — use a small model for testing
@@ -73,39 +76,48 @@ def get_model_path():
 
 
 # =============================================================================
-# Test: Standalone Weight Sync
+# Test: Megatron Standalone Weight Sync
 # =============================================================================
 
-def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
-    """Test weight sync in STANDALONE mode (model and sampler on different GPUs).
+def test_megatron_weight_sync(
+    model_gpus: int = 2,
+    sampler_gpus: int = 2,
+    tp_size: int = 2,
+    pp_size: int = 1,
+):
+    """Test weight sync from MegatronModel to VLLMSampler via NCCL broadcast.
 
     Architecture:
-        Model workers  : GPU 0 .. model_gpus-1   (training, real weights)
-        Sampler workers: GPU model_gpus .. total-1 (inference, dummy weights)
+        Model workers  : GPU 0 .. model_gpus-1   (Megatron, TP=tp_size, real weights)
+        Sampler workers: GPU model_gpus .. total-1 (vLLM, dummy weights)
 
-    Weight sync flow (managed by CheckpointEngineManager):
-        1. prepare             — allocate NCCL buffers, ZMQ metadata server
-        2. build_topology      — model[0]→rank0 (source), sampler→rank1..N
-        3. init_process_group  — temporary NCCL group
-        4. send / receive      — NCCL broadcast (parallel)
-        5. finalize            — release buffers, close ZMQ
+    The Megatron bridge converts weights from Megatron format to HuggingFace
+    format during export.  TP allgather is handled internally by the bridge.
+    Only model_actor[0] broadcasts via the checkpoint engine's NCCL group;
+    other model actors consume the generator (triggering TP allgather) but
+    do not participate in the broadcast.
     """
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
-    from twinkle.model.transformers import TransformersModel
+    from twinkle.model import MegatronModel
     from twinkle.sampler import VLLMSampler
     from twinkle.template import Template
     from twinkle.checkpoint_engine import CheckpointEngineManager
-    from transformers import AutoTokenizer
     from twinkle.data_format import Trajectory
     from twinkle.sampler.types import SamplingParams
 
     total_gpus = model_gpus + sampler_gpus
     model_path = get_model_path()
 
+    # Validate parallelism config
+    assert model_gpus == tp_size * pp_size, (
+        f"model_gpus ({model_gpus}) must equal tp_size * pp_size "
+        f"({tp_size} * {pp_size} = {tp_size * pp_size})"
+    )
+
     log("=" * 70)
-    log(f"TEST: Standalone Weight Sync")
-    log(f"  Model  : GPU 0-{model_gpus - 1}  ({model_gpus} workers)")
+    log(f"TEST: Megatron Standalone Weight Sync")
+    log(f"  Model  : GPU 0-{model_gpus - 1}  ({model_gpus} workers, TP={tp_size}, PP={pp_size})")
     log(f"  Sampler: GPU {model_gpus}-{total_gpus - 1}  ({sampler_gpus} workers)")
     log(f"  Model  : {model_path}")
     log("=" * 70)
@@ -130,22 +142,36 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
         ],
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        from modelscope import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    # ── Create Model (real weights) ───────────────────────────────────
-    log("\nCreating Model (real weights)...")
-    model = TransformersModel(
+    # ── Create MegatronModel (real weights) ────────────────────────────
+    log("\nCreating MegatronModel (real weights)...")
+    model_device_mesh = DeviceMesh.from_sizes(
+        world_size=model_gpus,
+        dp_size=model_gpus // (tp_size * pp_size),
+        tp_size=tp_size,
+        pp_size=pp_size,
+    )
+    model = MegatronModel(
         model_id=model_path,
-        device_mesh=DeviceMesh.from_sizes(world_size=model_gpus, dp_size=model_gpus),
+        device_mesh=model_device_mesh,
+        mixed_precision='bf16',
+        sequence_parallel=(tp_size > 1),
         remote_group='model',
     )
+    log("  MegatronModel created successfully")
 
     # ── Create Sampler (dummy weights) ────────────────────────────────
     log("Creating Sampler (dummy weights)...")
     sampler = VLLMSampler(
         model_id=model_path,
         engine_args={
-            'load_format': 'dummy',         # start with random weights
+            'load_format': 'dummy',
             'gpu_memory_utilization': 0.3,
             'max_model_len': 256,
             'enforce_eager': True,
@@ -156,10 +182,11 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=model_path)
+    log("  VLLMSampler created successfully")
 
     # Wait for vLLM initialization
     log("Waiting for vLLM initialization...")
-    time.sleep(3)
+    time.sleep(5)
 
     # ── Helper: sample one prompt ─────────────────────────────────────
     def do_sample(prompt: str, max_tokens: int = 32) -> str:
@@ -179,7 +206,7 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     text_before = do_sample("What is 2+2?")
     log(f"  Output: '{text_before[:100]}'")
 
-    # ── Sync weights: Model → Sampler via NCCL ────────────────────────
+    # ── Sync weights: MegatronModel → Sampler via NCCL ────────────────
     log("\n--- Syncing weights via CheckpointEngineManager ---")
     manager = CheckpointEngineManager(
         model=model,
@@ -211,8 +238,8 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
             log("  BONUS: Model correctly answered '2+2' question!")
     else:
         log("  FAIL: Outputs are identical — weight sync may have failed.")
-    sampler.shutdown()
 
+    sampler.shutdown()
     return outputs_differ
 
 
@@ -221,20 +248,31 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Test STANDALONE weight synchronization')
-    parser.add_argument('--model-gpus', type=int, default=1,
-                        help='Number of GPUs for model (training)')
-    parser.add_argument('--sampler-gpus', type=int, default=1,
-                        help='Number of GPUs for sampler (inference)')
+    parser = argparse.ArgumentParser(description='Test Megatron standalone weight synchronization')
+    parser.add_argument('--model-gpus', type=int, default=2,
+                        help='Number of GPUs for Megatron model (default: 2)')
+    parser.add_argument('--sampler-gpus', type=int, default=2,
+                        help='Number of GPUs for vLLM sampler (default: 2)')
+    parser.add_argument('--tp-size', type=int, default=2,
+                        help='Tensor parallel size (default: 2)')
+    parser.add_argument('--pp-size', type=int, default=1,
+                        help='Pipeline parallel size (default: 1)')
     args = parser.parse_args()
 
-    log(f"Starting standalone weight sync test...")
+    log(f"Starting Megatron standalone weight sync test...")
     log(f"  Model GPUs:   {args.model_gpus}")
     log(f"  Sampler GPUs: {args.sampler_gpus}")
+    log(f"  TP size:      {args.tp_size}")
+    log(f"  PP size:      {args.pp_size}")
     log(f"  Model ID:     {MODEL_ID}")
 
     try:
-        success = test_standalone_weight_sync(args.model_gpus, args.sampler_gpus)
+        success = test_megatron_weight_sync(
+            model_gpus=args.model_gpus,
+            sampler_gpus=args.sampler_gpus,
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+        )
     except Exception as e:
         log(f"\nTest failed with exception: {e}")
         import traceback

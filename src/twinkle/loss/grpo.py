@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Optional, List, TYPE_CHECKING
+from typing import Dict, Optional, List, TYPE_CHECKING, Union
 
 from twinkle.loss.base import Loss
 from twinkle.utils.torch_utils import selective_log_softmax
@@ -135,30 +135,192 @@ class GRPOLoss(Loss):
         # Mean over tokens per sequence, then mean over batch
         return (
             (per_token_loss * loss_mask).sum(-1) 
-            / loss_mask.sum(-1).clamp(min=1.0)
+            # clip_grad_norm normalized by the number of tokens in the batch, skip
+            # / loss_mask.sum(-1).clamp(min=1.0) 
         ).mean()
+
+    @staticmethod
+    def _pad_and_align_logps(
+        logps: 'Union[torch.Tensor, List[List[float]]]',
+        loss_mask: 'torch.Tensor',
+        device: 'torch.device',
+        dtype: 'torch.dtype',
+    ) -> 'torch.Tensor':
+        """Align auxiliary log-probabilities to the model's padded sequence.
+
+        ``old_logps`` and ``ref_logps`` come from the sampler or a reference
+        model and are **not** processed by the ``InputProcessor`` pipeline.
+        They only cover **response tokens** (variable length per sample),
+        whereas the model's ``logps`` covers the entire padded sequence
+        (prompt + response + collation padding + CP/TP padding).
+
+        This method scatters the compact response-only log-probs into the
+        correct positions within the full padded sequence, using ``loss_mask``
+        to determine where response tokens are located.
+
+        If ``logps`` is already a ``[batch, seq_len]`` tensor whose
+        ``seq_len`` matches the target, it is returned as-is (assumed to be
+        pre-aligned, e.g. from a reference model that ran the same pipeline).
+
+        Args:
+            logps: Per-token log probabilities, either:
+                - ``List[List[float]]``: ragged per-sample response log-probs
+                - ``torch.Tensor [batch, response_len]``: compact response-
+                  only tensor (may have different length than target)
+                - ``torch.Tensor [batch, seq_len]``: pre-aligned tensor
+            loss_mask: ``[batch, seq_len]`` bool tensor indicating response
+                token positions within the padded sequence.
+            device: Target device.
+            dtype: Target dtype.
+
+        Returns:
+            Tensor of shape ``[batch, seq_len]`` with log-probs placed at
+            positions where ``loss_mask`` is True, and 0.0 elsewhere.
+        """
+        import torch
+
+        batch_size, target_seq_len = loss_mask.shape
+
+        # ── 1. Normalize input to a list of per-sample 1-D tensors ───────
+        if isinstance(logps, torch.Tensor):
+            logps = logps.to(device=device, dtype=dtype)
+            if logps.dim() == 1:
+                logps = logps.unsqueeze(0)
+            # Already aligned: same batch & seq_len → fast path
+            if logps.shape == (batch_size, target_seq_len):
+                return logps
+            # Compact tensor: split into per-sample tensors
+            per_sample = [logps[i] for i in range(logps.shape[0])]
+        elif isinstance(logps, (list, tuple)):
+            per_sample = [
+                torch.as_tensor(seq, dtype=dtype, device=device)
+                for seq in logps
+            ]
+        else:
+            raise TypeError(f"Unsupported logps type: {type(logps)}")
+
+        # ── 2. Scatter into loss_mask positions ──────────────────────────
+        result = torch.zeros(batch_size, target_seq_len, dtype=dtype, device=device)
+        for i in range(batch_size):
+            positions = loss_mask[i].nonzero(as_tuple=True)[0]
+            n_response = positions.shape[0]
+            n_logps = per_sample[i].shape[0]
+            n = min(n_response, n_logps)
+            if n > 0:
+                result[i, positions[:n]] = per_sample[i][:n].to(device=device, dtype=dtype)
+
+        return result
+
+    @staticmethod
+    def _unpack_packed_logps(
+        logps: 'torch.Tensor',
+        loss_mask: 'torch.Tensor',
+        position_ids: 'Optional[torch.Tensor]',
+        num_sequences: int,
+    ) -> 'tuple':
+        """Unpack packed (padding_free) tensors into per-sequence batch format.
+
+        In padding_free / packing mode, the processor concatenates all
+        sequences into a single row: ``[1, total_tokens]``.  This method
+        splits them back into ``[num_sequences, max_seq_len]`` so that
+        per-sequence operations (advantages broadcast, loss aggregation)
+        work correctly.
+
+        Sequence boundaries are detected from ``position_ids`` (which
+        resets to 0 at each boundary).  If ``position_ids`` is unavailable,
+        the method falls back to detecting contiguous non-masked (prompt)
+        gaps in the packed ``loss_mask``.
+
+        Args:
+            logps: ``[1, total_tokens]`` packed log-probabilities.
+            loss_mask: ``[1, total_tokens]`` packed loss mask.
+            position_ids: ``[1, total_tokens]`` packed position ids, or None.
+            num_sequences: Expected number of sequences in the pack.
+
+        Returns:
+            ``(logps, loss_mask)`` each of shape
+            ``[num_sequences, max_seq_len]``, right-padded with 0.
+        """
+        import torch
+
+        total_len = logps.shape[1]
+        logps_flat = logps.squeeze(0)        # [total_tokens]
+        mask_flat = loss_mask.squeeze(0)      # [total_tokens]
+
+        # ── Find sequence boundaries ─────────────────────────────────────
+        if position_ids is not None:
+            pos_flat = position_ids.squeeze(0)  # [total_tokens]
+            # position_ids resets to 0 at each new sequence
+            boundary_indices = (pos_flat == 0).nonzero(as_tuple=True)[0]
+        else:
+            # Fallback: use loss_mask transitions.  Each sequence has a
+            # prompt region (mask=0) followed by a response region (mask=1).
+            # Detect 0→1 transitions preceded by a 0→0 gap (new prompt).
+            # Simpler: find where mask goes from 1→0→...→0→1 (prompt gap).
+            # We mark boundaries at the start of each prompt (first 0 after 1).
+            shifted = torch.cat([torch.tensor([False], device=mask_flat.device), mask_flat[:-1]])
+            # Start of a new sequence: transition from mask=1 (end of prev response)
+            # to mask=0 (start of next prompt), or position 0 for the first sequence.
+            prompt_starts = ((~mask_flat) & shifted).nonzero(as_tuple=True)[0]
+            boundary_indices = torch.cat([
+                torch.tensor([0], device=mask_flat.device),
+                prompt_starts,
+            ])
+
+        # Deduplicate & sort
+        boundary_indices = boundary_indices.unique(sorted=True)
+
+        # Add end sentinel
+        boundaries = torch.cat([
+            boundary_indices,
+            torch.tensor([total_len], device=boundary_indices.device),
+        ])
+
+        # ── Split and pad ────────────────────────────────────────────────
+        seq_logps = []
+        seq_masks = []
+        n_seqs = min(boundaries.shape[0] - 1, num_sequences)
+        for i in range(n_seqs):
+            start = boundaries[i].item()
+            end = boundaries[i + 1].item()
+            seq_logps.append(logps_flat[start:end])
+            seq_masks.append(mask_flat[start:end])
+
+        max_len = max(s.shape[0] for s in seq_logps)
+        padded_logps = torch.zeros(n_seqs, max_len, dtype=logps.dtype, device=logps.device)
+        padded_masks = torch.zeros(n_seqs, max_len, dtype=loss_mask.dtype, device=loss_mask.device)
+        for i in range(n_seqs):
+            L = seq_logps[i].shape[0]
+            padded_logps[i, :L] = seq_logps[i]
+            padded_masks[i, :L] = seq_masks[i]
+
+        return padded_logps, padded_masks
 
     def __call__(
         self,
         inputs: Dict,
         outputs: Dict,
         *,
-        old_logps: Optional['torch.Tensor'] = None,
+        old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
-        trajectories: Optional[List[Trajectory]] = None,
+        trajectories: Optional[List[Trajectory]] = None, # TODO: remove this argument
+        advantages: Optional['torch.Tensor'] = None,
         **kwargs,
     ) -> 'torch.Tensor':
         """
         Compute GRPO loss.
 
         Args:
-            inputs: Dict containing 'input_ids' and 'labels' [batch, seq_len]
+            inputs: Dict containing 'input_ids' and 'labels' [batch, seq_len].
+                In packing mode, also expects 'position_ids' [1, total_tokens].
             outputs: Dict containing either:
                 - 'logps'/'log_probs': [batch, seq_len] pre-computed log probs, OR
                 - 'logits': [batch, seq_len, vocab] from which logps will be computed
             old_logps: [batch, seq_len] or List[List[float]] log probs from old/sampling policy.
-                      If None, uses current logps (on-policy, ratio=1).
-            ref_logps: Optional [batch, seq_len] reference model log probs for KL penalty
+                      Can have ragged per-sample lengths — will be padded and aligned
+                      automatically.  If None, uses current logps (on-policy, ratio=1).
+            ref_logps: Optional [batch, seq_len] reference model log probs for KL penalty.
+                      Same padding/alignment rules as old_logps.
             trajectories: Optional List[Trajectory] containing advantages
             **kwargs: Additional arguments
 
@@ -168,9 +330,6 @@ class GRPOLoss(Loss):
         import torch
         labels = inputs.get('labels')
         assert labels is not None, "inputs must contain 'labels'"
-        # todo: check data_collator return labels as tensor
-        if labels is None:
-            raise ValueError("inputs must contain 'labels'")
         if not torch.is_tensor(labels):
             labels = torch.as_tensor(labels)
         if labels.dim() == 1:
@@ -179,43 +338,67 @@ class GRPOLoss(Loss):
         logits = outputs.get('logits')
         if logits.shape[1] != labels.shape[1]:
             # some mllm return logits with image tokens, exclude here
-            logits = logits[:, :-labels.shape[1]:]
+            logits = logits[:, -labels.shape[1]:]
 
-        labels = torch.roll(labels, shifts=-1, dims=1)
+        # labels = torch.roll(labels, shifts=-1, dims=1)
+        # breakpoint()
         loss_mask = (labels != self.ignore_index).bool()
         masked_labels = labels.clone()
         masked_labels[~loss_mask] = 0
         logps = selective_log_softmax(logits, masked_labels)
 
+        del logits
+
         device = logps.device
 
-        if old_logps is None:
-            # On-policy
-            old_logps = logps.detach()
-        
-        assert trajectories is not None, "trajectories must be provided"
-        # TODO: just pass advantages?
-        advantages = self._extract_advantages_from_trajectories(trajectories, device)
+        # ── Detect and handle packing mode ──────────────────────────────
+        # In padding_free / packing mode the processor concatenates all
+        # sequences into a single row [1, total_tokens].  We detect this
+        # by checking: batch_size == 1 but the actual number of sequences
+        # (known from trajectories or advantages) is greater than 1.
+        if trajectories is not None:
+            num_sequences = len(trajectories)
+        elif advantages is not None:
+            num_sequences = len(advantages) if isinstance(advantages, (list, tuple)) else advantages.shape[0]
+        else:
+            num_sequences = logps.shape[0]
+        is_packed = (logps.shape[0] == 1 and num_sequences > 1)
+        if is_packed:
+            position_ids = inputs.get('position_ids')
+            logps, loss_mask = self._unpack_packed_logps(
+                logps, loss_mask, position_ids, num_sequences,
+            )
 
+        # ── Prepare old_logps ────────────────────────────────────────────
+        # old_logps may be ragged (List[List[float]]) containing only
+        # response-token log-probs, whereas logps covers the full padded
+        # sequence.  _pad_and_align_logps scatters them into the correct
+        # positions using loss_mask.
+        if old_logps is None:
+            old_logps = logps.detach()
+        else:
+            old_logps = self._pad_and_align_logps(
+                old_logps, loss_mask, device, logps.dtype,
+            )
+
+        # ── Prepare ref_logps (same treatment) ──────────────────────────
+        if ref_logps is not None:
+            ref_logps = self._pad_and_align_logps(
+                ref_logps, loss_mask, device, logps.dtype,
+            )
+
+        assert advantages is not None, \
+            "advantages must be provided (pass as kwarg to forward_backward)"
         if not torch.is_tensor(advantages):
             advantages = torch.as_tensor(advantages, device=device, dtype=torch.float32)
         else:
             advantages = advantages.to(device, dtype=torch.float32)
         
-        # Ensure advantages is 2D for broadcasting
+        # Ensure advantages is 2D for broadcasting [batch, 1]
         if advantages.dim() == 1:
             advantages = advantages.unsqueeze(1)
 
-        # Align shapes
-        assert logps.shape[1] == old_logps.shape[1] == loss_mask.shape[1], (
-            "logps, old_logps, and loss_mask must have the same sequence length"
-            f"but got {logps.shape[1]}, {old_logps.shape[1]}, {loss_mask.shape[1]} respectively")
-        
-        if ref_logps is not None:
-            assert ref_logps.shape[1] == logps.shape[1], (
-                "ref_logps must have the same sequence length as logps"
-                f"but got {ref_logps.shape[1]}, {logps.shape[1]} respectively")
-        
+        # ── Compute loss ────────────────────────────────────────────────
         log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
         ratio = torch.exp(log_importance_weights)
         

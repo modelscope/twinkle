@@ -27,6 +27,7 @@ from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
 from twinkle.metric import Metric, LossMetric, TrainMetric
+from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -118,7 +119,7 @@ _default_adapter_name = ''
 
 
 @remote_class(execute='all')
-class MegatronModel(TwinkleModel, nn.Module):
+class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def __init__(
         self,
@@ -345,9 +346,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             else:
                 seq_length = original_seq_length
 
+        loss_extra_kwargs = kwargs
+
         def post_loss_function(output_tensor, inputs):
             outputs = ModelOutput(logits=output_tensor)
-            losses, counts = loss_instance(inputs, outputs)
+            result = loss_instance(inputs, outputs, **loss_extra_kwargs)
+            if isinstance(result, tuple):
+                losses, counts = result
+            else:
+                losses = result
+                counts = torch.tensor(1, device=losses.device)
             return self.strategy.gather_loss_for_cp(losses, counts, output_tensor)
 
         # Define forward step function for Megatron
@@ -905,6 +913,25 @@ class MegatronModel(TwinkleModel, nn.Module):
             tqdm_desc='Weight sync: ',
         )
 
+    @remote_function(dispatch='all', collect='first', sync=True)
+    def export_weights_dict(self, adapter_name: str = '', lora_only: bool = False) -> Dict[str, torch.Tensor]:
+        """Export model weights as a dict via Ray object store.
+
+        Collects all weights from ``get_hf_state_dict()`` into a dict.
+        Used as an alternative to NCCL checkpoint engine for weight sync.
+
+        Args:
+            adapter_name: Adapter name for weight extraction.
+            lora_only: If True, only export LoRA adapter weights.
+
+        Returns:
+            Dict mapping parameter names to CPU tensors.
+        """
+        weights = {}
+        for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name if lora_only else ''):
+            weights[name] = tensor.cpu()
+        return weights
+
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
         assert adapter_name, 'Use a non-empty adapter_name'
@@ -1010,6 +1037,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['framework'] = 'megatron'
+        # processor/base.py: self.device_mesh.cp_world_size
+        kwargs['device_mesh'] = kwargs.get('device_mesh', self.device_mesh)
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
     @remote_function(execute='first', lazy_collect=False)
@@ -1093,3 +1122,105 @@ class MegatronModel(TwinkleModel, nn.Module):
             self._bridge_instance = megatron_model_meta.bridge_cls()
             
         return self._bridge_instance
+
+    # ── Checkpoint Engine (from CheckpointEngineMixin) ──────────────────
+    # prepare_checkpoint_engine, init_checkpoint_process_group, and
+    # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
+    #
+    # Key difference from TransformersModel: Megatron uses TP/PP, so
+    # get_hf_state_dict() internally performs TP allgather and handles PP
+    # layer distribution.  All model ranks MUST execute the weight generator
+    # concurrently for the collective communications to complete.  Only
+    # model_actor[0] (rank=0 in the checkpoint engine) actually broadcasts
+    # via NCCL; others consume the generator silently (rank=-1).
+
+    @remote_function(dispatch='all')
+    def send_weights_via_checkpoint_engine(
+        self,
+        adapter_name: str = '',
+        base_sync_done: bool = False,
+    ):
+        """Send model weights via NCCL broadcast.
+
+        Uses ``get_hf_state_dict()`` to convert Megatron-format weights to
+        HuggingFace format on-the-fly.  The bridge's ``export_weights``
+        internally handles TP allgather and PP layer distribution, so all
+        model ranks must execute this method concurrently.
+
+        LoRA-aware sending:
+        - ``base_sync_done=False``: Send all base model weights (HF format).
+          LoRA-specific weights (lora_A, lora_B) are filtered out.
+        - ``base_sync_done=True`` and ``adapter_name`` set: Send only LoRA
+          adapter weights.
+
+        Args:
+            adapter_name: Adapter name for LoRA weight identification.
+            base_sync_done: If True, only send LoRA adapter weights.
+        """
+        import asyncio
+        import logging
+        import threading
+
+        logger = logging.getLogger(__name__)
+        engine = self._get_or_create_checkpoint_engine()
+
+        if base_sync_done and adapter_name:
+            # ── LoRA-only mode ────────────────────────────────────────────
+            # Export only LoRA adapter weights via the bridge in PEFT format
+            def weight_generator():
+                for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
+                    if name is not None and tensor is not None:
+                        yield name, tensor
+
+            logger.info("Sending LoRA-only weights (Megatron)")
+        else:
+            # ── Full model mode ───────────────────────────────────────────
+            # Export all base weights via the bridge (HF format)
+            def weight_generator():
+                for name, tensor in self.get_hf_state_dict(adapter_name=''):
+                    if name is None or tensor is None:
+                        continue
+                    # Skip LoRA-specific weights for base model sync
+                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                        continue
+                    yield name, tensor
+
+        async def _send():
+            await engine.send_weights(weight_generator())
+
+        result_container = {'error': None}
+
+        def _run():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_send())
+                finally:
+                    loop.close()
+            except Exception as e:
+                result_container['error'] = e
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+
+        if result_container['error'] is not None:
+            raise result_container['error']
+
+    @remote_function(collect='first')
+    def get_peft_config_dict(self, adapter_name: str = '') -> dict:
+        """Return the PEFT config as a dict for vLLM's PEFTHelper.
+
+        Used by CheckpointEngineManager for LoRA-only weight sync.
+
+        Returns:
+            PEFT config dict, or None if no LoRA adapter is present.
+        """
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is None or optimizer_config.adapter_config is None:
+            return None
+        config = optimizer_config.adapter_config
+        if isinstance(config, dict):
+            config = config.get(adapter_name, next(iter(config.values())))
+        return config.to_dict() if hasattr(config, 'to_dict') else dict(config)

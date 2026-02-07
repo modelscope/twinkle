@@ -89,6 +89,8 @@ class Sampler(ABC):
         assert adapter_name in self.sample_group, \
             f'Invalid adapter_name: {adapter_name}. Available: {list(self.sample_group.keys())}'
 
+    # used in grpo demo, TODO: remove remote_function
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def _get_template(self, adapter_name: str = '') -> Optional[Template]:
         if adapter_name and adapter_name in self.sample_group:
             template = self.sample_group[adapter_name].template

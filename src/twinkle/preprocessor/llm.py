@@ -57,3 +57,24 @@ class AlpacaProcessor(Preprocessor):
             Message(role='assistant', content=output_text),
         ]
         return Trajectory(messages=messages)
+
+class CountdownProcessor(Preprocessor):
+    system_prompt = (
+        "You are a helpful assistant. You first thinks about the reasoning process "
+        "in the mind and then provides the user with the answer."
+    )
+    def __call__(self, row) -> Trajectory:
+        nums = row.get('nums', [])
+        target = row.get('response', row.get('target', 0))
+        
+        query = f"""Using the numbers {nums}, create an equation that equals {target}.
+You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
+Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags,
+for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
+        
+        messages = [
+            Message(role='system', content=self.system_prompt),
+            Message(role='user', content=query),
+            Message(role='assistant', content=''),
+        ]
+        return Trajectory(messages=messages, user_data=[{'target': target, 'nums': nums}])
