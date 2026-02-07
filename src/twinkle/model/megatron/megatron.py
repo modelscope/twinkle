@@ -63,12 +63,11 @@ class MegatronOptimizerGroup:
     _last_grad_norm: float = 0.0
     _last_step_success: bool = True
 
-    def do_grad_sync(self,
-                     gradient_accumulation_steps: Optional[int] = None
-                     ) -> bool:
-        """Check if gradient synchronization should happen."""
+    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
+        else:
+            self.gradient_accumulation_steps = gradient_accumulation_steps
         return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
 
@@ -128,7 +127,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         load_weights: bool = True,
-        recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
+        recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+        recompute_method: Optional[str] = 'uniform',
+        recompute_num_layers: Optional[int] = 1,
         recompute_modules: Optional[list] = None,  # Modules to recompute
         **kwargs,
     ):
@@ -163,11 +164,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         ac_kwargs = {
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
+            'recompute_method': recompute_method,
+            'recompute_num_layers': recompute_num_layers,
         }
-        if kwargs.get('recompute_method'):
-            ac_kwargs['recompute_method'] = kwargs.get('recompute_method')
-        if kwargs.get('recompute_num_layers'):
-            ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
 
         # Initialize TwinkleMegatronArgs BEFORE creating the model
         args = TwinkleMegatronArgs.from_hf_config(
@@ -185,6 +184,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
+        self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
 
@@ -321,8 +321,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
 
         if micro_batch_size is None:
-            assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
-            micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
+            micro_batch_size = 1
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -965,6 +964,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             'gradient_accumulation_steps', 1)
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+        self.active_group = adapter_name
 
     @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(

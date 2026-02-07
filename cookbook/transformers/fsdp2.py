@@ -22,7 +22,7 @@ if Platform.get_rank() == 0:
 
 
 # Construct a device_mesh, fsdp=2, dp=2
-device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2)
+device_mesh = DeviceMesh.from_sizes(fsdp_size=4)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
@@ -74,6 +74,8 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
+    # lora: 18G * 4
+    # full: 50G * 4
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)

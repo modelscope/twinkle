@@ -200,6 +200,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
+        self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):

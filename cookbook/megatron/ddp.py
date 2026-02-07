@@ -38,7 +38,6 @@ def eval(model):
     dataloader = DataLoader(dataset=dataset, batch_size=1)
     for step, batch in tqdm(enumerate(dataloader)):
         model.forward_only(inputs=batch)
-        model.calculate_loss()
     metrics = model.calculate_metric(is_training=False)
     return metrics
 
@@ -53,7 +52,7 @@ def train():
     # Encode dataset
     dataset.encode()
     # Global batch size = 1, dp_size = 1
-    dataloader = DataLoader(dataset=dataset, batch_size=1)
+    dataloader = DataLoader(dataset=dataset, batch_size=16)
     # Use a MegatronModel
     model = MegatronModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
@@ -64,28 +63,31 @@ def train():
     )
 
     # Add a lora to model, with name `default`
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
+    # Comment this to use full-parameter training
+    model.add_adapter_to_model('default', lora_config)
     # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='default', lr=1e-4)
     # Add LRScheduler for lora `default`
-    model.set_lr_scheduler(scheduler_cls='default', num_warmup_steps=5, num_training_steps=len(dataloader))
+    model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=5, lr_decay_steps=len(dataloader))
     logger.info(get_device_placement())
     # Print the training config
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
+    # lora: 10G * 8
+    # full: 40G * 8
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
         # Step
         model.clip_grad_and_step()
-        if step % 20 == 0:
+        if step % 5 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
             if Platform.get_rank() == 0:
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
-        if step > 0 and step % 40 == 0:
+        if step > 0 and step % 20 == 0:
            metrics = eval(model)
            logger.info(f'Eval metric: {metrics}')
            metrics['step'] = step
