@@ -384,6 +384,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
             inputs['labels'] = labels
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
+        optimizer_config.loss_value = outputs.get('aux_loss', 0)
         return outputs
 
     @remote_function(collect='mean')

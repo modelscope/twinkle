@@ -13,7 +13,7 @@ else:
 if TYPE_CHECKING:
     import torch
 
-InputType = Union[List[List[int]], List[int], np.ndarray, torch.Tensor]
+InputType = Union[List[List[int]], List[int], np.ndarray, 'torch.Tensor']
 
 
 class InputFeature(TypedDict, total=False):

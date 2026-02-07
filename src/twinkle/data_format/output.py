@@ -12,7 +12,7 @@ else:
 if TYPE_CHECKING:
     import torch
 
-OutputType = Union[np.ndarray, torch.Tensor, List[Any]]
+OutputType = Union[np.ndarray, 'torch.Tensor', List[Any]]
 
 
 class ModelOutput(TypedDict, total=False):
