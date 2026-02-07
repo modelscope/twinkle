@@ -325,6 +325,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        if not inputs:
+            raise ValueError(f'inputs empty, check your DataLoader outputs')
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -364,6 +366,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        if not inputs:
+            raise ValueError(f'inputs empty, check your DataLoader outputs')
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -869,7 +873,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
 
-    @remote_function(collect='first')
+    @remote_function(collect='first', lazy_collect=False)
     def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -997,7 +1001,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel):
         trainable_param_names = '\n'.join(trainable_param_names)
         return trainable_param_names
 
-    @remote_function(execute='first')
+    @remote_function(execute='first', lazy_collect=False)
     def get_train_configs(self, **kwargs) -> str:
         expr = ''
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())

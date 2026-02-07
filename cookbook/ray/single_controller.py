@@ -4,7 +4,7 @@ from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform
+from twinkle import DeviceMesh, Platform, DeviceGroup
 from twinkle import get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
@@ -21,10 +21,18 @@ if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     )
 
 
+device_group = [
+        DeviceGroup(
+            name='default',
+            ranks=8,
+            device_type='cuda',
+        )
+    ]
+    
 # Construct a device_mesh, fsdp=4, dp=2
 device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
-# use torchrun mode
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+# use ray mode
+twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
 
 logger = get_logger()
 
@@ -37,6 +45,9 @@ def eval(model):
     dataset.encode()
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     for step, batch in tqdm(enumerate(dataloader)):
+        if len(batch) < 8:
+            # No device mesh in dataloader, manually skip the last batch
+            break
         model.forward_only(inputs=batch)
         model.calculate_loss()
     metrics = model.calculate_metric(is_training=False)
@@ -55,7 +66,7 @@ def train():
     # Global batch size = 4, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='default')
 
     lora_config = LoraConfig(
         r=8,

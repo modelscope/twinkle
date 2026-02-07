@@ -47,5 +47,8 @@ name = "aliyun"
 url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

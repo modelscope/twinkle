@@ -309,7 +309,8 @@ class MegatronModel(TwinkleModel, nn.Module):
         forward_only = kwargs.pop('forward_only', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
-
+        if not inputs:
+            raise ValueError(f'inputs empty, check your DataLoader outputs')
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -1011,7 +1012,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         kwargs['framework'] = 'megatron'
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
-    @remote_function(execute='first')
+    @remote_function(execute='first', lazy_collect=False)
     def get_train_configs(self, **kwargs):
         """Get training configuration summary.
 
