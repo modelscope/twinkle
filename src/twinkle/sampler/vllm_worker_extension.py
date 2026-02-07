@@ -220,14 +220,6 @@ class TwinkleWorkerExtension:
 
     # Stacked parameter mapping matching vLLM Qwen2 model:
     # (stacked_param_name, source_shard_name, shard_id)
-    _STACKED_PARAMS_MAPPING = [
-        ("qkv_proj", "q_proj", "q"),
-        ("qkv_proj", "k_proj", "k"),
-        ("qkv_proj", "v_proj", "v"),
-        ("gate_up_proj", "gate_proj", 0),
-        ("gate_up_proj", "up_proj", 1),
-    ]
-
     def _load_weights(
         self,
         weights: List[Tuple[str, torch.Tensor]],
@@ -262,9 +254,9 @@ class TwinkleWorkerExtension:
             )
             self.add_lora(lora_request)
         else:
-            # Base model mode — strip PEFT prefixes
-            from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
+            # Base model mode — strip PEFT prefixes and delegate to
+            # vLLM's model.load_weights() which handles stacked params,
+            # prefix normalization, and weight_loader internally.
             vllm_has_lora = getattr(
                 getattr(self, 'vllm_config', None), 'lora_config', None,
             ) is not None
@@ -282,63 +274,8 @@ class TwinkleWorkerExtension:
             if not converted:
                 return
 
-            model = self.model_runner.model
-            params_dict = dict(model.named_parameters(remove_duplicate=False))
-            has_model_prefix = any(k.startswith('model.') for k in params_dict)
-            # When LoRA is enabled, vLLM adds `.base_layer.` before the
-            # suffix (e.g. qkv_proj.base_layer.weight).
-            has_base_layer = any('.base_layer.' in k for k in params_dict)
-
-            def _try_lookup(n: str) -> Optional[str]:
-                """Return the actual key in params_dict, trying base_layer variant."""
-                if n in params_dict:
-                    return n
-                if has_base_layer:
-                    # Insert .base_layer. before .weight / .bias
-                    for suffix in ('.weight', '.bias'):
-                        if n.endswith(suffix):
-                            alt = n[:-len(suffix)] + '.base_layer' + suffix
-                            if alt in params_dict:
-                                return alt
-                return None
-
-            loaded = 0
-            for name, tensor in converted:
-                # Normalize prefix
-                if has_model_prefix and not name.startswith('model.') \
-                        and not name.startswith('lm_head.') \
-                        and not name.startswith('embed_tokens.'):
-                    name = 'model.' + name
-                elif not has_model_prefix and name.startswith('model.'):
-                    name = name[6:]
-
-                # Try stacked parameter mapping (e.g. q_proj -> qkv_proj)
-                matched_stacked = False
-                for param_name, shard_name, shard_id in self._STACKED_PARAMS_MAPPING:
-                    shard_pattern = f'.{shard_name}.'
-                    if shard_pattern not in name:
-                        continue
-                    stacked_name = name.replace(shard_pattern, f'.{param_name}.')
-                    actual_key = _try_lookup(stacked_name)
-                    if actual_key is not None:
-                        param = params_dict[actual_key]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
-                        weight_loader(param, tensor, shard_id)
-                        loaded += 1
-                        matched_stacked = True
-                        break
-
-                if matched_stacked:
-                    continue
-
-                # Direct parameter copy for non-stacked weights
-                actual_key = _try_lookup(name)
-                if actual_key is not None:
-                    params_dict[actual_key].data.copy_(tensor)
-                    loaded += 1
-
-            logger.info(f"Loaded {loaded}/{len(converted)} base weights")
+            self.model_runner.model.load_weights(converted)
+            logger.info(f"Loaded {len(converted)} base weights")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for IPC communication."""

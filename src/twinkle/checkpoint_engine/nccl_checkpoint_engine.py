@@ -10,8 +10,11 @@ across different processes/nodes. It supports:
 - Persistent resources: NCCL group, ZMQ sockets, and buffers are reused
   across multiple sync calls to avoid costly re-initialization (~4s per call).
 
-This implementation uses ray.util.collective for NCCL operations, which is
-compatible with Ray's distributed execution model.
+This implementation uses torch.distributed ProcessGroupNCCL directly for
+NCCL operations.  A dedicated TCPStore handles rendezvous between the
+participating Ray actors, completely independent of any existing default
+process group.  This avoids NCCL version conflicts between CuPy (compiled
+against NCCL 2.25) and the runtime NCCL 2.27 loaded by PyTorch.
 """
 
 import asyncio
@@ -19,14 +22,10 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator, Union
-from unittest.mock import patch
-
-with patch("importlib.metadata.distributions", return_value=[]):
-    import cupy as cp
 
 import ray
-import ray.util.collective as collective
 import torch
+import torch.distributed as dist
 import zmq
 
 from twinkle.utils.network import (
@@ -42,19 +41,36 @@ logger = logging.getLogger(__name__)
 class MasterMetadata:
     zmq_ip: str
     zmq_port: int
+    # TCPStore address for the checkpoint NCCL process group
+    nccl_store_host: str = ""
+    nccl_store_port: int = 0
+
+
+def _pg_broadcast(pg: dist.ProcessGroup, tensor: torch.Tensor, src: int = 0):
+    """Broadcast *tensor* using a raw (unregistered) ProcessGroupNCCL.
+
+    ``dist.broadcast()`` requires a *registered* process group.  Since we
+    create the PG directly via ``ProcessGroupNCCL(store, rank, world_size)``
+    (which is NOT registered with the default ``_World``), we fall back to
+    the low-level C++ ``pg.broadcast([tensor], opts)`` API.
+    """
+    opts = dist.BroadcastOptions()
+    opts.rootRank = src
+    work = pg.broadcast([tensor], opts)
+    work.wait()
 
 
 class BroadcastOperation:
     """Async broadcast operation with NCCL in separate thread.
 
-    Wraps NCCL broadcast to run asynchronously so the main thread can
-    continue processing (e.g. filling the next bucket) while the current
-    bucket is being broadcast.
+    Wraps ``ProcessGroupNCCL.broadcast`` to run asynchronously so the main
+    thread can continue processing (e.g. filling the next bucket) while the
+    current bucket is being broadcast.
 
     Args:
         rank: The rank of the current process.
-        group_name: The name of the NCCL process group.
-        bucket: The tensor buffer to broadcast (cupy or torch tensor).
+        pg: The torch.distributed ProcessGroup (unregistered NCCL).
+        bucket: The GPU tensor buffer to broadcast.
         metadata: The metadata of tensors in the bucket.
         socket: The ZMQ socket for metadata communication.
         topic: The ZMQ topic for pub/sub.
@@ -63,14 +79,14 @@ class BroadcastOperation:
     def __init__(
         self,
         rank: int,
-        group_name: str,
-        bucket: Union[torch.Tensor, cp.ndarray],
+        pg: dist.ProcessGroup,
+        bucket: torch.Tensor,
         metadata: dict[str, TensorMeta],
         socket: zmq.Socket,
         topic: str,
     ) -> None:
         self.rank = rank
-        self.group_name = group_name
+        self.pg = pg
         self.bucket = bucket
         self.metadata = metadata
         self.socket = socket
@@ -88,8 +104,8 @@ class BroadcastOperation:
             self.socket.recv_string()
             self.metadata = self.socket.recv_pyobj()
 
-        # Broadcast tensor data via ray.util.collective
-        collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
+        # Broadcast tensor data via NCCL
+        _pg_broadcast(self.pg, self.bucket, src=0)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
         """Wait for the broadcast operation to complete.
@@ -103,9 +119,9 @@ class BroadcastOperation:
 
 @CheckpointEngineRegistry.register("nccl")
 class NCCLCheckpointEngine(CheckpointEngine):
-    """NCCL checkpoint engine with collective communication.
+    """NCCL checkpoint engine using torch.distributed ProcessGroupNCCL.
 
-    All heavy resources (NCCL group, ZMQ sockets, GPU buffers) are
+    All heavy resources (NCCL process group, ZMQ sockets, GPU buffers) are
     **persistent** — they are created once during the first ``prepare()`` /
     ``init_process_group()`` call and reused across subsequent syncs.
     ``finalize()`` only releases buffers by default; set ``rebuild_group=True``
@@ -142,6 +158,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.send_buf = None
         self.recv_buf = None
         self.socket = None
+
+        # torch.distributed process group for checkpoint NCCL ops
+        self._pg: dist.ProcessGroup | None = None
+        self._store: dist.Store | None = None
 
         # Track whether resources are ready for reuse
         self._prepared = False
@@ -186,25 +206,44 @@ class NCCLCheckpointEngine(CheckpointEngine):
         metadata without re-allocating.
 
         Returns:
-            MasterMetadata with ZMQ IP/port if master, else None.
+            MasterMetadata with ZMQ IP/port and TCPStore address if master,
+            else None.
         """
         if self._prepared:
             # Already prepared — return cached metadata
             if self.is_master:
-                return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port)
+                return MasterMetadata(
+                    zmq_ip=self.ip,
+                    zmq_port=self.listen_port,
+                    nccl_store_host=self._nccl_store_host,
+                    nccl_store_port=self._nccl_store_port,
+                )
             return None
 
-        # Master uses cupy to avoid memory register error with
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         if self.is_master:
-            self.send_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
-            self.recv_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
+            # Buffers on CUDA for NCCL broadcast
+            self.send_buf = torch.zeros(
+                self.bucket_size, dtype=torch.uint8, device="cuda")
+            self.recv_buf = torch.zeros(
+                self.bucket_size, dtype=torch.uint8, device="cuda")
             self._start_zmq_server()
+
+            # Allocate a TCPStore port for the checkpoint process group
+            self._nccl_store_host = self.ip
+            self._nccl_store_port = find_free_port()
+
             self._prepared = True
-            return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port)
+            return MasterMetadata(
+                zmq_ip=self.ip,
+                zmq_port=self.listen_port,
+                nccl_store_host=self._nccl_store_host,
+                nccl_store_port=self._nccl_store_port,
+            )
         else:
-            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
-            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
+            self.send_buf = torch.zeros(
+                self.bucket_size, dtype=torch.uint8, device="cuda")
+            self.recv_buf = torch.zeros(
+                self.bucket_size, dtype=torch.uint8, device="cuda")
             self._prepared = True
             return None
 
@@ -212,8 +251,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
         """Clean up resources after a sync.
 
         When ``rebuild_group=False`` (default): keeps NCCL group, ZMQ sockets,
-        and buffers alive for the next sync.  Only useful for explicit cleanup
-        if you want to reclaim GPU memory between syncs.
+        and buffers alive for the next sync.
 
         When ``rebuild_group=True``: destroys NCCL group and ZMQ sockets,
         forces a full re-init on the next sync.
@@ -227,11 +265,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     logger.warning(f"Error closing ZMQ socket: {e}")
                 self.socket = None
 
-            if self.rank is not None and self.rank >= 0:
-                try:
-                    collective.destroy_collective_group(self.group_name)
-                except Exception as e:
-                    logger.warning(f"Error destroying collective group: {e}")
+            if self._pg is not None:
+                # Release PG by dropping references; do NOT call
+                # dist.destroy_process_group as the PG is unregistered.
+                self._pg = None
+                self._store = None
 
             self.rank = None
             self.world_size = None
@@ -244,7 +282,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(
-        cls, 
+        cls,
         trainer_world_size: int,
         rollout_world_size: int,
         metadata: list[dict],
@@ -252,9 +290,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         """Build communication topology for NCCL broadcast.
 
         The topology assigns:
-        - Trainer rank 0 → broadcast source (NCCL rank 0)
-        - Other trainer ranks → rank -1 (not participating)
-        - Rollout workers → ranks 1, 2, 3, ... (receivers)
+        - Trainer rank 0 -> broadcast source (NCCL rank 0)
+        - Other trainer ranks -> rank -1 (not participating)
+        - Rollout workers -> ranks 1, 2, 3, ... (receivers)
 
         Args:
             trainer_world_size: Number of trainer workers.
@@ -279,17 +317,23 @@ class NCCLCheckpointEngine(CheckpointEngine):
         }
         return trainer_kwargs, rollout_kwargs
 
-    def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
-        """Initialize the NCCL process group for weight synchronization.
+    def init_process_group(self, rank: int, world_size: int,
+                           master_metadata: MasterMetadata):
+        """Initialize a dedicated NCCL process group for weight synchronization.
+
+        Creates a ``ProcessGroupNCCL`` directly (without registering it in the
+        default ``_World``), using a ``TCPStore`` hosted by the master for
+        rendezvous.  This is completely independent of any existing
+        ``torch.distributed`` default process group.
 
         Idempotent: if the group is already initialized and ``rebuild_group``
-        is False, this is a fast no-op (skips NCCL group creation, ZMQ
-        connection, and barrier).
+        is False, this is a fast no-op.
 
         Args:
             rank: The rank of this worker (-1 for non-participating trainers).
             world_size: Total number of workers in the sync group.
-            master_metadata: Metadata from the master for ZMQ connection.
+            master_metadata: Metadata from the master for ZMQ and store
+                connection.
         """
         # Non-participating trainer ranks: record rank and return
         if rank < 0:
@@ -302,10 +346,28 @@ class NCCLCheckpointEngine(CheckpointEngine):
         if self._group_initialized and not self.rebuild_group:
             return
 
-        if self.rebuild_group or not collective.is_group_initialized(self.group_name):
-            collective.init_collective_group(world_size, rank, "nccl", self.group_name)
+        if self._pg is None:
             self.rank = rank
             self.world_size = world_size
+
+            # Create a dedicated TCPStore for this checkpoint group.
+            # Rank 0 (master / trainer) is the store server; all others
+            # are clients that connect to it.
+            is_store_master = (rank == 0)
+            self._store = dist.TCPStore(
+                host_name=master_metadata.nccl_store_host,
+                port=master_metadata.nccl_store_port,
+                world_size=world_size,
+                is_master=is_store_master,
+                wait_for_workers=True,
+            )
+
+            # Create a ProcessGroupNCCL directly — this does NOT interfere
+            # with the default process group or any existing torch.distributed
+            # state.
+            self._pg = dist.ProcessGroupNCCL(
+                self._store, rank, world_size,
+            )
         else:
             assert self.rank == rank, f"rank {rank} != self.rank {self.rank}"
             assert self.world_size == world_size, (
@@ -316,16 +378,24 @@ class NCCLCheckpointEngine(CheckpointEngine):
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
-        # Barrier to ensure all workers are ready
-        collective.barrier(self.group_name)
+        # Barrier via broadcast to ensure all workers are ready
+        barrier_tensor = torch.zeros(1, dtype=torch.int32, device="cuda")
+        _pg_broadcast(self._pg, barrier_tensor, src=0)
+        torch.cuda.synchronize()
 
         self._group_initialized = True
-        logger.info(f"init_process_group: rank={self.rank}, world_size={self.world_size}")
+        logger.info(
+            f"init_process_group: rank={self.rank}, "
+            f"world_size={self.world_size}"
+        )
 
     # ── Send / Receive ───────────────────────────────────────────────────
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ):
         """Send model weights to rollout workers via NCCL broadcast.
 
         Uses double buffering: fill send_buf while the previous bucket
@@ -362,7 +432,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
-                    group_name=self.group_name,
+                    pg=self._pg,
                     bucket=send_buf,
                     metadata={"bucket_meta": bucket_meta, "is_last": False},
                     socket=self.socket,
@@ -387,15 +457,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 "offset": offset,
             }
 
-            # Copy weight to buffer
-            if isinstance(send_buf, cp.ndarray):
-                send_buf[offset:offset + weight.nbytes] = cp.asarray(
-                    weight.view(-1).view(torch.uint8)
-                )
-            else:
-                send_buf[offset:offset + weight.nbytes].copy_(
-                    weight.view(-1).view(torch.uint8), non_blocking=True
-                )
+            # Copy weight to buffer (both buffers are on CUDA)
+            send_buf[offset:offset + weight.nbytes].copy_(
+                weight.view(-1).view(torch.uint8), non_blocking=True
+            )
             offset += weight.nbytes
 
         # Broadcast final bucket
@@ -405,7 +470,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            pg=self._pg,
             bucket=send_buf,
             metadata={"bucket_meta": bucket_meta, "is_last": True},
             socket=self.socket,
@@ -413,10 +478,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
         )
         await broadcast_op.wait_for_complete()
 
-        logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
+        logger.info(
+            f"Rank {self.rank} send weights done, "
+            f"time cost: {time.time() - start_time:.2f}s"
+        )
 
     @torch.no_grad()
-    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(
+        self,
+    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         """Receive model weights from trainer via NCCL broadcast.
 
         Uses double buffering: receive into recv_buf while processing
@@ -424,10 +494,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         Yields:
             Tuples of (name, tensor) for each weight.  The tensor is a
-            *view* into the receive buffer — callers that need to keep it
+            *view* into the receive buffer -- callers that need to keep it
             should clone it.
         """
-        assert self.rank is not None and self.rank > 0, "Rank 0 should not receive weights."
+        assert self.rank is not None and self.rank > 0, (
+            "Rank 0 should not receive weights."
+        )
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         total_bytes, total_params = 0, 0
@@ -436,7 +508,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            group_name=self.group_name,
+            pg=self._pg,
             bucket=recv_buf,
             metadata=None,
             socket=self.socket,
@@ -453,7 +525,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             # 1. Start receiving next bucket
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
-                group_name=self.group_name,
+                pg=self._pg,
                 bucket=recv_buf,
                 metadata=None,
                 socket=self.socket,
@@ -464,7 +536,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             for name, meta in metadata["bucket_meta"].items():
                 dtype, shape = meta["dtype"], meta["shape"]
                 size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"]:meta["offset"] + size].view(dtype=dtype).view(shape)
+                tensor = send_buf[
+                    meta["offset"]:meta["offset"] + size
+                ].view(dtype=dtype).view(shape)
                 yield name, tensor
 
             # 3. Wait for next bucket
@@ -480,12 +554,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
         for name, meta in metadata["bucket_meta"].items():
             dtype, shape = meta["dtype"], meta["shape"]
             size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"]:meta["offset"] + size].view(dtype=dtype).view(shape)
+            tensor = send_buf[
+                meta["offset"]:meta["offset"] + size
+            ].view(dtype=dtype).view(shape)
             yield name, tensor
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024)
         logger.info(
-            f"receive_weights done: rank={self.rank}, params={total_params}, "
+            f"receive_weights done: rank={self.rank}, "
+            f"params={total_params}, "
             f"time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s"
         )

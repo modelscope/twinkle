@@ -137,10 +137,10 @@ class ResourceManager:
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
-                # ranks is only used to declare "how many processes/devices", should not participate in physical device mapping.
-                # When visible devices are already trimmed by ASCEND_RT_VISIBLE_DEVICES etc.,
-                # logical ranks may be non-contiguous like [8,9], need to normalize them in order.
-                normalized_ranks = list(range(len(ranks)))
+                # Use original ranks for GPU mapping so each DeviceGroup maps to
+                # the correct physical devices.  E.g. ranks=[2,3] with
+                # nproc_per_node=4 should map to gpu_rank [2,3], not [0,1].
+                normalized_ranks = list(ranks)
 
                 if gpus_per_worker > 1:
                     if len(normalized_ranks) % gpus_per_worker != 0:

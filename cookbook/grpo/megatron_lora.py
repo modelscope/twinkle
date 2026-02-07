@@ -253,8 +253,9 @@ class SimpleWeightSync:
             base_sync_done=self.base_sync_done,
         ))
 
-        if not self.base_sync_done:
-            self.base_sync_done = True
+        # TODO: remove this after lora sync is implemented
+        # if not self.base_sync_done:
+        #     self.base_sync_done = True
 
 
 # ========== Main ==========
@@ -308,7 +309,7 @@ def main():
             'max_model_len': 2048,
             'enforce_eager': True,
             'enable_sleep_mode': False,
-            'enable_lora': True,
+            'enable_lora': False, # sync lora todo
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',

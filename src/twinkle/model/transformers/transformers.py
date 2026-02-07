@@ -247,11 +247,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 self.sp_strategy.initialize()
             self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
             optimizer_group.optimizer = optimizer
-            # Ensure training mode is propagated to all sub-modules.
-            # Accelerate's FSDP2 prepare path does not call model.train(),
-            # leaving decoder layers in eval mode.  This breaks gradient
-            # checkpointing whose guard is ``self.training``.
-            self.model.train()
             self._model_wrapped = True
 
     @staticmethod
@@ -309,6 +304,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        self.model.train()
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -347,6 +343,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
+        self.model.eval()
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
