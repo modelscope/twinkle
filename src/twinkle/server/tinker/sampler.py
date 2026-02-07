@@ -30,37 +30,6 @@ from .common.io_utils import create_checkpoint_manager
 logger = get_logger()
 
 
-def parse_adapter_uri(adapter_uri: str, token: str) -> tuple:
-    """Parse adapter URI to extract user_id and resolved lora_path.
-    
-    Args:
-        adapter_uri: The adapter URI, supports formats:
-            - twinkle://{training_run_id}/weights/{checkpoint_name} or sampler_weights/{name}
-            - Local filesystem path
-        token: User token for resolving the base output directory
-        
-    Returns:
-        Tuple of (user_id, lora_path) where lora_path is the resolved filesystem path
-    """
-    if adapter_uri.startswith('twinkle://'):
-        # Use CheckpointManager to parse and resolve the path
-        checkpoint_manager = create_checkpoint_manager(token)
-        parsed = checkpoint_manager.parse_path(adapter_uri)
-        if parsed:
-            # Get the filesystem path using get_ckpt_dir
-            lora_path = str(checkpoint_manager.get_ckpt_dir(
-                parsed.training_run_id, parsed.checkpoint_id
-            ))
-            return parsed.training_run_id, lora_path
-        else:
-            # Fallback: parse manually for non-standard formats
-            suffix = adapter_uri[len('twinkle://'):]
-            return 'default', suffix
-    else:
-        # Local path
-        return 'default', adapter_uri
-
-
 def build_sampler_app(model_id: str,
                       nproc_per_node: int,
                       device_group: Dict[str, Any],
@@ -189,7 +158,8 @@ def build_sampler_app(model_id: str,
                     user_id = None
                     if model_path:
                         token = request.state.token
-                        user_id, adapter_uri = parse_adapter_uri(model_path, token)
+                        checkpoint_manager = create_checkpoint_manager(token)
+                        user_id, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
                     
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None

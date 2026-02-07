@@ -818,6 +818,33 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         except Exception:
             return None
 
+    def parse_adapter_uri(self, adapter_uri: str) -> tuple:
+        """Parse adapter URI to extract user_id and resolved lora_path.
+
+        Args:
+            adapter_uri: The adapter URI, supports formats:
+                - twinkle://{training_run_id}/weights/{checkpoint_name} or sampler_weights/{name}
+                - Local filesystem path
+
+        Returns:
+            Tuple of (user_id, lora_path) where lora_path is the resolved filesystem path
+        """
+        if adapter_uri.startswith(self.path_prefix):
+            parsed = self.parse_path(adapter_uri)
+            if parsed:
+                # Get the filesystem path using get_ckpt_dir
+                lora_path = str(self.get_ckpt_dir(
+                    parsed.training_run_id, parsed.checkpoint_id
+                ))
+                return parsed.training_run_id, lora_path
+            else:
+                # Fallback: parse manually for non-standard formats
+                suffix = adapter_uri[len(self.path_prefix):]
+                return 'default', suffix
+        else:
+            # Local path
+            return 'default', adapter_uri
+
     def resolve_load_path(self, path: str, validate_exists: bool = True) -> ResolvedLoadPath:
         """
         Resolve a checkpoint load path.

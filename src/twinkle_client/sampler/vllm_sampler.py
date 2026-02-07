@@ -35,7 +35,7 @@ class VLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
-        self.server_url = f'{self.server_url}/models/{model_id}'
+        self.server_url = f'{self.server_url}/samplers/{model_id}'
         response = http_post(
             url=f'{self.server_url}/create',
             json_data=kwargs
@@ -84,25 +84,34 @@ class VLLMSampler(Sampler):
         self,
         inputs: Union[List[Trajectory], List[InputFeature]],
         sampling_params: Optional[Dict[str, Any]] = None,
-        adapter_name: str = ''
-    ) -> SampleResponse:
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        num_samples: int = 1,
+    ) -> Dict[str, Any]:
         """Sample from the model.
         
         Args:
             inputs: List of Trajectory or InputFeature to sample from.
             sampling_params: Sampling parameters dict.
-            adapter_name: Adapter name.
+            adapter_name: Adapter name for LoRA inference.
+            adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference.
+            num_samples: Number of completions to generate per prompt.
             
         Returns:
-            SampleResponse with sampled sequences.
+            Dict with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
+        json_data = {
+            'inputs': inputs,
+            'sampling_params': sampling_params,
+            'adapter_name': adapter_name,
+            'num_samples': num_samples,
+        }
+        if adapter_uri is not None:
+            json_data['adapter_uri'] = adapter_uri
+
         response = http_post(
             url=f'{self.server_url}/sample',
-            json_data={
-                'inputs': inputs,
-                'sampling_params': sampling_params,
-                'adapter_name': adapter_name
-            }
+            json_data=json_data
         )
         response.raise_for_status()
         return response.json()
