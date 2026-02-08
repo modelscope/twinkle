@@ -18,7 +18,6 @@ against NCCL 2.25) and the runtime NCCL 2.27 loaded by PyTorch.
 """
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator, Union
@@ -27,14 +26,15 @@ import ray
 import torch
 import torch.distributed as dist
 import zmq
+from twinkle import get_logger
 
 from twinkle.utils.network import (
     find_free_port,
     is_valid_ipv6_address,
 )
-from .base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from .base import CheckpointEngine, TensorMeta
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 @dataclass
@@ -117,27 +117,11 @@ class BroadcastOperation:
         return self.metadata
 
 
-@CheckpointEngineRegistry.register("nccl")
 class NCCLCheckpointEngine(CheckpointEngine):
-    """NCCL checkpoint engine using torch.distributed ProcessGroupNCCL.
-
-    All heavy resources (NCCL process group, ZMQ sockets, GPU buffers) are
-    **persistent** — they are created once during the first ``prepare()`` /
-    ``init_process_group()`` call and reused across subsequent syncs.
-    ``finalize()`` only releases buffers by default; set ``rebuild_group=True``
-    if you need to tear everything down each sync.
-
-    Args:
-        bucket_size: Bucket size in bytes for weight transfer.
-            Note: Memory overhead is 2 * bucket_size due to double buffering.
-        group_name: Name of the NCCL process group.
-        rebuild_group: Whether to destroy the NCCL group after each sync.
-        rollout_dtype: Target dtype for weights.
-    """
 
     def __init__(
         self,
-        bucket_size: int,
+        bucket_size: int = 2048 << 20,
         group_name: str = "twinkle_ckpt",
         rebuild_group: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,

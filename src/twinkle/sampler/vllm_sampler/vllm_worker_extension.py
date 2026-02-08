@@ -12,18 +12,17 @@ parameter and provides methods for:
 Reference: verl's vLLMColocateWorkerExtension implementation.
 """
 import gc
-import logging
 import os
 import platform
 import ctypes
 import re
 import signal
 from typing import Dict, List, Optional, Tuple
-
+from twinkle import get_logger
 import torch
 from twinkle.utils.framework import Torch
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def set_death_signal():
@@ -79,7 +78,7 @@ class TwinkleWorkerExtension:
     ``AsyncLLM.collective_rpc()``.
 
     Usage:
-        worker_extension_cls="twinkle.sampler.vllm_worker_extension.TwinkleWorkerExtension"
+        worker_extension_cls="twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension"
     """
 
     def __new__(cls, *args, **kwargs):

@@ -341,7 +341,6 @@ class GRPOLoss(Loss):
             logits = logits[:, -labels.shape[1]:]
 
         # labels = torch.roll(labels, shifts=-1, dims=1)
-        # breakpoint()
         loss_mask = (labels != self.ignore_index).bool()
         masked_labels = labels.clone()
         masked_labels[~loss_mask] = 0
@@ -414,7 +413,7 @@ class GRPOLoss(Loss):
         
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
         
-        return loss
+        return loss, loss_mask.sum()
 
     def compute_metrics(
         self,

@@ -11,26 +11,24 @@ import os
 import re
 import time
 import numpy as np
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 from peft import LoraConfig
-import torch
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, Platform, get_device_placement, get_logger
-from twinkle import remote_class, remote_function
+from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
 from twinkle.data_format import Trajectory, Message, InputFeature
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import VLLMSampler
-from twinkle.sampler.types import SamplingParams, SampleResponse
-from twinkle.rl import GRPOAdvantage
-import ray
+from twinkle.data_format.sampling import SamplingParams, SampleResponse
+from twinkle.advantage import GRPOAdvantage
+from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.template import Template
 
 from transformers import AutoTokenizer
@@ -40,9 +38,9 @@ logger = get_logger()
 
 # ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
-NUM_GPUS = 4
-MODEL_GPUS = 2
+MODEL_GPUS = 4
 SAMPLER_GPUS = 2
+NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
@@ -212,52 +210,6 @@ def wait_result(result):
     return result
 
 
-class SimpleWeightSync:
-    """Sync weights from MegatronModel to VLLMSampler via Ray object store.
-
-    Avoids ray.util.collective NCCL, which conflicts with Megatron's
-    torch.distributed NCCL (Megatron's initialize_model_parallel creates
-    NCCL communicators that are incompatible with cupy's NCCL bindings
-    used by ray.util.collective).
-    """
-
-    def __init__(self, model, sampler, adapter_name: str = ''):
-        self.model = model
-        self.sampler = sampler
-        self.adapter_name = adapter_name
-        self.base_sync_done = False
-
-    def sync_weights(self, adapter_name: str = ''):
-        """Sync model weights to sampler via Ray object store."""
-        adapter_name = adapter_name or self.adapter_name
-
-        if not self.base_sync_done:
-            # First sync: all base weights
-            weights_dict = wait_result(
-                self.model.export_weights_dict(adapter_name=adapter_name)
-            )
-            peft_config = None
-        else:
-            # Subsequent syncs: LoRA weights only
-            weights_dict = wait_result(
-                self.model.export_weights_dict(adapter_name=adapter_name, lora_only=True)
-            )
-            peft_config = wait_result(
-                self.model.get_peft_config_dict(adapter_name=adapter_name)
-            )
-
-        # Load into sampler
-        wait_result(self.sampler.import_weights_dict(
-            weights=weights_dict,
-            peft_config=peft_config,
-            base_sync_done=self.base_sync_done,
-        ))
-
-        # TODO: remove this after lora sync is implemented
-        # if not self.base_sync_done:
-        #     self.base_sync_done = True
-
-
 # ========== Main ==========
 def main():
     # ── Device setup ──────────────────────────────────────────────────
@@ -269,7 +221,7 @@ def main():
     ]
     # MegatronModel: DP=2, TP=1, PP=1 for 2 GPUs
     model_mesh = DeviceMesh.from_sizes(
-        dp_size=MODEL_GPUS, tp_size=1, pp_size=1,
+        dp_size=MODEL_GPUS, tp_size=2, pp_size=2,
     )
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
 
@@ -280,13 +232,13 @@ def main():
         target_modules="all-linear", r=8, lora_alpha=32, lora_dropout=0.05,
     )
 
-    # ── MegatronModel (training) ──────────────────────────────────────
     model = MegatronModel(
         model_id=MODEL_ID,
         device_mesh=model_mesh,
         remote_group='model',
         mixed_precision='bf16',
         recompute_granularity='selective',
+        recompute_num_layers=None,
     )
     model.add_adapter_to_model(
         ADAPTER_NAME, lora_config,
@@ -309,16 +261,14 @@ def main():
             'max_model_len': 2048,
             'enforce_eager': True,
             'enable_sleep_mode': False,
-            'enable_lora': False, # sync lora todo
+            'enable_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=MODEL_ID)
 
-    # Use SimpleWeightSync instead of CheckpointEngineManager to avoid
-    # NCCL conflict between Megatron's torch.distributed and cupy NCCL.
-    weight_sync = SimpleWeightSync(model, sampler, adapter_name=ADAPTER_NAME)
+    ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     dataset = create_countdown_dataset()
     dataloader = DataLoader(
         dataset=dataset, batch_size=BATCH_SIZE,
@@ -347,7 +297,7 @@ def main():
         # ========== 1. Weight Sync ==========
         if step % WEIGHT_SYNC_INTERVAL == 0:
             sync_start = time.perf_counter()
-            weight_sync.sync_weights(adapter_name=ADAPTER_NAME)
+            ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
             metrics.weight_sync_time = time.perf_counter() - sync_start
 
         # ========== 2. Generate ==========

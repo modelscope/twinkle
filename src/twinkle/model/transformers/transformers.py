@@ -6,7 +6,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Literal, Callable
 from typing import overload, Type, Optional, Union
-
+import asyncio
+import threading
+from twinkle.utils.framework import Torch
 import torch
 import torch.distributed as dist
 import transformers
@@ -24,6 +26,7 @@ import twinkle
 import twinkle.module.scheduler
 from twinkle import Platform
 from twinkle import remote_class, remote_function, template, DeviceMesh
+from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, CrossEntropyLoss
@@ -60,6 +63,7 @@ class OptimizerGroup:
     num_tokens: int = 0
     train_metrics: List[Metric] = field(default_factory=list)
     eval_metrics: List[Metric] = field(default_factory=list)
+    checkpoint_engine: CheckpointEngine = None
     _dp_group = None
     _device_mesh: DeviceMesh = None
 
@@ -1065,38 +1069,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # Only send_weights_via_checkpoint_engine is model-specific.
 
-    @remote_function(dispatch='all')
-    def send_weights_via_checkpoint_engine(
+    @remote_function(dispatch='all', lazy_collect=True)
+    def send_weights(
         self,
         adapter_name: str = '',
         base_sync_done: bool = False,
     ):
-        """Send model weights via NCCL broadcast.
-
-        Called on ALL model workers:
-        - Rank 0 (master): Collects weights and broadcasts via NCCL.
-        - Other ranks (rank=-1): Consume the generator without sending.
-
-        LoRA-aware sending (follows verl's design):
-        - ``base_sync_done=False``: Send ALL base weights from the full state
-          dict.  Names are sent as-is (including ``.base_layer`` for PEFT
-          models); the **sampler** side handles stripping ``.base_layer``
-          based on its vLLM ``enable_lora`` setting.
-          LoRA-specific weights (lora_A, lora_B) are filtered out.
-        - ``base_sync_done=True`` and ``adapter_name`` is set: Send only LoRA
-          adapter weights via ``get_peft_model_state_dict()``.  The sampler
-          converts names to vLLM LoRA format for ``add_lora()``.
-
-        Args:
-            adapter_name: Adapter name for LoRA weight identification.
-            base_sync_done: If True, only send LoRA adapter weights.
-        """
-        import asyncio
-        import threading
-        from twinkle.utils.framework import Torch
-
         engine = self._get_or_create_checkpoint_engine()
-
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 

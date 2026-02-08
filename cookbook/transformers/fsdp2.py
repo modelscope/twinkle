@@ -52,7 +52,7 @@ def train():
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     # Encode dataset
     dataset.encode()
-    # Global batch size = 4, for GPUs, so 1 sample per GPU
+    # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')

@@ -1,13 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-import logging
 import math
 import os
 from typing import Dict, List
 
 from twinkle import DeviceGroup
 from twinkle import Platform
-
-logger = logging.getLogger(__name__)
 
 class ResourceManager:
 
@@ -183,13 +180,6 @@ class ResourceManager:
                                 ray_address=ray_address))
 
                 self.device_groups[group.name] = local_device_groups
-                if os.environ.get("TWINKLE_DEBUG_GPW", "0") == "1":
-                    logger.info(
-                        "DeviceGroup '%s' gpus_per_worker=%s local_device_groups=%s",
-                        group.name,
-                        gpus_per_worker,
-                        local_device_groups,
-                    )
                 
                 # Update the group's ranks to reflect actual worker count
                 if gpus_per_worker > 1:

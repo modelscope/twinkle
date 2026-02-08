@@ -25,10 +25,17 @@ class DataLoader:
         dataset: A dataset instance, or a callable to create a dataset.
             If runs in ray mode, it's recommended to use callable to make dataset and dataloader in one worker
         device_mesh: The device_mesh of this dataloader.
+        batch_size: How many samples per batch.
+        min_batch_size: At least how many samples should be returned.
+        max_retries: Number of times to retry at one time if data fetch fails.
         kwargs: The dataloader creation parameters.
     """
 
-    def __init__(self, dataset: Union[Dataset, Callable], device_mesh: Optional[DeviceMesh]=None,
+    def __init__(self, dataset: Union[Dataset, Callable],
+                 *,
+                 batch_size: int,
+                 min_batch_size: Optional[int] = None,
+                 device_mesh: Optional[DeviceMesh]=None,
                  **kwargs):
         if isinstance(dataset, Callable):
             self.dataset: Dataset = dataset()
@@ -36,15 +43,12 @@ class DataLoader:
             self.dataset: Dataset = dataset
         self.dataloader = None
         self.max_retries = kwargs.pop('max_retries', 20)
-        if 'batch_size' not in kwargs:
-            if device_mesh is not None:
-                kwargs['batch_size'] = device_mesh.data_world_size
-            else:
-                kwargs['batch_size'] = 1
+        self.min_batch_size = min_batch_size
         if device_mesh is not None:
-            assert kwargs['batch_size'] >= device_mesh.data_world_size and kwargs['batch_size'] % device_mesh.data_world_size == 0
-        self.batch_size = kwargs['batch_size']
+            assert batch_size >= device_mesh.data_world_size and batch_size % device_mesh.data_world_size == 0
+        self.batch_size = batch_size
         self.dataloader_params = kwargs
+        self.dataloader_params['batch_size'] = batch_size
         self.device_mesh = device_mesh
         self.processor: Optional[InputProcessor] = None
         self._set_work_init_fn()
@@ -109,6 +113,6 @@ class DataLoader:
     def _repeat_sample_and_shard(self):
         if self.dataloader.batch_sampler is not None and hasattr(self.dataloader.batch_sampler, 'sampler'):
             self.dataloader.batch_sampler.sampler = RetrySampler(self.dataloader.batch_sampler.sampler, self.dataset, max_retries=self.max_retries)
-            self.dataloader.batch_sampler = DeviceMeshSampler(self.dataloader.batch_sampler, self.device_mesh)
+            self.dataloader.batch_sampler = DeviceMeshSampler(self.dataloader.batch_sampler, self.device_mesh, self.min_batch_size)
         elif self.dataloader.sampler is not None:
             self.dataloader.sampler = RetrySampler(self.dataloader.sampler, self.dataset, max_retries=self.max_retries)

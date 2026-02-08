@@ -15,8 +15,6 @@ Usage:
 
 from .base import (
     CheckpointEngine,
-    CheckpointEngineRegistry,
-    ColocatedCheckpointEngine,
     TensorMeta,
 )
 from .manager import CheckpointEngineManager
@@ -28,9 +26,7 @@ from .hccl_checkpoint_engine import HCCLCheckpointEngine
 
 __all__ = [
     "CheckpointEngine",
-    "CheckpointEngineRegistry",
     "CheckpointEngineMixin",
-    "ColocatedCheckpointEngine",
     "CheckpointEngineManager",
     "NCCLCheckpointEngine",
     "HCCLCheckpointEngine",

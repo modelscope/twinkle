@@ -1,19 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
-import logging
 import os
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-
-from twinkle import remote_class, remote_function
-from .base_engine import BaseSamplerEngine
-from .types import StopReason, SamplingParams, SampleResponse, SampledSequence
+from twinkle import get_logger
+from twinkle.sampler.base_engine import BaseSamplerEngine
+from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
 
 import inspect
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
     """Get the nearest allowed vLLM LoRA rank."""
@@ -29,7 +26,7 @@ def get_vllm_max_lora_rank(lora_rank: int) -> int:
         # Fallback for older vLLM versions
         return lora_rank
 
-@remote_class()
+
 class VLLMEngine(BaseSamplerEngine):
     """
     A vLLM-based inference engine for RL training.
@@ -140,7 +137,7 @@ class VLLMEngine(BaseSamplerEngine):
         
         # Enable worker extension for weight synchronization
         engine_config["worker_extension_cls"] = (
-            "twinkle.sampler.vllm_worker_extension.TwinkleWorkerExtension"
+            "twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension"
         )
         
         engine_config.update(self.engine_kwargs)
@@ -179,8 +176,7 @@ class VLLMEngine(BaseSamplerEngine):
     # =========================================================================
     # Core Sampling API
     # =========================================================================
-    
-    @remote_function()
+
     async def sample(
         self,
         prompt_token_ids: List[int],

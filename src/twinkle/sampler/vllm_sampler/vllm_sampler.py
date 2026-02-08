@@ -21,23 +21,21 @@ Data Flow:
 """
 import asyncio
 import atexit
-import logging
 import os
 import threading
 from dataclasses import asdict
 from typing import List, Dict, Any, Union, Optional, Literal
 
-import torch
-
-from .base import Sampler
-from .types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.checkpoint_engine import CheckpointEngineMixin
+from twinkle.sampler.base import Sampler
+from twinkle.data_format import SamplingParams, SampleResponse, SampledSequence
 from twinkle import remote_function, remote_class, DeviceMesh, requires
-from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.utils.platform import Platform
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle import get_logger
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def _collect_sample_responses(results: List[SampleResponse]) -> SampleResponse:
@@ -265,7 +263,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         lora_request = None
         if not adapter_path and self._ckpt_lora_loaded:
             from vllm.lora.request import LoRARequest
-            from twinkle.sampler.vllm_worker_extension import (
+            from twinkle.sampler.vllm_sampler.vllm_worker_extension import (
                 VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
             )
             lora_request = LoRARequest(
@@ -290,6 +288,8 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
                 stop_reason=seq.stop_reason,
                 tokens=seq.tokens,
                 logprobs=seq.logprobs,
+                decoded=self.template.decode(seq.tokens),
+                new_input_feature=self.template.concat_input_feature(feat, seq.tokens)
             )
             for seq in response.sequences
         ]
@@ -484,8 +484,8 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # Only receive_weights_via_checkpoint_engine is sampler-specific.
 
-    @remote_function(dispatch='all')
-    def receive_weights_via_checkpoint_engine(
+    @remote_function(dispatch='all', lazy_collect=True)
+    def receive_weights(
         self,
         base_sync_done: bool = False,
         peft_config: dict = None,

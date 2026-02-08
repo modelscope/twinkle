@@ -19,14 +19,13 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 from twinkle.model.megatron.args import get_args
-
+from twinkle import get_logger
 from twinkle.model.megatron.utils import split_cp_inputs
 
 from packaging import version
-import logging
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 

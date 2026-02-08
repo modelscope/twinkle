@@ -10,7 +10,6 @@ across different processes/nodes. It supports:
 """
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -24,9 +23,10 @@ from twinkle.utils.network import (
     is_valid_ipv6_address,
     stateless_init_process_group,
 )
-from .base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from .base import CheckpointEngine, TensorMeta
+from twinkle import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 @dataclass
@@ -92,7 +92,6 @@ class BroadcastOperation:
         return self.metadata
 
 
-@CheckpointEngineRegistry.register("hccl")
 class HCCLCheckpointEngine(CheckpointEngine):
     """HCCL checkpoint engine for Ascend NPU.
 
@@ -109,7 +108,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
     def __init__(
         self,
-        bucket_size: int,
+        bucket_size: int = 2048 << 20,
         group_name: str = "twinkle_ckpt",
         rebuild_group: bool = True,
         rollout_dtype: torch.dtype = torch.bfloat16,
