@@ -71,7 +71,7 @@ pip install -e . --no-build-isolation
 
 ## 更新日志
 
-- 🎉2026-02-10 twinkle-kit第一版编写完成，包含纯文本模型SFT/PT/RL和远程训练能力，并支持了[魔搭官方免费资源]()
+- 🎉2026-02-10 twinkle-kit第一版编写完成，包含纯文本模型SFT/PT/RL和远程训练能力，并支持了[魔搭官方免费资源](docs/source/使用指引/魔搭免费资源.md)。
 
 ## 支持的硬件
 
@@ -162,6 +162,24 @@ twinkle的架构由client和server两部分构成，其中client端包含两个�
 2. 对原生Tinker API的兼容
 
 这使得开发者可以直接使用Tinker API调用twinkle部署起来的后端训练服务。
+
+## 多租户支持
+
+Twinkle支持多个租户同时使用一个基模型进行训练。这一行为目前仅限于[LoRA](https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/config.py#L323)。
+Twinkle采用了LoRA池+租户申请的技术方案。这个方案可以支持最大N个租户并行训练互不干扰，并且在模型角度来看，不同租户的训练流程可能不同，在基模中的数据padding方式、optimizer、Loss类型也可以不同。
+
+<img src="assets/multi_lora.png" style="max-width: 500px; width: 100%;" />
+
+例如：
+
+- 租户A：本机加载本地私有数据集，loRA rank=8，使用基模进行SFT
+- 租户B：使用远端加载Hub端开源数据集，LoRA rank=32，使用基模进行PT
+- 租户C：使用基模进行GRPO Loss计算，使用Sampler采样
+- 租户D：使用基模进行logps推理
+
+这些过程可以同时发生在一个基模上，因为模型、Sampler本质上也是twinkle组件的一部分，可以做到任务无关。训练完成后，支持checkpoint推送HuggingFace/ModelScope的模型仓库，默认为私有。twinkle提供了完整的多租户训练解决方案，在server端支持集群化管理和动态扩缩容，可以进行简单定制化后作为企业级服务。
+
+> 作为模块化框架，twinkle本身也可以支持远端临时的独占式训练，即全参数方式。
 
 ## 支持的组件
 
