@@ -362,17 +362,34 @@ def build_model_app(model_id: str,
 
                     if self.use_megatron:
                         # Megatron uses combined forward_backward, no separate backward/calculate_loss
+                        # Set loss first based on loss_fn
+                        if loss_fn == 'cross_entropy':
+                            self.model.set_loss('CrossEntropyLoss',
+                                                adapter_name=adapter_name)
+                        elif loss_fn == 'importance_sampling':
+                            self.model.set_loss('GRPOLoss',
+                                                adapter_name=adapter_name,
+                                                epsilon=0.2,  # Default GRPO epsilon
+                                                beta=0.0)     # No KL penalty by default
+                        else:
+                            raise ValueError(
+                                f'Unsupported loss function {loss_fn}')
+                        
                         output, loss = self.model.forward_backward(
                             inputs=datum_list,
                             adapter_name=adapter_name,
                             **loss_fn_config)
                     else:
                         # Transformers uses separate forward, calculate_loss, backward
-                        # When use_megatron is True, we don't need to set the loss
-                        # Set loss first
+                        # Set loss first based on loss_fn
                         if loss_fn == 'cross_entropy':
                             self.model.set_loss('CrossEntropyLoss',
                                                 adapter_name=adapter_name)
+                        elif loss_fn == 'importance_sampling':
+                            self.model.set_loss('GRPOLoss',
+                                                adapter_name=adapter_name,
+                                                epsilon=0.2,  # Default GRPO epsilon
+                                                beta=0.0)     # No KL penalty by default
                         else:
                             raise ValueError(
                                 f'Unsupported loss function {loss_fn}')
@@ -382,8 +399,9 @@ def build_model_app(model_id: str,
                         loss = self.model.calculate_loss(adapter_name=adapter_name,
                                                          **loss_fn_config)
                         self.model.backward(adapter_name=adapter_name)
+                    output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     return types.ForwardBackwardOutput(
-                        loss_fn_output_type='CrossEntropyLossReturn',
+                        loss_fn_output_type=output_type,
                         loss_fn_outputs=output,
                         metrics={'loss:avg': loss},
                     )

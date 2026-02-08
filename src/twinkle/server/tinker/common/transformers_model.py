@@ -1,10 +1,51 @@
 import torch
 from tinker import types
-from typing import List
+from typing import List, Tuple, Optional, Any
 from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature
 from .io_utils import create_checkpoint_manager
+
+
+def _extract_rl_fields_from_inputs(
+    input_features: List[dict], 
+    kwargs: dict
+) -> Tuple[Optional[List], Optional[List], dict]:
+    """Extract old_logps and advantages from input features and kwargs.
+    
+    This function handles the common logic for extracting reinforcement learning
+    fields (old_logps and advantages) from both input features and kwargs.
+    
+    Args:
+        input_features: List of input feature dictionaries
+        kwargs: Keyword arguments dictionary
+        
+    Returns:
+        Tuple of (old_logps, advantages, updated_kwargs)
+    """
+    # Extract from kwargs first (higher priority)
+    old_logps = kwargs.pop('old_logps', None)
+    advantages = kwargs.pop('advantages', None)
+    
+    # If not in kwargs, check input features
+    if old_logps is None:
+        old_logps_list = [inp.get('old_logps') for inp in input_features if inp.get('old_logps') is not None]
+        if old_logps_list:
+            old_logps = old_logps_list
+    
+    if advantages is None:
+        advantages_list = [inp.get('advantages') for inp in input_features if inp.get('advantages') is not None]
+        if advantages_list:
+            advantages = advantages_list
+    
+    # Prepare kwargs for loss function
+    loss_kwargs = kwargs.copy()
+    if old_logps is not None:
+        loss_kwargs['old_logps'] = old_logps
+    if advantages is not None:
+        loss_kwargs['advantages'] = advantages
+        
+    return old_logps, advantages, loss_kwargs
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
@@ -45,6 +86,11 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         # Convert Datum to InputFeature
         input_features = [datum_to_input_feature(datum) for datum in inputs]
        
+        # Extract old_logps and advantages using common utility
+        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
+        # Update kwargs for forward pass (exclude loss-specific fields)
+        kwargs.update({k: v for k, v in loss_kwargs.items() if k not in ['old_logps', 'advantages']})
+       
         outputs = super().forward(inputs=input_features, **kwargs)
         logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
         results = self._get_forward_output(inputs, logits)
@@ -54,6 +100,11 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
     def forward_only(self, *, inputs: List[types.Datum], **kwargs):
         # Convert Datum to InputFeature
         input_features = [datum_to_input_feature(datum) for datum in inputs]
+        
+        # Extract old_logps and advantages using common utility
+        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
+        # Update kwargs for forward pass (exclude loss-specific fields)
+        kwargs.update({k: v for k, v in loss_kwargs.items() if k not in ['old_logps', 'advantages']})
 
         outputs = super().forward_only(inputs=input_features, **kwargs)
         logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
@@ -62,8 +113,33 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
-        loss = super().calculate_loss(**kwargs)
+        # Extract old_logps and advantages using common utility (for importance_sampling loss)
+        # Note: We don't need the input_features here since this is called separately
+        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs([], kwargs)
+            
+        loss = super().calculate_loss(**loss_kwargs)
         return loss
+
+    @remote_function(dispatch='slice_dp', collect='flatten')
+    def forward_backward(self, *, inputs: List[types.Datum], **kwargs):
+        # Convert Datum to InputFeature
+        input_features = [datum_to_input_feature(datum) for datum in inputs]
+        
+        # Extract old_logps and advantages using common utility
+        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
+        
+        # Forward pass
+        outputs = super().forward(inputs=input_features, **kwargs)
+        
+        # Calculate loss with extra parameters
+        loss = super().calculate_loss(**loss_kwargs)
+        
+        # Backward pass
+        super().backward(**kwargs)
+        
+        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
+        results = self._get_forward_output(inputs, logits)
+        return results, loss
 
     @remote_function()
     def step(self, *, adam_params: types.AdamParams, **kwargs):

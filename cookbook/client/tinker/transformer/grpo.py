@@ -182,68 +182,98 @@ def main():
             step += 1
             continue
 
-        # ========== 6. Training step ==========
-        # Select samples with positive advantages for training
-        # Weight them by their advantage value for GRPO-style optimization
-        training_data = []
-        for i, seq in enumerate(all_sequences):
-            if advantages[i] <= 0:
-                continue
-            # Build a Datum from the completion tokens
-            # Prompt tokens: weight=0 (don't compute loss on prompt)
-            # Completion tokens: weight=advantage (advantage-weighted SFT)
-            prompt_feature = prompts[i // NUM_GENERATIONS]
-            prompt_ids = prompt_feature['input_ids']
-            if hasattr(prompt_ids, 'tolist'):
-                prompt_ids = prompt_ids.tolist()
+    # Train the policies with the Advantage-Regularized policy 
+    # gradient (GRPO) loss function.
+    # 
+    # The GRPO loss function requires:
+    # 1. logprobs: The log probabilities of the tokens under the current policy
+    # 2. advantages: The advantage values for each completion
+    # 
+    # The training data is constructed with:
+    # - model_input: The full prompt + completion tokens
+    # - target_tokens: The shifted tokens for next-token prediction
+    # - logprobs: The log probabilities from the sampling step
+    # - advantages: The computed advantage values
+    training_data = []
+    for i, seq in enumerate(all_sequences):
+        # Build a Datum from the completion tokens with logprobs and advantages
+        prompt_feature = prompts[i // NUM_GENERATIONS]
+        prompt_ids = prompt_feature['input_ids']
+        if hasattr(prompt_ids, 'tolist'):
+            prompt_ids = prompt_ids.tolist()
 
-            full_tokens = prompt_ids + list(seq.tokens)
-            prompt_weights = [0.0] * len(prompt_ids)
-            # Scale completion weights by normalized advantage
-            completion_weights = [float(advantages[i])] * len(seq.tokens)
+        full_tokens = prompt_ids + list(seq.tokens)
+        
+        # Shift by one for next-token prediction
+        input_tokens = full_tokens[:-1]
+        target_tokens = full_tokens[1:]
+        
+        # Get logprobs from the sampling result
+        logprobs = seq.logprobs if seq.logprobs else [0.0] * len(seq.tokens)
+        # Pad logprobs to match full sequence length (prompt + completion)
+        # Prompt positions get 0.0 logprobs (no loss computed on prompt)
+        padded_logprobs = [0.0] * len(prompt_ids) + logprobs
+        
+        # Get advantage for this sequence
+        advantage = float(advantages[i])
+        
+        # Pad advantages to match full sequence length
+        # Only completion tokens get the advantage value, prompt gets 0.0
+        padded_advantages = [0.0] * len(prompt_ids) + [advantage] * len(seq.tokens)
+        
+        # Verify lengths match
+        assert len(input_tokens) == len(target_tokens) == len(padded_logprobs) == len(padded_advantages), \
+            f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, " \
+            f"logprobs={len(padded_logprobs)}, advantages={len(padded_advantages)}"
 
-            # Shift by one for next-token prediction
-            input_tokens = full_tokens[:-1]
-            target_tokens = full_tokens[1:]
-            weights = (prompt_weights + completion_weights)[1:]
-
-            datum = types.Datum(
-                model_input=types.ModelInput.from_ints(input_tokens),
-                loss_fn_inputs={
-                    'target_tokens': target_tokens,
-                    'weights': weights,
-                },
-            )
-            training_data.append(datum)
+        datum = types.Datum(
+            model_input=types.ModelInput.from_ints(input_tokens),
+            loss_fn_inputs={
+                'target_tokens': target_tokens,
+                'logprobs': types.TensorData.from_numpy(np.array(padded_logprobs, dtype=np.float32)),
+                'advantages': types.TensorData.from_numpy(np.array(padded_advantages, dtype=np.float32)),
+            },
+        )
+        training_data.append(datum)
 
         if not training_data:
             logger.info(
-                f"Step {step}: No positive-advantage samples, skipping")
+                f"Step {step}: No training data constructed, skipping")
             step += 1
             continue
 
-        # Forward-backward pass with cross-entropy on advantage-weighted data
+        # Forward-backward pass with importance_sampling (GRPO) loss
+        # The training data already contains logprobs and advantages for the GRPO loss
         fwdbwd_future = training_client.forward_backward(
-            training_data, "cross_entropy")
+            training_data, "importance_sampling")
         optim_future = training_client.optim_step(
             types.AdamParams(learning_rate=LEARNING_RATE))
-
+        
         fwdbwd_result = fwdbwd_future.result()
         optim_result = optim_future.result()
 
-        # Compute weighted average loss for monitoring
-        logprobs = np.concatenate(
-            [output['logprobs'].tolist()
-             for output in fwdbwd_result.loss_fn_outputs])
-        weights = np.concatenate(
-            [d.loss_fn_inputs['weights'].tolist() for d in training_data])
-        loss_per_token = -np.dot(logprobs, weights) / max(weights.sum(), 1e-8)
+        # Compute metrics from the forward-backward result
+        # For importance_sampling, we get logprobs and elementwise_loss
+        logprobs_list = []
+        elementwise_losses = []
+        for output in fwdbwd_result.loss_fn_outputs:
+            if output.get('logprobs') is not None:
+                logprobs_list.append(output['logprobs'].to_numpy())
+            if output.get('elementwise_loss') is not None:
+                elementwise_losses.append(output['elementwise_loss'].to_numpy())
+        
+        # Compute average loss per token (weighted by advantages)
+        if elementwise_losses:
+            all_losses = np.concatenate(elementwise_losses)
+            avg_loss = np.mean(all_losses) if len(all_losses) > 0 else 0.0
+        else:
+            avg_loss = 0.0
 
         gc.collect()
 
         # ========== 7. Log ==========
         log_dict = metrics.calculate()
-        log_dict['train/loss_per_token'] = loss_per_token
+        log_dict['train/loss_per_token'] = float(avg_loss)
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         log_dict['train/num_training_samples'] = len(training_data)
         logger.info(f"Step {step}: {log_dict}")

@@ -22,6 +22,17 @@ def datum_to_input_feature(datum: types.Datum) -> InputFeature:
         labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
         
         input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
+    
+    # 3. Handle importance_sampling specific fields
+    # 'logprobs' -> 'old_logps' (for GRPO loss)
+    if 'logprobs' in datum.loss_fn_inputs:
+        old_logps = datum.loss_fn_inputs['logprobs'].to_numpy().tolist()
+        input_feature['old_logps'] = old_logps
+    
+    # 'advantages' -> 'advantages' (for GRPO loss)
+    if 'advantages' in datum.loss_fn_inputs:
+        advantages = datum.loss_fn_inputs['advantages'].to_numpy().tolist()
+        input_feature['advantages'] = advantages
 
     return input_feature
 
