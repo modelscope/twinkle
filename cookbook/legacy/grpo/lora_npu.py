@@ -9,7 +9,7 @@ from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
-from twinkle.data_format.types import SamplingParams, SampleResponse
+from twinkle.data_format.sampling import SamplingParams, SampleResponse
 from twinkle.weight_loader import NativeLoader
 from twinkle.advantage import compute_advantages
 

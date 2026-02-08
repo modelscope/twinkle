@@ -1,7 +1,7 @@
 import gc
 import os
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 from peft import LoraConfig
 
@@ -37,6 +37,8 @@ GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 ADAPTER_NAME = 'default'
+DATA_NUM = 500
+USE_MEGATRON = False
 
 # SwanLab is optional - only used if SWANLAB_API_KEY is set
 USE_SWANLAB = 'SWANLAB_API_KEY' in os.environ
@@ -62,10 +64,10 @@ if USE_SWANLAB:
 def create_countdown_dataset():
     """Create Countdown Game dataset."""
     from twinkle.preprocessor import CountdownProcessor
-    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
+    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(DATA_NUM)))
     dataset.set_template("Template", model_id=MODEL_ID, max_length=8192)
     dataset.map(CountdownProcessor())
-    dataset.encode()
+    dataset.encode(add_generation_prompt=True)
     return dataset
 
 
@@ -78,15 +80,16 @@ def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[f
     return total_rewards, format_rewards, accuracy_rewards
 
 def main():
-
-    # ── Device setup ──────────────────────────────────────────────────
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)),
                     device_type='GPU', gpus_per_worker=1),
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)),
                     device_type='GPU', gpus_per_worker=1),
     ]
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    if USE_MEGATRON:
+        model_mesh = DeviceMesh.from_sizes(dp_size=MODEL_GPUS, tp_size=2, pp_size=2)
+    else:
+        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
     logger.info(get_device_placement())
@@ -96,9 +99,22 @@ def main():
     )
 
     # ── Model (training) ──────────────────────────────────────────────
-    model = TransformersModel(
+    if USE_MEGATRON:
+        from twinkle.model.megatron import MegatronModel
+        model = MegatronModel(
+            model_id=MODEL_ID,
+            device_mesh=model_mesh,
+            remote_group='model',
+            mixed_precision='bf16',
+            recompute_granularity='selective',
+            recompute_num_layers=None,
+        )
+    else:
+        model = TransformersModel(
         model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model',
     )
+
+
     model.add_adapter_to_model(
         ADAPTER_NAME, lora_config,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
@@ -158,24 +174,22 @@ def main():
         sample_response = sampler.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
         generate_time = time.perf_counter() - gen_start
 
-        trajectories: List[Trajectory] = []
-        input_features: List[InputFeature] = []
+        input_data : List[Dict[str, Any]] = []
         old_logps_list: List[List[float]] = []
         completion_lengths: List[int] = []
 
         for sequence in sample_response.sequences:
-            input_features.append(sequence.new_input_feature)
-            trajectories.append(sequence.new_input_feature)
+            input_data.append(sequence.new_input_feature)
             old_logps_list.append(sequence.logprobs)
             completion_lengths.append(len(sequence.tokens))
 
-        if not trajectories:
+        if not input_data:
             logger.warning(f"Step {step}: No valid samples, skipping")
             step += 1
             continue
 
         # ========== 4. Compute rewards ==========
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(trajectories)
+        total_rewards, format_rewards, accuracy_rewards = compute_rewards(input_data)
         metrics.accumulate(None, None,
                            generate_time=generate_time,
                            weight_sync_time=weight_sync_time,
@@ -201,7 +215,7 @@ def main():
         # Pass InputFeature list directly (exact token alignment with sampler).
         # advantages and old_logps are lists, sliced in sync by dispatch.
         model.forward_backward(
-            inputs=input_features,
+            inputs=input_data,
             adapter_name=ADAPTER_NAME,
             advantages=advantages,
             old_logps=old_logps_list,

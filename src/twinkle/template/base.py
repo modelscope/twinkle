@@ -142,20 +142,22 @@ class Template:
         return current
 
     def concat_input_feature(self, prompt_input_feature: InputFeature, new_tokens: List[int]) -> InputFeature:
+        import copy
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
-        prompt_ids = prompt_input_feature['input_ids']
+        result = copy.deepcopy(prompt_input_feature)
+        prompt_ids = result['input_ids']
         input_ids = list(prompt_ids) + new_tokens
         labels = [-100] * len(prompt_ids) + new_tokens
-        prompt_input_feature['input_ids'] = input_ids
-        prompt_input_feature['labels'] = labels
-        new_input_feature = self._invoke_post_pipeline([prompt_input_feature])[0]
-        prompt_input_feature.update(new_input_feature)
-        messages: List[Message] = prompt_input_feature.get('messages')
+        result['input_ids'] = input_ids
+        result['labels'] = labels
+        new_input_feature = self._invoke_post_pipeline([result])[0]
+        result.update(new_input_feature)
+        messages: List[Message] = result.get('messages')
         if messages is not None:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             messages.append(Message(role='assistant', content=response_text))
-            prompt_input_feature['messages'] = messages
-        return prompt_input_feature
+            result['messages'] = messages
+        return result
 
     def _add_default_system(self, trajectory: Trajectory) -> List[Trajectory]:
         if self.use_chat_template and self.default_system:
@@ -316,7 +318,7 @@ class Template:
 
         return columns
 
-    def batch_encode(self, trajectories: Union[Dict[str, Any], List[Trajectory]]) -> List[InputFeature]:
+    def batch_encode(self, trajectories: Union[Dict[str, Any], List[Trajectory]], add_generation_prompt: bool = False) -> List[InputFeature]:
         output = []
         _transfer = False
         if isinstance(trajectories, Mapping):
@@ -324,7 +326,7 @@ class Template:
             trajectories = self.map_col_to_row(trajectories)
         trajectories = self._invoke_pre_pipeline(trajectories)
         for trajectory in trajectories:
-            output.append(self.encode(trajectory))
+            output.append(self.encode(trajectory, add_generation_prompt=add_generation_prompt))
         output = self._invoke_post_pipeline(output)
         if _transfer:
             output = self.map_row_to_col(output)

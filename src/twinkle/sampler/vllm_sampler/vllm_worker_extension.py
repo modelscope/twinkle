@@ -78,7 +78,7 @@ class TwinkleWorkerExtension:
     ``AsyncLLM.collective_rpc()``.
 
     Usage:
-        worker_extension_cls="twinkle.sampler.vllm_worker_extension.TwinkleWorkerExtension"
+        worker_extension_cls="twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension"
     """
 
     def __new__(cls, *args, **kwargs):

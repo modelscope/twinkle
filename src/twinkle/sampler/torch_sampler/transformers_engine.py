@@ -17,7 +17,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from twinkle import get_logger
 from twinkle.sampler.base_engine import BaseSamplerEngine
-from twinkle.data_format.types import SampleResponse, SampledSequence, SamplingParams
+from twinkle.data_format.sampling import SampleResponse, SampledSequence, SamplingParams
 
 logger = get_logger()
 

@@ -25,9 +25,18 @@ class CheckpointEngineMixin:
         engine.is_master = is_master
         return engine.prepare()
 
-    @remote_function(dispatch='all', lazy_collect=False)
+    @remote_function(dispatch='slice', lazy_collect=True)
     def init_checkpoint_process_group(self, rank: int, world_size: int, master_metadata):
         """Initialize process group for weight synchronization."""
+        if isinstance(rank, list):
+            assert len(rank) == 1
+            rank = rank[0]
+        if isinstance(world_size, list):
+            assert len(world_size) == 1
+            world_size = world_size[0]
+        if isinstance(master_metadata, list):
+            assert len(master_metadata) == 1
+            master_metadata = master_metadata[0]
         engine = self._get_or_create_checkpoint_engine()
         engine.init_process_group(
             rank=rank,

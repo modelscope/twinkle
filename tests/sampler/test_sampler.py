@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from twinkle.sampler.base import Sampler, SampleGroup
-from twinkle.data_format.types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format.sampling import SamplingParams, SampleResponse, SampledSequence
 from twinkle.data_format import Trajectory, InputFeature
 
 

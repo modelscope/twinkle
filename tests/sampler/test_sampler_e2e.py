@@ -37,7 +37,7 @@ def test_vllm_engine_with_input_ids():
     
     import asyncio
     from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
-    from twinkle.data_format.types import SamplingParams
+    from twinkle.data_format.sampling import SamplingParams
 
     print(f"Creating VLLMEngine with model: {MODEL_ID}")
     engine = VLLMEngine(
@@ -89,7 +89,7 @@ def test_transformers_engine_with_input_ids():
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from twinkle.data_format.types import SamplingParams
+    from twinkle.data_format.sampling import SamplingParams
 
     print(f"Loading model: {MODEL_ID}")
     
@@ -148,7 +148,7 @@ def test_vllm_engine_batch():
     
     import asyncio
     from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
-    from twinkle.data_format.types import SamplingParams
+    from twinkle.data_format.sampling import SamplingParams
 
     print(f"Creating VLLMEngine with model: {MODEL_ID}")
     engine = VLLMEngine(
@@ -205,7 +205,7 @@ def test_sampling_params_conversion():
     print("Test: SamplingParams conversion")
     print("=" * 60)
     
-    from twinkle.data_format.types import SamplingParams
+    from twinkle.data_format.sampling import SamplingParams
     
     params = SamplingParams(
         max_tokens=64,

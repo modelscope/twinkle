@@ -9,7 +9,7 @@ from twinkle.sampler.vllm_sampler.vllm_engine import (
     LoRAAdapterManager,
     get_vllm_max_lora_rank,
 )
-from twinkle.data_format.types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format.sampling import SamplingParams, SampleResponse, SampledSequence
 
 # =============================================================================
 # Tests for Data Types

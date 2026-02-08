@@ -15,7 +15,7 @@ from twinkle.data_format import Trajectory, InputFeature
 from twinkle.sampler import VLLMSampler
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
-from twinkle.data_format.types import SamplingParams, SampleResponse
+from twinkle.data_format.sampling import SamplingParams, SampleResponse
 
 
 def build_sampler_app(model_id: str,

@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from twinkle.sampler.base import Sampler
-from twinkle.data_format.types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format.sampling import SamplingParams, SampleResponse, SampledSequence
 from twinkle import remote_class, remote_function, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation

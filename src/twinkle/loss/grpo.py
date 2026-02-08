@@ -341,7 +341,6 @@ class GRPOLoss(Loss):
             logits = logits[:, -labels.shape[1]:]
 
         # labels = torch.roll(labels, shifts=-1, dims=1)
-        # breakpoint()
         loss_mask = (labels != self.ignore_index).bool()
         masked_labels = labels.clone()
         masked_labels[~loss_mask] = 0

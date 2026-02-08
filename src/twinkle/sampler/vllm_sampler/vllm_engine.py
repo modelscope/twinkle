@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from twinkle import get_logger
 from twinkle.sampler.base_engine import BaseSamplerEngine
-from twinkle.data_format.types import StopReason, SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
 
 import inspect
 
@@ -137,7 +137,7 @@ class VLLMEngine(BaseSamplerEngine):
         
         # Enable worker extension for weight synchronization
         engine_config["worker_extension_cls"] = (
-            "twinkle.sampler.vllm_worker_extension.TwinkleWorkerExtension"
+            "twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension"
         )
         
         engine_config.update(self.engine_kwargs)

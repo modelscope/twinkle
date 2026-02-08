@@ -53,7 +53,7 @@ from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
-from twinkle.data_format.types import SamplingParams
+from twinkle.data_format.sampling import SamplingParams
 from twinkle.weight_loader import NativeLoader
 from twinkle.advantage import GRPOAdvantage
 

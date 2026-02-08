@@ -26,14 +26,9 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import VLLMSampler
-<<<<<<< HEAD
-from twinkle.data_format.types import SamplingParams, SampleResponse
+from twinkle.data_format.sampling import SamplingParams, SampleResponse
 from twinkle.advantage import GRPOAdvantage
-=======
-from twinkle.sampler.types import SamplingParams, SampleResponse
-from twinkle.rl import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
->>>>>>> dev
 from twinkle.template import Template
 
 from transformers import AutoTokenizer
