@@ -10,7 +10,6 @@
 # ============================================================================
 
 from typing import Type, Union
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta

@@ -374,7 +374,7 @@ class VLLMEngine(BaseSamplerEngine):
             # Verify it's still loaded in engine
             loaded_loras = await self.engine.list_loras()
             if lora_int_id in loaded_loras:
-                if lora_path != self._user_lora_paths[user_id]:
+                if self._user_lora_paths.get(user_id) != lora_path:
                     # reload the lora
                     await self.remove_adapter(user_id)
                     lora_request = await self._get_or_load_lora(lora_path, user_id)

@@ -33,8 +33,8 @@ applications:
 
   # 2. Model Service - Hosts the base model for training
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct   # REST path for this model
+  - name: models-Qwen2.5-0.5B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-0.5B-Instruct   # REST path for this model
     import_path: model
     args:
       use_megatron: false                              # Use HuggingFace Transformers (not Megatron)
@@ -82,5 +82,37 @@ applications:
           min_replicas: 1
           max_replicas: 1
           target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+
+  # 4. Sampler Service - Handles text generation inference
+  #    Uses vLLM for efficient batched generation with optional LoRA adapters.
+  - name: sampler-Qwen2.5-0.5B-Instruct
+    route_prefix: /samplers/Qwen/Qwen2.5-0.5B-Instruct   # REST path for this sampler
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"        # ModelScope model identifier to load
+      sampler_type: vllm                                 # Sampler backend (vllm or torch)
+      nproc_per_node: 1                                  # Number of GPU processes per node
+      engine_args:                                       # vLLM engine configuration
+        gpu_memory_utilization: 0.4
+        max_model_len: 1024
+      adapter_config:                                    # Adapter lifecycle management
+        per_token_adapter_limit: 30                      # Max LoRA adapters per user
+        adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
+      device_group:
+        name: sampler
+        ranks: [0]                                     # GPU rank indices to use
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
