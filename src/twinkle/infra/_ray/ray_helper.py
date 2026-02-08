@@ -336,7 +336,8 @@ class RayHelper:
         else:
             world_size = len(ranks)
             workers = []
-            _visible_device_env = {Platform.get_platform(device_type_upper).visible_device_env(): ''}
+            # For CPU case, don't set visible device environment variables
+            _visible_device_env = {}
             for rank, (deploy_pg, index) in enumerate(zip(placement_groups, list(range(world_size)))):
                 deploy_pg: Dict
                 cluster_name = group
