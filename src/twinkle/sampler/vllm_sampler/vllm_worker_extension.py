@@ -74,7 +74,7 @@ class TwinkleWorkerExtension:
     """Extension class for vLLM workers to support weight synchronization.
 
     Mixed into vLLM's Worker class via ``worker_extension_cls``.  Methods
-    are called from the VLLMSampler Ray actor through
+    are called from the vLLMSampler Ray actor through
     ``AsyncLLM.collective_rpc()``.
 
     Usage:

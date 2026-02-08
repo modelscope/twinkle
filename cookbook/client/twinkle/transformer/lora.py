@@ -46,27 +46,27 @@ def train():
     # Step 4: Prepare the dataset
 
     # Load the self-cognition dataset from ModelScope
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply a chat template so the data matches the model's expected input format
     dataset.set_template(
-        'Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+        'Template', model_id='ms://Qwen/Qwen2.5-0.5B-Instruct', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
     dataset.map('SelfCognitionProcessor', init_args={
-                'model_name': 'twinkle模型', 'model_author': 'twinkle团队'})
+                'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
 
     # Tokenize and encode the dataset into model-ready input features
     dataset.encode(batched=True)
 
-    # Wrap the dataset into a DataLoader that yields batches of size 8
-    dataloader = DataLoader(dataset=dataset, batch_size=8)
+    # Wrap the dataset into a DataLoader that yields batches of size 4
+    dataloader = DataLoader(dataset=dataset, batch_size=4)
 
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
     model = MultiLoraTransformersModel(
-        model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+        model_id='ms://Qwen/Qwen2.5-0.5B-Instruct')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(
@@ -102,38 +102,41 @@ def train():
     # Step 7: Run the training loop
     logger.info(model.get_train_configs())
 
-    for step, batch in enumerate(dataloader):
-        # Forward pass + backward pass (computes gradients)
-        output = model.forward_backward(inputs=batch)
+    for epoch in range(3):
+        logger.info(f'Starting epoch {epoch}')
+        for step, batch in enumerate(dataloader):
+            # Forward pass + backward pass (computes gradients)
+            output = model.forward_backward(inputs=batch)
 
-        # Log the loss every 2 steps (aligned with gradient accumulation)
-        if step % 2 == 0:
-            logger.info(f'Current is step {step // 2}, loss: {output}')
+            # Log the loss every 2 steps (aligned with gradient accumulation)
+            if step % 2 == 0:
+                logger.info(f'Current is step {step // 2}, loss: {output}')
 
-        # Clip gradients to prevent exploding gradients (max norm = 1.0)
-        model.clip_grad_norm(1.0)
+            # Clip gradients to prevent exploding gradients (max norm = 1.0)
+            model.clip_grad_norm(1.0)
 
-        # Perform one optimizer step (update model weights)
-        model.step()
+            # Perform one optimizer step (update model weights)
+            model.step()
 
-        # Reset gradients to zero for the next iteration
-        model.zero_grad()
+            # Reset gradients to zero for the next iteration
+            model.zero_grad()
 
-        # Advance the learning rate scheduler by one step
-        model.lr_step()
+            # Advance the learning rate scheduler by one step
+            model.lr_step()
 
-    # Step 8: Save the trained checkpoint
-    twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
-    logger.info(f"Saved checkpoint: {twinkle_path}")
+        # Step 8: Save the trained checkpoint
+        twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+        logger.info(f"Saved checkpoint: {twinkle_path}")
 
     # Step 9: Upload the checkpoint to ModelScope Hub
-    hub_model_id = 'AlexEz/twinkle-self-cognition'
-    model.upload_to_hub(
-        checkpoint_dir=twinkle_path, 
-        hub_model_id=hub_model_id, 
-        async_upload=False
-    )
-    logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
+    # YOUR_USER_NAME = "your_username"
+    # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
+    # model.upload_to_hub(
+    #     checkpoint_dir=twinkle_path, 
+    #     hub_model_id=hub_model_id, 
+    #     async_upload=False
+    # )
+    # logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")
 
 
 if __name__ == '__main__':

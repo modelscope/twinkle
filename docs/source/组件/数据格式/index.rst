@@ -1,4 +1,4 @@
-数据加载
+数据格式
 ===============
 .. toctree::
    :maxdepth: 1
@@ -7,3 +7,5 @@
    Trajectory.md
    InputFeature.md
    ModelOutput.md
+   Sampling.md
+   Output.md

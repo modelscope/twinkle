@@ -5,7 +5,7 @@
 This script serves as both a test and a minimal demo of the weight sync flow
 used during RL training:
 
-    1. Create TransformersModel (with real weights) and VLLMSampler (with dummy weights)
+    1. Create TransformersModel (with real weights) and vLLMSampler (with dummy weights)
     2. Sample with dummy weights → garbage output
     3. Sync weights from Model → Sampler via CheckpointEngineManager (NCCL broadcast)
     4. Sample with synced weights → coherent output
@@ -93,7 +93,7 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
     from twinkle.model.transformers import TransformersModel
-    from twinkle.sampler import VLLMSampler
+    from twinkle.sampler import vLLMSampler
     from twinkle.template import Template
     from twinkle.checkpoint_engine import CheckpointEngineManager
     from transformers import AutoTokenizer
@@ -142,7 +142,7 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
 
     # ── Create Sampler (dummy weights) ────────────────────────────────
     log("Creating Sampler (dummy weights)...")
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=model_path,
         engine_args={
             'load_format': 'dummy',         # start with random weights

@@ -35,25 +35,25 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+MODEL_ID = 'ms://Qwen/Qwen2.5-0.5B-Instruct'
 NUM_GENERATIONS = 8
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
-MAX_STEPS = 2000
+MAX_STEPS = 10
 BATCH_SIZE = 4
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 1       # Save weights for sampler every N steps
-LORA_RANK = 8
+SYNC_INTERVAL = 5       # Save weights for sampler every N steps
+GRADIENT_ACCUMULATION_STEPS = 4
 
 
 def create_countdown_dataset():
     """Create Countdown Game dataset for GRPO training."""
-    from twinkle.preprocessor import CountdownProcessor
+
     dataset = Dataset(DatasetMeta(
-        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
+        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(500)))
     dataset.set_template(
         "Template", model_id=f'ms://{BASE_MODEL}', max_length=8192)
-    dataset.map(CountdownProcessor())
+    dataset.map('CountdownProcessor')
     dataset.encode(add_generation_prompt=True)
     return dataset
 

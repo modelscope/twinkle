@@ -1,14 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Alignment tests between twinkle samplers and swift inference engines.
 
-This script tests that twinkle's TorchSampler and VLLMSampler produce identical
+This script tests that twinkle's TorchSampler and vLLMSampler produce identical
 results to swift's TransformersEngine and VllmEngine respectively.
 
 Test cases:
 1. LLM + TorchSampler vs TransformersEngine
-2. LLM + VLLMSampler vs VllmEngine
+2. LLM + vLLMSampler vs VllmEngine
 3. MLLM + TorchSampler vs TransformersEngine
-4. MLLM + VLLMSampler vs VllmEngine
+4. MLLM + vLLMSampler vs VllmEngine
 """
 
 import gc
@@ -19,7 +19,7 @@ twinkle.initialize(mode='local', nproc_per_node=1)
 
 from swift.infer_engine import TransformersEngine, VllmEngine, RequestConfig
 from swift.utils import seed_everything
-from twinkle.sampler import TorchSampler, VLLMSampler, SamplingParams
+from twinkle.sampler import TorchSampler, vLLMSampler, SamplingParams
 from twinkle.template import Template
 from twinkle.template.qwen3_vl import Qwen3VLTemplate
 from twinkle.data_format import Trajectory
@@ -84,7 +84,7 @@ def test_llm_vllm_sampler():
     clean_cache()
 
     seed_everything(42)
-    sampler = VLLMSampler(LLM_MODEL_ID, gpu_memory_utilization=0.5)
+    sampler = vLLMSampler(LLM_MODEL_ID, gpu_memory_utilization=0.5)
     sampler.set_template(Template, model_id=LLM_MODEL_ID)
     
     trajectory = Trajectory(messages=LLM_MESSAGES)
@@ -141,7 +141,7 @@ def test_mllm_vllm_sampler():
     clean_cache()
 
     seed_everything(42)
-    sampler = VLLMSampler(MLLM_MODEL_ID, gpu_memory_utilization=VLLM_GPU_MEM, max_model_len=VLLM_MAX_MODEL_LEN)
+    sampler = vLLMSampler(MLLM_MODEL_ID, gpu_memory_utilization=VLLM_GPU_MEM, max_model_len=VLLM_MAX_MODEL_LEN)
     sampler.set_template(Qwen3VLTemplate, model_id=MLLM_MODEL_ID)
     
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
@@ -164,9 +164,9 @@ def main():
     
     # Run all tests
     results['LLM TorchSampler'] = test_llm_torch_sampler()
-    results['LLM VLLMSampler'] = test_llm_vllm_sampler()
+    results['LLM vLLMSampler'] = test_llm_vllm_sampler()
     results['MLLM TorchSampler'] = test_mllm_torch_sampler()
-    results['MLLM VLLMSampler'] = test_mllm_vllm_sampler()
+    results['MLLM vLLMSampler'] = test_mllm_vllm_sampler()
 
     for test_name, passed in results.items():
         status = 'PASS' if passed else 'FAIL'

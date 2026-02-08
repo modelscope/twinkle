@@ -1,6 +1,6 @@
 # Template
 
-模板是用于将Trajectory转换为InputFeature的关键组件。
+模板是用于将 Trajectory 转换为 InputFeature 的关键组件。
 
 ```python
 class Template:
@@ -40,13 +40,13 @@ class Template:
 ```
 
 - model_id: 包含tokenizer或者processor的模型id
-- use_chat_template: 是否使用chat_template。如果不使用，一般是预训练场景
+- use_chat_template: 是否使用 chat_template。如果不使用，一般是预训练场景
 - max_length: 单样本的最大长度
 - truncation_strategy: 如果超过了最大长度，如何处理该样本
   - raise: 抛出异常。一般用于非常精确的数据集场景
-  - left: 移除左边的token，使其符合max_length
-  - right: 移除右边的token，使其符合max_length
-  - default_system: 如果数据集没有system，则使用默认system
+  - left: 移除左边的 token，使其符合 max_length
+  - right: 移除右边的 token，使其符合 max_length
+  - default_system: 如果数据集没有 system，则使用默认 system
 
-> Template不支持使用函数来代替，因为其内部要支持的功能较多。如果需要编写新的Template，请继承`Template`类。
-> 一般来说，纯文本模型使用Template基类就足够了，在基类中我们使用了tokenizer.apply_chat_template来编码模型，对一般的纯文本模型是通用的。
+> Template 不支持使用函数来代替，因为其内部要支持的功能较多。如果需要编写新的 Template，请继承 `Template` 类。
+> 一般来说，纯文本模型使用 Template 基类就足够了，在基类中我们使用了 tokenizer.apply_chat_template 来编码模型，对一般的纯文本模型是通用的。

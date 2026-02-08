@@ -25,7 +25,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.processor import InputProcessor
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.data_format.sampling import SamplingParams, SampleResponse
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
@@ -253,7 +253,7 @@ def main():
     model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
     model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'load_format': 'dummy',

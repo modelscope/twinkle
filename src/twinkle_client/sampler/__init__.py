@@ -8,4 +8,4 @@
 #   1. Modify the source files in src/twinkle/
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
-from .vllm_sampler import VLLMSampler
+from .vllm_sampler import vLLMSampler

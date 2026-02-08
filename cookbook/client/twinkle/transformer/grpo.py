@@ -41,26 +41,25 @@ from twinkle_client.sampler import VLLMSampler
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = 'ms://Qwen/Qwen2.5-3B-Instruct'
+MODEL_ID = 'ms://Qwen/Qwen2.5-0.5B-Instruct'
 NUM_GENERATIONS = 8
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
-MAX_STEPS = 2000
+MAX_STEPS = 10
 BATCH_SIZE = 4
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 1       # Save weights for sampler every N steps
+SYNC_INTERVAL = 5       # Save weights for sampler every N steps
 GRADIENT_ACCUMULATION_STEPS = 4
 
 
 def create_countdown_dataset():
     """Create Countdown Game dataset for GRPO training."""
-    from twinkle.preprocessor import CountdownProcessor
 
     dataset = Dataset(dataset_meta=DatasetMeta(
-        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
+        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(500)))
     dataset.set_template(
         'Template', model_id=MODEL_ID, max_length=8192)
-    dataset.map(CountdownProcessor())
+    dataset.map('CountdownProcessor')
     dataset.encode(add_generation_prompt=True, batched=True)
     return dataset
 

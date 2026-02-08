@@ -9,18 +9,13 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 from typing import Any, Optional, List, Dict, Union
-import uuid
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.types import SamplingParams, SampleResponse
-from twinkle import DeviceMesh
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
-import json
 
 
-class VLLMSampler(Sampler):
+class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
     
     This client manages sampling operations and adapter synchronization with the sampler server.
@@ -41,7 +36,6 @@ class VLLMSampler(Sampler):
             json_data=kwargs
         )
         response.raise_for_status()
-        return response.json()
     
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""

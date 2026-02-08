@@ -240,7 +240,6 @@ def generate_processors():
             if typing_imports:
                 lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
             lines.extend([
-                "from twinkle_client.http import TWINKLE_SERVER_URL",
                 "from twinkle_client.http import http_post, heartbeat_manager",
             ])
             lines.extend(sorted(twinkle_imports))
@@ -447,7 +446,6 @@ def generate_models():
 
     model_code = AUTO_GEN_WARNING + '''from typing import Any, Optional, Union, Type, Dict, Literal, List
 import uuid
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
@@ -724,18 +722,13 @@ def generate_samplers():
     client_module_path.mkdir(parents=True, exist_ok=True)
 
     sampler_code = AUTO_GEN_WARNING + '''from typing import Any, Optional, List, Dict, Union
-import uuid
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.types import SamplingParams, SampleResponse
-from twinkle import DeviceMesh
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
-import json
 
 
-class VLLMSampler(Sampler):
+class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
     
     This client manages sampling operations and adapter synchronization with the sampler server.
@@ -756,7 +749,6 @@ class VLLMSampler(Sampler):
             json_data=kwargs
         )
         response.raise_for_status()
-        return response.json()
     
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""
@@ -859,7 +851,7 @@ class VLLMSampler(Sampler):
 
     # Create/overwrite __init__.py
     init_file = client_module_path / '__init__.py'
-    init_content = AUTO_GEN_WARNING + "from .vllm_sampler import VLLMSampler\n"
+    init_content = AUTO_GEN_WARNING + "from .vllm_sampler import vLLMSampler\n"
     print(f"Writing {init_file}...")
     with open(init_file, 'w', encoding='utf-8') as f:
         f.write(init_content)

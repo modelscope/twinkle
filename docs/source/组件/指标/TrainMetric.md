@@ -10,4 +10,4 @@ metric.accumulate(None, None, lr=0.0001, step=10, gradient_accumulation_steps=16
 _metric = metric.calculate()
 ```
 
-> TrainMetric不需要device_mesh和process_group信息，也不需要inputs、outputs信息
+> TrainMetric 不需要 device_mesh 和 process_group 信息，也不需要 inputs、outputs 信息

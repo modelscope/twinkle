@@ -10,7 +10,6 @@
 # ============================================================================
 
 from typing import List, Literal, Optional, Union
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature

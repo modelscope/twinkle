@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Tests for Sampler classes (VLLMSampler, TorchSampler)."""
+"""Tests for Sampler classes (vLLMSampler, TorchSampler)."""
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -240,13 +240,13 @@ class TestMockSampler:
 
 @pytest.mark.skip(reason="Requires model and GPU")
 class TestVLLMSamplerIntegration:
-    """Integration tests for VLLMSampler."""
+    """Integration tests for vLLMSampler."""
     
     def test_sample_with_trajectory(self):
         """Test sampling with Trajectory input."""
-        from twinkle.sampler import VLLMSampler
+        from twinkle.sampler import vLLMSampler
         
-        sampler = VLLMSampler(
+        sampler = vLLMSampler(
             model_id="Qwen/Qwen2.5-0.5B",
             engine_args={'max_model_len': 512, 'gpu_memory_utilization': 0.5}
         )
@@ -267,9 +267,9 @@ class TestVLLMSamplerIntegration:
     
     def test_sample_with_input_feature(self):
         """Test sampling with InputFeature input."""
-        from twinkle.sampler import VLLMSampler
+        from twinkle.sampler import vLLMSampler
         
-        sampler = VLLMSampler(
+        sampler = vLLMSampler(
             model_id="Qwen/Qwen2.5-0.5B",
             engine_args={'max_model_len': 512, 'gpu_memory_utilization': 0.5}
         )

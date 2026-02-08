@@ -9,17 +9,15 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
-from typing import Callable, Optional, Type, Union
-from twinkle_client.http import TWINKLE_SERVER_URL
+from typing import Callable, Type, Union
 from twinkle_client.http import http_post, heartbeat_manager
-from twinkle import DeviceMesh
 from twinkle.dataset import Dataset
 from twinkle.processor import InputProcessor
 
 class DataLoader(object):
     """Client wrapper for DataLoader that calls server HTTP endpoints."""
 
-    def __init__(self, dataset: Union[Dataset, Callable], device_mesh: Optional[DeviceMesh] = None, **kwargs):
+    def __init__(self, dataset: Union[Dataset, Callable], **kwargs):
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
@@ -28,7 +26,7 @@ class DataLoader(object):
             json_data={
                 'processor_type': 'dataloader',
                 'class_type': 'DataLoader',
-                **{'dataset': dataset, 'device_mesh': device_mesh}, **kwargs
+                **{'dataset': dataset}, **kwargs
             }
         )
         response.raise_for_status()

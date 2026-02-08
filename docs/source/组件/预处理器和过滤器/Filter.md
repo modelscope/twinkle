@@ -1,8 +1,8 @@
 # Filter
 
-预处理器是用于数据ETL的脚本。它的作用是将杂乱、未清洗的数据转换为标准化、清洗过的数据。twinkle支持的预处理方式是运行在dataset.map方法上。
+预处理器是用于数据 ETL 的脚本。它的作用是将杂乱、未清洗的数据转换为标准化、清洗过的数据。Twinkle 支持的预处理方式是运行在 dataset.map 方法上。
 
-Filter的基类：
+Filter 的基类：
 
 ```python
 class DataFilter:
@@ -18,7 +18,7 @@ dataset.map(...)
 dataset.filter(...)
 ```
 
-Filter包含__call__方法，这意味着你可以使用function来代替类：
+Filter 包含 __call__ 方法，这意味着你可以使用 function 来代替类：
 
 ```python
 def my_custom_filter(row):

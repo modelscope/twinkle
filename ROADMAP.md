@@ -64,6 +64,7 @@
 - [ ] 支持GKD、on-policy-distill等蒸馏算法
 - [ ] 支持DPO对齐训练
 - [ ] 支持colocate RL训练
+- [ ] Preprocess支持batched
 
 ### 网络能力
 
@@ -82,6 +83,7 @@
 - [ ] Support for distillation algorithms such as GKD and on-policy distillation
 - [ ] Support for DPO alignment training
 - [ ] Support for colocate RL training
+- [ ] Support for batched preprocessing
 
 ### Networking Capabilities
 
