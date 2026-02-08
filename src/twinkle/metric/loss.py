@@ -65,5 +65,5 @@ class LossMetric(Metric):
         if avg_loss is not None:
             results['loss'] = f'{avg_loss:.4f}'
         if grad_norm > 0:
-            results['grad_norm'] = f'{grad_norm:.2f}'
+            results['grad_norm'] = f'{grad_norm:.6f}'
         return results

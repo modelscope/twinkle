@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from twinkle import get_logger
 from twinkle_client import init_twinkle_client
-from twinkle_client.sampler import VLLMSampler
+from twinkle_client.sampler import vLLMSampler
 
 logger = get_logger()
 
@@ -39,7 +39,7 @@ def sample():
     )
 
     # Step 3: Create the sampler client pointing to the model on the server
-    sampler = VLLMSampler(model_id=MODEL_ID)
+    sampler = vLLMSampler(model_id=MODEL_ID)
 
     # Step 4: Set the chat template so the sampler can encode Trajectory inputs
     sampler.set_template('Template', model_id=MODEL_ID)
