@@ -15,7 +15,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 from twinkle.metric import CompletionRewardMetric
 
@@ -126,7 +126,7 @@ def main():
     model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
     model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'load_format': 'dummy',

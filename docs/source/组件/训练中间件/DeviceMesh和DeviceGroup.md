@@ -1,6 +1,6 @@
 # DeviceMesh/DeviceGroup
 
-这两个类用于表达硬件资源分配和网络构型，twinkle的数据分发和收集也依赖它们。
+这两个类用于表达硬件资源分配和网络拓扑，Twinkle 的数据分发和收集也依赖它们。
 
 ## DeviceGroup
 
@@ -16,15 +16,15 @@ class DeviceGroup:
 
 - name: 资源组名
 - ranks: 占用硬件列表，如果是CPU资源仅支持int类型
-- device_type: 硬件类型，例如GPU/CPU/NPU等
-- visible_devices: 可见资源列表，用于希望仅使用部分rank的硬件的情况
-- gpus_per_worker: 每个worker占用多少硬件
+- device_type: 硬件类型，例如 GPU/CPU/NPU 等
+- visible_devices: 可见资源列表，用于希望仅使用部分 rank 的硬件的情况
+- gpus_per_worker: 每个 worker 占用多少硬件
 
-如果训练RL，开发者可以构造多个这样的组，并将对应的模型、采样器分配进入其中。
+如果训练 RL，开发者可以构造多个这样的组，并将对应的模型、采样器分配进入其中。
 
 ## DeviceMesh
 
-DeviceMesh承载了组件构型、分布式并行信息，这个类会在组件内传递，数据分发和数据收集。
+DeviceMesh 承载了组件拓扑、分布式并行信息，这个类会在组件内传递，用于数据分发和数据收集。
 
 ```python
 @dataclass
@@ -38,7 +38,7 @@ class DeviceMesh:
         ...
 ```
 
-推荐使用`from_sizes`来构造它。
+推荐使用 `from_sizes` 来构造它。
 
 我们举一个例子：
 
@@ -57,14 +57,14 @@ for data in dataloader:
 
 我们以上面的伪代码来分析数据传递情况。
 
-dataloader取出数据 -> 按照dp_size=4分发给sampler -> 按照dp_size=4收集数据 -> 按照dp_size=2分发给模型 -> 按照dp_size=2收集输出
+dataloader 取出数据 -> 按照 dp_size=4 分发给 sampler -> 按照 dp_size=4 收集数据 -> 按照 dp_size=2 分发给模型 -> 按照 dp_size=2 收集输出
 
-通过DeviceMesh，可以将数据流平顺的在各个group和组件之间流转起来。
+通过 DeviceMesh，可以将数据流平顺地在各个 group 和组件之间流转起来。
 
-数据的分发判断由DeviceMesh的`get_slice`方法执行：
+数据的分发判断由 DeviceMesh 的 `get_slice` 方法执行：
 
 ```python
 batch[device_mesh.get_slice(len(batch))]
 ```
 
-get_slice会根据当前rank，计算出当前worker属于哪个dp组，并获取对应的数据。该过程发生在DataLoader的DeviceMeshSampler中，同样发生在remote_class的dispatch和collect中。
+get_slice 会根据当前 rank，计算出当前 worker 属于哪个 dp 组，并获取对应的数据。该过程发生在 DataLoader 的 DeviceMeshSampler 中，同样发生在 remote_class 的 dispatch 和 collect 中。

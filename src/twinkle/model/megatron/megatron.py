@@ -527,6 +527,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer = optimizer_config.optimizer
         assert optimizer is not None, 'Set optimizer correctly before stepping'
         # Megatron optimizer step() returns (success, grad_norm, num_zeros)
+
+        optim_params = kwargs.pop('optim_params', {})
+        if optim_params:
+            for group in optimizer.param_groups:
+                group['lr'] = optim_params['lr']
+                if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
+                    group['weight_decay'] = optim_params['weight_decay']
+                if optim_params.get('eps') is not None:
+                    group['eps'] = optim_params['eps']
+                if optim_params.get('betas') is not None:
+                    group['betas'] = optim_params['betas']
+
         success, grad_norm, num_zeros = optimizer.step()
         # Store grad_norm for later retrieval
         optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
@@ -571,7 +583,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         optimizer = optimizer_config.optimizer
         if optimizer is not None:
-            optimizer.zero_grad(**kwargs)
+            optimizer.zero_grad(set_to_none=True)
 
     @remote_function()
     def lr_step(self, **kwargs):

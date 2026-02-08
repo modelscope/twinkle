@@ -25,6 +25,10 @@ Twinkle DOCUMENTATION
    组件/数据加载/index.rst
    组件/任务处理器/index.rst
    组件/模型/index.rst
+   组件/采样器/index.rst
+   组件/奖励/index.rst
+   组件/优势/index.rst
+   组件/检查点引擎/index.rst
    组件/指标/index.rst
    组件/损失/index.rst
    组件/LRScheduler/index.rst

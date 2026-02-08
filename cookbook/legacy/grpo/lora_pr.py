@@ -12,7 +12,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 from twinkle import torch_util
 
@@ -47,7 +47,7 @@ def main():
     lora_config = LoraConfig(target_modules="all-linear", r=8, lora_alpha=32, lora_dropout=0.05)
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-3B-Instruct', device_mesh=model_mesh, remote_group='model')
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=4,)
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id='ms://Qwen/Qwen2.5-3B-Instruct',
         engine_args={
             'load_format': 'dummy',

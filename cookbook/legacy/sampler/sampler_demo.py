@@ -1,7 +1,7 @@
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from transformers import AutoTokenizer
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.template import Template
 from twinkle.data_format import Trajectory
@@ -29,7 +29,7 @@ if __name__ == '__main__':
         # 'enforce_eager': True,
         # 'enable_sleep_mode': True,
     }
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=MODEL_ID, 
         engine_args=engine_kwargs,
         device_mesh=DeviceMesh.from_sizes(world_size=VLLM_DP, dp_size=VLLM_DP),

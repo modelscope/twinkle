@@ -15,7 +15,7 @@ from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 
 
-class VLLMSampler(Sampler):
+class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
     
     This client manages sampling operations and adapter synchronization with the sampler server.

@@ -6,9 +6,9 @@ This script tests the checkpoint engine weight sync flow when the training
 model uses Megatron-Core (with TP/PP parallelism) and the inference sampler
 uses vLLM:
 
-    1. Create MegatronModel (with real weights, TP=2) and VLLMSampler (with dummy weights)
+    1. Create MegatronModel (with real weights, TP=2) and vLLMSampler (with dummy weights)
     2. Sample with dummy weights → garbage output
-    3. Sync weights from MegatronModel → VLLMSampler via CheckpointEngineManager
+    3. Sync weights from MegatronModel → vLLMSampler via CheckpointEngineManager
     4. Sample with synced weights → coherent output
     5. Verify that outputs differ (proof that weights were synced)
 
@@ -85,7 +85,7 @@ def test_megatron_weight_sync(
     tp_size: int = 2,
     pp_size: int = 1,
 ):
-    """Test weight sync from MegatronModel to VLLMSampler via NCCL broadcast.
+    """Test weight sync from MegatronModel to vLLMSampler via NCCL broadcast.
 
     Architecture:
         Model workers  : GPU 0 .. model_gpus-1   (Megatron, TP=tp_size, real weights)
@@ -100,7 +100,7 @@ def test_megatron_weight_sync(
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
     from twinkle.model import MegatronModel
-    from twinkle.sampler import VLLMSampler
+    from twinkle.sampler import vLLMSampler
     from twinkle.template import Template
     from twinkle.checkpoint_engine import CheckpointEngineManager
     from twinkle.data_format import Trajectory
@@ -168,7 +168,7 @@ def test_megatron_weight_sync(
 
     # ── Create Sampler (dummy weights) ────────────────────────────────
     log("Creating Sampler (dummy weights)...")
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=model_path,
         engine_args={
             'load_format': 'dummy',
@@ -182,7 +182,7 @@ def test_megatron_weight_sync(
         remote_group='sampler',
     )
     sampler.set_template(Template, model_id=model_path)
-    log("  VLLMSampler created successfully")
+    log("  vLLMSampler created successfully")
 
     # Wait for vLLM initialization
     log("Waiting for vLLM initialization...")

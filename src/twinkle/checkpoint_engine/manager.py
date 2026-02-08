@@ -20,7 +20,7 @@ class CheckpointEngineManager:
 
         Trainer GPU(s)                          Rollout GPU(s)
         ┌──────────────────┐                    ┌──────────────────┐
-        │ TransformersModel│                    │   VLLMSampler    │
+        │ TransformersModel│                    │   vLLMSampler    │
         │  (Ray actors)    │                    │  (Ray actors)    │
         │        │         │                    │        │         │
         │        ▼         │                    │        ▼         │

@@ -10,9 +10,6 @@ if sys.version_info[:2] <= (3, 11):
 else:
     from typing import TypedDict
 
-if TYPE_CHECKING:
-    import torch
-
 InputType = Union[List[List[int]], List[int], np.ndarray, 'torch.Tensor']
 
 
@@ -40,7 +37,3 @@ class InputFeature(TypedDict, total=False):
     labels: InputType
     completion_mask: InputType
     length: int
-
-    # Multimodal fields (raw data)
-    images: List[Any]
-    videos: List[Any]

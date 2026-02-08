@@ -2,7 +2,7 @@
 """vLLM-based sampler using VLLMEngine (AsyncLLM).
 
 Device Configuration:
-    VLLMSampler automatically detects the number of available GPUs from
+    vLLMSampler automatically detects the number of available GPUs from
     CUDA_VISIBLE_DEVICES environment variable (set by twinkle's ResourceManager)
     and configures vLLM's tensor_parallel_size accordingly.
     
@@ -15,7 +15,7 @@ Device Configuration:
         DeviceGroup(name='sampler', ranks=[0,1,2,3], gpus_per_worker=4)
 
 Data Flow:
-    When multiple VLLMSampler workers exist (DP > 1):
+    When multiple vLLMSampler workers exist (DP > 1):
     - Data is dispatched via dispatch='slice_dp' (each worker gets a slice)
     - Results are collected via collect='flatten' (merged into single list)
 """
@@ -62,7 +62,7 @@ def _collect_sample_responses(results: List[SampleResponse]) -> SampleResponse:
 
 
 @remote_class()
-class VLLMSampler(Sampler, CheckpointEngineMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
     
     This sampler automatically configures vLLM based on available GPUs.
@@ -76,7 +76,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         device_mesh: DeviceMesh = None,
         **kwargs
     ):
-        """Initialize VLLMSampler.
+        """Initialize vLLMSampler.
         
         Args:
             model_id: HuggingFace model ID or local path.
@@ -106,7 +106,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
         self._async_thread = threading.Thread(
             target=self._run_event_loop,
             daemon=True,
-            name="VLLMSampler-EventLoop"
+            name="vLLMSampler-EventLoop"
         )
         self._async_thread.start()
         
@@ -549,7 +549,7 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
             if hasattr(self, 'engine') and self.engine is not None:
                 self.engine.shutdown()
         except Exception as e:
-            logger.warning(f"VLLMSampler engine shutdown error: {e}")
+            logger.warning(f"vLLMSampler engine shutdown error: {e}")
 
         # 2. Stop the background event loop and join thread
         try:
@@ -558,4 +558,4 @@ class VLLMSampler(Sampler, CheckpointEngineMixin):
             if hasattr(self, '_async_thread') and self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
         except Exception as e:
-            logger.warning(f"VLLMSampler event loop shutdown error: {e}")
+            logger.warning(f"vLLMSampler event loop shutdown error: {e}")

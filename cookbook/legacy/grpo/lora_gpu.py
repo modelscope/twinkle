@@ -3,7 +3,7 @@ GRPO LoRA Training Script for GPU (CUDA)
 
 This script tests the twinkle RL training capabilities on GPU:
 1. TransformersModel backend
-2. VLLMSampler / TorchSampler integration
+2. vLLMSampler / TorchSampler integration
 3. GRPOLoss and advantage computation
 4. Weight synchronization between model and sampler
 
@@ -16,7 +16,7 @@ Usage:
     # Test with multiple GPUs (Ray mode)
     CUDA_VISIBLE_DEVICES=0,1 TWINKLE_MODE=ray python lora_gpu.py
 
-    # Use VLLMSampler (requires more GPU memory)
+    # Use vLLMSampler (requires more GPU memory)
     TWINKLE_USE_TORCH_SAMPLER=0 python lora_gpu.py
 
     # Debug mode
@@ -27,14 +27,14 @@ Environment Variables:
     TWINKLE_MAX_LENGTH: Max sequence length (default: 2048)
     TWINKLE_MAX_STEPS: Max training steps (default: 3)
     TWINKLE_USE_REF_MODEL: Use reference model for KL (default: 0)
-    TWINKLE_USE_TORCH_SAMPLER: Use TorchSampler instead of VLLMSampler (default: 1)
+    TWINKLE_USE_TORCH_SAMPLER: Use TorchSampler instead of vLLMSampler (default: 1)
     TWINKLE_DEBUG: Enable debug logging (default: 0)
     TWINKLE_MODE: 'local' or 'ray' (default: local)
 
 Test Results (as of 2026-01-30):
     - TransformersModel + TorchSampler: PASS
-    - VLLMSampler sampling: PASS  
-    - VLLMSampler LoRA weight sync: IN PROGRESS (needs more debugging)
+    - vLLMSampler sampling: PASS  
+    - vLLMSampler LoRA weight sync: IN PROGRESS (needs more debugging)
 """
 import numpy as np
 from peft import LoraConfig
@@ -52,7 +52,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
-from twinkle.sampler import VLLMSampler, TorchSampler
+from twinkle.sampler import vLLMSampler, TorchSampler
 from twinkle.data_format.sampling import SamplingParams
 from twinkle.weight_loader import NativeLoader
 from twinkle.advantage import GRPOAdvantage
@@ -238,8 +238,8 @@ class ActorGroup:
             )
         else:
             if engine_args is None:
-                raise ValueError("engine_args is required for VLLMSampler.")
-            self.sampler = VLLMSampler(
+                raise ValueError("engine_args is required for vLLMSampler.")
+            self.sampler = vLLMSampler(
                 model_path,
                 engine_args=engine_args,
                 device_mesh=actor_device_mesh,
@@ -403,7 +403,7 @@ def train_local():
             device_mesh=actor_device_mesh,
         )
     else:
-        from twinkle.sampler import VLLMSampler
+        from twinkle.sampler import vLLMSampler
         engine_args = {
             'model': model_path,
             'enable_lora': True,
@@ -413,7 +413,7 @@ def train_local():
             'gpu_memory_utilization': 0.5,
             'trust_remote_code': True,
         }
-        sampler = VLLMSampler(
+        sampler = vLLMSampler(
             model_path,
             engine_args=engine_args,
             device_mesh=actor_device_mesh,

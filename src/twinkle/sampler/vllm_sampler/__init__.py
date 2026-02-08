@@ -1,1 +1,1 @@
-from .vllm_sampler import VLLMSampler
+from .vllm_sampler import vLLMSampler

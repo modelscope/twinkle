@@ -101,9 +101,9 @@ def build_sampler_app(model_id: str,
             
             # Initialize sampler based on type
             if sampler_type == 'vllm':
-                from twinkle.sampler import VLLMSampler
+                from twinkle.sampler import vLLMSampler
                 sampler_kwargs = engine_args or {}
-                self.sampler = VLLMSampler(
+                self.sampler = vLLMSampler(
                     model_id=model_id,
                     engine_args=sampler_kwargs,
                     device_mesh=self.device_mesh,

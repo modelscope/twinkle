@@ -8,7 +8,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
-from twinkle.sampler import VLLMSampler, TorchSampler
+from twinkle.sampler import vLLMSampler, TorchSampler
 from twinkle.data_format.sampling import SamplingParams, SampleResponse
 from twinkle.weight_loader import NativeLoader
 from twinkle.advantage import compute_advantages
@@ -230,8 +230,8 @@ class ActorGroup:
             )
         else:
             if engine_args is None:
-                raise ValueError("engine_args is required for VLLMSampler.")
-            self.sampler = VLLMSampler(
+                raise ValueError("engine_args is required for vLLMSampler.")
+            self.sampler = vLLMSampler(
                 model_path,
                 engine_args=engine_args,
                 device_mesh=actor_device_mesh,
