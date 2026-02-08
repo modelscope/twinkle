@@ -18,8 +18,7 @@ from ray import serve
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.data_format import Trajectory, InputFeature
-from twinkle.sampler.types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format import Trajectory, InputFeature, SamplingParams
 from twinkle.server.utils.adapter_manager import AdapterManagerMixin
 from twinkle.server.utils.validation import verify_request_token, get_token_from_request
 from twinkle.server.utils.state import get_server_state, ServerStateProxy

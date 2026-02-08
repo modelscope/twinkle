@@ -1,13 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
-import sys
 from numbers import Number
 from typing import Mapping, Any
-
-if sys.version_info[:2] <= (3, 11):
-    from typing_extensions import TypedDict
-else:
-    from typing import TypedDict
 
 from peft import LoraConfig
 
@@ -65,7 +59,7 @@ def serialize_object(obj) -> str:
         }
         filtered_dict['_TWINKLE_TYPE_'] = 'LoraConfig'
         return json.dumps(filtered_dict, ensure_ascii=False)
-    elif isinstance(obj, (Mapping, TypedDict)):
+    elif isinstance(obj, Mapping):
         return json.dumps(obj, ensure_ascii=False)
     elif isinstance(obj, basic_types):
         return obj

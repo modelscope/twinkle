@@ -10,7 +10,6 @@
 # ============================================================================
 
 from typing import Any, Callable, Dict, Type, Union
-from twinkle_client.http import TWINKLE_SERVER_URL
 from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta
@@ -58,13 +57,13 @@ class Dataset(object):
         return response.json()["result"]
     
     
-    def encode(self, **kwargs):
+    def encode(self, add_generation_prompt: bool = False, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'encode',
-                **{},
+                **{'add_generation_prompt': add_generation_prompt},
                 **kwargs
             }
         )
