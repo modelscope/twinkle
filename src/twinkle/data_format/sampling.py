@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Sequence, Tuple, Union, Dict, Any
-
+import numpy as np
+from twinkle.data_format import InputFeature
 
 StopReason = Literal["length", "stop"]
 
@@ -128,7 +129,8 @@ class SampledSequence:
     stop_reason: StopReason
     tokens: List[int]
     logprobs: Optional[List[float]] = None
-
+    decoded: str = None
+    new_input_feature: InputFeature = None
 
 @dataclass
 class SampleResponse:

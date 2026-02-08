@@ -141,6 +141,22 @@ class Template:
             current = next_batch
         return current
 
+    def concat_input_feature(self, prompt_input_feature: InputFeature, new_tokens: List[int]) -> InputFeature:
+        assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
+        prompt_ids = prompt_input_feature['input_ids']
+        input_ids = list(prompt_ids) + new_tokens
+        labels = [-100] * len(prompt_ids) + new_tokens
+        prompt_input_feature['input_ids'] = input_ids
+        prompt_input_feature['labels'] = labels
+        new_input_feature = self._invoke_post_pipeline([prompt_input_feature])[0]
+        prompt_input_feature.update(new_input_feature)
+        messages: List[Message] = prompt_input_feature.get('messages')
+        if messages is not None:
+            response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            messages.append(Message(role='assistant', content=response_text))
+            prompt_input_feature['messages'] = messages
+        return prompt_input_feature
+
     def _add_default_system(self, trajectory: Trajectory) -> List[Trajectory]:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':

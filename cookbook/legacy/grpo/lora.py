@@ -1,21 +1,23 @@
+import gc
 import os
 import time
-import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Tuple
+
 from peft import LoraConfig
+
 import twinkle
-import gc
 from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
-from twinkle.data_format import Trajectory, Message, InputFeature
+from twinkle.advantage import GRPOAdvantage
+from twinkle.checkpoint_engine import CheckpointEngineManager
+from twinkle.data_format import SamplingParams, SampleResponse
+from twinkle.data_format import Trajectory, InputFeature
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import VLLMSampler
-from twinkle.data_format import SamplingParams, SampleResponse
-from twinkle.advantage import GRPOAdvantage
-from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.template import Template
+from twinkle.metric import CompletionRewardMetric
 
 logger = get_logger()
 
@@ -67,63 +69,19 @@ def create_countdown_dataset():
     return dataset
 
 
-# ========== Sample Processing ==========
 def process_samples(
-    prompts: List[InputFeature],
     sample_response: SampleResponse,
-    tokenizer,
-    num_generations: int,
-    template: Template,
 ) -> Tuple[List[Trajectory], List[InputFeature], List[List[float]], List[int]]:
-    """Process sampled responses.
-
-    Builds ``InputFeature`` directly by concatenating prompt token ids with
-    the sampler's raw response token ids, avoiding decode/re-encode drift.
-
-    Returns:
-        (trajectories, input_features, old_logps_list, completion_lengths)
-    """
     trajectories: List[Trajectory] = []
     input_features: List[InputFeature] = []
     old_logps_list: List[List[float]] = []
     completion_lengths: List[int] = []
-    sequences = sample_response.sequences
 
-    for i, prompt in enumerate(prompts):
-        prompt_ids = prompt['input_ids']
-
-        for j in range(num_generations):
-            seq_idx = i * num_generations + j
-            if seq_idx >= len(sequences):
-                logger.warning(
-                    f"Expected {len(prompts) * num_generations} sequences, "
-                    f"got {len(sequences)}"
-                )
-                break
-
-            seq = sequences[seq_idx]
-            response_tokens = list(seq.tokens)
-            response_logprobs = seq.logprobs if seq.logprobs else []
-            response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
-            messages.append(Message(role='assistant', content=response_text))
-            trajectories.append(Trajectory(
-                messages=messages,
-                user_data=prompt.get('user_data', []),
-            ))
-
-            # InputFeature (exact token alignment with sampler)
-            input_ids = prompt_ids + response_tokens
-            labels = [-100] * len(prompt_ids) + response_tokens
-            input_feature = InputFeature(
-                input_ids=np.array(input_ids),
-                labels=np.array(labels),
-            )
-            input_feature = template._invoke_post_pipeline([input_feature])
-            input_features.append(input_feature[0])
-
-            old_logps_list.append(response_logprobs)
-            completion_lengths.append(len(response_tokens))
-
+    for sequence in sample_response.sequences:
+        input_features.append(sequence.new_input_feature)
+        trajectories.append(sequence.new_input_feature)
+        old_logps_list.append(sequence.logprobs)
+        completion_lengths.append(len(sequence.tokens))
     return trajectories, input_features, old_logps_list, completion_lengths
 
 
@@ -189,7 +147,7 @@ def main():
         device_mesh=model_mesh, remote_group='model', num_workers=0,
     )
     advantage_fn = GRPOAdvantage()
-    metrics = TrainingMetrics()
+    metrics = CompletionRewardMetric()
 
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE, top_p=0.95,
@@ -204,32 +162,35 @@ def main():
 
         prompts = batch if isinstance(batch, list) else [batch]
 
+        weight_sync_time = None
         # ========== 1. Weight Sync ==========
         if step % WEIGHT_SYNC_INTERVAL == 0:
             sync_start = time.perf_counter()
             ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
-            metrics.weight_sync_time = time.perf_counter() - sync_start
+            weight_sync_time = time.perf_counter() - sync_start
 
         # ========== 2. Generate ==========
         gen_start = time.perf_counter()
         sample_response = sampler.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
-        metrics.generate_time = time.perf_counter() - gen_start
-
-        trajectories, input_features, old_logps_list, completion_lengths = \
-            process_samples(prompts, sample_response, NUM_GENERATIONS)
+        generate_time = time.perf_counter() - gen_start
+        trajectories, input_features, old_logps_list, completion_lengths = process_samples(sample_response)
 
         if not trajectories:
             logger.warning(f"Step {step}: No valid samples, skipping")
             step += 1
             continue
 
-        metrics.completion_lengths = completion_lengths
-
         # ========== 4. Compute rewards ==========
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(trajectories)
-        metrics.rewards = total_rewards
-        metrics.format_rewards = format_rewards
-        metrics.accuracy_rewards = accuracy_rewards
+        metrics.accumulate(None, None,
+                           generate_time=generate_time,
+                           weight_sync_time=weight_sync_time,
+                           completion_lengths=completion_lengths,
+                           rewards={
+                               'total': total_rewards,
+                               'format': format_rewards,
+                               'accuracy': accuracy_rewards,
+                           })
 
         # ========== 5. Compute advantages ==========
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group')
@@ -258,19 +219,12 @@ def main():
         torch_util.empty_cache()
 
         # ========== 7. Log ==========
-        log_dict = metrics.to_log_dict(step)
+        log_dict = metrics.calculate()
+        log_dict.update(model.calculate_metric())
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         if USE_SWANLAB:
             swanlab.log(log_dict)
-
-        logger.info(
-            f"Step {step}: loss={metrics.loss:.6f}, grad_norm={metrics.grad_norm:.7f}, "
-            f"reward={log_dict.get('train/reward', 0):.4f}, "
-            f"format={log_dict.get('train/rewards/Format/mean', 0):.2f}, "
-            f"accuracy={log_dict.get('train/rewards/CountdownORM/mean', 0):.2f}, "
-            f"completion_len={log_dict.get('train/completions/mean_length', 0):.1f}"
-        )
-
+        logger.info(log_dict)
         step += 1
 
     model.save('grpo-countdown-checkpoint', adapter_name=ADAPTER_NAME)
