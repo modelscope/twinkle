@@ -69,22 +69,6 @@ def create_countdown_dataset():
     return dataset
 
 
-def process_samples(
-    sample_response: SampleResponse,
-) -> Tuple[List[Trajectory], List[InputFeature], List[List[float]], List[int]]:
-    trajectories: List[Trajectory] = []
-    input_features: List[InputFeature] = []
-    old_logps_list: List[List[float]] = []
-    completion_lengths: List[int] = []
-
-    for sequence in sample_response.sequences:
-        input_features.append(sequence.new_input_feature)
-        trajectories.append(sequence.new_input_feature)
-        old_logps_list.append(sequence.logprobs)
-        completion_lengths.append(len(sequence.tokens))
-    return trajectories, input_features, old_logps_list, completion_lengths
-
-
 def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[float], List[float]]:
     """Compute format and accuracy rewards."""
     from twinkle.reward import CountDownAccuracy, FormatReward
@@ -173,7 +157,17 @@ def main():
         gen_start = time.perf_counter()
         sample_response = sampler.sample(prompts, sampling_params, num_samples=NUM_GENERATIONS)
         generate_time = time.perf_counter() - gen_start
-        trajectories, input_features, old_logps_list, completion_lengths = process_samples(sample_response)
+
+        trajectories: List[Trajectory] = []
+        input_features: List[InputFeature] = []
+        old_logps_list: List[List[float]] = []
+        completion_lengths: List[int] = []
+
+        for sequence in sample_response.sequences:
+            input_features.append(sequence.new_input_feature)
+            trajectories.append(sequence.new_input_feature)
+            old_logps_list.append(sequence.logprobs)
+            completion_lengths.append(len(sequence.tokens))
 
         if not trajectories:
             logger.warning(f"Step {step}: No valid samples, skipping")
