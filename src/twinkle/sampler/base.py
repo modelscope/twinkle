@@ -8,7 +8,7 @@ from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 from twinkle.template import Template
 from twinkle.processor import InputProcessor
-from twinkle.sampler.types import SamplingParams, SampleResponse
+from twinkle.data_format import SamplingParams, SampleResponse
 import twinkle
 
 from twinkle.utils import construct_class

@@ -22,8 +22,6 @@ import os
 import sys
 import traceback
 
-import pytest
-
 # Set environment variables before imports
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')
 
@@ -38,9 +36,9 @@ def test_vllm_engine_with_input_ids():
     print("=" * 60)
     
     import asyncio
-    from twinkle.sampler.vllm_engine import VLLMEngine
-    from twinkle.sampler.types import SamplingParams, SampleResponse
-    
+    from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
+    from twinkle.data_format.types import SamplingParams
+
     print(f"Creating VLLMEngine with model: {MODEL_ID}")
     engine = VLLMEngine(
         model_id=MODEL_ID,
@@ -88,12 +86,11 @@ def test_transformers_engine_with_input_ids():
     print("\n" + "=" * 60)
     print("Test: TransformersEngine with input_ids")
     print("=" * 60)
-    
-    import asyncio
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from twinkle.sampler.types import SamplingParams, SampleResponse, SampledSequence
-    
+    from twinkle.data_format.types import SamplingParams
+
     print(f"Loading model: {MODEL_ID}")
     
     # Load model and tokenizer directly (bypass remote_class)
@@ -150,9 +147,9 @@ def test_vllm_engine_batch():
     print("=" * 60)
     
     import asyncio
-    from twinkle.sampler.vllm_engine import VLLMEngine
-    from twinkle.sampler.types import SamplingParams, SampleResponse
-    
+    from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
+    from twinkle.data_format.types import SamplingParams
+
     print(f"Creating VLLMEngine with model: {MODEL_ID}")
     engine = VLLMEngine(
         model_id=MODEL_ID,
@@ -208,7 +205,7 @@ def test_sampling_params_conversion():
     print("Test: SamplingParams conversion")
     print("=" * 60)
     
-    from twinkle.sampler.types import SamplingParams
+    from twinkle.data_format.types import SamplingParams
     
     params = SamplingParams(
         max_tokens=64,

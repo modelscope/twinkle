@@ -9,7 +9,6 @@ It supports:
 3. Multi-user inference with rate limiting
 4. Flexible sampling parameters
 """
-import os
 import traceback
 from typing import Any, Dict, Optional
 
@@ -19,10 +18,10 @@ from tinker import types
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.utils.validation import verify_request_token, get_token_from_request
+from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
-from twinkle.sampler.types import SamplingParams as TwinkleSamplingParams
+from twinkle.data_format.types import SamplingParams as TwinkleSamplingParams
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager
 

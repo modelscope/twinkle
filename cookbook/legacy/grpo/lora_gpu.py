@@ -48,15 +48,14 @@ if os.path.exists(twinkle_src):
 
 import twinkle
 from twinkle import DeviceMesh, get_device_placement
-from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
-from twinkle.sampler.types import SamplingParams
+from twinkle.data_format.types import SamplingParams
 from twinkle.weight_loader import NativeLoader
-from twinkle.rl import GRPOAdvantage
+from twinkle.advantage import GRPOAdvantage
 
 # Environment variable setup
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')

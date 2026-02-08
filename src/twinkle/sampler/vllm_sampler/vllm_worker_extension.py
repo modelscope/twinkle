@@ -12,18 +12,17 @@ parameter and provides methods for:
 Reference: verl's vLLMColocateWorkerExtension implementation.
 """
 import gc
-import logging
 import os
 import platform
 import ctypes
 import re
 import signal
 from typing import Dict, List, Optional, Tuple
-
+from twinkle import get_logger
 import torch
 from twinkle.utils.framework import Torch
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def set_death_signal():

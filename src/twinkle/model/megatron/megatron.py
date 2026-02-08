@@ -5,7 +5,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Type, Union, Callable
-
+import asyncio
+import threading
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -1149,34 +1150,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     # model_actor[0] (rank=0 in the checkpoint engine) actually broadcasts
     # via NCCL; others consume the generator silently (rank=-1).
 
-    @remote_function(dispatch='all')
-    def send_weights_via_checkpoint_engine(
+    @remote_function(dispatch='all', lazy_collect=True)
+    def send_weights(
         self,
         adapter_name: str = '',
         base_sync_done: bool = False,
     ):
-        """Send model weights via NCCL broadcast.
-
-        Uses ``get_hf_state_dict()`` to convert Megatron-format weights to
-        HuggingFace format on-the-fly.  The bridge's ``export_weights``
-        internally handles TP allgather and PP layer distribution, so all
-        model ranks must execute this method concurrently.
-
-        LoRA-aware sending:
-        - ``base_sync_done=False``: Send all base model weights (HF format).
-          LoRA-specific weights (lora_A, lora_B) are filtered out.
-        - ``base_sync_done=True`` and ``adapter_name`` set: Send only LoRA
-          adapter weights.
-
-        Args:
-            adapter_name: Adapter name for LoRA weight identification.
-            base_sync_done: If True, only send LoRA adapter weights.
-        """
-        import asyncio
-        import logging
-        import threading
-
-        logger = logging.getLogger(__name__)
         engine = self._get_or_create_checkpoint_engine()
 
         is_peft_format = (adapter_name != _default_adapter_name)
@@ -1209,7 +1188,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         continue
                     yield name, tensor
 
-            logger.info("Sending LoRA-only weights (Megatron)")
         else:
             def _raw_weights():
                 for name, tensor in self.get_hf_state_dict(adapter_name=''):

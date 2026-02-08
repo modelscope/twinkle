@@ -1,14 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """PyTorch native sampler using TransformersEngine."""
-from typing import List, Dict, Any, Union, Optional, Type, Union
+from typing import List, Dict, Any, Optional, Type, Union
 
 import torch
 from peft import PeftConfig, get_peft_model
 from transformers import AutoModelForCausalLM, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
-from .base import Sampler
-from .types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.sampler.base import Sampler
+from twinkle.data_format.types import SamplingParams, SampleResponse, SampledSequence
 from twinkle import remote_class, remote_function, DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
@@ -163,6 +163,7 @@ class TorchSampler(Sampler):
         
         return SampleResponse(sequences=all_sequences)
 
+    @remote_function()
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
         super().add_adapter_to_sampler(adapter_name, config)
         
@@ -174,6 +175,7 @@ class TorchSampler(Sampler):
                 self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
             self.model.eval()
 
+    @remote_function()
     def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
         if not adapter_name:
             self.model.load_state_dict(state_dict, strict=False)
@@ -185,6 +187,7 @@ class TorchSampler(Sampler):
                 if adapter_state_dict:
                     self.model.load_state_dict(adapter_state_dict, strict=False)
 
+    @remote_function()
     def remove_adapter(self, adapter_name: str):
         if adapter_name and adapter_name in self.sample_group:
             from peft import PeftModel

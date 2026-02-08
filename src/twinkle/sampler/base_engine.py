@@ -7,13 +7,14 @@ Engines are the low-level components that handle token-based inference.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
-from .types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format import SamplingParams, SampleResponse
 
 
 class BaseSamplerEngine(ABC):
+
     @abstractmethod
     async def sample(
         self,

@@ -98,7 +98,7 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     from twinkle.checkpoint_engine import CheckpointEngineManager
     from transformers import AutoTokenizer
     from twinkle.data_format import Trajectory
-    from twinkle.sampler.types import SamplingParams
+    from twinkle.data_format.types import SamplingParams
 
     total_gpus = model_gpus + sampler_gpus
     model_path = get_model_path()

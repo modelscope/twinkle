@@ -2,7 +2,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from transformers import AutoTokenizer
 from twinkle.sampler import VLLMSampler
-from twinkle.sampler.types import SamplingParams
+from twinkle.data_format.types import SamplingParams
 from twinkle.template import Template
 from twinkle.data_format import Trajectory
 

@@ -9,9 +9,9 @@ from twinkle.infra import DeviceGroup, remote_function, remote_class
 from twinkle.model import TransformersModel
 from twinkle.reward import MathReward
 from twinkle.sampler import VLLMSampler, TorchSampler
-from twinkle.sampler.types import SamplingParams, SampleResponse
+from twinkle.data_format.types import SamplingParams, SampleResponse
 from twinkle.weight_loader import NativeLoader
-from twinkle.rl import compute_advantages
+from twinkle.advantage import compute_advantages
 
 # Environment variable setup
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')

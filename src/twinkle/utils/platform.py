@@ -5,9 +5,10 @@ import shutil
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
-from itertools import product
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Type, Union
+from itertools import product
+from typing import Dict, List, Optional, Type, Union
+
 import numpy as np
 
 
@@ -431,7 +432,6 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
-    visible_devices: Optional[str] = None  # Optional: explicitly set visible devices (e.g., "8,9")
     gpus_per_worker: int = 1
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
@@ -448,62 +448,16 @@ class Platform(ABC):
             ) from exc
 
     @staticmethod
-    def visible_device_env() -> str:
-        return Platform.get_platform().visible_device_env()
+    def visible_device_env(platform: str = None) -> str:
+        return Platform.get_platform(platform).visible_device_env()
 
     @staticmethod
-    def device_prefix() -> str:
-        return Platform.get_platform().device_prefix()
+    def device_prefix(platform: str = None) -> str:
+        return Platform.get_platform(platform).device_prefix()
 
     @staticmethod
     def get_platform_names() -> List[str]:
         return ['GPU', 'NPU', 'MPS']
-
-    @staticmethod
-    def resolve_visible_devices(
-        device_type: str,
-        *,
-        explicit: Any = None,
-        env_values: Optional[List[Any]] = None,
-        include_os_env: bool = True,
-    ) -> Optional[str]:
-        def _normalize(value: Any) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, (list, tuple)):
-                return ','.join(str(v) for v in value)
-            if isinstance(value, int):
-                return str(value)
-            if isinstance(value, str):
-                return value
-            return None
-
-        if not device_type:
-            return None
-        if device_type.upper() == "CPU":
-            return None
-
-        try:
-            visible_env = Platform.get_platform(device_type.upper()).visible_device_env()
-        except Exception:
-            visible_env = None
-        if not visible_env:
-            return None
-
-        normalized = _normalize(explicit)
-        if normalized:
-            return normalized
-
-        if env_values:
-            for value in env_values:
-                normalized = _normalize(value)
-                if normalized:
-                    return normalized
-
-        if include_os_env:
-            return _normalize(os.environ.get(visible_env))
-
-        return None
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:

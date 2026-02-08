@@ -8,24 +8,20 @@ Slower than vLLM but more compatible and easier to debug.
 
 import hashlib
 import json
-import logging
 import os
-import uuid
-from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from twinkle import remote_class, remote_function
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
-from .base_engine import BaseSamplerEngine
-from .types import SampleResponse, SampledSequence, SamplingParams
+from twinkle import get_logger
+from twinkle.sampler.base_engine import BaseSamplerEngine
+from twinkle.data_format.types import SampleResponse, SampledSequence, SamplingParams
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
-@remote_class()
 class TransformersEngine(BaseSamplerEngine):
     def __init__(
         self,
@@ -126,8 +122,7 @@ class TransformersEngine(BaseSamplerEngine):
                     gen_kwargs["eos_token_id"] = all_stop_ids
         
         return gen_kwargs
-    
-    @remote_function()
+
     async def sample(
         self,
         prompt_token_ids: List[int],
@@ -266,8 +261,7 @@ class TransformersEngine(BaseSamplerEngine):
             ])
         
         return prompt_logprobs, topk_logprobs
-    
-    @remote_function()
+
     async def update_weights(
         self,
         weights: Dict[str, torch.Tensor],
@@ -289,8 +283,7 @@ class TransformersEngine(BaseSamplerEngine):
                 if adapter_state_dict:
                     self.model.load_state_dict(adapter_state_dict, strict=False)
                     logger.info(f"Updated {len(adapter_state_dict)} adapter weights for {adapter_name}")
-    
-    @remote_function()
+
     async def save_weights_for_sampler(
         self,
         user_id: str,
@@ -334,8 +327,8 @@ class TransformersEngine(BaseSamplerEngine):
         adapter_info = self._adapters[adapter_uri]
         adapter_path = adapter_info["path"]
         
-        from peft import PeftModel, PeftConfig
-        
+        from peft import PeftModel
+
         if not isinstance(self.model, PeftModel):
             # First adapter - wrap the model
             self.model = PeftModel.from_pretrained(

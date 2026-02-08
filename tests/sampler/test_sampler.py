@@ -2,11 +2,10 @@
 """Tests for Sampler classes (VLLMSampler, TorchSampler)."""
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
-from typing import Dict, Any, List
+from unittest.mock import MagicMock, patch
 
 from twinkle.sampler.base import Sampler, SampleGroup
-from twinkle.sampler.types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format.types import SamplingParams, SampleResponse, SampledSequence
 from twinkle.data_format import Trajectory, InputFeature
 
 

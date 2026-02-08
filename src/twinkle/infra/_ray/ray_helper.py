@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import logging
 import os
 from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
 from .resource_manager import ResourceManager
 from twinkle import DeviceGroup, Platform, find_node_ip, find_free_port, requires
 
 T = TypeVar('T')
-logger = logging.getLogger(__name__)
 
 
 class RayHelper:
@@ -231,6 +229,19 @@ class RayHelper:
         return False
 
     @staticmethod
+    def _noset_env():
+        return {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES": "1",
+            "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES": "1",
+            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
+            "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR": "1",
+        }
+
+    @staticmethod
     def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], *args, instance_id, seed=42, full_determinism=False, **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -269,33 +280,11 @@ class RayHelper:
         device_type_upper = (device_config.device_type or '').upper()
         if device_type_upper != 'CPU':
             world_size = len(ranks)
-            visible_env = Platform.get_platform(device_type_upper).visible_device_env()
             device_type = Platform.get_platform(device_type_upper).__name__
-
-            @ray.remote
-            def get_node_visible_env(env_name: str):
-                return os.environ.get(env_name)
-
-            def _map_visible_devices(base_visible: Optional[str], gpu_ranks: List[int]) -> str:
-                if not base_visible:
-                    return ','.join(str(r) for r in gpu_ranks)
-                base_list = [item.strip() for item in base_visible.split(',') if item.strip()]
-                if base_list and max(gpu_ranks) < len(base_list):
-                    return ','.join(base_list[r] for r in gpu_ranks)
-                return ','.join(str(r) for r in gpu_ranks)
-
             for pg_idx, (deploy_pg, gpu) in enumerate(zip(placement_groups, ranks)):
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(pg_idx)
-                # LOCAL_RANK should be "node-local rank", used for HCCL port offset on the same node.
-                # deploy_pg['gpu_rank'] has been normalized to 0..nproc_per_node-1 in ResourceManager.
-                local_rank = pg_idx
-                try:
-                    if isinstance(deploy_pg.get('gpu_rank'), list) and deploy_pg['gpu_rank']:
-                        local_rank = int(deploy_pg['gpu_rank'][0])
-                except Exception:
-                    local_rank = pg_idx
                 env_vars = os.environ.copy()
                 env_vars.update({
                     'WORLD_SIZE':
@@ -308,37 +297,18 @@ class RayHelper:
                     cluster_name,
                     'WORKER_NAME':
                     worker_name,
-                    # Platform.get_platform(device_config.device_type.upper()).visible_device_env():
-                    # ','.join([str(r) for r in deploy_pg['gpu_rank']]),
+                    Platform.get_platform(device_type_upper).visible_device_env(): ','.join([str(r) for r in deploy_pg['gpu_rank']]),
                     'TWINKLE_MODE': 'ray',
                     'TWINKLE_SEED': str(seed),
                     'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
                 })
-                # Prefer explicitly specified visible_devices from config, avoid relying on environment variable passing.
-                # This is especially important for Ray Serve scenarios, as replica processes do not inherit the main process's environment variables.
-                node_visible = ray.get(
-                    get_node_visible_env.options(
-                        placement_group=deploy_pg['placement_group']).remote(visible_env))
-                base_visible = Platform.resolve_visible_devices(
-                    device_type_upper,
-                    explicit=getattr(device_config, 'visible_devices', None),
-                    env_values=[node_visible, os.environ.get(visible_env), env_vars.get(visible_env)],
-                    include_os_env=False,
-                )
-
-                desired_visible = _map_visible_devices(base_visible, deploy_pg['gpu_rank'])
-
-                env_vars[visible_env] = desired_visible
-                env_vars['TWINKLE_VISIBLE_ENV'] = visible_env
-                env_vars['TWINKLE_VISIBLE_DEVICES'] = desired_visible
-
 
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
 
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
-                env_vars['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
+                env_vars.update(RayHelper._noset_env())
                 
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
@@ -366,10 +336,7 @@ class RayHelper:
         else:
             world_size = len(ranks)
             workers = []
-            if device_type_upper != 'CPU':
-                _visible_device_env = {Platform.get_platform(device_type_upper).visible_device_env(): ''}
-            else:
-                _visible_device_env = {}
+            _visible_device_env = {Platform.get_platform(device_type_upper).visible_device_env(): ''}
             for rank, (deploy_pg, index) in enumerate(zip(placement_groups, list(range(world_size)))):
                 deploy_pg: Dict
                 cluster_name = group

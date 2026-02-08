@@ -7,7 +7,6 @@ from twinkle.reward.base import Reward
 from twinkle.data_format import Trajectory
 
 
-@remote_class()
 class MathReward(Reward):
 
     def __init__(self, ground_truth_key: str = 'solution'):
@@ -62,7 +61,6 @@ class MathReward(Reward):
             value = False
         return value
 
-    @remote_function()
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
         def _last_content(traj):
