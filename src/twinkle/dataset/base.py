@@ -15,6 +15,7 @@ from twinkle.preprocessor import Preprocessor, DataFilter
 from twinkle.template import Template
 from twinkle.utils import construct_class
 from twinkle.utils import processing_lock
+from twinkle.data_format import full_features
 
 
 @dataclass
@@ -163,7 +164,7 @@ class Dataset(TorchDataset):
             key = dataset_meta.get_id()
         kwargs['batched'] = False # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
-            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs).filter(lambda x: x is not None, **kwargs) # filter none rows
+            self.datasets[key] = self.datasets[key].map(preprocess_func, features=full_features, **kwargs).filter(lambda x: x is not None, **kwargs) # filter none rows
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
