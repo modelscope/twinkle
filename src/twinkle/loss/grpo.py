@@ -140,9 +140,9 @@ class GRPOLoss(Loss):
             / loss_mask.sum(-1).clamp(min=1.0)
         ).mean()
 
-    @staticmethod
     def _pad_and_align_to_batch(
-        data: 'Union[torch.Tensor, List[float], np.ndarray]',
+        self,
+        data: 'Union[torch.Tensor, List, np.ndarray]',
         mask: 'torch.Tensor',
         device: 'torch.device',
         dtype: 'torch.dtype',
@@ -150,35 +150,42 @@ class GRPOLoss(Loss):
     ) -> 'torch.Tensor':
         """Align data to mask: scalars broadcast, sequences scatter."""
         import torch
-
+        
         batch_size, seq_len = mask.shape
         
-        # Normalize to tensor
-        if not isinstance(data, torch.Tensor):
-            data = torch.as_tensor(data, dtype=dtype, device=device)
-        else:
+        # Convert to tensor if possible
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        if isinstance(data, torch.Tensor):
             data = data.to(device=device, dtype=dtype)
-        
-        if data.shape == (batch_size, seq_len):
-            return data
-        
-        result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
-        
-        # Case 1: Scalars [batch] or [batch, 1]
-        if data.dim() == 1 or data.shape[1] == 1:
+            if data.shape == (batch_size, seq_len):
+                return data  # Already aligned
             if data.dim() == 1:
                 data = data.unsqueeze(1)
-            if mask.any():
-                batch_idx = mask.nonzero(as_tuple=True)[0]
-                result[mask] = data[batch_idx, 0]
-            return result
+            if data.shape[1] == 1:  # Scalars
+                result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
+                result[mask] = data[mask.any(dim=1).nonzero(as_tuple=True)[0].repeat_interleave(mask.sum(dim=1)), 0]
+                return result
+            data = [data[i] for i in range(batch_size)]  # To list
         
-        # Case 2: Sequences [batch, *]
-        for i in range(batch_size):
+        # Handle list (scalars or sequences)
+        if isinstance(data, (list, tuple)):
+            if all(isinstance(x, (int, float)) for x in data):  # Flat scalars
+                return self._pad_and_align_to_batch(
+                    torch.tensor(data, dtype=dtype, device=device), mask, device, dtype, fill_value
+                )
+            data = [torch.as_tensor(s, dtype=dtype, device=device) for s in data]
+        
+        # Scatter sequences
+        result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
+        for i, sample in enumerate(data):
+            sample = sample.flatten()
             pos = mask[i].nonzero(as_tuple=True)[0]
-            n = min(len(pos), data[i].numel())
-            if n > 0:
-                result[i, pos[:n]] = data[i].flatten()[:n]
+            if sample.numel() == 1:
+                result[i, pos] = sample.item()
+            else:
+                n = min(len(pos), len(sample))
+                result[i, pos[:n]] = sample[:n]
         
         return result
 
