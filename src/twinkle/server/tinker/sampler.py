@@ -21,7 +21,7 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
-from twinkle.data_format import SamplingParams, SampleResponse
+from twinkle.data_format import SamplingParams
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager
 
@@ -116,7 +116,7 @@ def build_sampler_app(model_id: str,
                     device_mesh=self.device_mesh,
                     **kwargs
                 )
-            
+            self.sampler.set_template('Template', model_id=model_id)
             self.state: ServerStateProxy = get_server_state()
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
@@ -143,22 +143,24 @@ def build_sampler_app(model_id: str,
             async def _do_sample():
                 try:
                     # Extract prompt token IDs from ModelInput
-                    prompt_token_ids = body.prompt.to_ints()
+                    prompt_inputs = {'input_ids': body.prompt.to_ints()}
                     
                     # Get model_path: use body.model_path or look up from sampling session
                     model_path = body.model_path
+                    base_model = body.base_model
                     if not model_path and body.sampling_session_id:
                         session = self.state.get_sampling_session(body.sampling_session_id)
                         if session:
                             model_path = session.get('model_path')
+                            base_model = session.get('base_model')
                     
                     # Parse and resolve adapter URI from model_path
                     adapter_uri = None
-                    user_id = None
+                    adapter_name = None
                     if model_path:
                         token = request.state.token
                         checkpoint_manager = create_checkpoint_manager(token)
-                        user_id, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
+                        adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
                     
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
@@ -173,15 +175,11 @@ def build_sampler_app(model_id: str,
                     
                     # Only request logprobs when the client asks for them. Some backends may
                     # return None entries in logprobs, which breaks pydantic validation.
-                    response: SampleResponse = await self.sampler.engine.sample(
-                        prompt_token_ids=prompt_token_ids * body.num_samples,  # For speed up
+                    response = self.sampler.sample(
+                        inputs=[prompt_inputs] * body.num_samples,  # For speed up
                         sampling_params=sampling_params,
-                        num_samples=1,
-                        logprobs=True,  # Always request logprobs
-                        include_prompt_logprobs=body.prompt_logprobs or False,
-                        topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
                         adapter_path=adapter_uri,
-                        adapter_user_id=user_id,
+                        adapter_name=adapter_name,
                     )
                     
                     # Convert twinkle SampleResponse to tinker types.SampleResponse

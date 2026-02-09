@@ -73,8 +73,10 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
 
     @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: List[types.Datum], **kwargs):
+        # Get template for input processing
+        template = self.get_template(**kwargs)
         # Convert Datum to InputFeature
-        input_features = datum_to_input_feature(inputs)
+        input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, **kwargs)
         # shape (batch_size, seq_len, vocab_size)
         logits = outputs['logits'].detach().cpu()

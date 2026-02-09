@@ -26,12 +26,13 @@ def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]], templat
     if 'weights' in datum.loss_fn_inputs:
         # remove weights 0 from labels
         weights = datum.loss_fn_inputs['weights'].to_numpy()
-        new_tokens = labels[weights > 0].tolist()
+        input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
     else:
         # remove padding (0-id)
-        new_tokens = labels[labels > 0].tolist()
-
-    input_feature = template.concat_input_feature(input_feature, new_tokens)
+        input_feature['labels'] = np.where(labels > 0, labels, -100).tolist()
+    
+    # 3. Invoke post-pipeline hooks
+    input_feature = template._add_attention_fields(input_feature)[0]
     return input_feature
 
 def extract_rl_feature(datum: Union[types.Datum, List[types.Datum]]) -> dict:
