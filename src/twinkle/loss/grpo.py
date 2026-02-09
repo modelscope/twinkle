@@ -132,11 +132,11 @@ class GRPOLoss(Loss):
         Returns:
             loss: scalar loss value
         """
-        # Mean over tokens per sequence, then mean over batch
+        # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
+        # Each sequence contributes equally regardless of length.
         return (
-            (per_token_loss * loss_mask).sum(-1) 
-            # clip_grad_norm normalized by the number of tokens in the batch, skip
-            # / loss_mask.sum(-1).clamp(min=1.0) 
+            (per_token_loss * loss_mask).sum(-1)
+            / loss_mask.sum(-1).clamp(min=1.0)
         ).mean()
 
     @staticmethod
@@ -413,7 +413,8 @@ class GRPOLoss(Loss):
         
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
         
-        return loss, loss_mask.sum()
+        return loss
+
 
     def compute_metrics(
         self,

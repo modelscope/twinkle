@@ -15,7 +15,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 from twinkle.metric import CompletionRewardMetric
 
@@ -44,7 +44,6 @@ DATA_NUM = int(os.environ.get('DATA_NUM', 5000))
 
 # SwanLab is optional - only used if SWANLAB_API_KEY is set
 USE_SWANLAB = True
-os.environ['SWANLAB_API_KEY'] = '3hVJrk0veNB2NCm72UdJg'
 if USE_SWANLAB:
     import swanlab
     if USE_SWANLAB:
@@ -134,7 +133,7 @@ def main():
     model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
     model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'load_format': 'dummy',

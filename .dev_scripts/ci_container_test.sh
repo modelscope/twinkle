@@ -1,6 +1,5 @@
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     # pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-    pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
     git config --global --add safe.directory /twinkle
     git config --global user.email tmp
     git config --global user.name tmp.com
@@ -12,7 +11,6 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
         if [ $? -ne 0 ]; then
             echo "linter test failed, please run 'pre-commit run --all-files' to check"
             echo "From the repository folder"
-            echo "Run 'pip install -r requirements/tests.txt' install test dependencies."
             echo "Run 'pre-commit install' install pre-commit hooks."
             echo "Finally run linter with command: 'pre-commit run --all-files' to check."
             echo "Ensure there is no failure!!!!!!!!"
@@ -20,23 +18,19 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
         fi
     fi
 
-    pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
     pip install optimum
-    pip install diffusers
-    # pip install autoawq -U --no-deps
 
     # test with install
     pip install .
-    pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
 else
     echo "Running case in release image, run case directly!"
 fi
 # remove torch_extensions folder to avoid ci hang.
 rm -rf ~/.cache/torch_extensions
 if [ $# -eq 0 ]; then
-    ci_command="python tests/run.py --subprocess"
+    ci_command="pytest tests"
 else
     ci_command="$@"
 fi

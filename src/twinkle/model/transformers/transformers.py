@@ -347,8 +347,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if self.sp_strategy is not None:
             inputs = self.sp_strategy.preprocess_inputs(inputs)
         labels: torch.Tensor = inputs.pop('labels', None)
-        if labels is not None:
-            optimizer_config.num_tokens += (labels >= 0).sum().item()
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
         if self.sp_strategy is not None and labels is None:
@@ -418,7 +416,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         inputs = optimizer_config.inputs
         outputs = optimizer_config.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
-        loss_value: torch.Tensor = loss_instance(inputs, outputs, **kwargs)
+        result = loss_instance(inputs, outputs, **kwargs)
+        if isinstance(result, tuple):
+            loss_value, counts = result
+        else:
+            loss_value = result
+            counts = torch.tensor(0, device=loss_value.device)
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value += loss_value

@@ -62,7 +62,6 @@ DATA_NUM = int(os.environ.get('DATA_NUM', 7473))  # GSM8K train split has 7473 s
 # SwanLab experiment tracking
 USE_SWANLAB = bool(int(os.environ.get('USE_SWANLAB', '1')))
 if USE_SWANLAB:
-    os.environ['SWANLAB_API_KEY'] = '3hVJrk0veNB2NCm72UdJg'
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
     swanlab.init(project="twinkle-gsm8k", config={
@@ -285,13 +284,6 @@ def main():
             remote_group='model',
         )
 
-    # NOTE: Since the training loop externally manages micro-batch splitting
-    # and only calls clip_grad_and_step once per optimizer step, we set
-    # gradient_accumulation_steps=1 here. The internal do_grad_sync check
-    # in OptimizerGroup uses cur_step to decide when to perform optimizer
-    # updates; with external micro-batch management, setting gas>1 would
-    # cause cur_step to never align with the internal trigger condition,
-    # effectively preventing optimizer.step() from ever executing.
     model.add_adapter_to_model(
         ADAPTER_NAME,
         lora_config,
@@ -334,6 +326,7 @@ def main():
             'enforce_eager': True,
             'enable_sleep_mode': False,
             'enable_lora': True,
+            "logprobs_mode": "processed_logprobs",
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
