@@ -1,8 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import math
-import os
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
