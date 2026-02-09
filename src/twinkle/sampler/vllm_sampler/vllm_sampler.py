@@ -116,11 +116,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         # Auto-detect tensor_parallel_size from CUDA_VISIBLE_DEVICES
         if 'tensor_parallel_size' not in engine_kwargs:
             tp_size = 1
-            visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            visible_devices = os.environ.get(Platform.visible_device_env(), '')
             if visible_devices:
                 num_gpus = len([d for d in visible_devices.split(',') if d.strip()])
                 if num_gpus > 0:
                     tp_size = num_gpus
+            logger.info(f'vLLM TP size: {tp_size}')
             engine_kwargs['tensor_parallel_size'] = tp_size
         
         # Set unique seed per engine based on rank for diverse sampling across DP workers
