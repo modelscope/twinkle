@@ -135,7 +135,6 @@ def get_modules_to_not_convert(model):
             res.append(n)
     return res if res else None
 
-
 def get_llm_model(model, *, model_meta=None, inner_backbone: bool = True):
     """Best-effort extraction of the LLM module from a (possibly wrapped) model.
 
