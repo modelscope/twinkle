@@ -884,7 +884,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
-        return self.strategy.unwrap_model(self.model).state_dict()
+        return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
