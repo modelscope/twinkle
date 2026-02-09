@@ -179,7 +179,7 @@ def build_sampler_app(model_id: str,
                         inputs=[prompt_inputs] * body.num_samples,  # For speed up
                         sampling_params=sampling_params,
                         adapter_path=adapter_uri,
-                        adapter_name=adapter_name,
+                        # adapter_name=adapter_name,
                     )
                     
                     # Convert twinkle SampleResponse to tinker types.SampleResponse

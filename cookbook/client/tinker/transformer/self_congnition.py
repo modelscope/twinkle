@@ -18,7 +18,7 @@ from twinkle.server.tinker.common import input_feature_to_datum
 from modelscope import AutoTokenizer
 
 # The base model to fine-tune / evaluate
-base_model = "Qwen/Qwen2.5-7B-Instruct"
+base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 def train():
@@ -136,5 +136,5 @@ def eval():
 
 
 if __name__ == "__main__":
-    train()   # Uncomment to run training
-    # eval()      # Run evaluation / inference
+    # train()   # Uncomment to run training
+    eval()      # Run evaluation / inference

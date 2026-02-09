@@ -29,11 +29,12 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
+from modelscope import AutoTokenizer
 
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
+BASE_MODEL = 'Qwen/Qwen2.5-0.5B-Instruct'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
@@ -76,6 +77,10 @@ def main():
     # Step 1: Prepare dataset and dataloader (client-side)
     dataset = create_countdown_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL, trust_remote_code=True)
+    
+    logger.info("Dataset and tokenizer initialized")
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info("Connecting to Tinker server...")
@@ -153,8 +158,9 @@ def main():
         completion_lengths = []
 
         for seq in all_sequences:
+            decoded_text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
             trajectories.append({
-                'messages': [{'role': 'assistant', 'content': seq.decoded}]
+                'messages': [{'role': 'assistant', 'content': decoded_text}]
             })
             old_logps_list.append(
                 [lp for lp in seq.logprobs] if seq.logprobs else [])
