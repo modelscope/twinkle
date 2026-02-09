@@ -21,12 +21,9 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
     pip install optimum
-    pip install diffusers
-    # pip install autoawq -U --no-deps
 
     # test with install
     pip install .
-    pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
 else
     echo "Running case in release image, run case directly!"
 fi

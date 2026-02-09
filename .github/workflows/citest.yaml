@@ -73,5 +73,4 @@ jobs:
         shell: bash
         run: |
           set -e
-          source /mnt/modelscope/ci_env.sh
           bash .dev_scripts/dockerci.sh
