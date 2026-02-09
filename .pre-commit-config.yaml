@@ -7,6 +7,9 @@ repos:
             (?x)^(
                 examples/|
                 cookbook/|
+                client_tools/|
+                src/twinkle_client|
+                
             )$
   - repo: https://github.com/PyCQA/isort.git
     rev: 7.0.0
@@ -16,6 +19,8 @@ repos:
             (?x)^(
                 examples/|
                 cookbook/|
+                client_tools/|
+                src/twinkle_client|
             )$
   - repo: https://github.com/google/yapf
     rev: v0.43.0
@@ -25,6 +30,8 @@ repos:
             (?x)^(
                 examples/|
                 cookbook/|
+                client_tools/|
+                src/twinkle_client|
             )$
   - repo: https://github.com/pre-commit/pre-commit-hooks.git
     rev: v6.0.0
