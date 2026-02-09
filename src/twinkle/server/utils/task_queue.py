@@ -62,7 +62,7 @@ class TaskQueueConfig:
         per_token_adapter_limit: Maximum number of adapters per user token.
         adapter_timeout: Timeout in seconds for inactive adapters (default 30 minutes).
     """
-    rps_limit: float = 10.0           # 10 requests per second
+    rps_limit: float = 100.0           # 10 requests per second
     tps_limit: float = 10000.0        # 10000 input tokens per second
     window_seconds: float = 1.0       # 1 second sliding window
     queue_timeout: float = 300.0      # 5 minutes queue timeout

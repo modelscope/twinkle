@@ -9,46 +9,6 @@ from .datum import datum_to_input_feature
 from .io_utils import create_checkpoint_manager
 
 
-def _extract_rl_fields_from_inputs(
-    input_features: List[dict], 
-    kwargs: dict
-) -> Tuple[Optional[List], Optional[List], dict]:
-    """Extract old_logps and advantages from input features and kwargs.
-    
-    This function handles the common logic for extracting reinforcement learning
-    fields (old_logps and advantages) from both input features and kwargs.
-    
-    Args:
-        input_features: List of input feature dictionaries
-        kwargs: Keyword arguments dictionary
-        
-    Returns:
-        Tuple of (old_logps, advantages, updated_kwargs)
-    """
-    # Extract from kwargs first (higher priority)
-    old_logps = kwargs.pop('old_logps', None)
-    advantages = kwargs.pop('advantages', None)
-    
-    # If not in kwargs, check input features
-    if old_logps is None:
-        old_logps_list = [inp.get('old_logps') for inp in input_features if inp.get('old_logps') is not None]
-        if old_logps_list:
-            old_logps = old_logps_list
-    
-    if advantages is None:
-        advantages_list = [inp.get('advantages') for inp in input_features if inp.get('advantages') is not None]
-        if advantages_list:
-            advantages = advantages_list
-    
-    # Prepare kwargs for loss function
-    loss_kwargs = kwargs.copy()
-    if old_logps is not None:
-        loss_kwargs['old_logps'] = old_logps
-    if advantages is not None:
-        loss_kwargs['advantages'] = advantages
-        
-    return old_logps, advantages, loss_kwargs
-
 if TYPE_CHECKING:
     from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
 elif exists('megatron_core'):
@@ -122,14 +82,11 @@ class TwinkleCompatMegatronModel(_MegatronBase):
             'logprobs' and 'elementwise_loss', and loss is a scalar.
         """
         # Convert Datum to InputFeature
-        input_features = [datum_to_input_feature(datum) for datum in inputs]
-        
-        # Extract old_logps and advantages using common utility
-        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
+        input_features = datum_to_input_feature(inputs)
         
         adapter_name = kwargs.get('adapter_name')
         # Megatron forward_backward returns loss directly
-        loss = super().forward_backward(inputs=input_features, **loss_kwargs)
+        loss = super().forward_backward(inputs=input_features, **kwargs)
         
         # Get logits from outputs
         optimizer_config = self.optimizer_group.get(adapter_name)

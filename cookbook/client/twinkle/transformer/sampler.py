@@ -21,7 +21,7 @@ from twinkle_client.sampler import VLLMSampler
 
 logger = get_logger()
 
-MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
+MODEL_ID = 'Qwen/Qwen2.5-7B-Instruct'
 
 # Optional: adapter URI for LoRA inference
 # This can be a twinkle:// path from a training run checkpoint

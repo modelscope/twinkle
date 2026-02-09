@@ -51,7 +51,7 @@ for tr in response.training_runs:
     
 # Step 5: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen2.5-7B-Instruct"
 if not resume_path:
     training_client = service_client.create_lora_training_client(
         base_model=base_model

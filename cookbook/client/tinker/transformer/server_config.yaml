@@ -33,43 +33,43 @@ applications:
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
-  # - name: models-Qwen2.5-0.5B-Instruct
-  #   route_prefix: /api/v1/model/Qwen/Qwen2.5-0.5B-Instruct
-  #   import_path: model
-  #   args:
-  #     use_megatron: false                          # Use HuggingFace Transformers backend
-  #     model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct" # ModelScope model identifier
-  #     nproc_per_node: 2                            # Number of GPU processes per node
-  #     device_group:
-  #       name: model
-  #       ranks: [0, 1]                              # GPU rank indices
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       mesh: [0, 1]
-  #       mesh_dim_names: ['dp']                     # 'dp' = data parallel
-  #     queue_config:
-  #       rps_limit: 100                             # Max requests per second
-  #       tps_limit: 10000                           # Max tokens per second
-  #     adapter_config:
-  #       per_token_adapter_limit: 30                # Max concurrent LoRA adapters
-  #       adapter_timeout: 1800                      # Seconds before idle adapter unload
-  #   deployments:
-  #     - name: ModelManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
+    import_path: model
+    args:
+      use_megatron: false                          # Use HuggingFace Transformers backend
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
+      nproc_per_node: 2                            # Number of GPU processes per node
+      device_group:
+        name: model
+        ranks: [0, 1]                              # GPU rank indices
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0, 1]
+        mesh_dim_names: ['dp']                     # 'dp' = data parallel
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 10000                           # Max tokens per second
+      adapter_config:
+        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
+        adapter_timeout: 1800                      # Seconds before idle adapter unload
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen2.5-0.5B-Instruct
-    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct
+  - name: sampler-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-7B-Instruct
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"   # ModelScope model identifier
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"   # ModelScope model identifier
       nproc_per_node: 1               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings

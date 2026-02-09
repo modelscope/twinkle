@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from typing import List, Union
+from collections import defaultdict
 import numpy as np
 from twinkle.data_format.input_feature import InputFeature
 from tinker import types
     
-def datum_to_input_feature(datum: types.Datum) -> InputFeature:
+def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]]) -> Union[InputFeature, List[InputFeature]]:
     """Convert a Datum to a dictionary of input features for model inference."""
+    if isinstance(datum, list):
+        return [datum_to_input_feature(d) for d in datum]
+    
     input_feature: InputFeature = {}
 
     # 1. Flatten model_input chunks to get input_ids
@@ -22,20 +27,25 @@ def datum_to_input_feature(datum: types.Datum) -> InputFeature:
         labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
         
         input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
-    
-    # 3. Handle importance_sampling specific fields
-    # 'logprobs' -> 'old_logps' (for GRPO loss)
-    if 'logprobs' in datum.loss_fn_inputs:
-        old_logps = datum.loss_fn_inputs['logprobs'].to_numpy().tolist()
-        input_feature['old_logps'] = old_logps
-    
-    # 'advantages' -> 'advantages' (for GRPO loss)
-    if 'advantages' in datum.loss_fn_inputs:
-        advantages = datum.loss_fn_inputs['advantages'].to_numpy().tolist()
-        input_feature['advantages'] = advantages
 
     return input_feature
 
+def extract_rl_feature(datum: Union[types.Datum, List[types.Datum]]) -> dict:
+    if not isinstance(datum, list):
+        datum = [datum]
+    
+    result = defaultdict(list)
+    for d in datum:
+        # 'logprobs' -> 'old_logps' (for GRPO loss)
+        if 'logprobs' in d.loss_fn_inputs:
+            old_logps = d.loss_fn_inputs['logprobs'].to_numpy().tolist()
+            result['old_logps'].append(old_logps)
+        
+        # 'advantages' -> 'advantages' (for GRPO loss)
+        if 'advantages' in d.loss_fn_inputs:
+            advantages = d.loss_fn_inputs['advantages'].to_numpy().tolist()
+            result['advantages'].append(advantages)
+    return result
 
 def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
     """Convert an input feature dictionary to a Datum object.

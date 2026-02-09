@@ -161,15 +161,10 @@ class ServerLauncher:
         import ray
 
         # Determine namespace
-        namespace = self.ray_namespace
-        if namespace is None:
-            namespace = self.config.get('ray_namespace')
-        if namespace is None and self.server_type == "tinker":
-            namespace = "twinkle_cluster"
+        namespace = self.ray_namespace or self.config.get('ray_namespace') or "twinkle_cluster"
 
         init_kwargs = {}
-        if namespace:
-            init_kwargs['namespace'] = namespace
+        init_kwargs['namespace'] = namespace
 
         if not ray.is_initialized():
             ray.init(**init_kwargs)

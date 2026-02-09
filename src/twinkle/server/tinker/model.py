@@ -361,44 +361,16 @@ def build_model_app(model_id: str,
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
                     if self.use_megatron:
-                        # Megatron uses combined forward_backward, no separate backward/calculate_loss
-                        # Set loss first based on loss_fn
-                        if loss_fn == 'cross_entropy':
-                            self.model.set_loss('CrossEntropyLoss',
-                                                adapter_name=adapter_name)
-                        elif loss_fn == 'importance_sampling':
-                            self.model.set_loss('GRPOLoss',
-                                                adapter_name=adapter_name,
-                                                epsilon=0.2,  # Default GRPO epsilon
-                                                beta=0.0)     # No KL penalty by default
-                        else:
-                            raise ValueError(
-                                f'Unsupported loss function {loss_fn}')
-                        
+                        # megatron do not need to set loss
                         output, loss = self.model.forward_backward(
                             inputs=datum_list,
                             adapter_name=adapter_name,
                             **loss_fn_config)
                     else:
-                        # Transformers uses separate forward, calculate_loss, backward
-                        # Set loss first based on loss_fn
-                        if loss_fn == 'cross_entropy':
-                            self.model.set_loss('CrossEntropyLoss',
-                                                adapter_name=adapter_name)
-                        elif loss_fn == 'importance_sampling':
-                            self.model.set_loss('GRPOLoss',
-                                                adapter_name=adapter_name,
-                                                epsilon=0.2,  # Default GRPO epsilon
-                                                beta=0.0)     # No KL penalty by default
-                        else:
-                            raise ValueError(
-                                f'Unsupported loss function {loss_fn}')
-
-                        output = self.model.forward(inputs=datum_list,
-                                                    adapter_name=adapter_name)
-                        loss = self.model.calculate_loss(adapter_name=adapter_name,
-                                                         **loss_fn_config)
-                        self.model.backward(adapter_name=adapter_name)
+                        output, loss = self.model.forward_backward(inputs=datum_list,
+                                                                    adapter_name=adapter_name,
+                                                                    loss_fn=loss_fn,
+                                                                    **loss_fn_config)
                     output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,
@@ -581,7 +553,7 @@ def build_model_app(model_id: str,
                     sampling_session_id = self.state.create_sampling_session(payload)
 
                     return types.SaveWeightsForSamplerResponseInternal(
-                        path=tinker_path,
+                        path=None, # Disable path return for internal use
                         sampling_session_id=sampling_session_id
                     )
                 except Exception:

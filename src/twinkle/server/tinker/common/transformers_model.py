@@ -1,51 +1,38 @@
 import torch
 from tinker import types
-from typing import List, Tuple, Optional, Any
+from typing import List
 from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
-from .datum import datum_to_input_feature
+from .datum import datum_to_input_feature, extract_rl_feature
 from .io_utils import create_checkpoint_manager
 
 
-def _extract_rl_fields_from_inputs(
-    input_features: List[dict], 
-    kwargs: dict
-) -> Tuple[Optional[List], Optional[List], dict]:
-    """Extract old_logps and advantages from input features and kwargs.
-    
-    This function handles the common logic for extracting reinforcement learning
-    fields (old_logps and advantages) from both input features and kwargs.
-    
+def _collect_forward_backward_results(results):
+    """Custom collect function for forward_backward that handles list [outputs, loss].
+
     Args:
-        input_features: List of input feature dictionaries
-        kwargs: Keyword arguments dictionary
-        
+        results: List of lists from each worker, where each list is [outputs_list, loss_float]
+
     Returns:
-        Tuple of (old_logps, advantages, updated_kwargs)
+        List of [flattened_outputs, averaged_loss]
     """
-    # Extract from kwargs first (higher priority)
-    old_logps = kwargs.pop('old_logps', None)
-    advantages = kwargs.pop('advantages', None)
-    
-    # If not in kwargs, check input features
-    if old_logps is None:
-        old_logps_list = [inp.get('old_logps') for inp in input_features if inp.get('old_logps') is not None]
-        if old_logps_list:
-            old_logps = old_logps_list
-    
-    if advantages is None:
-        advantages_list = [inp.get('advantages') for inp in input_features if inp.get('advantages') is not None]
-        if advantages_list:
-            advantages = advantages_list
-    
-    # Prepare kwargs for loss function
-    loss_kwargs = kwargs.copy()
-    if old_logps is not None:
-        loss_kwargs['old_logps'] = old_logps
-    if advantages is not None:
-        loss_kwargs['advantages'] = advantages
-        
-    return old_logps, advantages, loss_kwargs
+    if not results:
+        return results
+
+    # results is a list of lists: [[outputs1, loss1], [outputs2, loss2], ...]
+    # Flatten outputs (first element of each list)
+    all_outputs = []
+    all_losses = []
+    for result in results:
+        outputs, loss = result
+        all_outputs.extend(outputs)
+        all_losses.append(loss)
+
+    # Average the losses
+    avg_loss = float(np.mean(all_losses))
+
+    return [all_outputs, avg_loss]
+
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
@@ -81,63 +68,49 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
     with a ``MultiLoraTransformersModel`` instance without needing to know its
     internal input feature schema, output structure, or optimizer API.
     """
-    @remote_function(dispatch='slice_dp', collect='flatten')
-    def forward(self, *, inputs: List[types.Datum], **kwargs):
-        # Convert Datum to InputFeature
-        input_features = [datum_to_input_feature(datum) for datum in inputs]
-       
-        # Extract old_logps and advantages using common utility
-        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
-        # Update kwargs for forward pass (exclude loss-specific fields)
-        kwargs.update({k: v for k, v in loss_kwargs.items() if k not in ['old_logps', 'advantages']})
-       
-        outputs = super().forward(inputs=input_features, **kwargs)
-        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
-        results = self._get_forward_output(inputs, logits)
-        return results
 
     @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: List[types.Datum], **kwargs):
         # Convert Datum to InputFeature
-        input_features = [datum_to_input_feature(datum) for datum in inputs]
-        
-        # Extract old_logps and advantages using common utility
-        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
-        # Update kwargs for forward pass (exclude loss-specific fields)
-        kwargs.update({k: v for k, v in loss_kwargs.items() if k not in ['old_logps', 'advantages']})
-
+        input_features = datum_to_input_feature(inputs)
         outputs = super().forward_only(inputs=input_features, **kwargs)
-        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
+        # shape (batch_size, seq_len, vocab_size)
+        logits = outputs['logits'].detach().cpu()
         results = self._get_forward_output(inputs, logits)
         return results
 
-    @remote_function(collect='mean')
-    def calculate_loss(self, **kwargs):
-        # Extract old_logps and advantages using common utility (for importance_sampling loss)
-        # Note: We don't need the input_features here since this is called separately
-        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs([], kwargs)
-            
-        loss = super().calculate_loss(**loss_kwargs)
-        return loss
+    @remote_function(dispatch='slice_dp', collect=_collect_forward_backward_results)
+    def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+        # Set loss first based on loss_fn
+        if loss_fn == 'cross_entropy':
+            super().set_loss('CrossEntropyLoss',
+                             adapter_name=adapter_name)
+        elif loss_fn == 'importance_sampling':
+            super().set_loss('GRPOLoss',
+                             adapter_name=adapter_name,
+                             epsilon=0.2,  # Default GRPO epsilon
+                             beta=0.0)     # No KL penalty by default
+        else:
+            raise ValueError(
+                f'Unsupported loss function {loss_fn}')
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
-    def forward_backward(self, *, inputs: List[types.Datum], **kwargs):
         # Convert Datum to InputFeature
-        input_features = [datum_to_input_feature(datum) for datum in inputs]
-        
-        # Extract old_logps and advantages using common utility
-        old_logps, advantages, loss_kwargs = _extract_rl_fields_from_inputs(input_features, kwargs)
-        
+        input_features = datum_to_input_feature(inputs)
+
         # Forward pass
         outputs = super().forward(inputs=input_features, **kwargs)
-        
+
         # Calculate loss with extra parameters
+        # Extract old_logps and advantages using common utility
+        loss_values = extract_rl_feature(inputs)
+        loss_kwargs = kwargs.copy().update(loss_values)
         loss = super().calculate_loss(**loss_kwargs)
-        
+
         # Backward pass
         super().backward(**kwargs)
-        
-        logits = outputs['logits'].detach().cpu()  # shape (batch_size, seq_len, vocab_size)
+
+        # shape (batch_size, seq_len, vocab_size)
+        logits = outputs['logits'].detach().cpu()
         results = self._get_forward_output(inputs, logits)
         return results, loss
 
@@ -157,13 +130,13 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         }
         super().step(optim_params=optim_params, **kwargs)
         # Zero gradients
-        self.zero_grad(**kwargs)
+        super().zero_grad(**kwargs)
 
     @remote_function()
     def load(self, checkpoint_dir: str, **kwargs):
         """
         Load checkpoint with token-based isolation support.
-        
+
         Args:
             checkpoint_dir: The twinkle:// path to the checkpoint or hub model ID
             **kwargs: Additional keyword arguments including optional 'token'
@@ -172,13 +145,13 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         token = kwargs.pop('token', None)
         if not token:
             raise ValueError("Token is required for loading checkpoints")
-        
+
         # Create checkpoint manager with the token
         checkpoint_manager = create_checkpoint_manager(token)
-        
+
         # Use resolve_load_path to handle path resolution
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
-        
+
         if resolved.is_twinkle_path:
             # Load from twinkle checkpoint
             return super().load(name=resolved.checkpoint_name, output_dir=str(resolved.checkpoint_dir), **kwargs)

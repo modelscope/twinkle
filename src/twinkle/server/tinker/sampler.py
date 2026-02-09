@@ -21,7 +21,7 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
-from twinkle.data_format.sampling import SamplingParams as TwinkleSamplingParams
+from twinkle.data_format import SamplingParams, SampleResponse
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager
 
@@ -163,7 +163,7 @@ def build_sampler_app(model_id: str,
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
                     if body.sampling_params:
-                        sampling_params = TwinkleSamplingParams(
+                        sampling_params = SamplingParams(
                             max_tokens=body.sampling_params.max_tokens or 256,
                             temperature=body.sampling_params.temperature or 1.0,
                             top_p=body.sampling_params.top_p,
@@ -173,12 +173,11 @@ def build_sampler_app(model_id: str,
                     
                     # Only request logprobs when the client asks for them. Some backends may
                     # return None entries in logprobs, which breaks pydantic validation.
-                    want_logprobs = bool(body.prompt_logprobs) or (body.topk_prompt_logprobs or 0) > 0
-                    response = await self.sampler.engine.sample(
+                    response: SampleResponse = await self.sampler.engine.sample(
                         prompt_token_ids=prompt_token_ids,
                         sampling_params=sampling_params,
                         num_samples=body.num_samples or 1,
-                        logprobs=want_logprobs,
+                        logprobs=True,  # Always request logprobs
                         include_prompt_logprobs=body.prompt_logprobs or False,
                         topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
                         adapter_path=adapter_uri,

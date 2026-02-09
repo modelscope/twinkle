@@ -41,7 +41,7 @@ from twinkle_client.sampler import VLLMSampler
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = 'ms://Qwen/Qwen2.5-0.5B-Instruct'
+MODEL_ID = 'ms://Qwen/Qwen2.5-7B-Instruct'
 NUM_GENERATIONS = 8
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
