@@ -134,3 +134,49 @@ def get_modules_to_not_convert(model):
                                                          or any(n.startswith(prefix) for prefix in prefix_list)):
             res.append(n)
     return res if res else None
+
+def get_llm_model(model, *, model_meta=None, inner_backbone: bool = True):
+    """Best-effort extraction of the LLM module from a (possibly wrapped) model.
+
+    This mirrors the common pattern used by Swift/PEFT/Accelerate stacks:
+    - unwrap parallel wrappers (DDP/FSDP/Accelerate)
+    - unwrap PEFT/Swift wrappers (if present)
+    - use `model_meta.model_arch.language_model` to locate the LLM in multimodal models
+    - optionally return the inner backbone (e.g. `QwenModel`/`LlamaModel`) via `.model`
+    """
+    # 1) Unwrap parallel wrappers (Accelerate).
+    try:
+        from accelerate.utils import extract_model_from_parallel  # type: ignore
+
+        model = extract_model_from_parallel(model)
+    except Exception:
+        pass
+
+    # 2) Unwrap PEFT wrappers.
+    try:
+        from peft import PeftModel  # type: ignore
+
+        if isinstance(model, PeftModel):
+            model = model.model
+    except Exception:
+        pass
+
+    # 3) Locate the language model module in multimodal containers via model_meta.
+    if model_meta is None:
+        model_meta = getattr(model, "model_meta", None)
+    llm_model = model
+    model_arch = getattr(model_meta, "model_arch", None) if model_meta is not None else None
+    llm_prefix = getattr(model_arch, "language_model", None) if model_arch is not None else None
+    if llm_prefix:
+        # Convention: `language_model` is a list of candidate prefixes.
+        llm_model = deep_getattr(model, llm_prefix[0])
+    else:
+        llm_model = getattr(model, "language_model", model)
+
+    # 4) Return the inner backbone if requested.
+    if inner_backbone:
+        if hasattr(llm_model, "thinker"):
+            llm_model = llm_model.thinker.model
+        elif hasattr(llm_model, "model"):
+            llm_model = llm_model.model
+    return llm_model

@@ -425,6 +425,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
+            if "loss_reduction" not in self.sp_strategy.sp_config:
+                reduction = getattr(loss_instance, "reduction", None)
+                if reduction is not None:
+                    self.sp_strategy.sp_config["loss_reduction"] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value += loss_value
         outputs['loss'] = optimizer_config.loss_value
