@@ -16,11 +16,13 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
-                 enable_ep: bool = True):
+                 enable_ep: bool = True,
+                 enable_ep_fsdp: bool = False):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
         self.enable_ep = enable_ep
+        self.enable_ep_fsdp = enable_ep_fsdp
 
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:
@@ -28,12 +30,31 @@ class NativeFSDPStrategy:
 
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
+            ep_fsdp_mode = _is_ep_fsdp_mode_enabled(
+                self.device_mesh,
+                self.enable_ep,
+                self.enable_ep_fsdp,
+            )
             if self.enable_ep:
                 _ensure_moe_patched_if_needed(model, self.device_mesh)
                 _place_ep_experts_on_local_device(model, self.device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
             reshard_after_forward = self.fsdp_config.get("reshard_after_forward", True)
             ignored_params = _collect_expert_params(model) if self.enable_ep else None
+
+            if ep_fsdp_mode:
+                _ensure_ep_fsdp_supported(model)
+                ep_fsdp_mesh = _build_ep_fsdp_mesh(self.device_mesh)
+                if ep_fsdp_mesh is None:
+                    raise RuntimeError(
+                        "expert_parallel.ep_fsdp is enabled but could not build an ep_fsdp device mesh."
+                    )
+                _maybe_shard_ep_expert_blocks(
+                    model,
+                    mesh=ep_fsdp_mesh,
+                    reshard_after_forward=reshard_after_forward,
+                    mp_policy=mp_policy,
+                )
 
             _maybe_shard_layers(
                 model,
@@ -83,6 +104,23 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
     return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=("fsdp",))
 
 
+def _build_ep_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
+    if device_mesh is None or not device_mesh.has_dim("ep_fsdp"):
+        return None
+    ranks = device_mesh.get_ranks_for_dims("ep_fsdp")
+    if len(ranks) <= 1:
+        return None
+    return TorchDeviceMesh(device_mesh.device_type, ranks, mesh_dim_names=("ep_fsdp",))
+
+
+def _is_ep_fsdp_mode_enabled(device_mesh: Optional[DeviceMesh], enable_ep: bool, enable_ep_fsdp: bool) -> bool:
+    if not enable_ep or not enable_ep_fsdp or device_mesh is None:
+        return False
+    if not device_mesh.has_dim("ep_fsdp"):
+        return False
+    return (device_mesh.ep_fsdp_world_size or 1) > 1
+
+
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     ignored: Set[nn.Parameter] = set()
     ep_patched = False
@@ -105,6 +143,18 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     if not ep_patched:
         return None
     return ignored or None
+
+
+def _collect_block_expert_params(block: nn.Module) -> Set[nn.Parameter]:
+    experts = getattr(block, "experts", None)
+    if experts is None:
+        return set()
+    if isinstance(experts, nn.ModuleList):
+        params: Set[nn.Parameter] = set()
+        for expert in experts:
+            params.update(expert.parameters())
+        return params
+    return set(experts.parameters())
 
 
 def _place_ep_experts_on_local_device(model: nn.Module, device_mesh: DeviceMesh) -> None:
@@ -135,6 +185,43 @@ def _ensure_moe_patched_if_needed(model: nn.Module, device_mesh: DeviceMesh) -> 
                 "Found MoE experts but expert parallel is not applied. "
                 "Call apply_expert_parallel(model, device_mesh, config) before wrapping with FSDP2."
             )
+
+
+def _ensure_ep_fsdp_supported(model: nn.Module) -> None:
+    for module in model.modules():
+        if not getattr(module, "_ep_patched", False):
+            continue
+        experts = getattr(module, "experts", None)
+        if isinstance(experts, nn.ModuleList):
+            raise NotImplementedError(
+                "EP+EP_FSDP currently does not support MoE experts stored as nn.ModuleList. "
+                "Only tensor experts (gate_up_proj/down_proj) are supported."
+            )
+
+
+def _maybe_shard_ep_expert_blocks(model: nn.Module,
+                                  *,
+                                  mesh: TorchDeviceMesh,
+                                  reshard_after_forward: Optional[bool],
+                                  mp_policy: MixedPrecisionPolicy) -> None:
+    for module in model.modules():
+        if not getattr(module, "_ep_patched", False):
+            continue
+        experts = getattr(module, "experts", None)
+        if experts is None:
+            continue
+        expert_params = _collect_block_expert_params(module)
+        if not expert_params:
+            continue
+        block_params = set(module.parameters())
+        non_expert_params = block_params - expert_params
+        fully_shard(
+            module,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
+            ignored_params=non_expert_params or None,
+        )
 
 
 def _maybe_shard_layers(model: nn.Module,

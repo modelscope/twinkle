@@ -21,6 +21,7 @@ class ExpertParallelConfig:
     keep_router_logits: bool = True
     pad_to_max: bool = False
     ignore_shared_experts: bool = False
+    ep_fsdp: bool = False
 
 
 def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: Optional[Dict[str, Any]] = None):
@@ -31,6 +32,13 @@ def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: Opt
     ep_world_size = device_mesh.ep_world_size
     if ep_world_size <= 1:
         return model
+
+    # Only explicit ep_fsdp config enables this mode.
+    ep_fsdp_enabled = bool(
+        cfg.ep_fsdp
+        and device_mesh.has_dim("ep_fsdp")
+        and (device_mesh.ep_fsdp_world_size or 1) > 1
+    )
 
     if cfg.pad_to_max:
         raise NotImplementedError("pad_to_max is not implemented.")
@@ -45,7 +53,7 @@ def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: Opt
         raise RuntimeError("EP process group is not available in device_mesh.")
 
     for block in find_moe_blocks(model):
-        shard_experts(block, device_mesh, cfg)
+        shard_experts(block, device_mesh, cfg, ep_fsdp_enabled=ep_fsdp_enabled)
         patch_forward(block, device_mesh, cfg)
 
     return model
@@ -76,7 +84,7 @@ def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
     return blocks
 
 
-def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:
+def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig, *, ep_fsdp_enabled: bool) -> None:
     num_experts = _get_num_experts(block)
     ep_world_size = device_mesh.ep_world_size
     ep_rank = device_mesh.ep_rank
@@ -91,6 +99,11 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     local_end = local_start + experts_per_rank
 
     if isinstance(block.experts, nn.ModuleList):
+        if ep_fsdp_enabled:
+            raise NotImplementedError(
+                "EP+EP_FSDP currently does not support MoE experts stored as nn.ModuleList. "
+                "Only tensor experts (gate_up_proj/down_proj) are supported."
+            )
         local_experts = nn.ModuleList(block.experts[local_start:local_end])
         block.experts = local_experts
         block._ep_tensor_experts = False
@@ -105,6 +118,7 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     block._ep_rank = ep_rank
     block._ep_world_size = ep_world_size
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
+    block._ep_fsdp_enabled = ep_fsdp_enabled
 
 
 def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:

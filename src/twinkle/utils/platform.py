@@ -22,6 +22,7 @@ class DeviceMesh:
     - ulysses: ulysses sequence parallel
     - cp: Context Parallel
     - ep: Expert Parallel
+    - ep_fsdp: Expert FSDP Parallel
     - vpp: Virtual Pipeline Parallel
 
     Examples:
@@ -34,6 +35,7 @@ class DeviceMesh:
     mesh: np.ndarray
     mesh_dim_names: Optional[tuple[str, ...]]
     ep_size: Optional[int] = None
+    ep_fsdp_size: Optional[int] = None
     etp_size: Optional[int] = None
     # megatron only
     vpp_size: Optional[int] = None
@@ -46,7 +48,8 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
+                   ep_fsdp_size: int = None, etp_size: int = None, vpp_size: int = None, device_type: str = 'cuda',
+                   sequence_parallel: bool = False) -> "DeviceMesh":
         """Create a default device mesh from the given sizes.
 
         Args:
@@ -58,6 +61,7 @@ class DeviceMesh:
             ulysses_size: The ulysses parallel size
             cp_size: The context parallel size
             ep_size: The expert parallel size
+            ep_fsdp_size: The expert fsdp parallel size
             etp_size: The expert tensor parallel size
             vpp_size: The virtual pipeline parallel size
             device_type: The device type
@@ -84,13 +88,16 @@ class DeviceMesh:
             if origin_world_size == 1:
                 world_size *= dp_size
             mesh_dim_sizes.append(dp_size)
-        else:
-            mesh_dim_sizes.append(-1)
         if ep_size is not None:
             mesh_dim_sizes.append(ep_size)
             mesh_dim_names.append("ep")
             if origin_world_size == 1:
                 world_size *= ep_size
+        if ep_fsdp_size is not None:
+            mesh_dim_sizes.append(ep_fsdp_size)
+            mesh_dim_names.append("ep_fsdp")
+            if origin_world_size == 1:
+                world_size *= ep_fsdp_size
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")
@@ -107,6 +114,7 @@ class DeviceMesh:
             mesh_dim_names=tuple(mesh_dim_names),
             vpp_size=vpp_size,
             ep_size=ep_size,
+            ep_fsdp_size=ep_fsdp_size,
             etp_size=etp_size,
             ulysses_size=ulysses_size,
             sequence_parallel=sequence_parallel,
@@ -116,7 +124,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep"}
+        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep", "ep_fsdp"}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(
@@ -128,6 +136,12 @@ class DeviceMesh:
     def create_process_group(self, dims):
         """Create a process group by dims"""
         import torch.distributed as dist
+        ranks = self.get_ranks_for_dims(dims)
+        return dist.new_group(ranks=ranks)
+
+    def get_ranks_for_dims(self, dims):
+        if isinstance(dims, str):
+            dims = (dims,)
         rank = dist.get_rank()
         coords = np.argwhere(self.mesh == rank)[0]
         slices = []
@@ -137,8 +151,7 @@ class DeviceMesh:
             else:
                 slices.append(coords[i])
 
-        ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
-        return dist.new_group(ranks=ranks)
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
 
     def get_dim_group(self, dims):
         import torch.distributed as dist
@@ -185,7 +198,7 @@ class DeviceMesh:
     def order(self):
         """The order of the dimensions for megatron"""
         # TODO hard coded for now
-        return 'tp-cp-ep-dp-pp'
+        return 'tp-cp-ep-ep_fsdp-dp-pp'
 
     def to_torch_device_mesh(self):
         import torch
@@ -264,6 +277,10 @@ class DeviceMesh:
         return self._get_rank_for_dim("ep")
 
     @property
+    def ep_fsdp_rank(self) -> Optional[int]:
+        return self._get_rank_for_dim("ep_fsdp")
+
+    @property
     def dp_world_size(self) -> int:
         return self._get_world_size_for_dim("dp")
 
@@ -286,6 +303,10 @@ class DeviceMesh:
     @property
     def ep_world_size(self) -> Optional[int]:
         return self._get_world_size_for_dim("ep")
+
+    @property
+    def ep_fsdp_world_size(self) -> Optional[int]:
+        return self._get_world_size_for_dim("ep_fsdp")
 
     @property
     def etp_world_size(self) -> int:

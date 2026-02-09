@@ -183,6 +183,24 @@ class TestDeviceMeshRanks:
         assert mesh.pp_world_size == 5
         assert mesh.world_size == 2 * 3 * 4 * 5
 
+    def test_ep_fsdp_rank_and_world_size(self):
+        mesh = DeviceMesh.from_sizes(dp_size=1, ep_size=2, ep_fsdp_size=3)
+        mesh_array = mesh.mesh.reshape(1, 2, 3)
+
+        for ep_idx in range(2):
+            for ep_fsdp_idx in range(3):
+                global_rank = int(mesh_array[0, ep_idx, ep_fsdp_idx])
+                with patch.object(Platform, 'get_rank', return_value=global_rank):
+                    assert mesh.ep_rank == ep_idx
+                    assert mesh.ep_fsdp_rank == ep_fsdp_idx
+                    assert mesh.ep_world_size == 2
+                    assert mesh.ep_fsdp_world_size == 3
+
+    def test_without_dp_dimension(self):
+        mesh = DeviceMesh.from_sizes(dp_size=None, ep_size=2, ep_fsdp_size=2)
+        assert mesh.mesh.shape == (2, 2)
+        assert mesh.mesh_dim_names == ('ep', 'ep_fsdp')
+
     def test_data_rank_with_dp_only(self):
         mesh = DeviceMesh.from_sizes(dp_size=4)
         

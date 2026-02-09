@@ -20,11 +20,12 @@ TEMPLATE_ID = os.environ.get('QWEN3_TEMPLATE_ID', 'Template')
 PROCESSOR_ID = os.environ.get('QWEN3_PROCESSOR_ID', 'AlpacaProcessor')
 NUM_LAYERS = int(os.environ.get('QWEN3_NUM_LAYERS', '1'))
 
-# 4 GPUs: dp=2, ep=2
+# 4 GPUs: ep=2, ep_fsdp=2
 device_mesh = DeviceMesh.from_sizes(
     device_type=Platform.get_platform().device_prefix(),
-    dp_size=2,
+    dp_size=None,
     ep_size=2,
+    ep_fsdp_size=2,
 )
 
 twinkle.initialize(
@@ -80,6 +81,7 @@ def train():
                 "router_dtype": "fp32",
                 "all_to_all": "torch",
                 "keep_router_logits": False,
+                "ep_fsdp": True,
             }
         },
     )
