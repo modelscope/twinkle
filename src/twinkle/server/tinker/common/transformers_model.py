@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from tinker import types
 from typing import List
 from twinkle.model import MultiLoraTransformersModel
@@ -98,21 +99,22 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         input_features = datum_to_input_feature(inputs)
 
         # Forward pass
-        outputs = super().forward(inputs=input_features, **kwargs)
+        outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
 
         # Calculate loss with extra parameters
         # Extract old_logps and advantages using common utility
         loss_values = extract_rl_feature(inputs)
-        loss_kwargs = kwargs.copy().update(loss_values)
-        loss = super().calculate_loss(**loss_kwargs)
+        loss_kwargs = kwargs.copy()
+        loss_kwargs.update(loss_values)
+        loss = super().calculate_loss(adapter_name=adapter_name, **loss_kwargs)
 
         # Backward pass
-        super().backward(**kwargs)
+        super().backward(adapter_name=adapter_name, **kwargs)
 
         # shape (batch_size, seq_len, vocab_size)
         logits = outputs['logits'].detach().cpu()
         results = self._get_forward_output(inputs, logits)
-        return results, loss
+        return [results, loss]
 
     @remote_function()
     def step(self, *, adam_params: types.AdamParams, **kwargs):

@@ -136,5 +136,5 @@ def eval():
 
 
 if __name__ == "__main__":
-    # train()   # Uncomment to run training
-    eval()      # Run evaluation / inference
+    train()   # Uncomment to run training
+    # eval()      # Run evaluation / inference
