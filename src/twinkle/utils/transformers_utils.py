@@ -152,19 +152,11 @@ def get_llm_model(model, *, model_meta=None, inner_backbone: bool = True):
     except Exception:
         pass
 
-    # 2) Unwrap PEFT/Swift wrappers.
+    # 2) Unwrap PEFT wrappers.
     try:
         from peft import PeftModel  # type: ignore
 
         if isinstance(model, PeftModel):
-            model = model.model
-    except Exception:
-        pass
-
-    try:
-        from swift.tuners import SwiftModel  # type: ignore
-
-        if isinstance(model, SwiftModel):
             model = model.model
     except Exception:
         pass
