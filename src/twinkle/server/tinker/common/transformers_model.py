@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tinker import types
 from typing import List
+from twinkle.template import Template
 from twinkle.model import MultiLoraTransformersModel
 from twinkle import remote_class, remote_function
 from .datum import datum_to_input_feature, extract_rl_feature
@@ -94,9 +95,11 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         else:
             raise ValueError(
                 f'Unsupported loss function {loss_fn}')
-
+        # Get template for input processing
+        template = self.get_template(adapter_name)
+        
         # Convert Datum to InputFeature
-        input_features = datum_to_input_feature(inputs)
+        input_features = datum_to_input_feature(inputs, template)
 
         # Forward pass
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
@@ -160,6 +163,9 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         else:
             # Load from hub
             return super().load(name=resolved.checkpoint_name, **kwargs)
+
+    def get_template(self, adapter_name: str) -> Template:
+        return self.optimizer_group[adapter_name].template
 
     @staticmethod
     def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor) -> List[dict]:

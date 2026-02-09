@@ -19,7 +19,6 @@
 # Requires both model and sampler services to be configured.
 
 import gc
-import time
 import numpy as np
 from typing import List, Tuple
 
@@ -30,7 +29,6 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
-from twinkle.server.tinker.common import input_feature_to_datum
 from modelscope import AutoTokenizer
 
 logger = get_logger()
@@ -41,7 +39,7 @@ NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
 MAX_STEPS = 10
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 5       # Save weights for sampler every N steps
 LORA_RANK = 8
@@ -122,14 +120,11 @@ def main():
         # ========== 1. Save weights for sampler (instead of sync_weights) ==========
         if step % SYNC_INTERVAL == 0:
             logger.info(f"Step {step}: Saving weights for sampler...")
-            try:
-                sampling_client = (
-                    training_client.save_weights_and_get_sampling_client(
-                        name=f'grpo-step-{step}'))
-                logger.info(f"Step {step}: Sampling client ready")
-            except Exception as e:
-                logger.error(f"Step {step}: Failed to create sampling client: {e}")
-                sampling_client = None
+
+            sampling_client = (
+                training_client.save_weights_and_get_sampling_client(
+                    name=f'grpo-step-{step}'))
+            logger.info(f"Step {step}: Sampling client ready")
 
         if sampling_client is None:
             logger.warning("No sampling client available, skipping step")
@@ -219,24 +214,15 @@ def main():
             if hasattr(prompt_ids, 'tolist'):
                 prompt_ids = prompt_ids.tolist()
 
-            full_tokens = prompt_ids + list(seq.tokens)
-            
-            # Shift by one for next-token prediction
-            input_tokens = full_tokens[:-1]
-            target_tokens = full_tokens[1:]
-            
-            # Get logprobs from the sampling result
-            logprobs = seq.logprobs if seq.logprobs else [0.0] * len(seq.tokens)
-            # Pad logprobs to match full sequence length (prompt + completion)
-            # Prompt positions get 0.0 logprobs (no loss computed on prompt)
-            padded_logprobs = [0.0] * (len(prompt_ids) - 1) + logprobs
-            
-            # Get advantage for this sequence
+            sampled_tokens = list(seq.tokens)
+            logprobs = seq.logprobs if seq.logprobs else [0.0] * len(sampled_tokens)
             advantage = float(advantages[i])
             
-            # Pad advantages to match full sequence length
-            # Only completion tokens get the advantage value, prompt gets 0.0
-            padded_advantages = [0.0] * (len(prompt_ids) - 1) + [advantage] * len(seq.tokens)
+            ob_len = len(prompt_ids) - 1
+            input_tokens = prompt_ids + sampled_tokens[:-1]
+            target_tokens = [0] * ob_len + sampled_tokens
+            padded_advantages = [0.0] * ob_len + [advantage] * len(sampled_tokens)
+            padded_logprobs = [0.0] * ob_len + logprobs
             
             # Verify lengths match
             assert len(input_tokens) == len(target_tokens) == len(padded_logprobs) == len(padded_advantages), \

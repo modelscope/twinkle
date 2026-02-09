@@ -172,6 +172,7 @@ def build_model_app(model_id: str,
                         self.register_adapter(
                             adapter_name, request.state.token)
 
+                        self.model.set_template('Template', adapter_name=adapter_name)
                         self.model.set_processor('InputProcessor',
                                                  adapter_name=adapter_name)
                         self.model.set_optimizer('Adam',

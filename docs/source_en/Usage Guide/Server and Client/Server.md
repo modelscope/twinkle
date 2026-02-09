@@ -1,5 +1,114 @@
 # Server
 
+## Ray Cluster Configuration
+
+Before starting the Server, **you must first start and configure the Ray nodes**. Only after the Ray nodes are properly configured can the Server correctly allocate and occupy resources (GPU, CPU, etc.).
+
+### Starting Ray Nodes
+
+A Ray cluster consists of multiple nodes, each of which can be configured with different resources. The startup steps are as follows:
+
+#### 1. Start the Head Node (First GPU Node)
+
+```bash
+# Stop existing Ray cluster (if any)
+ray stop
+
+# Start the Head node with GPU 0-3, 4 GPUs in total
+CUDA_VISIBLE_DEVICES=0,1,2,3 ray start --head --num-gpus=4 --port=6379
+```
+
+#### 2. Start Worker Nodes
+
+```bash
+# Second GPU node, using GPU 4-7, 4 GPUs in total
+CUDA_VISIBLE_DEVICES=4,5,6,7 ray start --address=10.28.252.9:6379 --num-gpus=4
+
+# CPU node (for running Processor and other CPU tasks)
+ray start --address=10.28.252.9:6379 --num-gpus=0
+```
+
+**Notes:**
+- `--head`: Marks this node as the Head node (the primary node of the cluster)
+- `--port=6379`: The port the Head node listens on
+- `--address=<IP>:<PORT>`: The address for Worker nodes to connect to the Head node
+- `--num-gpus=N`: The number of GPUs available on this node
+- `CUDA_VISIBLE_DEVICES`: Restricts the GPU devices visible to this node
+
+#### 3. Complete Example: 3-Node Cluster
+
+```bash
+# Stop the old cluster and start a new one
+ray stop && \
+CUDA_VISIBLE_DEVICES=0,1,2,3 ray start --head --num-gpus=4 --port=6379 && \
+CUDA_VISIBLE_DEVICES=4,5,6,7 ray start --address=10.28.252.9:6379 --num-gpus=4 && \
+ray start --address=10.28.252.9:6379 --num-gpus=0
+```
+
+This configuration starts 3 nodes:
+- **Node 0** (Head): 4 GPUs (cards 0-3)
+- **Node 1** (Worker): 4 GPUs (cards 4-7)
+- **Node 2** (Worker): CPU-only node
+
+### Node Rank in YAML Configuration
+
+In the YAML configuration file, **each component needs to occupy a separate Node**, and the `ranks` within each Node are numbered starting from 0.
+
+**Example configuration:**
+
+```yaml
+applications:
+  # Model service occupies Node 0 (Head node, GPU 0-3)
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+    import_path: model
+    args:
+      nproc_per_node: 4
+      device_group:
+        name: model
+        ranks: [0, 1, 2, 3]    # GPU indices within Node 0
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0, 1, 2, 3]
+        mesh_dim_names: ['dp']
+
+  # Sampler service occupies Node 1 (Worker node, GPU 4-7)
+  - name: sampler-Qwen2.5-7B-Instruct
+    route_prefix: /sampler/Qwen/Qwen2.5-7B-Instruct
+    import_path: sampler
+    args:
+      nproc_per_node: 2
+      device_group:
+        name: sampler
+        ranks: [0, 1]          # GPU indices within Node 1 (corresponding to physical GPU 4-5)
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        mesh: [0, 1]
+        mesh_dim_names: ['dp']
+
+  # Processor service occupies Node 2 (CPU node)
+  - name: processor
+    route_prefix: /processors
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 4
+      device_group:
+        name: processor
+        ranks: 0               # CPU index within Node 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        mesh: [0, 1, 2, 3]
+        mesh_dim_names: ['dp']
+```
+
+**Important notes:**
+- The `ranks` configuration for each component is relative to the Ray Node it occupies
+- Different components are automatically assigned to different Nodes
+- Ray automatically schedules components to the appropriate Node based on resource requirements (`num_gpus`, `num_cpus` in `ray_actor_options`)
+
 ## Startup Methods
 
 The Server is uniformly launched through the `launch_server` function or CLI command, with YAML configuration files.

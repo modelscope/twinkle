@@ -4,7 +4,7 @@ Tinker-compatible sampler (inference) server.
 
 This module provides a Ray Serve deployment for distributed text generation/inference.
 It supports:
-1. VLLM and Torch sampler backends
+1. vLLM and Torch sampler backends
 2. LoRA adapter loading via adapter URIs
 3. Multi-user inference with rate limiting
 4. Flexible sampling parameters
@@ -70,7 +70,7 @@ def build_sampler_app(model_id: str,
         """Sampler management service for text generation inference.
         
         This class manages:
-        - VLLM or Torch sampler initialization and lifecycle
+        - vLLM or Torch sampler initialization and lifecycle
         - Inference requests with LoRA adapter support
         - Rate limiting via task queue
         - Sampling parameter conversion between Tinker and Twinkle formats
@@ -174,9 +174,9 @@ def build_sampler_app(model_id: str,
                     # Only request logprobs when the client asks for them. Some backends may
                     # return None entries in logprobs, which breaks pydantic validation.
                     response: SampleResponse = await self.sampler.engine.sample(
-                        prompt_token_ids=prompt_token_ids,
+                        prompt_token_ids=prompt_token_ids * body.num_samples,  # For speed up
                         sampling_params=sampling_params,
-                        num_samples=body.num_samples or 1,
+                        num_samples=1,
                         logprobs=True,  # Always request logprobs
                         include_prompt_logprobs=body.prompt_logprobs or False,
                         topk_prompt_logprobs=body.topk_prompt_logprobs or 0,

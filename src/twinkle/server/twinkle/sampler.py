@@ -205,13 +205,6 @@ def build_sampler_app(model_id: str,
                       sampler_type: str = 'vllm',
                       engine_args: Optional[Dict[str, Any]] = None,
                       adapter_config: Optional[Dict[str, Any]] = None,
-                      nproc_per_node: int = 1,
-                      device_group: Dict[str, Any] = None,
-                      device_mesh: Dict[str, Any] = None,
-                      deploy_options: Dict[str, Any] = None,
-                      sampler_type: str = 'vllm',
-                      engine_args: Optional[Dict[str, Any]] = None,
-                      adapter_config: Optional[Dict[str, Any]] = None,
                       **kwargs):
     """Build a sampler application for text generation inference.
 

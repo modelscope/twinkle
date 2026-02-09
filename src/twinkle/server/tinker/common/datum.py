@@ -4,30 +4,34 @@ from typing import List, Union
 from collections import defaultdict
 import numpy as np
 from twinkle.data_format.input_feature import InputFeature
+from twinkle.template import Template
 from tinker import types
     
-def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]]) -> Union[InputFeature, List[InputFeature]]:
+def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]], template: Template) -> Union[InputFeature, List[InputFeature]]:
     """Convert a Datum to a dictionary of input features for model inference."""
     if isinstance(datum, list):
-        return [datum_to_input_feature(d) for d in datum]
+        return [datum_to_input_feature(d, template) for d in datum]
     
     input_feature: InputFeature = {}
 
     # 1. Flatten model_input chunks to get input_ids
     input_ids = datum.model_input.to_ints()
     input_feature['input_ids'] = input_ids
-    input_feature['attention_mask'] = [1] * len(input_ids)
-    input_feature['length'] = len(input_ids)
-    input_feature['position_ids'] = list(range(len(input_ids)))
-    
+
     # 2. Map loss function inputs
     # 'target_tokens' -> 'labels'
-    if 'target_tokens' in datum.loss_fn_inputs and 'weights' in datum.loss_fn_inputs:
+    assert 'target_tokens' in datum.loss_fn_inputs, f"Missing 'target_tokens' in loss_fn_inputs {datum.loss_fn_inputs}"
+    
+    labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
+    if 'weights' in datum.loss_fn_inputs:
+        # remove weights 0 from labels
         weights = datum.loss_fn_inputs['weights'].to_numpy()
-        labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
-        
-        input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
+        new_tokens = labels[weights > 0].tolist()
+    else:
+        # remove padding (0-id)
+        new_tokens = labels[labels > 0].tolist()
 
+    input_feature = template.concat_input_feature(input_feature, new_tokens)
     return input_feature
 
 def extract_rl_feature(datum: Union[types.Datum, List[types.Datum]]) -> dict:
