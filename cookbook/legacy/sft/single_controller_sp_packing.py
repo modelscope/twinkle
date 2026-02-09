@@ -8,6 +8,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import PackingDataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.processor import InputProcessor
 
 logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen2.5-7B-Instruct'
@@ -82,9 +83,10 @@ def train():
         strategy="native_fsdp",
         remote_group="default",
     )
-
     lora_config = LoraConfig(target_modules="all-linear")
     model.add_adapter_to_model("default", lora_config, gradient_accumulation_steps=1)
+    model.set_processor(InputProcessor, padding_free=True, adapter_name="default")
+    model.set_loss("CrossEntropyLoss", reduction="mean", adapter_name="default")
     model.set_optimizer("AdamW", lr=1e-4, adapter_name="default")
 
     loss_metric = 99.0

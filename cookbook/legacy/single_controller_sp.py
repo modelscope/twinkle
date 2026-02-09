@@ -46,26 +46,12 @@ def create_dataset(data_slice=None):
         "Template",
         model_id=MODEL_ID,
         truncation_strategy="left",
-        max_length=64,
+        max_length=256,
     )
     dataset.map(SelfCognitionProcessor("twinkle模型", "twinkle团队"))
     dataset.encode(batched=True)
     return dataset
 
-
-def eval(model: TransformersModel):
-    dataloader = DataLoader(
-        dataset=partial(create_dataset, data_slice=range(20)),
-        batch_size=4,
-        drop_last=True,
-        device_mesh=device_mesh,
-        remote_group="default",
-    )
-    for step, batch in enumerate(dataloader):
-        model.forward_only(inputs=batch, adapter_name="default")
-        model.calculate_loss(adapter_name="default")
-    metrics = model.calculate_metric(is_training=False, adapter_name="default")
-    return metrics()
 
 
 def train():
@@ -87,21 +73,20 @@ def train():
     model.add_adapter_to_model("default", lora_config, gradient_accumulation_steps=1)
     model.set_optimizer("AdamW", lr=1e-4, adapter_name="default")
 
-    loss_metric = 99.0
     for step, batch in enumerate(dataloader):
-        if isinstance(batch, list) and len(batch) == 0:
-            continue
-        output = model.forward_backward(inputs=batch, adapter_name="default")
-        loss_value = output() if callable(output) else output
-        logger.info(f"step {step}, loss: {loss_value}")
-        model.clip_grad_and_step(adapter_name="default")
-        if step % 50 == 0 and step > 0:
-            metrics = eval(model)
-            logger.info(f"Current is step {step} of {len(dataloader)}, metric: {metrics}")
-            metrics["step"] = step
-            if loss_metric > metrics["loss"]:
-                model.save(f"checkpoint-{step}")
-                loss_metric = metrics["loss"]
+        model.forward_backward(inputs=batch, adapter_name='default')
+        model.clip_grad_and_step(adapter_name='default')
+        if step % 1 == 0:
+            metric = model.calculate_metric(is_training=True, adapter_name='default')
+            _metrics = {}
+            for key, value in metric.items():
+                try:
+                    value = float(value)
+                    _metrics[key] = value
+                except:
+                    pass
+            logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
+    model.save(f'last-checkpoint', interval=1)
 
 
 if __name__ == "__main__":

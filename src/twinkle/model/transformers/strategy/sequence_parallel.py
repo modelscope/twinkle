@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import os
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
@@ -1004,7 +1005,11 @@ class SequenceParallelStrategy:
             local_sum = loss
             global_sum = local_sum.detach().clone()
             dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-            return global_sum + (local_sum - local_sum.detach())
+            out = global_sum + (local_sum - local_sum.detach())
+            if sequence_parallel.world_size > 1:
+                out_metric = out.detach() / sequence_parallel.world_size
+                return out_metric + (out - out.detach())
+            return out
         # Default to mean reduction.
         local_sum = loss * num_valid_tokens
         global_sum = local_sum.detach().clone()
@@ -1013,7 +1018,11 @@ class SequenceParallelStrategy:
         dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
         if global_tokens.item() == 0:
             return loss
-        return (global_sum + (local_sum - local_sum.detach())) / global_tokens
+        out = (global_sum + (local_sum - local_sum.detach())) / global_tokens
+        if sequence_parallel.world_size > 1:
+            out_metric = out.detach() / sequence_parallel.world_size
+            return out_metric + (out - out.detach())
+        return out
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()

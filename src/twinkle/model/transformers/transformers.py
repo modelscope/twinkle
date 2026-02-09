@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import contextlib
+import os
 import json
 import os
 import re
