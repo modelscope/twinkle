@@ -32,7 +32,7 @@ from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
 from twinkle.reward.base import Reward
-from twinkle.sampler import VLLMSampler
+from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 from twinkle.metric import CompletionRewardMetric
 
@@ -47,13 +47,13 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
-GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
+GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 ADAPTER_NAME = 'default'
@@ -80,7 +80,6 @@ if USE_SWANLAB:
     })
 
 
-# ========== GSM8K Data Processing ==========
 SYSTEM_PROMPT = (
     "You are a helpful math assistant. Solve the problem step by step. "
     "Show your reasoning in <think> </think> tags, then give the final "
@@ -326,11 +325,12 @@ def main():
     model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
     # ── Sampler (load real weights for meaningful generation) ─────────
-    sampler = VLLMSampler(
+    sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.7,
-            'max_model_len': 2048,
+            'max_model_len': 4096,
+            'max_lora_rank': 64,
             'enforce_eager': True,
             'enable_sleep_mode': False,
             'enable_lora': True,
@@ -381,13 +381,12 @@ def main():
 
         global_prompts = batch if isinstance(batch, list) else [batch]
 
-        # ========== 1. Weight Sync ==========
         t0 = time.perf_counter()
         if optim_step % WEIGHT_SYNC_INTERVAL == 0:
             ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
+            sampler.reset_prefix_cache()
         timings['weight_sync'] = time.perf_counter() - t0
 
-        # ========== 2. Generate ==========
         t1 = time.perf_counter()
         sample_response = sampler.sample(
             global_prompts,
@@ -445,32 +444,20 @@ def main():
             1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
         )
 
-        # ========== 5. Training (micro-batches) ==========
+        # ========== 5. Training ==========
         t4 = time.perf_counter()
-        micro_batch_seqs = BATCH_SIZE * NUM_GENERATIONS
 
-        for micro_idx in range(GRADIENT_ACCUMULATION_STEPS):
-            start = micro_idx * micro_batch_seqs
-            end = start + micro_batch_seqs
-            mb_inputs = all_input_data[start:end]
-            mb_old_logps = all_old_logps[start:end]
-            mb_advantages = advantages[start:end]
-
-            if not mb_inputs:
-                break
-
-            if all(abs(a) < 1e-8 for a in mb_advantages):
-                logger.info(
-                    f"Optim step {optim_step}, micro {micro_idx}: "
-                    f"All advantages zero, skipping"
-                )
-                continue
-
+        if all(abs(a) < 1e-8 for a in advantages):
+            logger.info(
+                f"Optim step {optim_step}: "
+                f"All advantages zero, skipping training"
+            )
+        else:
             model.forward_backward(
-                inputs=mb_inputs,
+                inputs=all_input_data,
                 adapter_name=ADAPTER_NAME,
-                advantages=mb_advantages,
-                old_logps=mb_old_logps,
+                advantages=advantages,
+                old_logps=all_old_logps,
             )
 
         model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
