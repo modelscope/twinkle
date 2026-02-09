@@ -73,4 +73,7 @@ jobs:
         shell: bash
         run: |
           set -e
+          mkdir -p ~/.cache
+          export MODELSCOPE_CACHE=~/.cache
+          export CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest tests'
           bash .dev_scripts/dockerci.sh
