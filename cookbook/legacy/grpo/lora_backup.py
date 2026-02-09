@@ -44,7 +44,6 @@ DATA_NUM = int(os.environ.get('DATA_NUM', 5000))
 
 # SwanLab is optional - only used if SWANLAB_API_KEY is set
 USE_SWANLAB = True
-os.environ['SWANLAB_API_KEY'] = '3hVJrk0veNB2NCm72UdJg'
 if USE_SWANLAB:
     import swanlab
     if USE_SWANLAB:

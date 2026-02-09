@@ -421,7 +421,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_value, counts = result
         else:
             loss_value = result
-            counts = torch.tensor(1, device=loss_value.device)
+            counts = torch.tensor(0, device=loss_value.device)
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
