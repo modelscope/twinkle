@@ -5,9 +5,11 @@ repos:
       - id: flake8
         exclude: |
             (?x)^(
-                thirdparty/|
                 examples/|
-                tests/run.py
+                cookbook/|
+                client_tools/|
+                src/twinkle_client|
+                
             )$
   - repo: https://github.com/PyCQA/isort.git
     rev: 7.0.0
@@ -16,7 +18,9 @@ repos:
         exclude: |
             (?x)^(
                 examples/|
-                tests/run.py|
+                cookbook/|
+                client_tools/|
+                src/twinkle_client|
             )$
   - repo: https://github.com/google/yapf
     rev: v0.43.0
@@ -24,25 +28,11 @@ repos:
       - id: yapf
         exclude: |
             (?x)^(
-                thirdparty/|
                 examples/|
-                tests/run.py
+                cookbook/|
+                client_tools/|
+                src/twinkle_client|
             )$
   - repo: https://github.com/pre-commit/pre-commit-hooks.git
     rev: v6.0.0
     hooks:
-      - id: trailing-whitespace
-        exclude: thirdparty/|tests/run.py
-      - id: check-yaml
-        exclude: thirdparty/|tests/run.py
-      - id: end-of-file-fixer
-        exclude: thirdparty/|tests/run.py
-      - id: requirements-txt-fixer
-        exclude: thirdparty/|tests/run.py
-      - id: double-quote-string-fixer
-        exclude: thirdparty/|tests/run.py
-      - id: check-merge-conflict
-        exclude: thirdparty/|tests/run.py
-      - id: mixed-line-ending
-        exclude: thirdparty/|tests/run.py
-        args: ["--fix=lf"]

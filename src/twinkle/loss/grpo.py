@@ -4,6 +4,7 @@ from typing import Dict, Optional, List, TYPE_CHECKING, Union
 from twinkle.loss.base import Loss
 from twinkle.utils.torch_utils import selective_log_softmax
 from twinkle.data_format import Trajectory
+import numpy as np
 
 if TYPE_CHECKING:
     import torch
@@ -100,7 +101,7 @@ class GRPOLoss(Loss):
         
         Args:
             ratio: [batch, seq_len] importance sampling ratio
-            advantages: [batch, 1] advantage values (already expanded)
+            advantages: [batch, 1] or [batch, seq_len] advantage values (already expanded)
             per_token_logps: [batch, seq_len] current policy log probabilities
             
         Returns:
@@ -132,83 +133,53 @@ class GRPOLoss(Loss):
         Returns:
             loss: scalar loss value
         """
-        # Mean over tokens per sequence, then mean over batch
+        # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
+        # Each sequence contributes equally regardless of length.
         return (
-            (per_token_loss * loss_mask).sum(-1) 
-            # clip_grad_norm normalized by the number of tokens in the batch, skip
-            # / loss_mask.sum(-1).clamp(min=1.0) 
+            (per_token_loss * loss_mask).sum(-1)
+            / loss_mask.sum(-1).clamp(min=1.0)
         ).mean()
 
     @staticmethod
-    def _pad_and_align_logps(
-        logps: 'Union[torch.Tensor, List[List[float]]]',
-        loss_mask: 'torch.Tensor',
+    def _pad_and_align_to_batch(
+        data: 'Union[torch.Tensor, List[float], np.ndarray]',
+        mask: 'torch.Tensor',
         device: 'torch.device',
         dtype: 'torch.dtype',
+        fill_value: float = 0.0,
     ) -> 'torch.Tensor':
-        """Align auxiliary log-probabilities to the model's padded sequence.
-
-        ``old_logps`` and ``ref_logps`` come from the sampler or a reference
-        model and are **not** processed by the ``InputProcessor`` pipeline.
-        They only cover **response tokens** (variable length per sample),
-        whereas the model's ``logps`` covers the entire padded sequence
-        (prompt + response + collation padding + CP/TP padding).
-
-        This method scatters the compact response-only log-probs into the
-        correct positions within the full padded sequence, using ``loss_mask``
-        to determine where response tokens are located.
-
-        If ``logps`` is already a ``[batch, seq_len]`` tensor whose
-        ``seq_len`` matches the target, it is returned as-is (assumed to be
-        pre-aligned, e.g. from a reference model that ran the same pipeline).
-
-        Args:
-            logps: Per-token log probabilities, either:
-                - ``List[List[float]]``: ragged per-sample response log-probs
-                - ``torch.Tensor [batch, response_len]``: compact response-
-                  only tensor (may have different length than target)
-                - ``torch.Tensor [batch, seq_len]``: pre-aligned tensor
-            loss_mask: ``[batch, seq_len]`` bool tensor indicating response
-                token positions within the padded sequence.
-            device: Target device.
-            dtype: Target dtype.
-
-        Returns:
-            Tensor of shape ``[batch, seq_len]`` with log-probs placed at
-            positions where ``loss_mask`` is True, and 0.0 elsewhere.
-        """
+        """Align data to mask: scalars broadcast, sequences scatter."""
         import torch
 
-        batch_size, target_seq_len = loss_mask.shape
-
-        # ── 1. Normalize input to a list of per-sample 1-D tensors ───────
-        if isinstance(logps, torch.Tensor):
-            logps = logps.to(device=device, dtype=dtype)
-            if logps.dim() == 1:
-                logps = logps.unsqueeze(0)
-            # Already aligned: same batch & seq_len → fast path
-            if logps.shape == (batch_size, target_seq_len):
-                return logps
-            # Compact tensor: split into per-sample tensors
-            per_sample = [logps[i] for i in range(logps.shape[0])]
-        elif isinstance(logps, (list, tuple)):
-            per_sample = [
-                torch.as_tensor(seq, dtype=dtype, device=device)
-                for seq in logps
-            ]
+        batch_size, seq_len = mask.shape
+        
+        # Normalize to tensor
+        if not isinstance(data, torch.Tensor):
+            data = torch.as_tensor(data, dtype=dtype, device=device)
         else:
-            raise TypeError(f"Unsupported logps type: {type(logps)}")
-
-        # ── 2. Scatter into loss_mask positions ──────────────────────────
-        result = torch.zeros(batch_size, target_seq_len, dtype=dtype, device=device)
+            data = data.to(device=device, dtype=dtype)
+        
+        if data.shape == (batch_size, seq_len):
+            return data
+        
+        result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
+        
+        # Case 1: Scalars [batch] or [batch, 1]
+        if data.dim() == 1 or data.shape[1] == 1:
+            if data.dim() == 1:
+                data = data.unsqueeze(1)
+            if mask.any():
+                batch_idx = mask.nonzero(as_tuple=True)[0]
+                result[mask] = data[batch_idx, 0]
+            return result
+        
+        # Case 2: Sequences [batch, *]
         for i in range(batch_size):
-            positions = loss_mask[i].nonzero(as_tuple=True)[0]
-            n_response = positions.shape[0]
-            n_logps = per_sample[i].shape[0]
-            n = min(n_response, n_logps)
+            pos = mask[i].nonzero(as_tuple=True)[0]
+            n = min(len(pos), data[i].numel())
             if n > 0:
-                result[i, positions[:n]] = per_sample[i][:n].to(device=device, dtype=dtype)
-
+                result[i, pos[:n]] = data[i].flatten()[:n]
+        
         return result
 
     @staticmethod
@@ -304,7 +275,7 @@ class GRPOLoss(Loss):
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
         trajectories: Optional[List[Trajectory]] = None, # TODO: remove this argument
-        advantages: Optional['torch.Tensor'] = None,
+        advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         **kwargs,
     ) -> 'torch.Tensor':
         """
@@ -321,7 +292,7 @@ class GRPOLoss(Loss):
                       automatically.  If None, uses current logps (on-policy, ratio=1).
             ref_logps: Optional [batch, seq_len] reference model log probs for KL penalty.
                       Same padding/alignment rules as old_logps.
-            trajectories: Optional List[Trajectory] containing advantages
+            advantages: advantage values
             **kwargs: Additional arguments
 
         Returns:
@@ -376,26 +347,23 @@ class GRPOLoss(Loss):
         if old_logps is None:
             old_logps = logps.detach()
         else:
-            old_logps = self._pad_and_align_logps(
+            old_logps = self._pad_and_align_to_batch(
                 old_logps, loss_mask, device, logps.dtype,
             )
 
         # ── Prepare ref_logps (same treatment) ──────────────────────────
         if ref_logps is not None:
-            ref_logps = self._pad_and_align_logps(
+            ref_logps = self._pad_and_align_to_batch(
                 ref_logps, loss_mask, device, logps.dtype,
             )
 
+        
         assert advantages is not None, \
             "advantages must be provided (pass as kwarg to forward_backward)"
-        if not torch.is_tensor(advantages):
-            advantages = torch.as_tensor(advantages, device=device, dtype=torch.float32)
-        else:
-            advantages = advantages.to(device, dtype=torch.float32)
-        
-        # Ensure advantages is 2D for broadcasting [batch, 1]
-        if advantages.dim() == 1:
-            advantages = advantages.unsqueeze(1)
+
+        advantages = self._pad_and_align_to_batch(
+            advantages, loss_mask, device, logps.dtype,
+        )
 
         # ── Compute loss ────────────────────────────────────────────────
         log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
@@ -413,7 +381,8 @@ class GRPOLoss(Loss):
         
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
         
-        return loss, loss_mask.sum()
+        return loss
+
 
     def compute_metrics(
         self,

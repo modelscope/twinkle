@@ -33,8 +33,8 @@ applications:
 
   # 2. Model Service - Hosts the base model for training
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct   # REST path for this model
+  - name: models-Qwen2.5-0.5B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-0.5B-Instruct   # REST path for this model
     import_path: model
     args:
       use_megatron: false                              # Use HuggingFace Transformers (not Megatron)

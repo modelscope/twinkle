@@ -50,7 +50,7 @@ def train():
 
     # Apply a chat template so the data matches the model's expected input format
     dataset.set_template(
-        'Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+        'Template', model_id='ms://Qwen/Qwen2.5-0.5B-Instruct', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
     dataset.map('SelfCognitionProcessor', init_args={
@@ -66,7 +66,7 @@ def train():
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
     model = MultiLoraTransformersModel(
-        model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+        model_id='ms://Qwen/Qwen2.5-0.5B-Instruct')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(

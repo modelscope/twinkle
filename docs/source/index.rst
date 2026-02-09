@@ -34,6 +34,7 @@ Twinkle DOCUMENTATION
    组件/LRScheduler/index.rst
    组件/补丁/index.rst
    组件/组件化/index.rst
+   组件/Kernel/index.rst
    组件/训练中间件/index.rst
 
 Indices and tables

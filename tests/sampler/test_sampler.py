@@ -239,7 +239,7 @@ class TestMockSampler:
 # =============================================================================
 
 @pytest.mark.skip(reason="Requires model and GPU")
-class TestVLLMSamplerIntegration:
+class TestvLLMSamplerIntegration:
     """Integration tests for vLLMSampler."""
     
     def test_sample_with_trajectory(self):

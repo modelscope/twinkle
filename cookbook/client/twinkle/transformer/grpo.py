@@ -36,7 +36,7 @@ from twinkle_client import init_twinkle_client
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client.sampler import VLLMSampler
+from twinkle_client.sampler import vLLMSampler
 
 logger = get_logger()
 
@@ -116,7 +116,7 @@ def train():
     model.set_template('Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
-    sampler = VLLMSampler(model_id=MODEL_ID)
+    sampler = vLLMSampler(model_id=MODEL_ID)
     sampler.set_template('Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function

@@ -61,6 +61,7 @@ pip install -e . --no-build-isolation
 | --------------------------------- | ------------ | ---------------------------------------- |
 | FSDP finetuning                   | transformers | [脚本](cookbook/transformers/fsdp2.py)      |
 | FSDP MoE finetuning               | transformers | [脚本](cookbook/transformers/fsdp2_moe.py)  |
+| EP MoE finetuning                 | transformers | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
 | pp/tp/cp finetuning               | megatron     | [脚本](cookbook/megatron/tp.py)             |
 | pp/tp/cp MoE finetuning           | megatron     | [脚本](cookbook/megatron/tp_moe.py)         |
 | tinker client finetuning          | megatron     | [脚本](cookbook/client/tinker/megatron)     |

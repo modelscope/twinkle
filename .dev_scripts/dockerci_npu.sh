@@ -5,7 +5,7 @@ MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'
 is_get_file_lock=false
-CI_COMMAND=${CI_COMMAND:-bash .dev_scripts/ci_container_test.sh python tests/run.py --parallel 2 --run_config tests/run_config.yaml}
+CI_COMMAND=${CI_COMMAND:-bash .dev_scripts/ci_container_test.sh pytest tests}
 echo "ci command: $CI_COMMAND"
 PR_CHANGED_FILES="${PR_CHANGED_FILES:-}"
 echo "PR modified files: $PR_CHANGED_FILES"

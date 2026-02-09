@@ -2,13 +2,20 @@
 MODELSCOPE_CACHE_DIR_IN_CONTAINER=/modelscope_cache
 CODE_DIR=$PWD
 CODE_DIR_IN_CONTAINER=/twinkle
+mkdir -p ~/.cache
+MODELSCOPE_CACHE=~/.cache
+IMAGE_NAME=modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope
+IMAGE_VERSION=ci_image
+MODELSCOPE_HOME_CACHE=~/.cache
+CI_TEST=True
+MODELSCOPE_SDK_DEBUG=True
+CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest tests'
 MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'
 cpu_sets='0-15 16-31'
 cpu_sets_arr=($cpu_sets)
 is_get_file_lock=false
-CI_COMMAND=${CI_COMMAND:-bash .dev_scripts/ci_container_test.sh python tests/run.py --parallel 2 --run_config tests/run_config.yaml}
 echo "ci command: $CI_COMMAND"
 PR_CHANGED_FILES="${PR_CHANGED_FILES:-}"
 echo "PR modified files: $PR_CHANGED_FILES"

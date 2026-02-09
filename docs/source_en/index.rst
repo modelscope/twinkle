@@ -34,6 +34,7 @@ Twinkle DOCUMENTATION
    Components/LRScheduler/index.rst
    Components/Patch/index.rst
    Components/Plugin/index.rst
+   Components/Kernel/index.rst
    Components/Training Middleware/index.rst
 
 Indices and tables
