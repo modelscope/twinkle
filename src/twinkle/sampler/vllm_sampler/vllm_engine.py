@@ -9,7 +9,6 @@ from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
 
 import inspect
-
 logger = get_logger()
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
@@ -92,10 +91,8 @@ class VLLMEngine(BaseSamplerEngine):
         # Initialize engine
         self.engine = self._create_engine()
 
-        self.engine.collective_rpc(method="monkey_patch_model")
         # Tokenizer is lazy loaded via get_tokenizer()
         self._tokenizer = None
-        # breakpoint()
     
     def _create_engine(self):
         """Create and return the vLLM engine."""
@@ -113,10 +110,12 @@ class VLLMEngine(BaseSamplerEngine):
             "enforce_eager": self.enforce_eager,
             "dtype": self.dtype,
             "load_format": self.load_format,
-            "distributed_executor_backend": "mp",
             "disable_log_stats": True,
         }
         
+        if self.tensor_parallel_size > 1:
+            engine_config["distributed_executor_backend"] = "mp"
+
         if self.max_model_len is not None:
             engine_config["max_model_len"] = self.max_model_len
         

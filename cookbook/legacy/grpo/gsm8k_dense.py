@@ -39,29 +39,27 @@ from twinkle.metric import CompletionRewardMetric
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
-SAMPLER_TP = int(os.environ.get('SAMPLER_TP', SAMPLER_GPUS // 2))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS',4))
+SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
-PP_SIZE = 2
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 32768))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 ADAPTER_NAME = 'default'
 DATA_NUM = int(os.environ.get('DATA_NUM', 7473))  # GSM8K train split has 7473 samples
 
-# SwanLab experiment tracking
 USE_SWANLAB = bool(int(os.environ.get('USE_SWANLAB', '1')))
 if USE_SWANLAB:
     import swanlab
@@ -244,7 +242,7 @@ def main():
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=MODEL_GPUS//PP_SIZE, pp_size=PP_SIZE, ep_size=MODEL_GPUS // PP_SIZE,
+            world_size=MODEL_GPUS, dp_size=MODEL_GPUS,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
@@ -275,6 +273,8 @@ def main():
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
+            recompute_granularity='full',
+            recompute_num_layers=None,
         )
     else:
         model = TransformersModel(
@@ -317,9 +317,10 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.7,
-            'max_model_len': 8192,
+            'max_model_len': 4096,
             'max_loras': 1,
             'max_lora_rank': 32,
+            
             'enable_sleep_mode': False,
             'enable_lora': True,
             "logprobs_mode": "processed_logprobs",
@@ -350,7 +351,6 @@ def main():
         top_p=0.95,
     )
 
-    # ── Training loop ────────────────────────────────────────────────
     optim_step = 0
     logger.info(get_device_placement())
 
@@ -394,13 +394,6 @@ def main():
             all_old_logps.append(sequence.logprobs)
             all_completion_lengths.append(len(sequence.tokens))
 
-        if not all_input_data:
-            logger.warning(
-                f"Optim step {optim_step}: No valid samples, skipping"
-            )
-            continue
-
-        # ========== 3. Rewards ==========
         t2 = time.perf_counter()
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             all_input_data
@@ -420,22 +413,20 @@ def main():
             },
         )
 
-        # ========== 4. Advantages ==========
-        t3 = time.perf_counter()
         advantages = advantage_fn(
             total_rewards,
             num_generations=NUM_GENERATIONS,
             scale='group',
         )
         advantages = advantages.tolist()
-        timings['advantage'] = time.perf_counter() - t3
 
         frac_zero_std = (
             1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
         )
 
         # ========== 5. Training ==========
-        t4 = time.perf_counter()
+        t3 = time.perf_counter()
+
 
         model.forward_backward(
             inputs=all_input_data,
@@ -444,7 +435,7 @@ def main():
         )
 
         model.clip_grad_and_step()
-        timings['train'] = time.perf_counter() - t4
+        timings['train'] = time.perf_counter() - t3
 
         gc.collect()
         from twinkle import torch_util

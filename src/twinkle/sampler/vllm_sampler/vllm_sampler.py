@@ -135,9 +135,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         
         # Create engine in the background event loop so all async operations
         # (including vLLM's internal background tasks) run in the same loop
-        self.engine = self._run_in_loop(
+        self.engine: VLLMEngine = self._run_in_loop(
             self._create_engine_async(VLLMEngine, model_id, engine_kwargs)
         )
+        self._run_in_loop(self.engine.engine.collective_rpc("monkey_patch_model"))
         
         VLLMLoraWeights()(self)
 
@@ -238,6 +239,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         adapter_path: Optional[str] = None,
         request_seed: Optional[int] = None,
         *,
+        logprobs: bool = True,
         num_samples: int = 1,
     ) -> List[SampledSequence]:
         """Sample a single input asynchronously.
@@ -276,6 +278,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         response = await self.engine.sample(
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
+            logprobs=logprobs,
             num_samples=num_samples,
             adapter_path=adapter_path,
             lora_request=lora_request,
@@ -290,7 +293,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 tokens=seq.tokens,
                 logprobs=seq.logprobs,
                 decoded=self.template.decode(seq.tokens),
-                new_input_feature=self.template.concat_input_feature(feat, seq.tokens)
+                new_input_feature=self.template.concat_input_feature(feat, seq.tokens),
             )
             for seq in response.sequences
         ]
@@ -303,8 +306,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         adapter_name: str = '',
         adapter_path: Optional[str] = None,
         *,
+        logprobs: bool = True,
         num_samples: int = 1,
-        return_type: Literal['sample_response', 'trajectory', 'InputFeature'] = 'sample_response', # TODO:enum
+        return_encoded: bool = False,
     ) -> SampleResponse:
         """Sample responses for given inputs.
         
@@ -354,18 +358,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
             tasks = [
-                self._sample_single(feat, sampling_params, adapter_path, num_samples=num_samples)
+                self._sample_single(feat, sampling_params, adapter_path, logprobs=logprobs, num_samples=num_samples)
                 for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)
-        
         results = self._run_in_loop(_sample_all())
-        
         # Flatten results (each result contains num_samples sequences)
         all_sequences = []
         for seqs in results:
             all_sequences.extend(seqs)
-        
         return SampleResponse(sequences=all_sequences)
 
     @remote_function(dispatch='all', collect='first')
@@ -546,7 +547,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         # 1. Shutdown vLLM engine (stops EngineCore process and output_handler)
         try:
             if hasattr(self, 'engine') and self.engine is not None:
-                self.engine.shutdown()
+                self._run_in_loop(self.engine.shutdown())
         except Exception as e:
             logger.warning(f"vLLMSampler engine shutdown error: {e}")
 
@@ -558,3 +559,4 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 self._async_thread.join(timeout=5)
         except Exception as e:
             logger.warning(f"vLLMSampler event loop shutdown error: {e}")
+

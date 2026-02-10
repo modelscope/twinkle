@@ -132,7 +132,6 @@ def main():
             'load_format': 'dummy',
             'gpu_memory_utilization': 0.7,
             'max_model_len': 2048,
-            'enforce_eager': True,
             'enable_sleep_mode': False,
             'enable_lora': True,
         },

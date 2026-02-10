@@ -139,10 +139,11 @@ def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
     log("\n--- Starting weight sync ---")
     manager = CheckpointEngineManager(model=model, sampler=sampler)
 
-    # 1. Base model sync
+    # Base model sync
     sync_start = time.time()
     manager.sync_weights()
-    manager.sync_weights(adapter_name='default')
+    # lora
+    manager.sync_weights()
     base_time = time.time() - sync_start
     log(f"  Base weight sync completed in {base_time:.2f}s")
 

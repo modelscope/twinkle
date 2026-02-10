@@ -1,22 +1,30 @@
 """
-GSM8K GRPO training demo for Twinkle.
+DAPO-Math-17k GRPO training demo for Twinkle.
 
-This demo trains a model on Grade School Math (GSM8K) using GRPO.
-Reward = accuracy_reward (1.0 if answer correct, 0.0 otherwise)
-       + format_reward  (1.0 if output contains <think>...</think>, 0.0 otherwise)
+Uses the AI-ModelScope/DAPO-Math-17k dataset (~17k competition-level math
+problems).  All ground-truth answers in this dataset are **integers**, making
+reward verification straightforward and reliable.
 
-Expected to show reward improvement within ~30-80 steps.
+Reward = accuracy_reward only (no format reward).
+  - From the last 300 chars of model output, extracts:
+    1) ``Answer: <number>``  (the prompt asks for this format)
+    2) ``\\boxed{<number>}`` (fallback)
+  - Normalizes both prediction and ground truth to integers.
+  - Returns 1.0 for correct, 0.0 for incorrect.
 
-Reference configs:
-  - Verl: run_qwen2_5-3b_gsm8k_grpo_lora.sh (lr=3e-6, n=5, max_resp=1024)
-  - TRL:  accuracy_reward (math_verify based)
-  - Swift: countdown demo (lr=1e-5, n=8, gas=8)
+Designed for strong instruct models (e.g. Qwen3-30B-A3B-Instruct) that do
+NOT use <think> tags.  The dataset prompt already contains step-by-step
+instructions, so no additional system prompt is needed.
+
+Reference reward implementations:
+  - verl:  verl/utils/reward_score/math_dapo.py  (compute_score)
+  - slime: slime/rollout/rm_hub/math_dapo_utils.py (compute_score)
 """
 import gc
 import os
 import re
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 from peft import LoraConfig
 
@@ -24,8 +32,8 @@ import twinkle
 from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.data_format import SamplingParams
-from twinkle.data_format import Trajectory, Message
+from twinkle.data_format import SamplingParams, SampleResponse
+from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -47,9 +55,8 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 SAMPLER_TP = int(os.environ.get('SAMPLER_TP', SAMPLER_GPUS // 2))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
-PP_SIZE = 2
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 32768))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
@@ -59,15 +66,16 @@ GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
 ADAPTER_NAME = 'default'
-DATA_NUM = int(os.environ.get('DATA_NUM', 7473))  # GSM8K train split has 7473 samples
+DATA_NUM = int(os.environ.get('DATA_NUM', 17000))  # DAPO-Math-17k has ~17k samples
 
 # SwanLab experiment tracking
 USE_SWANLAB = bool(int(os.environ.get('USE_SWANLAB', '1')))
 if USE_SWANLAB:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-    swanlab.init(project="twinkle-gsm8k", config={
+    swanlab.init(project="twinkle-math", config={
         'model_id': MODEL_ID,
+        'dataset': 'DAPO-Math-17k',
         'num_gpus': NUM_GPUS,
         'model_gpus': MODEL_GPUS,
         'sampler_gpus': SAMPLER_GPUS,
@@ -81,61 +89,189 @@ if USE_SWANLAB:
     })
 
 
-SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the problem step by step. "
-    "Show your reasoning in <think> </think> tags, then give the final "
-    "numerical answer after ####.\n"
-    "For example:\n<think> ... reasoning ... </think>\n#### 42"
-)
+# ========== DAPO Math Reward (adapted from verl/slime math_dapo) ==========
+# All answers in DAPO-Math-17k are integers, so verification is simpler
+# than general MATH problems.
+
+# --- Normalization constants (from verl/slime math_dapo_utils) ---
+_SUBSTITUTIONS = [
+    ("an ", ""), ("a ", ""), (".$", "$"), ("\\$", ""), (r"\ ", ""),
+    (" ", ""), ("mbox", "text"), (",\\text{and}", ","),
+    ("\\text{and}", ","), ("\\text{m}", "\\text{}"),
+]
+_REMOVED_EXPRESSIONS = [
+    "square", "ways", "integers", "dollars", "mph", "inches", "hours",
+    "km", "units", "\\ldots", "sue", "points", "feet", "minutes",
+    "digits", "cents", "degrees", "cm", "gm", "pounds", "meters",
+    "meals", "edges", "students", "childrentickets", "multiples",
+    "\\text{s}", "\\text{.}", "\\text{\ns}", "\\text{}^2",
+    "\\text{}^3", "\\text{\n}", "\\text{}", r"\mathrm{th}",
+    r"^\circ", r"^{\circ}", r"\;", r",\!", "{,}", '"', "\\dots",
+    "<|im_end|>", "<|endoftext|>",
+]
 
 
-class GSM8KProcessor(Preprocessor):
-    """Preprocessor for GSM8K dataset.
+def _normalize_final_answer(answer: str) -> str:
+    """Normalize a math answer string for comparison.
 
-    GSM8K fields: question (str), answer (str ending with '#### <number>')
-    Extracts the ground truth number and stores it in user_data for reward.
+    Adapted from verl/slime math_dapo_utils.normalize_final_answer.
+    """
+    answer = str(answer)
+    answer = answer.split("=")[-1]
+    for before, after in _SUBSTITUTIONS:
+        answer = answer.replace(before, after)
+    for expr in _REMOVED_EXPRESSIONS:
+        answer = answer.replace(expr, "")
+    # Strip LaTeX wrappers
+    answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", answer)
+    answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", answer)
+    answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", answer)
+    answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", answer)
+    answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", answer)
+    answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", answer)
+    answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", answer)
+    answer = answer.replace("$", "")
+    if answer.replace(",", "").isdigit():
+        answer = answer.replace(",", "")
+    return answer.strip()
+
+
+def _last_boxed_only_string(string: str) -> Optional[str]:
+    """Extract the last \\boxed{...} from a string."""
+    idx = string.rfind("\\boxed{")
+    if idx < 0:
+        return None
+    i = idx
+    right_brace_idx = None
+    num_left_braces_open = 0
+    while i < len(string):
+        if string[i] == "{":
+            num_left_braces_open += 1
+        if string[i] == "}":
+            num_left_braces_open -= 1
+            if num_left_braces_open == 0:
+                right_brace_idx = i
+                break
+        i += 1
+    return string[idx: right_brace_idx + 1] if right_brace_idx is not None else None
+
+
+def _remove_boxed(s: str) -> str:
+    """Remove \\boxed{} wrapper."""
+    left = "\\boxed{"
+    if not (s.startswith(left) and s.endswith("}")):
+        return s
+    return s[len(left): -1]
+
+
+def _extract_answer_minerva(
+    solution: str,
+    pattern: str = r"(?i)Answer\s*:\s*([^\n]+)",
+) -> Optional[str]:
+    """Extract answer via 'Answer: ...' pattern (Minerva-style).
+
+    This is the primary extraction method since the DAPO prompt asks:
+    "The last line of your response should be of the form Answer: $Answer"
+    """
+    matches = re.findall(pattern, solution)
+    if matches:
+        return _normalize_final_answer(matches[-1])
+    return None
+
+
+def _extract_answer_boxed(solution: str) -> Optional[str]:
+    """Extract answer from \\boxed{} (fallback)."""
+    boxed = _last_boxed_only_string(solution)
+    if boxed is not None:
+        try:
+            return _remove_boxed(boxed)
+        except Exception:
+            pass
+    return None
+
+
+def compute_dapo_score(completion: str, ground_truth: str) -> Dict[str, Any]:
+    """Compute DAPO-Math reward score for a single sample.
+
+    Adapted from verl/utils/reward_score/math_dapo.py compute_score.
+    All DAPO-Math-17k answers are integers, so we normalize to int for
+    comparison.
+
+    Returns dict with 'score' (1.0 or 0.0), 'acc' (bool), 'pred' (str).
+    """
+    # Only look at the tail for efficiency
+    tail = completion[-300:] if len(completion) > 300 else completion
+
+    # Normalize ground truth to integer string
+    try:
+        gt_normalized = str(int(float(ground_truth)))
+    except (ValueError, OverflowError):
+        gt_normalized = _normalize_final_answer(ground_truth)
+
+    # Try "Answer: ..." extraction first (matches the prompt format)
+    pred = _extract_answer_minerva(tail)
+    if pred is not None:
+        pred_normalized = _normalize_final_answer(pred)
+        try:
+            pred_int = str(int(float(pred_normalized)))
+            correct = (pred_int == gt_normalized)
+        except (ValueError, OverflowError):
+            correct = (pred_normalized == gt_normalized)
+        return {"score": 1.0 if correct else 0.0, "acc": correct, "pred": pred}
+
+    # Fallback: try \boxed{}
+    pred = _extract_answer_boxed(tail)
+    if pred is not None:
+        pred_normalized = _normalize_final_answer(pred)
+        try:
+            pred_int = str(int(float(pred_normalized)))
+            correct = (pred_int == gt_normalized)
+        except (ValueError, OverflowError):
+            correct = (pred_normalized == gt_normalized)
+        return {"score": 1.0 if correct else 0.0, "acc": correct, "pred": pred}
+
+    return {"score": 0.0, "acc": False, "pred": None}
+
+
+# ========== Preprocessor ==========
+class DAPOMathProcessor(Preprocessor):
+    """Preprocessor for DAPO-Math-17k dataset.
+
+    Dataset fields:
+      - data_source: "math_dapo"
+      - prompt: list of messages [{"role": "user", "content": "..."}]
+      - reward_model: {"ground_truth": "<integer>", "style": "..."}
+      - ability: "MATH"
+      - extra_info: {"index": "..."}
+
+    The prompt already contains instructions ("Solve ... step by step.
+    The last line of your response should be of the form Answer: $Answer"),
+    so no additional system prompt is needed.
     """
 
-    @staticmethod
-    def extract_ground_truth(answer_str: str) -> str:
-        """Extract the number after '####' from GSM8K answer."""
-        match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
-        if match:
-            return match.group(1).replace(',', '').strip()
-        return ''
-
     def __call__(self, row) -> Trajectory:
-        question = row['question']
-        answer = row.get('answer', '')
-        ground_truth = self.extract_ground_truth(answer)
+        # prompt is already a list of message dicts
+        prompt_messages = row['prompt']
+        ground_truth = row['reward_model']['ground_truth']
 
         messages = [
-            Message(role='system', content=SYSTEM_PROMPT),
-            Message(role='user', content=question),
+            Message(role=msg['role'], content=msg['content'])
+            for msg in prompt_messages
         ]
         return Trajectory(
             messages=messages,
-            user_data=[('ground_truth', ground_truth)],
+            user_data=[('ground_truth', str(ground_truth))],
         )
 
 
-# ========== GSM8K Reward Functions ==========
-class GSM8KAccuracyReward(Reward):
-    """Accuracy reward for GSM8K: checks if the model's answer matches ground truth.
+# ========== Reward Functions ==========
+class DAPOMathAccuracyReward(Reward):
+    """Accuracy reward for DAPO-Math-17k.
 
-    Extracts the last '#### <number>' from model output and compares with ground truth.
+    Extracts the answer from model output and compares with ground truth.
+    Uses the same verification logic as verl/slime math_dapo.
     Returns 1.0 for correct, 0.0 for incorrect.
     """
-
-    @staticmethod
-    def extract_answer(completion: str) -> str:
-        """Extract the last #### answer from model completion."""
-        # Only check last 500 chars for efficiency
-        text = completion[-500:] if len(completion) > 500 else completion
-        matches = re.findall(r'####\s*([\-\d,\.\s]+)', text)
-        if matches:
-            return matches[-1].replace(',', '').replace(' ', '').strip()
-        return ''
 
     def __call__(
         self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
@@ -143,14 +279,12 @@ class GSM8KAccuracyReward(Reward):
         rewards = []
         for trajectory in trajectories:
             messages = trajectory.get('messages', [])
-            # Get model completion (last assistant message)
             completion = ''
             for msg in reversed(messages):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
 
-            # Get ground truth from user_data
             gt = ''
             user_data = trajectory.get('user_data', [])
             if isinstance(user_data, list):
@@ -160,70 +294,42 @@ class GSM8KAccuracyReward(Reward):
                             gt = str(item[1])
                             break
 
-            predicted = self.extract_answer(completion)
-
-            # Numeric comparison
-            correct = False
-            if predicted and gt:
-                try:
-                    correct = abs(float(predicted) - float(gt)) < 1e-5
-                except (ValueError, OverflowError):
-                    correct = predicted == gt
-
-            rewards.append(1.0 if correct else 0.0)
+            if completion and gt:
+                result = compute_dapo_score(completion, gt)
+                rewards.append(result['score'])
+            else:
+                rewards.append(0.0)
         return rewards
 
 
-class GSM8KFormatReward(Reward):
-    """Format reward: checks if output contains <think>...</think> tag.
+def create_dapo_math_dataset():
+    """Create DAPO-Math-17k dataset.
 
-    Returns 1.0 if format is correct, 0.0 otherwise.
+    Downloads from ModelScope: AI-ModelScope/DAPO-Math-17k
     """
-
-    def __call__(
-        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
-    ) -> List[float]:
-        rewards = []
-        for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
-            has_think = bool(
-                re.search(r'<think>.*?</think>', completion, re.DOTALL)
-            )
-            has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
-            rewards.append(1.0 if (has_think and has_answer) else 0.0)
-        return rewards
-
-
-def create_gsm8k_dataset():
-    """Create GSM8K dataset."""
     meta = DatasetMeta(
-        "ms://modelscope/gsm8k",
-        subset_name='main', split='train',
+        "ms://AI-ModelScope/DAPO-Math-17k",
+        split='train',
         data_slice=range(DATA_NUM),
     )
     dataset = Dataset(meta)
     dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
-    dataset.map(GSM8KProcessor())
+    dataset.map(DAPOMathProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
 
 
 def compute_rewards(
     trajectories: List[Trajectory],
-) -> Tuple[List[float], List[float], List[float]]:
-    """Compute accuracy and format rewards for GSM8K."""
-    accuracy_reward_fn = GSM8KAccuracyReward()
-    format_reward_fn = GSM8KFormatReward()
+) -> Tuple[List[float], List[float]]:
+    """Compute accuracy rewards for DAPO-Math.
 
+    Returns (total_rewards, accuracy_rewards).
+    No format reward — instruct model does not need thinking tags.
+    """
+    accuracy_reward_fn = DAPOMathAccuracyReward()
     accuracy_rewards = accuracy_reward_fn(trajectories, [])
-    format_rewards = format_reward_fn(trajectories, [])
-    total_rewards = [a + f for a, f in zip(accuracy_rewards, format_rewards)]
-    return total_rewards, format_rewards, accuracy_rewards
+    return accuracy_rewards, accuracy_rewards
 
 
 # ========== Main ==========
@@ -243,8 +349,10 @@ def main():
         ),
     ]
     if USE_MEGATRON:
+        PP_SIZE = 2
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=MODEL_GPUS//PP_SIZE, pp_size=PP_SIZE, ep_size=MODEL_GPUS // PP_SIZE,
+            dp_size=MODEL_GPUS // PP_SIZE, pp_size=PP_SIZE,
+            ep_size=MODEL_GPUS // PP_SIZE,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
@@ -252,7 +360,8 @@ def main():
         )
     assert SAMPLER_GPUS % SAMPLER_TP == 0
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // SAMPLER_TP, tp_size=SAMPLER_TP
+        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // SAMPLER_TP,
+        tp_size=SAMPLER_TP,
     )
     twinkle.initialize(
         mode='ray',
@@ -262,12 +371,13 @@ def main():
     )
 
     lora_config = LoraConfig(
-        target_modules="all-linear",
+        target_modules='all-linear',
         r=8,
         lora_alpha=32,
         lora_dropout=0.05,
     )
 
+    # ── Model ─────────────────────────────────────────────────────────
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
         model = MegatronModel(
@@ -275,6 +385,8 @@ def main():
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
+            recompute_granularity='full',
+            recompute_num_layers=None,
         )
     else:
         model = TransformersModel(
@@ -312,7 +424,7 @@ def main():
     model.set_processor(InputProcessor)
     model.set_template('Template', model_id=MODEL_ID)
 
-    # ── Sampler (load real weights for meaningful generation) ─────────
+    # ── Sampler ───────────────────────────────────────────────────────
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
@@ -334,7 +446,7 @@ def main():
     # Global batch = prompts for one full gradient accumulation cycle
     GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     dataloader = DataLoader(
-        dataset=create_gsm8k_dataset,
+        dataset=create_dapo_math_dataset,
         batch_size=GLOBAL_BATCH_SIZE,
         min_batch_size=GLOBAL_BATCH_SIZE,
         device_mesh=model_mesh,
@@ -350,7 +462,7 @@ def main():
         top_p=0.95,
     )
 
-    # ── Training loop ────────────────────────────────────────────────
+    # ── Training loop ─────────────────────────────────────────────────
     optim_step = 0
     logger.info(get_device_placement())
 
@@ -402,9 +514,7 @@ def main():
 
         # ========== 3. Rewards ==========
         t2 = time.perf_counter()
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
-            all_input_data
-        )
+        total_rewards, accuracy_rewards = compute_rewards(all_input_data)
         timings['reward'] = time.perf_counter() - t2
 
         metrics.accumulate(
@@ -415,7 +525,6 @@ def main():
             completion_lengths=all_completion_lengths,
             rewards={
                 'total': total_rewards,
-                'format': format_rewards,
                 'accuracy': accuracy_rewards,
             },
         )
@@ -466,7 +575,7 @@ def main():
         logger.info(f"[Step {optim_step}/{MAX_STEPS}] {log_dict}")
 
     logger.info(f"Training completed. optim_steps={optim_step}")
-    model.save('grpo-gsm8k-checkpoint')
+    model.save('grpo-math-checkpoint')
 
 
 if __name__ == '__main__':

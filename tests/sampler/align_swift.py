@@ -45,6 +45,15 @@ MLLM_IMAGES = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.p
 VLLM_MAX_MODEL_LEN = 8192
 VLLM_GPU_MEM = 0.9
 
+SYSTEM_PROMPT = """You are a helpful math assistant. Solve the problem step by step. Show your reasoning in <think> </think> tags, then give the final numerical answer after ####.
+For example:
+<think> ... reasoning ... </think>
+#### 42"""
+GSM8K_MESSAGES1 = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': 'James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?'}]
+GSM8K_MESSAGES2 = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': 'Mark has a garden with flowers. He planted plants of three different colors in it. Ten of them are yellow, and there are 80% more of those in purple. There are only 25\% \as many green flowers as there are yellow and purple flowers. How many flowers does Mark have in his garden?'}]
+GSM8K_MESSAGES3 = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': 'A car is driving through a tunnel with many turns. After a while, the car must travel through a ring that requires a total of 4 right-hand turns. After the 1st turn, it travels 5 meters. After the 2nd turn, it travels 8 meters. After the 3rd turn, it travels a little further and at the 4th turn, it immediately exits the tunnel. If the car has driven a total of 23 meters around the ring, how far did it have to travel after the 3rd turn?'}]
+GSM8K_MESSAGES4 = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': 'Hans booked a room in a hotel. The hotel has 10 floors with 10 identical rooms on each floor. Because of an accident, the last floor is unavailable for the guests. Considering there are no other guests, in how many different rooms could Hans be checked in?'}]
+
 # Optional: restrict GPUs for local tests (e.g. '6,7'). Ray test uses 6 GPUs by default.
 if 'CUDA_VISIBLE_DEVICES' not in os.environ or not os.environ['CUDA_VISIBLE_DEVICES']:
     pass  # use default
