@@ -5,6 +5,10 @@ from typing import Dict, List
 
 from twinkle import DeviceGroup
 from twinkle import Platform
+from twinkle.utils import get_logger
+
+logger = get_logger()
+
 
 class ResourceManager:
 
@@ -55,8 +59,16 @@ class ResourceManager:
 
         assert len(set(all_ranks)) == len(all_ranks) # no duplication
         if device_type != 'CPU':
-            self.nnodes = math.ceil(len(all_ranks) / nproc_per_node)
+            # Calculate required nodes based on actual node indices spanned by all_ranks
+            if all_ranks:
+                node_indices = [rank // nproc_per_node for rank in all_ranks]
+                self.min_node_idx = min(node_indices)
+                self.nnodes = max(node_indices) - self.min_node_idx + 1
+            else:
+                self.min_node_idx = 0
+                self.nnodes = 0
         else:
+            self.min_node_idx = 0
             self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
         self.nodes = []
@@ -82,7 +94,6 @@ class ResourceManager:
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
-        cpu_nnodes = 0
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
             assert cpu_nnodes <= len(self.nodes), (
@@ -124,8 +135,16 @@ class ResourceManager:
             self.node_ranks = list(range(len(self.placement_groups)))
 
         self.node2pg: Dict[int, PlacementGroup] = {}
-        for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
-            self.node2pg[node_rank] = placement_group
+        # Map actual node indices to placement groups
+        # For GPU/NPU groups, node indices start from self.min_node_idx
+        if device_type != 'CPU' and all_ranks:
+            for i, placement_group in enumerate(self.placement_groups):
+                actual_node_idx = self.min_node_idx + i
+                self.node2pg[actual_node_idx] = placement_group
+        else:
+            # For CPU-only or when using default node_ranks
+            for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
+                self.node2pg[node_rank] = placement_group
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
@@ -199,6 +218,9 @@ class ResourceManager:
                 self.device_groups[group.name] = local_device_groups
 
         self.group_configs = groups
+        logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
+        logger.info(f"node_ranks: {self.node_ranks}")
+        logger.info(f"node2pg keys: {list(self.node2pg.keys())}")
 
     def get_config(self, group: str):
         for config in self.group_configs:
