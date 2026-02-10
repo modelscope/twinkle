@@ -95,8 +95,8 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
                              epsilon=0.2,  # Default GRPO epsilon
                              beta=0.0)     # No KL penalty by default
         else:
-            raise ValueError(
-                f'Unsupported loss function {loss_fn}')
+            super().set_loss('CrossEntropyLoss',
+                             adapter_name=adapter_name)
         # Get template for input processing
         template = self.get_template(adapter_name)
         

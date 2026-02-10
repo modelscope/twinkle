@@ -33,12 +33,13 @@ applications:
 
   # 2. Model Service - Hosts the base model for training (Megatron backend)
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct   # REST path for this model
+  - name: models-Qwen2.5-3B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
     import_path: model
     args:
       use_megatron: true                               # Use Megatron-LM backend (not HuggingFace)
-      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"     # ModelScope model identifier to load
+      mixed_precision: bf16
+      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
         name: model
@@ -48,6 +49,9 @@ applications:
         device_type: cuda
         mesh: [0,1]                   # Device indices in the mesh
         mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
+      adapter_config:
+        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
+        adapter_timeout: 1800                      # Seconds before idle adapter unload
     deployments:
       - name: ModelManagement
         autoscaling_config:

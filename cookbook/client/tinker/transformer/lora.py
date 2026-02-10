@@ -36,7 +36,7 @@ response = future.result()
 #   2. A model id on hub: "<user>/<model_id>"
 # Example:
 # resume_path = "twinkle://20260131_170251-Qwen_Qwen2_5-0_5B-Instruct-7275126c/weights/pig-latin-lora-epoch-1"
-# resume_path = "AlexEz/20260205_163645-Qwen_Qwen2_5-0.5B-Instruct-385d5c17_pig-latin-lora-epoch-1"
+# resume_path = "AlexEz/20260205_163645-Qwen_Qwen2_5-3B-Instruct-385d5c17_pig-latin-lora-epoch-1"
 resume_path = ""
 
 print(f"Found {len(response.training_runs)} training runs")
@@ -51,7 +51,7 @@ for tr in response.training_runs:
     
 # Step 5: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen2.5-3B-Instruct"
 if not resume_path:
     training_client = service_client.create_lora_training_client(
         base_model=base_model

@@ -34,9 +34,10 @@ class TestPluginLoad:
     
     def test_load_plugin_safe_mode(self):
         """Test loading plugin when trust_remote_code is False."""
-        with patch('twinkle.utils.loader.trust_remote_code', return_value=False):
-            with pytest.raises(ValueError, match="Twinkle does not support plugin in safe mode"):
-                Plugin.load_plugin("ms://test/plugin", BasePlugin)
+        with patch('twinkle.utils.loader.MSHub.download_model', return_value="/tmp/fake"):
+            with patch('twinkle.utils.loader.trust_remote_code', return_value=False):
+                with pytest.raises(ValueError, match="Twinkle does not support plugin in safe mode"):
+                    Plugin.load_plugin("ms://test/plugin", BasePlugin)
     
     def test_load_plugin_missing_init_file(self):
         """Test loading plugin when __init__.py is missing."""
@@ -84,7 +85,7 @@ class TestPluginLoad:
             mock_module = MagicMock()
             mock_module.__file__ = str(init_file)
             test_plugin_class = type('TestPlugin', (BasePlugin,), {})
-            test_plugin_class.__module__ = str(init_file)
+            test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
             
             with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):
@@ -110,7 +111,7 @@ class TestPluginLoad:
             mock_module = MagicMock()
             mock_module.__file__ = str(init_file)
             test_plugin_class = type('TestPlugin', (BasePlugin,), {})
-            test_plugin_class.__module__ = str(init_file)
+            test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
             
             with patch('twinkle.utils.loader.HFHub.download_model', return_value=tmpdir):
@@ -136,7 +137,7 @@ class TestPluginLoad:
             mock_module = MagicMock()
             mock_module.__file__ = str(init_file)
             test_plugin_class = type('TestPlugin', (BasePlugin,), {})
-            test_plugin_class.__module__ = str(init_file)
+            test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
             
             assert tmpdir not in sys.path
@@ -189,7 +190,7 @@ class TestConstructClass:
             mock_module = MagicMock()
             mock_module.__file__ = str(init_file)
             test_plugin_class = type('TestPlugin', (BasePlugin,), {})
-            test_plugin_class.__module__ = str(init_file)
+            test_plugin_class.__module__ = '__init__'
             mock_module.TestPlugin = test_plugin_class
             
             with patch('twinkle.utils.loader.MSHub.download_model', return_value=tmpdir):

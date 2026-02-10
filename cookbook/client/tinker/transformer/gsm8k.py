@@ -1,12 +1,12 @@
-# Tinker-Compatible Client - GRPO (Group Relative Policy Optimization) Training Example
+# Tinker-Compatible Client - GSM8K GRPO Training Example
 #
-# This script demonstrates GRPO reinforcement learning training using the
+# This script demonstrates GSM8K math problem training using the
 # Tinker-compatible client API with save_weights_for_sampler for weight sync.
 # Instead of calling sync_weights directly, it periodically saves weights and
 # creates a sampling client for generation.
 #
 # Flow:
-#   1. Prepare Countdown dataset (client-side)
+#   1. Prepare GSM8K dataset (client-side)
 #   2. Initialize Tinker-compatible training & sampling clients
 #   3. Training loop:
 #      a. Every SYNC_INTERVAL steps: save_weights_for_sampler → sampling_client
@@ -19,6 +19,7 @@
 # Requires both model and sampler services to be configured.
 
 import gc
+import re
 import numpy as np
 from typing import List, Tuple
 
@@ -27,6 +28,9 @@ from twinkle_client import init_tinker_compat_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.dataloader import DataLoader
+from twinkle.preprocessor import Preprocessor
+from twinkle.reward.base import Reward
+from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from modelscope import AutoTokenizer
@@ -36,46 +40,165 @@ logger = get_logger()
 # ========== Configuration ==========
 BASE_MODEL = 'Qwen/Qwen2.5-3B-Instruct'
 NUM_GENERATIONS = 4
-MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = 2048
 LEARNING_RATE = 1e-5
 MAX_STEPS = 100
 BATCH_SIZE = 2
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 2       # Save weights for sampler every N steps
+SYNC_INTERVAL = 1       # Save weights for sampler every N steps
 LORA_RANK = 8
+DATA_NUM = 1000         # Number of GSM8K samples to use
+
+SYSTEM_PROMPT = (
+    "You are a helpful math assistant. Solve the problem step by step. "
+    "Show your reasoning in <think> </think> tags, then give the final "
+    "numerical answer after ####.\n"
+    "For example:\n<think> ... reasoning ... </think>\n#### 42"
+)
 
 
-def create_countdown_dataset():
-    """Create Countdown Game dataset for GRPO training."""
-    logger.info("Loading Countdown dataset...")
-    
-    dataset = Dataset(DatasetMeta(
-        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(500)))
-    dataset.set_template(
-        "Template", model_id=f'ms://{BASE_MODEL}', max_length=8192)
-    dataset.map('CountdownProcessor')
+class GSM8KProcessor(Preprocessor):
+    """Preprocessor for GSM8K dataset.
+
+    GSM8K fields: question (str), answer (str ending with '#### <number>')
+    Extracts the ground truth number and stores it in user_data for reward.
+    """
+
+    @staticmethod
+    def extract_ground_truth(answer_str: str) -> str:
+        """Extract the number after '####' from GSM8K answer."""
+        match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
+        if match:
+            return match.group(1).replace(',', '').strip()
+        return ''
+
+    def __call__(self, row) -> Trajectory:
+        question = row['question']
+        answer = row.get('answer', '')
+        ground_truth = self.extract_ground_truth(answer)
+
+        messages = [
+            Message(role='system', content=SYSTEM_PROMPT),
+            Message(role='user', content=question),
+        ]
+        return Trajectory(
+            messages=messages,
+            user_data=[('ground_truth', ground_truth)],
+        )
+
+
+# ========== GSM8K Reward Functions ==========
+class GSM8KAccuracyReward(Reward):
+    """Accuracy reward for GSM8K: checks if the model's answer matches ground truth.
+
+    Extracts the last '#### <number>' from model output and compares with ground truth.
+    Returns 1.0 for correct, 0.0 for incorrect.
+    """
+
+    @staticmethod
+    def extract_answer(completion: str) -> str:
+        """Extract the last #### answer from model completion."""
+        # Only check last 500 chars for efficiency
+        text = completion[-500:] if len(completion) > 500 else completion
+        matches = re.findall(r'####\s*([\-\d,\.\s]+)', text)
+        if matches:
+            return matches[-1].replace(',', '').replace(' ', '').strip()
+        return ''
+
+    def __call__(
+        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
+    ) -> List[float]:
+        rewards = []
+        for trajectory in trajectories:
+            messages = trajectory.get('messages', [])
+            # Get model completion (last assistant message)
+            completion = ''
+            for msg in reversed(messages):
+                if msg.get('role') == 'assistant':
+                    completion = msg.get('content', '')
+                    break
+
+            # Get ground truth from user_data
+            gt = ''
+            user_data = trajectory.get('user_data', [])
+            if isinstance(user_data, list):
+                for item in user_data:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        if item[0] == 'ground_truth':
+                            gt = str(item[1])
+                            break
+
+            predicted = self.extract_answer(completion)
+
+            # Numeric comparison
+            correct = False
+            if predicted and gt:
+                try:
+                    correct = abs(float(predicted) - float(gt)) < 1e-5
+                except (ValueError, OverflowError):
+                    correct = predicted == gt
+
+            rewards.append(1.0 if correct else 0.0)
+        return rewards
+
+
+class GSM8KFormatReward(Reward):
+    """Format reward: checks if output contains <think>...</think> tag.
+
+    Returns 1.0 if format is correct, 0.0 otherwise.
+    """
+
+    def __call__(
+        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
+    ) -> List[float]:
+        rewards = []
+        for trajectory in trajectories:
+            messages = trajectory.get('messages', [])
+            completion = ''
+            for msg in reversed(messages):
+                if msg.get('role') == 'assistant':
+                    completion = msg.get('content', '')
+                    break
+            has_think = bool(
+                re.search(r'<think>.*?</think>', completion, re.DOTALL)
+            )
+            has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
+            rewards.append(1.0 if (has_think and has_answer) else 0.0)
+        return rewards
+
+
+def create_gsm8k_dataset():
+    """Create GSM8K dataset."""
+    meta = DatasetMeta(
+        "ms://modelscope/gsm8k",
+        subset_name='main', split='train',
+        data_slice=range(DATA_NUM),
+    )
+    dataset = Dataset(meta)
+    dataset.set_template("Template", model_id=f'ms://{BASE_MODEL}', max_length=2048)
+    dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
-    
-    logger.info(f"Dataset loaded with {len(dataset)} samples")
     return dataset
 
 
 def compute_rewards(
-    trajectories: List[dict],
+    trajectories: List[Trajectory],
 ) -> Tuple[List[float], List[float], List[float]]:
-    """Compute format and accuracy rewards for Countdown game."""
-    from twinkle.reward import CountDownAccuracy, FormatReward
-    format_rewards = FormatReward()(trajectories, [])
-    accuracy_rewards = CountDownAccuracy()(trajectories, [])
-    total_rewards = [a + b for a, b in zip(accuracy_rewards, format_rewards)]
+    """Compute accuracy and format rewards for GSM8K."""
+    accuracy_reward_fn = GSM8KAccuracyReward()
+    format_reward_fn = GSM8KFormatReward()
+
+    accuracy_rewards = accuracy_reward_fn(trajectories, [])
+    format_rewards = format_reward_fn(trajectories, [])
+    total_rewards = [a + f for a, f in zip(accuracy_rewards, format_rewards)]
     return total_rewards, format_rewards, accuracy_rewards
 
 
 def main():
-    logger.info("Starting GRPO training...")
+    logger.info("Starting GSM8K GRPO training...")
     
     # Step 1: Prepare dataset and dataloader (client-side)
-    dataset = create_countdown_dataset()
+    dataset = create_gsm8k_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
     tokenizer = AutoTokenizer.from_pretrained(
         BASE_MODEL, trust_remote_code=True)
@@ -123,7 +246,7 @@ def main():
 
             sampling_client = (
                 training_client.save_weights_and_get_sampling_client(
-                    name=f'grpo-step-{step}'))
+                    name=f'gsm8k-step-{step}'))
             logger.info(f"Step {step}: Sampling client ready")
 
         if sampling_client is None:
@@ -134,6 +257,7 @@ def main():
         # ========== 2. Sample completions ==========
         # Convert input features to token prompts for the sampling client
         all_sequences = []
+        all_user_data = []
         for prompt_feature in prompts:
             input_ids = prompt_feature['input_ids']
             if hasattr(input_ids, 'tolist'):
@@ -145,6 +269,9 @@ def main():
                 num_samples=NUM_GENERATIONS,
             )
             result = future.result()
+            # Store both sequences and user data
+            for _ in range(NUM_GENERATIONS):
+                all_user_data.append(prompt_feature.get('user_data', []))
             all_sequences.extend(result.sequences)
 
         if not all_sequences:
@@ -157,10 +284,16 @@ def main():
         old_logps_list = []
         completion_lengths = []
 
-        for seq in all_sequences:
+        for idx, seq in enumerate(all_sequences):
             decoded_text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
+            # Use the corresponding user data for this sequence
             trajectories.append({
-                'messages': [{'role': 'assistant', 'content': decoded_text}]
+                'messages': [
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user', 'content': 'Math problem'},  # Placeholder
+                    {'role': 'assistant', 'content': decoded_text}
+                ],
+                'user_data': all_user_data[idx]
             })
             old_logps_list.append(
                 [lp for lp in seq.logprobs] if seq.logprobs else [])
@@ -283,7 +416,7 @@ def main():
         step += 1
 
     # Save final checkpoint
-    save_future = training_client.save_state("grpo-countdown-final")
+    save_future = training_client.save_state("gsm8k-grpo-final")
     save_result = save_future.result()
     logger.info(f"Saved final checkpoint to {save_result.path}")
 

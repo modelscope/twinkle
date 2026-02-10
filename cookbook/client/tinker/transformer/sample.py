@@ -9,7 +9,7 @@ from twinkle_client import init_tinker_compat_client
 from modelscope import AutoTokenizer
 
 # Step 1: Define the base model and connect to the server
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen2.5-3B-Instruct"
 service_client = init_tinker_compat_client(base_url='http://localhost:8000', api_key="tml-EMPTY_TOKEN")
 
 # Step 2: Create a sampling client by loading weights from a saved checkpoint.

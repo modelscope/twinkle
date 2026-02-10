@@ -20,6 +20,8 @@ from twinkle_client import init_twinkle_client
 
 logger = get_logger()
 
+# Whether to use Megatron for training
+use_megatron = True
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
@@ -50,7 +52,7 @@ def train():
 
     # Apply a chat template so the data matches the model's expected input format
     dataset.set_template(
-        'Template', model_id='ms://Qwen/Qwen2.5-0.5B-Instruct', max_length=512)
+        'Template', model_id='ms://Qwen/Qwen2.5-3B-Instruct', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
     dataset.map('SelfCognitionProcessor', init_args={
@@ -66,7 +68,7 @@ def train():
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
     model = MultiLoraTransformersModel(
-        model_id='ms://Qwen/Qwen2.5-0.5B-Instruct')
+        model_id='ms://Qwen/Qwen2.5-3B-Instruct')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(
@@ -88,11 +90,12 @@ def train():
     # Use cross-entropy loss for language modeling
     model.set_loss('CrossEntropyLoss')
 
-    # Use AdamW optimizer with a learning rate of 1e-4
-    model.set_optimizer('AdamW', lr=1e-4)
+    # Use Adam optimizer with a learning rate of 1e-4 (Only support Adam optimizer if server use megatron)
+    model.set_optimizer('Adam', lr=1e-4)
 
-    # Use a linear learning rate scheduler (linearly decays the LR)
-    model.set_lr_scheduler('LinearLR')
+    # Use a linear learning rate scheduler (Do not support LR scheduler if server use megatron)
+    if not use_megatron:
+        model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
     if resume_path:

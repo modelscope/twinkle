@@ -6,14 +6,16 @@ from tinker import types
 from twinkle.template import Template
 from twinkle import remote_class, remote_function
 from twinkle.utils import exists, requires
-from .datum import datum_to_input_feature
+from .datum import datum_to_input_feature, extract_rl_feature
 from .io_utils import create_checkpoint_manager
 
 
 if TYPE_CHECKING:
     from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
 elif exists('megatron_core'):
-    from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
+    # Use module-level import to trigger LazyModule's __getattr__ correctly
+    import twinkle.model.megatron as megatron_module
+    _MegatronBase = megatron_module.MultiLoraMegatronModel
 else:
     class _MegatronBase:
         def __init__(self, *args, **kwargs):
@@ -75,21 +77,28 @@ class TwinkleCompatMegatronModel(_MegatronBase):
     """
 
     @remote_function(dispatch='slice_dp', collect=_collect_forward_backward_results, sync=True)
-    def forward_backward(self, *, inputs: List[types.Datum], **kwargs):
+    def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass.
         
         Returns:
             Tuple of (outputs, loss) where outputs is a list of dicts with
             'logprobs' and 'elementwise_loss', and loss is a scalar.
         """
+        if loss_fn == 'importance_sampling':
+            super().set_loss('GRPOLoss',
+                             adapter_name=adapter_name,
+                             epsilon=0.2,  # Default GRPO epsilon
+                             beta=0.0)     # No KL penalty by default
         # Get template for input processing
-        template = self.get_template(**kwargs)
+        template = self.get_template(adapter_name=adapter_name)
         # Convert Datum to InputFeature
         input_features = datum_to_input_feature(inputs, template)
-        
-        adapter_name = kwargs.get('adapter_name')
+        # Extract old_logps and advantages using common utility
+        loss_values = extract_rl_feature(inputs)
+        loss_kwargs = kwargs.copy()
+        loss_kwargs.update(loss_values)
         # Megatron forward_backward returns loss directly
-        loss = super().forward_backward(inputs=input_features, **kwargs)
+        loss = super().forward_backward(inputs=input_features, adapter_name=adapter_name, **loss_kwargs)
         
         # Get logits from outputs
         optimizer_config = self.optimizer_group.get(adapter_name)

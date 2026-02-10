@@ -169,7 +169,7 @@ class TestRetrySampler:
         batches = list(dataloader)
         assert len(batches) == 2
 
-    def test_retry_sampler_補齐长度(self):
+    def test_retry_sampler_length(self):
         csv_path = str(TEST_DATA_DIR / "test.csv")
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         

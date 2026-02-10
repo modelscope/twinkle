@@ -137,7 +137,7 @@ class ResourceManager:
         self.node2pg: Dict[int, PlacementGroup] = {}
         # Map actual node indices to placement groups
         # For GPU/NPU groups, node indices start from self.min_node_idx
-        if device_type != 'CPU' and all_ranks:
+        if device_type != 'CPU':
             for i, placement_group in enumerate(self.placement_groups):
                 actual_node_idx = self.min_node_idx + i
                 self.node2pg[actual_node_idx] = placement_group

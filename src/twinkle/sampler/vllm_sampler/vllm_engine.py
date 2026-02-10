@@ -96,6 +96,7 @@ class VLLMEngine(BaseSamplerEngine):
     
     def _create_engine(self):
         """Create and return the vLLM engine."""
+        os.environ["VLLM_USE_V1"] = "1"
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext

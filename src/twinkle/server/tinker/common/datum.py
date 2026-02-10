@@ -26,10 +26,13 @@ def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]], templat
     if 'weights' in datum.loss_fn_inputs:
         # remove weights 0 from labels
         weights = datum.loss_fn_inputs['weights'].to_numpy()
-        input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
+        input_feature['labels'] = np.where(weights != 0, labels, -100).tolist()
     else:
         # remove padding (0-id)
-        input_feature['labels'] = np.where(labels > 0, labels, -100).tolist()
+        input_feature['labels'] = np.where(labels != 0, labels, -100).tolist()
+        # add weights to loss_fn_inputs
+        weights = (labels != 0).astype(np.float32)
+        datum.loss_fn_inputs['weights'] = types.TensorData.from_numpy(weights)
     
     # 3. Invoke post-pipeline hooks
     input_feature = template._add_attention_fields(input_feature)[0]
@@ -99,8 +102,7 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
         weights_arr = (labels_arr != -100).astype(np.float32)
         target_tokens_arr = np.where(labels_arr == -100, 0, labels_arr)
 
-        TensorData = types.TensorData
-        loss_fn_inputs["target_tokens"] = TensorData.from_numpy(target_tokens_arr)
-        loss_fn_inputs["weights"] = TensorData.from_numpy(weights_arr)
+        loss_fn_inputs["target_tokens"] = types.TensorData.from_numpy(target_tokens_arr)
+        loss_fn_inputs["weights"] = types.TensorData.from_numpy(weights_arr)
 
     return types.Datum(loss_fn_inputs=loss_fn_inputs, model_input=model_input)

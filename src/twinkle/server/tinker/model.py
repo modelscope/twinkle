@@ -37,8 +37,8 @@ def build_model_app(model_id: str,
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
-                    adapter_config: Dict[str, Any] = None,
-                    queue_config: Optional[Dict[str, Any]] = None,
+                    adapter_config: Dict[str, Any] = {},
+                    queue_config: Optional[Dict[str, Any]] = {},
                     **kwargs):
     """Build a model management application for distributed training.
 
@@ -122,6 +122,7 @@ def build_model_app(model_id: str,
                     remote_group=self.device_group.name,
                     **kwargs
                 )
+            self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
             # Initialize task queue
@@ -175,7 +176,7 @@ def build_model_app(model_id: str,
                         self.register_adapter(
                             adapter_name, request.state.token)
 
-                        self.model.set_template('Template', adapter_name=adapter_name)
+                        self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                         self.model.set_processor('InputProcessor',
                                                  adapter_name=adapter_name)
                         self.model.set_optimizer('Adam',
@@ -364,17 +365,11 @@ def build_model_app(model_id: str,
                     loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
-                    if self.use_megatron:
-                        # megatron do not need to set loss
-                        output, loss = self.model.forward_backward(
-                            inputs=datum_list,
-                            adapter_name=adapter_name,
-                            **loss_fn_config)
-                    else:
-                        output, loss = self.model.forward_backward(inputs=datum_list,
-                                                                    adapter_name=adapter_name,
-                                                                    loss_fn=loss_fn,
-                                                                    **loss_fn_config)
+                    # Unified forward_backward for both Megatron and Transformers
+                    output, loss = self.model.forward_backward(inputs=datum_list,
+                                                                adapter_name=adapter_name,
+                                                                loss_fn=loss_fn,
+                                                                **loss_fn_config)
                     output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,
@@ -520,6 +515,7 @@ def build_model_app(model_id: str,
 
             async def _do_save_for_sampler():
                 try:
+    
                     adapter_name = self.get_adapter_name(
                         adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
@@ -538,15 +534,16 @@ def build_model_app(model_id: str,
                         model_id=body.model_id,
                         is_sampler=True
                     )
-
+                    # NOTE: Need to save meta first to ensure only one sample weight exists
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=True)
+                    
+                    logger.info(f"Saving weights to {save_dir}")
                     # Save weights with save_optimizer=False for sampler use
                     self.model.save(name=checkpoint_name,
                                     output_dir=save_dir,
                                     adapter_name=adapter_name,
                                     save_optimizer=False)
-
-                    tinker_path = checkpoint_manager.save(
-                        body.model_id, name=checkpoint_name, is_sampler=True)
 
                     # Create sampling session with resolved model_path/base_model.
                     payload = body.model_dump()
