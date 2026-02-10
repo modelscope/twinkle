@@ -15,7 +15,7 @@ from twinkle.server import launch_server
 
 # Resolve the path to server_config.yaml relative to this script's location
 file_dir = os.path.abspath(os.path.dirname(__file__))
-config_path = os.path.join(file_dir, 'server_config.yaml')
+config_path = os.path.join(file_dir, 'server_config_3b.yaml')
 
 # Launch the Twinkle server — this call blocks until the server is shut down
 launch_server(config_path=config_path)
