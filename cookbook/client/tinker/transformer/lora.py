@@ -36,7 +36,7 @@ response = future.result()
 #   2. A model id on hub: "<user>/<model_id>"
 # Example:
 # resume_path = "twinkle://20260131_170251-Qwen_Qwen2_5-0_5B-Instruct-7275126c/weights/pig-latin-lora-epoch-1"
-# resume_path = "AlexEz/20260205_163645-Qwen_Qwen2_5-7B-Instruct-385d5c17_pig-latin-lora-epoch-1"
+# resume_path = "AlexEz/20260205_163645-Qwen_Qwen2_5-0.5B-Instruct-385d5c17_pig-latin-lora-epoch-1"
 resume_path = ""
 
 print(f"Found {len(response.training_runs)} training runs")

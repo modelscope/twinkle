@@ -39,11 +39,11 @@ from twinkle.metric import CompletionRewardMetric
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
-USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '0')))
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507')
+USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
@@ -237,19 +237,19 @@ def main():
             name='sampler',
             ranks=list(range(MODEL_GPUS, NUM_GPUS)),
             device_type='GPU',
-            gpus_per_worker=1,
+            gpus_per_worker=4,
         ),
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=MODEL_GPUS, tp_size=1, pp_size=1,
+            dp_size=1, tp_size=SAMPLER_GPUS, ep_size=SAMPLER_GPUS,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
             world_size=MODEL_GPUS, dp_size=MODEL_GPUS,
         )
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS,
+        world_size=SAMPLER_GPUS, tp_size=4
     )
     twinkle.initialize(
         mode='ray',
@@ -257,11 +257,10 @@ def main():
         groups=device_groups,
         lazy_collect=False,
     )
-    logger.info(get_device_placement())
 
     lora_config = LoraConfig(
         target_modules="all-linear",
-        r=64,
+        r=8,
         lora_alpha=32,
         lora_dropout=0.05,
     )
@@ -274,8 +273,6 @@ def main():
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
-            recompute_granularity='selective',
-            recompute_num_layers=None,
         )
     else:
         model = TransformersModel(
@@ -291,41 +288,38 @@ def main():
     )
     if USE_MEGATRON:
         model.set_optimizer(
-            'default', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME,
+            'default', lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
             'default',
             lr_decay_steps=MAX_STEPS,
             max_lr=LEARNING_RATE,
-            adapter_name=ADAPTER_NAME,
         )
     else:
         model.set_optimizer(
-            'AdamW', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME,
+            'AdamW', lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
             'CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0,
-            adapter_name=ADAPTER_NAME,
         )
     model.set_loss(
         'GRPOLoss',
-        adapter_name=ADAPTER_NAME,
         epsilon=GRPO_EPSILON,
         beta=GRPO_BETA,
     )
-    model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
-    model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
+    model.set_processor(InputProcessor)
+    model.set_template('Template', model_id=MODEL_ID)
 
     # ── Sampler (load real weights for meaningful generation) ─────────
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.7,
-            'max_model_len': 4096,
-            'max_lora_rank': 64,
+            'max_model_len': 2048,
+            'max_lora_rank': 32,
             'enforce_eager': True,
             'enable_sleep_mode': False,
-            'enable_lora': True,
+            'enable_lora': False,
             "logprobs_mode": "processed_logprobs",
         },
         device_mesh=sampler_mesh,
@@ -356,6 +350,7 @@ def main():
 
     # ── Training loop ────────────────────────────────────────────────
     optim_step = 0
+    logger.info(get_device_placement())
 
     for batch in dataloader:
         if optim_step >= MAX_STEPS:
@@ -376,7 +371,7 @@ def main():
 
         t0 = time.perf_counter()
         if optim_step % WEIGHT_SYNC_INTERVAL == 0:
-            ckpt_manager.sync_weights(adapter_name=ADAPTER_NAME)
+            ckpt_manager.sync_weights()
             sampler.reset_prefix_cache()
         timings['weight_sync'] = time.perf_counter() - t0
 
@@ -448,12 +443,11 @@ def main():
         else:
             model.forward_backward(
                 inputs=all_input_data,
-                adapter_name=ADAPTER_NAME,
                 advantages=advantages,
                 old_logps=all_old_logps,
             )
 
-        model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
+        model.clip_grad_and_step()
         timings['train'] = time.perf_counter() - t4
 
         gc.collect()
@@ -476,7 +470,7 @@ def main():
         logger.info(f"[Step {optim_step}/{MAX_STEPS}] {log_dict}")
 
     logger.info(f"Training completed. optim_steps={optim_step}")
-    model.save('grpo-gsm8k-checkpoint', adapter_name=ADAPTER_NAME)
+    model.save('grpo-gsm8k-checkpoint')
 
 
 if __name__ == '__main__':

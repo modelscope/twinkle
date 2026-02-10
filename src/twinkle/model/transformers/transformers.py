@@ -425,6 +425,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
+            if "loss_reduction" not in self.sp_strategy.sp_config:
+                reduction = getattr(loss_instance, "reduction", None)
+                if reduction is not None:
+                    self.sp_strategy.sp_config["loss_reduction"] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value += loss_value
         outputs['loss'] = optimizer_config.loss_value
@@ -1077,23 +1081,42 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
-        adapter_name: str = '',
+        adapter_name: str = None,
         base_sync_done: bool = False,
+        merge_and_sync: bool = False,
     ):
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
         engine = self._get_or_create_checkpoint_engine()
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 
         if base_sync_done and adapter_name:
-            # ── LoRA-only mode: send only adapter weights ────────────────
-            # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
-            from peft.utils import get_peft_model_state_dict
-            lora_state_dict = get_peft_model_state_dict(model)
+            if merge_and_sync:
+                def weight_generator():
+                    if isinstance(model, PeftModel):
+                        model.merge_adapter()
+                    for name, tensor in model.state_dict().items():
+                        # Skip LoRA-specific weights for base model sync
+                        if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                            continue
+                        tensor = Torch.to_local_tensor(tensor)
+                        # Keep original names (including .base_layer for PEFT models).
+                        # The sampler side will strip .base_layer based on whether
+                        # vLLM has enable_lora=True/False.
+                        yield name, tensor
+                    if isinstance(model, PeftModel):
+                        model.unmerge_adapter()
+            else:
+                # ── LoRA-only mode: send only adapter weights ────────────────
+                # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
+                from peft.utils import get_peft_model_state_dict
+                lora_state_dict = get_peft_model_state_dict(model)
 
-            def weight_generator():
-                for name, tensor in lora_state_dict.items():
-                    tensor = Torch.to_local_tensor(tensor)
-                    yield name, tensor
+                def weight_generator():
+                    for name, tensor in lora_state_dict.items():
+                        tensor = Torch.to_local_tensor(tensor)
+                        yield name, tensor
 
         else:
             # ── Full model mode: send all weights (base model sync) ──────

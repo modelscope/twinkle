@@ -20,6 +20,8 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
 
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
+    pip uninstall lmdeploy -y
+    pip uninstall tensorflow -y
     pip install optimum
 
     # test with install

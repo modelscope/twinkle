@@ -954,8 +954,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             model,
             target_device=None,  # Keep on current device for IPC transfer
             only_last_rank=False,  # All ranks participate in weight sync
-            is_peft_format=False,
-            adapter_name=adapter_name if adapter_name else 'default',
+            is_peft_format=bool(adapter_name),
+            adapter_name=adapter_name if adapter_name else None,
             tqdm_desc='Weight sync: ',
         )
 
@@ -1165,9 +1165,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
-        adapter_name: str = '',
+        adapter_name: str = None,
         base_sync_done: bool = False,
-    ):
+        merge_and_sync: bool = False,
+    ):  
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
         engine = self._get_or_create_checkpoint_engine()
 
         is_peft_format = (adapter_name != _default_adapter_name)
@@ -1188,17 +1191,33 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             return name, tensor
 
         if base_sync_done and adapter_name:
-            # ── LoRA-only mode ────────────────────────────────────────────
-            # Export only LoRA adapter weights via the bridge.
-            # The bridge may also yield non-LoRA weights (e.g. embed_tokens
-            # for modules_to_save), filter to only lora_A/lora_B tensors.
-            def weight_generator():
-                for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
-                    if name is None or tensor is None:
-                        continue
-                    if 'lora' not in name:
-                        continue
-                    yield name, tensor
+            if merge_and_sync:
+                def weight_generator():
+                    for _model in self.strategy.unwrap_model(self.model):
+                        if isinstance(_model, PeftModel):
+                            _model.merge_adapter()
+                    for name, tensor in self.get_hf_state_dict(adapter_name=''):
+                        if name is None or tensor is None:
+                            continue
+                        # Skip LoRA-specific weights for base model sync
+                        if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                            continue
+                        yield _trim_vocab(name, tensor)
+                    for _model in self.strategy.unwrap_model(self.model):
+                        if isinstance(_model, PeftModel):
+                            _model.unmerge_adapter()
+            else:
+                # ── LoRA-only mode ────────────────────────────────────────────
+                # Export only LoRA adapter weights via the bridge.
+                # The bridge may also yield non-LoRA weights (e.g. embed_tokens
+                # for modules_to_save), filter to only lora_A/lora_B tensors.
+                def weight_generator():
+                    for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
+                        if name is None or tensor is None:
+                            continue
+                        if 'lora' not in name:
+                            continue
+                        yield name, tensor
 
         else:
             def _raw_weights():
@@ -1240,7 +1259,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             raise result_container['error']
 
     @remote_function(collect='first')
-    def get_peft_config_dict(self, adapter_name: str = '') -> dict:
+    def get_peft_config_dict(self, adapter_name: str = None) -> dict:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 
         Used by CheckpointEngineManager for LoRA-only weight sync.
@@ -1248,6 +1267,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         Returns:
             PEFT config dict, or None if no LoRA adapter is present.
         """
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
         optimizer_config = self.optimizer_group.get(adapter_name)
         if optimizer_config is None or optimizer_config.adapter_config is None:
             return None

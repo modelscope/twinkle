@@ -76,13 +76,12 @@ class CheckpointEngineManager:
         else:
             raise NotImplementedError
 
-    def sync_weights(self, adapter_name: str = ''):
+    def sync_weights(self, merge_and_sync=True):
         start_time = time.time()
-        is_lora_only = self.base_sync_done and bool(adapter_name)
         model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.world_size -1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
-            self.model.device_mesh.world_size, self.sampler.device_mesh.world_size, [model_metadata],
+            self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],
         )
         # Launch both init calls concurrently — TCPStore server (model rank 0)
         # blocks until all clients (sampler ranks) connect, so these MUST NOT
@@ -93,13 +92,12 @@ class CheckpointEngineManager:
         sampler_init() # wait for sampler init to complete
 
         peft_config = None
-        if self.base_sync_done and adapter_name:
+        if self.base_sync_done and not merge_and_sync:
             if self._peft_config is None:
                 self._peft_config = self.model.get_peft_config_dict(adapter_name)
             peft_config = self._peft_config
 
-        model_result = self.model.send_weights(adapter_name=adapter_name,
-                base_sync_done=self.base_sync_done)
+        model_result = self.model.send_weights(base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync)
         sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done,
                 peft_config=peft_config)
         model_result()
@@ -113,5 +111,4 @@ class CheckpointEngineManager:
             logger.info("Base model sync completed, subsequent syncs will be LoRA-only")
 
         elapsed = time.time() - start_time
-        mode = "LoRA-only" if is_lora_only else "full"
-        logger.info(f"Weight sync ({mode}) completed in {elapsed:.2f}s")
+        logger.info(f"Weight sync completed in {elapsed:.2f}s")

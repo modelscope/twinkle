@@ -152,4 +152,4 @@ def _vocab_parallel_selective_log_softmax(
     from megatron.core import mpu
     tp_group = mpu.get_tensor_model_parallel_group()
 
-    return fused_vocab_parallel_cross_entropy(logits, index, tp_group)
+    return -fused_vocab_parallel_cross_entropy(logits, index, tp_group)

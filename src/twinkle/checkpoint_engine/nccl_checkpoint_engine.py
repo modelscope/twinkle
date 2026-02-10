@@ -20,9 +20,8 @@ against NCCL 2.25) and the runtime NCCL 2.27 loaded by PyTorch.
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Generator, Union
+from typing import Any, AsyncGenerator, Generator
 
-import ray
 import torch
 import torch.distributed as dist
 import zmq
@@ -155,6 +154,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         """Start ZMQ PUB server for metadata broadcast (master only)."""
+        import ray
         self.ip = ray.util.get_node_ip_address().strip("[]")
         self.listen_port = find_free_port()
 

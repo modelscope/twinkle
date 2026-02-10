@@ -4,7 +4,7 @@ Kernel module unit tests
 """
 import os
 import unittest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
 
 from twinkle.kernel import (
     kernelize_model,
@@ -13,9 +13,7 @@ from twinkle.kernel import (
     register_kernels,
 )
 from twinkle.kernel.base import (
-    get_device_type,
     is_kernels_available,
-    is_kernels_enabled,
     to_kernels_mode,
 )
 from twinkle.kernel.registry import (
@@ -32,6 +30,7 @@ from twinkle.kernel.registry import (
 class TestBase(unittest.TestCase):
     """Test base helpers and env vars."""
 
+    @unittest.skip('Skip because get_device_type does not exist.')
     def test_get_device_type_no_torch(self):
         """Test device detection without torch."""
         with patch("twinkle.kernel.base.exists", return_value=False):
@@ -321,7 +320,7 @@ class TestModeSupport(unittest.TestCase):
     @patch("twinkle.kernel.layer.is_kernels_available", return_value=False)
     def test_register_with_mode_fallback(self, mock_available):
         """Test fallback mode mapping when mode is None."""
-        from twinkle.kernel.layer import register_layer_kernel, _to_hf_mode
+        from twinkle.kernel.layer import _to_hf_mode
         from kernels import Mode
 
         result = _to_hf_mode(None)
