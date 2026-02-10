@@ -56,6 +56,14 @@ SYSTEM_PROMPT = (
     "For example:\n<think> ... reasoning ... </think>\n#### 42"
 )
 
+# SwanLab experiment tracking
+USE_SWANLAB = True
+if USE_SWANLAB:
+    import swanlab
+    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
+    swanlab.init(project="twinkle-gsm8k", config={
+        'model_id': BASE_MODEL,
+    })
 
 class GSM8KProcessor(Preprocessor):
     """Preprocessor for GSM8K dataset.
@@ -354,18 +362,15 @@ def main():
             ob_len = len(prompt_ids) - 1
             input_tokens = prompt_ids + sampled_tokens[:-1]
             target_tokens = [0] * ob_len + sampled_tokens
-            padded_advantages = [0.0] * ob_len + [advantage] * len(sampled_tokens)
-            padded_logprobs = [0.0] * ob_len + logprobs
-            
-            # Verify lengths match
-            assert len(input_tokens) == len(target_tokens) == len(padded_logprobs) == len(padded_advantages), \
-                f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, " \
-                f"logprobs={len(padded_logprobs)}, advantages={len(padded_advantages)}"
+            weights = [0] * ob_len + [1] * len(sampled_tokens)
+            padded_advantages = [advantage] * len(sampled_tokens)
+            padded_logprobs = logprobs
 
             datum = types.Datum(
                 model_input=types.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
                     'target_tokens': target_tokens,
+                    'weights': weights,
                     'logprobs': types.TensorData.from_numpy(np.array(padded_logprobs, dtype=np.float32)),
                     'advantages': types.TensorData.from_numpy(np.array(padded_advantages, dtype=np.float32)),
                 },
@@ -380,14 +385,10 @@ def main():
 
         # Forward-backward pass with importance_sampling (GRPO) loss
         # The training data already contains logprobs and advantages for the GRPO loss
-        fwdbwd_future = training_client.forward_backward(
-            training_data, "importance_sampling")
-        optim_future = training_client.optim_step(
-            types.AdamParams(learning_rate=LEARNING_RATE))
-        
-        fwdbwd_result = fwdbwd_future.result()
-        optim_result = optim_future.result()
+        fwdbwd_result = training_client.forward_backward(training_data, "importance_sampling").result()
 
+        optim_result = training_client.optim_step(types.AdamParams(learning_rate=LEARNING_RATE)).result()
+        
         # Compute metrics from the forward-backward result
         # For importance_sampling, we get logprobs and elementwise_loss
         logprobs_list = []
@@ -414,6 +415,8 @@ def main():
         log_dict['train/num_training_samples'] = len(training_data)
         logger.info(f"Step {step}: {log_dict}")
         step += 1
+        if USE_SWANLAB:
+            swanlab.log(log_dict)
 
     # Save final checkpoint
     save_future = training_client.save_state("gsm8k-grpo-final")

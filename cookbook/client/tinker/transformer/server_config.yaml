@@ -46,8 +46,7 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0, 1]
-        mesh_dim_names: ['dp']                     # 'dp' = data parallel
+        dp_size: 2
       queue_config:
         rps_limit: 100                             # Max requests per second
         tps_limit: 10000                           # Max tokens per second
@@ -76,14 +75,14 @@ applications:
         max_model_len: 4096           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
+        logprobs_mode: processed_logprobs # Logprobs mode for sampling results
       device_group:                   # Logical device group for the sampler
         name: sampler
-        ranks: [0]                    # GPU rank indices to use
+        ranks: [2]                    # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0]
-        mesh_dim_names: ['dp']
+        dp_size: 1
     deployments:
       - name: SamplerManagement
         autoscaling_config:
