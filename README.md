@@ -1,9 +1,7 @@
-<h1 align="center">Twinkle: The training workbench to make your model glow</h1>
+<h1 align="center">Twinkle: Training workbench to make your model glow</h1>
 
 <p align="center">
-    <br>
-    <img src="assets/slogan.png"/>
-    <br>
+    <img src="assets/slogan.png" width="200"/>
 <p>
 <p align="center">
 by <a href="https://modelscope.cn/home">ModelScope</a>
@@ -24,29 +22,23 @@ by <a href="https://modelscope.cn/home">ModelScope</a>
         <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
 </p>
 
-<div align="center">
-
 ## ✨ What is Twinkle?
-<p align="left">
 Twinkle✨ is a lightweight, client-server training framework engineered 
 with modular, high-cohesion interfaces. Whether you are executing locally 
 with `torchrun`, or scaling training across Ray clusters,
 Twinkle✨ eliminates infrastructure friction by encapsulating 
 complex training logic into standardized APIs. Beyond simple 
 abstraction, Twinkle✨ serves as a robust gateway to Serverless Training (TaaS), 
-providing a _superset_ of the interfaces offered by Tinker APIs.
+providing a _superset_ of the interfaces offered by [Tinker](https://thinkingmachines.ai/tinker/) APIs.
 
-<p align="left">
 🧩 <b>Decoupled Architecture</b> · Standardized Interfaces<br>
 🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
 🔌 <b>Multi-Training Backends</b> · Transformers / Megatron<br>
 👥 <b>Multi-Tenancy</b> · Training multiple LoRAs that share one base model deployment<br>
-</p>
 
-</div>
 Note: Twinkle✨is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
 we expect the two projects to evolve together, and some fundamental components in Twinkle✨will likely
-be reused in ms-swift
+be reused in [ms-swift](https://github.com/modelscope/ms-swift).
 
 ## Installation
 
@@ -80,7 +72,7 @@ pip install -e . --no-build-isolation
 
 ## Changelog
 
-- 🎉2026-02-10 Initial version of Twinkle✨ released, including SFT/PT/RL for text models and serverless training capabilities on [ModelScope](link)
+- 🎉2026-02-10 Initial version of Twinkle✨ released, including SFT/PT/RL for text models and serverless training capabilities on [ModelScope](https://modelscope.cn).
 
 ## Supported Hardware
 
@@ -96,7 +88,7 @@ We will be adding support for models as new models are released. The following t
 supported on Twinkle✨ framework, but the models supported on our serverless training backend may be a
 much smaller subset. See the [doc](link) section for more information.
 
-| Model Type          | Model ID on ModelScope                                                                                                   | Requires             | Megatron Support | HF Model ID                                                                                                |
+| Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                                               | Requires             | Megatron Support | HF Model ID                                                                                                |
 | ------------------- |--------------------------------------------------------------------------------------------------------------------------| -------------------- |-----------| ---------------------------------------------------------------------------------------------------------- |
 | qwen3 series        | [Qwen/Qwen3-0.6B-Base](https://modelscope.cn/models/Qwen/Qwen3-0.6B-Base)~32B                                            | transformers>=4.51   | ✅         | [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                                           |
 | qwen3_moe series    | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                          | transformers>=4.51   | ✅         | [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                                     |
