@@ -77,7 +77,6 @@ class BaseSamplerEngine(ABC):
     
     async def save_weights_for_sampler(
         self,
-        user_id: str,
         weights: Dict[str, torch.Tensor],
         peft_config: Dict[str, Any],
         **kwargs,
@@ -86,7 +85,6 @@ class BaseSamplerEngine(ABC):
         Save weights as a LoRA adapter for sampling (client-server mode).
         
         Args:
-            user_id: Unique identifier for the user/training run.
             weights: LoRA weight tensors.
             peft_config: PEFT/LoRA configuration dict.
             

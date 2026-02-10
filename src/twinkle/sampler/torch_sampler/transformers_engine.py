@@ -23,6 +23,7 @@ logger = get_logger()
 
 
 class TransformersEngine(BaseSamplerEngine):
+    # not tested yet
     def __init__(
         self,
         model_id: str,
@@ -286,64 +287,14 @@ class TransformersEngine(BaseSamplerEngine):
 
     async def save_weights_for_sampler(
         self,
-        user_id: str,
         weights: Dict[str, torch.Tensor],
         peft_config: Dict[str, Any],
     ) -> str:
-        """Save weights as a LoRA adapter for sampling."""
-        if not self.enable_lora:
-            raise RuntimeError("LoRA not enabled. Set enable_lora=True.")
-        
-        # Save adapter to disk
-        adapter_dir = os.path.join(self._lora_weights_dir, user_id)
-        os.makedirs(adapter_dir, exist_ok=True)
-        
-        import safetensors.torch
-        safetensors.torch.save_file(weights, os.path.join(adapter_dir, "adapter_model.safetensors"))
-        
-        with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
-            json.dump(peft_config, f)
-        
-        # Track adapter
-        uri = f"twinkle://{self._model_id}/lora/{user_id}"
-        self._adapters[uri] = {
-            "user_id": user_id,
-            "path": adapter_dir,
-            "peft_config": peft_config,
-        }
-        
-        logger.info(f"Saved LoRA adapter for user {user_id}: {len(weights)} tensors")
-        return uri
+        raise NotImplementedError
     
     async def _load_adapter(self, adapter_uri: str) -> None:
-        """Load a LoRA adapter."""
-        if self._current_adapter == adapter_uri:
-            return
-        
-        if adapter_uri not in self._adapters:
-            logger.warning(f"Adapter {adapter_uri} not found")
-            return
-        
-        adapter_info = self._adapters[adapter_uri]
-        adapter_path = adapter_info["path"]
-        
-        from peft import PeftModel
+        raise NotImplementedError
 
-        if not isinstance(self.model, PeftModel):
-            # First adapter - wrap the model
-            self.model = PeftModel.from_pretrained(
-                self.model,
-                adapter_path,
-                adapter_name=adapter_info["user_id"],
-            )
-        else:
-            # Load additional adapter
-            self.model.load_adapter(adapter_path, adapter_name=adapter_info["user_id"])
-            self.model.set_adapter(adapter_info["user_id"])
-        
-        self._current_adapter = adapter_uri
-        logger.info(f"Loaded adapter: {adapter_uri}")
-    
     async def sleep(self, **kwargs) -> None:
         pass
 
