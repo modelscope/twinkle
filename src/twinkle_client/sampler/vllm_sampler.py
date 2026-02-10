@@ -110,16 +110,6 @@ class vLLMSampler(Sampler):
         response.raise_for_status()
         return response.json()
     
-    def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = ''):
-        """Synchronize weights to the sampler."""
-        adapter = adapter_name or self.adapter_name
-        response = http_post(
-            url=f'{self.server_url}/sync_weights',
-            json_data={'state_dict': state_dict, 'adapter_name': adapter}
-        )
-        response.raise_for_status()
-        return response.json()
-    
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs):
         """Set the template for encoding trajectories."""
         response = http_post(

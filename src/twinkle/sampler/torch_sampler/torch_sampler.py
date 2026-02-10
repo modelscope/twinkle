@@ -3,7 +3,6 @@
 from typing import List, Dict, Any, Optional, Type, Union
 
 import torch
-from peft import PeftConfig, get_peft_model
 from transformers import AutoModelForCausalLM, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
@@ -16,6 +15,7 @@ from twinkle.hub import HubOperation
 
 @remote_class()
 class TorchSampler(Sampler):
+    # not tested yet
     """A PyTorch native sampler using TransformersEngine."""
 
     def __init__(
@@ -70,9 +70,7 @@ class TorchSampler(Sampler):
             
         Returns:
             SampleResponse containing sampled sequences.
-        """
-        self._check_adapter_valid(adapter_name)
-        
+        """        
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
@@ -84,7 +82,7 @@ class TorchSampler(Sampler):
         is_trajectory = self._is_trajectory(inputs)
         
         if is_trajectory:
-            template = self._get_template(adapter_name)
+            template = self.template
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
             encoded_inputs = [self.encode_trajectory(traj, adapter_name) for traj in inputs_list]
@@ -162,35 +160,3 @@ class TorchSampler(Sampler):
             ))
         
         return SampleResponse(sequences=all_sequences)
-
-    @remote_function()
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig):
-        super().add_adapter_to_sampler(adapter_name, config)
-        
-        if config is not None:
-            from peft import PeftModel
-            if isinstance(self.model, PeftModel):
-                self.model.add_adapter(adapter_name, config)
-            else:
-                self.model = get_peft_model(self.model, config, adapter_name=adapter_name)
-            self.model.eval()
-
-    @remote_function()
-    def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
-        if not adapter_name:
-            self.model.load_state_dict(state_dict, strict=False)
-        else:
-            self._check_adapter_valid(adapter_name)
-            from peft import PeftModel
-            if isinstance(self.model, PeftModel):
-                adapter_state_dict = {k: v for k, v in state_dict.items() if adapter_name in k}
-                if adapter_state_dict:
-                    self.model.load_state_dict(adapter_state_dict, strict=False)
-
-    @remote_function()
-    def remove_adapter(self, adapter_name: str):
-        if adapter_name and adapter_name in self.sample_group:
-            from peft import PeftModel
-            if isinstance(self.model, PeftModel):
-                self.model.base_model.delete_adapter(adapter_name=adapter_name)
-            super().remove_adapter(adapter_name)

@@ -89,18 +89,6 @@ class AddAdapterResponse(BaseModel):
     status: str = "ok"
     adapter_name: str
 
-
-class SyncWeightsRequest(BaseModel):
-    """Request body for the /sync_weights endpoint."""
-    state_dict: Dict[str, Any] = Field(..., description="Model state dict to sync")
-    adapter_name: str = Field('', description="Adapter name for LoRA weight sync")
-
-
-class SyncWeightsResponse(BaseModel):
-    """Response body for the /sync_weights endpoint."""
-    status: str = "ok"
-
-
 class HeartbeatRequest(BaseModel):
     """Request body for the /heartbeat endpoint."""
     adapter_name: str = Field(..., description="Adapter name to keep alive")
@@ -167,18 +155,6 @@ class AddAdapterResponse(BaseModel):
     """Response body for the /add_adapter_to_sampler endpoint."""
     status: str = "ok"
     adapter_name: str
-
-
-class SyncWeightsRequest(BaseModel):
-    """Request body for the /sync_weights endpoint."""
-    state_dict: Dict[str, Any] = Field(..., description="Model state dict to sync")
-    adapter_name: str = Field('', description="Adapter name for LoRA weight sync")
-
-
-class SyncWeightsResponse(BaseModel):
-    """Response body for the /sync_weights endpoint."""
-    status: str = "ok"
-
 
 class HeartbeatRequest(BaseModel):
     """Request body for the /heartbeat endpoint."""
@@ -416,7 +392,7 @@ def build_sampler_app(model_id: str,
             """Set the chat template for encoding Trajectory inputs."""
             full_adapter_name = self._get_adapter_name(request, body.adapter_name) or ''
             extra_kwargs = body.model_extra or {}
-            self.sampler.set_template(body.template_cls, adapter_name=full_adapter_name, **extra_kwargs)
+            self.sampler.set_template(body.template_cls, **extra_kwargs)
             return SetTemplateResponse()
 
         @app.post("/add_adapter_to_sampler", response_model=AddAdapterResponse)
@@ -439,12 +415,6 @@ def build_sampler_app(model_id: str,
 
             return AddAdapterResponse(adapter_name=full_adapter_name)
 
-        @app.post("/sync_weights", response_model=SyncWeightsResponse)
-        def sync_weights(self, request: Request, body: SyncWeightsRequest) -> SyncWeightsResponse:
-            """Synchronize model weights to the sampler."""
-            full_adapter_name = self._get_adapter_name(request, body.adapter_name) or ''
-            self.sampler.sync_weights(body.state_dict, full_adapter_name)
-            return SyncWeightsResponse()
         @app.post("/create", response_model=CreateResponse)
         def create(self, request: Request) -> CreateResponse:
             """Health check / session creation endpoint."""
@@ -525,7 +495,7 @@ def build_sampler_app(model_id: str,
             """Set the chat template for encoding Trajectory inputs."""
             full_adapter_name = self._get_adapter_name(request, body.adapter_name) or ''
             extra_kwargs = body.model_extra or {}
-            self.sampler.set_template(body.template_cls, adapter_name=full_adapter_name, **extra_kwargs)
+            self.sampler.set_template(body.template_cls, **extra_kwargs)
             return SetTemplateResponse()
 
         @app.post("/add_adapter_to_sampler", response_model=AddAdapterResponse)
@@ -547,13 +517,6 @@ def build_sampler_app(model_id: str,
                 raise RuntimeError(reason)
 
             return AddAdapterResponse(adapter_name=full_adapter_name)
-
-        @app.post("/sync_weights", response_model=SyncWeightsResponse)
-        def sync_weights(self, request: Request, body: SyncWeightsRequest) -> SyncWeightsResponse:
-            """Synchronize model weights to the sampler."""
-            full_adapter_name = self._get_adapter_name(request, body.adapter_name) or ''
-            self.sampler.sync_weights(body.state_dict, full_adapter_name)
-            return SyncWeightsResponse()
 
         @app.post("/heartbeat", response_model=HeartbeatResponse)
         def heartbeat(self, request: Request, body: HeartbeatRequest) -> HeartbeatResponse:

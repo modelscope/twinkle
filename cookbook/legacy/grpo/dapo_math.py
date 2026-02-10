@@ -52,9 +52,9 @@ USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
-SAMPLER_TP = int(os.environ.get('SAMPLER_TP', SAMPLER_GPUS // 2))
+SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
-
+PP_SIZE = 2
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
@@ -349,7 +349,6 @@ def main():
         ),
     ]
     if USE_MEGATRON:
-        PP_SIZE = 2
         model_mesh = DeviceMesh.from_sizes(
             dp_size=MODEL_GPUS // PP_SIZE, pp_size=PP_SIZE,
             ep_size=MODEL_GPUS // PP_SIZE,
@@ -376,6 +375,23 @@ def main():
         lora_alpha=32,
         lora_dropout=0.05,
     )
+
+    # ── Sampler ───────────────────────────────────────────────────────
+    sampler = vLLMSampler(
+        model_id=MODEL_ID,
+        engine_args={
+            'gpu_memory_utilization': 0.8,
+            'max_model_len': 8192,
+            'max_loras': 1,
+            'max_lora_rank': 32,
+            'enable_sleep_mode': False,
+            'enable_lora': True,
+            "logprobs_mode": "processed_logprobs",
+        },
+        device_mesh=sampler_mesh,
+        remote_group='sampler',
+    )
+    sampler.set_template(Template, model_id=MODEL_ID)
 
     # ── Model ─────────────────────────────────────────────────────────
     if USE_MEGATRON:
@@ -423,23 +439,6 @@ def main():
     )
     model.set_processor(InputProcessor)
     model.set_template('Template', model_id=MODEL_ID)
-
-    # ── Sampler ───────────────────────────────────────────────────────
-    sampler = vLLMSampler(
-        model_id=MODEL_ID,
-        engine_args={
-            'gpu_memory_utilization': 0.7,
-            'max_model_len': 8192,
-            'max_loras': 1,
-            'max_lora_rank': 32,
-            'enable_sleep_mode': False,
-            'enable_lora': True,
-            "logprobs_mode": "processed_logprobs",
-        },
-        device_mesh=sampler_mesh,
-        remote_group='sampler',
-    )
-    sampler.set_template(Template, model_id=MODEL_ID)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

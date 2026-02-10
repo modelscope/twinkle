@@ -1,39 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, Union, Type
-from dataclasses import dataclass
+from typing import List, Any, Optional, Union, Type
 
 from peft import PeftConfig
 
 from twinkle.data_format import Trajectory, InputFeature
 from twinkle.template import Template
-from twinkle.processor import InputProcessor
 from twinkle.data_format import SamplingParams, SampleResponse
 import twinkle
 
 from twinkle.utils import construct_class
 from twinkle import remote_function
 
-@dataclass
-class SampleGroup:
-    adapter_name: str = None
-    adapter_config: PeftConfig = None
-    template: Template = None
-    processor: InputProcessor = None
-    # LoRA info for vLLM weight sync
-    lora_int_id: int = None
-    lora_ready: bool = False
-
-
 class Sampler(ABC):
-    _default_adapter_name = ''
-
     def __init__(self):
         self.engine = None
         self.template = None
-        self.sample_group: Dict[str, SampleGroup] = {
-            self._default_adapter_name: SampleGroup()
-        }
 
     @abstractmethod
     def sample(
@@ -85,22 +67,9 @@ class Sampler(ABC):
             return [inputs]
         return list(inputs)
 
-    def _check_adapter_valid(self, adapter_name: str):
-        assert adapter_name in self.sample_group, \
-            f'Invalid adapter_name: {adapter_name}. Available: {list(self.sample_group.keys())}'
-
-    # used in grpo demo, TODO: remove remote_function
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
-    def _get_template(self, adapter_name: str = '') -> Optional[Template]:
-        if adapter_name and adapter_name in self.sample_group:
-            template = self.sample_group[adapter_name].template
-            if template is not None:
-                return template
-        return self.template
-
     def encode_trajectory(self, trajectory: Trajectory, adapter_name: str = '', 
                           add_generation_prompt: bool = True) -> InputFeature:
-        template = self._get_template(adapter_name)
+        template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
         
@@ -122,47 +91,16 @@ class Sampler(ABC):
 
     def decode_response(self, token_ids: List[int], adapter_name: str = '') -> str:
         """Decode token ids to text."""
-        template = self._get_template(adapter_name)
+        template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
         return template.decode(token_ids)
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
-        adapter_name = kwargs.pop("adapter_name", None) or ''
-        self._check_adapter_valid(adapter_name)
         template = construct_class(template_cls, Template, twinkle.template, **kwargs)
-        self.sample_group[adapter_name].template = template
-        if adapter_name == '' or self.template is None:
-            self.template = template
-
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
-    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs):
-        adapter_name = kwargs.pop("adapter_name", None) or ''
-        self._check_adapter_valid(adapter_name)
-        processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
-        self.sample_group[adapter_name].processor = processor
+        self.template = template
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig) -> None:
-        if adapter_name in self.sample_group and adapter_name != self._default_adapter_name:
-            return
-        
-        if adapter_name not in self.sample_group:
-            self.sample_group[adapter_name] = SampleGroup()
-        
-        group = self.sample_group[adapter_name]
-        group.adapter_name = adapter_name
-        group.adapter_config = config
-        
-        used_ids = [g.lora_int_id for g in self.sample_group.values() if g.lora_int_id is not None]
-        group.lora_int_id = (max(used_ids) + 1) if used_ids else 1
-        group.lora_ready = False
-
-    def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
-        pass
-
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
-    def remove_adapter(self, adapter_name: str) -> None:
-        if adapter_name and adapter_name in self.sample_group:
-            self.sample_group.pop(adapter_name)
+        raise NotImplementedError

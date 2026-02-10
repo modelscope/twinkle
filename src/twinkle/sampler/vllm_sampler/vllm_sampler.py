@@ -23,8 +23,7 @@ import asyncio
 import atexit
 import os
 import threading
-from dataclasses import asdict
-from typing import List, Dict, Any, Union, Optional, Literal
+from typing import List, Dict, Any, Union, Optional
 
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.sampler.base import Sampler
@@ -33,7 +32,7 @@ from twinkle import remote_function, remote_class, DeviceMesh, requires
 from twinkle.utils.platform import Platform
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle import get_logger
-from twinkle.patch.vllm_lora_weights import VLLMLoraWeights, TensorLoRARequest
+from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 
 logger = get_logger()
 
@@ -142,10 +141,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         
         VLLMLoraWeights()(self)
 
-        # Track LoRA loaded via checkpoint engine sync.
-        # When set, sampling automatically uses this LoRA request.
-        self._ckpt_lora_loaded: bool = False
-
         self._shutdown_called = False
         atexit.register(self.shutdown)
 
@@ -173,7 +168,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         Returns:
             InputFeature with input_ids suitable for vLLM (unexpanded image tokens).
         """
-        template = self._get_template(adapter_name)
+        template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
         
@@ -236,8 +231,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self,
         feat: Dict[str, Any],
         sampling_params: SamplingParams,
-        adapter_path: Optional[str] = None,
-        request_seed: Optional[int] = None,
+        lora_request: Optional[Any] = None,
         *,
         logprobs: bool = True,
         num_samples: int = 1,
@@ -247,8 +241,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         Args:
             feat: Encoded input features containing 'input_ids' and optionally 'images'/'videos'.
             sampling_params: Sampling parameters.
-            adapter_path: Optional LoRA adapter path.
-            request_seed: Optional seed for reproducibility.
+            adapter_path: Optional LoRA adapter path (legacy, prefer lora_request).
+            lora_request: Pre-built LoRARequest to attach to the sampling request.
+                Avoids repeated ``_get_or_load_lora`` calls per input.
             num_samples: Number of completions to generate for this prompt.
             
         Returns:
@@ -261,26 +256,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         images = feat.get('images')
         videos = feat.get('videos')
         
-        # If a LoRA adapter was loaded via checkpoint engine sync and
-        # no explicit adapter_path is provided, use the synced LoRA.
-        lora_request = None
-        if not adapter_path and self._ckpt_lora_loaded:
-            from vllm.lora.request import LoRARequest
-            from twinkle.sampler.vllm_sampler.vllm_worker_extension import (
-                VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
-            )
-            lora_request = LoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
-            )
-
         response = await self.engine.sample(
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
             logprobs=logprobs,
             num_samples=num_samples,
-            adapter_path=adapter_path,
             lora_request=lora_request,
             images=images,
             videos=videos,
@@ -331,9 +311,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             - Data is automatically sliced by DP rank (dispatch='slice_dp')
             - Results are merged using _collect_sample_responses
             - Each worker receives already-sliced inputs (e.g., DP4 with 8 inputs -> 2 per worker)
-        """
-        self._check_adapter_valid(adapter_name)
-        
+        """        
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
@@ -345,7 +323,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         is_trajectory = self._is_trajectory(inputs)
         
         if is_trajectory:
-            template = self._get_template(adapter_name)
+            template = self.template
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
             encoded_inputs = [
@@ -354,11 +332,27 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             ]
         else:
             encoded_inputs = inputs_list
-        
+
+        lora_request = None
+        if adapter_path is not None:
+            lora_request = self._run_in_loop(
+                self.engine._get_or_load_lora(adapter_path, force_reload=True)
+            )
+            if lora_request is None:
+                logger.warning(
+                    f"Failed to pre-load LoRA from {adapter_path}, "
+                    "sampling will proceed without LoRA"
+                )
+
         # Sample all inputs in parallel using background event loop
         async def _sample_all():
             tasks = [
-                self._sample_single(feat, sampling_params, adapter_path, logprobs=logprobs, num_samples=num_samples)
+                self._sample_single(
+                    feat, sampling_params,
+                    lora_request=lora_request,
+                    logprobs=logprobs,
+                    num_samples=num_samples,
+                )
                 for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)
@@ -369,52 +363,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             all_sequences.extend(seqs)
         return SampleResponse(sequences=all_sequences)
 
-    @remote_function(dispatch='all', collect='first')
-    def sync_weights(self, state_dict: Dict[str, Any], adapter_name: str = '') -> None:
-        """Sync weights from training to vLLM engine.
-        
-        Args:
-            state_dict: Model state dict to sync.
-            adapter_name: If provided, sync as LoRA adapter. Otherwise sync base model.
-        """
-        if not adapter_name:
-            self._run_in_loop(self.engine.update_weights(state_dict))
-        else:
-            self._check_adapter_valid(adapter_name)
-            group = self.sample_group[adapter_name]
-            
-            lora_request = TensorLoRARequest(
-                lora_name=adapter_name,
-                lora_int_id=group.lora_int_id,
-                lora_path='dummy_lora_path',
-                peft_config=asdict(group.adapter_config) if group.adapter_config else {},
-                lora_tensors=state_dict,
-            )
-            
-            if group.lora_ready:
-                remove_lora = getattr(self.engine, 'remove_lora', None)
-                if remove_lora is not None:
-                    try:
-                        remove_lora(adapter_name)
-                    except TypeError:
-                        remove_lora(group.lora_int_id)
-                group.lora_ready = False
-            
-            if self.engine.add_lora(lora_request):
-                group.lora_ready = True
-
-    def remove_adapter(self, adapter_name: str):
-        if adapter_name and adapter_name in self.sample_group:
-            group = self.sample_group[adapter_name]
-            if group.lora_ready:
-                remove_lora = getattr(self.engine, 'remove_lora', None)
-                if remove_lora is not None:
-                    try:
-                        remove_lora(adapter_name)
-                    except TypeError:
-                        remove_lora(group.lora_int_id)
-            self.sample_group.pop(adapter_name)
-    
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:
         """
@@ -430,62 +378,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
     def reset_prefix_cache(self):
         self._run_in_loop(self.engine.reset_prefix_cache())
     
-    @remote_function(dispatch='all')
-    def import_weights_dict(
-        self,
-        weights: Dict[str, Any],
-        peft_config: dict = None,
-        base_sync_done: bool = False,
-    ):
-        """Import weights from a dict via Ray object store.
-
-        Alternative to NCCL checkpoint engine for weight sync. Avoids
-        ray.util.collective NCCL which can conflict with Megatron's NCCL.
-
-        Args:
-            weights: Dict mapping parameter names to tensors.
-            peft_config: PEFT config dict for LoRA adapter loading.
-            base_sync_done: If True, load as LoRA adapter.
-
-        Returns:
-            Number of weights loaded.
-        """
-        import gc
-        from twinkle.utils.framework import Torch
-
-        # Move weights to GPU
-        device = Torch.get_device(None)
-        gpu_weights = {}
-        for name, tensor in weights.items():
-            gpu_weights[name] = tensor.to(device, non_blocking=True)
-        Torch.synchronize()
-
-        # Transfer to vLLM subprocess via engine.update_weights
-        async def _load():
-            await self.engine.update_weights(
-                gpu_weights,
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-            )
-
-        self._run_in_loop(_load())
-
-        n_loaded = len(gpu_weights)
-        del gpu_weights
-        gc.collect()
-        Torch.empty_cache()
-
-        logger.info(f"Imported {n_loaded} weights from dict"
-                     f" ({'LoRA' if base_sync_done and peft_config else 'base'} mode)")
-        return n_loaded
-
-    # =========================================================================
-    # Checkpoint Engine — Weight Sync (from CheckpointEngineMixin)
-    # =========================================================================
-    # prepare_checkpoint_engine, init_checkpoint_process_group, and
-    # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
-    # Only receive_weights_via_checkpoint_engine is sampler-specific.
-
     @remote_function(dispatch='all', lazy_collect=True)
     def receive_weights(
         self,
@@ -526,10 +418,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 base_sync_done=base_sync_done,
             )
 
-            # After LoRA sync, mark that the synced LoRA is loaded so
-            # sampling automatically uses it.
+            # After a LoRA sync, refresh the cached LoRARequest in engine
+            # so that sample() can use it without per-request list_loras RPC.
             if base_sync_done and peft_config:
-                self._ckpt_lora_loaded = True
+                await self.engine.refresh_synced_lora()
+            elif not base_sync_done:
+                # Base-model sync invalidates any previously synced LoRA.
+                self.engine.invalidate_synced_lora()
 
         self._run_in_loop(_receive_and_load())
 

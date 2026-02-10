@@ -79,14 +79,18 @@ class VLLMEngine(BaseSamplerEngine):
         self.dtype = dtype
         self.quantization = quantization
         self.load_format = load_format
-        self.logprobs_mode = logprobs_mode
+        self.logprobs_mode = logprobs_mode or 'processed_logprobs'
         self.engine_kwargs = kwargs or {}
         
-        # Simple LoRA tracking: user_id -> lora_int_id
         # Only need to track which users have loaded LoRAs and their IDs
         self._user_lora_ids: Dict[str, int] = {}
-        self._user_lora_paths: Dict[str, str] = {}
         self._next_lora_id = 1
+
+        # Cached LoRARequest for the RL-training synced LoRA.
+        # Built lazily by ``refresh_synced_lora()`` after CheckpointEngine
+        # finishes a LoRA sync, so ``sample()`` never needs to call
+        # ``list_loras()`` per request.
+        self._synced_lora_request: Optional[Any] = None
         
         # Initialize engine
         self.engine = self._create_engine()
@@ -160,15 +164,6 @@ class VLLMEngine(BaseSamplerEngine):
         logger.info(f"VLLMEngine initialized: model={self.model_id}")
         return engine
 
-    def shutdown(self):
-        """Shutdown the underlying vLLM AsyncLLM engine."""
-        if hasattr(self, 'engine') and self.engine is not None:
-            try:
-                self.engine.shutdown()
-                logger.info("VLLMEngine shutdown completed.")
-            except Exception as e:
-                logger.warning(f"VLLMEngine shutdown error: {e}")
-
     async def get_tokenizer(self):
         """Get the tokenizer asynchronously."""
         if self._tokenizer is None:
@@ -187,8 +182,6 @@ class VLLMEngine(BaseSamplerEngine):
         logprobs: bool = True,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
-        adapter_path: Optional[str] = None,
-        adapter_user_id: Optional[str] = None,
         lora_request: Optional[Any] = None,
         request_id: Optional[str] = None,
         priority: int = 0,
@@ -208,10 +201,7 @@ class VLLMEngine(BaseSamplerEngine):
             logprobs: Whether to return log probabilities for generated tokens.
             include_prompt_logprobs: Whether to compute logprobs on prompt tokens.
             topk_prompt_logprobs: If > 0, returns top-k logprobs for each prompt token.
-            adapter_path: Resolved filesystem path to LoRA adapter directory.
-            adapter_user_id: User identifier for the adapter (for tracking loaded adapters).
-            lora_request: Pre-built LoRARequest for RL training weight sync.
-                         Takes precedence over adapter_path.
+            lora_request: LoRARequest for sampling.
             request_id: Optional request ID for tracking.
             priority: Request priority (higher = more urgent).
             images: Optional list of images for multimodal models.
@@ -253,25 +243,19 @@ class VLLMEngine(BaseSamplerEngine):
             )
         else:
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        
-        # Build LoRA request: pre-built lora_request takes precedence,
-        # then adapter_path for multi-tenant mode.
-        if lora_request is None and adapter_path and self.enable_lora:
-            lora_request = await self._get_or_load_lora(adapter_path, adapter_user_id)
-        
-        # Default: use the synced LoRA.
-        if lora_request is None and self.enable_lora:
-            from vllm.lora.request import LoRARequest
-            from twinkle.sampler.vllm_sampler.vllm_worker_extension import (
-                VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
+
+        if lora_request is not None and not self.enable_lora:
+            logger.warning(
+                "lora_request provided but enable_lora is "
+                "False — LoRA will be ignored for this request"
             )
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME,
-                    lora_int_id=VLLM_LORA_INT_ID,
-                    lora_path=VLLM_LORA_PATH,
-                )
+            lora_request = None
+
+        if lora_request is None and self._synced_lora_request is not None:
+            # RL training path: use the LoRA synced via CheckpointEngine.
+            # The request object is cached after the first ``list_loras``
+            # check to avoid per-request RPC overhead.
+            lora_request = self._synced_lora_request
 
         generator = self.engine.generate(
             prompt=prompt,
@@ -355,109 +339,104 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
 
+    # -----------------------------------------------------------------
+    # RL-training synced LoRA helpers
+    # -----------------------------------------------------------------
+
+    async def refresh_synced_lora(self) -> None:
+        """Refresh the cached LoRARequest for the RL-training synced LoRA.
+
+        Called by ``vLLMSampler.receive_weights`` after a successful LoRA
+        sync via CheckpointEngine.  Subsequent ``sample()`` calls will use
+        the cached request object without any ``list_loras()`` RPC.
+        """
+        from vllm.lora.request import LoRARequest
+        from twinkle.sampler.vllm_sampler.vllm_worker_extension import (
+            VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
+        )
+        loaded = await self.engine.list_loras()
+        if VLLM_LORA_INT_ID in loaded:
+            self._synced_lora_request = LoRARequest(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
+            )
+        else:
+            self._synced_lora_request = None
+
+    def invalidate_synced_lora(self) -> None:
+        """Clear the cached synced LoRA request.
+
+        Called before a new base-model weight sync that replaces the model
+        weights (invalidating any previously loaded LoRA).
+        """
+        self._synced_lora_request = None
+
     def _generate_lora_id(self) -> int:
         """Generate a unique LoRA int ID."""
         lora_id = self._next_lora_id
         self._next_lora_id += 1
         return lora_id
 
-    async def _get_or_load_lora(self, lora_path: str, user_id: Optional[str] = None):
-        """
-        Get or load a LoRA adapter from path, return LoRARequest for sampling.
-        
-        This method:
-        1. Uses the provided user_id for tracking (or 'default' if not provided)
-        2. Checks if already loaded for this user
-        3. Loads if needed
-        4. Returns the LoRARequest for vLLM
-        
+    async def _get_or_load_lora(
+        self,
+        lora_path: str,
+        *,
+        force_reload: bool = False,
+    ):
+        """Get or load a LoRA adapter from *lora_path*.
+
         Args:
-            lora_path: Resolved filesystem path to the LoRA adapter directory
-            user_id: User identifier for tracking loaded adapters
-            
+            lora_path: Resolved filesystem path to the LoRA adapter directory.
+            force_reload: If ``True``, remove the existing adapter and reload.
+
         Returns:
-            LoRARequest or None if loading fails
+            ``LoRARequest`` or ``None`` if loading fails.
         """
         from vllm.lora.request import LoRARequest
-        
-        if user_id is None:
-            user_id = 'default'
-
-        # Check if already loaded for this user
-        if user_id in self._user_lora_ids:
+        user_id = 'default' # TODO, multi-tenant
+        # Fast path: return cached request if it exists and reload is not forced.
+        if user_id in self._user_lora_ids and not force_reload:
             lora_int_id = self._user_lora_ids[user_id]
-            # Verify it's still loaded in engine
             loaded_loras = await self.engine.list_loras()
             if lora_int_id in loaded_loras:
-                if self._user_lora_paths.get(user_id) != lora_path:
-                    # reload the lora
-                    await self.remove_adapter(user_id)
-                    lora_request = await self._get_or_load_lora(lora_path, user_id)
-                    return lora_request
                 return LoRARequest(
-                    lora_name=f"lora_{user_id}",
+                    lora_name=str(lora_int_id),
                     lora_int_id=lora_int_id,
                     lora_path=lora_path,
                 )
-            else:
-                # Was unloaded, need to reload
-                del self._user_lora_ids[user_id]
-        
-        # Load the LoRA adapter
+            # Stale entry — clean up and fall through to load below.
+            self._user_lora_ids.pop(user_id, None)
+
+        # If force reload, remove existing first.
+        if force_reload and user_id in self._user_lora_ids:
+            await self.engine.remove_lora(self._user_lora_ids[user_id])
+
         if not os.path.exists(lora_path):
             logger.error(f"LoRA path does not exist: {lora_path}")
             return None
-        
+
         config_path = os.path.join(lora_path, "adapter_config.json")
         if not os.path.exists(config_path):
             logger.error(f"adapter_config.json not found in {lora_path}")
             return None
-        
-        # Generate new lora_int_id
+
         lora_int_id = self._generate_lora_id()
-        lora_name = f"lora_{user_id}"
-        
+        lora_name = str(lora_int_id)
+
         lora_request = LoRARequest(
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             lora_path=lora_path,
         )
-        
+
         try:
-            # Use the proper add_lora API instead of collective_rpc
-            # This ensures LoRARequest is properly serialized/deserialized
             await self.engine.add_lora(lora_request)
             self._user_lora_ids[user_id] = lora_int_id
-            self._user_lora_paths[user_id] = lora_path
-            logger.info(f"Loaded LoRA adapter from {lora_path} for user {user_id} (id={lora_int_id})")
             return lora_request
         except Exception as e:
             logger.error(f"Failed to load LoRA: {e}")
             return None
-
-    async def remove_adapter(self, user_id: str) -> bool:
-        """
-        Remove a LoRA adapter for a user.
-        
-        Args:
-            user_id: User identifier.
-            
-        Returns:
-            True if adapter was removed, False if not found.
-        """
-        if user_id not in self._user_lora_ids:
-            return False
-
-        lora_int_id = self._user_lora_ids.pop(user_id)
-        self._user_lora_paths.pop(user_id, None)
-        try:
-            # Use the proper remove_lora API
-            await self.engine.remove_lora(lora_int_id)
-            logger.info(f"Removed LoRA adapter for user {user_id} (id={lora_int_id})")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to remove adapter from engine: {e}")
-            return False
 
     async def sleep(self, level: int = 2) -> None:
         """
@@ -500,13 +479,6 @@ class VLLMEngine(BaseSamplerEngine):
         await self.engine.wake_up(tags=tags)
         
         logger.debug(f"Engine waking up with tags: {tags}")
-
-    async def clear_kv_cache(self) -> None:
-        """Clear the KV cache (prefix cache)."""
-        if hasattr(self.engine, 'reset_prefix_cache'):
-            await self.engine.reset_prefix_cache()
-        elif hasattr(self.engine, 'reset_mm_cache'):
-            await self.engine.reset_mm_cache() # Do we need this?
 
     async def reset_prefix_cache(self) -> None:
         await self.engine.reset_prefix_cache()
@@ -606,6 +578,9 @@ class VLLMEngine(BaseSamplerEngine):
             )
         )
 
+        # Yield to event loop so worker_task (collective_rpc) can start.
+        # Without this, the synchronous ZMQ send below blocks the thread
+        # and the worker subprocess never receives the RPC to connect.
         await asyncio.sleep(0.1)
 
         # Send IPC/SHM handle, wait for worker ready
@@ -680,10 +655,6 @@ class VLLMEngine(BaseSamplerEngine):
         mode = "LoRA" if base_sync_done and peft_config else "base"
         logger.info(f"Updated {n_weights} {mode} weights via "
                      f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
-
-    async def abort_request(self, request_id: str) -> None:
-        """Abort a specific request."""
-        await self.engine.abort(request_id)
     
     async def shutdown(self) -> None:
         """Shutdown the vLLM engine and release all resources.
@@ -711,7 +682,6 @@ class VLLMEngine(BaseSamplerEngine):
         
         # Clear LoRA state
         self._user_lora_ids.clear()
-        self._user_lora_paths.clear()
         
         # Force garbage collection
         gc.collect()
