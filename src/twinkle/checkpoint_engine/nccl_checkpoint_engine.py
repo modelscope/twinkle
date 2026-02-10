@@ -1,21 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/nccl_checkpoint_engine.py
-"""NCCL-based checkpoint engine for disaggregated trainer and rollout.
-
-This engine uses NCCL broadcast for efficient GPU-to-GPU weight transfer
-across different processes/nodes. It supports:
-- Double buffering for pipelined transfer
-- ZMQ for metadata, NCCL for weight data
-- Streaming weight transfer to avoid OOM
-- Persistent resources: NCCL group, ZMQ sockets, and buffers are reused
-  across multiple sync calls to avoid costly re-initialization (~4s per call).
-
-This implementation uses torch.distributed ProcessGroupNCCL directly for
-NCCL operations.  A dedicated TCPStore handles rendezvous between the
-participating Ray actors, completely independent of any existing default
-process group.  This avoids NCCL version conflicts between CuPy (compiled
-against NCCL 2.25) and the runtime NCCL 2.27 loaded by PyTorch.
-"""
 
 import asyncio
 import time

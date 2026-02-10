@@ -69,6 +69,14 @@ class MegatronStrategy:
         use_distributed_optimizer: bool = True,
     ) -> List[nn.Module]:
         if self.device_mesh.world_size <= 1:
+            from megatron.core.distributed import DistributedDataParallelConfig
+            ddp_config = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                use_distributed_optimizer=False,
+            )
+            for m in model:
+                if not hasattr(m, 'ddp_config'):
+                    m.ddp_config = ddp_config
             return model
 
         self._check_device_mesh()

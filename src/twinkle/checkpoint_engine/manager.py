@@ -79,7 +79,6 @@ class CheckpointEngineManager:
     def sync_weights(self, merge_and_sync=True):
         start_time = time.time()
         model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.world_size -1))
-        model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.data_world_size -1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],

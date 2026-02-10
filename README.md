@@ -28,27 +28,29 @@ with modular, high-cohesion interfaces. Whether you are executing locally
 with `torchrun`, or scaling training across Ray clusters,
 Twinkle✨ eliminates infrastructure friction by encapsulating 
 complex training logic into standardized APIs. Beyond simple 
-abstraction, Twinkle✨ serves as a robust gateway to Serverless Training (TaaS), 
-providing a _superset_ of the interfaces offered by [Tinker](https://thinkingmachines.ai/tinker/) APIs.
+abstraction, Twinkle✨ serves as a robust backend and gateway to enable serverless Training-as-a-Service (TaaS).
+It offers interfaces that constitute a _superset_ of  [Tinker](https://thinkingmachines.ai/tinker/) APIs, 
+thereby making is possible to access a Twinkle✨ training service via Tinker client or native Twinkle✨-client
+which offers more functionalities.
 
-🧩 <b>Decoupled Architecture</b> · Standardized Interfaces<br>
-🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
-🔌 <b>Multi-Training Backends</b> · Transformers / Megatron<br>
-👥 <b>Multi-Tenancy</b> · Training multiple LoRAs that share one base model deployment<br>
+🧩 <b>Decoupled Architecture</b>: Standardized Interfaces, backward compatible with Tinker APIs.<br>
+🚀 <b>Multiple Runtime Modes</b>: torchrun / Ray / HTTP.<br>
+🔌 <b>Multi-Training Backends</b>: Transformers / Megatron.<br>
+👥 <b>Multi-Tenancy Training Service</b>: Train multiple LoRAs that share one base model deployment.<br>
 
 Note: Twinkle✨is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
-we expect the two projects to evolve together, and some fundamental components in Twinkle✨will likely
+we expect the two projects to evolve together. We expect some fundamental components in Twinkle✨will likely
 be reused in [ms-swift](https://github.com/modelscope/ms-swift).
 
 ## Installation
 
-Install using pip:
+### Install with package:
 
 ```shell
 pip install 'twinkle-kit'
 ```
 
-## Installation from Source
+### Installation from Source:
 
 ```shell
 git clone https://github.com/modelscope/twinkle.git
@@ -56,7 +58,7 @@ cd twinkle
 pip install -e . --no-build-isolation
 ```
 
-## Tutorial Examples
+## Tutorials
 
 | Training Type                     | Model Framework | Cookbook Path                            |
 | --------------------------------- | --------------- | ---------------------------------------- |
@@ -83,10 +85,10 @@ pip install -e . --no-build-isolation
 | PPU                  | ✅                                                               |
 | CPU                  | Supports partial components like dataset, dataloader            |
 
-## Supported Large Language Models
-We will be adding support for models as new models are released. The following table lists all models
-supported on Twinkle✨ framework, but the models supported on our serverless training backend may be a
-much smaller subset. See the [doc](link) section for more information.
+## Supported Models
+We will be adding support for more models as new models are released. The following table lists current models
+supported on Twinkle✨ framework. However, the models supported on our serverless training backend may be a
+much smaller subset. Please refer to the [doc](link) section for more information.
 
 | Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                                               | Requires             | Megatron Support | HF Model ID                                                                                                |
 | ------------------- |--------------------------------------------------------------------------------------------------------------------------| -------------------- |-----------| ---------------------------------------------------------------------------------------------------------- |
@@ -178,7 +180,7 @@ if __name__ == '__main__':
     train()
 ```
 
-Start training like this:
+Launch training:
 
 ```shell
 python3 train.py

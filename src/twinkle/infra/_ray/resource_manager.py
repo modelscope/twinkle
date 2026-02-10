@@ -86,9 +86,10 @@ class ResourceManager:
         bundles = []
         cpu_bundles = []
 
-        # GPU/NPU placement groups: keep existing strategy (CPU= node_cpu//2) to avoid affecting training/inference throughput assumptions.
         for i in range(self.nnodes):
-            node = self.nodes[i]
+            # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
+            node_idx = self.min_node_idx + i if device_type != 'CPU' else i
+            node = self.nodes[node_idx]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
@@ -148,6 +149,11 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
+        if 'DEVICE_COUNT_PER_PHYSICAL_NODE' in os.environ:
+            # Sometimes, multiply nodes are in one physical node, there may be error in `gpu_rank`
+            device_per_node = int(os.environ['DEVICE_COUNT_PER_PHYSICAL_NODE'])
+        else:
+            device_per_node = nproc_per_node
         for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
@@ -172,7 +178,7 @@ class ResourceManager:
 
                         # All GPUs for a worker should be on the same node
                         node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
+                        gpu_ranks_local = [r % device_per_node for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(
@@ -183,17 +189,15 @@ class ResourceManager:
                         node_rank = node_ranks[0]
                         local_device_groups.append(
                             dict(
-                                node_rank=node_rank,
                                 gpu_rank=gpu_ranks_local,
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = alloc_rank % nproc_per_node
+                        gpu_rank = alloc_rank % device_per_node
                         local_device_groups.append(
                             dict(
-                                node_rank=node_rank,
                                 gpu_rank=[gpu_rank],
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))

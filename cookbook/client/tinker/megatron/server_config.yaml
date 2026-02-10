@@ -30,6 +30,44 @@ applications:
           target_ongoing_requests: 128   # Target concurrent requests per replica
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
+
+  # 3. Sampler Service - Runs inference / sampling using vLLM engine
+  #    Used for generating text from the model (e.g., evaluating LoRA results).
+  - name: sampler-Qwen3-30B-A3B-Instruct-2507
+    route_prefix: /api/v1/sampler/Qwen/Qwen3-30B-A3B-Instruct-2507
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507"   # ModelScope model identifier
+      nproc_per_node: 4               # Number of GPU processes per node
+      sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
+      engine_args:                    # vLLM engine-specific settings
+        max_model_len: 4096           # Maximum sequence length the engine supports
+        gpu_memory_utilization: 0.7   # Fraction of GPU memory to use (0.0-1.0)
+        enable_lora: true             # Allow loading LoRA adapters during inference
+      device_group:                   # Logical device group for the sampler
+        name: sampler
+        gpus_per_worker: 1
+        ranks: [0,1,2,3]                    # GPU rank indices to use
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 4
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
@@ -42,7 +80,7 @@ applications:
       nproc_per_node: 4                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: [0, 1, 2, 3]                              # GPU rank indices
+        ranks: [4,5,6,7]                              # GPU rank indices
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -64,36 +102,7 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
-          num_gpus: 1
-
-  # 3. Sampler Service - Runs inference / sampling using vLLM engine
-  #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen3-30B-A3B-Instruct-2507
-    route_prefix: /api/v1/sampler/Qwen/Qwen3-30B-A3B-Instruct-2507
-    import_path: sampler
-    args:
-      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507"   # ModelScope model identifier
-      nproc_per_node: 4               # Number of GPU processes per node
-      sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
-      engine_args:                    # vLLM engine-specific settings
-        max_model_len: 4096           # Maximum sequence length the engine supports
-        gpu_memory_utilization: 0.7   # Fraction of GPU memory to use (0.0-1.0)
-        enable_lora: true             # Allow loading LoRA adapters during inference
-      device_group:                   # Logical device group for the sampler
-        name: sampler
-        gpus_per_worker: 1
-        ranks: [4,5,6,7]                    # GPU rank indices to use
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        dp_size: 4
-        tp_size: 1
-    deployments:
-      - name: SamplerManagement
-        autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
-          target_ongoing_requests: 16
-        ray_actor_options:
-          num_cpus: 0.1
-          num_gpus: 1                 # Sampler needs a full GPU for inference
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
