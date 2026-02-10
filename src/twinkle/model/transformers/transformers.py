@@ -1088,7 +1088,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # ── LoRA-only mode: send only adapter weights ────────────────
             # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
             from peft.utils import get_peft_model_state_dict
-            lora_state_dict = get_peft_model_state_dict(model)
+            lora_state_dict = get_peft_model_state_dict(
+                model, adapter_name=adapter_name
+            )
 
             def weight_generator():
                 for name, tensor in lora_state_dict.items():

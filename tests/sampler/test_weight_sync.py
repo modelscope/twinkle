@@ -37,7 +37,7 @@ os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
 os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
 # Model configuration — use a small model for testing
-MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2.5-0.5B-Instruct')
+MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2.5-3B-Instruct')
 
 logger = logging.getLogger(__name__)
 
@@ -133,24 +133,27 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     # ── Create Model (real weights) ───────────────────────────────────
-    log("\nCreating Model (real weights)...")
     model = TransformersModel(
         model_id=model_path,
         device_mesh=DeviceMesh.from_sizes(world_size=model_gpus, dp_size=model_gpus),
         remote_group='model',
     )
+    from peft import LoraConfig
+    model.add_adapter_to_model('default', LoraConfig(r=8, lora_alpha=32, lora_dropout=0.05, target_modules="all-linear"), gradient_accumulation_steps=1)
+    lora_path = '/mnt/nas2/hujinghan.hjh/swift/output/v1168-20260209-194533/checkpoint-32/default/output/v0-20260209-212154/checkpoint-32'
 
+    model.load('default', output_dir=lora_path, adapter_name='default')
     # ── Create Sampler (dummy weights) ────────────────────────────────
-    log("Creating Sampler (dummy weights)...")
     sampler = vLLMSampler(
         model_id=model_path,
         engine_args={
-            'load_format': 'dummy',         # start with random weights
+            # 'load_format': 'dummy',         # start with random weights
             'gpu_memory_utilization': 0.3,
             'max_model_len': 256,
             'enforce_eager': True,
             'enable_sleep_mode': True,
-            'enable_lora': False,
+            'enable_lora': True,
+            'max_loras': 1
         },
         device_mesh=DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_gpus),
         remote_group='sampler',
@@ -176,7 +179,7 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
 
     # ── Sample BEFORE sync (dummy weights → garbage) ──────────────────
     log("\n--- Sampling BEFORE weight sync (dummy weights) ---")
-    text_before = do_sample("What is 2+2?")
+    text_before = do_sample("What's your name?")
     log(f"  Output: '{text_before[:100]}'")
 
     # ── Sync weights: Model → Sampler via NCCL ────────────────────────
@@ -185,16 +188,20 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
         model=model,
         sampler=sampler,
     )
+    # test lora-only sync
 
     sync_start = time.time()
+    # base
     manager.sync_weights()
+    # lora
+    manager.sync_weights('default')
     sampler.reset_prefix_cache()
     sync_time = time.time() - sync_start
     log(f"  Weight sync completed in {sync_time:.2f}s")
 
     # ── Sample AFTER sync (real weights → coherent) ───────────────────
     log("\n--- Sampling AFTER weight sync (real weights) ---")
-    text_after = do_sample("What is 2+2?")
+    text_after = do_sample("What's your name?")
     log(f"  Output: '{text_after[:100]}'")
 
     # ── Verification ──────────────────────────────────────────────────
