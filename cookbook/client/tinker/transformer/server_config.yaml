@@ -39,14 +39,14 @@ applications:
     args:
       use_megatron: false                          # Use HuggingFace Transformers backend
       model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
-      nproc_per_node: 1                            # Number of GPU processes per node
+      nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: [0]                              # GPU rank indices
+        ranks: [0, 1]                              # GPU rank indices
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0]
+        mesh: [0, 1]
         mesh_dim_names: ['dp']                     # 'dp' = data parallel
       queue_config:
         rps_limit: 100                             # Max requests per second

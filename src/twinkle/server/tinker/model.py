@@ -361,17 +361,11 @@ def build_model_app(model_id: str,
                     loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
-                    if self.use_megatron:
-                        # megatron do not need to set loss
-                        output, loss = self.model.forward_backward(
-                            inputs=datum_list,
-                            adapter_name=adapter_name,
-                            **loss_fn_config)
-                    else:
-                        output, loss = self.model.forward_backward(inputs=datum_list,
-                                                                    adapter_name=adapter_name,
-                                                                    loss_fn=loss_fn,
-                                                                    **loss_fn_config)
+                    # Unified forward_backward for both Megatron and Transformers
+                    output, loss = self.model.forward_backward(inputs=datum_list,
+                                                                adapter_name=adapter_name,
+                                                                loss_fn=loss_fn,
+                                                                **loss_fn_config)
                     output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,

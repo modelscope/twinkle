@@ -38,10 +38,10 @@ BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
-MAX_STEPS = 10
-BATCH_SIZE = 1
+MAX_STEPS = 100
+BATCH_SIZE = 2
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 5       # Save weights for sampler every N steps
+SYNC_INTERVAL = 2       # Save weights for sampler every N steps
 LORA_RANK = 8
 
 
