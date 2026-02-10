@@ -86,8 +86,8 @@ class ResourceManager:
         bundles = []
         cpu_bundles = []
 
-        # GPU/NPU placement groups: keep existing strategy (CPU= node_cpu//2) to avoid affecting training/inference throughput assumptions.
         for i in range(self.nnodes):
+            # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
             node_idx = self.min_node_idx + i if device_type != 'CPU' else i
             node = self.nodes[node_idx]
             node_cpu = int(node['Resources']['CPU'])
@@ -149,6 +149,11 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
+        if 'DEVICE_COUNT_PER_PHYSICAL_NODE' in os.environ:
+            # Sometimes, multiply nodes are in one physical node, there may be error in `gpu_rank`
+            device_per_node = int(os.environ['DEVICE_COUNT_PER_PHYSICAL_NODE'])
+        else:
+            device_per_node = nproc_per_node
         for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
@@ -172,8 +177,8 @@ class ResourceManager:
                         worker_ranks = normalized_ranks[start_idx:start_idx + gpus_per_worker]
 
                         # All GPUs for a worker should be on the same node
-                        node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
+                        node_ranks = [r // device_per_node for r in worker_ranks]
+                        gpu_ranks_local = [r % device_per_node for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(
@@ -190,8 +195,8 @@ class ResourceManager:
                                 ray_address=ray_address))
                 else:
                     for alloc_rank in normalized_ranks:
-                        node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = alloc_rank % nproc_per_node
+                        node_rank = alloc_rank // device_per_node
+                        gpu_rank = alloc_rank % device_per_node
                         local_device_groups.append(
                             dict(
                                 node_rank=node_rank,
@@ -217,39 +222,6 @@ class ResourceManager:
                             ray_address=ray_address))
                     global_cpu_proc_idx += 1
                 self.device_groups[group.name] = local_device_groups
-
-        import ray
-
-        @ray.remote(num_gpus=1)
-        def check_gpu_info():
-            import os
-            import torch
-
-            node_id = ray.get_runtime_context().get_node_id()
-            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
-
-            # 获取实际 GPU 信息
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                gpu_uuid = torch.cuda.get_device_properties(0).uuid  # 不一定有
-            else:
-                gpu_name = "N/A"
-
-            return {
-                "node_id": node_id,
-                "CUDA_VISIBLE_DEVICES": cuda_visible,
-                "gpu_name": gpu_name,
-            }
-
-        # 在指定 PG 上运行
-        result = ray.get(
-            check_gpu_info.options(
-                placement_group=self.placement_groups[0],
-                placement_group_bundle_index=0
-            ).remote()
-        )
-        print(result)
-        breakpoint()
 
         self.group_configs = groups
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
