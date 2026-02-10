@@ -54,14 +54,14 @@ MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
-PP_SIZE = 2
-NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
+PP_SIZE = 4
+NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 4))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 1))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
 WEIGHT_SYNC_INTERVAL = int(os.environ.get('WEIGHT_SYNC_INTERVAL', 1))
@@ -334,6 +334,9 @@ def compute_rewards(
 
 # ========== Main ==========
 def main():
+    from twinkle.utils.import_utils import requires
+    requires("vllm>=0.15.0")
+
     device_groups = [
         DeviceGroup(
             name='model',
@@ -350,8 +353,10 @@ def main():
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=MODEL_GPUS // PP_SIZE, pp_size=PP_SIZE,
-            ep_size=MODEL_GPUS // PP_SIZE,
+            dp_size=1, 
+            tp_size=2,
+            pp_size=2,
+            ep_size=2,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
@@ -370,7 +375,7 @@ def main():
     )
 
     lora_config = LoraConfig(
-        target_modules='all-linear',
+        target_modules=['linear_qkv', 'linear_proj'],
         r=8,
         lora_alpha=32,
         lora_dropout=0.05,

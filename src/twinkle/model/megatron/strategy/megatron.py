@@ -18,11 +18,15 @@ class MegatronStrategy:
         **kwargs,
     ):
         self.device_mesh = device_mesh
-        self.sequence_parallel = self.device_mesh.sequence_parallel
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
     
+    @property
+    def sequence_parallel(self) -> bool:
+        """Read from device_mesh so auto-enable in args.py is visible."""
+        return getattr(self.device_mesh, 'sequence_parallel', False)
+
     def _check_device_mesh(self):
         from megatron.core import parallel_state as mpu
 
