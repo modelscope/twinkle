@@ -88,7 +88,8 @@ class ResourceManager:
 
         # GPU/NPU placement groups: keep existing strategy (CPU= node_cpu//2) to avoid affecting training/inference throughput assumptions.
         for i in range(self.nnodes):
-            node = self.nodes[i]
+            node_idx = self.min_node_idx + i if device_type != 'CPU' else i
+            node = self.nodes[node_idx]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
@@ -216,6 +217,39 @@ class ResourceManager:
                             ray_address=ray_address))
                     global_cpu_proc_idx += 1
                 self.device_groups[group.name] = local_device_groups
+
+        import ray
+
+        @ray.remote(num_gpus=1)
+        def check_gpu_info():
+            import os
+            import torch
+
+            node_id = ray.get_runtime_context().get_node_id()
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+
+            # 获取实际 GPU 信息
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_uuid = torch.cuda.get_device_properties(0).uuid  # 不一定有
+            else:
+                gpu_name = "N/A"
+
+            return {
+                "node_id": node_id,
+                "CUDA_VISIBLE_DEVICES": cuda_visible,
+                "gpu_name": gpu_name,
+            }
+
+        # 在指定 PG 上运行
+        result = ray.get(
+            check_gpu_info.options(
+                placement_group=self.placement_groups[0],
+                placement_group_bundle_index=0
+            ).remote()
+        )
+        print(result)
+        breakpoint()
 
         self.group_configs = groups
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
