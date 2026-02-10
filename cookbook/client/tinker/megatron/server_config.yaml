@@ -37,11 +37,11 @@ applications:
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-3B-Instruct
+  - name: sampler-Qwen3-30B-A3B-Instruct-2507
+    route_prefix: /api/v1/sampler/Qwen/Qwen3-30B-A3B-Instruct-2507
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"   # ModelScope model identifier
+      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507"   # ModelScope model identifier
       nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
@@ -71,12 +71,12 @@ applications:
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
-  - name: models-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-3B-Instruct
+  - name: models-Qwen3-30B-A3B-Instruct-2507
+    route_prefix: /api/v1/model/Qwen/Qwen3-30B-A3B-Instruct-2507
     import_path: model
     args:
-      use_megatron: false                          # Use HuggingFace Transformers backend
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct" # ModelScope model identifier
+      use_megatron: true                          # Use HuggingFace Transformers backend
+      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507" # ModelScope model identifier
       nproc_per_node: 4                            # Number of GPU processes per node
       device_group:
         name: model
@@ -84,7 +84,9 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 4
+        dp_size: 2
+        tp_size: 2
+        ep_size: 2
 
       queue_config:
         rps_limit: 100                             # Max requests per second
