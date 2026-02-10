@@ -36,7 +36,7 @@ def set_death_signal():
 
 
 # Constants for the RL training LoRA adapter identity.
-VLLM_LORA_INT_ID = 1
+VLLM_LORA_INT_ID = 111
 VLLM_LORA_NAME = "twinkle_lora"
 VLLM_LORA_PATH = "twinkle_lora_path"
 
@@ -85,8 +85,12 @@ class TwinkleWorkerExtension:
         from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
         set_death_signal()
         VLLMLoraWeights()(None)
+
         return super().__new__(cls)
 
+    def monkey_patch_model(self):
+        from twinkle.patch.vllm_moe_loader import VLLMMoEWeights
+        VLLMMoEWeights()(self.model_runner.model)
     # -----------------------------------------------------------------
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
@@ -104,12 +108,18 @@ class TwinkleWorkerExtension:
         in buckets over a ZMQ REQ/REP channel backed by CUDA IPC (GPU
         tensors) or shared memory (CPU tensors).
 
+        For TP > 1, only TP rank 0 communicates with the VLLMEngine over
+        ZMQ.  It broadcasts the IPC handle and bucket metadata to other
+        ranks via ``torch.distributed``, so every rank can read the shared
+        buffer and call ``load_weights`` for its own TP shard.
+
         Args:
             peft_config: If provided with base_sync_done, loads as LoRA.
             base_sync_done: If True and peft_config, replaces existing LoRA.
             use_shm: If True, use shared memory instead of CUDA IPC.
         """
         import zmq
+        import torch.distributed as dist
 
         if self.device is None:
             self.device = torch.device(Torch.get_device())
@@ -117,17 +127,55 @@ class TwinkleWorkerExtension:
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
 
-        # Setup ZMQ socket
-        if not hasattr(self, '_zmq_ctx') or self._zmq_ctx is None:
-            self._zmq_ctx = zmq.Context()
-        socket = self._zmq_ctx.socket(zmq.REP)
-        socket.connect(self._get_zmq_handle())
+        # Detect TP rank — vLLM sets self.rank on each worker.
+        tp_rank = getattr(self, 'rank', 0)
+        tp_size = 1
+        try:
+            tp_size = self.model_runner.parallel_config.tensor_parallel_size
+        except Exception:
+            pass
 
-        comm_metadata = socket.recv_pyobj()
+        is_driver = (tp_rank == 0)
 
+        if tp_size > 1:
+            # Use vLLM's built-in TP cpu group for object broadcasts.
+            from vllm.distributed import get_tp_group
+            tp_coord = get_tp_group()
+            cpu_group = tp_coord.cpu_group
+            broadcast_src = tp_coord.ranks[0]  # global rank of TP rank 0
+        else:
+            cpu_group = None
+            broadcast_src = 0
+
+        def _broadcast_obj(obj):
+            """Broadcast a picklable object from TP rank 0 to all TP ranks."""
+            obj_list = [obj]
+            dist.broadcast_object_list(obj_list, src=broadcast_src, group=cpu_group)
+            return obj_list[0]
+
+        # ── Step 1: Establish ZMQ connection (driver only) ──
+        socket = None
+        if is_driver:
+            if not hasattr(self, '_zmq_ctx') or self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context()
+            socket = self._zmq_ctx.socket(zmq.REP)
+            socket.connect(self._get_zmq_handle())
+
+        # ── Step 2: Receive and broadcast IPC/SHM handle ──
         buffer, shm = None, None
+
+        if is_driver:
+            comm_metadata = socket.recv_pyobj()
+        else:
+            comm_metadata = None
+
+        if tp_size > 1:
+            comm_metadata = _broadcast_obj(comm_metadata)
+
         if not use_shm:
             handle = comm_metadata
+            # All TP ranks rebuild the IPC buffer from the same handle.
+            # CUDA IPC allows any process on the same node to map the memory.
             buffer = _rebuild_ipc(handle, self.device.index)
         else:
             from multiprocessing import shared_memory
@@ -135,12 +183,21 @@ class TwinkleWorkerExtension:
                 comm_metadata["name"], comm_metadata["size"],
             )
 
-        socket.send(b"")  # Ready
+        if is_driver:
+            socket.send(b"")  # Ready
 
+        # ── Step 3: Receive and process weight buckets ──
         while True:
-            metadata = socket.recv_pyobj()
-            weights = []
+            # Only the driver receives bucket metadata from VLLMEngine.
+            if is_driver:
+                metadata = socket.recv_pyobj()
+            else:
+                metadata = None
 
+            if tp_size > 1:
+                metadata = _broadcast_obj(metadata)
+
+            weights = []
             for name, meta in metadata["bucket_meta"].items():
                 shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
                 size = dtype.itemsize * shape.numel()
@@ -152,7 +209,14 @@ class TwinkleWorkerExtension:
                 weights.append((name, tensor))
 
             Torch.synchronize()
-            socket.send(b"")
+
+            if is_driver:
+                socket.send(b"")
+
+            # Ensure all ranks finish reading the buffer before the driver
+            # proceeds to the next bucket (which overwrites the buffer).
+            if tp_size > 1:
+                dist.barrier(group=cpu_group)
 
             self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
@@ -160,7 +224,8 @@ class TwinkleWorkerExtension:
             if metadata["is_last"]:
                 break
 
-        socket.close()
+        if is_driver and socket is not None:
+            socket.close()
         del buffer
         if shm is not None:
             shm.close()
@@ -208,11 +273,14 @@ class TwinkleWorkerExtension:
     def _convert_peft_to_vllm_lora_name(name: str) -> str:
         """Convert PEFT LoRA weight name to vLLM format.
 
-        PEFT: base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
-        vLLM: base_model.model.layers.0.self_attn.q_proj.lora_A.weight
+        PEFT names look like:
+            base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
+        vLLM expects:
+            base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+
+        Only the adapter-name segment (e.g. ``.default.``) between
+        ``lora_A``/``lora_B`` and ``weight`` needs to be removed.
         """
-        if name.startswith('base_model.model.model.'):
-            name = 'base_model.model.' + name[len('base_model.model.model.'):]
         name = re.sub(r'\.lora_A\.[^.]+\.', '.lora_A.', name)
         name = re.sub(r'\.lora_B\.[^.]+\.', '.lora_B.', name)
         return name
@@ -260,6 +328,21 @@ class TwinkleWorkerExtension:
                 getattr(self, 'vllm_config', None), 'lora_config', None,
             ) is not None
 
+            # When vLLM LoRA is enabled, some LinearBase modules are
+            # replaced by *WithLoRA wrappers.  Their parameters shift
+            # from e.g. ``gate.weight`` to ``gate.base_layer.weight``.
+            # HF checkpoint names do NOT contain ``.base_layer.``, so
+            # vLLM's own ``load_weights`` will KeyError on them.
+            #
+            # Build a set of base-layer prefixes that need rewriting.
+            lora_base_prefixes: set = set()
+            if vllm_has_lora:
+                from vllm.lora.layers import BaseLayerWithLoRA
+                for mod_name, mod in self.model_runner.model.named_modules():
+                    if isinstance(mod, BaseLayerWithLoRA):
+                        # mod_name is e.g. "model.layers.0.mlp.gate"
+                        lora_base_prefixes.add(mod_name + ".")
+
             converted = []
             for name, tensor in weights:
                 if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
@@ -268,6 +351,18 @@ class TwinkleWorkerExtension:
                 name = name.removeprefix('base_model.model.')
                 if not vllm_has_lora:
                     name = name.replace('.base_layer.', '.')
+                else:
+                    # Insert ``.base_layer.`` for weights whose module
+                    # has been wrapped by LoRA and whose name does NOT
+                    # already contain it.
+                    if '.base_layer.' not in name:
+                        for pfx in lora_base_prefixes:
+                            if name.startswith(pfx):
+                                # e.g. "model.layers.0.mlp.gate.weight"
+                                # →    "model.layers.0.mlp.gate.base_layer.weight"
+                                suffix = name[len(pfx):]
+                                name = pfx + "base_layer." + suffix
+                                break
                 converted.append((name, tensor))
 
             if not converted:

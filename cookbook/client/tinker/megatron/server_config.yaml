@@ -1,4 +1,4 @@
-# Twinkle Server Configuration - Tinker-Compatible Megatron Backend
+# Twinkle Server Configuration - Tinker-Compatible Transformers Backend
 
 # Server protocol type: "tinker" enables the Tinker-compatible API
 server_type: tinker
@@ -31,24 +31,28 @@ applications:
         ray_actor_options:
           num_cpus: 0.1                  # CPU resources allocated to this actor
 
-  # 2. Model Service - Hosts the base model for training (Megatron backend)
-  #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
+  # 2. Model Service (commented out) - Would host the base model for training.
+  #    Uncomment and configure if you need a training model worker.
+  - name: models-Qwen3-30B-A3B-Instruct-2507
+    route_prefix: /api/v1/model/Qwen/Qwen3-30B-A3B-Instruct-2507
     import_path: model
     args:
-      use_megatron: true                               # Use Megatron-LM backend (not HuggingFace)
-      mixed_precision: bf16                             # Use bfloat16 precision for training
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
-      nproc_per_node: 2               # Number of GPU processes per node
-      device_group:                   # Logical device group for this model
+      use_megatron: true                          # Use HuggingFace Transformers backend
+      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507" # ModelScope model identifier
+      nproc_per_node: 4                            # Number of GPU processes per node
+      device_group:
         name: model
-        ranks: [0, 1]                 # GPU rank indices to use
+        ranks: [0, 1, 2, 3]                              # GPU rank indices
         device_type: cuda
-      device_mesh:                    # Distributed training mesh configuration
+      device_mesh:
         device_type: cuda
-        mesh: [0, 1]                  # Device indices in the mesh
-        mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
+        dp_size: 2
+        tp_size: 2
+        ep_size: 2
+
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 10000                           # Max tokens per second
       adapter_config:
         per_token_adapter_limit: 30                # Max concurrent LoRA adapters
         adapter_timeout: 1800                      # Seconds before idle adapter unload
@@ -60,28 +64,30 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          num_gpus: 1
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-3B-Instruct
+  - name: sampler-Qwen3-30B-A3B-Instruct-2507
+    route_prefix: /api/v1/sampler/Qwen/Qwen3-30B-A3B-Instruct-2507
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"   # ModelScope model identifier
-      nproc_per_node: 1               # Number of GPU processes per node
+      model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507"   # ModelScope model identifier
+      nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 4096           # Maximum sequence length the engine supports
-        gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
+        gpu_memory_utilization: 0.7   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
       device_group:                   # Logical device group for the sampler
         name: sampler
-        ranks: [0]                    # GPU rank indices to use
+        gpus_per_worker: 1
+        ranks: [4,5,6,7]                    # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0]
-        mesh_dim_names: ['dp']
+        dp_size: 4
+        tp_size: 1
     deployments:
       - name: SamplerManagement
         autoscaling_config:

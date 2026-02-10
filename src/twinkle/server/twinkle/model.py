@@ -154,7 +154,10 @@ def build_model_app(model_id: str,
         def __init__(self, nproc_per_node: int, device_group: Dict[str, Any], device_mesh: Dict[str, Any]):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
-            self.device_mesh = DeviceMesh(**device_mesh)
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             if use_megatron:
                 from twinkle.model import MultiLoraMegatronModel
                 self.model = MultiLoraMegatronModel(

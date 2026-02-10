@@ -100,7 +100,10 @@ def build_model_app(model_id: str,
                                nproc_per_node=nproc_per_node,
                                groups=[self.device_group],
                                lazy_collect=False)
-            self.device_mesh = DeviceMesh(**device_mesh)
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.use_megatron = use_megatron
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:

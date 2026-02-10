@@ -8,7 +8,8 @@
 import os
 
 # Enable Ray debug mode for verbose logging during development
-os.environ['RAY_DEBUG'] = '1'
+# os.environ['RAY_DEBUG'] = '1'
+os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '0'
 
 from twinkle.server import launch_server
 

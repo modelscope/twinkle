@@ -91,12 +91,15 @@ class VLLMEngine(BaseSamplerEngine):
         
         # Initialize engine
         self.engine = self._create_engine()
-        
+
+        self.engine.collective_rpc(method="monkey_patch_model")
         # Tokenizer is lazy loaded via get_tokenizer()
         self._tokenizer = None
+        # breakpoint()
     
     def _create_engine(self):
         """Create and return the vLLM engine."""
+        os.environ["VLLM_USE_V1"] = "1"
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
@@ -511,27 +514,25 @@ class VLLMEngine(BaseSamplerEngine):
 
     async def update_weights(
         self,
-        weights: Dict[str, torch.Tensor],
+        weights,
         peft_config: Optional[dict] = None,
         base_sync_done: bool = False,
         bucket_size_mb: int = 2048,
         **kwargs,
     ) -> None:
-        """Update model weights via ZMQ + CUDA IPC/SHM to worker extension.
+        """Update model weights via ZMQ + CUDA IPC to worker extension.
 
-        vLLM v1 AsyncLLM runs the model in a separate ``WorkerProc`` subprocess.
-        We use a ZMQ REQ/REP + CUDA IPC (or SHM for CPU tensors) channel to
-        stream weights in buckets to the worker, avoiding pickle serialization
-        overhead for large tensor dicts.
+        Accepts **either** a ``dict[str, Tensor]`` (legacy) **or** an async
+        generator / sync generator of ``(name, tensor)`` pairs (streaming).
 
-        LoRA-aware:
-        - ``base_sync_done=False``: Weights loaded via ``load_weights()``
-          in the vLLM worker (base model sync).
-        - ``base_sync_done=True`` with ``peft_config``: Weights loaded as
-          a LoRA adapter via ``add_lora()`` in the vLLM worker.
+        The streaming path avoids accumulating a full model copy on GPU:
+        tensors are consumed one-by-one from the generator, copied into a
+        GPU IPC bucket, and flushed to the vLLM worker subprocess when the
+        bucket is full — identical to verl's approach.
 
         Args:
-            weights: Dict mapping weight names to tensors (GPU or CPU).
+            weights: Weights to transfer.  ``dict[str, Tensor]`` or
+                ``(Async)Generator[tuple[str, Tensor], ...]``.
             peft_config: PEFT config dict for LoRA adapter loading.
             base_sync_done: If True with peft_config, load as LoRA adapter.
             bucket_size_mb: Size of transfer bucket in MB.
@@ -540,14 +541,33 @@ class VLLMEngine(BaseSamplerEngine):
         import time
         import zmq
         import asyncio
-        from concurrent.futures import ThreadPoolExecutor
         from vllm.platforms import current_platform
 
         start_time = time.time()
 
-        # Determine if weights are on GPU (use CUDA IPC) or CPU (use SHM)
-        first_weight = next(iter(weights.values()))
-        use_gpu_ipc = first_weight.is_cuda
+        # Normalise *weights* into an async iterator regardless of input type.
+        if isinstance(weights, dict):
+            async def _dict_iter():
+                for item in weights.items():
+                    yield item
+            weight_aiter = _dict_iter()
+        elif hasattr(weights, '__aiter__'):
+            weight_aiter = weights.__aiter__()
+        else:
+            # sync generator / iterable
+            async def _sync_iter():
+                for item in weights:
+                    yield item
+            weight_aiter = _sync_iter()
+
+        # Peek first tensor to detect device (GPU → IPC, CPU → SHM).
+        try:
+            first_name, first_tensor = await weight_aiter.__anext__()
+        except StopAsyncIteration:
+            logger.warning("update_weights called with empty weights")
+            return
+
+        use_gpu_ipc = first_tensor.is_cuda
         use_shm = not use_gpu_ipc
 
         # Get device UUID for ZMQ handle
@@ -562,7 +582,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         if use_gpu_ipc:
             from torch.multiprocessing.reductions import reduce_tensor
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_weight.device)
+            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
             ipc_handle = reduce_tensor(buffer)
         else:
             from multiprocessing import shared_memory
@@ -575,53 +595,8 @@ class VLLMEngine(BaseSamplerEngine):
         socket = zmq_ctx.socket(zmq.REQ)
         socket.bind(zmq_handle)
 
-        def _send_weights_via_zmq():
-            """Send weights via ZMQ in a separate thread."""
-            if use_gpu_ipc:
-                socket.send_pyobj(ipc_handle)
-            else:
-                socket.send_pyobj({"name": shm_name, "size": bucket_size})
-            socket.recv()  # Wait for worker ready
-
-            offset = 0
-            bucket_meta = {}
-
-            for name, weight in weights.items():
-                if use_shm and weight.is_cuda:
-                    weight = weight.cpu()
-
-                if weight.nbytes > bucket_size:
-                    raise ValueError(
-                        f"Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds "
-                        f"bucket size ({bucket_size_mb} MB). Increase bucket_size_mb."
-                    )
-
-                if offset + weight.nbytes > bucket_size:
-                    torch.cuda.synchronize() if use_gpu_ipc else None
-                    socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    socket.recv()
-                    bucket_meta = {}
-                    offset = 0
-
-                bucket_meta[name] = {
-                    "name": name,
-                    "shape": weight.shape,
-                    "dtype": weight.dtype,
-                    "offset": offset,
-                }
-                buffer[offset:offset + weight.nbytes].copy_(
-                    weight.view(-1).view(torch.uint8), non_blocking=True
-                )
-                offset += weight.nbytes
-
-            if use_gpu_ipc:
-                torch.cuda.synchronize()
-            socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            socket.recv()
-
-        # Run ZMQ communication and collective_rpc concurrently
-        loop = asyncio.get_event_loop()
-        worker_task = asyncio.create_task(
+        # Launch worker side concurrently
+        worker_task = asyncio.ensure_future(
             self.engine.collective_rpc(
                 "update_weights_from_ipc",
                 kwargs={
@@ -634,9 +609,62 @@ class VLLMEngine(BaseSamplerEngine):
 
         await asyncio.sleep(0.1)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            await loop.run_in_executor(executor, _send_weights_via_zmq)
+        # Send IPC/SHM handle, wait for worker ready
+        if use_gpu_ipc:
+            socket.send_pyobj(ipc_handle)
+        else:
+            socket.send_pyobj({"name": shm_name, "size": bucket_size})
+        socket.recv()  # Worker ready
 
+        # Stream weights into buckets and send to worker
+        async def _chain_first():
+            """Re-inject the peeked first tensor, then yield the rest."""
+            yield first_name, first_tensor
+            async for item in weight_aiter:
+                yield item
+
+        offset = 0
+        bucket_meta: dict = {}
+        n_weights = 0
+
+        async for name, weight in _chain_first():
+            if use_shm and weight.is_cuda:
+                weight = weight.cpu()
+
+            if weight.nbytes > bucket_size:
+                raise ValueError(
+                    f"Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds "
+                    f"bucket size ({bucket_size_mb} MB). Increase bucket_size_mb."
+                )
+
+            # Flush current bucket if it would overflow
+            if offset + weight.nbytes > bucket_size:
+                if use_gpu_ipc:
+                    torch.cuda.synchronize()
+                socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                socket.recv()
+                bucket_meta = {}
+                offset = 0
+
+            bucket_meta[name] = {
+                "name": name,
+                "shape": weight.shape,
+                "dtype": weight.dtype,
+                "offset": offset,
+            }
+            buffer[offset:offset + weight.nbytes].copy_(
+                weight.view(-1).view(torch.uint8), non_blocking=True
+            )
+            offset += weight.nbytes
+            n_weights += 1
+
+        # Send last bucket
+        if use_gpu_ipc:
+            torch.cuda.synchronize()
+        socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
+        socket.recv()
+
+        # Wait for worker to finish loading
         await worker_task
 
         # Clean up
@@ -651,7 +679,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         elapsed = time.time() - start_time
         mode = "LoRA" if base_sync_done and peft_config else "base"
-        logger.info(f"Updated {len(weights)} {mode} weights via "
+        logger.info(f"Updated {n_weights} {mode} weights via "
                      f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
 
     async def abort_request(self, request_id: str) -> None:

@@ -237,19 +237,19 @@ def main():
             name='sampler',
             ranks=list(range(MODEL_GPUS, NUM_GPUS)),
             device_type='GPU',
-            gpus_per_worker=4,
+            gpus_per_worker=1,
         ),
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=1, tp_size=SAMPLER_GPUS, ep_size=SAMPLER_GPUS,
+            dp_size=1, pp_size=MODEL_GPUS, ep_size=MODEL_GPUS,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
             world_size=MODEL_GPUS, dp_size=MODEL_GPUS,
         )
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS, tp_size=4
+        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS, tp_size=1
     )
     twinkle.initialize(
         mode='ray',
@@ -316,10 +316,11 @@ def main():
         engine_args={
             'gpu_memory_utilization': 0.7,
             'max_model_len': 2048,
+            'max_loras': 1,
             'max_lora_rank': 32,
             'enforce_eager': True,
             'enable_sleep_mode': False,
-            'enable_lora': False,
+            'enable_lora': True,
             "logprobs_mode": "processed_logprobs",
         },
         device_mesh=sampler_mesh,
@@ -371,7 +372,7 @@ def main():
 
         t0 = time.perf_counter()
         if optim_step % WEIGHT_SYNC_INTERVAL == 0:
-            ckpt_manager.sync_weights()
+            ckpt_manager.sync_weights(merge_and_sync=False)
             sampler.reset_prefix_cache()
         timings['weight_sync'] = time.perf_counter() - t0
 

@@ -79,6 +79,7 @@ class CheckpointEngineManager:
     def sync_weights(self, merge_and_sync=True):
         start_time = time.time()
         model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.world_size -1))
+        model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.data_world_size -1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],
@@ -94,7 +95,7 @@ class CheckpointEngineManager:
         peft_config = None
         if self.base_sync_done and not merge_and_sync:
             if self._peft_config is None:
-                self._peft_config = self.model.get_peft_config_dict(adapter_name)
+                self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
 
         model_result = self.model.send_weights(base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync)

@@ -13,7 +13,9 @@ from .io_utils import create_checkpoint_manager
 if TYPE_CHECKING:
     from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
 elif exists('megatron_core'):
-    from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
+    # Use module-level import to trigger LazyModule's __getattr__ correctly
+    import twinkle.model.megatron as megatron_module
+    _MegatronBase = megatron_module.MultiLoraMegatronModel
 else:
     class _MegatronBase:
         def __init__(self, *args, **kwargs):

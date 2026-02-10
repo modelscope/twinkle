@@ -30,8 +30,6 @@ class TensorLoRARequest(LoRARequest):
 class VLLMLoraWeights(Patch):
 
     def __call__(self, sampler, **kwargs):
-        requires('vllm>=0.11')
-        
         _sampler_ref = sampler
         
         def _get_tokenizer():
