@@ -31,6 +31,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
+from twinkle.reward import MathReward
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
@@ -44,7 +45,7 @@ USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
-SAMPLER_TP = int(os.environ.get('SAMPLER_TP', SAMPLER_GPUS // 2))
+SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 PP_SIZE = 2
@@ -83,10 +84,35 @@ if USE_SWANLAB:
 
 SYSTEM_PROMPT = (
     "You are a helpful math assistant. Solve the problem step by step. "
-    "Show your reasoning in <think> </think> tags, then give the final "
-    "numerical answer after ####.\n"
-    "For example:\n<think> ... reasoning ... </think>\n#### 42"
+    "YOU MUST Show your reasoning in <think> </think> tags, then give the final "
+    "numerical answer with boxed \\boxed{}.\n"
+    "For example:\n<think> ... reasoning ... </think>\n\\boxed{42}"
 )
+
+
+class MathPreprocessor(Preprocessor):
+
+    def __call__(self, sample):
+        if sample['level'] not in ('Level 4', 'Level 5'):
+            return None
+
+        def get_boxed_answer(text):
+            match = re.search(r'\\boxed\{([^}]+)\}', text)
+            return match.group(1) if match else None
+
+        ground_truth = get_boxed_answer(sample['solution'])
+        if ground_truth is None:
+            return None
+        problem = sample['problem']
+        solution = sample['solution']
+        return Trajectory(
+            messages=[
+                Message(role='user', content=problem),
+                Message(role='assistant', content=solution)
+            ],
+            user_data=[('ground_truth', ground_truth)],
+        )
+
 
 
 class GSM8KProcessor(Preprocessor):
@@ -202,13 +228,13 @@ class GSM8KFormatReward(Reward):
 def create_gsm8k_dataset():
     """Create GSM8K dataset."""
     meta = DatasetMeta(
-        "ms://modelscope/gsm8k",
-        subset_name='main', split='train',
-        data_slice=range(DATA_NUM),
+        "ms://modelscope/competition_math",
+        subset_name='default', split='train',
+        data_slice=range(2000),
     )
     dataset = Dataset(meta)
     dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
-    dataset.map(GSM8KProcessor())
+    dataset.map(MathPreprocessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
 
@@ -217,7 +243,7 @@ def compute_rewards(
     trajectories: List[Trajectory],
 ) -> Tuple[List[float], List[float], List[float]]:
     """Compute accuracy and format rewards for GSM8K."""
-    accuracy_reward_fn = GSM8KAccuracyReward()
+    accuracy_reward_fn = MathReward()
     format_reward_fn = GSM8KFormatReward()
 
     accuracy_rewards = accuracy_reward_fn(trajectories, [])

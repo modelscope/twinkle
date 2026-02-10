@@ -110,6 +110,7 @@ def build_sampler_app(model_id: str,
                     model_id=model_id,
                     engine_args=sampler_kwargs,
                     device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
                     **{k: v for k, v in kwargs.items() if k not in ['engine_args']}
                 )
             else:  # torch sampler

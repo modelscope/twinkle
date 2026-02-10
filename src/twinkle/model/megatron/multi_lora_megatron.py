@@ -17,7 +17,6 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
-from .args import TwinkleMegatronArgs, set_args
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
 from ..multi_lora import MultiLora
@@ -42,6 +41,7 @@ class MultiLoraMegatronModel(MegatronModel):
         requires('megatron_core')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        from .args import TwinkleMegatronArgs, set_args
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 

@@ -34,8 +34,6 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from .strategy import MegatronStrategy
 from twinkle.utils import construct_class, exists
-from .args import get_args, set_args, TwinkleMegatronArgs
-from .model import get_megatron_model_meta, GPTBridge
 from twinkle.patch import Patch, apply_patch
 
 
@@ -173,6 +171,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ):
         requires('megatron_core')
+        from .args import get_args, set_args, TwinkleMegatronArgs
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
@@ -240,6 +239,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         load_weights: bool = True,
         **kwargs,
     ) -> List[nn.Module]:
+        from .args import get_args
         args = get_args()
         self.initialize(**kwargs)
         
@@ -1002,6 +1002,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     if isinstance(m, LoraLinear):
                         # just check
                         # TODO untested code
+                        from .args import get_args
                         args = get_args()
                         from .tuners import LoraParallelLinear
                         assert args.is_multimodal and not isinstance(m, LoraParallelLinear)
@@ -1114,6 +1115,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from .args import get_args
         self._try_init_process_group()
         args = get_args()
         init_kwargs = {
@@ -1142,8 +1144,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._initialized = True
 
     @property
-    def _bridge(self) -> GPTBridge:
+    def _bridge(self) -> 'GPTBridge':
         if not hasattr(self, '_bridge_instance'):
+            from .args import get_args
+            from .model import get_megatron_model_meta
             args = get_args()
             megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
             assert megatron_model_meta is not None, f'Model: {args.hf_model_type} is not supported.'
@@ -1181,6 +1185,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Trim any tensor whose dim-0 equals padded_vocab_size back to
         # org_vocab_size — this is shape-based, not name-based, so it works
         # regardless of the model architecture's naming convention.
+        from .args import get_args
         args = get_args()
         org_vocab_size = getattr(self.hf_config, 'vocab_size', args.padded_vocab_size)
         _padded_vocab_size = args.padded_vocab_size
