@@ -34,7 +34,7 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-0.5B-Instruct'
+BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
