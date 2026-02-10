@@ -79,11 +79,9 @@ class CheckpointEngineManager:
     def sync_weights(self, merge_and_sync=True):
         start_time = time.time()
         model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.world_size -1))
-        is_lora_only = self.base_sync_done and bool(adapter_name)
         model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.data_world_size -1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
-            self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],
             self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],
         )
         # Launch both init calls concurrently — TCPStore server (model rank 0)
