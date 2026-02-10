@@ -222,6 +222,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().add_metric(metric_cls, is_training, **kwargs)
 
+    @remote_function(collect='first', lazy_collect=False)
+    def calculate_metric(self, is_training, **kwargs):
+        self._check_adapter_valid(kwargs.get("adapter_name"))
+        return super().calculate_metric(is_training, **kwargs)
+
     @remote_function()
     def remove_adapter(self, adapter_name: str):
         if adapter_name in self.optimizer_group:

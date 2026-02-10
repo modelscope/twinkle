@@ -139,6 +139,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         # Zero gradients
         super().zero_grad(**kwargs)
 
+        return super().calculate_metric(is_training=True, **kwargs)
     @remote_function()
     def load(self, checkpoint_dir: str, **kwargs):
         """

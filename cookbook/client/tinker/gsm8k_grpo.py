@@ -388,23 +388,6 @@ def main():
         fwdbwd_result = training_client.forward_backward(training_data, "importance_sampling").result()
 
         optim_result = training_client.optim_step(types.AdamParams(learning_rate=LEARNING_RATE)).result()
-        
-        # Compute metrics from the forward-backward result
-        # For importance_sampling, we get logprobs and elementwise_loss
-        logprobs_list = []
-        elementwise_losses = []
-        for output in fwdbwd_result.loss_fn_outputs:
-            if output.get('logprobs') is not None:
-                logprobs_list.append(output['logprobs'].to_numpy())
-            if output.get('elementwise_loss') is not None:
-                elementwise_losses.append(output['elementwise_loss'].to_numpy())
-        
-        # Compute average loss per token (weighted by advantages)
-        if elementwise_losses:
-            all_losses = np.concatenate(elementwise_losses)
-            avg_loss = np.mean(all_losses) if len(all_losses) > 0 else 0.0
-        else:
-            avg_loss = 0.0
 
         gc.collect()
 

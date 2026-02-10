@@ -419,9 +419,9 @@ def build_model_app(model_id: str,
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
-                    self.model.step(adam_params=body.adam_params,
+                    metrics = self.model.step(adam_params=body.adam_params,
                                     adapter_name=adapter_name)
-                    return types.OptimStepResponse(metrics=None)
+                    return types.OptimStepResponse(metrics=metrics)
                 except Exception:
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(

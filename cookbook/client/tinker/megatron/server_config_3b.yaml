@@ -61,7 +61,10 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
-          num_gpus: 1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -91,4 +94,7 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
-          num_gpus: 1                 # Sampler needs a full GPU for inference
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"

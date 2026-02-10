@@ -42,14 +42,14 @@ applications:
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: [0, 1]                              # GPU rank indices
+        ranks: [1,2]                              # GPU rank indices
         device_type: cuda
       device_mesh:
         device_type: cuda
         dp_size: 2
       queue_config:
         rps_limit: 100                             # Max requests per second
-        tps_limit: 10000                           # Max tokens per second
+        tps_limit: 100000                           # Max tokens per second
       adapter_config:
         per_token_adapter_limit: 30                # Max concurrent LoRA adapters
         adapter_timeout: 1800                      # Seconds before idle adapter unload
@@ -61,6 +61,10 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -78,11 +82,14 @@ applications:
         logprobs_mode: processed_logprobs # Logprobs mode for sampling results
       device_group:                   # Logical device group for the sampler
         name: sampler
-        ranks: [2]                    # GPU rank indices to use
+        ranks: [3]                    # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda
         dp_size: 1
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 100000                           # Max tokens per second
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -91,4 +98,7 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
-          num_gpus: 1                 # Sampler needs a full GPU for inference
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
