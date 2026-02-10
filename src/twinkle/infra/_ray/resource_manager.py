@@ -162,6 +162,10 @@ class ResourceManager:
                             )
 
                         node_rank = node_ranks[0]
+                        if node_rank >= len(self.node2pg):
+                            raise ValueError(f'No available resources for node {node_rank}, '
+                                             f'available resources are: {bundles}'
+                                             f'CPU: {cpu_bundles}')
                         local_device_groups.append(
                             dict(
                                 node_rank=node_rank,
