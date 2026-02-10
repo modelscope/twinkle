@@ -56,7 +56,7 @@ SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 PP_SIZE = 4
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 4))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
@@ -357,6 +357,7 @@ def main():
             tp_size=2,
             pp_size=2,
             ep_size=2,
+            sequence_parallel=True,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
