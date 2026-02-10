@@ -18,7 +18,7 @@ from twinkle.server.tinker.common import input_feature_to_datum
 from modelscope import AutoTokenizer
 
 # The base model to fine-tune / evaluate
-base_model = "Qwen/Qwen2.5-7B-Instruct"
+base_model = "Qwen/Qwen2.5-3B-Instruct"
 
 
 def train():

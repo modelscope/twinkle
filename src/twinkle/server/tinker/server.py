@@ -92,6 +92,7 @@ def build_server_app(
             self.route_prefix = kwargs.get("route_prefix", "/api/v1")
             self.supported_models = supported_models or [
                 types.SupportedModel(model_name="Qwen/Qwen2.5-0.5B-Instruct"),
+                types.SupportedModel(model_name="Qwen/Qwen2.5-3B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
             ]

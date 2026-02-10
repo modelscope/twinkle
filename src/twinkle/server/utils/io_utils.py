@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Optional, TypeVar, Generic
 from pydantic import BaseModel
 
 from twinkle.hub import HubOperation
+from twinkle import get_logger
+
+logger = get_logger()
 
 
 TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
@@ -276,7 +279,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         Returns:
             Path to token-specific base directory
         """
-        base_path = Path(TWINKLE_DEFAULT_SAVE_DIR)
+        base_path = Path(TWINKLE_DEFAULT_SAVE_DIR).absolute()
         # Sanitize token to avoid filesystem issues
         sanitized_token = re.sub(r'[^\w\-]', '_', self.token)
         return base_path / sanitized_token
@@ -625,6 +628,10 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         path = f"{self.path_prefix}{model_id}/{checkpoint_id}"
         checkpoint_path = self.get_ckpt_dir(model_id, checkpoint_id)
         
+        # For sampler checkpoints, delete existing sampler weights for this model_id
+        if is_sampler:
+            self._delete_existing_sampler_weights(model_id)
+        
         # Read training run info to include in checkpoint metadata
         run_info = self.training_run_manager._read_info(model_id)
         
@@ -647,6 +654,28 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         # Update last_checkpoint in run info
         self.training_run_manager.update(model_id, {'last_checkpoint': ckpt_data})
         return path
+
+    def _delete_existing_sampler_weights(self, model_id: str):
+        """
+        Delete all existing sampler weights for a model_id.
+        
+        Args:
+            model_id: The model identifier
+        """
+        run_dir = self.training_run_manager.get_model_dir(model_id)
+        sampler_weights_dir = run_dir / 'sampler_weights'
+        
+        if sampler_weights_dir.exists() and sampler_weights_dir.is_dir():
+            # Delete all subdirectories in sampler_weights
+            for item in sampler_weights_dir.iterdir():
+                if item.is_dir():
+                    # Delete checkpoint metadata file first
+                    meta_path = item / CHECKPOINT_INFO_FILENAME
+                    if meta_path.exists():
+                        meta_path.unlink()
+                    # Delete the directory
+                    shutil.rmtree(item)
+            logger.info(f"Deleted existing sampler weights for model_id: {model_id}")
 
     def get(self, model_id: str, checkpoint_id: str) -> Optional[Any]:
         """

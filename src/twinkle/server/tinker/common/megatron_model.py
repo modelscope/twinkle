@@ -88,7 +88,7 @@ class TwinkleCompatMegatronModel(_MegatronBase):
                              epsilon=0.2,  # Default GRPO epsilon
                              beta=0.0)     # No KL penalty by default
         # Get template for input processing
-        template = self.get_template(**kwargs)
+        template = self.get_template(adapter_name=adapter_name)
         # Convert Datum to InputFeature
         input_features = datum_to_input_feature(inputs, template)
         # Extract old_logps and advantages using common utility

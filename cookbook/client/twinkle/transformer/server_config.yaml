@@ -33,12 +33,12 @@ applications:
 
   # 2. Model Service - Hosts the base model for training
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-0.5B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-0.5B-Instruct   # REST path for this model
+  - name: models-Qwen2.5-3B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
     import_path: model
     args:
       use_megatron: false                              # Use HuggingFace Transformers (not Megatron)
-      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"     # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
       adapter_config:
         per_token_adapter_limit: 30   # Max LoRA adapters that can be active simultaneously
         adapter_timeout: 1800         # Seconds before an idle adapter is unloaded
@@ -87,11 +87,11 @@ applications:
 
   # 4. Sampler Service - Handles text generation inference
   #    Uses vLLM for efficient batched generation with optional LoRA adapters.
-  - name: sampler-Qwen2.5-7B-Instruct
-    route_prefix: /samplers/Qwen/Qwen2.5-7B-Instruct   # REST path for this sampler
+  - name: sampler-Qwen2.5-3B-Instruct
+    route_prefix: /samplers/Qwen/Qwen2.5-3B-Instruct   # REST path for this sampler
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"        # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"        # ModelScope model identifier to load
       sampler_type: vllm                                 # Sampler backend (vllm or torch)
       nproc_per_node: 1                                  # Number of GPU processes per node
       engine_args:                                       # vLLM engine configuration

@@ -139,7 +139,7 @@ def build_model_app(model_id: str,
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
-                    adapter_config: Dict[str, Any] = None,
+                    adapter_config: Dict[str, Any] = {},
                     **kwargs):
     app = FastAPI()
 

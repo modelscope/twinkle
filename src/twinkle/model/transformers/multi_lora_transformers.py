@@ -51,6 +51,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
+        self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
         self.model = self.strategy.wrap_model(self.model)
