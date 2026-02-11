@@ -27,15 +27,15 @@ Twinkle✨ is a lightweight, client-server training framework engineered
 with modular, high-cohesion interfaces. Whether you are executing locally 
 with `torchrun`, or scaling training across Ray clusters,
 Twinkle✨ eliminates infrastructure friction by encapsulating 
-complex training logic into standardized APIs. Beyond simple 
+training logic into standardized APIs. Beyond simple 
 abstraction, Twinkle✨ serves as a robust backend and gateway to enable serverless Training-as-a-Service (TaaS).
 It offers interfaces that constitute a _superset_ of  [Tinker](https://thinkingmachines.ai/tinker/) APIs, 
-thereby making is possible to access a Twinkle✨ training service via Tinker client or native Twinkle✨-client
+thereby making it possible to access a Twinkle✨ training service via Tinker client or native Twinkle✨ client
 which offers more functionalities.
 
 🧩 <b>Decoupled Architecture</b>: Standardized Interfaces, backward compatible with Tinker APIs.<br>
 🚀 <b>Multiple Runtime Modes</b>: torchrun / Ray / HTTP.<br>
-🔌 <b>Multi-Training Backends</b>: Transformers / Megatron.<br>
+🔌 <b>Versatile Backends</b>: Transformers / Megatron.<br>
 👥 <b>Multi-Tenancy Training Service</b>: Train multiple LoRAs that share one base model deployment.<br>
 
 Note: Twinkle✨is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
