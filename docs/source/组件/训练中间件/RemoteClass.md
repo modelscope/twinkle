@@ -53,8 +53,9 @@ remote_function 在装饰方法的时候有下面的参数：
 - dispatch: 如何分发输入数据。支持 slice/all/slice_dp/函数 四种。slice 会将 list 输入均匀分发（非 list 会全部分发），all 进行全部分发，slice_dp 会将输入数据按照 device_mesh 的 dp 组进行切分分发，来保障模型输入数据的正确性，函数方式支持以自己的实现来分发输入数据：
 
 ```python
-def _dispatcher(length, i, args, kwargs):
+def _dispatcher(length, i, args, kwargs, device_mesh):
     # length 是 worker 数量，i 是当前 rank，args 和 kwargs 是输入数据，在这里具体执行分发逻辑
+    # device_mesh是隶属于目标组件的device_mesh
     return _args_rank, _kwargs_rank
 ```
 
@@ -68,7 +69,8 @@ def _dispatcher(length, i, args, kwargs):
   - 函数: 支持自定义收集方法
 
 ```python
-def _collect(all_results: List):
+def _collect(all_results: List, device_mesh):
+    # device_mesh是隶属于目标组件的device_mesh
     return ...
 ```
 

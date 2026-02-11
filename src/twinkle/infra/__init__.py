@@ -291,7 +291,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif isinstance(method, Callable):
         # Callable
-        return method(result)
+        return method(result, device_mesh=device_mesh)
     else:
         raise ValueError(f'Unsupported collect method: {method}')
 
@@ -355,7 +355,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         length = len(workers)
         result = []
         for i in range(length):
-            sliced_args, sliced_kwargs = dispatch(length, i, args, kwargs)
+            sliced_args, sliced_kwargs = dispatch(length, i, args, kwargs, device_mesh=device_mesh)
             result.append((workers[i], sliced_args, sliced_kwargs))
         return result
     else:
