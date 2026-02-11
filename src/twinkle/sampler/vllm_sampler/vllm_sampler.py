@@ -37,7 +37,7 @@ from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 logger = get_logger()
 
 
-def _collect_sample_responses(results: List[SampleResponse]) -> SampleResponse:
+def _collect_sample_responses(results: List[SampleResponse], **kwargs) -> SampleResponse:
     """Custom collect function to merge multiple SampleResponse objects.
     
     Args:
