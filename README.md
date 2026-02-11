@@ -56,7 +56,7 @@ pip install 'twinkle-kit'
 ```shell
 git clone https://github.com/modelscope/twinkle.git
 cd twinkle
-pip install -e . --no-build-isolation
+pip install -e .
 ```
 
 ## Tutorials
