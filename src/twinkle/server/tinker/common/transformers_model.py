@@ -137,7 +137,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
 
         if resolved.is_twinkle_path:
             # Load from twinkle checkpoint
-            return super().load(name=resolved.checkpoint_name, output_dir=str(resolved.checkpoint_dir), **kwargs)
+            return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
         else:
             # Load from hub
             return super().load(name=resolved.checkpoint_name, **kwargs)

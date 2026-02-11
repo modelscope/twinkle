@@ -175,13 +175,13 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         
         # Create checkpoint manager with the token
         checkpoint_manager = create_checkpoint_manager(token)
-        
+
         # Use resolve_load_path to handle path resolution
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
         
         if resolved.is_twinkle_path:
             # Load from twinkle checkpoint
-            return super().load(name=resolved.checkpoint_name, output_dir=str(resolved.checkpoint_dir), **kwargs)
+            return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
         else:
             # Load from hub
             return super().load(name=resolved.checkpoint_name, **kwargs)
