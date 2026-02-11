@@ -48,6 +48,18 @@ def _collect_forward_backward_results(results):
     
     return [all_outputs, avg_loss]
 
+def _clean_metrics(metrics: dict) -> dict:
+    cleaned = {}
+    for key, value in metrics.items():
+        if isinstance(value, str):
+            import re
+            match = re.match(r'^([+-]?\d*\.?\d+)', value.strip())
+            if match:
+                cleaned[key] = float(match.group(1))
+        else:
+            cleaned[key] = value
+    return cleaned
+
 
 @remote_class(execute='all')
 class TwinkleCompatMegatronModel(_MegatronBase):
@@ -178,6 +190,13 @@ class TwinkleCompatMegatronModel(_MegatronBase):
         super().step(**kwargs)
         # Zero gradients
         super().zero_grad(**kwargs)
+
+
+    @remote_function(collect='first', lazy_collect=False)
+    def calculate_metric(self, is_training, **kwargs):
+        metric = super().calculate_metric(is_training, **kwargs)
+        return _clean_metrics(metric)
+
 
     @remote_function(dispatch='all', sync=True)
     def load(self, checkpoint_dir: str, **kwargs):

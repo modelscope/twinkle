@@ -17,7 +17,7 @@
 #
 # The server must be running first (see server.py and server_config.yaml).
 # Requires both model and sampler services to be configured.
-
+import os
 import gc
 import re
 import numpy as np
@@ -38,12 +38,12 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-3B-Instruct'
+BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 NUM_GENERATIONS = 4
-MAX_NEW_TOKENS = 2048
-LEARNING_RATE = 1e-5
+MAX_NEW_TOKENS = 1024
+LEARNING_RATE = 1e-4
 MAX_STEPS = 100
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1       # Save weights for sampler every N steps
 LORA_RANK = 8
@@ -60,7 +60,7 @@ SYSTEM_PROMPT = (
 USE_SWANLAB = True
 if USE_SWANLAB:
     import swanlab
-    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
+    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
     swanlab.init(project="twinkle-gsm8k", config={
         'model_id': BASE_MODEL,
     })
@@ -363,8 +363,8 @@ def main():
             input_tokens = prompt_ids + sampled_tokens[:-1]
             target_tokens = [0] * ob_len + sampled_tokens
             weights = [0] * ob_len + [1] * len(sampled_tokens)
-            padded_advantages = [advantage] * len(sampled_tokens)
-            padded_logprobs = logprobs
+            padded_advantages = [0.0] * ob_len + [advantage] * len(sampled_tokens)
+            padded_logprobs = [0.0] * ob_len + logprobs
 
             datum = types.Datum(
                 model_input=types.ModelInput.from_ints(input_tokens),
@@ -393,7 +393,8 @@ def main():
 
         # ========== 7. Log ==========
         log_dict = metrics.calculate()
-        log_dict['train/loss_per_token'] = float(avg_loss)
+        if optim_result.metrics:
+            log_dict.update(optim_result.metrics)
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         log_dict['train/num_training_samples'] = len(training_data)
         logger.info(f"Step {step}: {log_dict}")

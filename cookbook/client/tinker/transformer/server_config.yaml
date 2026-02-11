@@ -33,16 +33,17 @@ applications:
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
-  - name: models-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-3B-Instruct
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
     import_path: model
     args:
       use_megatron: false                          # Use HuggingFace Transformers backend
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct" # ModelScope model identifier
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
+      max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: [1,2]                              # GPU rank indices
+        ranks: [0,1]                              # GPU rank indices
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -68,12 +69,12 @@ applications:
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen2.5-3B-Instruct
-    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-3B-Instruct
+  - name: sampler-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-7B-Instruct
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"   # ModelScope model identifier
-      nproc_per_node: 1               # Number of GPU processes per node
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"   # ModelScope model identifier
+      nproc_per_node: 2               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 4096           # Maximum sequence length the engine supports
@@ -82,7 +83,7 @@ applications:
         logprobs_mode: processed_logprobs # Logprobs mode for sampling results
       device_group:                   # Logical device group for the sampler
         name: sampler
-        ranks: [3]                    # GPU rank indices to use
+        ranks: [2]                    # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda

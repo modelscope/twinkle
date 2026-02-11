@@ -71,7 +71,7 @@ class ResourceManager:
             self.min_node_idx = 0
             self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
-        breakpoint()
+        # breakpoint()
         self.nodes = []
         for node in ray.nodes():
             # get available nodes

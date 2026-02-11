@@ -35,6 +35,18 @@ def _collect_forward_backward_results(results):
 
     return [all_outputs, avg_loss]
 
+def _clean_metrics(metrics: dict) -> dict:
+    cleaned = {}
+    for key, value in metrics.items():
+        if isinstance(value, str):
+            import re
+            match = re.match(r'^([+-]?\d*\.?\d+)', value.strip())
+            if match:
+                cleaned[key] = float(match.group(1))
+        else:
+            cleaned[key] = value
+    return cleaned
+
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
@@ -102,7 +114,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         
         # Convert Datum to InputFeature
         input_features = datum_to_input_feature(inputs, template)
-
+        # breakpoint()
         # Forward pass
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
 
@@ -139,7 +151,11 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
         # Zero gradients
         super().zero_grad(**kwargs)
 
-        return super().calculate_metric(is_training=True, **kwargs)
+    @remote_function(collect='first', lazy_collect=False)
+    def calculate_metric(self, is_training, **kwargs):
+        metric = super().calculate_metric(is_training, **kwargs)
+        return _clean_metrics(metric)
+
     @remote_function()
     def load(self, checkpoint_dir: str, **kwargs):
         """
