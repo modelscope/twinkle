@@ -57,17 +57,17 @@ pip install -e . --no-build-isolation
 
 ## 示例教程
 
-| 训练类型                          | 模型框架     | cookbook地址                             |
-| --------------------------------- | ------------ | ---------------------------------------- |
-| FSDP finetuning                   | transformers | [脚本](cookbook/transformers/fsdp2.py)      |
-| FSDP MoE finetuning               | transformers | [脚本](cookbook/transformers/fsdp2_moe.py)  |
+| 训练类型                          | 模型框架     | cookbook地址                                    |
+| --------------------------------- | ------------ | ----------------------------------------------- |
+| FSDP finetuning                   | transformers | [脚本](cookbook/transformers/fsdp2.py)             |
+| FSDP MoE finetuning               | transformers | [脚本](cookbook/transformers/fsdp2_moe.py)         |
 | EP MoE finetuning                 | transformers | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
-| pp/tp/cp finetuning               | megatron     | [脚本](cookbook/megatron/tp.py)             |
-| pp/tp/cp MoE finetuning           | megatron     | [脚本](cookbook/megatron/tp_moe.py)         |
-| tinker client finetuning          | megatron     | [脚本](cookbook/client/tinker/megatron)     |
-| tinker client finetuning/sampling | transformers | [脚本](cookbook/client/tinker/transformer)  |
-| twinkle client finetuning         | megatron     | [脚本](cookbook/client/twinkle/megatron)    |
-| twinkle client finetuning         | transformer  | [脚本](cookbook/client/twinkle/transformer) |
+| pp/tp/cp finetuning               | megatron     | [脚本](cookbook/megatron/tp.py)                    |
+| pp/tp/cp MoE finetuning           | megatron     | [脚本](cookbook/megatron/tp_moe.py)                |
+| tinker client finetuning          | megatron     | [脚本](cookbook/client/tinker/megatron)            |
+| tinker client finetuning/sampling | transformers | [脚本](cookbook/client/tinker/transformer)         |
+| twinkle client finetuning         | megatron     | [脚本](cookbook/client/twinkle/megatron)           |
+| twinkle client finetuning         | transformer  | [脚本](cookbook/client/twinkle/transformer)        |
 
 ## 更新日志
 
@@ -88,18 +88,12 @@ pip install -e . --no-build-isolation
 | Model Type          | Model ID 举例                                                                                                          | Requires             | Support Megatron | HF Model ID                                                                                                |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------- |
 | qwen2 全系列        | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct) ～72B                                  | transformers>=4.37   | ✔               | [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)                                   |
-|                     | [Qwen/Qwen2-72B](https://modelscope.cn/models/Qwen/Qwen2-72B)～72B                                                        | transformers>=4.37   | ✔               | [Qwen/Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)                                                     |
 |                     | [Qwen/Qwen2.5-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct)～72B                                | transformers>=4.37   | ✔               | [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)                               |
 |                     | [Qwen/Qwen2.5-0.5B](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B)～72B                                                  | transformers>=4.37   | ✔               | [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)                                                 |
 | qwen2_moe 全系列    | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://modelscope.cn/models/Qwen/Qwen1.5-MoE-A2.7B-Chat)                                   | transformers>=4.40   | ✔               | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat)                             |
 | qwen3 全系列        | [Qwen/Qwen3-0.6B-Base](https://modelscope.cn/models/Qwen/Qwen3-0.6B-Base)～32B                                            | transformers>=4.51   | ✔               | [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                                           |
 | qwen3_moe 全系列    | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                           | transformers>=4.51   | ✔               | [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                                     |
 |                     | [Qwen/Qwen3-30B-A3B](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B)～235B                                               | transformers>=4.51   | ✔               | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)                                               |
-| chatglm2 全系列     | [ZhipuAI/chatglm2-6b](https://modelscope.cn/models/ZhipuAI/chatglm2-6b)                                                   | transformers<4.42    | ✘               | [zai-org/chatglm2-6b](https://huggingface.co/zai-org/chatglm2-6b)                                             |
-|                     | [ZhipuAI/chatglm2-6b-32k](https://modelscope.cn/models/ZhipuAI/chatglm2-6b-32k)                                           | transformers<4.42    | ✘               | [zai-org/chatglm2-6b-32k](https://huggingface.co/zai-org/chatglm2-6b-32k)                                     |
-| chatglm3 全系列     | [ZhipuAI/chatglm3-6b](https://modelscope.cn/models/ZhipuAI/chatglm3-6b)                                                   | transformers<4.42    | ✘               | [zai-org/chatglm3-6b](https://huggingface.co/zai-org/chatglm3-6b)                                             |
-|                     | [ZhipuAI/chatglm3-6b-base](https://modelscope.cn/models/ZhipuAI/chatglm3-6b-base)                                         | transformers<4.42    | ✘               | [zai-org/chatglm3-6b-base](https://huggingface.co/zai-org/chatglm3-6b-base)                                   |
-|                     | [ZhipuAI/chatglm3-6b-32k](https://modelscope.cn/models/ZhipuAI/chatglm3-6b-32k)~128k                                      | transformers<4.42    | ✘               | [zai-org/chatglm3-6b-32k](https://huggingface.co/zai-org/chatglm3-6b-32k)                                     |
 | chatglm4 全系列     | [ZhipuAI/glm-4-9b-chat](https://modelscope.cn/models/ZhipuAI/glm-4-9b-chat)                                               | transformers>=4.42   | ✘               | [zai-org/glm-4-9b-chat](https://huggingface.co/zai-org/glm-4-9b-chat)                                         |
 |                     | [ZhipuAI/LongWriter-glm4-9b](https://modelscope.cn/models/ZhipuAI/LongWriter-glm4-9b)                                     | transformers>=4.42   | ✘               | [zai-org/LongWriter-glm4-9b](https://huggingface.co/zai-org/LongWriter-glm4-9b)                               |
 | glm_edge 全系列     | [ZhipuAI/glm-edge-1.5b-chat](https://modelscope.cn/models/ZhipuAI/glm-edge-1.5b-chat)                                     | transformers>=4.46   | ✘               | [zai-org/glm-edge-1.5b-chat](https://huggingface.co/zai-org/glm-edge-1.5b-chat)                               |
@@ -209,7 +203,6 @@ Twinkle采用了LoRA池+租户申请的技术方案。这个方案可以支持�
 这些过程可以同时发生在一个基模上，因为模型、Sampler本质上也是twinkle组件的一部分，可以做到任务无关。训练完成后，支持checkpoint推送HuggingFace/ModelScope的模型仓库，默认为私有。twinkle提供了完整的多租户训练解决方案，在server端支持集群化管理和动态扩缩容，可以进行简单定制化后作为企业级服务。
 
 > 作为模块化框架，twinkle本身也可以支持远端临时的独占式训练，即全参数方式。
-
 
 ## 支持的组件
 
