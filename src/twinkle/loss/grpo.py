@@ -305,7 +305,6 @@ class GRPOLoss(Loss):
         Returns:
             loss: Scalar loss value
         """
-        # breakpoint()
         import torch
         labels = inputs.get('labels')
         assert labels is not None, "inputs must contain 'labels'"
