@@ -19,7 +19,6 @@ import torch.multiprocessing as mp
 
 from twinkle.model.transformers.strategy.sequence_parallel import (
     DistributedAttention,
-    _get_sp_group_from_device_mesh,
     sequence_parallel,
 )
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
