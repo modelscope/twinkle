@@ -78,17 +78,17 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         outputs = optimizer_config.outputs if optimizer_config else {}
         logits_list = outputs.get('logits', [])
         
+        # When PP enabled, only logits from last stage are available
+        if not logits_list:
+            return [None, None]
+
         # Process logits to match transformers output format
-        if logits_list and len(logits_list) > 0:
-            if isinstance(logits_list, torch.Tensor):
-                logits = logits_list.detach().cpu()
-            else:
-                # Concatenate logits from multiple microbatches
-                logits = torch.cat([l.detach().cpu() for l in logits_list], dim=0)
-            results = self._get_forward_output(inputs, logits)
+        if isinstance(logits_list, torch.Tensor):
+            logits = logits_list.detach()
         else:
-            # If no logits available (non-last PP stage), return empty results
-            results = [{'logprobs': None, 'elementwise_loss': None} for _ in inputs]
+            # Concatenate logits from multiple microbatches
+            logits = torch.cat([l.detach() for l in logits_list], dim=0)
+        results = self._get_forward_output(inputs, logits)
         
         # Convert loss to scalar
         if isinstance(loss, torch.Tensor):

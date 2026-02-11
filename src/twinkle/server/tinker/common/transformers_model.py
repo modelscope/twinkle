@@ -88,7 +88,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         super().backward(adapter_name=adapter_name, **kwargs)
 
         # shape (batch_size, seq_len, vocab_size)
-        logits = outputs['logits'].detach().cpu()
+        logits = outputs['logits'].detach()
         results = self._get_forward_output(inputs, logits)
         return [results, loss]
 

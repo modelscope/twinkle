@@ -123,8 +123,13 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
 
     try:
         from megatron.core import parallel_state as mpu
+        # breakpoint()
         if mpu.get_tensor_model_parallel_world_size() > 1:
-            return _vocab_parallel_selective_log_softmax(logits, index)
+            try:
+                return _vocab_parallel_selective_log_softmax(logits, index)
+            except Exception:
+                import traceback
+                print(traceback.format_exc())
     except Exception:
         pass
         

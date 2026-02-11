@@ -385,6 +385,31 @@ class DeviceMesh:
             return False
         return Platform.get_rank() in pp_ranks
 
+    def is_tp_last_rank(self) -> bool:
+        """Check if the current rank is the last rank in its Tensor Parallel group."""
+        tp_ranks = self.get_tp_ranks()
+        if not tp_ranks:
+            return True
+        return Platform.get_rank() == tp_ranks[-1]
+
+    def get_tp_ranks(self, rank: Optional[int] = None) -> List[int]:
+        """Get the ranks in the same TP group"""
+        if rank is None:
+            rank = Platform.get_rank()
+
+        tp_dim_idx = self._get_dim_index("tp")
+        if tp_dim_idx is None:
+            return [rank]
+
+        coords = self._get_coord_for_rank(rank)
+        if coords is None:
+            return []
+
+        # Fix all dimensions except TP
+        slices = list(coords)
+        slices[tp_dim_idx] = slice(None)
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
     def get_pp_stage_ranks(self, stage: int) -> Optional[list[int]]:
         pp_dim_idx = self._get_dim_index("pp")
 
