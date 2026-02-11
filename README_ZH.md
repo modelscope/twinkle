@@ -105,6 +105,8 @@ pip install -e .
 
 ## 示例代码
 
+### 使用Ray训练
+
 ```python
 from peft import LoraConfig
 import twinkle
@@ -162,6 +164,45 @@ def train():
 
 if __name__ == '__main__':
     train()
+```
+
+### Tinker兼容的远程训练
+
+```python
+from tqdm import tqdm
+from tinker import types
+from twinkle_client import init_tinker_compat_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.server.tinker.common import input_feature_to_datum
+
+base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# 使用 Twinkle 的 Dataset 组件加载和预处理数据
+dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
+dataset.encode(batched=True, load_from_cache_file=False)
+dataloader = DataLoader(dataset=dataset, batch_size=8)
+
+# 初始化 Tinker 兼容客户端
+service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
+
+# 训练循环：使用 input_feature_to_datum 转换数据格式
+for epoch in range(3):
+    for step, batch in tqdm(enumerate(dataloader)):
+        # 将 Twinkle 的 InputFeature 转换为 Tinker 的 Datum
+        input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
+
+        fwdbwd_future = training_client.forward_backward(input_datum, "cross_entropy")
+        optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
+
+        fwdbwd_result = fwdbwd_future.result()
+        optim_result = optim_future.result()
+
+    training_client.save_state(f"twinkle-lora-{epoch}").result()
 ```
 
 启动训练：
