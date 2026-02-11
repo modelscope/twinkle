@@ -17,7 +17,7 @@
 #
 # The server must be running first (see server.py and server_config.yaml).
 # Requires both model and sampler services to be configured.
-
+import os
 import gc
 import re
 import numpy as np
@@ -38,12 +38,12 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-3B-Instruct'
+BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 NUM_GENERATIONS = 4
-MAX_NEW_TOKENS = 2048
-LEARNING_RATE = 1e-5
+MAX_NEW_TOKENS = 1024
+LEARNING_RATE = 1e-4
 MAX_STEPS = 100
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1       # Save weights for sampler every N steps
 LORA_RANK = 8
@@ -56,6 +56,14 @@ SYSTEM_PROMPT = (
     "For example:\n<think> ... reasoning ... </think>\n#### 42"
 )
 
+# SwanLab experiment tracking
+USE_SWANLAB = True
+if USE_SWANLAB:
+    import swanlab
+    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
+    swanlab.init(project="twinkle-gsm8k", config={
+        'model_id': BASE_MODEL,
+    })
 
 class GSM8KProcessor(Preprocessor):
     """Preprocessor for GSM8K dataset.
@@ -354,18 +362,15 @@ def main():
             ob_len = len(prompt_ids) - 1
             input_tokens = prompt_ids + sampled_tokens[:-1]
             target_tokens = [0] * ob_len + sampled_tokens
+            weights = [0] * ob_len + [1] * len(sampled_tokens)
             padded_advantages = [0.0] * ob_len + [advantage] * len(sampled_tokens)
             padded_logprobs = [0.0] * ob_len + logprobs
-            
-            # Verify lengths match
-            assert len(input_tokens) == len(target_tokens) == len(padded_logprobs) == len(padded_advantages), \
-                f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, " \
-                f"logprobs={len(padded_logprobs)}, advantages={len(padded_advantages)}"
 
             datum = types.Datum(
                 model_input=types.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
                     'target_tokens': target_tokens,
+                    'weights': weights,
                     'logprobs': types.TensorData.from_numpy(np.array(padded_logprobs, dtype=np.float32)),
                     'advantages': types.TensorData.from_numpy(np.array(padded_advantages, dtype=np.float32)),
                 },
@@ -380,40 +385,22 @@ def main():
 
         # Forward-backward pass with importance_sampling (GRPO) loss
         # The training data already contains logprobs and advantages for the GRPO loss
-        fwdbwd_future = training_client.forward_backward(
-            training_data, "importance_sampling")
-        optim_future = training_client.optim_step(
-            types.AdamParams(learning_rate=LEARNING_RATE))
-        
-        fwdbwd_result = fwdbwd_future.result()
-        optim_result = optim_future.result()
+        fwdbwd_result = training_client.forward_backward(training_data, "importance_sampling").result()
 
-        # Compute metrics from the forward-backward result
-        # For importance_sampling, we get logprobs and elementwise_loss
-        logprobs_list = []
-        elementwise_losses = []
-        for output in fwdbwd_result.loss_fn_outputs:
-            if output.get('logprobs') is not None:
-                logprobs_list.append(output['logprobs'].to_numpy())
-            if output.get('elementwise_loss') is not None:
-                elementwise_losses.append(output['elementwise_loss'].to_numpy())
-        
-        # Compute average loss per token (weighted by advantages)
-        if elementwise_losses:
-            all_losses = np.concatenate(elementwise_losses)
-            avg_loss = np.mean(all_losses) if len(all_losses) > 0 else 0.0
-        else:
-            avg_loss = 0.0
+        optim_result = training_client.optim_step(types.AdamParams(learning_rate=LEARNING_RATE)).result()
 
         gc.collect()
 
         # ========== 7. Log ==========
         log_dict = metrics.calculate()
-        log_dict['train/loss_per_token'] = float(avg_loss)
+        if optim_result.metrics:
+            log_dict.update(optim_result.metrics)
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         log_dict['train/num_training_samples'] = len(training_data)
         logger.info(f"Step {step}: {log_dict}")
         step += 1
+        if USE_SWANLAB:
+            swanlab.log(log_dict)
 
     # Save final checkpoint
     save_future = training_client.save_state("gsm8k-grpo-final")

@@ -95,6 +95,7 @@ def build_server_app(
                 types.SupportedModel(model_name="Qwen/Qwen2.5-3B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
+                types.SupportedModel(model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"),
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)
             self._modelscope_config_lock = asyncio.Lock()

@@ -18,7 +18,7 @@ from twinkle.server.tinker.common import input_feature_to_datum
 from modelscope import AutoTokenizer
 
 # The base model to fine-tune / evaluate
-base_model = "Qwen/Qwen2.5-3B-Instruct"
+base_model = "Qwen/Qwen2.5-7B-Instruct"
 
 
 def train():
@@ -83,7 +83,7 @@ def eval():
     # Step 1: Load the trained LoRA checkpoint for inference
 
     # Path to a previously saved LoRA checkpoint (twinkle:// URI)
-    weight_path = "twinkle://20260207_110850-Qwen_Qwen2_5-0_5B-Instruct-ce7e819f/weights/twinkle-lora-2"
+    weight_path = "twinkle://20260211_112719-Qwen_Qwen2_5-7B-Instruct-a74a4826/weights/twinkle-lora-2"
 
     # Connect to the server and create a sampling client with the trained weights
     service_client = init_tinker_compat_client(base_url='http://localhost:8000')
@@ -136,5 +136,5 @@ def eval():
 
 
 if __name__ == "__main__":
-    # train()   # Uncomment to run training
-    eval()      # Run evaluation / inference
+    train()   # Uncomment to run training
+    # eval()      # Run evaluation / inference
