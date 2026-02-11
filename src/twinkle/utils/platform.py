@@ -373,6 +373,57 @@ class DeviceMesh:
         end = (rank + 1) * k + min(rank + 1, m)
         return slice(start, end)
 
+    def get_tp_ranks(self) -> List[int]:
+        """Get all ranks in the same TP group as the current rank."""
+        rank = Platform.get_rank()
+        if not self._has_dim("tp"):
+            return [rank]
+
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return []
+
+        slices = []
+        for i, dim_val in enumerate(coords):
+            if i == tp_idx:
+                slices.append(slice(None))
+            else:
+                slices.append(dim_val)
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def get_tp_last_ranks(self) -> List[int]:
+        """Get a list of all ranks that are the last rank in their respective TP group."""
+        if not self._has_dim("tp"):
+            return self.mesh.flatten().tolist()
+
+        tp_idx = self._get_dim_index("tp")
+        tp_size = self.mesh.shape[tp_idx]
+
+        slices = [slice(None)] * self.mesh.ndim
+        slices[tp_idx] = tp_size - 1
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def is_tp_last_rank(self, rank: Optional[int] = None) -> bool:
+        """Check if the given rank is the last rank in its TP group."""
+        if rank is None:
+            rank = Platform.get_rank()
+        
+        if not self._has_dim("tp"):
+            return True
+            
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return False
+            
+        tp_size = self.mesh.shape[tp_idx]
+        return coords[tp_idx] == tp_size - 1
+    
     def is_pp_first_rank(self) -> bool:
         pp_ranks = self.get_pp_first_ranks()
         if pp_ranks is None:
@@ -384,31 +435,6 @@ class DeviceMesh:
         if pp_ranks is None:
             return False
         return Platform.get_rank() in pp_ranks
-
-    def is_tp_last_rank(self) -> bool:
-        """Check if the current rank is the last rank in its Tensor Parallel group."""
-        tp_ranks = self.get_tp_ranks()
-        if not tp_ranks:
-            return True
-        return Platform.get_rank() == tp_ranks[-1]
-
-    def get_tp_ranks(self, rank: Optional[int] = None) -> List[int]:
-        """Get the ranks in the same TP group"""
-        if rank is None:
-            rank = Platform.get_rank()
-
-        tp_dim_idx = self._get_dim_index("tp")
-        if tp_dim_idx is None:
-            return [rank]
-
-        coords = self._get_coord_for_rank(rank)
-        if coords is None:
-            return []
-
-        # Fix all dimensions except TP
-        slices = list(coords)
-        slices[tp_dim_idx] = slice(None)
-        return sorted(self.mesh[tuple(slices)].flatten().tolist())
 
     def get_pp_stage_ranks(self, stage: int) -> Optional[list[int]]:
         pp_dim_idx = self._get_dim_index("pp")
