@@ -22,7 +22,7 @@ async def verify_request_token(request: Request, call_next):
     Returns:
         JSONResponse with error if validation fails, otherwise the response from call_next
     """
-    authorization = request.headers.get("Authorization")
+    authorization = request.headers.get("Twinkle-Authorization")
     token = authorization[7:] if authorization and authorization.startswith("Bearer ") else authorization
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={"detail": "Invalid token"})
