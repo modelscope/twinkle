@@ -10,7 +10,7 @@ proxy_location: EveryNode
 # HTTP listener settings
 http_options:
   host: 0.0.0.0        # Listen on all network interfaces
-  port: 8000            # Port number for the server
+  port: 9000            # Port number for the server
 
 # Applications: each entry defines a service component deployed on the server
 applications:
