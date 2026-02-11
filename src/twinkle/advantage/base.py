@@ -20,7 +20,7 @@ class Advantage:
         - compute_advantages_rloo: RLOO-style (leave-one-out baseline)
 
         Example:
-            >>> from twinkle.rl import GRPOAdvantage
+            >>> from twinkle.advantage import GRPOAdvantage
             >>> rewards = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # 2 prompts, 4 samples each
             >>> advantages = GRPOAdvantage()(rewards, num_generations=4)
         """
