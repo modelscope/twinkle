@@ -34,10 +34,10 @@ It offers interfaces that constitute a _superset_ of  [Tinker](https://thinkingm
 thereby making it possible to access a Twinkle✨ training service via Tinker client or native Twinkle✨ client
 which offers more functionalities.
 
-🧩 `<b>`Decoupled Architecture`</b>`: Standardized Interfaces, backward compatible with Tinker APIs.`<br>`
-🚀 `<b>`Multiple Runtime Modes`</b>`: torchrun / Ray / HTTP.`<br>`
-🔌 `<b>`Versatile Backends`</b>`: Transformers / Megatron.`<br>`
-👥 `<b>`Multi-Tenancy Training Service`</b>`: Train multiple LoRAs that share one base model deployment.`<br>`
+🧩 <b>Decoupled Architecture</b>: Standardized Interfaces, backward compatible with Tinker APIs.<br>
+🚀 <b>Multiple Runtime Modes</b>: torchrun / Ray / HTTP.<br>
+🔌 <b>Versatile Backends</b>: Transformers / Megatron.<br>
+👥 <b>Multi-Tenancy Training Service</b>: Train multiple LoRAs that share one base model deployment.<br>
 
 Note: Twinkle✨is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
 we expect the two projects to evolve together. We expect some fundamental components in Twinkle✨will likely
