@@ -3,6 +3,7 @@ import numpy as np
 from typing import List
 from tinker import types
 from twinkle.template import Template
+from twinkle.utils.torch_utils import selective_log_softmax
 
 
 def collect_forward_backward_results(results):
@@ -71,10 +72,7 @@ class TwinkleCompatModelBase:
                 feature_logits = logits[i, :seq_len, :]
 
                 # Calculate log probs for all labels
-                # Apply log_softmax to convert raw logits to log-probabilities
-                feature_log_probs = torch.log_softmax(feature_logits, dim=-1)
-                token_log_probs = feature_log_probs.gather(
-                    dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+                token_log_probs = selective_log_softmax(feature_logits, labels)
 
                 # elementwise_loss: positive NLL loss (0.0 where masked)
                 elementwise_loss = -token_log_probs * weights
