@@ -56,7 +56,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
 
