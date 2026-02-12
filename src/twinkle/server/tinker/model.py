@@ -309,9 +309,6 @@ def build_model_app(model_id: str,
                     self.touch_adapter(adapter_name)
 
                     datum_list = body.forward_input.data
-                    assert len(
-                        datum_list) >= self.device_mesh.data_world_size, f"Batch size {len(datum_list)} must be greater than data world size {self.device_mesh.data_world_size}"
-
                     loss_fn_config = body.forward_input.loss_fn_config or {}
 
                     output = self.model.forward_only(inputs=datum_list,
@@ -330,15 +327,19 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            # Calculate input tokens for rate limiting
+            # Calculate input tokens and batch size for validation
+            datum_list = body.forward_input.data
             input_tokens = sum(
-                len(d.model_input.to_ints()) for d in body.forward_input.data
+                len(d.model_input.to_ints()) for d in datum_list
             )
+            batch_size = len(datum_list)
             return await self.schedule_task(
                 _do_forward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
                 task_type='forward',
             )
 
@@ -371,9 +372,6 @@ def build_model_app(model_id: str,
                     self.touch_adapter(adapter_name)
 
                     datum_list = body.forward_backward_input.data
-                    assert len(
-                        datum_list) >= self.device_mesh.data_world_size, f"Batch size {len(datum_list)} must be greater than data world size {self.device_mesh.data_world_size}"
-
                     loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
@@ -397,15 +395,19 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            # Calculate input tokens for rate limiting
+            # Calculate input tokens and batch size for validation
+            datum_list = body.forward_backward_input.data
             input_tokens = sum(
-                len(d.model_input.to_ints()) for d in body.forward_backward_input.data
+                len(d.model_input.to_ints()) for d in datum_list
             )
+            batch_size = len(datum_list)
             return await self.schedule_task(
                 _do_forward_backward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
                 task_type='forward_backward',
             )
 

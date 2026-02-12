@@ -61,8 +61,7 @@ class TaskQueueConfig:
         enabled: Whether rate limiting is enabled.
         token_cleanup_multiplier: Multiplier for token cleanup threshold.
         token_cleanup_interval: How often to run cleanup task (seconds).
-        per_token_adapter_limit: Maximum number of adapters per user token.
-        adapter_timeout: Timeout in seconds for inactive adapters (default 30 minutes).
+        max_input_tokens: Maximum allowed input tokens per request (default 10000).
     """
     rps_limit: float = 100.0           # 10 requests per second
     tps_limit: float = 10000.0        # 10000 input tokens per second
@@ -72,6 +71,7 @@ class TaskQueueConfig:
     # Remove tokens after 10x window inactivity
     token_cleanup_multiplier: float = 10.0
     token_cleanup_interval: float = 60.0    # Run cleanup every 60 seconds
+    max_input_tokens: int = 10000     # Maximum input tokens per request
 
     @classmethod
     def from_dict(cls, config_dict: Optional[Dict[str, Any]] = None) -> 'TaskQueueConfig':
@@ -86,6 +86,7 @@ class TaskQueueConfig:
                 - enabled: whether rate limiting is enabled
                 - token_cleanup_multiplier: multiplier for token cleanup threshold
                 - token_cleanup_interval: cleanup task interval in seconds
+                - max_input_tokens: maximum input tokens per request
 
         Returns:
             TaskQueueConfig instance with values from dict merged with defaults.
@@ -108,6 +109,8 @@ class TaskQueueConfig:
             if 'token_cleanup_interval' in config_dict:
                 config.token_cleanup_interval = float(
                     config_dict['token_cleanup_interval'])
+            if 'max_input_tokens' in config_dict:
+                config.max_input_tokens = int(config_dict['max_input_tokens'])
         return config
 
 @dataclass
@@ -120,46 +123,6 @@ class _QueuedTask:
     task_type: Optional[str]
     created_at: float
     first_rate_limited_at: Optional[float] = None
-
-
-class _DequeTaskQueue:
-    """Unbounded async queue backed by deque, with put_left() support.
-
-    Only implements the subset of asyncio.Queue APIs used in this module.
-    """
-    def __init__(self) -> None:
-        self._q: Deque[Any] = deque()
-        self._unfinished_tasks: int = 0
-        self._finished: asyncio.Event = asyncio.Event()
-        self._finished.set()
-
-    def qsize(self) -> int:
-        return len(self._q)
-
-    async def put(self, item: Any) -> None:
-        self._q.append(item)
-        self._unfinished_tasks += 1
-        self._finished.clear()
-
-    async def put_left(self, item: Any) -> None:
-        self._q.appendleft(item)
-        self._unfinished_tasks += 1
-        self._finished.clear()
-
-    def get_nowait(self) -> Any:
-        if not self._q:
-            raise asyncio.QueueEmpty
-        return self._q.popleft()
-
-    def task_done(self) -> None:
-        if self._unfinished_tasks <= 0:
-            raise ValueError("task_done() called too many times")
-        self._unfinished_tasks -= 1
-        if self._unfinished_tasks == 0:
-            self._finished.set()
-
-    async def join(self) -> None:
-        await self._finished.wait()
 
 
 class TaskQueueMixin:
@@ -203,7 +166,7 @@ class TaskQueueMixin:
         """
         self._task_queue_config = config or TaskQueueConfig()
         # Per-key queues, but executed by a single global worker.
-        self._task_queues: Dict[str, _DequeTaskQueue] = {}
+        self._task_queues: Dict[str, asyncio.Queue] = {}
         self._queue_order: Deque[str] = deque()
         self._new_task_event: asyncio.Event = asyncio.Event()
 
@@ -250,7 +213,7 @@ class TaskQueueMixin:
 
     def _ensure_queue_registered(self, queue_key: str) -> None:
         if queue_key not in self._task_queues:
-            self._task_queues[queue_key] = _DequeTaskQueue()
+            self._task_queues[queue_key] = asyncio.Queue()
         if queue_key not in self._queue_order:
             self._queue_order.append(queue_key)
 
@@ -301,37 +264,7 @@ class TaskQueueMixin:
                         q.task_done()
                         continue
 
-                    # Rate limiting at execution time (requeue on limit)
-                    if self._task_queue_config.enabled and task.token:
-                        allowed, reason = await self._rate_limiter.check_and_record(
-                            task.token, task.input_tokens
-                        )
-                        if not allowed:
-                            if task.first_rate_limited_at is None:
-                                task.first_rate_limited_at = now
-                            # If a task cannot get a slot within a window, fail it.
-                            if (now - task.first_rate_limited_at) > self._task_queue_config.window_seconds:
-                                error_payload = {
-                                    'error': f"Rate limit wait exceeded window: {reason}",
-                                    'category': 'Server'
-                                }
-                                self.state.store_future_status(
-                                    task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
-                                    queue_state=QueueState.PAUSED_RATE_LIMIT.value,
-                                    queue_state_reason=reason,
-                                )
-                                q.task_done()
-                                continue
-
-                            # Put back to FRONT to preserve order, then try other queues
-                            self.state.store_future_status(
-                                task.request_id, TaskStatus.QUEUED.value, task.model_id,
-                                queue_state=QueueState.PAUSED_RATE_LIMIT.value,
-                                queue_state_reason=reason,
-                            )
-                            await q.put_left(task)
-                            q.task_done()
-                            continue
+                    # Rate limiting check has been moved to schedule_task(), so tasks here should pass rate limits
 
                     # Execute
                     executed_any = True
@@ -384,7 +317,7 @@ class TaskQueueMixin:
                 drained.append(q.get_nowait())
             except asyncio.QueueEmpty:
                 break
-
+        
         for task in drained:
             error_payload = {
                 'error': reason,
@@ -405,6 +338,7 @@ class TaskQueueMixin:
         except ValueError:
             pass
 
+
     def fail_pending_tasks_for_model(self, model_id: str, reason: str) -> None:
         """Fail and drop queued tasks for a model. Safe to call from non-async threads."""
         queue_key = self._queue_key(model_id=model_id, token=None)
@@ -419,12 +353,85 @@ class TaskQueueMixin:
 
         self._event_loop.call_soon_threadsafe(_schedule)
 
+    async def _perform_preflight_checks(
+        self,
+        request_id: str,
+        model_id: Optional[str],
+        token: Optional[str],
+        input_tokens: int,
+        batch_size: Optional[int] = None,
+        data_world_size: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Perform pre-flight checks including rate limiting and token validation.
+
+        Args:
+            request_id: The request ID for status tracking.
+            model_id: Optional model_id for error reporting.
+            token: Optional user token for rate limiting.
+            input_tokens: Number of input tokens for validation.
+            batch_size: Optional batch size for validation.
+            data_world_size: Optional data world size for batch size validation.
+
+        Returns:
+            None if checks pass, or error response dict if checks fail.
+        """
+        if not token or not self._task_queue_config.enabled:
+            return None
+
+        # Check max input tokens
+        if input_tokens > self._task_queue_config.max_input_tokens:
+            error_msg = f"Input tokens ({input_tokens}) exceed maximum allowed ({self._task_queue_config.max_input_tokens})"
+            error_payload = {
+                'error': error_msg,
+                'category': 'User'
+            }
+            self.state.store_future_status(
+                request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                queue_state=QueueState.UNKNOWN.value,
+                queue_state_reason=error_msg,
+            )
+            return {'request_id': request_id, 'model_id': model_id}
+
+        # Check batch size if provided
+        if batch_size is not None and data_world_size is not None:
+            if batch_size < data_world_size:
+                error_msg = f"Batch size {batch_size} must be greater than or equal to data world size {data_world_size}"
+                error_payload = {
+                    'error': error_msg,
+                    'category': 'User'
+                }
+                self.state.store_future_status(
+                    request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                    queue_state=QueueState.UNKNOWN.value,
+                    queue_state_reason=error_msg,
+                )
+                return {'request_id': request_id, 'model_id': model_id}
+
+        # Check rate limits
+        allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
+        if not allowed:
+            error_msg = f"Rate limit exceeded: {reason}"
+            error_payload = {
+                'error': error_msg,
+                'category': 'User'
+            }
+            self.state.store_future_status(
+                request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                queue_state=QueueState.PAUSED_RATE_LIMIT.value,
+                queue_state_reason=error_msg,
+            )
+            return {'request_id': request_id, 'model_id': model_id}
+        
+        return None
+
     async def schedule_task(
         self,
         coro_factory: Callable[[], Coroutine],
         model_id: Optional[str] = None,
         token: Optional[str] = None,
         input_tokens: int = 0,
+        batch_size: Optional[int] = None,
+        data_world_size: Optional[int] = None,
         task_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Schedule an async task with rate limiting and status tracking.
@@ -445,12 +452,22 @@ class TaskQueueMixin:
             model_id: Optional model_id to associate with the result.
             token: Optional user token for rate limiting.
             input_tokens: Number of input tokens for tps rate limiting.
+            batch_size: Optional batch size for validation.
+            data_world_size: Optional data world size for batch size validation.
             task_type: Optional task type for logging/observability.
 
         Returns:
             Dict containing request_id and model_id for future retrieval.
         """
+        # Generate request_id first so it can be included in error responses
         request_id = f"req_{uuid.uuid4().hex}"
+        
+        # 1. Pre-flight checks: rate limiting, max token validation, and batch size validation
+        preflight_result = await self._perform_preflight_checks(
+            request_id, model_id, token, input_tokens, batch_size, data_world_size
+        )
+        if preflight_result is not None:
+            return preflight_result
 
         if self._event_loop is None:
             self._event_loop = asyncio.get_running_loop()
@@ -458,20 +475,21 @@ class TaskQueueMixin:
         print(
             f"[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}")
 
-        # 1. Register PENDING status FIRST (fixes race condition)
+
+        # 2. Register PENDING status FIRST
         self.state.store_future_status(
             request_id, TaskStatus.PENDING.value, model_id,
             queue_state=QueueState.ACTIVE.value
         )
 
-        # 2. Route to per-model/per-token queue
+        # 3. Route to per-model/per-token queue
         queue_key = self._queue_key(model_id=model_id, token=token)
         self._ensure_queue_registered(queue_key)
 
-        # 3. Ensure worker is started
+        # 4. Ensure worker is started
         await self._ensure_worker_started()
 
-        # 4. Put task in queue and update status
+        # 5. Put task in queue and update status
         q = self._task_queues[queue_key]
         print(
             f"[TaskQueue] Adding task {request_id} to queue key={queue_key} (current size: {q.qsize()}) type={task_type}")
