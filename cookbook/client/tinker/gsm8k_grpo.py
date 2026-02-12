@@ -33,7 +33,7 @@ from twinkle.reward.base import Reward
 from twinkle.data_format import Trajectory, InputFeature, Message
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
-from modelscope import AutoTokenizer
+from twinkle.template import Template
 
 logger = get_logger()
 
@@ -208,10 +208,9 @@ def main():
     # Step 1: Prepare dataset and dataloader (client-side)
     dataset = create_gsm8k_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
-    tokenizer = AutoTokenizer.from_pretrained(
-        BASE_MODEL, trust_remote_code=True)
+    template = Template(model_id=f'ms://{BASE_MODEL}')
     
-    logger.info("Dataset and tokenizer initialized")
+    logger.info("Dataset and template initialized")
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info("Connecting to Tinker server...")
@@ -293,7 +292,7 @@ def main():
         completion_lengths = []
 
         for idx, seq in enumerate(all_sequences):
-            decoded_text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
+            decoded_text = template.decode(seq.tokens, skip_special_tokens=True)
             # Use the corresponding user data for this sequence
             trajectories.append({
                 'messages': [

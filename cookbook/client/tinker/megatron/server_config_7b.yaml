@@ -50,10 +50,12 @@ applications:
         dp_size: 2
       queue_config:
         rps_limit: 100                             # Max requests per second
-        tps_limit: 100000                           # Max tokens per second
+        tps_limit: 10000                           # Max tokens per second for a single user
+        max_input_tokens: 10000                    # Maximum input tokens per request
       adapter_config:
-        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
-        adapter_timeout: 1800                      # Seconds before idle adapter unload
+        per_token_adapter_limit: 30                # Max concurrent LoRA adapters per user
+        adapter_timeout: 60                        # Seconds before idle adapter unload
+        adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
         autoscaling_config:
