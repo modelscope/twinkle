@@ -37,7 +37,7 @@ from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 logger = get_logger()
 
 
-def _collect_sample_responses(results: List[SampleResponse]) -> SampleResponse:
+def _collect_sample_responses(results: List[SampleResponse], **kwargs) -> SampleResponse:
     """Custom collect function to merge multiple SampleResponse objects.
     
     Args:
@@ -137,7 +137,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self.engine: VLLMEngine = self._run_in_loop(
             self._create_engine_async(VLLMEngine, model_id, engine_kwargs)
         )
-        self._run_in_loop(self.engine.engine.collective_rpc("monkey_patch_model"))
+        # fix: On NPU, monkey_patch_model can trigger Triton compatibility errors and abort sampler init.
+        # fix: Explicitly skip this patch on NPU and keep it for non-NPU paths only.
+        # NPU platform may trigger triton errors with monkey_patch_model
+        if Platform.get_platform().device_prefix() != 'npu':
+            self._run_in_loop(self.engine.engine.collective_rpc("monkey_patch_model"))
         
         VLLMLoraWeights()(self)
 
@@ -454,4 +458,3 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 self._async_thread.join(timeout=5)
         except Exception as e:
             logger.warning(f"vLLMSampler event loop shutdown error: {e}")
-

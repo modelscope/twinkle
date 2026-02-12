@@ -37,7 +37,7 @@ applications:
     route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
     import_path: model
     args:
-      use_megatron: false                          # Use HuggingFace Transformers backend
+      use_megatron: true                          
       model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node

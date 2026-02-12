@@ -31,7 +31,9 @@ class MultiLoraMegatronModel(MegatronModel):
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
                  load_weights: bool = True,
-                 recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
+                 recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+                 recompute_method: Optional[str] = 'uniform',
+                 recompute_num_layers: Optional[int] = 1,
                  recompute_modules: Optional[list] = None,  # Modules to recompute
                  max_loras:int = 5,
                  max_r:int = 32,
@@ -56,7 +58,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
 
@@ -72,11 +74,9 @@ class MultiLoraMegatronModel(MegatronModel):
         ac_kwargs = {
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
+            'recompute_method': recompute_method,
+            'recompute_num_layers': recompute_num_layers,
         }
-        if kwargs.get('recompute_method'):
-            ac_kwargs['recompute_method'] = kwargs.get('recompute_method')
-        if kwargs.get('recompute_num_layers'):
-            ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
 
         # Initialize TwinkleMegatronArgs BEFORE creating the model
         args = TwinkleMegatronArgs.from_hf_config(
@@ -87,6 +87,7 @@ class MultiLoraMegatronModel(MegatronModel):
             sequence_parallel=self.strategy.sequence_parallel,
             **ac_kwargs,
         )
+
         set_args(args)
         self._initialized = False
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)

@@ -912,18 +912,16 @@ class BaseCheckpointManager(BaseFileManager, ABC):
                         f"Checkpoint not found or access denied: {path}"
                     )
             
-            # Get the checkpoint directory
-            checkpoint_dir = str(self.get_ckpt_dir(training_run_id, checkpoint_id))
+            # Get the checkpoint directory parent path (no checkpoint name in the path)
+            checkpoint_dir = self.get_ckpt_dir(training_run_id, checkpoint_id).parent
             
             if validate_exists:
-                # Verify the directory exists
-                from pathlib import Path as PathLib
-                if not PathLib(checkpoint_dir).exists():
+                if not checkpoint_dir.exists():
                     raise ValueError(f"Checkpoint directory not found: {checkpoint_dir}")
             
             return ResolvedLoadPath(
                 checkpoint_name=checkpoint_name,
-                checkpoint_dir=checkpoint_dir,
+                checkpoint_dir=checkpoint_dir.as_posix(),
                 is_twinkle_path=True,
                 training_run_id=training_run_id,
                 checkpoint_id=checkpoint_id

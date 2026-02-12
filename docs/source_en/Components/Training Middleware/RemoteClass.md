@@ -53,8 +53,9 @@ Parameters when remote_function decorates a method:
 - dispatch: How to distribute input data. Supports four types: slice/all/slice_dp/function. slice will evenly distribute list input (non-list will be fully distributed), all performs full distribution, slice_dp will split and distribute the input data according to the dp group of device_mesh to ensure the correctness of model input data. The function method supports distributing input data with your own implementation:
 
 ```python
-def _dispatcher(length, i, args, kwargs):
+def _dispatcher(length, i, args, kwargs, device_mesh):
     # length is the number of workers, i is the current rank, args and kwargs are input data, execute the distribution logic here
+    # device_mesh is the device_mesh belongs to the target component
     return _args_rank, _kwargs_rank
 ```
 
@@ -68,7 +69,8 @@ def _dispatcher(length, i, args, kwargs):
   - function: Supports custom collection methods
 
 ```python
-def _collect(all_results: List):
+def _collect(all_results: List, device_mesh):
+    # device_mesh is the device_mesh belongs to the target component
     return ...
 ```
 

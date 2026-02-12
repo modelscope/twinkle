@@ -10,7 +10,7 @@ proxy_location: EveryNode
 # HTTP listener settings
 http_options:
   host: 0.0.0.0        # Listen on all network interfaces
-  port: 8000            # Port number for the server
+  port: 9000            # Port number for the server
 
 # Applications: each entry defines a service component deployed on the server
 applications:
@@ -50,12 +50,13 @@ applications:
         enable_lora: true             # Allow loading LoRA adapters during inference
       device_group:                   # Logical device group for the sampler
         name: sampler
-        gpus_per_worker: 1
-        ranks: [0,1,2,3]                    # GPU rank indices to use
+        gpus_per_worker: 2
+        ranks: [0,1,2,3,4,5,6,7]                    # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda
         dp_size: 4
+        tp_size: 2
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -67,7 +68,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "16"
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
@@ -80,12 +81,13 @@ applications:
       nproc_per_node: 4                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: [4,5,6,7]                              # GPU rank indices
+        ranks: [8,9,10,11,12,13,14,15]                              # GPU rank indices
         device_type: cuda
       device_mesh:
         device_type: cuda
         dp_size: 2
         tp_size: 2
+        pp:size: 2
         ep_size: 2
 
       queue_config:
@@ -105,4 +107,4 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "16"

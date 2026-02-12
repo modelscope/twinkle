@@ -1,7 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import platform
+import hashlib
+import re
 import shutil
+import socket
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
@@ -373,6 +376,57 @@ class DeviceMesh:
         end = (rank + 1) * k + min(rank + 1, m)
         return slice(start, end)
 
+    def get_tp_ranks(self) -> List[int]:
+        """Get all ranks in the same TP group as the current rank."""
+        rank = Platform.get_rank()
+        if not self._has_dim("tp"):
+            return [rank]
+
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return []
+
+        slices = []
+        for i, dim_val in enumerate(coords):
+            if i == tp_idx:
+                slices.append(slice(None))
+            else:
+                slices.append(dim_val)
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def get_tp_last_ranks(self) -> List[int]:
+        """Get a list of all ranks that are the last rank in their respective TP group."""
+        if not self._has_dim("tp"):
+            return self.mesh.flatten().tolist()
+
+        tp_idx = self._get_dim_index("tp")
+        tp_size = self.mesh.shape[tp_idx]
+
+        slices = [slice(None)] * self.mesh.ndim
+        slices[tp_idx] = tp_size - 1
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def is_tp_last_rank(self, rank: Optional[int] = None) -> bool:
+        """Check if the given rank is the last rank in its TP group."""
+        if rank is None:
+            rank = Platform.get_rank()
+        
+        if not self._has_dim("tp"):
+            return True
+            
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return False
+            
+        tp_size = self.mesh.shape[tp_idx]
+        return coords[tp_idx] == tp_size - 1
+    
     def is_pp_first_rank(self) -> bool:
         pp_ranks = self.get_pp_first_ranks()
         if pp_ranks is None:
@@ -640,6 +694,73 @@ def is_last_rank():
     if not dist.is_initialized():
         return True
     return dist.get_rank() == dist.get_world_size() - 1
+
+
+def _resolve_ascend_physical_device_id(device_id: int) -> int:
+    """Map local NPU device index to physical device id via visible devices."""
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return device_id
+    parts = [p.strip() for p in visible.split(",") if p.strip()]
+    if device_id < 0 or device_id >= len(parts):
+        return device_id
+    return int(parts[device_id])
+
+
+def _get_npu_bus_id_from_npu_smi(device_id: int) -> Optional[str]:
+    """Get NPU Bus-Id from `npu-smi info` output."""
+    try:
+        physical_id = _resolve_ascend_physical_device_id(device_id)
+    except Exception:
+        physical_id = device_id
+
+    try:
+        output = subprocess.check_output(
+            ["npu-smi", "info"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+    except Exception:
+        return None
+
+    # fix: vllm-ascend may not implement get_device_uuid, but we still need a reproducible cross-process device id.
+    # fix: Prefer physical Bus-Id parsed from npu-smi instead of unstable/random identifiers.
+    # Typical line:
+    # | 0     0                   | 0000:9D:00.0  | ...
+    pattern = re.compile(
+        r"^\|\s*\d+\s+(\d+)\s*\|\s*"
+        r"([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s*\|",
+        re.MULTILINE,
+    )
+    for match in pattern.finditer(output):
+        phy_id = int(match.group(1))
+        if phy_id == physical_id:
+            return match.group(2).lower()
+    return None
+
+
+def get_vllm_device_uuid(device_id: int = 0) -> str:
+    """Get vLLM device uuid with NPU Bus-Id special handling."""
+    from vllm.platforms import current_platform
+
+    try:
+        return current_platform.get_device_uuid(device_id)
+    except NotImplementedError:
+        # fix: Root cause was NPU platform calling vLLM base placeholder and raising NotImplementedError.
+        # fix: Use Bus-Id fallback first so sender/receiver compute the same IPC endpoint.
+        # NPU special case: prefer stable PCIe Bus-Id from npu-smi.
+        bus_id = _get_npu_bus_id_from_npu_smi(device_id)
+        if bus_id:
+            return bus_id
+        # fix: If npu-smi is unavailable, fall back to deterministic hash instead of failing hard.
+        # Generic deterministic fallback to keep sender/receiver socket names aligned.
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+            "CUDA_VISIBLE_DEVICES", ""
+        )
+        raw = f"{socket.gethostname()}:{visible}:{device_id}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
 
 def is_master():
     return Platform.is_master()
