@@ -126,12 +126,12 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
-        def _on_adapter_expired(self, adapter_name: str, token: str) -> None:
+        def _on_adapter_expired(self, adapter_name: str) -> None:
             # Called from AdapterManagerMixin's countdown thread.
             self.clear_adapter_state(adapter_name)
             # Fail any pending tasks for this adapter/model.
             self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
-            super()._on_adapter_expired(adapter_name, token)
+            super()._on_adapter_expired(adapter_name)
 
         @app.post('/create_model')
         async def create_model(

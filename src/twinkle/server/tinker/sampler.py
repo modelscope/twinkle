@@ -9,6 +9,7 @@ It supports:
 3. Multi-user inference with rate limiting
 4. Flexible sampling parameters
 """
+import os
 import traceback
 from typing import Any, Dict, Optional
 
@@ -165,6 +166,13 @@ def build_sampler_app(model_id: str,
                         token = request.state.token
                         checkpoint_manager = create_checkpoint_manager(token)
                         adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
+                    
+                    # Validate adapter URI existence if provided
+                    if not adapter_uri or not os.path.exists(adapter_uri):
+                        return types.RequestFailedResponse(
+                            error=f"Adapter URI {model_path} does not exist. Please check the model_path.",
+                            category=types.RequestErrorCategory.User,
+                        )
                     
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
