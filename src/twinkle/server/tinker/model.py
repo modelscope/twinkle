@@ -125,11 +125,20 @@ def build_model_app(model_id: str,
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
+            # Training state: require at least one forward_backward before optim_step.
+            # Keyed by adapter_name.
+            self._grad_ready: Dict[str, bool] = {}
+
             # Initialize task queue
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
+
+        def _on_adapter_expired(self, adapter_name: str, token: str) -> None:
+            # Called from AdapterManagerMixin's countdown thread.
+            self._grad_ready.pop(adapter_name, None)
+            super()._on_adapter_expired(adapter_name, token)
 
         @app.post('/create_model')
         async def create_model(
@@ -182,12 +191,18 @@ def build_model_app(model_id: str,
                         self.model.set_optimizer('Adam',
                                                  adapter_name=adapter_name)
 
+                        # Fresh adapter has no accumulated gradients.
+                        self._grad_ready[adapter_name] = False
+
                     training_run_manager = create_training_run_manager(
                         request.state.token)
                     training_run_manager.save(model_id, body)
 
                     return types.CreateModelResponse(model_id=model_id)
                 except Exception:
+                    # Ensure we don't leave stale grad state.
+                    adapter_name = self.get_adapter_name(adapter_name=model_id)
+                    self._grad_ready.pop(adapter_name, None)
                     # If adapter creation fails, decrement the count
                     self.check_adapter_limit(request.state.token, False)
 
@@ -198,9 +213,11 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _create_adapter(),
+                _create_adapter,
                 model_id=model_id,
                 token=request.state.token,
+                adapter_name=model_id,
+                task_type='create_model',
             )
 
 
@@ -257,6 +274,7 @@ def build_model_app(model_id: str,
                 # Only remove adapter, not the base model
                 adapter_name = self.get_adapter_name(
                     adapter_name=body.model_id)
+                self._grad_ready.pop(adapter_name, None)
                 if self.get_adapter_info(adapter_name):
                     self.model.remove_adapter(adapter_name)
                     # Unregister adapter from rate limiter
@@ -267,9 +285,11 @@ def build_model_app(model_id: str,
                 return types.UnloadModelResponse(model_id=body.model_id)
 
             return await self.schedule_task(
-                _do_unload(),
+                _do_unload,
                 model_id=body.model_id,
                 token=request.state.token,
+                adapter_name=body.model_id,
+                task_type='unload_model',
             )
 
         @app.post('/forward')
@@ -324,10 +344,12 @@ def build_model_app(model_id: str,
                 len(d.model_input.to_ints()) for d in body.forward_input.data
             )
             return await self.schedule_task(
-                _do_forward(),
+                _do_forward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                adapter_name=body.model_id,
+                task_type='forward',
             )
 
         @app.post('/forward_backward')
@@ -371,6 +393,8 @@ def build_model_app(model_id: str,
                                                                 loss_fn=loss_fn,
                                                                 **loss_fn_config)
                     output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
+                    # Mark gradients as ready after a successful forward_backward.
+                    self._grad_ready[adapter_name] = True
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,
                         loss_fn_outputs=output,
@@ -388,10 +412,12 @@ def build_model_app(model_id: str,
                 len(d.model_input.to_ints()) for d in body.forward_backward_input.data
             )
             return await self.schedule_task(
-                _do_forward_backward(),
+                _do_forward_backward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                adapter_name=body.model_id,
+                task_type='forward_backward',
             )
 
         @app.post('/optim_step')
@@ -416,11 +442,19 @@ def build_model_app(model_id: str,
                         adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
+                    # Disallow empty step (must have at least one forward_backward since last step)
+                    if not self._grad_ready.get(adapter_name, False):
+                        raise RuntimeError(
+                            f"No accumulated gradients for adapter={adapter_name}; call forward_backward before optim_step"
+                        )
+
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
                     self.model.step(adam_params=body.adam_params,
                                     adapter_name=adapter_name)
+                    # Clear grad-ready after a successful step.
+                    self._grad_ready[adapter_name] = False
                     metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
                     return types.OptimStepResponse(metrics=metrics)
                 except Exception:
@@ -431,9 +465,11 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_optim(),
+                _do_optim,
                 model_id=body.model_id,
                 token=request.state.token,
+                adapter_name=body.model_id,
+                task_type='optim_step',
             )
 
         @app.post('/save_weights')
@@ -492,9 +528,11 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_save(),
+                _do_save,
                 model_id=body.model_id,
                 token=request.state.token,
+                adapter_name=body.model_id,
+                task_type='save_weights',
             )
 
         @app.post('/save_weights_for_sampler')
@@ -566,9 +604,11 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_save_for_sampler(),
+                _do_save_for_sampler,
                 model_id=body.model_id,
                 token=request.state.token,
+                adapter_name=body.model_id,
+                task_type='save_weights_for_sampler',
             )
 
         @app.post('/load_weights')
@@ -609,6 +649,9 @@ def build_model_app(model_id: str,
                                     load_optimizer=load_optimizer,
                                     adapter_name=adapter_name,
                                     token=token)
+
+                    # Loading a checkpoint should reset step readiness.
+                    self._grad_ready[adapter_name] = False
                     return types.LoadWeightsResponse(path=body.path,
                                                      type='load_weights')
                 except Exception:
@@ -619,9 +662,11 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_load(),
+                _do_load,
                 model_id=body.model_id,
                 token=request.state.token,
+                adapter_name=body.model_id,
+                task_type='load_weights',
             )
 
     return ModelManagement.options(**deploy_options).bind(

@@ -220,9 +220,10 @@ def build_sampler_app(model_id: str,
             # Calculate input tokens for rate limiting
             input_tokens = len(body.prompt.to_ints())
             return await self.schedule_task(
-                _do_sample(),
+                _do_sample,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                task_type='sample',
             )
 
     return SamplerManagement.options(**deploy_options).bind(
