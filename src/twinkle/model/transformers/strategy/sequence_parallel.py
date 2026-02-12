@@ -969,34 +969,55 @@ class SequenceParallelStrategy:
             return loss
         if labels is None or sequence_parallel._sp_group is None:
             return loss
-        # Compute full-sequence loss in forward, but keep backward local to this rank.
-        reduction = str(self.sp_config.get('loss_reduction', 'mean')).lower()
-        if reduction == 'none':
-            raise ValueError("SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
-                             'Please aggregate per-token losses before calling reduce_loss.')
+        # Compute global loss via autograd-aware all-reduce.
+        reduction = str(self.sp_config.get("loss_reduction", "mean")).lower()
+        if reduction == "none":
+            raise ValueError(
+                "SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
+                "Please aggregate per-token losses before calling reduce_loss."
+            )
+
+        class _ReduceSequenceParallelLoss(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, local_sum: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
+                if num_valid_tokens.item() == 0:
+                    local_sum = torch.nan_to_num(local_sum)
+                local_tokens = num_valid_tokens.detach().clone()
+                global_sum = local_sum.detach().clone()
+                dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+                global_tokens = num_valid_tokens.detach().clone()
+                dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
+                ctx.save_for_backward(local_tokens, global_tokens)
+                if global_tokens.item() == 0:
+                    return local_sum
+                return global_sum / global_tokens
+
+            @staticmethod
+            def backward(ctx, grad_output: torch.Tensor):
+                local_tokens, global_tokens = ctx.saved_tensors
+                if global_tokens.item() == 0:
+                    return grad_output, None
+                grad_local_sum = grad_output * (local_tokens / global_tokens)
+                return grad_local_sum, None
+
+        class _ReduceSequenceParallelSum(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, local_sum: torch.Tensor) -> torch.Tensor:
+                global_sum = local_sum.detach().clone()
+                dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+                return global_sum
+
+            @staticmethod
+            def backward(ctx, grad_output: torch.Tensor):
+                return grad_output
+
+        if reduction == "sum":
+            return _ReduceSequenceParallelSum.apply(loss)
+
+        # Default to mean reduction: assume `loss` is local mean, convert to local sum.
         num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
-        if reduction == 'sum':
-            local_sum = loss
-            global_sum = local_sum.detach().clone()
-            dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-            out = global_sum + (local_sum - local_sum.detach())
-            if sequence_parallel.world_size > 1:
-                out_metric = out.detach() / sequence_parallel.world_size
-                return out_metric + (out - out.detach())
-            return out
-        # Default to mean reduction.
         local_sum = loss * num_valid_tokens
-        global_sum = local_sum.detach().clone()
-        dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-        global_tokens = num_valid_tokens.detach().clone()
-        dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
-        if global_tokens.item() == 0:
-            return loss
-        out = (global_sum + (local_sum - local_sum.detach())) / global_tokens
-        if sequence_parallel.world_size > 1:
-            out_metric = out.detach() / sequence_parallel.world_size
-            return out_metric + (out - out.detach())
-        return out
+        return _ReduceSequenceParallelLoss.apply(local_sum, num_valid_tokens)
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()
