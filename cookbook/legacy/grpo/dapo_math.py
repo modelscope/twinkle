@@ -55,12 +55,12 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 1))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 PP_SIZE = 4
-NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 4))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
+NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRPO_EPSILON = float(os.environ.get('GRPO_EPSILON', 0.2))
 GRPO_BETA = float(os.environ.get('GRPO_BETA', 0.0))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
+MAX_STEPS = int(os.environ.get('MAX_STEPS', 2000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 1))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
@@ -387,7 +387,7 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.8,
-            'max_model_len': 8192,
+            'max_model_len': 6000,
             'max_loras': 1,
             'max_lora_rank': 32,
             'enable_sleep_mode': False,
@@ -408,7 +408,7 @@ def main():
             remote_group='model',
             mixed_precision='bf16',
             recompute_granularity='full',
-            recompute_num_layers=None,
+            recompute_num_layers=1,
         )
     else:
         model = TransformersModel(

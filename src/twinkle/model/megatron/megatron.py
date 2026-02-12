@@ -1240,28 +1240,41 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 else:
                     yield from _raw_weights()
 
-        async def _send():
-            await engine.send_weights(weight_generator())
+        is_sender = (engine.rank is not None and engine.rank == 0)
 
-        result_container = {'error': None}
+        if not is_sender:
+            for _name, _tensor in weight_generator():
+                pass
+            return
 
-        def _run():
+        import queue
+        buf: queue.Queue = queue.Queue(maxsize=4)
+        error: list = []
+
+        def _send():
+            def _iter():
+                while (item := buf.get()) is not None:
+                    yield item
+            loop = asyncio.new_event_loop()
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_send())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
+                loop.run_until_complete(engine.send_weights(_iter()))
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                loop.close()
 
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-
-        if result_container['error'] is not None:
-            raise result_container['error']
+        sender = threading.Thread(target=_send, name="ce-broadcast", daemon=True)
+        sender.start()
+        try:
+            for name, tensor in weight_generator():
+                buf.put((name, tensor.clone()))
+                if error:
+                    break
+        finally:
+            buf.put(None)  # sentinel
+        sender.join()
+        if error:
+            raise error[0]
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:

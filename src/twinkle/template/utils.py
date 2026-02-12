@@ -127,7 +127,15 @@ def tokenize_with_assistant_labels(
             "Placeholder might appear in original content."
         )
 
-    labels = build_labels(full_ids, template_parts)
+    try:
+        labels = build_labels(full_ids, template_parts)
+    except ValueError as e:
+        newline_placeholder_ids = tokenizer.encode("\n" + placeholder, **extra_kwargs)
+        template_parts = split_by_subsequence(template_ids, newline_placeholder_ids)
+        if len(template_parts) == assistant_count + 1:
+            labels = build_labels(full_ids, template_parts)
+        else:
+            raise e
     if labels and labels[-1] == -100:
         end_idx = len(labels)
         start_idx = end_idx - 1

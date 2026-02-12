@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from twinkle import get_logger
 import torch
 from twinkle.utils.framework import Torch
+from twinkle.utils.platform import get_vllm_device_uuid
 
 logger = get_logger()
 
@@ -62,12 +63,6 @@ def _rebuild_shared_memory(name: str, size: int):
     shm = shared_memory.SharedMemory(name=name)
     tensor = torch.frombuffer(shm.buf[:size], dtype=torch.uint8)
     return tensor, shm
-
-
-def _get_device_uuid(device_id: int) -> str:
-    """Get unique device identifier."""
-    from vllm.platforms import current_platform
-    return current_platform.get_device_uuid(device_id)
 
 
 class TwinkleWorkerExtension:
@@ -122,7 +117,10 @@ class TwinkleWorkerExtension:
         import torch.distributed as dist
 
         if self.device is None:
-            self.device = torch.device(Torch.get_device())
+            # fix: In some worker paths, omitting local_rank can pick the wrong device / trigger get_device arg issues.
+            # fix: Pass local_rank when available so each worker binds to the expected local device.
+            print(f"VLLM Worker local_rank: {getattr(self, 'local_rank', None)} <<<<<<<<<<<<< {Torch.get_device()}")
+            self.device = torch.device(Torch.get_device(getattr(self, "local_rank", None)))
 
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
@@ -257,7 +255,8 @@ class TwinkleWorkerExtension:
             base_sync_done: If True with peft_config, load as LoRA adapter.
         """
         if self.device is None:
-            self.device = torch.device(Torch.get_device())
+            # fix: Keep device resolution consistent with update_weights_from_ipc to avoid path divergence.
+            self.device = torch.device(Torch.get_device(getattr(self, "local_rank", None)))
 
         weight_list = list(weights.items())
         self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
@@ -374,5 +373,6 @@ class TwinkleWorkerExtension:
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for IPC communication."""
         if not hasattr(self, '_device_uuid') or not self._device_uuid:
-            self._device_uuid = _get_device_uuid(self.device.index)
+            # fix: Always use platform fallback to avoid worker-side crashes when NPU get_device_uuid is unimplemented.
+            self._device_uuid = get_vllm_device_uuid(self.device.index)
         return f"ipc:///tmp/twinkle-ipc-{self._device_uuid}.sock"
