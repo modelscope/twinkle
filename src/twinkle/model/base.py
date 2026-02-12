@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import abstractmethod, ABC
 from typing import Dict, Any, Union, Type, Optional, Callable, TYPE_CHECKING
-
+import os
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
@@ -138,7 +138,6 @@ class TwinkleModel(ABC):
             )
 
     def _try_init_process_group(self):
-        import os
         import torch
         import torch.distributed as dist
         if not dist.is_initialized() and Platform.get_world_size() > 1:
