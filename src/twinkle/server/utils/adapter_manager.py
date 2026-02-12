@@ -82,6 +82,7 @@ class AdapterManagerMixin:
                 'last_activity': current_time,
                 'created_at': current_time,
                 'inactivity_counter': 0,
+                'state': {},
             }
             logger.debug(
                 f"[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...")
@@ -103,6 +104,48 @@ class AdapterManagerMixin:
                     f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}...")
                 return True
             return False
+
+    def set_adapter_state(self, adapter_name: str, key: str, value: Any) -> None:
+        """Set a per-adapter state value.
+
+        This is intentionally generic so higher-level services can store
+        adapter-scoped state (e.g., training readiness) without maintaining
+        separate side maps.
+        """
+        with self._adapter_lock:
+            info = self._adapter_records.get(adapter_name)
+            if info is None:
+                return
+            state = info.setdefault('state', {})
+            state[key] = value
+
+    def get_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
+        """Get a per-adapter state value."""
+        with self._adapter_lock:
+            info = self._adapter_records.get(adapter_name)
+            if info is None:
+                return default
+            state = info.get('state') or {}
+            return state.get(key, default)
+
+    def pop_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
+        """Pop a per-adapter state value."""
+        with self._adapter_lock:
+            info = self._adapter_records.get(adapter_name)
+            if info is None:
+                return default
+            state = info.get('state')
+            if not isinstance(state, dict):
+                return default
+            return state.pop(key, default)
+
+    def clear_adapter_state(self, adapter_name: str) -> None:
+        """Clear all per-adapter state values."""
+        with self._adapter_lock:
+            info = self._adapter_records.get(adapter_name)
+            if info is None:
+                return
+            info['state'] = {}
 
     def touch_adapter(self, adapter_name: str) -> bool:
         """Update adapter activity timestamp to prevent timeout.
@@ -161,6 +204,10 @@ class AdapterManagerMixin:
             token: User token that owns this adapter.
         """
         try:
+            # Best-effort cleanup of adapter state
+            with self._adapter_lock:
+                if adapter_name in self._adapter_records:
+                    self._adapter_records[adapter_name]['state'] = {}
             # Remove adapter from model
             self.model.remove_adapter(adapter_name)
             logger.info(

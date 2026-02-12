@@ -58,11 +58,6 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
-    # adapter_config can be None; expanding with ** would raise TypeError and break Serve init.
-    # Normalize to {} so AdapterManagerMixin uses its default timeout/limits.
-    if adapter_config is None:
-        adapter_config = {}
-
     app = FastAPI()
 
     @app.middleware('http')
@@ -125,10 +120,6 @@ def build_model_app(model_id: str,
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
-            # Training state: require at least one forward_backward before optim_step.
-            # Keyed by adapter_name.
-            self._grad_ready: Dict[str, bool] = {}
-
             # Initialize task queue
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
@@ -137,7 +128,9 @@ def build_model_app(model_id: str,
 
         def _on_adapter_expired(self, adapter_name: str, token: str) -> None:
             # Called from AdapterManagerMixin's countdown thread.
-            self._grad_ready.pop(adapter_name, None)
+            self.clear_adapter_state(adapter_name)
+            # Fail any pending tasks for this adapter/model.
+            self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
             super()._on_adapter_expired(adapter_name, token)
 
         @app.post('/create_model')
@@ -192,7 +185,7 @@ def build_model_app(model_id: str,
                                                  adapter_name=adapter_name)
 
                         # Fresh adapter has no accumulated gradients.
-                        self._grad_ready[adapter_name] = False
+                        self.set_adapter_state(adapter_name, 'grad_ready', False)
 
                     training_run_manager = create_training_run_manager(
                         request.state.token)
@@ -202,7 +195,7 @@ def build_model_app(model_id: str,
                 except Exception:
                     # Ensure we don't leave stale grad state.
                     adapter_name = self.get_adapter_name(adapter_name=model_id)
-                    self._grad_ready.pop(adapter_name, None)
+                    self.clear_adapter_state(adapter_name)
                     # If adapter creation fails, decrement the count
                     self.check_adapter_limit(request.state.token, False)
 
@@ -216,7 +209,6 @@ def build_model_app(model_id: str,
                 _create_adapter,
                 model_id=model_id,
                 token=request.state.token,
-                adapter_name=model_id,
                 task_type='create_model',
             )
 
@@ -274,7 +266,7 @@ def build_model_app(model_id: str,
                 # Only remove adapter, not the base model
                 adapter_name = self.get_adapter_name(
                     adapter_name=body.model_id)
-                self._grad_ready.pop(adapter_name, None)
+                self.clear_adapter_state(adapter_name)
                 if self.get_adapter_info(adapter_name):
                     self.model.remove_adapter(adapter_name)
                     # Unregister adapter from rate limiter
@@ -288,7 +280,6 @@ def build_model_app(model_id: str,
                 _do_unload,
                 model_id=body.model_id,
                 token=request.state.token,
-                adapter_name=body.model_id,
                 task_type='unload_model',
             )
 
@@ -348,7 +339,6 @@ def build_model_app(model_id: str,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
-                adapter_name=body.model_id,
                 task_type='forward',
             )
 
@@ -394,7 +384,7 @@ def build_model_app(model_id: str,
                                                                 **loss_fn_config)
                     output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     # Mark gradients as ready after a successful forward_backward.
-                    self._grad_ready[adapter_name] = True
+                    self.set_adapter_state(adapter_name, 'grad_ready', True)
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,
                         loss_fn_outputs=output,
@@ -416,7 +406,6 @@ def build_model_app(model_id: str,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
-                adapter_name=body.model_id,
                 task_type='forward_backward',
             )
 
@@ -443,7 +432,7 @@ def build_model_app(model_id: str,
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
                     # Disallow empty step (must have at least one forward_backward since last step)
-                    if not self._grad_ready.get(adapter_name, False):
+                    if not self.get_adapter_state(adapter_name, 'grad_ready', False):
                         raise RuntimeError(
                             f"No accumulated gradients for adapter={adapter_name}; call forward_backward before optim_step"
                         )
@@ -454,7 +443,7 @@ def build_model_app(model_id: str,
                     self.model.step(adam_params=body.adam_params,
                                     adapter_name=adapter_name)
                     # Clear grad-ready after a successful step.
-                    self._grad_ready[adapter_name] = False
+                    self.set_adapter_state(adapter_name, 'grad_ready', False)
                     metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
                     return types.OptimStepResponse(metrics=metrics)
                 except Exception:
@@ -468,7 +457,6 @@ def build_model_app(model_id: str,
                 _do_optim,
                 model_id=body.model_id,
                 token=request.state.token,
-                adapter_name=body.model_id,
                 task_type='optim_step',
             )
 
@@ -531,7 +519,6 @@ def build_model_app(model_id: str,
                 _do_save,
                 model_id=body.model_id,
                 token=request.state.token,
-                adapter_name=body.model_id,
                 task_type='save_weights',
             )
 
@@ -607,7 +594,6 @@ def build_model_app(model_id: str,
                 _do_save_for_sampler,
                 model_id=body.model_id,
                 token=request.state.token,
-                adapter_name=body.model_id,
                 task_type='save_weights_for_sampler',
             )
 
@@ -651,7 +637,7 @@ def build_model_app(model_id: str,
                                     token=token)
 
                     # Loading a checkpoint should reset step readiness.
-                    self._grad_ready[adapter_name] = False
+                    self.set_adapter_state(adapter_name, 'grad_ready', False)
                     return types.LoadWeightsResponse(path=body.path,
                                                      type='load_weights')
                 except Exception:
@@ -665,7 +651,6 @@ def build_model_app(model_id: str,
                 _do_load,
                 model_id=body.model_id,
                 token=request.state.token,
-                adapter_name=body.model_id,
                 task_type='load_weights',
             )
 

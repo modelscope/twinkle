@@ -10,11 +10,13 @@ This module provides:
 from __future__ import annotations
 
 import asyncio
+import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Deque, Dict, Optional
 
 from twinkle.utils.logger import get_logger
 from .rate_limiter import RateLimiter
@@ -108,6 +110,57 @@ class TaskQueueConfig:
                     config_dict['token_cleanup_interval'])
         return config
 
+@dataclass
+class _QueuedTask:
+    request_id: str
+    coro_factory: Callable[[], Coroutine]
+    model_id: Optional[str]
+    token: Optional[str]
+    input_tokens: int
+    task_type: Optional[str]
+    created_at: float
+    first_rate_limited_at: Optional[float] = None
+
+
+class _DequeTaskQueue:
+    """Unbounded async queue backed by deque, with put_left() support.
+
+    Only implements the subset of asyncio.Queue APIs used in this module.
+    """
+    def __init__(self) -> None:
+        self._q: Deque[Any] = deque()
+        self._unfinished_tasks: int = 0
+        self._finished: asyncio.Event = asyncio.Event()
+        self._finished.set()
+
+    def qsize(self) -> int:
+        return len(self._q)
+
+    async def put(self, item: Any) -> None:
+        self._q.append(item)
+        self._unfinished_tasks += 1
+        self._finished.clear()
+
+    async def put_left(self, item: Any) -> None:
+        self._q.appendleft(item)
+        self._unfinished_tasks += 1
+        self._finished.clear()
+
+    def get_nowait(self) -> Any:
+        if not self._q:
+            raise asyncio.QueueEmpty
+        return self._q.popleft()
+
+    def task_done(self) -> None:
+        if self._unfinished_tasks <= 0:
+            raise ValueError("task_done() called too many times")
+        self._unfinished_tasks -= 1
+        if self._unfinished_tasks == 0:
+            self._finished.set()
+
+    async def join(self) -> None:
+        await self._finished.wait()
+
 
 class TaskQueueMixin:
     """Mixin providing task queue management, rate limiting, and status tracking.
@@ -149,9 +202,10 @@ class TaskQueueMixin:
             config: Optional TaskQueueConfig. If None, uses default config.
         """
         self._task_queue_config = config or TaskQueueConfig()
-        # Per-key queues to avoid cross-adapter head-of-line blocking.
-        # Key is usually adapter_name; falls back to token/default.
-        self._task_queues: Dict[str, asyncio.Queue] = {}
+        # Per-key queues, but executed by a single global worker.
+        self._task_queues: Dict[str, _DequeTaskQueue] = {}
+        self._queue_order: Deque[str] = deque()
+        self._new_task_event: asyncio.Event = asyncio.Event()
 
         # Initialize rate limiter for RPS/TPS control
         self._rate_limiter = RateLimiter(
@@ -164,80 +218,206 @@ class TaskQueueMixin:
         # Start the rate limiter cleanup task
         self._rate_limiter.start_cleanup_task()
 
-        # Per-key workers
-        self._queue_workers: Dict[str, asyncio.Task] = {}
-        self._queue_worker_start_lock = asyncio.Lock()
+        # Single worker to ensure model operations remain serial.
+        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_started = False
+        self._worker_start_lock = asyncio.Lock()
+
+        # Event loop reference for thread-safe callbacks (e.g., adapter expiration thread)
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _queue_key(
-        adapter_name: Optional[str],
+        model_id: Optional[str],
         token: Optional[str],
     ) -> str:
-        if adapter_name:
-            return f"adapter:{adapter_name}"
+        if model_id:
+            return f"model:{model_id}"
         if token:
             return f"token:{token}"
         return "default"
 
-    async def _ensure_worker_started(self, queue_key: str) -> None:
-        """Ensure a background worker is running for a queue key."""
-        if queue_key in self._queue_workers and not self._queue_workers[queue_key].done():
+    async def _ensure_worker_started(self) -> None:
+        """Ensure the single background worker is running."""
+        if self._worker_started and self._worker_task is not None and not self._worker_task.done():
             return
 
-        async with self._queue_worker_start_lock:
-            worker = self._queue_workers.get(queue_key)
-            if worker is not None and not worker.done():
+        async with self._worker_start_lock:
+            if self._worker_started and self._worker_task is not None and not self._worker_task.done():
                 return
+            self._worker_task = asyncio.create_task(self._queue_worker())
+            self._worker_started = True
 
-            if queue_key not in self._task_queues:
-                self._task_queues[queue_key] = asyncio.Queue()
+    def _ensure_queue_registered(self, queue_key: str) -> None:
+        if queue_key not in self._task_queues:
+            self._task_queues[queue_key] = _DequeTaskQueue()
+        if queue_key not in self._queue_order:
+            self._queue_order.append(queue_key)
 
-            self._queue_workers[queue_key] = asyncio.create_task(
-                self._queue_worker(queue_key)
-            )
+    async def _queue_worker(self) -> None:
+        """Single background worker that processes tasks serially across all queues.
 
-    async def _queue_worker(self, queue_key: str) -> None:
-        """Background worker that processes tasks from a specific queue serially."""
-        print(f"[TaskQueue] Worker started for {queue_key}")
-        q = self._task_queues[queue_key]
+        Selection policy: round-robin across queue keys. If a task is rate-limited
+        at execution time, it is requeued and the worker tries other queues.
+        """
+        print("[TaskQueue] Worker started")
         while True:
             try:
-                print(
-                    f"[TaskQueue] Waiting for task... key={queue_key} (queue size: {q.qsize()})")
-                request_id, coro_factory, model_id = await q.get()
+                # Wait until there is at least one queue with a task
+                while True:
+                    if any(q.qsize() > 0 for q in self._task_queues.values()):
+                        break
+                    self._new_task_event.clear()
+                    await self._new_task_event.wait()
 
-                print(f"[TaskQueue] Processing task {request_id} key={queue_key}")
-                try:
+                executed_any = False
+                # Try each queue at most once per loop for fairness
+                for _ in range(len(self._queue_order)):
+                    queue_key = self._queue_order[0]
+                    self._queue_order.rotate(-1)
+
+                    q = self._task_queues.get(queue_key)
+                    if q is None:
+                        continue
+
+                    try:
+                        task: _QueuedTask = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        continue
+
+                    now = time.monotonic()
+
+                    # Global queue timeout
+                    if (now - task.created_at) > self._task_queue_config.queue_timeout:
+                        error_payload = {
+                            'error': f"Queue timeout exceeded: waited {now - task.created_at:.2f}s",
+                            'category': 'Server'
+                        }
+                        self.state.store_future_status(
+                            task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                            queue_state=QueueState.PAUSED_CAPACITY.value,
+                            queue_state_reason=error_payload['error'],
+                        )
+                        q.task_done()
+                        continue
+
+                    # Rate limiting at execution time (requeue on limit)
+                    if self._task_queue_config.enabled and task.token:
+                        allowed, reason = await self._rate_limiter.check_and_record(
+                            task.token, task.input_tokens
+                        )
+                        if not allowed:
+                            if task.first_rate_limited_at is None:
+                                task.first_rate_limited_at = now
+                            # If a task cannot get a slot within a window, fail it.
+                            if (now - task.first_rate_limited_at) > self._task_queue_config.window_seconds:
+                                error_payload = {
+                                    'error': f"Rate limit wait exceeded window: {reason}",
+                                    'category': 'Server'
+                                }
+                                self.state.store_future_status(
+                                    task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                                    queue_state=QueueState.PAUSED_RATE_LIMIT.value,
+                                    queue_state_reason=reason,
+                                )
+                                q.task_done()
+                                continue
+
+                            # Put back to FRONT to preserve order, then try other queues
+                            self.state.store_future_status(
+                                task.request_id, TaskStatus.QUEUED.value, task.model_id,
+                                queue_state=QueueState.PAUSED_RATE_LIMIT.value,
+                                queue_state_reason=reason,
+                            )
+                            await q.put_left(task)
+                            q.task_done()
+                            continue
+
+                    # Execute
+                    executed_any = True
                     self.state.store_future_status(
-                        request_id, TaskStatus.RUNNING.value, model_id,
+                        task.request_id, TaskStatus.RUNNING.value, task.model_id,
                         queue_state=QueueState.ACTIVE.value
                     )
 
-                    coro = coro_factory()
-                    result = await coro
+                    try:
+                        coro = task.coro_factory()
+                        result = await coro
+                        self.state.store_future_status(
+                            task.request_id, TaskStatus.COMPLETED.value, task.model_id, result=result,
+                            queue_state=QueueState.ACTIVE.value
+                        )
+                    except Exception:
+                        error_payload = {
+                            'error': traceback.format_exc(),
+                            'category': 'Server'
+                        }
+                        self.state.store_future_status(
+                            task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                            queue_state=QueueState.ACTIVE.value
+                        )
+                    finally:
+                        q.task_done()
 
-                    print(f"[TaskQueue] Task {request_id} completed successfully")
-                    self.state.store_future_status(
-                        request_id, TaskStatus.COMPLETED.value, model_id, result=result
-                    )
-                except Exception:
-                    print(f"[TaskQueue] Task {request_id} failed with error")
-                    error_payload = {
-                        'error': traceback.format_exc(),
-                        'category': 'Server'
-                    }
-                    self.state.store_future_status(
-                        request_id, TaskStatus.FAILED.value, model_id, result=error_payload
-                    )
-                finally:
-                    q.task_done()
+                    # Keep serial semantics: execute at most one runnable task per loop
+                    break
+
+                if not executed_any:
+                    # All available tasks were rate-limited; avoid busy looping.
+                    await asyncio.sleep(min(self._task_queue_config.window_seconds, 0.1))
 
             except asyncio.CancelledError:
-                logger.warning(f"[TaskQueue] Worker cancelled key={queue_key}")
+                logger.warning("[TaskQueue] Worker cancelled")
                 break
             except Exception:
-                logger.warning(f"Error in task queue worker key={queue_key}")
+                logger.warning("Error in task queue worker")
                 continue
+
+    async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
+        q = self._task_queues.get(queue_key)
+        if q is None:
+            return
+
+        drained: list[_QueuedTask] = []
+        while True:
+            try:
+                drained.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        for task in drained:
+            error_payload = {
+                'error': reason,
+                'category': 'Server'
+            }
+            self.state.store_future_status(
+                task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                queue_state=QueueState.UNKNOWN.value,
+                queue_state_reason=reason,
+            )
+            q.task_done()
+
+        # Remove queue structures
+        self._task_queues.pop(queue_key, None)
+        try:
+            while queue_key in self._queue_order:
+                self._queue_order.remove(queue_key)
+        except ValueError:
+            pass
+
+    def fail_pending_tasks_for_model(self, model_id: str, reason: str) -> None:
+        """Fail and drop queued tasks for a model. Safe to call from non-async threads."""
+        queue_key = self._queue_key(model_id=model_id, token=None)
+        if self._event_loop is None:
+            # Best-effort: nothing we can do safely without a loop.
+            logger.warning(
+                f"[TaskQueue] fail_pending_tasks_for_model called without event loop: {queue_key}")
+            return
+
+        def _schedule() -> None:
+            asyncio.create_task(self._fail_queue_tasks_async(queue_key, reason))
+
+        self._event_loop.call_soon_threadsafe(_schedule)
 
     async def schedule_task(
         self,
@@ -245,7 +425,6 @@ class TaskQueueMixin:
         model_id: Optional[str] = None,
         token: Optional[str] = None,
         input_tokens: int = 0,
-        adapter_name: Optional[str] = None,
         task_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Schedule an async task with rate limiting and status tracking.
@@ -266,13 +445,15 @@ class TaskQueueMixin:
             model_id: Optional model_id to associate with the result.
             token: Optional user token for rate limiting.
             input_tokens: Number of input tokens for tps rate limiting.
-            adapter_name: Optional adapter name used for per-adapter queueing.
             task_type: Optional task type for logging/observability.
 
         Returns:
             Dict containing request_id and model_id for future retrieval.
         """
         request_id = f"req_{uuid.uuid4().hex}"
+
+        if self._event_loop is None:
+            self._event_loop = asyncio.get_running_loop()
 
         print(
             f"[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}")
@@ -283,39 +464,36 @@ class TaskQueueMixin:
             queue_state=QueueState.ACTIVE.value
         )
 
-        # 2. Check rate limiting if enabled and token provided
-        if self._task_queue_config.enabled and token:
-            print(
-                f"[TaskQueue] Checking rate limit for token={token[:8]}... input_tokens={input_tokens}")
-            allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
-            if not allowed:
-                print(f"[TaskQueue] Rate limited: {reason}")
-                self.state.store_future_status(
-                    request_id, TaskStatus.RATE_LIMITED.value, model_id,
-                    reason=reason,
-                    queue_state=QueueState.PAUSED_RATE_LIMIT.value,
-                    queue_state_reason=reason
-                )
-                return {'request_id': request_id, 'model_id': model_id}
-            print(f"[TaskQueue] Rate limit check passed")
+        # 2. Route to per-model/per-token queue
+        queue_key = self._queue_key(model_id=model_id, token=token)
+        self._ensure_queue_registered(queue_key)
 
-        # 3. Route to per-adapter/per-token queue
-        queue_key = self._queue_key(adapter_name=adapter_name, token=token)
+        # 3. Ensure worker is started
+        await self._ensure_worker_started()
 
-        # 4. Ensure worker is started for this queue
-        await self._ensure_worker_started(queue_key)
-
-        # 5. Put task in queue and update status
+        # 4. Put task in queue and update status
         q = self._task_queues[queue_key]
         print(
             f"[TaskQueue] Adding task {request_id} to queue key={queue_key} (current size: {q.qsize()}) type={task_type}")
-        await q.put((request_id, coro_factory, model_id))
+        await q.put(
+            _QueuedTask(
+                request_id=request_id,
+                coro_factory=coro_factory,
+                model_id=model_id,
+                token=token,
+                input_tokens=input_tokens,
+                task_type=task_type,
+                created_at=time.monotonic(),
+            )
+        )
         self.state.store_future_status(
             request_id, TaskStatus.QUEUED.value, model_id,
             queue_state=QueueState.ACTIVE.value
         )
         print(
             f"[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}")
+
+        self._new_task_event.set()
 
         return {'request_id': request_id, 'model_id': model_id}
 
@@ -328,8 +506,7 @@ class TaskQueueMixin:
         return {
             'queue_size': sum(q.qsize() for q in self._task_queues.values()),
             'queue_count': len(self._task_queues),
-            'worker_running': any((t is not None and not t.done()) for t in self._queue_workers.values()),
-            'worker_count': len(self._queue_workers),
+            'worker_running': self._worker_task is not None and not self._worker_task.done(),
             'rate_limit_config': {
                 'rps_limit': self._task_queue_config.rps_limit,
                 'tps_limit': self._task_queue_config.tps_limit,
@@ -365,20 +542,18 @@ class TaskQueueMixin:
         # Stop the rate limiter cleanup task
         await self._rate_limiter.stop_cleanup_task()
 
-        # Cancel all queue workers if running
-        for task in list(self._queue_workers.values()):
-            if task and not task.done():
-                task.cancel()
-
-        for task in list(self._queue_workers.values()):
-            if not task:
-                continue
+        # Cancel the worker task if running
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
             try:
-                await task
+                await self._worker_task
             except asyncio.CancelledError:
                 pass
 
-        self._queue_workers.clear()
+        self._worker_task = None
+        self._worker_started = False
+
         self._task_queues.clear()
+        self._queue_order.clear()
 
         print("[TaskQueue] Task queue shutdown complete")
