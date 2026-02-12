@@ -584,7 +584,8 @@ class ServerStateProxy:
 
 
 def get_server_state(actor_name: str = 'twinkle_server_state',
-                     auto_start_cleanup: bool = True) -> ServerStateProxy:
+                     auto_start_cleanup: bool = True,
+                     **server_state_kwargs) -> ServerStateProxy:
     """
     Get or create the ServerState Ray actor.
     
@@ -594,6 +595,8 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state')
         auto_start_cleanup: Whether to automatically start the cleanup task (default: True)
+        **server_state_kwargs: Additional keyword arguments passed to ServerState constructor
+            (e.g., expiration_timeout, cleanup_interval, per_token_adapter_limit)
         
     Returns:
         A ServerStateProxy for interacting with the actor
@@ -603,7 +606,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     except ValueError:
         try:
             _ServerState = ray.remote(ServerState)
-            actor = _ServerState.options(name=actor_name, lifetime='detached').remote()
+            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(**server_state_kwargs)
             # Start cleanup task for newly created actor
             if auto_start_cleanup:
                 try:
@@ -614,4 +617,3 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
             actor = ray.get_actor(actor_name)
     assert actor is not None
     return ServerStateProxy(actor)
-

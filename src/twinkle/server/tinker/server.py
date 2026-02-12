@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 def build_server_app(
     deploy_options: Dict[str, Any],
     supported_models: Optional[List[types.SupportedModel]] = None,
+    server_config: Dict[str, Any] = {},
     **kwargs
 ):
     """Build and configure the Tinker-compatible server application.
@@ -43,23 +44,12 @@ def build_server_app(
     Args:
         deploy_options: Ray Serve deployment configuration (num_replicas, etc.)
         supported_models: List of supported base models for validation
+        server_config: Server configuration options (per_token_adapter_limit, etc.)
         **kwargs: Additional keyword arguments (route_prefix, etc.)
         
     Returns:
         Configured Ray Serve deployment bound with options
     """
-    # Normalize supported_models to objects; passing raw dicts can trigger internal errors
-    # when creating LoRA training clients via the tinker API.
-    if supported_models:
-        normalized = []
-        for item in supported_models:
-            if isinstance(item, types.SupportedModel):
-                normalized.append(item)
-            elif isinstance(item, dict):
-                normalized.append(types.SupportedModel(**item))
-            else:
-                raise TypeError(...)
-        supported_models = normalized
     app = FastAPI()
 
     @app.middleware("http")
@@ -79,18 +69,19 @@ def build_server_app(
         - Training run and checkpoint CRUD operations
         """
         
-        def __init__(self, supported_models: Optional[List[types.SupportedModel]] = None, **kwargs) -> None:
+        def __init__(self, supported_models: Optional[List[types.SupportedModel]] = None, server_config: Dict[str, Any] = {}, **kwargs) -> None:
             """Initialize the Tinker-compatible server.
             
             Args:
                 supported_models: List of supported base models for validation
                 **kwargs: Additional configuration (route_prefix, etc.)
             """
-            self.state = get_server_state()
+            # Get per_token_adapter_limit from kwargs or use default
+            self.state = get_server_state(**server_config)
             # Disable proxy for internal requests to avoid routing through external proxies
             self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get("route_prefix", "/api/v1")
-            self.supported_models = supported_models or [
+            self.supported_models = self.normalize_models(supported_models) or [
                 types.SupportedModel(model_name="Qwen/Qwen2.5-0.5B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-3B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
@@ -99,6 +90,20 @@ def build_server_app(
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)
             self._modelscope_config_lock = asyncio.Lock()
+
+        def normalize_models(self, supported_models):
+            # Normalize supported_models to objects; passing raw dicts can trigger internal errors
+            # when creating LoRA training clients via the tinker API.
+            if supported_models:
+                normalized = []
+                for item in supported_models:
+                    if isinstance(item, types.SupportedModel):
+                        normalized.append(item)
+                    elif isinstance(item, dict):
+                        normalized.append(types.SupportedModel(**item))
+                    else:
+                        normalized.append(types.SupportedModel(name=item))
+                return normalized
 
         def _validate_base_model(self, base_model: str) -> None:
             """Validate that base_model is in supported_models list.
@@ -710,4 +715,8 @@ def build_server_app(
             base_model = self._get_base_model(body.model_id)
             return await self._proxy_to_model(request, "save_weights_for_sampler", base_model)
 
-    return TinkerCompatServer.options(**deploy_options).bind(supported_models=supported_models, **kwargs)
+    return TinkerCompatServer.options(**deploy_options).bind(
+        supported_models=supported_models,
+        server_config=server_config,
+        **kwargs
+    )
