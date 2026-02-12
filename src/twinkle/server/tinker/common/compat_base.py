@@ -67,15 +67,43 @@ def collect_forward_backward_results(results, device_mesh: DeviceMesh):
 
 
 def clean_metrics(metrics: dict) -> dict:
+    import re
+    from numbers import Number
+
+    def _to_float(v):
+        # python numeric / numpy scalar
+        if isinstance(v, (float, int, Number, np.generic, str)):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        # 0-d torch tensor
+        if isinstance(v, torch.Tensor) and v.numel() == 1:
+            try:
+                return float(v.item())
+            except Exception:
+                return None
+        return None
+
     cleaned = {}
     for key, value in metrics.items():
+        fv = _to_float(value)
+        if fv is not None:
+            cleaned[key] = fv
+            continue
+
+        # handle common metric strings: "123 seconds", "1.23 iters/s"
         if isinstance(value, str):
-            import re
-            match = re.match(r'^([+-]?\d*\.?\d+)', value.strip())
-            if match:
-                cleaned[key] = float(match.group(1))
-        else:
-            cleaned[key] = value
+            s = value.strip()
+            if s:
+                try:
+                    head, unit = s.split()  # ignore unit/tail
+                    cleaned[f'{key}/{unit}'] = float(head)
+                except Exception:
+                    m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", s)
+                    if m:
+                        cleaned[key] = float(m.group(1))
+
     return cleaned
 
 
