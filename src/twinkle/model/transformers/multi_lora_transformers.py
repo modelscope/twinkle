@@ -51,10 +51,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
+        self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
         self.model = self.strategy.wrap_model(self.model)
         self.multi_adapter.save_initial_weights()
+        # Active group for compatibility with single adapter
+        self.active_group = None
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
@@ -215,9 +218,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_grad_scaler(**kwargs)
 
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        super().add_metric(metric_cls, **kwargs)
+        super().add_metric(metric_cls, is_training, **kwargs)
+
+    @remote_function(collect='first', lazy_collect=False)
+    def calculate_metric(self, is_training, **kwargs):
+        self._check_adapter_valid(kwargs.get("adapter_name"))
+        return super().calculate_metric(is_training, **kwargs)
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):

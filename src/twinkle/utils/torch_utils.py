@@ -120,6 +120,18 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
     """
     import torch
     import torch.nn.functional as F
+
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_tensor_model_parallel_world_size() >= 1:
+            try:
+                return _vocab_parallel_selective_log_softmax(logits, index)
+            except Exception:
+                import traceback
+                print(traceback.format_exc())
+    except Exception:
+        pass
+        
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
@@ -134,3 +146,14 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
     return per_token_logps
+
+
+def _vocab_parallel_selective_log_softmax(
+    logits: 'torch.Tensor',
+    index: 'torch.Tensor',
+) -> 'torch.Tensor':
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core import mpu
+    tp_group = mpu.get_tensor_model_parallel_group()
+
+    return -fused_vocab_parallel_cross_entropy(logits, index, tp_group)

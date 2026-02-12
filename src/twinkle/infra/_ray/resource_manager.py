@@ -1,13 +1,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-import logging
 import math
 import os
 from typing import Dict, List
 
 from twinkle import DeviceGroup
 from twinkle import Platform
+from twinkle.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
+
 
 class ResourceManager:
 
@@ -58,8 +59,16 @@ class ResourceManager:
 
         assert len(set(all_ranks)) == len(all_ranks) # no duplication
         if device_type != 'CPU':
-            self.nnodes = math.ceil(len(all_ranks) / nproc_per_node)
+            # Calculate required nodes based on actual node indices spanned by all_ranks
+            if all_ranks:
+                node_indices = [rank // nproc_per_node for rank in all_ranks]
+                self.min_node_idx = min(node_indices)
+                self.nnodes = max(node_indices) - self.min_node_idx + 1
+            else:
+                self.min_node_idx = 0
+                self.nnodes = 0
         else:
+            self.min_node_idx = 0
             self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
         self.nodes = []
@@ -77,15 +86,15 @@ class ResourceManager:
         bundles = []
         cpu_bundles = []
 
-        # GPU/NPU placement groups: keep existing strategy (CPU= node_cpu//2) to avoid affecting training/inference throughput assumptions.
         for i in range(self.nnodes):
-            node = self.nodes[i]
+            # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
+            node_idx = self.min_node_idx + i if device_type != 'CPU' else i
+            node = self.nodes[node_idx]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
-        cpu_nnodes = 0
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
             assert cpu_nnodes <= len(self.nodes), (
@@ -127,20 +136,33 @@ class ResourceManager:
             self.node_ranks = list(range(len(self.placement_groups)))
 
         self.node2pg: Dict[int, PlacementGroup] = {}
-        for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
-            self.node2pg[node_rank] = placement_group
+        # Map actual node indices to placement groups
+        # For GPU/NPU groups, node indices start from self.min_node_idx
+        if device_type != 'CPU':
+            for i, placement_group in enumerate(self.placement_groups):
+                actual_node_idx = self.min_node_idx + i
+                self.node2pg[actual_node_idx] = placement_group
+        else:
+            # For CPU-only or when using default node_ranks
+            for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
+                self.node2pg[node_rank] = placement_group
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
+        if 'DEVICE_COUNT_PER_PHYSICAL_NODE' in os.environ:
+            # Sometimes, multiply nodes are in one physical node, there may be error in `gpu_rank`
+            device_per_node = int(os.environ['DEVICE_COUNT_PER_PHYSICAL_NODE'])
+        else:
+            device_per_node = nproc_per_node
         for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
                 local_device_groups = []
-                # ranks is only used to declare "how many processes/devices", should not participate in physical device mapping.
-                # When visible devices are already trimmed by ASCEND_RT_VISIBLE_DEVICES etc.,
-                # logical ranks may be non-contiguous like [8,9], need to normalize them in order.
-                normalized_ranks = list(range(len(ranks)))
+                # Use original ranks for GPU mapping so each DeviceGroup maps to
+                # the correct physical devices.  E.g. ranks=[2,3] with
+                # nproc_per_node=4 should map to gpu_rank [2,3], not [0,1].
+                normalized_ranks = list(ranks)
 
                 if gpus_per_worker > 1:
                     if len(normalized_ranks) % gpus_per_worker != 0:
@@ -156,7 +178,7 @@ class ResourceManager:
 
                         # All GPUs for a worker should be on the same node
                         node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [r % nproc_per_node for r in worker_ranks]
+                        gpu_ranks_local = [r % device_per_node for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(
@@ -167,29 +189,20 @@ class ResourceManager:
                         node_rank = node_ranks[0]
                         local_device_groups.append(
                             dict(
-                                node_rank=node_rank,
                                 gpu_rank=gpu_ranks_local,
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = alloc_rank % nproc_per_node
+                        gpu_rank = alloc_rank % device_per_node
                         local_device_groups.append(
                             dict(
-                                node_rank=node_rank,
                                 gpu_rank=[gpu_rank],
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
 
                 self.device_groups[group.name] = local_device_groups
-                if os.environ.get("TWINKLE_DEBUG_GPW", "0") == "1":
-                    logger.info(
-                        "DeviceGroup '%s' gpus_per_worker=%s local_device_groups=%s",
-                        group.name,
-                        gpus_per_worker,
-                        local_device_groups,
-                    )
                 
                 # Update the group's ranks to reflect actual worker count
                 if gpus_per_worker > 1:
@@ -209,6 +222,9 @@ class ResourceManager:
                 self.device_groups[group.name] = local_device_groups
 
         self.group_configs = groups
+        logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
+        logger.info(f"node_ranks: {self.node_ranks}")
+        logger.info(f"node2pg keys: {list(self.node2pg.keys())}")
 
     def get_config(self, group: str):
         for config in self.group_configs:

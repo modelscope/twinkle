@@ -146,6 +146,12 @@ class InputProcessor:
                         result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map[key]))
                     value = torch.cat(result, dim=1)
                     _input[key] = value
+            elif self.device_mesh.sequence_parallel and tp_size > 1:
+                # Sequence parallel without CP still requires seq_len % TP == 0
+                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
+                    value = _input.get(key)
+                    if value is not None:
+                        _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
             return _input
 
         return [_pad_cp(_inp) for _inp in inputs]

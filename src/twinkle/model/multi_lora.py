@@ -11,7 +11,6 @@ from peft.tuners.lora import LoraLayer, Linear, Embedding
 
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
-from twinkle.patch.base import Patch
 
 
 @dataclass
@@ -25,7 +24,7 @@ class LoraTenant:
     lora_A_weights: Dict[str, torch.Tensor] = field(default_factory=lambda: {})
 
 
-class MultiLora(Patch):
+class MultiLora:
 
     def __init__(self, max_loras=5, max_r=32, max_length: int = 8192):
         self.max_loras = max_loras

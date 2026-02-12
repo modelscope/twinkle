@@ -53,21 +53,25 @@ class TestLocalDatasetLoading:
 class TestLocalIterableDatasetLoading:
     """测试本地数据集加载（iterable 方式）"""
 
+    def _iter_take(self, dataset, n: int):
+        """避免 list(dataset) 触发 __len__，用 for-loop 取前 n 个"""
+        items = []
+        for i, item in enumerate(dataset):
+            items.append(item)
+            if i >= n - 1:
+                break
+        return items
+
     def test_load_local_csv_iterable(self):
         """测试加载本地 CSV 文件（iterable 方式）"""
         csv_path = str(TEST_DATA_DIR / "test.csv")
         try:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         except NotImplementedError as e:
-            # datasets 不支持 streaming=True + num_proc；twinkle 目前本地 streaming 分支会传 num_proc
             pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
-        
-        # iterable dataset 不支持 __len__
         with pytest.raises(NotImplementedError):
             _ = len(dataset)
-        
-        # 测试迭代
-        items = list(dataset)
+        items = self._iter_take(dataset, 4)
         assert len(items) == 4
         assert items[0]['text'] == "Hello world"
         assert items[0]['label'] == 0
@@ -79,8 +83,7 @@ class TestLocalIterableDatasetLoading:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=json_path))
         except NotImplementedError as e:
             pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
-        
-        items = list(dataset)
+        items = self._iter_take(dataset, 4)
         assert len(items) == 4
         assert items[0]['text'] == "Hello world"
 
@@ -91,8 +94,7 @@ class TestLocalIterableDatasetLoading:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         except NotImplementedError as e:
             pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
-        
-        items = list(dataset)
+        items = self._iter_take(dataset, 4)
         assert len(items) == 4
         assert items[0]['text'] == "Hello world"
 

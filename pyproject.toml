@@ -1,5 +1,5 @@
 [project]
-name = "twinkle"
+name = "twinkle-kit"
 version = "0.0.1"
 description = "Training API for large language models with efficient data handling and advanced optimization techniques."
 readme = "README.md"
@@ -23,6 +23,7 @@ transformers = [
   "torchvision",
 ]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]"]
+vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 docs = [
   "sphinx>=5.3.0,<6.0.0",
@@ -47,5 +48,8 @@ name = "aliyun"
 url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

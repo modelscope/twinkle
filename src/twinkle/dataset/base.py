@@ -71,10 +71,13 @@ class Dataset(TorchDataset):
         self.template = construct_class(template_func, Template, twinkle.template, **kwargs)
 
     @remote_function()
-    def encode(self, **kwargs):
+    def encode(self, add_generation_prompt: bool = False, **kwargs):
         """An inplace operation to encode the dataset.
 
         Args:
+            add_generation_prompt: If True, append generation prompt suffix
+                (e.g. ``<|im_start|>assistant\\n``) to each encoded sample.
+                Useful when the encoded dataset will be used for sampling/inference.
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
         kwargs['batched'] = True # Only supported batched, because a single row may explode to several rows
@@ -82,9 +85,11 @@ class Dataset(TorchDataset):
             # By default, we don't use load_from_cache_file, because read cache will not consider the changes in the same file,
             # which will cause unexpected behaviors.
             kwargs['load_from_cache_file'] = False
+        from functools import partial
+        encode_fn = partial(self.template.batch_encode, add_generation_prompt=add_generation_prompt)
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
-            self.dataset = self.dataset.map(self.template.batch_encode, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
+            self.dataset = self.dataset.map(encode_fn, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
 
     @remote_function()
     def check(self, **kwargs):
@@ -164,12 +169,12 @@ class Dataset(TorchDataset):
             key = dataset_meta.get_id()
         kwargs['batched'] = False # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
-            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs).filter(lambda x: x is not None, **kwargs) # filter none rows
+            self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter]], dataset_meta: DatasetMeta = None,
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None,
                init_args: Dict[str, Any] = None,
                **kwargs) -> None:
         """An inplace method to operate or transform the dataset.

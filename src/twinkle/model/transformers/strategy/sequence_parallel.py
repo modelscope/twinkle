@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import math
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -10,16 +8,11 @@ from transformers import PreTrainedTokenizer
 from dataclasses import asdict, dataclass, is_dataclass
 
 from twinkle.utils import DeviceMesh
+from twinkle.utils.transformers_utils import get_llm_model
 
 
-def get_llm_model(model):  # type: ignore
-    return getattr(model, "language_model", model)
-
-
-class HfConfigFactory:  # type: ignore
-    @staticmethod
-    def get_config_attr(config, attr_name: str, include_vit: bool = False):
-        return getattr(config, attr_name, None)
+def get_config_attr(config, key, default=None):
+    return getattr(config, key, default)
 
 
 def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
@@ -196,8 +189,8 @@ class GatherLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_output):
-        # Split grads back to local sequence chunk; scale for all-gather semantics.
-        _grad = grad_output[0] * sequence_parallel.world_size
+        # Split grads back to local sequence chunk.
+        _grad = grad_output[0]
         if sequence_parallel.world_size > 1 and sequence_parallel._sp_group is not None:
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
         return _grad, None, None, None
@@ -468,7 +461,31 @@ class SequenceParallel:
                     query = query.transpose(1, 2)
                     key = key.transpose(1, 2)
                     value = value.transpose(1, 2)
-                    if 'cu_seq_lens_q' in kwargs:
+                    # Packed batches (produced by PackingDataset + padding_free collate) require FA2 varlen
+                    # semantics to avoid cross-subsequence attention. We derive cu_seqlens from position_ids
+                    # resets (0,1,...) and pass cu_seq_lens_* to FA2.
+                    if self.extra_kwargs.get('is_packed', False):
+                        position_ids = kwargs.get('position_ids')
+                        if position_ids is None:
+                            position_ids = self.real_position_ids
+                        # Treat SP-alignment padding (-1) as separate 1-token sequences by mapping -1 -> 0.
+                        pos = position_ids
+                        if pos.dim() == 1:
+                            pos = pos.unsqueeze(0)
+                        pos = pos.clone()
+                        pos[pos < 0] = 0
+
+                        cu_seqlens = get_cu_seqlens_from_position_ids(pos).to(torch.int32)
+                        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                        assert query.shape[2] == cu_seqlens[-1]
+                        kwargs['cu_seq_lens_q'] = cu_seqlens
+                        kwargs['cu_seq_lens_k'] = cu_seqlens
+                        kwargs['max_length_q'] = max_seqlen
+                        kwargs['max_length_k'] = max_seqlen
+                        # Do not use attention_mask-based unpadding when using explicit cu_seqlens.
+                        if len(args) > 0:
+                            args = (None, *args[1:])
+                    elif 'cu_seq_lens_q' in kwargs:
                         position_ids = kwargs.get('position_ids')
                         if position_ids is None:
                             position_ids = self.real_position_ids
@@ -495,6 +512,14 @@ class SequenceParallel:
             if self.world_size == 1 or module.__class__ not in [m.__class__ for m in text_model.modules()]:
                 return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](module, query_states, key_states, value_states,
                                                               attention_mask, *args, **kwargs)
+            # Policy: packed (PackingDataset/padding-free) batches require FlashAttention2 varlen/packed semantics.
+            # SDPA does not have a native packed/varlen interface; supporting packed batches would require building a
+            # large block-diagonal causal mask (slow / memory heavy).
+            if self.extra_kwargs.get('is_packed', False):
+                raise RuntimeError(
+                    'SequenceParallel: detected packed batch (position_ids contains multiple sequences). '
+                    'SDPA backend is not supported for packed batches; please use flash_attention_2.'
+                )
             if dist_attn.local_attn is None:
 
                 def _attention(query, key, value, *args, **kwargs):
@@ -582,7 +607,7 @@ class SequenceParallel:
         if 'Moe' in config.__class__.__name__:
             return True
         for key in ['num_experts', 'num_experts_per_tok', 'moe_intermediate_size']:
-            if HfConfigFactory.get_config_attr(config, key):
+            if get_config_attr(config, key):
                 return True
         return False
 
@@ -591,18 +616,16 @@ class SequenceParallel:
         sp_size: int,
         model: torch.nn.Module,
         tokenizer: PreTrainedTokenizer,
-        padding_free: bool,
         device_mesh: Optional[DeviceMesh] = None,
     ):
-        self.num_heads = HfConfigFactory.get_config_attr(model.config, 'num_key_value_heads')
+        self.num_heads = get_config_attr(model.config, 'num_key_value_heads')
         if self.num_heads is None:
-            self.num_heads = HfConfigFactory.get_config_attr(model.config, 'num_attention_heads')
+            self.num_heads = get_config_attr(model.config, 'num_attention_heads')
         assert self.num_heads is not None, 'Cannot find num_heads config in config.json'
         if sp_size > 1 and self.num_heads % sp_size != 0:
             raise ValueError(
                 f'sp_size ({sp_size}) must divide num_heads ({self.num_heads}) for ulysses sequence parallel.'
             )
-        self.padding_free = padding_free
         self.world_size = sp_size
 
         llm_model = get_llm_model(model)
@@ -627,8 +650,6 @@ class SequenceParallel:
 
         self.model_dtype = next(model.parameters()).dtype
         self.tokenizer = tokenizer
-        if not self.padding_free:
-            pass
 
     def pad(self, tensor, padding_value, position_ids=None, dim=1):
         """Pad tensor for sequence parallel"""
@@ -683,26 +704,6 @@ class SequenceParallel:
         output = tensor_list[rank].contiguous()
         return output
 
-    def pad_and_split_mm_tokens(self, visual_mask, mm_embeds):
-        input_ids = self.extra_kwargs['input_ids']
-        empty_embeds = torch.empty(
-            (input_ids.shape[0], input_ids.shape[1], mm_embeds.shape[-1])).to(mm_embeds.device).to(mm_embeds.dtype)
-        empty_embeds[visual_mask] = mm_embeds
-
-        embeds = SimpleNamespace(weight=mm_embeds)
-
-        _, split_input_embeds, _, _, _, _, extra_values = self.pad_and_split_inputs(
-            None,
-            empty_embeds,
-            None,
-            None,
-            None,
-            None,
-            embeds,
-            self.real_position_ids,
-            extra_split_values=[(visual_mask, 0, -1)])
-        visual_mask = extra_values[0]
-        return visual_mask, split_input_embeds[visual_mask]
 
     def pad_and_split_inputs(self,
                              input_ids,
@@ -731,6 +732,8 @@ class SequenceParallel:
         """
         tokenizer = self.tokenizer
         real_position_ids = real_position_ids if real_position_ids is not None else position_ids
+        # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
+        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -754,12 +757,20 @@ class SequenceParallel:
             loss_scale = self.pad(loss_scale, padding_value=0., position_ids=real_position_ids)
         if real_position_ids is not None:
             real_position_ids = self.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
+        # Build a 2D attention_mask whenever we padded for SP alignment so FlashAttention2 can unpad correctly.
+        # For packed batches (batch_size==1 with multiple position_id resets), relying on position_ids alone is
+        # unsafe if we also appended SP-alignment padding (position_ids=-1), because HF's FA2 varlen path will
+        # include the padded tail in the last segment when attention_mask is None.
         if (input_ids is not None or input_embeds is not None) and batch_size > 1:
+            # not padding_free, so not ring-attention
             inputs = input_ids if input_ids is not None else input_embeds
             attn_shape = inputs.shape[1]  # The sequence length
             if attention_mask is None:
-                attention_mask = torch.ones_like(real_position_ids)
+                # Mask out padded positions introduced by sequence-parallel padding.
+                # `real_position_ids` is padded with `-1` (see above), so use it to build a valid-token mask.
+                attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
             # no need position_ids here, because padding_free does not need attention_mask,
+            # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
             cache_position = torch.arange(0, attn_shape, device=inputs.device)
             # pad attention mask to 4d to avoid calculation errors
@@ -775,8 +786,22 @@ class SequenceParallel:
         if input_embeds is not None:
             input_embeds = self.split(input_embeds, dim=1, position_ids=real_position_ids)
         if labels is not None:
-            # Align next-token labels before splitting so each rank sees local targets.
-            labels = torch.roll(labels, shifts=-1, dims=-1)
+            if self.extra_kwargs.get('is_packed', False) and real_position_ids is not None:
+                # PackingDataset + padding_free collate concatenates multiple sequences into a single token stream.
+                # `position_ids` resets to 0 at each boundary, but our labels are already next-token aligned by
+                # Template._roll_labels(). Therefore the cross-subsequence supervision term lives at the *previous*
+                # token index (the token right before a boundary start).
+                #
+                # Example (boundary at index b where position_ids[b] == 0):
+                # - Bad term is: token[b-1] predicting token[b]
+                # - In next-token-aligned labels, this appears at labels[b-1]
+                boundary_starts = (real_position_ids == 0)
+                prev = torch.zeros_like(boundary_starts, dtype=torch.bool)
+                prev[..., 1:] = boundary_starts[..., :-1]
+                labels = labels.clone()
+                labels[prev] = -100
+                # Also avoid any potential wrap-around supervision at the end of the concatenated stream.
+                labels[..., -1] = -100
             labels = self.split(labels, dim=-1, position_ids=real_position_ids)
         if loss_scale is not None:
             loss_scale = torch.roll(loss_scale, shifts=-1, dims=-1)
@@ -802,6 +827,27 @@ class SequenceParallel:
         if self._sp_group is None and self.sp_world_size > 1:
             raise RuntimeError("Failed to create sequence-parallel group from DeviceMesh.")
 
+    @staticmethod
+    def _is_packed_position_ids(position_ids: Optional[torch.Tensor]) -> bool:
+        """Heuristic: detect packed samples by multiple (0,1,...) resets in position_ids.
+
+        PackingDataset packs multiple sequences into one row by resetting position_ids to 0/1/... at each boundary.
+        """
+        if position_ids is None or not torch.is_tensor(position_ids):
+            return False
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        if position_ids.dim() != 2:
+            return False
+        # A batch may contain multiple packed samples; consider it "packed" if any row is packed.
+        for i in range(position_ids.size(0)):
+            row = position_ids[i]
+            zero_count = int((row == 0).sum().item())
+            one_count = int((row == 1).sum().item())
+            if zero_count > 1 and one_count > 1:
+                return True
+        return False
+
 
     def prepare_inputs(self, inputs):
         """Prepare inputs
@@ -814,6 +860,7 @@ class SequenceParallel:
         position_ids = inputs.get('position_ids')
         if position_ids is not None and input_ids is not None and position_ids.shape[0] == input_ids.shape[0]:
             self.extra_kwargs['position_ids'] = position_ids.clone()
+        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
@@ -831,8 +878,8 @@ sequence_parallel = SequenceParallel()
 class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
-    padding_free: bool = False
     gather_logits: bool = True
+    loss_reduction: str = "mean"
 
 
 def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -> int:
@@ -866,7 +913,6 @@ class SequenceParallelStrategy:
             self.sp_config = sp_config or {}
         self.enabled = bool(self.sp_config.get("enabled", True))
         self.ulysses_size = _get_ulysses_size(device_mesh, self.sp_config)
-        self.padding_free = bool(self.sp_config.get("padding_free", False))
         self._model_ref = model
         self._tokenizer_id = tokenizer_id
         self._tokenizer = None
@@ -901,7 +947,6 @@ class SequenceParallelStrategy:
             self.ulysses_size,
             self._model_ref,
             tokenizer,
-            self.padding_free,
             device_mesh=self.device_mesh,
         )
         self._initialized = True
@@ -919,29 +964,25 @@ class SequenceParallelStrategy:
             or not self.sp_config.get("gather_logits", True)
         ):
             return outputs
-        # Optionally reassemble full-seq logits for downstream consumers.
-        logits = None
-        if hasattr(outputs, "logits"):
-            logits = outputs.logits
-        elif isinstance(outputs, dict):
-            logits = outputs.get("logits")
-        elif isinstance(outputs, (list, tuple)) and len(outputs) > 0 and torch.is_tensor(outputs[0]):
-            logits = outputs[0]
+        # Twinkle expects dict-like ModelOutput containers in the main training path
+        # (uses `.get(...)` and `outputs[...] = ...`). Keep SP postprocess consistent.
+        if outputs is None or not hasattr(outputs, "get") or not hasattr(outputs, "__setitem__"):
+            raise TypeError(
+                "SequenceParallelStrategy.postprocess_outputs expects a dict-like ModelOutput. "
+                f"Got type={type(outputs)}"
+            )
+        logits = outputs.get("logits", None)
         if logits is None or not torch.is_tensor(logits) or logits.dim() < 2:
             return outputs
         gathered = sequence_parallel.gather(
             logits, dim=1, position_ids=sequence_parallel.real_position_ids
         )
-        if hasattr(outputs, "logits"):
-            outputs.logits = gathered
-            return outputs
-        if isinstance(outputs, dict):
-            outputs["logits"] = gathered
-            return outputs
-        if isinstance(outputs, (list, tuple)) and len(outputs) > 0:
-            new = list(outputs)
-            new[0] = gathered
-            return type(outputs)(new)
+        # Scheme A: SP pads to make seq_len divisible by sp_size. Trim back to the original
+        # (unpadded) length using the cached real_position_ids.
+        real_pos = sequence_parallel.real_position_ids
+        if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
+            gathered = gathered[:, : real_pos.shape[1]].contiguous()
+        outputs["logits"] = gathered
         return outputs
 
     def reduce_loss(self, loss: torch.Tensor, labels: Optional[torch.Tensor], ignore_index: int = -100) -> torch.Tensor:
@@ -949,12 +990,36 @@ class SequenceParallelStrategy:
             return loss
         if labels is None or sequence_parallel._sp_group is None:
             return loss
-        # Reduce loss with token-count normalization across SP ranks.
+        # Compute full-sequence loss in forward, but keep backward local to this rank.
+        reduction = str(self.sp_config.get("loss_reduction", "mean")).lower()
+        if reduction == "none":
+            raise ValueError(
+                "SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
+                "Please aggregate per-token losses before calling reduce_loss."
+            )
         num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
-        reduced_loss = loss * num_valid_tokens
-        dist.all_reduce(reduced_loss, group=sequence_parallel._sp_group)
-        dist.all_reduce(num_valid_tokens, group=sequence_parallel._sp_group)
-        return reduced_loss / num_valid_tokens
+        if reduction == "sum":
+            local_sum = loss
+            global_sum = local_sum.detach().clone()
+            dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+            out = global_sum + (local_sum - local_sum.detach())
+            if sequence_parallel.world_size > 1:
+                out_metric = out.detach() / sequence_parallel.world_size
+                return out_metric + (out - out.detach())
+            return out
+        # Default to mean reduction.
+        local_sum = loss * num_valid_tokens
+        global_sum = local_sum.detach().clone()
+        dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+        global_tokens = num_valid_tokens.detach().clone()
+        dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
+        if global_tokens.item() == 0:
+            return loss
+        out = (global_sum + (local_sum - local_sum.detach())) / global_tokens
+        if sequence_parallel.world_size > 1:
+            out_metric = out.detach() / sequence_parallel.world_size
+            return out_metric + (out - out.detach())
+        return out
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()

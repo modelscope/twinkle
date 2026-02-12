@@ -1,14 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
-import logging
 import os
 from typing import Literal, List, Optional, Union, Callable, Any
 from typing import TypeVar
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform
 from twinkle.utils import requires, framework_util, check_unsafe
@@ -63,13 +60,7 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     _lazy_collect = lazy_collect
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
-    else:
-        # groups can be given by default
-        _device_mesh = DeviceMesh(
-            device_type=Platform.device_prefix(),
-            mesh=np.arange(Platform.get_world_size()),
-            mesh_dim_names=('dp',)
-        )
+
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
@@ -83,22 +74,19 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                     ranks=list(range(Platform.get_world_size())),
                     device_type=Platform.get_platform().device_prefix(),
                 )]
+
+        if _device_mesh is None:
+            _device_mesh = DeviceMesh(
+                device_type=Platform.device_prefix(),
+                mesh=np.arange(Platform.get_world_size()),
+                mesh_dim_names=('dp',)
+            )
             
         assert Platform.get_world_size() == _device_mesh.world_size
     else:
         requires('ray')
         from ._ray import RayHelper
         assert groups is not None
-        # Auto-fill visible_devices from env if missing (mirrors server-side builder wrapper).
-        for group in groups:
-            if getattr(group, 'visible_devices', None):
-                continue
-            device_type = (group.device_type or '').upper()
-            if device_type == 'CPU':
-                continue
-            visible_devices = Platform.resolve_visible_devices(device_type)
-            if visible_devices:
-                group.visible_devices = visible_devices
         # groups is needed for ray
         _device_group = groups
         RayHelper.initialize(nproc_per_node=nproc_per_node,
@@ -303,7 +291,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
         return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif isinstance(method, Callable):
         # Callable
-        return method(result)
+        return method(result, device_mesh=device_mesh)
     else:
         raise ValueError(f'Unsupported collect method: {method}')
 
@@ -367,7 +355,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         length = len(workers)
         result = []
         for i in range(length):
-            sliced_args, sliced_kwargs = dispatch(length, i, args, kwargs)
+            sliced_args, sliced_kwargs = dispatch(length, i, args, kwargs, device_mesh=device_mesh)
             result.append((workers[i], sliced_args, sliced_kwargs))
         return result
     else:
@@ -410,7 +398,7 @@ def _prepare_lazy_collect(args, kwargs):
                 arg._lazy_collect = False
         return args, kwargs
 
-def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
+def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
     """Patch each class used in remote clusters with this decorator.
 
     Use this decorator to wrap your class to enable it to execute in a remote cluster.
@@ -433,6 +421,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                         kwargs[device_mesh_name] = _device_mesh
                     assert len(_device_group) == 1 # only one device group is allowed
                     _device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
+                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
+                        # TODO An ugly special setting for dataloader to set the min batch size
+                        kwargs['min_batch_size'] = device_mesh.data_world_size
                     init_method(self, *args, **kwargs)
                 else:
                     # Pop the device_mesh
@@ -455,6 +446,15 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
 
                 device_mesh = _get_device_mesh_param(args, kwargs)
                 if device_mesh_name:
+                    if execute == 'first':
+                        # Manually create a device_mesh because there is only one worker
+                        device_mesh = DeviceMesh.from_sizes(dp_size=1)
+                        kwargs[device_mesh_name] = device_mesh
+
+                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
+                        # TODO An ugly special setting for dataloader to set the min batch size
+                        kwargs['min_batch_size'] = kwargs['batch_size']
+
                     if remote_group:
                         if device_mesh is None:
                             if _device_mesh is not None:
@@ -462,11 +462,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                                 kwargs[device_mesh_name] = device_mesh
                             else:
                                 raise ValueError('Set device_mesh=DeviceMesh(...) to enable ray.')
-
-                    if execute == 'first':
-                        # Manually create a device_mesh because there is only one worker
-                        device_mesh = DeviceMesh.from_sizes(dp_size=1)
-                        kwargs[device_mesh_name] = device_mesh
 
                     if _device_group and remote_group:
                         # usually this happens in driver because worker does not has a valid _device_group
@@ -497,61 +492,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'peer'):
                 if (not remote_group) or os.environ.get('CLUSTER_NAME') == remote_group:
                     # not remote_group: Ray mode with local component
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
-                    visible_env = os.environ.get('TWINKLE_VISIBLE_ENV')
-                    visible_devices = os.environ.get('TWINKLE_VISIBLE_DEVICES')
-                    if visible_env and visible_devices:
-                        # Restore the real visible devices inside the worker process.
-                        os.environ[visible_env] = visible_devices
-
-                    # Ensure each worker selects the correct local device early.
-                    # This must happen before any model/distributed init; otherwise torch_npu
-                    # may default multiple ranks to device 0.
-                    try:
-                        from twinkle.utils.framework import Torch
-                        Torch.set_device()
-                    except Exception:
-                        pass
                     seed = int(os.environ.get('TWINKLE_SEED', _seed))
                     determinism = int(os.environ.get('TWINKLE_FULL_DETERMINISM', int(_full_determinism)))
                     framework_util.seed_everything(seed, bool(determinism))
                     # Ensure torch.distributed is initialized inside Ray workers.
                     if os.environ.get('WORKER_NAME'):
-                        try:
-                            import torch
-                            import torch.distributed as dist
-                            if dist.is_available() and not dist.is_initialized():
-                                if torch.cuda.is_available():
-                                    backend = 'nccl'
-                                elif hasattr(torch, 'npu') and torch.npu.is_available():
-                                    try:
-                                        import torch_npu  # noqa: F401
-                                        backend = 'hccl'
-                                    except Exception:
-                                        # torch_npu not available, fall back to gloo
-                                        logger.warning(
-                                            "torch.npu is available but torch_npu import failed, "
-                                            "falling back to gloo backend"
-                                        )
-                                        backend = 'gloo'
-                                else:
-                                    backend = 'gloo'
-                                dist.init_process_group(backend=backend, init_method='env://')
-                            if os.environ.get("TWINKLE_DEBUG_WORLD_SIZE", "0") == "1":
-                                try:
-                                    ws = dist.get_world_size() if dist.is_initialized() else None
-                                except Exception:
-                                    ws = None
-                                logger.info(
-                                    "dist status: initialized=%s world_size=%s RANK=%s LOCAL_RANK=%s WORLD_SIZE=%s",
-                                    dist.is_initialized(),
-                                    ws,
-                                    os.environ.get("RANK"),
-                                    os.environ.get("LOCAL_RANK"),
-                                    os.environ.get("WORLD_SIZE"),
-                                )
-                        except Exception:
-                            pass
-
                         # This will depress the warnings of megatron and reduce overhead
                         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
                         # This will prevent the unlimited threads started by torch

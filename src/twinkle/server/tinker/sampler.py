@@ -4,12 +4,11 @@ Tinker-compatible sampler (inference) server.
 
 This module provides a Ray Serve deployment for distributed text generation/inference.
 It supports:
-1. VLLM and Torch sampler backends
+1. vLLM and Torch sampler backends
 2. LoRA adapter loading via adapter URIs
 3. Multi-user inference with rate limiting
 4. Flexible sampling parameters
 """
-import os
 import traceback
 from typing import Any, Dict, Optional
 
@@ -21,10 +20,11 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
-from twinkle.sampler.types import SamplingParams as TwinkleSamplingParams
+from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
+from twinkle.data_format import SamplingParams
 from twinkle.utils.logger import get_logger
+from .common.io_utils import create_checkpoint_manager
 
-from .common.task_queue import TaskQueueMixin, TaskQueueConfig
 
 logger = get_logger()
 
@@ -70,7 +70,7 @@ def build_sampler_app(model_id: str,
         """Sampler management service for text generation inference.
         
         This class manages:
-        - VLLM or Torch sampler initialization and lifecycle
+        - vLLM or Torch sampler initialization and lifecycle
         - Inference requests with LoRA adapter support
         - Rate limiting via task queue
         - Sampling parameter conversion between Tinker and Twinkle formats
@@ -96,17 +96,21 @@ def build_sampler_app(model_id: str,
                                nproc_per_node=nproc_per_node,
                                groups=[self.device_group],
                                lazy_collect=False)
-            self.device_mesh = DeviceMesh(**device_mesh)
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.sampler_type = sampler_type
             
             # Initialize sampler based on type
             if sampler_type == 'vllm':
-                from twinkle.sampler import VLLMSampler
+                from twinkle.sampler import vLLMSampler
                 sampler_kwargs = engine_args or {}
-                self.sampler = VLLMSampler(
+                self.sampler = vLLMSampler(
                     model_id=model_id,
                     engine_args=sampler_kwargs,
                     device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
                     **{k: v for k, v in kwargs.items() if k not in ['engine_args']}
                 )
             else:  # torch sampler
@@ -116,7 +120,7 @@ def build_sampler_app(model_id: str,
                     device_mesh=self.device_mesh,
                     **kwargs
                 )
-            
+            self.sampler.set_template('Template', model_id=model_id)
             self.state: ServerStateProxy = get_server_state()
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
@@ -143,15 +147,29 @@ def build_sampler_app(model_id: str,
             async def _do_sample():
                 try:
                     # Extract prompt token IDs from ModelInput
-                    prompt_token_ids = body.prompt.to_ints()
+                    prompt_inputs = {'input_ids': body.prompt.to_ints()}
                     
-                    # Determine adapter URI from model_path
-                    adapter_uri = body.model_path if body.model_path else None
+                    # Get model_path: use body.model_path or look up from sampling session
+                    model_path = body.model_path
+                    base_model = body.base_model
+                    if not model_path and body.sampling_session_id:
+                        session = self.state.get_sampling_session(body.sampling_session_id)
+                        if session:
+                            model_path = session.get('model_path')
+                            base_model = session.get('base_model')
+                    
+                    # Parse and resolve adapter URI from model_path
+                    adapter_uri = None
+                    adapter_name = None
+                    if model_path:
+                        token = request.state.token
+                        checkpoint_manager = create_checkpoint_manager(token)
+                        adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
                     
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
                     if body.sampling_params:
-                        sampling_params = TwinkleSamplingParams(
+                        sampling_params = SamplingParams(
                             max_tokens=body.sampling_params.max_tokens or 256,
                             temperature=body.sampling_params.temperature or 1.0,
                             top_p=body.sampling_params.top_p,
@@ -161,15 +179,11 @@ def build_sampler_app(model_id: str,
                     
                     # Only request logprobs when the client asks for them. Some backends may
                     # return None entries in logprobs, which breaks pydantic validation.
-                    want_logprobs = bool(body.prompt_logprobs) or (body.topk_prompt_logprobs or 0) > 0
-                    response = await self.sampler.engine.sample(
-                        prompt_token_ids=prompt_token_ids,
+                    response = self.sampler.sample(
+                        inputs=[prompt_inputs] * body.num_samples,  # For speed up
                         sampling_params=sampling_params,
-                        num_samples=body.num_samples or 1,
-                        logprobs=want_logprobs,
-                        include_prompt_logprobs=body.prompt_logprobs or False,
-                        topk_prompt_logprobs=body.topk_prompt_logprobs or 0,
-                        adapter_uri=adapter_uri,
+                        adapter_path=adapter_uri,
+                        # adapter_name=adapter_name,
                     )
                     
                     # Convert twinkle SampleResponse to tinker types.SampleResponse

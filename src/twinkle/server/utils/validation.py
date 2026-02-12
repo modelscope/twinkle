@@ -10,7 +10,7 @@ async def verify_request_token(request: Request, call_next):
     Middleware to verify request token and extract request metadata.
     
     This middleware:
-    1. Extracts the Bearer token from Twinkle-Authorization header
+    1. Extracts the Bearer token from Authorization header
     2. Validates the token
     3. Extracts X-Ray-Serve-Request-Id for sticky sessions
     4. Stores token and request_id in request.state for later use

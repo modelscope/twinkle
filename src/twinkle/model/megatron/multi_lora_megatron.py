@@ -17,7 +17,6 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
-from .args import TwinkleMegatronArgs, set_args
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
 from ..multi_lora import MultiLora
@@ -32,9 +31,10 @@ class MultiLoraMegatronModel(MegatronModel):
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
                  load_weights: bool = True,
-                 recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
+                 recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+                 recompute_method: Optional[str] = 'uniform',
+                 recompute_num_layers: Optional[int] = 1,
                  recompute_modules: Optional[list] = None,  # Modules to recompute
-                 sequence_parallel: bool = False,
                  max_loras:int = 5,
                  max_r:int = 32,
                  max_length: int = 8192,
@@ -43,6 +43,7 @@ class MultiLoraMegatronModel(MegatronModel):
         requires('megatron_core')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        from .args import TwinkleMegatronArgs, set_args
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -57,11 +58,11 @@ class MultiLoraMegatronModel(MegatronModel):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
 
-        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=sequence_parallel, mixed_precision=mixed_precision, **kwargs)
+        self.strategy = MegatronStrategy(self.device_mesh, sequence_parallel=self.device_mesh.sequence_parallel, mixed_precision=mixed_precision, **kwargs)
 
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
@@ -73,11 +74,9 @@ class MultiLoraMegatronModel(MegatronModel):
         ac_kwargs = {
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
+            'recompute_method': recompute_method,
+            'recompute_num_layers': recompute_num_layers,
         }
-        if kwargs.get('recompute_method'):
-            ac_kwargs['recompute_method'] = kwargs.get('recompute_method')
-        if kwargs.get('recompute_num_layers'):
-            ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
 
         # Initialize TwinkleMegatronArgs BEFORE creating the model
         args = TwinkleMegatronArgs.from_hf_config(
@@ -88,16 +87,19 @@ class MultiLoraMegatronModel(MegatronModel):
             sequence_parallel=self.strategy.sequence_parallel,
             **ac_kwargs,
         )
+
         set_args(args)
         self._initialized = False
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
 
-        MegatronPeft().patch()
+        MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.model = self.strategy.wrap_model(self.model)
         self._model_wrapped = True
         self.multi_adapter.save_initial_weights()
+        # Active group for compatibility with single adapter
+        self.active_group = None
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, f'Use a valid adapter_name first, current is: {adapter_name}'
@@ -253,9 +255,9 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get("adapter_name"))
         super().set_processor(processor_cls, **kwargs)
 
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         self._check_adapter_valid(kwargs.get("adapter_name"))
-        super().add_metric(metric_cls, **kwargs)
+        super().add_metric(metric_cls, is_training, **kwargs)
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):

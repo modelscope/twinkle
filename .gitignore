@@ -8,13 +8,6 @@ test.py
 # C extensions
 *.so
 
-src/twinkle_client/dataloader
-src/twinkle_client/dataset
-src/twinkle_client/model
-src/twinkle_client/processor
-src/twinkle_client/reward
-src/twinkle_client/sampler
-
 # Distribution / packaging
 .Python
 build/

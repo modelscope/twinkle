@@ -1,12 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Any, Optional, Literal, Set
+from typing import Dict, Any, Optional, Literal, Set, TYPE_CHECKING
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 
 from twinkle.utils import DeviceMesh, Platform
+
+if TYPE_CHECKING:
+    from torch.distributed.fsdp import MixedPrecisionPolicy
 
 
 class NativeFSDPStrategy:
@@ -27,7 +29,7 @@ class NativeFSDPStrategy:
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:
             return model, optimizer
-
+        from torch.distributed.fsdp import fully_shard
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_fsdp_mode = _is_ep_fsdp_mode_enabled(
@@ -80,7 +82,8 @@ class NativeFSDPStrategy:
         return model
 
 
-def _build_mp_policy(mixed_precision: str) -> MixedPrecisionPolicy:
+def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
+    from torch.distributed.fsdp import MixedPrecisionPolicy
     if mixed_precision == "bf16":
         dtype = torch.bfloat16
     elif mixed_precision == "fp16":
@@ -228,8 +231,9 @@ def _maybe_shard_layers(model: nn.Module,
                         *,
                         mesh: TorchDeviceMesh,
                         reshard_after_forward: Optional[bool],
-                        mp_policy: MixedPrecisionPolicy,
+                        mp_policy: 'MixedPrecisionPolicy',
                         ignored_params: Optional[Set[nn.Parameter]]) -> None:
+    from torch.distributed.fsdp import fully_shard
     layers = getattr(model, "layers", None)
     if not isinstance(layers, nn.ModuleList):
         return

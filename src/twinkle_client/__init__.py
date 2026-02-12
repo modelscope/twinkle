@@ -28,7 +28,8 @@ def init_tinker_compat_client(base_url: Optional[str] = None, api_key: Optional[
     
     default_headers = {
         "X-Ray-Serve-Request-Id": get_request_id(),
-        "Twinkle-Authorization": 'Bearer ' + api_key,
+        "Authorization": 'Bearer ' + api_key,
+        "Twinkle-Authorization": 'Bearer ' + api_key,  # For server compatibility
     } | kwargs.pop("default_headers", {})
 
     service_client = ServiceClient(base_url=base_url, api_key=api_key, default_headers=default_headers, **kwargs)

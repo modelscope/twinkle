@@ -32,4 +32,8 @@ class IterableDataset(IterableDataset, Dataset):
     def __iter__(self):
         # TODO if this class passed through actor handler, an error will occur:
         # a global single dataset, multiple dataloaders, the self._iter will cover each other
+        from datasets import IterableDatasetDict
+        if isinstance(self.dataset, IterableDatasetDict):
+            assert len(self.dataset) == 1
+            self.dataset = list(self.dataset.values())[0]
         return self.dataset.__iter__()

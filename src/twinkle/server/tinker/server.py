@@ -24,9 +24,9 @@ from tinker import types
 
 from twinkle.server.utils.validation import verify_request_token, get_token_from_request
 from twinkle.server.utils.state import get_server_state
+from twinkle.server.utils.task_queue import QueueState
 from twinkle.hub import HubOperation
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
-from .common.task_queue import QueueState
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +92,13 @@ def build_server_app(
             self.route_prefix = kwargs.get("route_prefix", "/api/v1")
             self.supported_models = supported_models or [
                 types.SupportedModel(model_name="Qwen/Qwen2.5-0.5B-Instruct"),
+                types.SupportedModel(model_name="Qwen/Qwen2.5-3B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
                 types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
+                types.SupportedModel(model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"),
             ]
+            # Lock for ModelScope config file operations (login writes, get_user_info reads)
+            self._modelscope_config_lock = asyncio.Lock()
 
         def _validate_base_model(self, base_model: str) -> None:
             """Validate that base_model is in supported_models list.
@@ -213,17 +217,6 @@ def build_server_app(
                 Proxied response from the sampler service
             """
             return await self._proxy_request(request, endpoint, base_model, 'sampler')
-
-        @staticmethod
-        def _sample_output() -> types.SampleResponse:
-            """Generate a sample output for testing purposes.
-            
-            Returns:
-                A mock SampleResponse with dummy data
-            """
-            sequence = types.SampledSequence(stop_reason="stop", tokens=[
-                                             1, 2, 3], logprobs=[-0.1, -0.2, -0.3])
-            return types.SampleResponse(sequences=[sequence])
 
         # --- Endpoints ---------------------------------------------------------
 
@@ -544,15 +537,19 @@ def build_server_app(
             
             # Generate hub_model_id from checkpoint content and user token
             # Format: {username}/{run_id}_{checkpoint_name}
-            try:
-                from modelscope.hub.api import HubApi, ModelScopeConfig
-                hub_api = HubApi(token=token)
-                hub_api.login() # Save user info to local
-                username = ModelScopeConfig.get_user_info()[0]
-            except Exception:
-                # Fallback to using sanitized token as username
-                import re
-                username = re.sub(r'[^\w\-]', '_', token)[:20]
+            # Use lock to prevent race conditions when multiple requests access ModelScope config file
+            async with self._modelscope_config_lock:
+                try:
+                    from modelscope.hub.api import HubApi, ModelScopeConfig
+                    hub_api = HubApi(token=token)
+                    hub_api.login()  # Save user info to local
+                    username = ModelScopeConfig.get_user_info()[0]
+                except Exception as e:
+                    logger.error(f"Failed to get username from ModelScope: {e}")
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Failed to get username from ModelScope. Please ensure your token is valid."
+                    )
             
             # Extract checkpoint name from checkpoint_id (e.g., "weights/step-8" -> "step-8")
             checkpoint_name = checkpoint_id.split('/')[-1]
@@ -676,8 +673,8 @@ def build_server_app(
         async def asample(self, request: Request, body: types.SampleRequest) -> Any:
             """Execute text generation (inference).
             
-            This endpoint first tries to use a local sampler if available.
-            Otherwise, it proxies the request to the sampler service.
+            Proxies the request to the sampler service based on base_model.
+            The sampler handles model_path resolution from sampling session.
             
             Args:
                 body: Sample request with prompt and sampling parameters
@@ -685,23 +682,13 @@ def build_server_app(
             Returns:
                 Proxied response from sampler service
             """
-            model_path = body.model_path
             base_model = body.base_model
             
-            # If both are None, look up from sampling session
-            if not model_path and not base_model and body.sampling_session_id:
+            # If base_model not provided, look up from sampling session
+            if not base_model and body.sampling_session_id:
                 session = self.state.get_sampling_session(body.sampling_session_id)
                 if session:
-                    model_path = session.get('model_path')
                     base_model = session.get('base_model')
-            
-            # Extract base_model from model_path if needed
-            if model_path and not base_model:
-                # Format: twinkle://Qwen/Qwen2.5-0.5B-Instruct/lora/xxx -> Qwen/Qwen2.5-0.5B-Instruct
-                path = model_path.replace("twinkle://", "").replace("tinker://", "")
-                parts = path.split("/")
-                if len(parts) >= 2:
-                    base_model = f"{parts[0]}/{parts[1]}"
             
             return await self._proxy_to_sampler(request, "asample", base_model)
             

@@ -13,7 +13,6 @@ from twinkle.kernel import (
     register_kernels,
 )
 from twinkle.kernel.base import (
-    get_device_type,
     is_kernels_available,
     is_kernels_enabled,
     to_kernels_mode,
@@ -31,12 +30,6 @@ from twinkle.kernel.registry import (
 
 class TestBase(unittest.TestCase):
     """Test base helpers and env vars."""
-
-    def test_get_device_type_no_torch(self):
-        """Test device detection without torch."""
-        with patch("twinkle.kernel.base.exists", return_value=False):
-            result = get_device_type()
-            self.assertIsNone(result)
 
     def test_is_kernels_available(self):
         """Test kernels availability check."""

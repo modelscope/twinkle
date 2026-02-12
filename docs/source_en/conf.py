@@ -15,13 +15,13 @@ import sys
 
 # import sphinx_book_theme
 
-sys.path.insert(0, os.path.abspath('../../'))
+sys.path.insert(0, os.path.abspath('../../src'))
 # -- Project information -----------------------------------------------------
 
-project = 'swift'
+project = 'twinkle'
 copyright = '2022-2025, Alibaba ModelScope'
 author = 'ModelScope Authors'
-version_file = '../../swift/version.py'
+version_file = '../../src/twinkle/version.py'
 html_theme = 'sphinx_rtd_theme'
 language = 'en'
 
@@ -85,7 +85,7 @@ root_doc = 'index'
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ['build', 'source_en/.ipynb_checkpoints', 'source_en/api/generated', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['build', 'source/.ipynb_checkpoints', 'source/api/generated', 'Thumbs.db', '.DS_Store']
 # A list of glob-style patterns [1] that are used to find source files.
 # They are matched against the source file names relative to the source directory,
 # using slashes as directory separators on all platforms.

@@ -557,9 +557,11 @@ class TwinkleMegatronArgs:
         use_sequence_parallel = self.sequence_parallel and self.tp_size > 1
         if num_experts > 0 and self.tp_size > 1 and not use_sequence_parallel:
             use_sequence_parallel = True
-            print(
-                f'Auto-enabling sequence_parallel for MoE with TP={self.tp_size}'
-            )
+            # Sync the flag back so that callers (e.g. padding logic in
+            # megatron.py) see the auto-enabled value.
+            self.sequence_parallel = True
+            if self.device_mesh is not None:
+                self.device_mesh.sequence_parallel = True
 
         # For MoE models, ffn_hidden_size should be moe_ffn_hidden_size if not specified
         ffn_hidden_size = mg_config_dict.get('ffn_hidden_size')

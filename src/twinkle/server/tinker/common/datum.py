@@ -1,30 +1,59 @@
 from __future__ import annotations
 
+from typing import List, Union
+from collections import defaultdict
 import numpy as np
 from twinkle.data_format.input_feature import InputFeature
+from twinkle.template import Template
 from tinker import types
     
-def datum_to_input_feature(datum: types.Datum) -> InputFeature:
+def datum_to_input_feature(datum: Union[types.Datum, List[types.Datum]], template: Template) -> Union[InputFeature, List[InputFeature]]:
     """Convert a Datum to a dictionary of input features for model inference."""
+    if isinstance(datum, list):
+        return [datum_to_input_feature(d, template) for d in datum]
+    
     input_feature: InputFeature = {}
 
     # 1. Flatten model_input chunks to get input_ids
     input_ids = datum.model_input.to_ints()
     input_feature['input_ids'] = input_ids
-    input_feature['attention_mask'] = [1] * len(input_ids)
-    input_feature['length'] = len(input_ids)
-    input_feature['position_ids'] = list(range(len(input_ids)))
-    
+
     # 2. Map loss function inputs
     # 'target_tokens' -> 'labels'
-    if 'target_tokens' in datum.loss_fn_inputs and 'weights' in datum.loss_fn_inputs:
+    assert 'target_tokens' in datum.loss_fn_inputs, f"Missing 'target_tokens' in loss_fn_inputs {datum.loss_fn_inputs}"
+    
+    labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
+    if 'weights' in datum.loss_fn_inputs:
+        # remove weights 0 from labels
         weights = datum.loss_fn_inputs['weights'].to_numpy()
-        labels = datum.loss_fn_inputs['target_tokens'].to_numpy()
-        
-        input_feature['labels'] = np.where(weights > 0, labels, -100).tolist()
-
+        input_feature['labels'] = np.where(weights != 0, labels, -100).tolist()
+    else:
+        # remove padding (0-id)
+        input_feature['labels'] = np.where(labels != 0, labels, -100).tolist()
+        # add weights to loss_fn_inputs
+        weights = (labels != 0).astype(np.float32)
+        datum.loss_fn_inputs['weights'] = types.TensorData.from_numpy(weights)
+    
+    # 3. Invoke post-pipeline hooks
+    input_feature = template._add_attention_fields(input_feature)[0]
     return input_feature
 
+def extract_rl_feature(datum: Union[types.Datum, List[types.Datum]]) -> dict:
+    if not isinstance(datum, list):
+        datum = [datum]
+    
+    result = defaultdict(list)
+    for d in datum:
+        # 'logprobs' -> 'old_logps' (for GRPO loss)
+        if 'logprobs' in d.loss_fn_inputs:
+            old_logps = d.loss_fn_inputs['logprobs'].to_numpy().tolist()
+            result['old_logps'].append(old_logps)
+        
+        # 'advantages' -> 'advantages' (for GRPO loss)
+        if 'advantages' in d.loss_fn_inputs:
+            advantages = d.loss_fn_inputs['advantages'].to_numpy().tolist()
+            result['advantages'].append(advantages)
+    return result
 
 def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
     """Convert an input feature dictionary to a Datum object.
@@ -73,8 +102,7 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
         weights_arr = (labels_arr != -100).astype(np.float32)
         target_tokens_arr = np.where(labels_arr == -100, 0, labels_arr)
 
-        TensorData = types.TensorData
-        loss_fn_inputs["target_tokens"] = TensorData.from_numpy(target_tokens_arr)
-        loss_fn_inputs["weights"] = TensorData.from_numpy(weights_arr)
+        loss_fn_inputs["target_tokens"] = types.TensorData.from_numpy(target_tokens_arr)
+        loss_fn_inputs["weights"] = types.TensorData.from_numpy(weights_arr)
 
     return types.Datum(loss_fn_inputs=loss_fn_inputs, model_input=model_input)

@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional, TypeVar, Generic
 
 from pydantic import BaseModel
 
+from twinkle.hub import HubOperation
+from twinkle import get_logger
+
+logger = get_logger()
+
 
 TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
 CHECKPOINT_INFO_FILENAME = 'checkpoint_metadata.json'
@@ -37,6 +42,14 @@ class BaseCheckpoint(BaseModel):
     time: datetime
     size_bytes: int
     public: bool = False
+    # Training run info (stored for hub downloads)
+    base_model: Optional[str] = None
+    is_lora: bool = False
+    lora_rank: Optional[int] = None
+    train_unembed: Optional[bool] = None
+    train_mlp: Optional[bool] = None
+    train_attn: Optional[bool] = None
+    user_metadata: Optional[Dict[str, Any]] = None
 
 
 class BaseTrainingRun(BaseModel):
@@ -74,6 +87,23 @@ class BaseParsedCheckpointPath(BaseModel):
     training_run_id: str
     checkpoint_type: str
     checkpoint_id: str
+
+
+class ResolvedLoadPath(BaseModel):
+    """Result of resolving a load path.
+    
+    Attributes:
+        checkpoint_name: The name of the checkpoint (e.g., 'step-8' or hub model id)
+        checkpoint_dir: The directory containing the checkpoint, or None if loading from hub
+        is_twinkle_path: Whether the path was a twinkle:// path
+        training_run_id: The training run ID (only set for twinkle:// paths)
+        checkpoint_id: The checkpoint ID (only set for twinkle:// paths)
+    """
+    checkpoint_name: str
+    checkpoint_dir: Optional[str] = None
+    is_twinkle_path: bool = False
+    training_run_id: Optional[str] = None
+    checkpoint_id: Optional[str] = None
 
 
 class BaseWeightsInfoResponse(BaseModel):
@@ -249,7 +279,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         Returns:
             Path to token-specific base directory
         """
-        base_path = Path(TWINKLE_DEFAULT_SAVE_DIR)
+        base_path = Path(TWINKLE_DEFAULT_SAVE_DIR).absolute()
         # Sanitize token to avoid filesystem issues
         sanitized_token = re.sub(r'[^\w\-]', '_', self.token)
         return base_path / sanitized_token
@@ -418,11 +448,32 @@ class BaseCheckpointManager(BaseFileManager, ABC):
     @abstractmethod
     def _create_checkpoint(
         self, checkpoint_id: str, checkpoint_type: str, 
-        path: str, size_bytes: int, public: bool
+        path: str, size_bytes: int, public: bool,
+        base_model: Optional[str] = None,
+        is_lora: bool = False,
+        lora_rank: Optional[int] = None,
+        train_unembed: Optional[bool] = None,
+        train_mlp: Optional[bool] = None,
+        train_attn: Optional[bool] = None,
+        user_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Create checkpoint data.
         
+        Args:
+            checkpoint_id: The checkpoint identifier
+            checkpoint_type: Type of checkpoint ('training' or 'sampler')
+            path: The twinkle:// path to the checkpoint
+            size_bytes: Size of the checkpoint in bytes
+            public: Whether the checkpoint is public
+            base_model: The base model name/path
+            is_lora: Whether this is a LoRA checkpoint
+            lora_rank: The LoRA rank if applicable
+            train_unembed: Whether unembed layers are trained
+            train_mlp: Whether MLP layers are trained
+            train_attn: Whether attention layers are trained
+            user_metadata: User-provided metadata
+            
         Returns:
             Dictionary with checkpoint data
         """
@@ -577,18 +628,54 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         path = f"{self.path_prefix}{model_id}/{checkpoint_id}"
         checkpoint_path = self.get_ckpt_dir(model_id, checkpoint_id)
         
+        # For sampler checkpoints, delete existing sampler weights for this model_id
+        if is_sampler:
+            self._delete_existing_sampler_weights(model_id)
+        
+        # Read training run info to include in checkpoint metadata
+        run_info = self.training_run_manager._read_info(model_id)
+        
         ckpt_data = self._create_checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
             path=path,
             size_bytes=self.get_dir_size(checkpoint_path),
-            public=public
+            public=public,
+            base_model=run_info.get('base_model'),
+            is_lora=run_info.get('is_lora', False),
+            lora_rank=run_info.get('lora_rank'),
+            train_unembed=run_info.get('train_unembed'),
+            train_mlp=run_info.get('train_mlp'),
+            train_attn=run_info.get('train_attn'),
+            user_metadata=run_info.get('user_metadata')
         )
         self._write_ckpt_info(model_id, checkpoint_id, ckpt_data)
 
         # Update last_checkpoint in run info
         self.training_run_manager.update(model_id, {'last_checkpoint': ckpt_data})
         return path
+
+    def _delete_existing_sampler_weights(self, model_id: str):
+        """
+        Delete all existing sampler weights for a model_id.
+        
+        Args:
+            model_id: The model identifier
+        """
+        run_dir = self.training_run_manager.get_model_dir(model_id)
+        sampler_weights_dir = run_dir / 'sampler_weights'
+        
+        if sampler_weights_dir.exists() and sampler_weights_dir.is_dir():
+            # Delete all subdirectories in sampler_weights
+            for item in sampler_weights_dir.iterdir():
+                if item.is_dir():
+                    # Delete checkpoint metadata file first
+                    meta_path = item / CHECKPOINT_INFO_FILENAME
+                    if meta_path.exists():
+                        meta_path.unlink()
+                    # Delete the directory
+                    shutil.rmtree(item)
+            logger.info(f"Deleted existing sampler weights for model_id: {model_id}")
 
     def get(self, model_id: str, checkpoint_id: str) -> Optional[Any]:
         """
@@ -701,27 +788,151 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """
         Get weights info.
         
+        Supports both twinkle:// paths (local checkpoints) and hub model IDs.
+        For hub model IDs, downloads checkpoint_metadata.json from ModelScope.
+        
         Args:
-            checkpoint_path: The path
+            checkpoint_path: The twinkle:// path or hub model ID
             
         Returns:
             WeightsInfoResponse or None if not found
         """
-        parsed_path = self.parse_path(checkpoint_path)
-        if not parsed_path:
+        # Use resolve_load_path to determine if this is a twinkle path or hub path
+        try:
+            resolved = self.resolve_load_path(checkpoint_path, validate_exists=False)
+        except ValueError:
             return None
         
-        ckpt_info = self.get(parsed_path.training_run_id, parsed_path.checkpoint_id)
-        if not ckpt_info:
-            return None
+        if resolved.is_twinkle_path:
+            # Local twinkle:// path - read from local checkpoint metadata
+            ckpt_data = self._read_ckpt_info(resolved.training_run_id, resolved.checkpoint_id)
+            if not ckpt_data or not ckpt_data.get('base_model'):
+                return None
+            return self._create_weights_info(ckpt_data)
+        else:
+            # Hub model ID - download checkpoint_metadata.json from ModelScope
+            return self._get_weights_info_from_hub(checkpoint_path)
+    
+    def _get_weights_info_from_hub(self, hub_model_id: str) -> Optional[Any]:
+        """
+        Download and parse checkpoint_metadata.json from hub.
         
-        # Weight info is stored in the training run info
-        run_info = self.training_run_manager._read_info(parsed_path.training_run_id)
-        if not run_info:
+        Args:
+            hub_model_id: The hub model ID (e.g., 'user/model-name')
+            
+        Returns:
+            WeightsInfoResponse or None if not found or failed to download
+        """
+        try:
+            # Download only the checkpoint_metadata.json file from hub
+            local_dir = HubOperation.download_file(
+                repo_id=hub_model_id,
+                allow_patterns=[CHECKPOINT_INFO_FILENAME],
+                token=self.token
+            )
+            
+            # Read and parse the metadata
+            metadata_path = os.path.join(local_dir, CHECKPOINT_INFO_FILENAME)
+            if not os.path.exists(metadata_path):
+                return None
+                
+            with open(metadata_path, 'r') as f:
+                ckpt_data = json.load(f)
+            
+            if not ckpt_data.get('base_model'):
+                return None
+            
+            return self._create_weights_info(ckpt_data)
+            
+        except Exception:
             return None
+
+    def parse_adapter_uri(self, adapter_uri: str) -> tuple:
+        """Parse adapter URI to extract user_id and resolved lora_path.
+
+        Args:
+            adapter_uri: The adapter URI, supports formats:
+                - twinkle://{training_run_id}/weights/{checkpoint_name} or sampler_weights/{name}
+                - Local filesystem path
+
+        Returns:
+            Tuple of (user_id, lora_path) where lora_path is the resolved filesystem path
+        """
+        if adapter_uri.startswith(self.path_prefix):
+            parsed = self.parse_path(adapter_uri)
+            if parsed:
+                # Get the filesystem path using get_ckpt_dir
+                lora_path = str(self.get_ckpt_dir(
+                    parsed.training_run_id, parsed.checkpoint_id
+                ))
+                return parsed.training_run_id, lora_path
+            else:
+                # Fallback: parse manually for non-standard formats
+                suffix = adapter_uri[len(self.path_prefix):]
+                return 'default', suffix
+        else:
+            # Local path
+            return 'default', adapter_uri
+
+    def resolve_load_path(self, path: str, validate_exists: bool = True) -> ResolvedLoadPath:
+        """
+        Resolve a checkpoint load path.
         
-        # Validate ownership
-        if not validate_ownership(self.token, run_info.get('model_owner', '')):
-            return None
+        This method handles two types of paths:
+        1. twinkle:// paths: Parse, validate permissions, return checkpoint_name and checkpoint_dir
+        2. Hub model IDs: Return the path as checkpoint_name with checkpoint_dir=None
         
-        return self._create_weights_info(run_info)
+        Args:
+            path: The path to resolve (either twinkle:// format or hub model ID)
+            validate_exists: Whether to validate that the checkpoint exists (default: True)
+            
+        Returns:
+            ResolvedLoadPath with checkpoint_name and checkpoint_dir
+            
+        Raises:
+            ValueError: If the path format is invalid or checkpoint not found
+        """
+        # Check if path starts with twinkle:// prefix
+        if path.startswith(self.path_prefix):
+            # Parse the twinkle:// path
+            parsed = self.parse_path(path)
+            if not parsed:
+                raise ValueError(f"Invalid {self.path_prefix} path format: {path}")
+            
+            # Extract components
+            training_run_id = parsed.training_run_id
+            checkpoint_id = parsed.checkpoint_id
+            checkpoint_name = checkpoint_id.split('/')[-1]  # Extract name from "weights/step-8"
+            
+            if validate_exists:
+                # Verify checkpoint exists and user has access
+                checkpoint = self.get(training_run_id, checkpoint_id)
+                if not checkpoint:
+                    raise ValueError(
+                        f"Checkpoint not found or access denied: {path}"
+                    )
+            
+            # Get the checkpoint directory parent path (no checkpoint name in the path)
+            checkpoint_dir = self.get_ckpt_dir(training_run_id, checkpoint_id).parent
+            
+            if validate_exists:
+                if not checkpoint_dir.exists():
+                    raise ValueError(f"Checkpoint directory not found: {checkpoint_dir}")
+            
+            return ResolvedLoadPath(
+                checkpoint_name=checkpoint_name,
+                checkpoint_dir=checkpoint_dir.as_posix(),
+                is_twinkle_path=True,
+                training_run_id=training_run_id,
+                checkpoint_id=checkpoint_id
+            )
+        else:
+            # Not a twinkle:// path - treat as hub model ID
+            # Return the path as checkpoint_name with no checkpoint_dir
+            return ResolvedLoadPath(
+                checkpoint_name=path,
+                checkpoint_dir=None,
+                is_twinkle_path=False,
+                training_run_id=None,
+                checkpoint_id=None
+            )

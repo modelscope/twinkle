@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import abstractmethod, ABC
-from typing import Dict, Any, Union, Type, Optional
+from typing import Dict, Any, Union, Type, Optional, Callable, TYPE_CHECKING
 
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
 from twinkle.patch import Patch
@@ -12,8 +11,15 @@ from twinkle.template import Template
 from twinkle import torch_util, Platform
 from twinkle.hub import HubOperation
 
+if TYPE_CHECKING:
+    import torch
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
+
 
 class TwinkleModel(ABC):
+
+    _checkpoint_engine = None
 
     @abstractmethod
     def forward(self, *, inputs: Dict[str, Any], **kwargs):
@@ -56,15 +62,15 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], 'torch.Tensor']], **kwargs):
         ...
 
     @abstractmethod
-    def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
+    def set_optimizer(self, optimizer_cls: Union['Optimizer', Type['Optimizer'], str], **kwargs):
         ...
 
     @abstractmethod
-    def set_lr_scheduler(self, scheduler_cls: Union[LRScheduler, Type[LRScheduler], str], **kwargs):
+    def set_lr_scheduler(self, scheduler_cls: Union['LRScheduler', Type['LRScheduler'], str], **kwargs):
         ...
 
     @abstractmethod
@@ -84,7 +90,7 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         ...
 
     @abstractmethod

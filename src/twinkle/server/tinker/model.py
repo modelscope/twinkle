@@ -24,9 +24,8 @@ from twinkle.server.utils.validation import verify_request_token
 from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from twinkle.utils.logger import get_logger
 
-from .common import TwinkleCompatTransformersModel
-from .common.task_queue import TaskQueueMixin, TaskQueueConfig
-from .common.adapter_manager import AdapterManagerMixin
+from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
+from twinkle.server.utils.adapter_manager import AdapterManagerMixin
 from .common.io_utils import create_training_run_manager, create_checkpoint_manager
 
 logger = get_logger()
@@ -38,8 +37,8 @@ def build_model_app(model_id: str,
                     device_mesh: Dict[str, Any],
                     deploy_options: Dict[str, Any],
                     use_megatron: bool = False,
-                    adapter_config: Dict[str, Any] = None,
-                    queue_config: Optional[Dict[str, Any]] = None,
+                    adapter_config: Dict[str, Any] = {},
+                    queue_config: Optional[Dict[str, Any]] = {},
                     **kwargs):
     """Build a model management application for distributed training.
 
@@ -101,7 +100,10 @@ def build_model_app(model_id: str,
                                nproc_per_node=nproc_per_node,
                                groups=[self.device_group],
                                lazy_collect=False)
-            self.device_mesh = DeviceMesh(**device_mesh)
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.use_megatron = use_megatron
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
@@ -113,12 +115,14 @@ def build_model_app(model_id: str,
                     **kwargs
                 )
             else:
+                from .common.transformers_model import TwinkleCompatTransformersModel
                 self.model = TwinkleCompatTransformersModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
                     **kwargs
                 )
+            self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
             # Initialize task queue
@@ -172,6 +176,7 @@ def build_model_app(model_id: str,
                         self.register_adapter(
                             adapter_name, request.state.token)
 
+                        self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                         self.model.set_processor('InputProcessor',
                                                  adapter_name=adapter_name)
                         self.model.set_optimizer('Adam',
@@ -360,30 +365,14 @@ def build_model_app(model_id: str,
                     loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
-                    if self.use_megatron:
-                        # Megatron uses combined forward_backward, no separate backward/calculate_loss
-                        output, loss = self.model.forward_backward(
-                            inputs=datum_list,
-                            adapter_name=adapter_name,
-                            **loss_fn_config)
-                    else:
-                        # Transformers uses separate forward, calculate_loss, backward
-                        # When use_megatron is True, we don't need to set the loss
-                        # Set loss first
-                        if loss_fn == 'cross_entropy':
-                            self.model.set_loss('CrossEntropyLoss',
-                                                adapter_name=adapter_name)
-                        else:
-                            raise ValueError(
-                                f'Unsupported loss function {loss_fn}')
-
-                        output = self.model.forward(inputs=datum_list,
-                                                    adapter_name=adapter_name)
-                        loss = self.model.calculate_loss(adapter_name=adapter_name,
-                                                         **loss_fn_config)
-                        self.model.backward(adapter_name=adapter_name)
+                    # Unified forward_backward for both Megatron and Transformers
+                    output, loss = self.model.forward_backward(inputs=datum_list,
+                                                                adapter_name=adapter_name,
+                                                                loss_fn=loss_fn,
+                                                                **loss_fn_config)
+                    output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
                     return types.ForwardBackwardOutput(
-                        loss_fn_output_type='CrossEntropyLossReturn',
+                        loss_fn_output_type=output_type,
                         loss_fn_outputs=output,
                         metrics={'loss:avg': loss},
                     )
@@ -432,7 +421,8 @@ def build_model_app(model_id: str,
 
                     self.model.step(adam_params=body.adam_params,
                                     adapter_name=adapter_name)
-                    return types.OptimStepResponse(metrics=None)
+                    metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
+                    return types.OptimStepResponse(metrics=metrics)
                 except Exception:
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
@@ -526,6 +516,7 @@ def build_model_app(model_id: str,
 
             async def _do_save_for_sampler():
                 try:
+    
                     adapter_name = self.get_adapter_name(
                         adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
@@ -544,15 +535,16 @@ def build_model_app(model_id: str,
                         model_id=body.model_id,
                         is_sampler=True
                     )
-
+                    # NOTE: Need to save meta first to ensure only one sample weight exists
+                    tinker_path = checkpoint_manager.save(
+                        body.model_id, name=checkpoint_name, is_sampler=True)
+                    
+                    logger.info(f"Saving weights to {save_dir}")
                     # Save weights with save_optimizer=False for sampler use
                     self.model.save(name=checkpoint_name,
                                     output_dir=save_dir,
                                     adapter_name=adapter_name,
                                     save_optimizer=False)
-
-                    tinker_path = checkpoint_manager.save(
-                        body.model_id, name=checkpoint_name, is_sampler=True)
 
                     # Create sampling session with resolved model_path/base_model.
                     payload = body.model_dump()
@@ -563,7 +555,7 @@ def build_model_app(model_id: str,
                     sampling_session_id = self.state.create_sampling_session(payload)
 
                     return types.SaveWeightsForSamplerResponseInternal(
-                        path=tinker_path,
+                        path=None, # Disable path return for internal use
                         sampling_session_id=sampling_session_id
                     )
                 except Exception:

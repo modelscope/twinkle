@@ -1,46 +1,89 @@
-# 截止0.1版本release
+# 0.1版本release
 
-发布时间: 1.31
-联合FC上线时间: 春节前
+## 中文
 
-## 基础能力
+### 基础能力
 
-- [x] sft跑通
-- [x] ray sft跑通
-- [x] http sft跑通
-- [ ] 多模态模型支持 P0 @jinghan
-- [ ] megatron支持 P0 @jinghan
-    - [ ] megatron多模态模型 P0
-- [ ] kernels/modules支持 P0
-    - [ ] liger kernel支持 P1
-- [ ] padding_free支持 P0 @yuhong
-- [ ] GRPO/多模态GRPO支持 P0 @yimin
-  - [ ] model/sampler placement（同步权重） P0 @yimin
-- [ ] DAPO、GSPO等算法平迁 P1
-- [ ] GKD/on-policy-distill平迁 P1
-- [ ] streaming数据支持 P0 @yuhong
-- [ ] MFU调优 P0 @yuhong
-- [ ] PT训练支持 P0 @yimin
-- [ ] DPO训练支持 P1
-- [ ] ulysses+ring-attention平迁 P1
+- [x] 支持transformers模型
+- [x] 支持megatron模型
+- [x] 支持vLLM采样器
+- [x] 支持dataset、dataloader、reward、advantage、权重同步等基本组件
+- [x] 支持数据集packing、padding_free、流式数据集
+- [x] 支持纯文本模型的PT/SFT
+- [x] 支持纯文本模型的GRPO
+- [x] 支持kernels
+- [x] 兼容NPU生态
 
-## 多租户
+### 网络能力
 
-- [ ] multi-lora支持 P0 @jinghan
-    - [ ] transformers P0 @jinghan
-    - [ ] megatron P0 @jinghan
-- [ ] 对接FC、百炼，可对外 P0 @yuhong @yunlin
-  - [ ] 多租户水位和降级控制 P0 @yuhong @yunlin
+- [x] 支持多LoRA租户
+- [x] 支持twinkle client训练
+- [x] 支持tinker API的兼容性
+- [x] 支持租户资源控制、水位控制
+- [x] 支持checkpoint的保存上传、下载
+- [x] 支持魔搭免费训练集群
 
-## API
+## English
 
-- [ ] 优化twinkle_client P0 @yunlin
-- [ ] 支持tinker client P0 @yunlin
+### Core Capabilities
 
-## 文档和发布
+- [x] Support for Transformers models
+- [x] Support for Megatron models
+- [x] Support for vLLM sampler
+- [x] Support for basic components including dataset, dataloader, reward, advantage, and weight synchronization
+- [x] Support for dataset packing, padding-free, and streaming datasets
+- [x] Support for PT/SFT of text-only models
+- [x] Support for GRPO of text-only models
+- [x] Support for kernels
+- [x] Compatibility with NPU ecosystem
 
-- [ ] code doc补充 P0 @yuhong
-- [ ] 测试用例补充 P0 @all
-- [ ] 文档编写 P0 @yuhong
-- [ ] README P0 @yuhong
-- [ ] 文档站建立 P0 @yuhong
+### Networking Capabilities
+
+- [x] Support for multi-LoRA tenants
+- [x] Support for Twinkle client training
+- [x] Support for Tinker API compatibility
+- [x] Support for tenant resource control and watermark control
+- [x] Support for checkpoint saving, uploading, and downloading
+- [x] Support for ModelScope free training cluster
+
+
+# 0.2版本待开发
+
+## 中文
+
+### 基础能力
+
+- [ ] 支持多模态模型
+- [ ] 支持megatron VPP
+- [ ] 支持liger kernel
+- [ ] 支持transformers模型的ulysses/ring-attention
+- [ ] 兼容transformers v5的tp、pp
+- [ ] 支持多轮RL
+- [ ] 支持gym训练
+- [ ] 支持GAPO、GSPO算法
+- [ ] 支持GKD、on-policy-distill等蒸馏算法
+- [ ] 支持DPO对齐训练
+- [ ] 支持colocate RL训练
+- [ ] Preprocess支持batched
+
+### 网络能力
+
+## English
+
+### Core Capabilities
+
+- [ ] Support for multimodal models
+- [ ] Support for Megatron VPP
+- [ ] Support for Liger kernel
+- [ ] Support for Ulysses/Ring-Attention for Transformers models
+- [ ] Compatibility with Transformers v5 TP and PP
+- [ ] Support for multi-turn RL
+- [ ] Support for Gym training
+- [ ] Support for GAPO and GSPO algorithms
+- [ ] Support for distillation algorithms such as GKD and on-policy distillation
+- [ ] Support for DPO alignment training
+- [ ] Support for colocate RL training
+- [ ] Support for batched preprocessing
+
+### Networking Capabilities
+

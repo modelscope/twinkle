@@ -18,11 +18,15 @@ class MegatronStrategy:
         **kwargs,
     ):
         self.device_mesh = device_mesh
-        self.sequence_parallel = self.device_mesh.sequence_parallel
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
     
+    @property
+    def sequence_parallel(self) -> bool:
+        """Read from device_mesh so auto-enable in args.py is visible."""
+        return getattr(self.device_mesh, 'sequence_parallel', False)
+
     def _check_device_mesh(self):
         from megatron.core import parallel_state as mpu
 
@@ -69,6 +73,14 @@ class MegatronStrategy:
         use_distributed_optimizer: bool = True,
     ) -> List[nn.Module]:
         if self.device_mesh.world_size <= 1:
+            from megatron.core.distributed import DistributedDataParallelConfig
+            ddp_config = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                use_distributed_optimizer=False,
+            )
+            for m in model:
+                if not hasattr(m, 'ddp_config'):
+                    m.ddp_config = ddp_config
             return model
 
         self._check_device_mesh()

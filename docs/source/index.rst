@@ -1,76 +1,41 @@
-.. swift documentation file,
+.. twinkle documentation file,
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Swift DOCUMENTATION
+Twinkle DOCUMENTATION
 ========================
 
 .. toctree::
    :maxdepth: 2
-   :caption: Get Started
+   :caption: 使用指引
 
-   GetStarted/SWIFT-installation.md
-   GetStarted/Quick-start.md
-   GetStarted/Web-UI.md
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Instruction
-
-   Instruction/Command-line-parameters.md
-   Instruction/Pre-training-and-Fine-tuning.md
-   Instruction/GRPO/index.rst
-   Instruction/GKD.md
-   Instruction/RLHF.md
-   Instruction/Inference-and-deployment.md
-   Instruction/Sample.md
-   Instruction/Evaluation.md
-   Instruction/Export-and-push.md
-   Instruction/Ray.md
-   Instruction/Reinforced-Fine-tuning.md
-   Instruction/Agent-support.md
-   Instruction/Supported-models-and-datasets.md
-   Instruction/Use-tuners.md
-   Instruction/Frequently-asked-questions.md
+   使用指引/快速开始.md
+   使用指引/安装.md
+   使用指引/服务端和客户端/index.rst
+   使用指引/NPU的支持.md
 
 .. toctree::
    :maxdepth: 2
-   :caption: Megatron-SWIFT
+   :caption: 组件
 
-   Megatron-SWIFT/Quick-start.md
-   Megatron-SWIFT/Command-line-parameters.md
-   Megatron-SWIFT/LoRA-Training.md
-   Megatron-SWIFT/Multimodal-Model.md
-   Megatron-SWIFT/Mcore-Bridge.md
-   Megatron-SWIFT/GRPO.md
-   Megatron-SWIFT/GKD.md
-   Megatron-SWIFT/Ascend.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Customization
-
-   Customization/Custom-model.md
-   Customization/Custom-dataset.md
-   Customization/Pluginization.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Best Practices
-
-   BestPractices/GRPO.md
-   BestPractices/GRPO-Multi-Modal-Training.md
-   BestPractices/GRPO-Code-Training.md
-   BestPractices/Qwen3-Best-Practice.md
-   BestPractices/Qwen3-VL-Best-Practice.md
-   BestPractices/MLLM-Registration.md
-   BestPractices/Embedding.md
-   BestPractices/Reranker.md
-   BestPractices/Rapidly-Training-VL-model.md
-   BestPractices/NPU-support.md
-   BestPractices/More-Best-Practices.md
+   组件/数据集/index.rst
+   组件/数据格式/index.rst
+   组件/模板/index.rst
+   组件/预处理器和过滤器/index.rst
+   组件/数据加载/index.rst
+   组件/任务处理器/index.rst
+   组件/模型/index.rst
+   组件/采样器/index.rst
+   组件/奖励/index.rst
+   组件/优势/index.rst
+   组件/检查点引擎/index.rst
+   组件/指标/index.rst
+   组件/损失/index.rst
+   组件/LRScheduler/index.rst
+   组件/补丁/index.rst
+   组件/组件化/index.rst
+   组件/Kernel/index.rst
+   组件/训练中间件/index.rst
 
 Indices and tables
 ==================

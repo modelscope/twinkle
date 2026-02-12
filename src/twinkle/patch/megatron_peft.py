@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 class MegatronPeft(Patch):
     _peft_patched = False
 
-    def patch(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs):
         from peft.tuners.tuners_utils import BaseTuner
 
         if MegatronPeft._peft_patched:

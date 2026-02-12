@@ -7,13 +7,14 @@ Engines are the low-level components that handle token-based inference.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
-from .types import SamplingParams, SampleResponse, SampledSequence
+from twinkle.data_format import SamplingParams, SampleResponse
 
 
 class BaseSamplerEngine(ABC):
+
     @abstractmethod
     async def sample(
         self,
@@ -76,7 +77,6 @@ class BaseSamplerEngine(ABC):
     
     async def save_weights_for_sampler(
         self,
-        user_id: str,
         weights: Dict[str, torch.Tensor],
         peft_config: Dict[str, Any],
         **kwargs,
@@ -85,7 +85,6 @@ class BaseSamplerEngine(ABC):
         Save weights as a LoRA adapter for sampling (client-server mode).
         
         Args:
-            user_id: Unique identifier for the user/training run.
             weights: LoRA weight tensors.
             peft_config: PEFT/LoRA configuration dict.
             

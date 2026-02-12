@@ -5,5 +5,5 @@ from twinkle.utils import construct_class
 
 class Patch:
 
-    def patch(self, module, *args, **kwargs):
+    def __call__(self, module, *args, **kwargs):
         ...

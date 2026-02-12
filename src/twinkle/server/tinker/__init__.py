@@ -8,3 +8,9 @@ from ..utils import wrap_builder_with_device_group_env
 
 build_model_app = wrap_builder_with_device_group_env(_build_model_app)
 build_sampler_app = wrap_builder_with_device_group_env(_build_sampler_app)
+
+__all__ = [
+    'build_model_app',
+    'build_sampler_app',
+    'build_server_app',
+]

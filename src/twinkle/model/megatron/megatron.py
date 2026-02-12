@@ -5,7 +5,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Type, Union, Callable
-
+import asyncio
+import threading
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -23,17 +24,16 @@ import twinkle.patch
 from twinkle import DeviceMesh, remote_class, remote_function, template, Platform
 from twinkle import requires
 from twinkle import torch_util
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import InputFeature, Trajectory, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
 from twinkle.metric import Metric, LossMetric, TrainMetric
+from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.model.base import TwinkleModel
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from .strategy import MegatronStrategy
 from twinkle.utils import construct_class, exists
-from .args import get_args, set_args, TwinkleMegatronArgs
-from .model import get_megatron_model_meta, GPTBridge
 from twinkle.patch import Patch, apply_patch
 
 
@@ -48,7 +48,7 @@ class MegatronOptimizerGroup:
     optimizer: Optimizer = None
     lr_scheduler: LRScheduler = None
     inputs: List[InputFeature] = None
-    outputs: Dict[str, Any] = None
+    outputs: ModelOutput = None
     loss_instance: Loss = None
     loss_value: Any = None
     template: Template = None
@@ -63,12 +63,11 @@ class MegatronOptimizerGroup:
     _last_grad_norm: float = 0.0
     _last_step_success: bool = True
 
-    def do_grad_sync(self,
-                     gradient_accumulation_steps: Optional[int] = None
-                     ) -> bool:
-        """Check if gradient synchronization should happen."""
+    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
+        else:
+            self.gradient_accumulation_steps = gradient_accumulation_steps
         return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
 
@@ -99,7 +98,9 @@ class MegatronOptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, {**self.outputs, 'lr': self._get_lr(), 'step': self.cur_step-1, 'gradient_accumulation_steps': self.gradient_accumulation_steps})
+                metric.accumulate(self.inputs, self.outputs, lr=self._get_lr(),
+                                  step=self.cur_step-1, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                                  grad_norm=self._last_grad_norm)
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -115,9 +116,46 @@ class MegatronOptimizerGroup:
 
 _default_adapter_name = ''
 
+_BASE_LAYER_SUFFIXES = [
+    ".q_proj.weight", ".q_proj.bias",
+    ".k_proj.weight", ".k_proj.bias",
+    ".v_proj.weight", ".v_proj.bias",
+    ".o_proj.weight", ".o_proj.bias",
+    ".gate_proj.weight", ".up_proj.weight",
+    ".down_proj.weight",
+    ".mlp.gate.weight", ".mlp.gate.bias",
+    ".mlp.gate.e_score_correction_bias",
+]
+
+
+def _add_base_layer_suffix(params):
+    """Insert ``.base_layer.`` before the final attribute for LoRA-target modules.
+
+    Converts plain HF names exported by the Megatron bridge into the format
+    expected by vLLM when ``enable_lora=True``::
+
+        model.layers.0.self_attn.q_proj.weight
+        -> model.layers.0.self_attn.q_proj.base_layer.weight
+
+    Non-matching names are yielded unchanged.
+
+    Args:
+        params: Iterable of ``(name, tensor)`` pairs.
+
+    Yields:
+        ``(name, tensor)`` with ``.base_layer.`` inserted where needed.
+    """
+    for name, param in params:
+        for suffix in _BASE_LAYER_SUFFIXES:
+            if name.endswith(suffix):
+                attr = suffix.rsplit(".", 1)[-1]  # 'weight' or 'bias'
+                name = f"{name[:-len(attr)]}base_layer.{attr}"
+                break
+        yield name, param
+
 
 @remote_class(execute='all')
-class MegatronModel(TwinkleModel, nn.Module):
+class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def __init__(
         self,
@@ -126,11 +164,14 @@ class MegatronModel(TwinkleModel, nn.Module):
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         load_weights: bool = True,
-        recompute_granularity: Optional[str] = 'selective',  # Activation checkpointing
+        recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+        recompute_method: Optional[str] = 'uniform',
+        recompute_num_layers: Optional[int] = 1,
         recompute_modules: Optional[list] = None,  # Modules to recompute
         **kwargs,
     ):
         requires('megatron_core')
+        from .args import get_args, set_args, TwinkleMegatronArgs
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
@@ -161,11 +202,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         ac_kwargs = {
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
+            'recompute_method': recompute_method,
+            'recompute_num_layers': recompute_num_layers,
         }
-        if kwargs.get('recompute_method'):
-            ac_kwargs['recompute_method'] = kwargs.get('recompute_method')
-        if kwargs.get('recompute_num_layers'):
-            ac_kwargs['recompute_num_layers'] = kwargs.get('recompute_num_layers')
 
         # Initialize TwinkleMegatronArgs BEFORE creating the model
         args = TwinkleMegatronArgs.from_hf_config(
@@ -183,8 +222,9 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._model_wrapped = False
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
-        MegatronPeft().patch()
-
+        self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
+        self.active_group = _default_adapter_name
+        MegatronPeft().__call__()
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
@@ -199,6 +239,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         load_weights: bool = True,
         **kwargs,
     ) -> List[nn.Module]:
+        from .args import get_args
         args = get_args()
         self.initialize(**kwargs)
         
@@ -227,6 +268,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         if not self._model_wrapped:
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
+
+    def _get_default_group(self):
+        """Get the only group has optimizer, else return the default one"""
+        if len(self.optimizer_group) == 1:
+            return next(iter(self.optimizer_group))
+        return self.active_group
 
     @staticmethod
     def _not_encoded(inputs):
@@ -297,11 +344,12 @@ class MegatronModel(TwinkleModel, nn.Module):
         from megatron.core.pipeline_parallel import get_forward_backward_func
         from megatron.core import parallel_state as mpu
 
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         forward_only = kwargs.pop('forward_only', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
-
+        if not inputs:
+            raise ValueError(f'inputs empty, check your DataLoader outputs')
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
@@ -313,8 +361,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
 
         if micro_batch_size is None:
-            assert len(inputs) >= optimizer_config.gradient_accumulation_steps and len(inputs) % optimizer_config.gradient_accumulation_steps == 0
-            micro_batch_size = len(inputs) // optimizer_config.gradient_accumulation_steps
+            micro_batch_size = 1
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -337,9 +384,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             else:
                 seq_length = original_seq_length
 
+        loss_extra_kwargs = kwargs
+
         def post_loss_function(output_tensor, inputs):
-            outputs = {'logits': output_tensor}
-            losses, counts = loss_instance(inputs, outputs)
+            outputs = ModelOutput(logits=output_tensor)
+            result = loss_instance(inputs, outputs, **loss_extra_kwargs)
+            if isinstance(result, tuple):
+                losses, counts = result
+            else:
+                losses = result
+                counts = torch.tensor(1, device=losses.device)
             return self.strategy.gather_loss_for_cp(losses, counts, output_tensor)
 
         # Define forward step function for Megatron
@@ -432,10 +486,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 'logits': logits,
             }
         else:
-            optimizer_config.outputs = {
-                'loss': loss,
-                'logits': logits,
-            }
+            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss)
             if isinstance(loss, torch.Tensor):
                 return loss.detach().cpu().float().numpy()
             return float(loss)
@@ -466,7 +517,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Args:
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
 
         if not optimizer_config.do_grad_sync(
@@ -476,8 +527,19 @@ class MegatronModel(TwinkleModel, nn.Module):
         optimizer = optimizer_config.optimizer
         assert optimizer is not None, 'Set optimizer correctly before stepping'
         # Megatron optimizer step() returns (success, grad_norm, num_zeros)
+
+        optim_params = kwargs.pop('optim_params', {})
+        if optim_params:
+            for group in optimizer.param_groups:
+                group['lr'] = optim_params['lr']
+                if group['weight_decay'] > 0.0 and optim_params.get('weight_decay', None) is not None:
+                    group['weight_decay'] = optim_params['weight_decay']
+                if optim_params.get('eps') is not None:
+                    group['eps'] = optim_params['eps']
+                if optim_params.get('betas') is not None:
+                    group['betas'] = optim_params['betas']
+
         success, grad_norm, num_zeros = optimizer.step()
-        optimizer_config.outputs['grad_norm'] = grad_norm
         # Store grad_norm for later retrieval
         optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
         optimizer_config._last_step_success = success
@@ -505,7 +567,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Args:
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
 
         # For DDP-wrapped models, ALWAYS zero the gradient buffer
@@ -521,7 +583,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         optimizer = optimizer_config.optimizer
         if optimizer is not None:
-            optimizer.zero_grad(**kwargs)
+            optimizer.zero_grad(set_to_none=True)
 
     @remote_function()
     def lr_step(self, **kwargs):
@@ -530,7 +592,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Args:
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
 
         if not optimizer_config.do_grad_sync(
@@ -544,7 +606,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             lr_scheduler.step(increment=increment)
 
     @remote_function(dispatch='all')
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]], **kwargs):
         """Set loss function.
 
         NOTE: For MegatronModel, the loss is computed internally by Megatron's
@@ -559,24 +621,24 @@ class MegatronModel(TwinkleModel, nn.Module):
             loss_cls: Loss class or string name (not used for Megatron).
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
 
-    def add_metric(self, metric_cls: Union[Metric, str], **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
         Args:
             metric_cls: A metric class type or id.
+            is_training: Whether the metric is for training. If None, it will be used for both training and evaluation.
             **kwargs:
                 adapter_name: Lora adapter name.
                 Any parameters needed to construct the metric_cls instance.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
-        is_training = kwargs.pop('is_training', None)
         if is_training is None or is_training is True:
             optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
         if not is_training:
@@ -595,7 +657,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                 - For standard optimizers: lr, weight_decay, etc.
                 - For MegatronDistributed: use_distributed_optimizer, clip_grad, etc.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         if not self._model_wrapped:
             self.model = self.strategy.wrap_model(self.model)
@@ -613,7 +675,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
     @remote_function(collect='first', lazy_collect=False)
     def calculate_metric(self, is_training, **kwargs):
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         return optimizer_config.calculate_metrics(is_training)
 
@@ -717,7 +779,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             scheduler_cls: Scheduler class or string name.
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer = optimizer_config.optimizer
         if not scheduler_cls or scheduler_cls in ('OptimizerParamScheduler', 'default'):
@@ -740,7 +802,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             interval: Save each interval steps.
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         if optimizer_config.cur_step % interval != 0:
             return
@@ -774,7 +836,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             checkpoint_dir = os.path.join(output_dir, name)
-        adapter_name = kwargs.get('adapter_name')
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
         bridge = self._bridge
         for _model in self.strategy.unwrap_model(self.model):
             bridge.load_weights(_model, checkpoint_dir, is_peft_format = (adapter_name != _default_adapter_name))
@@ -862,7 +924,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             State dict of trainable parameters.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         return self._get_trainable_parameters(adapter_name)
 
     def get_hf_state_dict(self, adapter_name: str = '') -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -887,19 +949,16 @@ class MegatronModel(TwinkleModel, nn.Module):
             >>> for name, tensor in model.get_hf_state_dict():
             ...     print(f"{name}: {tensor.shape}")
         """
-        is_peft_format = bool(adapter_name)
         model = self.strategy.unwrap_model(self.model)
-        
-        # Use bridge's export_weights which returns a generator
-        # This converts Megatron format to HF format on-the-fly
         yield from self._bridge.export_weights(
             model,
             target_device=None,  # Keep on current device for IPC transfer
             only_last_rank=False,  # All ranks participate in weight sync
-            is_peft_format=is_peft_format,
-            adapter_name=adapter_name if adapter_name else 'default',
+            is_peft_format=bool(adapter_name),
+            adapter_name=adapter_name if adapter_name else None,
             tqdm_desc='Weight sync: ',
         )
+
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         from .tuners.utils import set_linear_is_expert, get_target_modules, patch_deepcopy
@@ -943,6 +1002,7 @@ class MegatronModel(TwinkleModel, nn.Module):
                     if isinstance(m, LoraLinear):
                         # just check
                         # TODO untested code
+                        from .args import get_args
                         args = get_args()
                         from .tuners import LoraParallelLinear
                         assert args.is_multimodal and not isinstance(m, LoraParallelLinear)
@@ -961,6 +1021,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             'gradient_accumulation_steps', 1)
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+        self.active_group = adapter_name
 
     @remote_function(dispatch='all', sync=True)
     def add_adapter_to_model(
@@ -990,7 +1051,7 @@ class MegatronModel(TwinkleModel, nn.Module):
             template_cls: Template class or string name.
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.template = construct_class(template_cls, Template, twinkle.template, **kwargs)
 
@@ -1002,12 +1063,14 @@ class MegatronModel(TwinkleModel, nn.Module):
             processor_cls: Processor class or string name.
             **kwargs: Additional arguments.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['framework'] = 'megatron'
+        # processor/base.py: self.device_mesh.cp_world_size
+        kwargs['device_mesh'] = kwargs.get('device_mesh', self.device_mesh)
         optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
 
-    @remote_function(execute='first')
+    @remote_function(execute='first', lazy_collect=False)
     def get_train_configs(self, **kwargs):
         """Get training configuration summary.
 
@@ -1017,7 +1080,7 @@ class MegatronModel(TwinkleModel, nn.Module):
         Returns:
             Configuration summary string.
         """
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
 
         expr = f'Backend: Megatron-Core\n'
@@ -1052,6 +1115,7 @@ class MegatronModel(TwinkleModel, nn.Module):
 
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from .args import get_args
         self._try_init_process_group()
         args = get_args()
         init_kwargs = {
@@ -1080,11 +1144,140 @@ class MegatronModel(TwinkleModel, nn.Module):
         self._initialized = True
 
     @property
-    def _bridge(self) -> GPTBridge:
+    def _bridge(self) -> 'GPTBridge':
         if not hasattr(self, '_bridge_instance'):
+            from .args import get_args
+            from .model import get_megatron_model_meta
             args = get_args()
             megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
             assert megatron_model_meta is not None, f'Model: {args.hf_model_type} is not supported.'
             self._bridge_instance = megatron_model_meta.bridge_cls()
             
         return self._bridge_instance
+
+    # ── Checkpoint Engine (from CheckpointEngineMixin) ──────────────────
+    # prepare_checkpoint_engine, init_checkpoint_process_group, and
+    # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
+    #
+    # Key difference from TransformersModel: Megatron uses TP/PP, so
+    # get_hf_state_dict() internally performs TP allgather and handles PP
+    # layer distribution.  All model ranks MUST execute the weight generator
+    # concurrently for the collective communications to complete.  Only
+    # model_actor[0] (rank=0 in the checkpoint engine) actually broadcasts
+    # via NCCL; others consume the generator silently (rank=-1).
+
+    @remote_function(dispatch='all', lazy_collect=True)
+    def send_weights(
+        self,
+        adapter_name: str = None,
+        base_sync_done: bool = False,
+        merge_and_sync: bool = False,
+    ):  
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        engine = self._get_or_create_checkpoint_engine()
+
+        is_peft_format = (adapter_name != _default_adapter_name)
+
+        # Megatron uses padded_vocab_size for TP alignment (rounded up to
+        # TP * 128).  vLLM creates its embedding / lm_head from the original
+        # HF vocab_size, so weight_loader asserts shape[0] == org_vocab_size.
+        # Trim any tensor whose dim-0 equals padded_vocab_size back to
+        # org_vocab_size — this is shape-based, not name-based, so it works
+        # regardless of the model architecture's naming convention.
+        from .args import get_args
+        args = get_args()
+        org_vocab_size = getattr(self.hf_config, 'vocab_size', args.padded_vocab_size)
+        _padded_vocab_size = args.padded_vocab_size
+
+        def _trim_vocab(name, tensor):
+            if _padded_vocab_size != org_vocab_size and tensor.shape[0] == _padded_vocab_size:
+                tensor = tensor[:org_vocab_size]
+            return name, tensor
+
+        if base_sync_done and adapter_name:
+            if merge_and_sync:
+                def weight_generator():
+                    for _model in self.strategy.unwrap_model(self.model):
+                        if isinstance(_model, PeftModel):
+                            _model.merge_adapter()
+                    for name, tensor in self.get_hf_state_dict(adapter_name=''):
+                        if name is None or tensor is None:
+                            continue
+                        # Skip LoRA-specific weights for base model sync
+                        if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                            continue
+                        yield _trim_vocab(name, tensor)
+                    for _model in self.strategy.unwrap_model(self.model):
+                        if isinstance(_model, PeftModel):
+                            _model.unmerge_adapter()
+            else:
+                # ── LoRA-only mode ────────────────────────────────────────────
+                # Export only LoRA adapter weights via the bridge.
+                # The bridge may also yield non-LoRA weights (e.g. embed_tokens
+                # for modules_to_save), filter to only lora_A/lora_B tensors.
+                def weight_generator():
+                    for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
+                        if name is None or tensor is None:
+                            continue
+                        if 'lora' not in name:
+                            continue
+                        yield name, tensor
+
+        else:
+            def _raw_weights():
+                for name, tensor in self.get_hf_state_dict(adapter_name=''):
+                    if name is None or tensor is None:
+                        continue
+                    # Skip LoRA-specific weights for base model sync
+                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                        continue
+                    yield _trim_vocab(name, tensor)
+
+            def weight_generator():
+                if is_peft_format:
+                    yield from _add_base_layer_suffix(_raw_weights())
+                else:
+                    yield from _raw_weights()
+
+        async def _send():
+            await engine.send_weights(weight_generator())
+
+        result_container = {'error': None}
+
+        def _run():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_send())
+                finally:
+                    loop.close()
+            except Exception as e:
+                result_container['error'] = e
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+
+        if result_container['error'] is not None:
+            raise result_container['error']
+
+    @remote_function(collect='first')
+    def get_peft_config_dict(self, adapter_name: str = None) -> dict:
+        """Return the PEFT config as a dict for vLLM's PEFTHelper.
+
+        Used by CheckpointEngineManager for LoRA-only weight sync.
+
+        Returns:
+            PEFT config dict, or None if no LoRA adapter is present.
+        """
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is None or optimizer_config.adapter_config is None:
+            return None
+        config = optimizer_config.adapter_config
+        if isinstance(config, dict):
+            config = config.get(adapter_name, next(iter(config.values())))
+        return config.to_dict() if hasattr(config, 'to_dict') else dict(config)

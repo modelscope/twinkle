@@ -20,13 +20,16 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
     """
 
     def __init__(self, dataset: Dataset, auto_collation: bool, collate_fn: Callable[[Any], Any],
-                 drop_last: bool, batch_size: int, device_mesh: DeviceMesh, max_retries:int=20):
+                 drop_last: bool, batch_size: int, device_mesh: DeviceMesh, min_batch_size: int = None, max_retries:int=20):
         super().__init__(dataset, auto_collation, collate_fn, drop_last)
         self.dataset_iter = iter(dataset)
         self.ended = False
         self.batch_size = batch_size
         self.device_mesh = device_mesh
         self.max_retries = max_retries
+        self.min_batch_size = min_batch_size
+        if self.min_batch_size is None and self.device_mesh is not None:
+            self.min_batch_size = self.device_mesh.data_world_size
 
     def fetch(self, _):
         """Fetch data of global batch size and returns the slices belong to the current RANK.
@@ -66,7 +69,7 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
             data = next(self.dataset_iter)
 
         if self.device_mesh:
-            if len(data) < self.device_mesh.data_world_size:
+            if len(data) < self.min_batch_size:
                 raise StopIteration
             else:
                 data = data[self.device_mesh.get_slice(len(data))]

@@ -5,10 +5,10 @@ import shutil
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
-from itertools import product
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Type, Union
-import torch.distributed as dist
+from itertools import product
+from typing import Dict, List, Optional, Type, Union
+
 import numpy as np
 
 
@@ -20,6 +20,7 @@ class DeviceMesh:
     - tp: Tensor Parallel
     - pp: Pipeline Parallel
     - ulysses: ulysses sequence parallel
+    - sequence_parallel: megatron sequence parallel
     - cp: Context Parallel
     - ep: Expert Parallel
     - ep_fsdp: Expert FSDP Parallel
@@ -48,7 +49,7 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   ep_fsdp_size: int = None, etp_size: int = None, vpp_size: int = None, device_type: str = 'cuda',
+                   ep_fsdp_size: int = None, etp_size: int = 1,  vpp_size: int = None, device_type: str = 'cuda',
                    sequence_parallel: bool = False) -> "DeviceMesh":
         """Create a default device mesh from the given sizes.
 
@@ -88,16 +89,13 @@ class DeviceMesh:
             if origin_world_size == 1:
                 world_size *= dp_size
             mesh_dim_sizes.append(dp_size)
+        else:
+            mesh_dim_sizes.append(-1)
         if ep_size is not None:
             mesh_dim_sizes.append(ep_size)
             mesh_dim_names.append("ep")
             if origin_world_size == 1:
                 world_size *= ep_size
-        if ep_fsdp_size is not None:
-            mesh_dim_sizes.append(ep_fsdp_size)
-            mesh_dim_names.append("ep_fsdp")
-            if origin_world_size == 1:
-                world_size *= ep_fsdp_size
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")
@@ -398,6 +396,57 @@ class DeviceMesh:
         end = (rank + 1) * k + min(rank + 1, m)
         return slice(start, end)
 
+    def get_tp_ranks(self) -> List[int]:
+        """Get all ranks in the same TP group as the current rank."""
+        rank = Platform.get_rank()
+        if not self._has_dim("tp"):
+            return [rank]
+
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return []
+
+        slices = []
+        for i, dim_val in enumerate(coords):
+            if i == tp_idx:
+                slices.append(slice(None))
+            else:
+                slices.append(dim_val)
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def get_tp_last_ranks(self) -> List[int]:
+        """Get a list of all ranks that are the last rank in their respective TP group."""
+        if not self._has_dim("tp"):
+            return self.mesh.flatten().tolist()
+
+        tp_idx = self._get_dim_index("tp")
+        tp_size = self.mesh.shape[tp_idx]
+
+        slices = [slice(None)] * self.mesh.ndim
+        slices[tp_idx] = tp_size - 1
+
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def is_tp_last_rank(self, rank: Optional[int] = None) -> bool:
+        """Check if the given rank is the last rank in its TP group."""
+        if rank is None:
+            rank = Platform.get_rank()
+        
+        if not self._has_dim("tp"):
+            return True
+            
+        tp_idx = self._get_dim_index("tp")
+        coords = self._get_coord_for_rank(rank)
+        
+        if coords is None:
+            return False
+            
+        tp_size = self.mesh.shape[tp_idx]
+        return coords[tp_idx] == tp_size - 1
+    
     def is_pp_first_rank(self) -> bool:
         pp_ranks = self.get_pp_first_ranks()
         if pp_ranks is None:
@@ -457,7 +506,6 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
-    visible_devices: Optional[str] = None  # Optional: explicitly set visible devices (e.g., "8,9")
     gpus_per_worker: int = 1
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
@@ -474,62 +522,16 @@ class Platform(ABC):
             ) from exc
 
     @staticmethod
-    def visible_device_env() -> str:
-        return Platform.get_platform().visible_device_env()
+    def visible_device_env(platform: str = None) -> str:
+        return Platform.get_platform(platform).visible_device_env()
 
     @staticmethod
-    def device_prefix() -> str:
-        return Platform.get_platform().device_prefix()
+    def device_prefix(platform: str = None) -> str:
+        return Platform.get_platform(platform).device_prefix()
 
     @staticmethod
     def get_platform_names() -> List[str]:
         return ['GPU', 'NPU', 'MPS']
-
-    @staticmethod
-    def resolve_visible_devices(
-        device_type: str,
-        *,
-        explicit: Any = None,
-        env_values: Optional[List[Any]] = None,
-        include_os_env: bool = True,
-    ) -> Optional[str]:
-        def _normalize(value: Any) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, (list, tuple)):
-                return ','.join(str(v) for v in value)
-            if isinstance(value, int):
-                return str(value)
-            if isinstance(value, str):
-                return value
-            return None
-
-        if not device_type:
-            return None
-        if device_type.upper() == "CPU":
-            return None
-
-        try:
-            visible_env = Platform.get_platform(device_type.upper()).visible_device_env()
-        except Exception:
-            visible_env = None
-        if not visible_env:
-            return None
-
-        normalized = _normalize(explicit)
-        if normalized:
-            return normalized
-
-        if env_values:
-            for value in env_values:
-                normalized = _normalize(value)
-                if normalized:
-                    return normalized
-
-        if include_os_env:
-            return _normalize(os.environ.get(visible_env))
-
-        return None
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
