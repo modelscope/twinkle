@@ -4,7 +4,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Callable, Type, Union, Dict, Any
 
-from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset
+from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset, DatasetDict
 from torch.utils.data import Dataset as TorchDataset
 
 import twinkle
@@ -132,6 +132,21 @@ class Dataset(TorchDataset):
                 dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
+
+        # fix: Some dataset sources return DatasetDict instead of Dataset, which breaks downstream select/map calls.
+        # fix: Normalize split resolution here (target split first, then train) and fail early with a clear error.
+        if isinstance(dataset, DatasetDict):
+            if split in dataset:
+                dataset = dataset[split]
+            elif 'train' in dataset:
+                dataset = dataset['train']
+            else:
+                available_splits = list(dataset.keys())
+                raise KeyError(
+                    f"Split '{split}' not found for dataset '{dataset_id}'. "
+                    f'Available splits: {available_splits}'
+                )
+
         if isinstance(dataset_meta.data_slice, Iterable) and hasattr(dataset, '__len__'):
             
             iter_list = []

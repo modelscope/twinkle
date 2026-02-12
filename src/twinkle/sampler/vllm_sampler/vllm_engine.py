@@ -7,6 +7,7 @@ import torch
 from twinkle import get_logger
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
+from twinkle.utils.platform import get_vllm_device_uuid
 
 import inspect
 logger = get_logger()
@@ -541,8 +542,11 @@ class VLLMEngine(BaseSamplerEngine):
         use_gpu_ipc = first_tensor.is_cuda
         use_shm = not use_gpu_ipc
 
-        # Get device UUID for ZMQ handle
-        device_uuid = current_platform.get_device_uuid(0)
+        # fix: On NPU, current_platform.get_device_uuid may be unimplemented and break receive_weights flow.
+        # fix: Route through platform-level fallback so IPC socket name remains stable.
+        # Get device UUID for ZMQ handle.
+        # For NPU, this is resolved from `npu-smi info` Bus-Id when needed.
+        device_uuid = get_vllm_device_uuid(0)
         zmq_handle = f"ipc:///tmp/twinkle-ipc-{device_uuid}.sock"
 
         bucket_size = bucket_size_mb << 20
