@@ -30,18 +30,15 @@ class AdapterManagerMixin:
     that have been inactive for longer than the configured timeout period.
 
     Inheriting classes should:
-    1. Have a `self.model` attribute for model operations
-    2. Call _init_adapter_manager() in __init__
-    3. Optionally override _on_adapter_expired() to customize expiration handling
+    1. Call _init_adapter_manager() in __init__
+    2. Override _on_adapter_expired() to customize expiration handling
 
     Attributes:
         _adapter_timeout: Timeout in seconds for inactive adapters.
-        model: Model instance for adapter operations (must be set by inheriting class).
     """
 
     # Type hint for state attribute that inheriting classes must provide
     state: 'ServerStateProxy'
-    model: 'TwinkleModel'
     
     def _init_adapter_manager(
         self,
@@ -54,8 +51,9 @@ class AdapterManagerMixin:
         This should be called in the __init__ of the inheriting class.
 
         Args:
-            adapter_timeout: Timeout in seconds for inactive adapters.
-                Default is 1800.0 (30 minutes).
+            adapter_timeout: Timeout in seconds for inactive adapters and session-based expiration.
+                Default is 1800.0 (30 minutes). Adapters linked to sessions will expire
+                when their session hasn't been touched for this duration.
             per_token_adapter_limit: Maximum number of adapters per user token.
                 Default is 30.
             adapter_max_lifetime: Maximum lifetime in seconds for an adapter since creation.
@@ -66,35 +64,65 @@ class AdapterManagerMixin:
         self._adapter_max_lifetime = adapter_max_lifetime
 
         # Adapter lifecycle tracking
-        # Dict mapping adapter_name -> {'token': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
+        # Dict mapping adapter_name -> {'token': str, 'session_id': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
         self._adapter_records: Dict[str, Dict[str, Any]] = {}
         # Track adapter count per token
         self._adapter_counts: Dict[str, int] = {}
-        self._adapter_lock = threading.Lock()
 
         # Countdown thread
         self._adapter_countdown_thread: Optional[threading.Thread] = None
         self._adapter_countdown_running = False
 
-    def register_adapter(self, adapter_name: str, token: str) -> None:
+    def register_adapter(self, adapter_name: str, token: str, session_id: Optional[str] = None) -> None:
         """Register a new adapter for lifecycle tracking.
 
         Args:
             adapter_name: Name of the adapter to register.
             token: User token that owns this adapter.
+            session_id: Optional session ID to associate with this adapter.
+                If provided, adapter will expire when the session expires.
+        
+        Raises:
+            RuntimeError: If adapter limit is exceeded for this token.
         """
-        with self._adapter_lock:
-            current_time = time.time()
-            self._adapter_records[adapter_name] = {
-                'token': token,
-                'last_activity': current_time,
-                'created_at': current_time,
-                'inactivity_counter': 0,
-                'state': {},
-                'expiring': False,
-            }
-            logger.debug(
-                f"[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...")
+        # Check adapter limit BEFORE registering
+        allowed, reason = self.check_adapter_limit(token)
+        if not allowed:
+            raise RuntimeError(reason)
+        
+        current_time = time.time()
+        self._adapter_records[adapter_name] = {
+            'token': token,
+            'session_id': session_id,
+            'last_activity': current_time,
+            'created_at': current_time,
+            'inactivity_counter': 0,
+            'state': {},
+            'expiring': False,
+        }
+        logger.debug(
+            f"[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}..." + 
+            (f" (session: {session_id})" if session_id else ""))
+
+    def _is_session_alive(self, session_id: str) -> bool:
+        """Check if a session is still alive via state proxy.
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if session is alive, False if expired or not found
+        """
+        if not session_id:
+            return True  # No session association means always alive
+        
+        # Get session last heartbeat through proxy
+        last_heartbeat = self.state.get_session_last_heartbeat(session_id)
+        if last_heartbeat is None:
+            return False  # Session doesn't exist
+        
+        # Check if session has timed out using adapter_timeout
+        return (time.time() - last_heartbeat) < self._adapter_timeout
 
     def unregister_adapter(self, adapter_name: str) -> bool:
         """Unregister an adapter from lifecycle tracking.
@@ -105,14 +133,13 @@ class AdapterManagerMixin:
         Returns:
             True if adapter was found and removed, False otherwise.
         """
-        with self._adapter_lock:
-            if adapter_name in self._adapter_records:
-                adapter_info = self._adapter_records.pop(adapter_name)
-                token = adapter_info.get('token')
-                logger.debug(
-                    f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}...")
-                return True
-            return False
+        if adapter_name in self._adapter_records:
+            adapter_info = self._adapter_records.pop(adapter_name)
+            token = adapter_info.get('token')
+            logger.debug(
+                f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}...")
+            return True
+        return False
 
     def set_adapter_state(self, adapter_name: str, key: str, value: Any) -> None:
         """Set a per-adapter state value.
@@ -121,40 +148,36 @@ class AdapterManagerMixin:
         adapter-scoped state (e.g., training readiness) without maintaining
         separate side maps.
         """
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            if info is None:
-                return
-            state = info.setdefault('state', {})
-            state[key] = value
+        info = self._adapter_records.get(adapter_name)
+        if info is None:
+            return
+        state = info.setdefault('state', {})
+        state[key] = value
 
     def get_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
         """Get a per-adapter state value."""
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            if info is None:
-                return default
-            state = info.get('state') or {}
-            return state.get(key, default)
+        info = self._adapter_records.get(adapter_name)
+        if info is None:
+            return default
+        state = info.get('state') or {}
+        return state.get(key, default)
 
     def pop_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
         """Pop a per-adapter state value."""
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            if info is None:
-                return default
-            state = info.get('state')
-            if not isinstance(state, dict):
-                return default
-            return state.pop(key, default)
+        info = self._adapter_records.get(adapter_name)
+        if info is None:
+            return default
+        state = info.get('state')
+        if not isinstance(state, dict):
+            return default
+        return state.pop(key, default)
 
     def clear_adapter_state(self, adapter_name: str) -> None:
         """Clear all per-adapter state values."""
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            if info is None:
-                return
-            info['state'] = {}
+        info = self._adapter_records.get(adapter_name)
+        if info is None:
+            return
+        info['state'] = {}
 
     def touch_adapter(self, adapter_name: str) -> bool:
         """Update adapter activity timestamp to prevent timeout.
@@ -165,15 +188,14 @@ class AdapterManagerMixin:
         Returns:
             True if adapter was found and touched, False otherwise.
         """
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            if not info:
-                return False
-            if info.get('expiring'):
-                return False
-            info['last_activity'] = time.time()
-            info['inactivity_counter'] = 0
-            return True
+        info = self._adapter_records.get(adapter_name)
+        if not info:
+            return False
+        if info.get('expiring'):
+            return False
+        info['last_activity'] = time.time()
+        info['inactivity_counter'] = 0
+        return True
 
     def get_adapter_info(self, adapter_name: str) -> Optional[Dict[str, Any]]:
         """Get information about a registered adapter.
@@ -184,45 +206,23 @@ class AdapterManagerMixin:
         Returns:
             Dict with adapter information or None if not found.
         """
-        with self._adapter_lock:
-            return self._adapter_records.get(adapter_name)
-
-    def list_adapters(self, token: Optional[str] = None) -> List[str]:
-        """List all registered adapters, optionally filtered by token.
-
-        Args:
-            token: Optional user token to filter by.
-
-        Returns:
-            List of adapter names.
-        """
-        with self._adapter_lock:
-            if token is None:
-                return list(self._adapter_records.keys())
-            return [
-                name for name, info in self._adapter_records.items()
-                if info.get('token') == token
-            ]
+        return self._adapter_records.get(adapter_name)
 
     def _on_adapter_expired(self, adapter_name: str) -> None:
         """Hook method called when an adapter expires.
 
-        Default implementation removes the adapter from the model.
-        This is called from the countdown thread, so be careful with blocking operations.
+        This method must be overridden by inheriting classes to handle
+        adapter expiration logic. The base implementation raises NotImplementedError.
 
         Args:
             adapter_name: Name of the expired adapter.
+        
+        Raises:
+            NotImplementedError: If not overridden by inheriting class.
         """
-        try:
-            # Best-effort cleanup of adapter state
-            with self._adapter_lock:
-                info = self._adapter_records.get(adapter_name)
-                if info is not None:
-                    info['state'] = {}
-            self.model.remove_adapter(adapter_name)
-            logger.info(f"[AdapterManager] Removed expired adapter {adapter_name}")
-        except Exception as e:
-            logger.warning(f"[AdapterManager] Failed to remove expired adapter {adapter_name}: {e}")
+        raise NotImplementedError(
+            f"_on_adapter_expired must be implemented by {self.__class__.__name__}"
+        )
 
     @staticmethod
     def get_adapter_name(adapter_name: str) -> str:
@@ -240,23 +240,9 @@ class AdapterManagerMixin:
 
     def assert_adapter_exists(self, adapter_name: str) -> None:
         """Validate that an adapter exists and is not expiring."""
-        with self._adapter_lock:
-            info = self._adapter_records.get(adapter_name)
-            assert adapter_name and info is not None and not info.get('expiring'), \
-                f"Adapter {adapter_name} not found"
-
-    def assert_adapter_valid(self, adapter_name: Optional[str]) -> None:
-        """Validate that an adapter name is valid.
-
-        Args:
-            adapter_name: The adapter name to validate (can be None or empty)
-
-        Raises:
-            AssertionError: If adapter name is invalid
-        """
-        assert (adapter_name is None or adapter_name == '' or
-                self.get_adapter_info(adapter_name) is not None), \
-            f"Adapter {adapter_name} is invalid"
+        info = self._adapter_records.get(adapter_name)
+        assert adapter_name and info is not None and not info.get('expiring'), \
+            f"Adapter {adapter_name} not found"
 
     def _adapter_countdown_loop(self) -> None:
         """Background thread that monitors and handles inactive adapters.
@@ -274,50 +260,69 @@ class AdapterManagerMixin:
                 now = time.time()
 
                 expired_adapters: List[Tuple[str, Optional[str]]] = []
-                with self._adapter_lock:
-                    for adapter_name, info in list(self._adapter_records.items()):
-                        if info.get('expiring'):
-                            continue
+                # Create snapshot to avoid modification during iteration
+                adapter_snapshot = list(self._adapter_records.items())
+                for adapter_name, info in adapter_snapshot:
+                    if info.get('expiring'):
+                        continue
 
-                        created_at = info.get("created_at") or now
-                        exceeded_ttl = (
-                            self._adapter_max_lifetime
-                            and self._adapter_max_lifetime > 0
-                            and (now - created_at) > self._adapter_max_lifetime
-                        )
-
+                    session_id = info.get('session_id')
+                    created_at = info.get("created_at")
+                    
+                    # Check TTL for both cases
+                    exceeded_ttl = (
+                        self._adapter_max_lifetime
+                        and self._adapter_max_lifetime > 0
+                        and (now - created_at) > self._adapter_max_lifetime
+                    )
+                    
+                    # Different logic based on session association
+                    if session_id:
+                        # Has session: check session expiration and TTL
+                        session_expired = not self._is_session_alive(session_id)
+                        should_expire = session_expired or exceeded_ttl
+                        expiration_reasons = []
+                        if exceeded_ttl:
+                            expiration_reasons.append("ttl_exceeded")
+                        if session_expired:
+                            expiration_reasons.append("session_expired")
+                    else:
+                        # No session: check inactivity timeout and TTL
                         info["inactivity_counter"] = info.get("inactivity_counter", 0) + 1
                         exceeded_inactivity = info["inactivity_counter"] > self._adapter_timeout
-
-                        if exceeded_ttl or exceeded_inactivity:
-                            info['expiring'] = True
-                            info['state'] = {}  # best-effort clear
-                            token = info.get('token')
-                            expired_adapters.append((adapter_name, token))
-                            logger.debug(
-                                f"[AdapterManager] Adapter {adapter_name} expired "
-                                f"(ttl={exceeded_ttl}, inactivity={exceeded_inactivity})"
-                            )
+                        should_expire = exceeded_ttl or exceeded_inactivity
+                        expiration_reasons = []
+                        if exceeded_ttl:
+                            expiration_reasons.append("ttl_exceeded")
+                        if exceeded_inactivity:
+                            expiration_reasons.append("inactivity_timeout")
+                    
+                    if should_expire:
+                        info['expiring'] = True
+                        info['state'] = {}  # best-effort clear
+                        token = info.get('token')
+                        expired_adapters.append((adapter_name, token))
+                        logger.debug(
+                            f"[AdapterManager] Adapter {adapter_name} expired "
+                            f"(reasons={','.join(expiration_reasons)}, session={session_id})"
+                        )
 
                 for adapter_name, token in expired_adapters:
                     success = False
                     try:
                         self._on_adapter_expired(adapter_name)
-                        if token:
-                            self.check_adapter_limit(token, False)
                         success = True
                     except Exception as e:
                         logger.warning(
                             f"[AdapterManager] Error while expiring adapter {adapter_name}: {e}"
                         )
                     finally:
-                        with self._adapter_lock:
-                            if success:
-                                self._adapter_records.pop(adapter_name, None)
-                            else:
-                                info = self._adapter_records.get(adapter_name)
-                                if info is not None:
-                                    info['expiring'] = False
+                        if success:
+                            self._adapter_records.pop(adapter_name, None)
+                        else:
+                            info = self._adapter_records.get(adapter_name)
+                            if info is not None:
+                                info['expiring'] = False
 
             except Exception as e:
                 logger.warning(f"[AdapterManager] Error in countdown loop: {e}")
@@ -352,64 +357,27 @@ class AdapterManagerMixin:
                 self._adapter_countdown_thread.join(timeout=2.0)
             logger.debug("[AdapterManager] Countdown thread stopped")
 
-    def get_adapter_stats(self) -> Dict[str, Any]:
-        """Get adapter manager statistics.
-
-        Returns:
-            Dict with registered adapter count and configuration.
-        """
-        with self._adapter_lock:
-            return {
-                "registered_adapters": len(self._adapter_records),
-                "tracked_adapter_counts": len(self._adapter_counts),
-                "countdown_running": self._adapter_countdown_running,
-                "adapter_timeout_seconds": self._adapter_timeout,
-                "adapter_max_lifetime_seconds": self._adapter_max_lifetime,
-                "per_token_adapter_limit": self._per_token_adapter_limit,
-            }
-
-    def check_adapter_limit(self, token: str, add: bool) -> Tuple[bool, Optional[str]]:
-        """Check and update adapter count for a user token.
+    def check_adapter_limit(self, token: str) -> Tuple[bool, Optional[str]]:
+        """Check adapter count for a user token.
 
         This method enforces per-user adapter limits to prevent resource exhaustion.
+        Counts adapters directly from _adapter_records instead of using state storage.
 
         Args:
-            token: User token to check/update.
-            add: True to add an adapter (increment count), False to remove (decrement count).
+            token: User token to check.
 
         Returns:
             Tuple of (allowed: bool, reason: Optional[str]).
             If allowed is False, reason contains the explanation.
         """
-        user_key = token + '_' + 'model_adapter'
-        with self._adapter_lock:
-            current_count = self.state.get_config(user_key) or 0
+        # Count adapters directly from _adapter_records
+        current_count = sum(
+            1 for record in self._adapter_records.values() 
+            if record.get('token') == token and not record.get('expiring', False)
+        )
 
-            if add:
-                # Check if adding would exceed limit
-                if current_count >= self._per_token_adapter_limit:
-                    return False, f"Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters"
-                # Increment count in global state
-                self.state.add_config(user_key, current_count + 1)
-                return True, None
-            else:
-                # Decrement count in global state
-                if current_count > 0:
-                    current_count -= 1
-                    self.state.add_config(user_key, current_count)
-                if current_count <= 0:
-                    self.state.pop_config(user_key)
-                return True, None
+        # Check if current count exceeds limit
+        if current_count >= self._per_token_adapter_limit:
+            return False, f"Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters"
+        return True, None
 
-    def get_adapter_count(self, token: str) -> int:
-        """Get current adapter count for a user token.
-
-        Args:
-            token: User token to query.
-
-        Returns:
-            Current number of adapters for this token.
-        """
-        user_key = token + '_' + 'model_adapter'
-        with self._adapter_lock:
-            return self.state.get_config(user_key) or 0

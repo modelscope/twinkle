@@ -126,12 +126,36 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
+        def _cleanup_adapter(self, adapter_name: str) -> None:
+            """Common adapter cleanup logic used by both manual unload and automatic expiration.
+            
+            This method handles:
+            1. Clearing adapter state
+            2. Removing adapter from model
+            3. Unregistering from adapter manager
+            4. Removing from server state
+            
+            Args:
+                adapter_name: Name of the adapter to clean up
+            """
+            # Remove from model if it exists
+            if self.get_adapter_info(adapter_name):
+                # Clear adapter state
+                self.clear_adapter_state(adapter_name)
+                
+                self.model.remove_adapter(adapter_name)
+                # Unregister from adapter manager
+                self.unregister_adapter(adapter_name)
+                
+                # Remove from server state
+                self.state.unload_model(adapter_name)
+
         def _on_adapter_expired(self, adapter_name: str) -> None:
             # Called from AdapterManagerMixin's countdown thread.
-            self.clear_adapter_state(adapter_name)
             # Fail any pending tasks for this adapter/model.
             self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
-            super()._on_adapter_expired(adapter_name)
+            # Perform common cleanup (without token since it's automatic)
+            self._cleanup_adapter(adapter_name)
 
         @app.post('/create_model')
         async def create_model(
@@ -159,24 +183,20 @@ def build_model_app(model_id: str,
             async def _create_adapter():
                 try:
                     if body.lora_config:
-                        # Check adapter limit before creating
-                        allowed, reason = self.check_adapter_limit(
-                            request.state.token, True)
-                        if not allowed:
-                            raise RuntimeError(reason)
-
                         # TODO: support more lora config parameters, train_unembed, etc.
                         lora_cfg = LoraConfig(
                             r=body.lora_config.rank, target_modules='all-linear')
 
                         adapter_name = self.get_adapter_name(
                             adapter_name=model_id)
+                        
+                        # Register adapter FIRST (limit check happens inside register_adapter)
+                        self.register_adapter(
+                            adapter_name, request.state.token, session_id=body.session_id)
+                        
+                        # Create adapter AFTER successful registration
                         self.model.add_adapter_to_model(
                             adapter_name=adapter_name, config_or_dir=lora_cfg)
-
-                        # Register adapter with rate limiter for lifecycle tracking
-                        self.register_adapter(
-                            adapter_name, request.state.token)
 
                         self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                         self.model.set_processor('InputProcessor',
@@ -195,9 +215,7 @@ def build_model_app(model_id: str,
                 except Exception:
                     # Ensure we don't leave stale grad state.
                     adapter_name = self.get_adapter_name(adapter_name=model_id)
-                    self.clear_adapter_state(adapter_name)
-                    # If adapter creation fails, decrement the count
-                    self.check_adapter_limit(request.state.token, False)
+                    self._cleanup_adapter(adapter_name)
 
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
@@ -266,14 +284,8 @@ def build_model_app(model_id: str,
                 # Only remove adapter, not the base model
                 adapter_name = self.get_adapter_name(
                     adapter_name=body.model_id)
-                self.clear_adapter_state(adapter_name)
-                if self.get_adapter_info(adapter_name):
-                    self.model.remove_adapter(adapter_name)
-                    # Unregister adapter from rate limiter
-                    self.unregister_adapter(adapter_name)
-                    # Decrement adapter count via rate limiter
-                    self.check_adapter_limit(request.state.token, False)
-                self.state.unload_model(body.model_id)
+                # Use common cleanup logic
+                self._cleanup_adapter(adapter_name)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
             return await self.schedule_task(

@@ -64,6 +64,7 @@ class ServerState:
             'user_metadata': payload.get('user_metadata') or {},
             'sdk_version': payload.get('sdk_version'),
             'created_at': datetime.now().isoformat(),
+            'last_heartbeat': time.time(),
         }
         return session_id
 
@@ -81,6 +82,21 @@ class ServerState:
             return False
         self.sessions[session_id]['last_heartbeat'] = time.time()
         return True
+
+    def get_session_last_heartbeat(self, session_id: str) -> Optional[float]:
+        """
+        Get the last heartbeat timestamp for a session.
+        
+        Args:
+            session_id: The session ID to query
+            
+        Returns:
+            Last heartbeat timestamp, or None if session doesn't exist
+        """
+        session_info = self.sessions.get(session_id)
+        if not session_info:
+            return None
+        return session_info.get('last_heartbeat')
 
     # ----- Model Registration -----
 
@@ -464,6 +480,9 @@ class ServerStateProxy:
 
     def touch_session(self, session_id: str) -> bool:
         return ray.get(self._actor.touch_session.remote(session_id))
+
+    def get_session_last_heartbeat(self, session_id: str) -> Optional[float]:
+        return ray.get(self._actor.get_session_last_heartbeat.remote(session_id))
 
     # ----- Model Registration -----
 
