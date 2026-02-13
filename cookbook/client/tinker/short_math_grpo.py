@@ -1,12 +1,12 @@
-# Tinker-Compatible Client - GSM8K GRPO Training Example
+# Tinker-Compatible Client - Math GRPO Training Example
 #
-# This script demonstrates GSM8K math problem training using the
+# This script demonstrates Math problem training using the
 # Tinker-compatible client API with save_weights_for_sampler for weight sync.
 # Instead of calling sync_weights directly, it periodically saves weights and
 # creates a sampling client for generation.
 #
 # Flow:
-#   1. Prepare GSM8K dataset (client-side)
+#   1. Prepare Math dataset (client-side)
 #   2. Initialize Tinker-compatible training & sampling clients
 #   3. Training loop:
 #      a. Every SYNC_INTERVAL steps: save_weights_for_sampler → sampling_client
@@ -17,8 +17,8 @@
 #
 # The server must be running first (see server.py and server_config.yaml).
 # Requires both model and sampler services to be configured.
-import os
 import gc
+import os
 import re
 import numpy as np
 from typing import List, Tuple
@@ -30,7 +30,7 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import Preprocessor
 from twinkle.reward.base import Reward
-from twinkle.data_format import Trajectory, InputFeature, Message
+from twinkle.data_format import Trajectory, Message
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from modelscope import AutoTokenizer
@@ -38,22 +38,24 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
-NUM_GENERATIONS = 4
-MAX_NEW_TOKENS = 1024
+BASE_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+NUM_GENERATIONS = 8
+MAX_NEW_TOKENS = 4096
 LEARNING_RATE = 1e-4
-MAX_STEPS = 100
-BATCH_SIZE = 4
+MAX_STEPS = 1000
+BATCH_SIZE = 2
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1       # Save weights for sampler every N steps
 LORA_RANK = 8
-DATA_NUM = 1000         # Number of GSM8K samples to use
+DATA_NUM = 2000         # Number of Math samples to use
 
 SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the problem step by step. "
-    "Show your reasoning in <think> </think> tags, then give the final "
-    "numerical answer after ####.\n"
-    "For example:\n<think> ... reasoning ... </think>\n#### 42"
+    "You are a math assistant that values brevity. "
+    "Solve problems with minimal but correct reasoning.\n\n"
+    "Rules:\n"
+    "1. Use <step> </step> tags for reasoning\n"
+    "2. Final answer after ####\n\n"
+    "Example:\n<step>Key step1 -> Ket step 2 -> conclusion</step>\n#### 42"
 )
 
 # SwanLab experiment tracking
@@ -61,43 +63,37 @@ USE_SWANLAB = True
 if USE_SWANLAB:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
-    swanlab.init(project="twinkle-gsm8k", config={
+    swanlab.init(project="twinkle-Math", config={
         'model_id': BASE_MODEL,
     })
 
-class GSM8KProcessor(Preprocessor):
-    """Preprocessor for GSM8K dataset.
 
-    GSM8K fields: question (str), answer (str ending with '#### <number>')
-    Extracts the ground truth number and stores it in user_data for reward.
-    """
+class MathPreprocessor(Preprocessor):
 
-    @staticmethod
-    def extract_ground_truth(answer_str: str) -> str:
-        """Extract the number after '####' from GSM8K answer."""
-        match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
-        if match:
-            return match.group(1).replace(',', '').strip()
-        return ''
+    def __call__(self, sample):
+        if sample['level'] not in ('Level 4', 'Level 5'):
+            return Trajectory(messages=[], user_data=[])
 
-    def __call__(self, row) -> Trajectory:
-        question = row['question']
-        answer = row.get('answer', '')
-        ground_truth = self.extract_ground_truth(answer)
+        def get_boxed_answer(text):
+            match = re.search(r'\\boxed\{([^}]+)\}', text)
+            return match.group(1) if match else None
 
-        messages = [
-            Message(role='system', content=SYSTEM_PROMPT),
-            Message(role='user', content=question),
-        ]
+        ground_truth = get_boxed_answer(sample['solution'])
+        if ground_truth is None:
+            return Trajectory(messages=[], user_data=[])
+        problem = sample['problem']
         return Trajectory(
-            messages=messages,
+            messages=[
+                Message(role='system', content=SYSTEM_PROMPT),
+                Message(role='user', content=problem),
+            ],
             user_data=[('ground_truth', ground_truth)],
         )
 
 
-# ========== GSM8K Reward Functions ==========
-class GSM8KAccuracyReward(Reward):
-    """Accuracy reward for GSM8K: checks if the model's answer matches ground truth.
+# ========== Math Reward Functions ==========
+class MathAccuracyReward(Reward):
+    """Accuracy reward for Math: checks if the model's answer matches ground truth.
 
     Extracts the last '#### <number>' from model output and compares with ground truth.
     Returns 1.0 for correct, 0.0 for incorrect.
@@ -150,14 +146,15 @@ class GSM8KAccuracyReward(Reward):
         return rewards
 
 
-class GSM8KFormatReward(Reward):
-    """Format reward: checks if output contains <think>...</think> tag.
+class MathFormatReward(Reward):
+    """Format reward: checks format and rewards shorter completions.
 
-    Returns 1.0 if format is correct, 0.0 otherwise.
+    Returns higher score for shorter completions (1.0 at length 100 or less).
+    Returns 0.0 if format is incorrect.
     """
 
     def __call__(
-        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
+            self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
     ) -> List[float]:
         rewards = []
         for trajectory in trajectories:
@@ -167,24 +164,36 @@ class GSM8KFormatReward(Reward):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
+
             has_think = bool(
-                re.search(r'<think>.*?</think>', completion, re.DOTALL)
+                re.search(r'<step>.*?</step>', completion, re.DOTALL)
             )
             has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
-            rewards.append(1.0 if (has_think and has_answer) else 0.0)
+
+            if not (has_think and has_answer):
+                rewards.append(0.0)
+            else:
+                length = len(completion)
+                if length <= 100:
+                    rewards.append(1.0)
+                else:
+                    reward = max(0.0, 1.0 - (length - 100) / 2000)
+                    rewards.append(reward)
+
         return rewards
 
 
-def create_gsm8k_dataset():
-    """Create GSM8K dataset."""
+def create_Math_dataset():
+    """Create Math dataset."""
     meta = DatasetMeta(
-        "ms://modelscope/gsm8k",
-        subset_name='main', split='train',
+        "ms://modelscope/competition_math",
+        subset_name='default', split='train',
         data_slice=range(DATA_NUM),
     )
     dataset = Dataset(meta)
-    dataset.set_template("Template", model_id=f'ms://{BASE_MODEL}', max_length=2048)
-    dataset.map(GSM8KProcessor())
+    dataset.set_template("Template", model_id=BASE_MODEL, max_length=4096, truncation_strategy='delete')
+    dataset.map(MathPreprocessor())
+    dataset.filter(lambda row: bool(row['messages']))
     dataset.encode(add_generation_prompt=True)
     return dataset
 
@@ -192,9 +201,9 @@ def create_gsm8k_dataset():
 def compute_rewards(
     trajectories: List[Trajectory],
 ) -> Tuple[List[float], List[float], List[float]]:
-    """Compute accuracy and format rewards for GSM8K."""
-    accuracy_reward_fn = GSM8KAccuracyReward()
-    format_reward_fn = GSM8KFormatReward()
+    """Compute accuracy and format rewards for Math."""
+    accuracy_reward_fn = MathAccuracyReward()
+    format_reward_fn = MathFormatReward()
 
     accuracy_rewards = accuracy_reward_fn(trajectories, [])
     format_rewards = format_reward_fn(trajectories, [])
@@ -203,10 +212,10 @@ def compute_rewards(
 
 
 def main():
-    logger.info("Starting GSM8K GRPO training...")
+    logger.info("Starting Math GRPO training...")
     
     # Step 1: Prepare dataset and dataloader (client-side)
-    dataset = create_gsm8k_dataset()
+    dataset = create_Math_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
     tokenizer = AutoTokenizer.from_pretrained(
         BASE_MODEL, trust_remote_code=True)
@@ -215,8 +224,8 @@ def main():
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info("Connecting to Tinker server...")
-    service_client = init_tinker_compat_client(
-        base_url='http://localhost:8000')
+    service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle',
+                                               api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
     
     logger.info("Creating LoRA training client...")
     # Create a LoRA training client for GRPO
@@ -254,7 +263,7 @@ def main():
 
             sampling_client = (
                 training_client.save_weights_and_get_sampling_client(
-                    name=f'gsm8k-step-{step}'))
+                    name=f'Math-step-{step}'))
             logger.info(f"Step {step}: Sampling client ready")
 
         if sampling_client is None:
@@ -328,11 +337,6 @@ def main():
 
         frac_zero_std = (
             1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
-        if frac_zero_std == 1.0:
-            logger.info(
-                f"Step {step}: All advantages are zero, skipping training")
-            step += 1
-            continue
 
         # ========== 6. Train the policies with GRPO loss ==========
         # Train the policies with the Advantage-Regularized policy 
@@ -403,7 +407,7 @@ def main():
             swanlab.log(log_dict)
 
     # Save final checkpoint
-    save_future = training_client.save_state("gsm8k-grpo-final")
+    save_future = training_client.save_state("Math-grpo-final")
     save_result = save_future.result()
     logger.info(f"Saved final checkpoint to {save_result.path}")
 

@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import abstractmethod, ABC
 from typing import Dict, Any, Union, Type, Optional, Callable, TYPE_CHECKING
-
+import os
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
@@ -143,6 +143,14 @@ class TwinkleModel(ABC):
         if not dist.is_initialized() and Platform.get_world_size() > 1:
             torch_util.set_device()
             backend = Platform.device_backend()
+            if backend == "hccl":
+                # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
+                # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
+                # Keep training-side HCCL sockets on a per-job port layout to
+                # avoid collisions with other jobs on the same host.
+                from twinkle.utils.network import _ensure_hccl_socket_env
+                master_port = int(os.environ.get("MASTER_PORT", "29500"))
+                _ensure_hccl_socket_env(master_port)
             init_kwargs = {
                 "backend": backend,
                 "init_method": "env://",

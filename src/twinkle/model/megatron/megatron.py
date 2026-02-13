@@ -1,12 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 import json
+import logging
 import os
+import random
 import re
+from argparse import Namespace
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Type, Union, Callable
 import asyncio
 import threading
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -794,13 +798,22 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.lr_step(**kwargs)
 
     @remote_function(dispatch='all', sync=True)
-    def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
+    def save(self, name: Optional[str] = None, output_dir: Optional[str] = None,
+             interval: int = 1, save_optimizer: bool = False, **kwargs):
         """Save model checkpoint.
 
+        Always saves HF-format model weights. When ``save_optimizer`` is True,
+        additionally saves optimizer / lr_scheduler / RNG state in mcore
+        distributed-checkpoint format so that training can be resumed later.
+
         Args:
-            output_dir: Output directory.
-            interval: Save each interval steps.
-            **kwargs: Additional arguments.
+            name: Checkpoint name. Defaults to ``'checkpoint-step-{cur_step}'``.
+            output_dir: Output directory. Defaults to ``'output'``.
+            interval: Save each *interval* steps.
+            save_optimizer: If True, save optimizer + lr_scheduler + RNG state
+                alongside the HF weights for checkpoint resumption.
+            **kwargs: Additional arguments forwarded to the underlying save
+                methods (e.g. ``adapter_name``).
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -812,37 +825,332 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if output_dir is None:
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
-        save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
 
-        if save_format == 'hf':
-            self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
-        else:
-            self._save_megatron_format(checkpoint_dir, optimizer_config.adapter_name)
+        # Always save HF-format weights (for inference / deployment).
+        self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+
+        # Optionally save mcore optimizer state (for training resumption).
+        if save_optimizer:
+            self._save_mcore_optimizer(
+                checkpoint_dir,
+                optimizer_config=optimizer_config,
+                **kwargs,
+            )
 
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-        
-        # Final synchronization to ensure all ranks complete save
+
+        # Final synchronization to ensure all ranks complete save.
         if dist.is_initialized():
             dist.barrier()
 
         return checkpoint_dir
 
-
     @remote_function(dispatch='all')
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
-        if output_dir is None:
-            # load from hub
+        """Load model weights, and optionally optimizer / scheduler / RNG state.
+
+        Args:
+            name: Checkpoint name or HuggingFace Hub model id.
+            output_dir: Parent directory that contains the checkpoint folder.
+                If None **and** ``resume`` is False, downloads from Hub.
+            resume: If True, restore optimizer, lr_scheduler and RNG state
+                from the mcore sub-checkpoint for training resumption.
+            **kwargs: Additional arguments (``adapter_name``, ``no_load_optim``,
+                ``no_load_rng``, etc.).
+        """
+        resume = kwargs.pop('resume', False)
+        if output_dir is None and not resume:
+            # Load from hub
             token = kwargs.pop('token', None)
             checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
+            if output_dir is None:
+                output_dir = 'output'
             checkpoint_dir = os.path.join(output_dir, name)
+
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
-        bridge = self._bridge
-        for _model in self.strategy.unwrap_model(self.model):
-            bridge.load_weights(_model, checkpoint_dir, is_peft_format = (adapter_name != _default_adapter_name))
+
+        if resume:
+            self._load_mcore_optimizer(
+                checkpoint_dir,
+                adapter_name=adapter_name,
+                **kwargs,
+            )
+        else:
+            bridge = self._bridge
+            for _model in self.strategy.unwrap_model(self.model):
+                bridge.load_weights(
+                    _model, checkpoint_dir,
+                    is_peft_format=(adapter_name != _default_adapter_name),
+                )
 
         if dist.is_initialized():
             dist.barrier()
+
+    @staticmethod
+    def _get_rng_state() -> 'ShardedObject':
+        from megatron.core import parallel_state as mpu, tensor_parallel
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        rng_state = {
+            'random_rng_state': random.getstate(),
+            'np_rng_state': np.random.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state(),
+            'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
+        }
+        rng_state_list = [rng_state]
+
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+
+        return ShardedObject(
+            'rng_state', rng_state_list,
+            (pp_size, tp_size), (pp_rank, tp_rank),
+            replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
+        )
+
+    @staticmethod
+    def _generate_state_dict(
+        model: list,
+        optimizer=None,
+        opt_param_scheduler=None,
+        rng_state=None,
+        iteration: Optional[int] = None,
+        model_sd_kwargs: Optional[dict] = None,
+        optim_sd_kwargs: Optional[dict] = None,
+        save_optim: bool = True,
+        save_rng: bool = True,
+    ) -> dict:
+        model_sd_kwargs = model_sd_kwargs or {}
+        optim_sd_kwargs = optim_sd_kwargs or {}
+
+        state_dict: dict = {
+            'checkpoint_version': 3.0,
+        }
+        if iteration is not None:
+            state_dict['iteration'] = iteration
+
+        # Model sharded state dict
+        for i, m in enumerate(model):
+            key = 'model' if len(model) == 1 else f'model{i}'
+            state_dict[key] = m.sharded_state_dict(**model_sd_kwargs)
+
+        # Optimizer + scheduler
+        if save_optim and optimizer is not None:
+            state_dict['optimizer'] = optimizer.sharded_state_dict(
+                state_dict, **optim_sd_kwargs,
+            )
+            if opt_param_scheduler is not None:
+                state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+
+        # RNG
+        if save_rng and rng_state is not None:
+            state_dict['rng_state'] = rng_state
+
+        return state_dict
+
+    def _save_mcore_optimizer(
+        self,
+        checkpoint_dir: str,
+        optimizer_config: 'MegatronOptimizerGroup',
+        **kwargs,
+    ):
+        from megatron.core import dist_checkpointing, parallel_state as mpu
+        from megatron.core.dist_checkpointing.serialization import (
+            get_default_save_sharded_strategy,
+        )
+        from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+            FullyParallelSaveStrategyWrapper,
+        )
+
+        iteration = optimizer_config.cur_step
+        iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
+        os.makedirs(iter_dir, exist_ok=True)
+
+        sharded_sd_metadata = {
+            'distrib_optim_sharding_type': 'dp_reshardable',
+            'singleton_local_shards': False,
+            'chained_optim_avoid_prefix': True,
+        }
+
+        rng_state = self._get_rng_state()
+        model = self.model
+
+        state_dict = self._generate_state_dict(
+            model=model,
+            optimizer=optimizer_config.optimizer,
+            opt_param_scheduler=optimizer_config.lr_scheduler,
+            rng_state=rng_state,
+            iteration=iteration,
+            model_sd_kwargs={'metadata': sharded_sd_metadata},
+            optim_sd_kwargs={'metadata': sharded_sd_metadata},
+        )
+
+        save_strategy = get_default_save_sharded_strategy()
+        if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
+            save_strategy = FullyParallelSaveStrategyWrapper(
+                save_strategy,
+                mpu.get_data_parallel_group(with_context_parallel=True),
+            )
+
+        dist_checkpointing.save(
+            state_dict, iter_dir, save_strategy,
+            async_sharded_save=False,
+            validate_access_integrity=True,
+            content_metadata=sharded_sd_metadata,
+        )
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Write tracker file (rank 0 only).
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            tracker_path = os.path.join(
+                checkpoint_dir, 'latest_checkpointed_iteration.txt',
+            )
+            with open(tracker_path, 'w') as f:
+                f.write(str(iteration))
+
+        logging.getLogger(__name__).info(
+            f'Saved mcore optimizer state at iteration {iteration} '
+            f'to {checkpoint_dir}'
+        )
+
+    def _load_mcore_optimizer(
+        self,
+        checkpoint_dir: str,
+        adapter_name: str = '',
+        **kwargs,
+    ):
+        from megatron.core import (
+            dist_checkpointing, parallel_state as mpu, tensor_parallel,
+        )
+        from megatron.core.dist_checkpointing.serialization import (
+            get_default_load_sharded_strategy,
+        )
+        from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+            FullyParallelLoadStrategyWrapper,
+        )
+
+        no_load_optim = kwargs.pop('no_load_optim', False)
+        no_load_rng = kwargs.pop('no_load_rng', False)
+
+        optimizer_config = self.optimizer_group.get(
+            adapter_name or self._get_default_group(),
+        )
+
+        # Read iteration from tracker file.
+        tracker_path = os.path.join(
+            checkpoint_dir, 'latest_checkpointed_iteration.txt',
+        )
+        iteration = self._read_iteration(tracker_path)
+        if iteration == 0:
+            logging.getLogger(__name__).warning(
+                f'No checkpoint found in {checkpoint_dir}'
+            )
+            return
+
+        iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
+
+        # Load common (non-sharded) state to inspect content metadata.
+        common_state = dist_checkpointing.load_common_state_dict(iter_dir)
+        sharded_sd_metadata = dist_checkpointing.load_content_metadata(
+            preloaded_state_dict=common_state,
+        )
+
+        # Build optimizer / scheduler references for the sharded state dict.
+        optimizer = optimizer_config.optimizer if not no_load_optim else None
+        opt_param_scheduler = (
+            optimizer_config.lr_scheduler if not no_load_optim else None
+        )
+        rng_state = self._get_rng_state() if not no_load_rng else None
+
+        optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
+        model_sd_kwargs = dict(metadata=sharded_sd_metadata)
+
+        sharded_state_dict = self._generate_state_dict(
+            model=self.model,
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+            rng_state=rng_state,
+            iteration=iteration,
+            model_sd_kwargs=model_sd_kwargs,
+            optim_sd_kwargs=optim_sd_kwargs,
+        )
+
+        # Load using fully-parallel strategy for speed.
+        load_strategy = get_default_load_sharded_strategy(iter_dir)
+        if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
+            load_strategy = FullyParallelLoadStrategyWrapper(
+                load_strategy,
+                mpu.get_data_parallel_group(with_context_parallel=True),
+            )
+        state_dict = dist_checkpointing.load(
+            sharded_state_dict, iter_dir, load_strategy,
+        )
+
+        # Restore model weights.
+        if len(self.model) == 1:
+            self.model[0].load_state_dict(state_dict['model'], strict=False)
+        else:
+            for i, m in enumerate(self.model):
+                key = f'model{i}'
+                if key in state_dict:
+                    m.load_state_dict(state_dict[key], strict=False)
+
+        # Restore optimizer + LR scheduler.
+        if not no_load_optim and optimizer is not None and 'optimizer' in state_dict:
+            optimizer.load_state_dict(state_dict['optimizer'])
+            if (
+                opt_param_scheduler is not None
+                and 'opt_param_scheduler' in state_dict
+            ):
+                opt_param_scheduler.load_state_dict(
+                    state_dict['opt_param_scheduler'],
+                )
+
+        if not no_load_rng and 'rng_state' in state_dict:
+            rng = state_dict['rng_state']
+            rng = rng[0]
+            random.setstate(rng['random_rng_state'])
+            np.random.set_state(rng['np_rng_state'])
+            torch.set_rng_state(rng['torch_rng_state'])
+            torch.cuda.set_rng_state(rng['cuda_rng_state'])
+            tensor_parallel.get_cuda_rng_tracker().set_states(
+                rng['rng_tracker_states'],
+            )
+
+        # Restore iteration counter.
+        if optimizer_config is not None and 'iteration' in state_dict:
+            optimizer_config.cur_step = state_dict['iteration']
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        logging.getLogger(__name__).info(
+            f'Resumed from mcore checkpoint at iteration {iteration} '
+            f'from {checkpoint_dir}'
+        )
+
+    @staticmethod
+    def _read_iteration(tracker_path: str) -> int:
+        if not os.path.exists(tracker_path):
+            return 0
+        with open(tracker_path, 'r') as f:
+            iteration = int(f.read().strip())
+        if torch.distributed.is_initialized():
+            iters_cuda = torch.tensor(
+                [iteration], dtype=torch.long, device='cuda',
+            )
+            torch.distributed.all_reduce(
+                iters_cuda, op=torch.distributed.ReduceOp.MAX,
+            )
+            iteration = iters_cuda[0].item()
+        return iteration
 
     def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter = None):
         """Save in HuggingFace format using bridge adapter.
@@ -1240,28 +1548,41 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 else:
                     yield from _raw_weights()
 
-        async def _send():
-            await engine.send_weights(weight_generator())
+        is_sender = (engine.rank is not None and engine.rank == 0)
 
-        result_container = {'error': None}
+        if not is_sender:
+            for _name, _tensor in weight_generator():
+                pass
+            return
 
-        def _run():
+        import queue
+        buf: queue.Queue = queue.Queue(maxsize=4)
+        error: list = []
+
+        def _send():
+            def _iter():
+                while (item := buf.get()) is not None:
+                    yield item
+            loop = asyncio.new_event_loop()
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_send())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
+                loop.run_until_complete(engine.send_weights(_iter()))
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                loop.close()
 
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-
-        if result_container['error'] is not None:
-            raise result_container['error']
+        sender = threading.Thread(target=_send, name="ce-broadcast", daemon=True)
+        sender.start()
+        try:
+            for name, tensor in weight_generator():
+                buf.put((name, tensor.clone()))
+                if error:
+                    break
+        finally:
+            buf.put(None)  # sentinel
+        sender.join()
+        if error:
+            raise error[0]
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:

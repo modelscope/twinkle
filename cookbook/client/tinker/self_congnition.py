@@ -6,6 +6,7 @@
 #   2. eval():  Load a trained checkpoint and sample from it to verify
 #      that the model has learned the custom identity.
 # The server must be running first (see server.py and server_config.yaml).
+import os
 
 import numpy as np
 from tqdm import tqdm
@@ -18,7 +19,7 @@ from twinkle.server.tinker.common import input_feature_to_datum
 from modelscope import AutoTokenizer
 
 # The base model to fine-tune / evaluate
-base_model = "Qwen/Qwen2.5-7B-Instruct"
+base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
 def train():
@@ -42,7 +43,8 @@ def train():
     # Step 2: Initialize the training client
 
     # Connect to the Twinkle server running locally
-    service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+    service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle',
+                                               api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
     training_client = service_client.create_lora_training_client(

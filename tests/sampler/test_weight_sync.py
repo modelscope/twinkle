@@ -140,14 +140,11 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     )
     from peft import LoraConfig
     model.add_adapter_to_model('default', LoraConfig(r=8, lora_alpha=32, lora_dropout=0.05, target_modules="all-linear"), gradient_accumulation_steps=1)
-    lora_path = '/mnt/nas2/hujinghan.hjh/swift/output/v1168-20260209-194533/checkpoint-32/default/output/v0-20260209-212154/checkpoint-32'
-
-    model.load('default', output_dir=lora_path, adapter_name='default')
     # ── Create Sampler (dummy weights) ────────────────────────────────
     sampler = vLLMSampler(
         model_id=model_path,
         engine_args={
-            # 'load_format': 'dummy',         # start with random weights
+            'load_format': 'dummy',         # start with random weights
             'gpu_memory_utilization': 0.3,
             'max_model_len': 256,
             'enforce_eager': True,

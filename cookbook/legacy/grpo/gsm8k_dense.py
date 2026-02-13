@@ -261,8 +261,8 @@ def main():
 
     lora_config = LoraConfig(
         target_modules="all-linear",
-        r=8,
-        lora_alpha=32,
+        r=32,
+        lora_alpha=64,
         lora_dropout=0.05,
     )
 
@@ -274,7 +274,7 @@ def main():
             remote_group='model',
             mixed_precision='bf16',
             recompute_granularity='full',
-            recompute_num_layers=None,
+            recompute_num_layers=1,
         )
     else:
         model = TransformersModel(

@@ -22,10 +22,9 @@ Usage:
 """
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 from twinkle import get_logger
 
@@ -273,7 +272,8 @@ class ServerLauncher:
             print(f"  - http://{host}:{port}{route_prefix}")
 
         if wait:
-            input("\nPress Enter to stop the server...")
+            while True:
+                time.sleep(3600)
 
     @classmethod
     def from_yaml(

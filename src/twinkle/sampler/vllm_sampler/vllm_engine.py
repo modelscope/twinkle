@@ -7,6 +7,7 @@ import torch
 from twinkle import get_logger
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
+from twinkle.utils.platform import get_vllm_device_uuid
 
 import inspect
 logger = get_logger()
@@ -46,12 +47,12 @@ class VLLMEngine(BaseSamplerEngine):
         model_id: str,
         *,
         tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
+        gpu_memory_utilization: float = 0.7,
         max_model_len: Optional[int] = None,
         max_num_seqs: int = 256,
         enable_lora: bool = True,
-        max_loras: int = 64,
-        max_lora_rank: int = 64,
+        max_loras: int = 5,
+        max_lora_rank: int = 32,
         enable_sleep_mode: bool = False,
         enable_prefix_caching: bool = False,
         enforce_eager: bool = False,
@@ -541,8 +542,11 @@ class VLLMEngine(BaseSamplerEngine):
         use_gpu_ipc = first_tensor.is_cuda
         use_shm = not use_gpu_ipc
 
-        # Get device UUID for ZMQ handle
-        device_uuid = current_platform.get_device_uuid(0)
+        # fix: On NPU, current_platform.get_device_uuid may be unimplemented and break receive_weights flow.
+        # fix: Route through platform-level fallback so IPC socket name remains stable.
+        # Get device UUID for ZMQ handle.
+        # For NPU, this is resolved from `npu-smi info` Bus-Id when needed.
+        device_uuid = get_vllm_device_uuid(0)
         zmq_handle = f"ipc:///tmp/twinkle-ipc-{device_uuid}.sock"
 
         bucket_size = bucket_size_mb << 20
@@ -566,6 +570,17 @@ class VLLMEngine(BaseSamplerEngine):
         socket = zmq_ctx.socket(zmq.REQ)
         socket.bind(zmq_handle)
 
+        loop = asyncio.get_running_loop()
+
+        # Non-blocking ZMQ helpers — run blocking socket ops in the
+        # default executor so the event loop stays responsive.  This is
+        # critical when TP > 1: collective_rpc is an async task on the
+        # same loop, and blocking socket.recv() would prevent it from
+        # being scheduled, causing a deadlock.
+        def _zmq_send_recv(payload):
+            socket.send_pyobj(payload)
+            return socket.recv()
+
         # Launch worker side concurrently
         worker_task = asyncio.ensure_future(
             self.engine.collective_rpc(
@@ -578,17 +593,9 @@ class VLLMEngine(BaseSamplerEngine):
             )
         )
 
-        # Yield to event loop so worker_task (collective_rpc) can start.
-        # Without this, the synchronous ZMQ send below blocks the thread
-        # and the worker subprocess never receives the RPC to connect.
-        await asyncio.sleep(0.1)
-
-        # Send IPC/SHM handle, wait for worker ready
-        if use_gpu_ipc:
-            socket.send_pyobj(ipc_handle)
-        else:
-            socket.send_pyobj({"name": shm_name, "size": bucket_size})
-        socket.recv()  # Worker ready
+        # Send IPC/SHM handle, wait for worker ready (non-blocking)
+        handle_payload = ipc_handle if use_gpu_ipc else {"name": shm_name, "size": bucket_size}
+        await loop.run_in_executor(None, _zmq_send_recv, handle_payload)
 
         # Stream weights into buckets and send to worker
         async def _chain_first():
@@ -615,8 +622,10 @@ class VLLMEngine(BaseSamplerEngine):
             if offset + weight.nbytes > bucket_size:
                 if use_gpu_ipc:
                     torch.cuda.synchronize()
-                socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                socket.recv()
+                await loop.run_in_executor(
+                    None, _zmq_send_recv,
+                    {"bucket_meta": bucket_meta, "is_last": False},
+                )
                 bucket_meta = {}
                 offset = 0
 
@@ -635,8 +644,10 @@ class VLLMEngine(BaseSamplerEngine):
         # Send last bucket
         if use_gpu_ipc:
             torch.cuda.synchronize()
-        socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-        socket.recv()
+        await loop.run_in_executor(
+            None, _zmq_send_recv,
+            {"bucket_meta": bucket_meta, "is_last": True},
+        )
 
         # Wait for worker to finish loading
         await worker_task
