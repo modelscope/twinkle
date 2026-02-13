@@ -109,7 +109,7 @@ applications:
         adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
       device_group:
         name: sampler
-        ranks: [4]                                     # GPU rank indices to use
+        ranks: [2]                                     # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda

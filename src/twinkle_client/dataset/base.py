@@ -10,14 +10,14 @@
 # ============================================================================
 
 from typing import Any, Callable, Dict, Type, Union
-
-from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.preprocessor import DataFilter, Preprocessor
+from twinkle_client.http import http_post, heartbeat_manager
+from twinkle.dataset import Dataset
+from twinkle.dataset import DatasetMeta
+from twinkle.preprocessor import DataFilter
+from twinkle.preprocessor import Preprocessor
 from twinkle.template import Template
-from twinkle_client.http import heartbeat_manager, http_post
 
-
-class Dataset:
+class Dataset(object):
     """Client wrapper for Dataset that calls server HTTP endpoints."""
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
@@ -29,11 +29,9 @@ class Dataset:
             json_data={
                 'processor_type': 'dataset',
                 'class_type': 'Dataset',
-                **{
-                    'dataset_meta': dataset_meta
-                },
-                **kwargs
-            })
+                **{'dataset_meta': dataset_meta}, **kwargs
+            }
+        )
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -44,19 +42,20 @@ class Dataset:
         except:
             pass
 
+    
     def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'set_template',
-                **{
-                    'template_func': template_func
-                },
+                **{'template_func': template_func},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def encode(self, add_generation_prompt: bool = False, **kwargs):
         response = http_post(
@@ -64,13 +63,13 @@ class Dataset:
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'encode',
-                **{
-                    'add_generation_prompt': add_generation_prompt
-                },
+                **{'add_generation_prompt': add_generation_prompt},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def check(self, **kwargs):
         response = http_post(
@@ -80,49 +79,39 @@ class Dataset:
                 'function': 'check',
                 **{},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
-    def map(self,
-            preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
-            dataset_meta: DatasetMeta = None,
-            init_args: Dict[str, Any] = None,
-            **kwargs):
+    def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'map',
-                **{
-                    'preprocess_func': preprocess_func,
-                    'dataset_meta': dataset_meta,
-                    'init_args': init_args
-                },
+                **{'preprocess_func': preprocess_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
-    def filter(self,
-               filter_func: Union[Callable, str, Type[DataFilter], DataFilter],
-               dataset_meta: DatasetMeta = None,
-               init_args: Dict[str, Any] = None,
-               **kwargs):
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'filter',
-                **{
-                    'filter_func': filter_func,
-                    'dataset_meta': dataset_meta,
-                    'init_args': init_args
-                },
+                **{'filter_func': filter_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
         response = http_post(
@@ -130,26 +119,26 @@ class Dataset:
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'add_dataset',
-                **{
-                    'dataset_meta': dataset_meta
-                },
+                **{'dataset_meta': dataset_meta},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
-    def mix_dataset(self, interleave=True):
+    def mix_dataset(self, interleave = True):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'mix_dataset',
-                **{
-                    'interleave': interleave
-                },
-            })
+                **{'interleave': interleave},
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __getitem__(self, idx):
         response = http_post(
@@ -157,12 +146,12 @@ class Dataset:
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__getitem__',
-                **{
-                    'idx': idx
-                },
-            })
+                **{'idx': idx},
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __len__(self):
         response = http_post(
@@ -171,6 +160,8 @@ class Dataset:
                 'processor_id': self.processor_id,
                 'function': '__len__',
                 **{},
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
