@@ -332,11 +332,10 @@ for epoch in range(3):
 | -------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------- |
 | Patch    | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | 修复 Qwen3 MoE 模型在 FSDP2 训练期间挂起的问题，适用于 transformers==4.x | ModelScope 官方 |
 
-## 致谢
+## 开源贡献
 
-本项目由 Workshop 组织下的多个团队共同维护和支持：
+Twinkle✨ 是由 ModelScope（魔搭）与开源社区共同发起的协作项目。该项目得到了包括**招商银行技术团队**在内的技术伙伴的关键贡献。
 
-- ModelScope官方团队
-- 招商银行开源技术团队
+我们衷心感谢开源社区，特别是为我们提供灵感的项目，包括 [Transformers](https://github.com/huggingface/transformers)、[MS-SWIFT](https://github.com/modelscope/swift)、[veRL](https://github.com/verl-project/verl) 及 [Tinker](https://github.com/thinking-machines-lab/tinker) 等。
 
-Twinkle 的构建基于多个优秀的开源项目，包括 [Transformers](https://github.com/huggingface/transformers)、[MS-SWIFT](https://github.com/modelscope/swift)、[veRL](https://github.com/verl-project/verl) 等。
+我们欢迎通过 [Issues](https://github.com/modelscope/twinkle/issues) 和 [Pull Requests](https://github.com/modelscope/twinkle/pulls) 参与开源贡献。
