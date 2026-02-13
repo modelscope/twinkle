@@ -48,6 +48,7 @@ applications:
         max_model_len: 16000           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.85   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
+        max_loras: 5                  # Max allowed loras working on vLLM at the same time
       device_group:                   # Logical device group for the sampler
         name: sampler
         gpus_per_worker: 1
