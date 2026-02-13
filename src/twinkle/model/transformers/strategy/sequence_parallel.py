@@ -788,7 +788,8 @@ class SequenceParallel:
                 # - In next-token-aligned labels, this appears at labels[b-1]
                 boundary_starts = (real_position_ids == 0)
                 prev = torch.zeros_like(boundary_starts, dtype=torch.bool)
-                prev[..., 1:] = boundary_starts[..., :-1]
+                # Mask token b-1 when boundary starts at b.
+                prev[..., :-1] = boundary_starts[..., 1:]
                 labels = labels.clone()
                 labels[prev] = -100
                 # Also avoid any potential wrap-around supervision at the end of the concatenated stream.
@@ -982,13 +983,15 @@ class SequenceParallelStrategy:
             )
         compensate_fsdp_avg = bool(self.sp_config.get("compensate_fsdp_avg", False))
         compensate_factor = float(self.ulysses_size if compensate_fsdp_avg else 1.0)
+        sum_metric_scale = float(self.ulysses_size)
 
         class _ReduceSequenceParallelLoss(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, local_sum: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
-                if num_valid_tokens.item() == 0:
-                    local_sum = torch.nan_to_num(local_sum)
+            def forward(ctx, local_mean: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
                 local_tokens = num_valid_tokens.detach().clone()
+                local_sum = local_mean * local_tokens
+                if local_tokens.item() == 0:
+                    local_sum = torch.nan_to_num(local_sum)
                 global_sum = local_sum.detach().clone()
                 dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
                 global_tokens = num_valid_tokens.detach().clone()
@@ -1002,28 +1005,33 @@ class SequenceParallelStrategy:
             def backward(ctx, grad_output: torch.Tensor):
                 local_tokens, global_tokens = ctx.saved_tensors
                 if global_tokens.item() == 0:
-                    return grad_output, None
-                grad_local_sum = grad_output * (local_tokens / global_tokens) * compensate_factor
-                return grad_local_sum, None
+                    return torch.zeros_like(grad_output), None
+                # d(global_mean)/d(local_mean) = local_tokens / global_tokens.
+                grad_local_mean = grad_output * (local_tokens / global_tokens) * compensate_factor
+                return grad_local_mean, None
 
         class _ReduceSequenceParallelSum(torch.autograd.Function):
             @staticmethod
             def forward(ctx, local_sum: torch.Tensor) -> torch.Tensor:
+                ctx.sum_metric_scale = sum_metric_scale
                 global_sum = local_sum.detach().clone()
                 dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-                return global_sum
+                # Keep logging/metric value aligned with non-SP sum semantics under
+                # outer collect='mean' by removing one SP replication factor.
+                return global_sum / ctx.sum_metric_scale
 
             @staticmethod
             def backward(ctx, grad_output: torch.Tensor):
+                # Keep training gradient scale unchanged; forward-side scaling is for
+                # logging/metric alignment under outer collect='mean'.
                 return grad_output
 
         if reduction == "sum":
             return _ReduceSequenceParallelSum.apply(loss)
 
-        # Default to mean reduction: assume `loss` is local mean, convert to local sum.
+        # Default to mean reduction: `loss` is local mean.
         num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
-        local_sum = loss * num_valid_tokens
-        return _ReduceSequenceParallelLoss.apply(local_sum, num_valid_tokens)
+        return _ReduceSequenceParallelLoss.apply(loss, num_valid_tokens)
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()
