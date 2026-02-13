@@ -355,11 +355,16 @@ foundation for building customizable, enterprise-grade training services.
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
 
-## Acknowledgements
+## Contributions
 
-This project is maintained and supported by multiple teams under Workshop:
+Twinkle✨ is a collaborative initiative put together by ModelScope in partnership 
+with the open-source community, with key contributions from strategic stakeholders 
+including China Merchants Bank Tech Team. 
 
-- ModelScope Team
-- China Merchants Bank Tech Team
+We are grateful to the open-source community, particularly the projects that inspired us, 
+including [Transformers](https://github.com/huggingface/transformers),
+[MS-SWIFT](https://github.com/modelscope/swift), 
+[veRL](https://github.com/verl-project/verl), [Tinker](https://github.com/thinking-machines-lab/tinker), and many others.
 
-Twinkle is built on the shoulders of giants, including [Transformers](https://github.com/huggingface/transformers),[MS-SWIFT](https://github.com/modelscope/swift), [veRL](https://github.com/verl-project/verl), and other excellent projects.
+We welcome
+open contributions via [issues](https://github.com/modelscope/twinkle/issues) and [pull-requests](https://github.com/modelscope/twinkle/pulls).
