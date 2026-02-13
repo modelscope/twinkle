@@ -285,11 +285,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             inputs: Either InputFeature(s) or Trajectory(s).
                 - InputFeature: Must contain 'input_ids'. For multimodal, include 'images'/'videos'.
                 - Trajectory: Must contain 'messages'. Requires template to be set.
+
             sampling_params: Sampling parameters.
+
             adapter_name: Optional LoRA adapter name.
+
             adapter_path: Optional LoRA adapter path.
+
             num_samples: Number of completions to generate per input prompt.
-                        When > 1, returns num_samples sequences for each input.
+                When > 1, returns num_samples sequences for each input.
 
         Returns:
             SampleResponse containing sampled sequences.
@@ -321,7 +325,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         lora_request = None
         if adapter_path is not None:
-            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path, force_reload=True))
+            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
             if lora_request is None:
                 logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '
                                'sampling will proceed without LoRA')
@@ -369,7 +373,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
     ):
         """Receive weights via NCCL broadcast and stream into vLLM.
 
-        Uses a **streaming pipeline** (like verl) to avoid accumulating a
+        Uses a **streaming pipeline** to avoid accumulating a
         full model-weight copy on GPU:
 
         1. ``CheckpointEngine.receive_weights()`` yields tensors from

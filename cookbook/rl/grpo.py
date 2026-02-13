@@ -142,8 +142,6 @@ def main():
             all_input_data
         )
         metrics.accumulate(
-            None,
-            None,
             completion_lengths=all_completion_lengths,
             rewards={
                 'total': total_rewards,

@@ -34,20 +34,6 @@ class GRPOLoss(Loss):
         self.beta = beta
         self.ignore_index = ignore_index
 
-    def _extract_advantages_from_trajectories(self, trajectories: List[Trajectory],
-                                              device: 'torch.device') -> 'torch.Tensor':
-        """Extract advantages from trajectory objects."""
-        import torch
-        advantages_list = []
-        for traj in trajectories:
-            if isinstance(traj, dict):
-                adv = traj.get('advantages', None)
-            else:
-                adv = getattr(traj, 'advantages', None)
-            assert adv is not None, "trajectories must contain 'advantages'"
-            advantages_list.append(float(adv))
-        return torch.tensor(advantages_list, dtype=torch.float32, device=device)
-
     def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
         """
         Compute loss mask from labels.
@@ -275,7 +261,6 @@ class GRPOLoss(Loss):
         *,
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
-        trajectories: Optional[List[Trajectory]] = None,  # TODO: remove this argument
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         **kwargs,
     ) -> 'torch.Tensor':
@@ -326,13 +311,8 @@ class GRPOLoss(Loss):
         # In padding_free / packing mode the processor concatenates all
         # sequences into a single row [1, total_tokens].  We detect this
         # by checking: batch_size == 1 but the actual number of sequences
-        # (known from trajectories or advantages) is greater than 1.
-        if trajectories is not None:
-            num_sequences = len(trajectories)
-        elif advantages is not None:
-            num_sequences = len(advantages) if isinstance(advantages, (list, tuple)) else advantages.shape[0]
-        else:
-            num_sequences = logps.shape[0]
+        # is greater than 1.
+        num_sequences = len(advantages) if isinstance(advantages, (list, tuple)) else advantages.shape[0]
         is_packed = (logps.shape[0] == 1 and num_sequences > 1)
         if is_packed:
             position_ids = inputs.get('position_ids')

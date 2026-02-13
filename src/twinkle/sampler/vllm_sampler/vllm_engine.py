@@ -52,7 +52,7 @@ class VLLMEngine(BaseSamplerEngine):
         max_model_len: Optional[int] = None,
         max_num_seqs: int = 256,
         enable_lora: bool = True,
-        max_loras: int = 5,
+        max_loras: int = 1,
         max_lora_rank: int = 32,
         enable_sleep_mode: bool = False,
         enable_prefix_caching: bool = False,
@@ -84,8 +84,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.logprobs_mode = logprobs_mode or 'processed_logprobs'
         self.engine_kwargs = kwargs or {}
 
-        # Only need to track which users have loaded LoRAs and their IDs
-        self._user_lora_ids: Dict[str, int] = {}
+        self._lora_request_cache: Dict[str, Any] = {}
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -374,36 +373,20 @@ class VLLMEngine(BaseSamplerEngine):
     async def _get_or_load_lora(
         self,
         lora_path: str,
-        *,
-        force_reload: bool = False,
     ):
         """Get or load a LoRA adapter from *lora_path*.
 
         Args:
             lora_path: Resolved filesystem path to the LoRA adapter directory.
-            force_reload: If ``True``, remove the existing adapter and reload.
 
         Returns:
             ``LoRARequest`` or ``None`` if loading fails.
         """
         from vllm.lora.request import LoRARequest
-        user_id = 'default'  # TODO, multi-tenant
-        # Fast path: return cached request if it exists and reload is not forced.
-        if user_id in self._user_lora_ids and not force_reload:
-            lora_int_id = self._user_lora_ids[user_id]
-            loaded_loras = await self.engine.list_loras()
-            if lora_int_id in loaded_loras:
-                return LoRARequest(
-                    lora_name=str(lora_int_id),
-                    lora_int_id=lora_int_id,
-                    lora_path=lora_path,
-                )
-            # Stale entry — clean up and fall through to load below.
-            self._user_lora_ids.pop(user_id, None)
 
-        # If force reload, remove existing first.
-        if force_reload and user_id in self._user_lora_ids:
-            await self.engine.remove_lora(self._user_lora_ids[user_id])
+        # Fast path: return cached request for this path.
+        if lora_path in self._lora_request_cache:
+            return self._lora_request_cache[lora_path]
 
         if not os.path.exists(lora_path):
             logger.error(f'LoRA path does not exist: {lora_path}')
@@ -425,10 +408,9 @@ class VLLMEngine(BaseSamplerEngine):
 
         try:
             await self.engine.add_lora(lora_request)
-            self._user_lora_ids[user_id] = lora_int_id
+            self._lora_request_cache[lora_path] = lora_request
             return lora_request
         except Exception as e:
-            logger.error(f'Failed to load LoRA: {e}')
             return None
 
     async def sleep(self, level: int = 2) -> None:
@@ -492,7 +474,7 @@ class VLLMEngine(BaseSamplerEngine):
         The streaming path avoids accumulating a full model copy on GPU:
         tensors are consumed one-by-one from the generator, copied into a
         GPU IPC bucket, and flushed to the vLLM worker subprocess when the
-        bucket is full — identical to verl's approach.
+        bucket is full.
 
         Args:
             weights: Weights to transfer.  ``dict[str, Tensor]`` or
@@ -690,7 +672,7 @@ class VLLMEngine(BaseSamplerEngine):
                 self.engine = None
 
         # Clear LoRA state
-        self._user_lora_ids.clear()
+        self._lora_request_cache.clear()
 
         # Force garbage collection
         gc.collect()

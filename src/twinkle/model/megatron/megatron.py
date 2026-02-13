@@ -393,11 +393,35 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             else:
                 seq_length = original_seq_length
 
-        loss_extra_kwargs = kwargs
+        num_microbatches = len(inputs)
+        loss_extra_kwargs_per_mb = []
+        if num_microbatches <= 1:
+            loss_extra_kwargs_per_mb = [kwargs]
+        else:
+            for mb_idx in range(num_microbatches):
+                mb_start = mb_idx * micro_batch_size
+                mb_end = mb_start + micro_batch_size
+                mb_kwargs = {}
+                for key, value in kwargs.items():
+                    if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] > micro_batch_size:
+                        mb_kwargs[key] = value[mb_start:mb_end]
+                    elif isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] > micro_batch_size:
+                        mb_kwargs[key] = value[mb_start:mb_end]
+                    elif isinstance(value, (list, tuple)) and len(value) > micro_batch_size:
+                        mb_kwargs[key] = value[mb_start:mb_end]
+                    else:
+                        # Scalars, small tensors, or non-sliceable values pass through as-is
+                        mb_kwargs[key] = value
+                loss_extra_kwargs_per_mb.append(mb_kwargs)
+
+        _mb_counter = [0]  # mutable counter for closure
 
         def post_loss_function(output_tensor, inputs):
+            mb_idx = _mb_counter[0]
+            _mb_counter[0] += 1
+            current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
             outputs = ModelOutput(logits=output_tensor)
-            result = loss_instance(inputs, outputs, **loss_extra_kwargs)
+            result = loss_instance(inputs, outputs, **current_kwargs)
             if isinstance(result, tuple):
                 losses, counts = result
             else:
