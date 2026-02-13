@@ -18,9 +18,9 @@ def create_multimodal_messages(example):
 
 
 class TestMultimodalDataset:
-    # 基本功能
+    # Basic functionality
     def test_multimodal_dataset_basic(self):
-        # 多模态数据集基本功能（图像+文本）
+        # Multimodal dataset basic (image + text)
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(create_multimodal_messages)
@@ -37,7 +37,7 @@ class TestMultimodalDataset:
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_multimodal_dataset_with_qwen3vl_template(self):
-        # 使用Qwen3VLTemplate
+        # Use Qwen3VLTemplate
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(create_multimodal_messages)
@@ -52,7 +52,7 @@ class TestMultimodalDataset:
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_multimodal_dataset_encode_with_lazy(self):
-        # 多模态数据集编码
+        # Multimodal dataset encoding
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(create_multimodal_messages)
@@ -72,7 +72,7 @@ class TestMultimodalDataset:
         assert len(item['input_ids']) > 0
 
     def test_multimodal_dataset_image_placeholder(self):
-        # 图像占位符处理
+        # Image placeholder handling
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(create_multimodal_messages)
@@ -83,7 +83,7 @@ class TestMultimodalDataset:
         assert '<image>' in user_content
 
     def test_multimodal_dataset_multiple_image_placeholders(self):
-        # 多图像处理
+        # Multiple image handling
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
@@ -106,7 +106,7 @@ class TestMultimodalDataset:
         assert user_content.count('<image>') == 2
 
     def test_multimodal_dataset_video_placeholder(self):
-        # 视频占位符
+        # Video placeholder
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
@@ -129,7 +129,7 @@ class TestMultimodalDataset:
         assert '<video>' in user_content
 
     def test_multimodal_dataset_audio_placeholder(self):
-        # 音频占位符
+        # Audio placeholder
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 

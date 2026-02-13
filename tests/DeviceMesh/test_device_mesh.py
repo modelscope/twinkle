@@ -24,40 +24,40 @@ class TestDeviceMeshRanks:
 
     def test_tp_rank_only(self):
         mesh = DeviceMesh.from_sizes(tp_size=4)
-        # from_sizes 默认 dp_size=1，维度顺序是 (dp, tp)
+        # from_sizes default dp_size=1, dimension order (dp, tp)
         mesh_array = mesh.mesh.reshape(1, 4)
 
         for tp_idx in range(4):
             global_rank = int(mesh_array[0, tp_idx])
             with patch.object(Platform, 'get_rank', return_value=global_rank):
                 assert mesh.tp_rank == tp_idx
-                assert mesh.dp_rank == 0  # dp 默认是 1，所以 dp_rank 总是 0
+                assert mesh.dp_rank == 0  # dp default is 1, so dp_rank is always 0
                 assert mesh.pp_rank is None
                 assert mesh.fsdp_rank is None
 
     def test_pp_rank_only(self):
         mesh = DeviceMesh.from_sizes(pp_size=4)
-        # from_sizes 维度顺序是 (pp, dp)，默认 dp_size=1
+        # from_sizes dimension order (pp, dp), default dp_size=1
         mesh_array = mesh.mesh.reshape(4, 1)
 
         for pp_idx in range(4):
             global_rank = int(mesh_array[pp_idx, 0])
             with patch.object(Platform, 'get_rank', return_value=global_rank):
                 assert mesh.pp_rank == pp_idx
-                assert mesh.dp_rank == 0  # dp 默认是 1，所以 dp_rank 总是 0
+                assert mesh.dp_rank == 0  # dp default is 1, so dp_rank is always 0
                 assert mesh.tp_rank is None
                 assert mesh.fsdp_rank is None
 
     def test_fsdp_rank_only(self):
         mesh = DeviceMesh.from_sizes(fsdp_size=4)
-        # from_sizes 维度顺序是 (fsdp, dp)，默认 dp_size=1
+        # from_sizes dimension order (fsdp, dp), default dp_size=1
         mesh_array = mesh.mesh.reshape(4, 1)
 
         for fsdp_idx in range(4):
             global_rank = int(mesh_array[fsdp_idx, 0])
             with patch.object(Platform, 'get_rank', return_value=global_rank):
                 assert mesh.fsdp_rank == fsdp_idx
-                assert mesh.dp_rank == 0  # dp 默认是 1，所以 dp_rank 总是 0
+                assert mesh.dp_rank == 0  # dp default is 1, so dp_rank is always 0
                 assert mesh.tp_rank is None
                 assert mesh.pp_rank is None
 
@@ -77,7 +77,7 @@ class TestDeviceMeshRanks:
 
     def test_dp_fsdp_combination(self):
         mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=4)
-        # from_sizes 维度顺序是 (fsdp, dp)
+        # from_sizes dimension order (fsdp, dp)
         mesh_array = mesh.mesh.reshape(4, 2)
 
         for fsdp_idx in range(4):
@@ -91,7 +91,7 @@ class TestDeviceMeshRanks:
 
     def test_tp_pp_combination(self):
         mesh = DeviceMesh.from_sizes(tp_size=2, pp_size=4)
-        # from_sizes 维度顺序是 (pp, dp, tp)，默认 dp_size=1
+        # from_sizes dimension order (pp, dp, tp), default dp_size=1
         mesh_array = mesh.mesh.reshape(4, 1, 2)
 
         for pp_idx in range(4):
@@ -100,12 +100,12 @@ class TestDeviceMeshRanks:
                 with patch.object(Platform, 'get_rank', return_value=global_rank):
                     assert mesh.pp_rank == pp_idx
                     assert mesh.tp_rank == tp_idx
-                    assert mesh.dp_rank == 0  # dp 默认是 1，所以 dp_rank 总是 0
+                    assert mesh.dp_rank == 0  # dp default is 1, so dp_rank is always 0
                     assert mesh.fsdp_rank is None
 
     def test_dp_tp_pp_combination(self):
         mesh = DeviceMesh.from_sizes(dp_size=2, tp_size=2, pp_size=2)
-        # from_sizes 维度顺序是 (pp, dp, tp)
+        # from_sizes dimension order (pp, dp, tp)
         mesh_array = mesh.mesh.reshape(2, 2, 2)
 
         for pp_idx in range(2):
@@ -120,7 +120,7 @@ class TestDeviceMeshRanks:
 
     def test_dp_fsdp_tp_combination(self):
         mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2, tp_size=2)
-        # from_sizes 维度顺序是 (fsdp, dp, tp)
+        # from_sizes dimension order (fsdp, dp, tp)
         mesh_array = mesh.mesh.reshape(2, 2, 2)
 
         for fsdp_idx in range(2):
@@ -135,7 +135,7 @@ class TestDeviceMeshRanks:
 
     def test_all_dimensions_combination(self):
         mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2, tp_size=2, pp_size=2)
-        # from_sizes 维度顺序是 (fsdp, pp, dp, tp)
+        # from_sizes dimension order (fsdp, pp, dp, tp)
         mesh_array = mesh.mesh.reshape(2, 2, 2, 2)
 
         for fsdp_idx in range(2):
@@ -197,13 +197,13 @@ class TestDeviceMeshRanks:
 
     def test_data_rank_with_dp_fsdp(self):
         mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=3)
-        # from_sizes 维度顺序是 (fsdp, dp)
+        # from_sizes dimension order (fsdp, dp)
         mesh_array = mesh.mesh.reshape(3, 2)
 
         for fsdp_idx in range(3):
             for dp_idx in range(2):
                 global_rank = int(mesh_array[fsdp_idx, dp_idx])
                 with patch.object(Platform, 'get_rank', return_value=global_rank):
-                    # data_rank 的计算公式: dp_rank * fsdp_world_size + fsdp_rank
+                    # data_rank formula: dp_rank * fsdp_world_size + fsdp_rank
                     expected_data_rank = dp_idx * 3 + fsdp_idx
                     assert mesh.data_rank == expected_data_rank

@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-测试 Preprocessor 功能：
-1. CompetitionMathProcessor - 处理数学问题数据
-2. CompetitionMathGRPOProcessor - 处理数学问题数据（GRPO格式）
-3. SelfCognitionProcessor - 处理自我认知数据（带占位符）
-4. AlpacaProcessor - 处理 Alpaca 格式数据（多种情况）
-5. Dataset.map 改动点测试（自动过滤 None、batched=False）
+Test Preprocessor functionality:
+1. CompetitionMathProcessor - process math problem data
+2. CompetitionMathGRPOProcessor - process math problem data (GRPO format)
+3. SelfCognitionProcessor - process self-cognition data (with placeholders)
+4. AlpacaProcessor - process Alpaca format data (various cases)
+5. Dataset.map change tests (auto-filter None, batched=False)
 """
 import os
 import pytest
@@ -16,22 +16,22 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import (AlpacaProcessor, CompetitionMathGRPOProcessor, CompetitionMathProcessor,
                                   SelfCognitionProcessor)
 
-# 获取测试数据目录
+# Get test data directory
 TEST_DATA_DIR = Path(__file__).parent / 'test_data'
 
 
 class TestCompetitionMathProcessor:
-    """测试 CompetitionMathProcessor"""
+    """Test CompetitionMathProcessor"""
 
     def test_process_math_data(self):
-        """测试处理数学问题数据"""
+        """Test processing math problem data"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(CompetitionMathProcessor())
 
         assert len(dataset) == 4
 
-        # 检查第一个样本
+        # Check first sample
         sample = dataset[0]
         assert 'messages' in sample
         messages = sample['messages']
@@ -41,16 +41,16 @@ class TestCompetitionMathProcessor:
         assert messages[1]['role'] == 'assistant'
         assert messages[1]['content'] == 'The answer is 4.'
 
-        # 检查无 system message
+        # Check no system message
         assert all(msg['role'] != 'system' for msg in messages)
 
     def test_process_all_samples(self):
-        """测试处理所有样本"""
+        """Test processing all samples"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(CompetitionMathProcessor())
 
-        # 验证所有样本都有正确的结构
+        # Verify all samples have correct structure
         for i in range(len(dataset)):
             sample = dataset[i]
             assert 'messages' in sample
@@ -61,35 +61,35 @@ class TestCompetitionMathProcessor:
 
 
 class TestCompetitionMathGRPOProcessor:
-    """测试 CompetitionMathGRPOProcessor"""
+    """Test CompetitionMathGRPOProcessor"""
 
     def test_process_grpo_data(self):
-        """测试处理 GRPO 格式数据"""
+        """Test processing GRPO format data"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(CompetitionMathGRPOProcessor())
 
         assert len(dataset) == 4
 
-        # 检查第一个样本
+        # Check first sample
         sample = dataset[0]
         assert 'messages' in sample
         messages = sample['messages']
         assert len(messages) == 3
 
-        # 检查 system message
+        # Check system message
         assert messages[0]['role'] == 'system'
         assert 'math assistant' in messages[0]['content'].lower()
 
-        # 检查 user message
+        # Check user message
         assert messages[1]['role'] == 'user'
         assert messages[1]['content'] == 'What is 2+2?'
 
-        # 检查 assistant message（应该为空）
+        # Check assistant message (should be empty)
         assert messages[2]['role'] == 'assistant'
         assert messages[2]['content'] == ''
 
-        # 检查 user_data
+        # Check user_data
         assert 'user_data' in sample
         user_data = sample['user_data']
         assert len(user_data) == 1
@@ -97,12 +97,12 @@ class TestCompetitionMathGRPOProcessor:
         assert user_data[0][1] == 'The answer is 4.'
 
     def test_user_data_storage(self):
-        """测试 user_data 存储"""
+        """Test user_data storage"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(CompetitionMathGRPOProcessor())
 
-        # 验证所有样本都有 user_data
+        # Verify all samples have user_data
         for i in range(len(dataset)):
             sample = dataset[i]
             assert 'user_data' in sample
@@ -112,45 +112,45 @@ class TestCompetitionMathGRPOProcessor:
 
 
 class TestSelfCognitionProcessor:
-    """测试 SelfCognitionProcessor"""
+    """Test SelfCognitionProcessor"""
 
     def test_process_self_cognition_data(self):
-        """测试处理自我认知数据"""
+        """Test processing self-cognition data"""
         jsonl_path = str(TEST_DATA_DIR / 'self_cognition_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
 
         assert len(dataset) == 3
 
-        # 检查第一个样本
+        # Check first sample
         sample = dataset[0]
         assert 'messages' in sample
         messages = sample['messages']
         assert len(messages) == 3
 
-        # 检查 system message
+        # Check system message
         assert messages[0]['role'] == 'system'
         assert messages[0]['content'] == 'You are a helpful assistant.'
 
-        # 检查 user message（占位符应被替换）
+        # Check user message (placeholders should be replaced)
         assert messages[1]['role'] == 'user'
         assert messages[1]['content'] == 'What is twinkle模型?'
         assert '{{NAME}}' not in messages[1]['content']
         assert '{{AUTHOR}}' not in messages[1]['content']
 
-        # 检查 assistant message（占位符应被替换）
+        # Check assistant message (placeholders should be replaced)
         assert messages[2]['role'] == 'assistant'
         assert messages[2]['content'] == 'twinkle模型 is a language model developed by twinkle团队.'
         assert '{{NAME}}' not in messages[2]['content']
         assert '{{AUTHOR}}' not in messages[2]['content']
 
     def test_placeholder_replacement(self):
-        """测试占位符替换功能"""
+        """Test placeholder replacement"""
         jsonl_path = str(TEST_DATA_DIR / 'self_cognition_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(SelfCognitionProcessor('test_model', 'test_author'))
 
-        # 验证所有样本的占位符都被替换
+        # Verify all samples have placeholders replaced
         for i in range(len(dataset)):
             sample = dataset[i]
             messages = sample['messages']
@@ -162,15 +162,15 @@ class TestSelfCognitionProcessor:
 
 
 class TestAlpacaProcessor:
-    """测试 AlpacaProcessor - 多种情况"""
+    """Test AlpacaProcessor - various cases"""
 
     def test_alpaca_instruction_only(self):
-        """测试只有 instruction 的情况"""
+        """Test instruction-only case"""
         jsonl_path = str(TEST_DATA_DIR / 'alpaca_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(AlpacaProcessor())
 
-        # 找到只有 instruction 的样本（第4个样本）
+        # Find instruction-only sample (4th sample)
         sample = dataset[3]  # "What is the capital of France?"
         messages = sample['messages']
         assert len(messages) == 2
@@ -180,29 +180,29 @@ class TestAlpacaProcessor:
         assert messages[1]['content'] == 'The capital of France is Paris.'
 
     def test_alpaca_instruction_with_input(self):
-        """测试 instruction + input 的情况"""
+        """Test instruction + input case"""
         jsonl_path = str(TEST_DATA_DIR / 'alpaca_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(AlpacaProcessor())
 
-        # 找到有 input 的样本（第2个样本）
+        # Find sample with input (2nd sample)
         sample = dataset[1]  # "Translate the following text" + "Hello"
         messages = sample['messages']
         assert len(messages) == 2
         assert messages[0]['role'] == 'user'
         assert 'Translate the following text' in messages[0]['content']
         assert 'Hello' in messages[0]['content']
-        assert '\n' in messages[0]['content']  # 应该包含换行符
+        assert '\n' in messages[0]['content']  # Should contain newline
         assert messages[1]['role'] == 'assistant'
         assert messages[1]['content'] == '你好'
 
     def test_alpaca_empty_input(self):
-        """测试 input 为空字符串的情况"""
+        """Test empty input string case"""
         jsonl_path = str(TEST_DATA_DIR / 'alpaca_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(AlpacaProcessor())
 
-        # 找到 input 为空字符串的样本（第1个样本）
+        # Find sample with empty input (1st sample)
         sample = dataset[0]  # "Explain what AI is" with empty input
         messages = sample['messages']
         assert len(messages) == 2
@@ -211,8 +211,8 @@ class TestAlpacaProcessor:
         assert '\n' not in messages[0]['content']
 
     def test_alpaca_missing_fields(self):
-        """测试缺失字段的容错处理"""
-        # 创建包含缺失字段的测试数据
+        """Test tolerance for missing fields"""
+        # Create test data with missing fields
         import json
         import tempfile
 
@@ -236,7 +236,7 @@ class TestAlpacaProcessor:
             dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=temp_path))
             dataset.map(AlpacaProcessor())
 
-            # 第一个样本应该正常处理（缺失 input）
+            # First sample should process normally (missing input)
             assert len(dataset) >= 1
             sample = dataset[0]
             messages = sample['messages']
@@ -245,12 +245,12 @@ class TestAlpacaProcessor:
             os.unlink(temp_path)
 
     def test_alpaca_all_samples(self):
-        """测试处理所有 Alpaca 格式样本"""
+        """Test processing all Alpaca format samples"""
         jsonl_path = str(TEST_DATA_DIR / 'alpaca_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         dataset.map(AlpacaProcessor())
 
-        # 验证所有样本都有正确的结构
+        # Verify all samples have correct structure
         for i in range(len(dataset)):
             sample = dataset[i]
             assert 'messages' in sample
@@ -263,18 +263,18 @@ class TestAlpacaProcessor:
 
 
 class TestDatasetMapChanges:
-    """测试 Dataset.map 的改动点"""
+    """Test Dataset.map changes"""
 
     def test_auto_filter_none(self):
-        """测试自动过滤 None 值"""
+        """Test auto-filter None values"""
         import json
         import tempfile
 
-        # 注意：不能对第一个样本返回 None，因为 datasets 库在第一个样本返回 None 时会认为不需要更新数据
+        # Note: cannot return None for first sample, datasets lib treats it as no update needed
         class NoneProcessor(CompetitionMathProcessor):
 
             def __call__(self, row):
-                # 对第二个样本返回 None（不是第一个）
+                # Return None for second sample (not first)
                 if row['problem'] == 'Solve for x: 3x + 5 = 14':
                     return None
                 return super().__call__(row)
@@ -286,11 +286,11 @@ class TestDatasetMapChanges:
 
         dataset.map(NoneProcessor())
 
-        # 应该过滤掉返回 None 的样本
+        # Samples returning None should be filtered out
         assert len(dataset) < original_len
-        assert len(dataset) == 3  # 4个样本，1个返回None，剩下3个
+        assert len(dataset) == 3  # 4 samples, 1 returns None, 3 remain
 
-        # 验证没有 None 值，且所有样本都有正确的结构
+        # Verify no None values, all samples have correct structure
         for i in range(len(dataset)):
             sample = dataset[i]
             assert sample is not None
@@ -299,31 +299,31 @@ class TestDatasetMapChanges:
             assert messages[0]['content'] != 'Solve for x: 3x + 5 = 14'
 
     def test_batched_false(self):
-        """测试 batched=False 的设置"""
+        """Test batched=False setting"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
 
-        # 验证 map 方法会设置 batched=False
+        # Verify map sets batched=False
         dataset.map(CompetitionMathProcessor())
 
-        # 这里验证处理结果是正确的（单样本处理）
+        # Verify processing result is correct (single-sample processing)
         assert len(dataset) == 4
         for i in range(len(dataset)):
             sample = dataset[i]
             assert 'messages' in sample
-            # 每个样本应该有独立的 messages
+            # Each sample should have independent messages
             assert isinstance(sample['messages'], list)
 
     def test_load_from_cache_file_false(self):
-        """测试 load_from_cache_file=False 的默认设置"""
+        """Test load_from_cache_file=False default"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
 
-        # 多次调用 map，不应该使用缓存
+        # Multiple map calls should not use cache
         dataset.map(CompetitionMathProcessor())
         first_result = dataset[0]['messages'][0]['content']
 
-        # 修改 processor，再次处理
+        # Modify processor, process again
         class ModifiedProcessor(CompetitionMathProcessor):
 
             def __call__(self, row):
@@ -339,7 +339,7 @@ class TestDatasetMapChanges:
         assert 'Modified: ' in second_result
 
     def test_processor_string_name(self):
-        """测试使用字符串名称加载 processor"""
+        """Test loading processor by string name"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
 
@@ -350,7 +350,7 @@ class TestDatasetMapChanges:
         assert 'messages' in sample
 
     def test_processor_with_init_args(self):
-        """测试使用 init_args 初始化 processor"""
+        """Test initializing processor with init_args"""
         jsonl_path = str(TEST_DATA_DIR / 'self_cognition_data.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
 
