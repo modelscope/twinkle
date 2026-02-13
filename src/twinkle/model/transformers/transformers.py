@@ -252,7 +252,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # accelerate DDP/FSDP paths), compensate SP loss backward to keep gradient scale.
         if isinstance(self.strategy, (NativeFSDPStrategy, AccelerateStrategy)) and self.device_mesh is not None:
             if (self.device_mesh.ulysses_size or 1) > 1 and (self.device_mesh.data_world_size or 1) > 1:
-                sp_config["compensate_fsdp_avg"] = True
+                sp_config['compensate_fsdp_avg'] = True
         self.sp_strategy = SequenceParallelStrategy(
             self.device_mesh,
             sp_config,
@@ -440,9 +440,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
-            reduction = getattr(loss_instance, "reduction", None)
+            reduction = getattr(loss_instance, 'reduction', None)
             if reduction is not None:
-                self.sp_strategy.sp_config["loss_reduction"] = str(reduction)
+                self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value += loss_value
         outputs['loss'] = optimizer_config.loss_value

@@ -870,7 +870,7 @@ class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
-    loss_reduction: str = "mean"
+    loss_reduction: str = 'mean'
     compensate_fsdp_avg: bool = False
 
 
@@ -975,17 +975,16 @@ class SequenceParallelStrategy:
         if labels is None or sequence_parallel._sp_group is None:
             return loss
         # Compute global loss via autograd-aware all-reduce.
-        reduction = str(self.sp_config.get("loss_reduction", "mean")).lower()
-        if reduction == "none":
-            raise ValueError(
-                "SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
-                "Please aggregate per-token losses before calling reduce_loss."
-            )
-        compensate_fsdp_avg = bool(self.sp_config.get("compensate_fsdp_avg", False))
+        reduction = str(self.sp_config.get('loss_reduction', 'mean')).lower()
+        if reduction == 'none':
+            raise ValueError("SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
+                             'Please aggregate per-token losses before calling reduce_loss.')
+        compensate_fsdp_avg = bool(self.sp_config.get('compensate_fsdp_avg', False))
         compensate_factor = float(self.ulysses_size if compensate_fsdp_avg else 1.0)
         sum_metric_scale = float(self.ulysses_size)
 
         class _ReduceSequenceParallelLoss(torch.autograd.Function):
+
             @staticmethod
             def forward(ctx, local_mean: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
                 local_tokens = num_valid_tokens.detach().clone()
@@ -1011,6 +1010,7 @@ class SequenceParallelStrategy:
                 return grad_local_mean, None
 
         class _ReduceSequenceParallelSum(torch.autograd.Function):
+
             @staticmethod
             def forward(ctx, local_sum: torch.Tensor) -> torch.Tensor:
                 ctx.sum_metric_scale = sum_metric_scale
@@ -1026,7 +1026,7 @@ class SequenceParallelStrategy:
                 # logging/metric alignment under outer collect='mean'.
                 return grad_output
 
-        if reduction == "sum":
+        if reduction == 'sum':
             return _ReduceSequenceParallelSum.apply(loss)
 
         # Default to mean reduction: `loss` is local mean.
