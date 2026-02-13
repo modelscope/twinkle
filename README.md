@@ -357,13 +357,13 @@ foundation for building customizable, enterprise-grade training services.
 
 ## Contributions
 
-Twinkle✨ is a collaborative initiative put together by ModelScope in partnership 
-with the open-source community, with key contributions from strategic stakeholders 
-including China Merchants Bank Tech Team. 
+Twinkle✨ is a collaborative initiative put together by ModelScope in partnership
+with the open-source community, with key contributions from strategic stakeholders
+including China Merchants Bank Tech Team.
 
-We are grateful to the open-source community, particularly the projects that inspired us, 
+We are grateful to the open-source community, particularly the projects that inspired us,
 including [Transformers](https://github.com/huggingface/transformers),
-[MS-SWIFT](https://github.com/modelscope/swift), 
+[MS-SWIFT](https://github.com/modelscope/swift),
 [veRL](https://github.com/verl-project/verl), [Tinker](https://github.com/thinking-machines-lab/tinker), and many others.
 
 We welcome
