@@ -152,3 +152,4 @@ megatron_output/
 ast_index_file.py
 test_cookbook/
 /test*.py
+swanlog/
