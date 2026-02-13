@@ -69,7 +69,7 @@ pip install -e .
 
 ## 魔搭社区官方环境
 
-魔搭社区提供了Twinkle运行的官方环境，调用端点为:[base_url](https://www.modelscope.cn/twinkle)，开发者可以参考我们的[文档](docs/source_zh/使用指引/魔搭官方环境.md)来进行使用。
+魔搭社区提供了Twinkle运行的官方环境，调用端点为:[base_url](https://www.modelscope.cn/twinkle)，开发者可以参考我们的[文档](docs/source_zh/使用指引/训练服务.md)来进行使用。
 
 ## 支持的硬件
 
