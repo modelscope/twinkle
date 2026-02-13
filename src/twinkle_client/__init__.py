@@ -21,7 +21,7 @@ def init_tinker_compat_client(base_url: str | None = None, api_key: str | None =
     # Apply patch to bypass tinker:// prefix validation
     patch_tinker()
 
-    if api_key is None:
+    if not api_key:
         api_key = get_api_key()
 
     if base_url and not base_url.startswith(('http://', 'https://')):

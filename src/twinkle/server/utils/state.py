@@ -31,7 +31,8 @@ class ServerState:
     def __init__(
             self,
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
-            cleanup_interval: float = 3600.0) -> None:  # 1 hour in seconds
+            cleanup_interval: float = 3600.0,
+            **kwargs) -> None:  # 1 hour in seconds
         # Session tracking
         self.sessions: dict[str, dict[str, Any]] = {}
         # Model registration

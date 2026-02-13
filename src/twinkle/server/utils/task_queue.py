@@ -222,7 +222,7 @@ class TaskQueueMixin:
         Selection policy: round-robin across queue keys. If a task is rate-limited
         at execution time, it is requeued and the worker tries other queues.
         """
-        print('[TaskQueue] Worker started')
+        logger.debug('[TaskQueue] Worker started')
         while True:
             try:
                 # Wait until there is at least one queue with a task
@@ -470,7 +470,7 @@ class TaskQueueMixin:
         if self._event_loop is None:
             self._event_loop = asyncio.get_running_loop()
 
-        print(
+        logger.debug(
             f'[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}'  # noqa: E501
         )
 
@@ -487,7 +487,7 @@ class TaskQueueMixin:
 
         # 5. Put task in queue and update status
         q = self._task_queues[queue_key]
-        print(
+        logger.debug(
             f'[TaskQueue] Adding task {request_id} to queue key={queue_key} (current size: {q.qsize()}) type={task_type}'  # noqa: E501
         )
         await q.put(
@@ -502,7 +502,7 @@ class TaskQueueMixin:
             ))
         self.state.store_future_status(
             request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
-        print(f'[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}')
+        logger.debug(f'[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}')
 
         self._new_task_event.set()
 
@@ -567,4 +567,4 @@ class TaskQueueMixin:
         self._task_queues.clear()
         self._queue_order.clear()
 
-        print('[TaskQueue] Task queue shutdown complete')
+        logger.debug('[TaskQueue] Task queue shutdown complete')
