@@ -44,17 +44,6 @@ reward_fn = FormatReward()
 rewards = reward_fn(trajectories, ground_truths)
 ```
 
-## CountDownAccuracyReward
-
-The countdown accuracy reward function provides partial rewards when answers are close to correct.
-
-```python
-from twinkle.reward import CountDownAccuracyReward
-
-reward_fn = CountDownAccuracyReward()
-rewards = reward_fn(trajectories, ground_truths)
-```
-
 ## Custom Reward Functions
 
 You can create custom rewards by inheriting from the Reward base class or using functions:

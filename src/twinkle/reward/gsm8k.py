@@ -34,7 +34,10 @@ class GSM8KAccuracyReward(Reward):
 
             # Get ground truth from user_data
             user_data = trajectory.get('user_data')
-            gt = user_data.get('ground_truth')
+            for item in user_data:
+                if item[0] == 'ground_truth':
+                    gt = item[1]
+                    break
 
             predicted = self.extract_answer(completion)
 

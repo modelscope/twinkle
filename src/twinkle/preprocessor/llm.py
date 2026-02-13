@@ -96,7 +96,7 @@ class GSM8KProcessor(Preprocessor):
                      'numerical answer after ####.\n'
                      'For example:\n<think> ... reasoning ... </think>\n#### 42')
 
-    def extract_ground_truth(answer_str: str) -> str:
+    def extract_ground_truth(self, answer_str: str) -> str:
         """Extract the number after '####' from GSM8K answer."""
         match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
         if match:

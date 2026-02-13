@@ -21,8 +21,8 @@ class CompletionRewardMetric(Metric):
         self.completion_lengths = []
 
     def accumulate(self,
-                   _,
-                   __,
+                   inputs=None, # ignore
+                   outputs=None,# ignore
                    *,
                    rewards=None,
                    completion_lengths=None,
@@ -55,11 +55,11 @@ class CompletionRewardMetric(Metric):
         return 0.0
 
     def calculate(self) -> Dict[str, Any]:
-        metric_dict = {
-            'profiling/Time taken: move_model_to_sampler': self._mean(self.weight_sync_time),
-            'profiling/Time taken: generate': self._mean(self.generate_time),
-        }
-
+        metric_dict = {}
+        if self.weight_sync_time is not None:
+            metric_dict['profiling/Time taken: move_model_to_sampler'] = self._mean(self.weight_sync_time)
+        if self.generate_time is not None:
+            metric_dict['profiling/Time taken: generate'] = self._mean(self.generate_time)
         for key, values in self.rewards.items():
             metric_dict[f'train/{key}_reward'] = self._mean(values)
             metric_dict[f'train/{key}_reward_std'] = self._std(values)

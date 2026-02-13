@@ -107,7 +107,7 @@ class CountDownAccuracy(Reward):
 
 def compute_rewards(trajectories: List[dict], ) -> Tuple[List[float], List[float], List[float]]:
     """Compute format and accuracy rewards for Countdown game."""
-    from twinkle.reward import CountDownAccuracy, FormatReward
+    from twinkle.reward import FormatReward
     format_rewards = FormatReward()(trajectories, [])
     accuracy_rewards = CountDownAccuracy()(trajectories, [])
     total_rewards = [a + b for a, b in zip(accuracy_rewards, format_rewards)]
