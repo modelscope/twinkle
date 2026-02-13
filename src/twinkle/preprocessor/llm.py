@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Preprocessor
-from twinkle.data_format import Trajectory, Message
+import re
 
+from twinkle.data_format import Trajectory, Message
 
 class CompetitionMathProcessor(Preprocessor):
 
@@ -77,3 +78,44 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
             Message(role='user', content=query),
         ]
         return Trajectory(messages=messages, user_data=[{'target': target, 'nums': nums}])
+
+
+
+
+
+
+class GSM8KProcessor(Preprocessor):
+    """Preprocessor for GSM8K dataset.
+
+    GSM8K fields: question (str), answer (str ending with '#### <number>')
+    Extracts the ground truth number and stores it in user_data for reward.
+    """
+
+    system_prompt = (
+        "You are a helpful math assistant. Solve the problem step by step. "
+        "Show your reasoning in <think> </think> tags, then give the final "
+        "numerical answer after ####.\n"
+        "For example:\n<think> ... reasoning ... </think>\n#### 42"
+    )
+
+    def extract_ground_truth(answer_str: str) -> str:
+        """Extract the number after '####' from GSM8K answer."""
+        match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
+        if match:
+            return match.group(1).replace(',', '').strip()
+        return ''
+
+    def __call__(self, row) -> Trajectory:
+        question = row['question']
+        answer = row.get('answer', '')
+        ground_truth = self.extract_ground_truth(answer)
+
+        messages = [
+            Message(role='system', content=self.system_prompt),
+            Message(role='user', content=question),
+        ]
+        return Trajectory(
+            messages=messages,
+            user_data=[('ground_truth', ground_truth)],
+        )
+
