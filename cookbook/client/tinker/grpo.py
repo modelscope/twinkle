@@ -19,6 +19,8 @@
 # Requires both model and sampler services to be configured.
 
 import gc
+import os
+
 import numpy as np
 from typing import List, Tuple
 
@@ -34,7 +36,7 @@ from modelscope import AutoTokenizer
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
+BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
@@ -84,8 +86,8 @@ def main():
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info("Connecting to Tinker server...")
-    service_client = init_tinker_compat_client(
-        base_url='http://localhost:8000')
+    service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle',
+                                               api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
     
     logger.info("Creating LoRA training client...")
     # Create a LoRA training client for GRPO
