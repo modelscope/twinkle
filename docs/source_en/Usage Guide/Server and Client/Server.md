@@ -121,7 +121,7 @@ applications:
 - Different components will be automatically assigned to different Nodes
 - Ray will automatically schedule to the appropriate Node based on resource requirements (`num_gpus`, `num_cpus` in `ray_actor_options`)
 
-In the YAML configuration file, **each component needs to occupy a separate Node**, and the `ranks` within each Node are numbered starting from 0.
+In the YAML configuration file, **each component needs to occupy a separate Node**.
 
 **Example configuration:**
 

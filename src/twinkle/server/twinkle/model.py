@@ -200,8 +200,6 @@ def build_model_app(model_id: str,
             if self.get_adapter_info(adapter_name):
                 # Clear adapter state
                 self.clear_adapter_state(adapter_name)
-
-                self.model.remove_adapter(adapter_name)
                 # Unregister from adapter manager
                 self.unregister_adapter(adapter_name)
 
