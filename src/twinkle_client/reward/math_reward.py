@@ -10,11 +10,12 @@
 # ============================================================================
 
 from typing import List
-from twinkle_client.http import TWINKLE_SERVER_URL
-from twinkle_client.http import http_post, heartbeat_manager
-from twinkle.data_format import Trajectory
 
-class MathReward(object):
+from twinkle.data_format import Trajectory
+from twinkle_client.http import TWINKLE_SERVER_URL, heartbeat_manager, http_post
+
+
+class MathReward:
     """Client wrapper for MathReward that calls server HTTP endpoints."""
 
     def __init__(self, ground_truth_key: str = 'solution'):
@@ -26,9 +27,10 @@ class MathReward(object):
             json_data={
                 'processor_type': 'reward',
                 'class_type': 'MathReward',
-                **{'ground_truth_key': ground_truth_key}
-            }
-        )
+                **{
+                    'ground_truth_key': ground_truth_key
+                }
+            })
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -39,16 +41,16 @@ class MathReward(object):
         except:
             pass
 
-        
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__call__',
-                **{'trajectories': trajectories, 'ground_truths': ground_truths},
-            }
-        )
+                **{
+                    'trajectories': trajectories,
+                    'ground_truths': ground_truths
+                },
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
+        return response.json()['result']

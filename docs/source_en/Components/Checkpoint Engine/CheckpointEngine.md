@@ -7,30 +7,30 @@ CheckpointEngine is a component used to synchronize model weights between traine
 ```python
 class CheckpointEngine(ABC):
     """Checkpoint engine base class
-    
+
     The checkpoint engine handles weight synchronization between trainer and inference processes.
     """
-    
+
     @abstractmethod
     def prepare(self) -> dict[str, Any]:
         """Prepare for weight synchronization"""
         ...
-    
+
     @abstractmethod
     def init_process_group(self, rank: int, world_size: int, **kwargs):
         """Initialize process group"""
         ...
-    
+
     @abstractmethod
     async def send_weights(self, weight_generator):
         """Send weights (called in trainer process)"""
         ...
-    
+
     @abstractmethod
     def receive_weights(self) -> AsyncGenerator:
         """Receive weights (called in inference process)"""
         ...
-    
+
     @abstractmethod
     def finalize(self):
         """Clean up resources"""

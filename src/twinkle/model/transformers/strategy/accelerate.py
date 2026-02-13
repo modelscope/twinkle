@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Dict, Any, Optional, Literal
+from typing import Any, Dict, Literal, Optional
+
 from twinkle import DeviceMesh
 
 
@@ -14,12 +15,13 @@ class AccelerateStrategy:
         fsdp_config: Any fsdp config passed into accelerate.
     """
 
-    def __init__(self,
-                 device_mesh: Optional[DeviceMesh] = None,
-                 mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
-                 ddp_config: Dict[str, Any] = None,
-                 fsdp_config: Dict[str, Any] = None,
-                 ):
+    def __init__(
+        self,
+        device_mesh: Optional[DeviceMesh] = None,
+        mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+        ddp_config: Dict[str, Any] = None,
+        fsdp_config: Dict[str, Any] = None,
+    ):
         from accelerate import Accelerator
 
         self.device_mesh = device_mesh
@@ -47,11 +49,11 @@ class AccelerateStrategy:
         if device_mesh is None:
             return None
 
-        dp_size = device_mesh.get_dim_size("dp") if device_mesh.has_dim("dp") else 1
-        fsdp_size = device_mesh.get_dim_size("fsdp") if device_mesh.has_dim("fsdp") else 1
-        tp_size = device_mesh.get_dim_size("tp") if device_mesh.has_dim("tp") else 1
-        cp_size = device_mesh.get_dim_size("cp") if device_mesh.has_dim("cp") else 1
-        sp_size = device_mesh.get_dim_size("sp") if device_mesh.has_dim("sp") else 1
+        dp_size = device_mesh.get_dim_size('dp') if device_mesh.has_dim('dp') else 1
+        fsdp_size = device_mesh.get_dim_size('fsdp') if device_mesh.has_dim('fsdp') else 1
+        tp_size = device_mesh.get_dim_size('tp') if device_mesh.has_dim('tp') else 1
+        cp_size = device_mesh.get_dim_size('cp') if device_mesh.has_dim('cp') else 1
+        sp_size = device_mesh.get_dim_size('sp') if device_mesh.has_dim('sp') else 1
 
         if tp_size == 1 and cp_size == 1 and sp_size == 1:
             # Only ddp
@@ -69,21 +71,21 @@ class AccelerateStrategy:
 
     def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any]):
         from accelerate import FullyShardedDataParallelPlugin
-        from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
         from torch.distributed.fsdp import BackwardPrefetch
+        from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
 
         if device_mesh is None:
             return None
 
-        fsdp_size = device_mesh.get_dim_size("fsdp") if device_mesh.has_dim("fsdp") else 1
-        dp_size = device_mesh.get_dim_size("dp") if device_mesh.has_dim("dp") else 1
+        fsdp_size = device_mesh.get_dim_size('fsdp') if device_mesh.has_dim('fsdp') else 1
+        dp_size = device_mesh.get_dim_size('dp') if device_mesh.has_dim('dp') else 1
 
         if fsdp_size == 1 and dp_size == 1:
             return None
-        
+
         fsdp_config = fsdp_config or {}
 
-        sharding_strategy = fsdp_config.pop("sharding_strategy", None)
+        sharding_strategy = fsdp_config.pop('sharding_strategy', None)
         if dp_size > 1 and fsdp_size > 1:
             # HSDP
             if sharding_strategy not in (FSDPShardingStrategy.HYBRID_SHARD, FSDPShardingStrategy._HYBRID_SHARD_ZERO2):
@@ -99,11 +101,11 @@ class AccelerateStrategy:
         fsdp_plugin = FullyShardedDataParallelPlugin(
             fsdp_version=fsdp_version,
             sharding_strategy=sharding_strategy,
-            backward_prefetch=fsdp_config.pop("backward_prefetch", BackwardPrefetch.BACKWARD_PRE),
+            backward_prefetch=fsdp_config.pop('backward_prefetch', BackwardPrefetch.BACKWARD_PRE),
             mixed_precision_policy=self.mixed_precision,
-            cpu_offload=fsdp_config.pop("cpu_offload", False),
+            cpu_offload=fsdp_config.pop('cpu_offload', False),
             activation_checkpointing=fsdp_config.pop('activation_checkpointing', False),
-            auto_wrap_policy=fsdp_config.pop('auto_wrap_policy', 'transformer_based_wrap'), # noqa
+            auto_wrap_policy=fsdp_config.pop('auto_wrap_policy', 'transformer_based_wrap'),  # noqa
             reshard_after_forward=fsdp_config.pop('reshard_after_forward', True),
             **fsdp_config,
         )

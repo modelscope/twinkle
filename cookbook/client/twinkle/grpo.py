@@ -20,13 +20,13 @@
 # Requires both model and sampler services to be configured.
 
 import dotenv
+
 dotenv.load_dotenv('.env')
 
 import gc
 import os
-from typing import List, Tuple
-
 from peft import LoraConfig
+from typing import List, Tuple
 
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
@@ -48,25 +48,21 @@ LEARNING_RATE = 1e-5
 MAX_STEPS = 10
 BATCH_SIZE = 4
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 5       # Save weights for sampler every N steps
+SYNC_INTERVAL = 5  # Save weights for sampler every N steps
 GRADIENT_ACCUMULATION_STEPS = 4
 
 
 def create_countdown_dataset():
     """Create Countdown Game dataset for GRPO training."""
 
-    dataset = Dataset(dataset_meta=DatasetMeta(
-        "ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(500)))
-    dataset.set_template(
-        'Template', model_id=MODEL_ID, max_length=8192)
+    dataset = Dataset(dataset_meta=DatasetMeta('ms://zouxuhong/Countdown-Tasks-3to4', data_slice=range(500)))
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=8192)
     dataset.map('CountdownProcessor')
     dataset.encode(add_generation_prompt=True, batched=True)
     return dataset
 
 
-def compute_rewards(
-    trajectories: List[dict],
-) -> Tuple[List[float], List[float], List[float]]:
+def compute_rewards(trajectories: List[dict], ) -> Tuple[List[float], List[float], List[float]]:
     """Compute format and accuracy rewards for Countdown game."""
     from twinkle.reward import CountDownAccuracy, FormatReward
     format_rewards = FormatReward()(trajectories, [])
@@ -96,7 +92,8 @@ def train():
         lora_dropout=0.05,
     )
     model.add_adapter_to_model(
-        'default', lora_config,
+        'default',
+        lora_config,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     )
 
@@ -144,14 +141,13 @@ def train():
         # Instead of sync_weights, save the model checkpoint and pass
         # the resulting path to the sampler as adapter_uri
         if step % SYNC_INTERVAL == 0:
-            logger.info(f"Step {step}: Saving weights for sampler...")
+            logger.info(f'Step {step}: Saving weights for sampler...')
             twinkle_path = model.save(
                 name=f'grpo-sampler-step-{step}',
                 save_optimizer=False,
             )
             current_adapter_uri = twinkle_path
-            logger.info(
-                f"Step {step}: Saved weights to {current_adapter_uri}")
+            logger.info(f'Step {step}: Saved weights to {current_adapter_uri}')
 
         # ========== 2. Sample completions ==========
         sample_response = sampler.sample(
@@ -172,15 +168,15 @@ def train():
             completion_lengths.append(len(seq.get('tokens', [])))
 
         if not input_features:
-            logger.warning(f"Step {step}: No valid samples, skipping")
+            logger.warning(f'Step {step}: No valid samples, skipping')
             step += 1
             continue
 
         # ========== 3. Compute rewards ==========
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
-            input_features)
+        total_rewards, format_rewards, accuracy_rewards = compute_rewards(input_features)
         metrics.accumulate(
-            None, None,
+            None,
+            None,
             completion_lengths=completion_lengths,
             rewards={
                 'total': total_rewards,
@@ -195,11 +191,9 @@ def train():
             scale='group',
         ).tolist()
 
-        frac_zero_std = (
-            1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
+        frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
         if frac_zero_std == 1.0:
-            logger.info(
-                f"Step {step}: All advantages are zero, skipping training")
+            logger.info(f'Step {step}: All advantages are zero, skipping training')
             step += 1
             continue
 
@@ -224,13 +218,12 @@ def train():
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric())
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
-        logger.info(f"Step {step}: {log_dict}")
+        logger.info(f'Step {step}: {log_dict}')
         step += 1
 
     # Save final checkpoint
-    twinkle_path = model.save(
-        name='grpo-countdown-final', save_optimizer=True)
-    logger.info(f"Saved final checkpoint: {twinkle_path}")
+    twinkle_path = model.save(name='grpo-countdown-final', save_optimizer=True)
+    logger.info(f'Saved final checkpoint: {twinkle_path}')
 
 
 if __name__ == '__main__':

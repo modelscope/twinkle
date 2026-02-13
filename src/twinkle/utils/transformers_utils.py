@@ -1,7 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Callable, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, List, Optional
+
 from .utils import deep_getattr
+
 if TYPE_CHECKING:
     import torch.nn as nn
 
@@ -39,6 +41,7 @@ def find_layers(
             target_module_names.add(module_name)
     return list(target_module_names)
 
+
 def find_all_linears(model, model_arch=None, extra_layers=None, sub_module=None):
     if model_arch is None:
         model_arch = model.model_meta.model_arch
@@ -66,6 +69,7 @@ def find_all_linears(model, model_arch=None, extra_layers=None, sub_module=None)
         return False
 
     return find_layers(model, _cond, sub_module=sub_module)
+
 
 def get_multimodal_target_regex(
     model,
@@ -114,6 +118,7 @@ def get_multimodal_target_regex(
 
     return rf'^({"|".join(res)})$'
 
+
 def get_modules_to_not_convert(model):
     if not hasattr(model, 'model_meta') or not hasattr(model, 'model_info'):
         return
@@ -134,6 +139,7 @@ def get_modules_to_not_convert(model):
                                                          or any(n.startswith(prefix) for prefix in prefix_list)):
             res.append(n)
     return res if res else None
+
 
 def get_llm_model(model, *, model_meta=None, inner_backbone: bool = True):
     """Best-effort extraction of the LLM module from a (possibly wrapped) model.
@@ -163,20 +169,20 @@ def get_llm_model(model, *, model_meta=None, inner_backbone: bool = True):
 
     # 3) Locate the language model module in multimodal containers via model_meta.
     if model_meta is None:
-        model_meta = getattr(model, "model_meta", None)
+        model_meta = getattr(model, 'model_meta', None)
     llm_model = model
-    model_arch = getattr(model_meta, "model_arch", None) if model_meta is not None else None
-    llm_prefix = getattr(model_arch, "language_model", None) if model_arch is not None else None
+    model_arch = getattr(model_meta, 'model_arch', None) if model_meta is not None else None
+    llm_prefix = getattr(model_arch, 'language_model', None) if model_arch is not None else None
     if llm_prefix:
         # Convention: `language_model` is a list of candidate prefixes.
         llm_model = deep_getattr(model, llm_prefix[0])
     else:
-        llm_model = getattr(model, "language_model", model)
+        llm_model = getattr(model, 'language_model', model)
 
     # 4) Return the inner backbone if requested.
     if inner_backbone:
-        if hasattr(llm_model, "thinker"):
+        if hasattr(llm_model, 'thinker'):
             llm_model = llm_model.thinker.model
-        elif hasattr(llm_model, "model"):
+        elif hasattr(llm_model, 'model'):
             llm_model = llm_model.model
     return llm_model

@@ -1,8 +1,9 @@
 """
 Reference: swift/swift/megatron/trainers/utils.py
 """
-from typing import Optional
 import torch
+from typing import Optional
+
 from twinkle import requires
 
 

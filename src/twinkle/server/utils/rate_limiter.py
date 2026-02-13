@@ -61,15 +61,15 @@ class RateLimiter:
         self.token_cleanup_interval = token_cleanup_interval
 
         # Dict mapping user token -> list of (timestamp, token_count) tuples
-        self._token_requests: Dict[str, List[Tuple[float, int]]] = {}
+        self._token_requests: dict[str, list[tuple[float, int]]] = {}
         # Track last activity time for each token
-        self._last_activity: Dict[str, float] = {}
+        self._last_activity: dict[str, float] = {}
 
         # Async lock for rate limiting operations
         self._lock = asyncio.Lock()
 
         # Cleanup tasks
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_task: asyncio.Task | None = None
         self._cleanup_started = False
 
     def _cleanup_old_requests(self, token: str, current_time: float) -> None:
@@ -82,10 +82,7 @@ class RateLimiter:
         if token not in self._token_requests:
             return
         cutoff_time = current_time - self.window_seconds
-        self._token_requests[token] = [
-            (ts, count) for ts, count in self._token_requests[token]
-            if ts > cutoff_time
-        ]
+        self._token_requests[token] = [(ts, count) for ts, count in self._token_requests[token] if ts > cutoff_time]
 
         # Remove token completely if it has no requests in the current window
         if not self._token_requests[token]:
@@ -99,8 +96,7 @@ class RateLimiter:
         This prevents unbounded memory growth by removing tokens that haven't
         been active for token_cleanup_multiplier * window_seconds.
         """
-        logger.debug(
-            f"[RateLimiter] Cleanup task started (interval={self.token_cleanup_interval}s)")
+        logger.debug(f'[RateLimiter] Cleanup task started (interval={self.token_cleanup_interval}s)')
         while True:
             try:
                 await asyncio.sleep(self.token_cleanup_interval)
@@ -112,8 +108,7 @@ class RateLimiter:
 
                     # Find tokens that haven't been active recently
                     tokens_to_remove = [
-                        token for token, last_time in self._last_activity.items()
-                        if last_time < inactive_threshold
+                        token for token, last_time in self._last_activity.items() if last_time < inactive_threshold
                     ]
 
                     # Remove inactive tokens
@@ -124,16 +119,14 @@ class RateLimiter:
                             del self._last_activity[token]
 
                     if tokens_to_remove:
-                        logger.debug(
-                            f"[RateLimiter] Cleaned up {len(tokens_to_remove)} inactive tokens. "
-                            f"Active tokens remaining: {len(self._token_requests)}"
-                        )
+                        logger.debug(f'[RateLimiter] Cleaned up {len(tokens_to_remove)} inactive tokens. '
+                                     f'Active tokens remaining: {len(self._token_requests)}')
 
             except asyncio.CancelledError:
-                logger.debug("[RateLimiter] Cleanup task cancelled")
+                logger.debug('[RateLimiter] Cleanup task cancelled')
                 break
             except Exception as e:
-                logger.warning(f"[RateLimiter] Error in cleanup task: {e}")
+                logger.warning(f'[RateLimiter] Error in cleanup task: {e}')
                 continue
 
     def start_cleanup_task(self) -> None:
@@ -143,10 +136,9 @@ class RateLimiter:
         It's safe to call multiple times - subsequent calls are ignored.
         """
         if not self._cleanup_started:
-            self._cleanup_task = asyncio.create_task(
-                self._cleanup_inactive_tokens())
+            self._cleanup_task = asyncio.create_task(self._cleanup_inactive_tokens())
             self._cleanup_started = True
-            logger.debug("[RateLimiter] Background cleanup task started")
+            logger.debug('[RateLimiter] Background cleanup task started')
 
     async def stop_cleanup_task(self) -> None:
         """Stop the background cleanup task.
@@ -159,11 +151,9 @@ class RateLimiter:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
-            logger.debug("[RateLimiter] Background cleanup task stopped")
+            logger.debug('[RateLimiter] Background cleanup task stopped')
 
-    async def check_and_record(
-        self, token: str, input_tokens: int
-    ) -> Tuple[bool, Optional[str]]:
+    async def check_and_record(self, token: str, input_tokens: int) -> tuple[bool, str | None]:
         """Check if request is allowed and record it if so.
 
         Args:
@@ -195,17 +185,17 @@ class RateLimiter:
 
             # Check rps limit
             if request_count >= self.rps_limit:
-                return False, f"RPS limit exceeded: {request_count}/{self.rps_limit} requests/s"
+                return False, f'RPS limit exceeded: {request_count}/{self.rps_limit} requests/s'
 
             # Check tps limit
             if token_count + input_tokens > self.tps_limit:
-                return False, f"TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s"
+                return False, f'TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s'
 
             # Record this request
             self._token_requests[token].append((current_time, input_tokens))
             return True, None
 
-    def get_stats(self, token: str) -> Dict[str, Any]:
+    def get_stats(self, token: str) -> dict[str, Any]:
         """Get current rate limiting stats for a token.
 
         Args:
@@ -234,7 +224,7 @@ class RateLimiter:
             'tps_available': self.tps_limit - token_count,
         }
 
-    def get_memory_stats(self) -> Dict[str, Any]:
+    def get_memory_stats(self) -> dict[str, Any]:
         """Get memory usage statistics for monitoring.
 
         Returns:

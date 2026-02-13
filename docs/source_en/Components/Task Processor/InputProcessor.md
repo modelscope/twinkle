@@ -14,7 +14,7 @@ class InputProcessor:
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs) -> Union[InputFeature, List[InputFeature]]:
         # Overall processing entry point
         ...
-    
+
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
         # Move to cuda device
         ...

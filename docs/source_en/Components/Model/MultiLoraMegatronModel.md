@@ -15,7 +15,7 @@ class MultiLoraMegatronModel:
                  max_length: int = 8192,
                  **kwargs):
         ...
-    
+
     ...
 ```
 

@@ -1,14 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
+import numpy as np
 import os
 import random
 from abc import ABC, abstractmethod
 from functools import lru_cache
-from typing import Union, Optional, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-import numpy as np
-
-from .platform import Platform, DeviceMesh
+from .platform import DeviceMesh, Platform
 
 if TYPE_CHECKING:
     import torch
@@ -88,7 +87,7 @@ class Torch(Framework):
     @staticmethod
     @lru_cache
     def is_npu_available() -> bool:
-        "Checks if `torch_npu` is installed and if at least one NPU device is available"
+        'Checks if `torch_npu` is installed and if at least one NPU device is available'
         if not Torch.is_torch_available() or not Torch.is_torch_npu_available():
             return False
 
@@ -163,16 +162,16 @@ class Torch(Framework):
 
             if deterministic:
                 torch.use_deterministic_algorithms(True)
-                os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-                os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-                os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+                os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+                os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+                os.environ['FLASH_ATTENTION_DETERMINISTIC'] = '1'
                 torch.use_deterministic_algorithms(True, warn_only=True)
                 torch.backends.cudnn.deterministic = True
                 torch.backends.cudnn.benchmark = False
 
                 if Torch.is_npu_available():
-                    os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
-                    os.environ["HCCL_DETERMINISTIC"] = "1"
+                    os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+                    os.environ['HCCL_DETERMINISTIC'] = '1'
 
     @staticmethod
     def to_local_tensor(tensor: 'torch.Tensor') -> 'torch.Tensor':
@@ -200,20 +199,21 @@ class Torch(Framework):
         elif Torch.is_npu_available():
             import torch_npu
             torch.npu.synchronize(Platform.get_local_device())
-    
+
     @staticmethod
     def contains_nan(*args, **kwargs) -> bool:
         import torch
+
         def _check(obj: Any) -> bool:
             if isinstance(obj, torch.Tensor):
                 return torch.isnan(obj).any().item()
-            
+
             if isinstance(obj, dict):
                 return any(_check(v) for v in obj.values())
-            
+
             if isinstance(obj, (list, tuple, set)):
                 return any(_check(item) for item in obj)
-            
+
             return False
 
         for arg in args:
@@ -223,7 +223,7 @@ class Torch(Framework):
         for value in kwargs.values():
             if _check(value):
                 return True
-    
+
         return False
 
     @staticmethod

@@ -1,12 +1,13 @@
 import gc
 import time
-from typing import List, Tuple
 from peft import LoraConfig
+from typing import List, Tuple
+
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger, torch_util
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.data_format import SamplingParams, Trajectory, InputFeature
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
@@ -14,15 +15,14 @@ from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
-from twinkle import torch_util
 
 logger = get_logger()
 
 
 def create_countdown_dataset():
     from twinkle.preprocessor import CountdownProcessor
-    dataset = Dataset(DatasetMeta("ms://zouxuhong/Countdown-Tasks-3to4", data_slice=range(50000)))
-    dataset.set_template("Template", model_id='ms://Qwen/Qwen2.5-3B-Instruct', max_length=8192)
+    dataset = Dataset(DatasetMeta('ms://zouxuhong/Countdown-Tasks-3to4', data_slice=range(50000)))
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-3B-Instruct', max_length=8192)
     dataset.map(CountdownProcessor())
     dataset.encode()
     return dataset
@@ -32,8 +32,9 @@ def compute_rewards(trajectories: List[Trajectory]) -> Tuple[List[float], List[f
     from twinkle.reward import CountDownAccuracy, FormatReward
     format_rewards = FormatReward()(trajectories, [])
     accuracy_rewards = CountDownAccuracy()(trajectories, [])
-    total_rewards = [a+b for a, b in zip(accuracy_rewards, format_rewards)]
+    total_rewards = [a + b for a, b in zip(accuracy_rewards, format_rewards)]
     return total_rewards, format_rewards, accuracy_rewards
+
 
 def main():
     device_groups = [
@@ -44,9 +45,13 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(dp_size=4)
     twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_groups, lazy_collect=False)
     logger.info(get_device_placement())
-    lora_config = LoraConfig(target_modules="all-linear", r=8, lora_alpha=32, lora_dropout=0.05)
+    lora_config = LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05)
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-3B-Instruct', device_mesh=model_mesh, remote_group='model')
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=4,)
+    model.add_adapter_to_model(
+        'default',
+        lora_config,
+        gradient_accumulation_steps=4,
+    )
     sampler = vLLMSampler(
         model_id='ms://Qwen/Qwen2.5-3B-Instruct',
         engine_args={
@@ -63,8 +68,12 @@ def main():
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     dataloader = DataLoader(
-        dataset=create_countdown_dataset, batch_size=4, min_batch_size=4,
-        device_mesh=model_mesh, remote_group='model', num_workers=0,
+        dataset=create_countdown_dataset,
+        batch_size=4,
+        min_batch_size=4,
+        device_mesh=model_mesh,
+        remote_group='model',
+        num_workers=0,
     )
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
@@ -98,23 +107,25 @@ def main():
             completion_lengths.append(len(sequence.tokens))
 
         if not trajectories:
-            logger.warning(f"Step {step}: No valid samples, skipping")
+            logger.warning(f'Step {step}: No valid samples, skipping')
             step += 1
             continue
 
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(trajectories)
-        metrics.accumulate(None, None,
-                           completion_lengths=completion_lengths,
-                           rewards={
-                               'total': total_rewards,
-                               'format': format_rewards,
-                               'accuracy': accuracy_rewards,
-                           })
+        metrics.accumulate(
+            None,
+            None,
+            completion_lengths=completion_lengths,
+            rewards={
+                'total': total_rewards,
+                'format': format_rewards,
+                'accuracy': accuracy_rewards,
+            })
 
         advantages = advantage_fn(total_rewards, num_generations=8, scale='group').tolist()
         frac_zero_std = 1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
         if frac_zero_std == 1.0:
-            logger.info(f"Step {step}: All advantages are zero, skipping training")
+            logger.info(f'Step {step}: All advantages are zero, skipping training')
             step += 1
             continue
 

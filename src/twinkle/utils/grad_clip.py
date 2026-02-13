@@ -1,14 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from typing import Iterable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
+
 from twinkle import Platform
 from twinkle.utils import torch_util
+
 if TYPE_CHECKING:
     import torch
 
 
-def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
+def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
                                  *,
                                  num_tokens: int,
                                  max_grad_norm: float,
@@ -30,8 +32,8 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
     if not grads:
         return 0.0
 
-    has_dtensor_grad = any(hasattr(grad, "to_local") for grad in grads)
-    has_local_tensor_grad = any(not hasattr(grad, "to_local") for grad in grads)
+    has_dtensor_grad = any(hasattr(grad, 'to_local') for grad in grads)
+    has_local_tensor_grad = any(not hasattr(grad, 'to_local') for grad in grads)
     if not (has_dtensor_grad and has_local_tensor_grad):
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters,
@@ -42,28 +44,28 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
         return float(grad_norm.item())
 
     norm_type = float(norm_type)
-    if norm_type not in (2.0, float("inf")):
-        raise ValueError("Mixed DTensor/Tensor clip_grad_norm only supports norm_type=2 or inf.")
+    if norm_type not in (2.0, float('inf')):
+        raise ValueError('Mixed DTensor/Tensor clip_grad_norm only supports norm_type=2 or inf.')
 
     def _local_grad(grad: torch.Tensor) -> torch.Tensor:
-        if hasattr(grad, "to_local"):
+        if hasattr(grad, 'to_local'):
             return grad.to_local()
         return grad
 
     reduce_device = None
     for grad in grads:
         local_grad = _local_grad(grad)
-        if local_grad.is_cuda or getattr(local_grad, "is_npu", False):
+        if local_grad.is_cuda or getattr(local_grad, 'is_npu', False):
             reduce_device = local_grad.device
             break
     if reduce_device is None:
         backend = dist.get_backend() if dist.is_initialized() else None
-        if backend in ("nccl", "hccl"):
+        if backend in ('nccl', 'hccl'):
             reduce_device = torch.device(Platform.get_local_device())
         else:
-            reduce_device = torch.device("cpu")
+            reduce_device = torch.device('cpu')
 
-    if norm_type == float("inf"):
+    if norm_type == float('inf'):
         local_norm = 0.0
         for grad in grads:
             local_grad = _local_grad(grad)

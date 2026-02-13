@@ -1,8 +1,8 @@
 import unittest
 
 from twinkle.data_format import Message, Trajectory
-from twinkle.template import Template
 from twinkle.hub import HubOperation
+from twinkle.template import Template
 
 
 class TestMMModel(unittest.TestCase):

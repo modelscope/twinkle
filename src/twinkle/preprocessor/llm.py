@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from twinkle.data_format import Message, Trajectory
 from .base import Preprocessor
-from twinkle.data_format import Trajectory, Message
 
 
 class CompetitionMathProcessor(Preprocessor):
@@ -21,7 +21,10 @@ class CompetitionMathGRPOProcessor(Preprocessor):
         problem = row['problem']
         solution = row['solution']
         messages = [
-            Message(role='system', content='You are a helpful math assistant. Respond with only the final answer in the form \\boxed{...} and nothing else.'),
+            Message(
+                role='system',
+                content='You are a helpful math assistant. Respond with only the final answer in the form '
+                '\\boxed{...} and nothing else.'),
             Message(role='user', content=problem),
             Message(role='assistant', content=''),
         ]
@@ -51,27 +54,27 @@ class AlpacaProcessor(Preprocessor):
         instruction = row.get('instruction') or ''
         input_text = row.get('input') or ''
         output_text = row.get('output') or ''
-        prompt = instruction if not input_text else f"{instruction}\n{input_text}"
+        prompt = instruction if not input_text else f'{instruction}\n{input_text}'
         messages = [
             Message(role='user', content=prompt),
             Message(role='assistant', content=output_text),
         ]
         return Trajectory(messages=messages)
 
+
 class CountdownProcessor(Preprocessor):
-    system_prompt = (
-        "You are a helpful assistant. You first thinks about the reasoning process "
-        "in the mind and then provides the user with the answer."
-    )
+    system_prompt = ('You are a helpful assistant. You first thinks about the reasoning process '
+                     'in the mind and then provides the user with the answer.')
+
     def __call__(self, row) -> Trajectory:
         nums = row.get('nums', [])
         target = row.get('response', row.get('target', 0))
-        
+
         query = f"""Using the numbers {nums}, create an equation that equals {target}.
 You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
 Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags,
 for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
-        
+
         messages = [
             Message(role='system', content=self.system_prompt),
             Message(role='user', content=query),

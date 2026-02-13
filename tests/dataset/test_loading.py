@@ -12,41 +12,41 @@ import os
 import pytest
 from pathlib import Path
 
-from twinkle.dataset import Dataset, IterableDataset, DatasetMeta
-
+from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
 
 # 获取测试数据目录
-TEST_DATA_DIR = Path(__file__).parent / "test_data"
+TEST_DATA_DIR = Path(__file__).parent / 'test_data'
+
 
 class TestLocalDatasetLoading:
     """测试本地数据集加载（普通 dataset 方式）"""
 
     def test_load_local_csv(self):
         """测试加载本地 CSV 文件"""
-        csv_path = str(TEST_DATA_DIR / "test.csv")
+        csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
-        
+
         assert len(dataset) == 4
-        assert dataset[0]['text'] == "Hello world"
+        assert dataset[0]['text'] == 'Hello world'
         assert dataset[0]['label'] == 0
-        assert dataset[1]['text'] == "Test data"
+        assert dataset[1]['text'] == 'Test data'
         assert dataset[1]['label'] == 1
 
     def test_load_local_json(self):
         """测试加载本地 JSON 文件"""
-        json_path = str(TEST_DATA_DIR / "test.json")
+        json_path = str(TEST_DATA_DIR / 'test.json')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=json_path))
-        
+
         assert len(dataset) == 4
-        assert dataset[0]['text'] == "Hello world"
+        assert dataset[0]['text'] == 'Hello world'
         assert dataset[0]['label'] == 0
 
     def test_load_local_jsonl(self):
-        jsonl_path = str(TEST_DATA_DIR / "test.jsonl")
+        jsonl_path = str(TEST_DATA_DIR / 'test.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
-        
+
         assert len(dataset) == 4
-        assert dataset[0]['text'] == "Hello world"
+        assert dataset[0]['text'] == 'Hello world'
         assert dataset[0]['label'] == 0
 
 
@@ -64,56 +64,49 @@ class TestLocalIterableDatasetLoading:
 
     def test_load_local_csv_iterable(self):
         """测试加载本地 CSV 文件（iterable 方式）"""
-        csv_path = str(TEST_DATA_DIR / "test.csv")
+        csv_path = str(TEST_DATA_DIR / 'test.csv')
         try:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         except NotImplementedError as e:
-            pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
+            pytest.xfail(f'Known limitation: streaming local file with num_proc is not supported: {e}')
         with pytest.raises(NotImplementedError):
             _ = len(dataset)
         items = self._iter_take(dataset, 4)
         assert len(items) == 4
-        assert items[0]['text'] == "Hello world"
+        assert items[0]['text'] == 'Hello world'
         assert items[0]['label'] == 0
 
     def test_load_local_json_iterable(self):
         """测试加载本地 JSON 文件（iterable 方式）"""
-        json_path = str(TEST_DATA_DIR / "test.json")
+        json_path = str(TEST_DATA_DIR / 'test.json')
         try:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=json_path))
         except NotImplementedError as e:
-            pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
+            pytest.xfail(f'Known limitation: streaming local file with num_proc is not supported: {e}')
         items = self._iter_take(dataset, 4)
         assert len(items) == 4
-        assert items[0]['text'] == "Hello world"
+        assert items[0]['text'] == 'Hello world'
 
     def test_load_local_jsonl_iterable(self):
         """测试加载本地 JSONL 文件（iterable 方式）"""
-        jsonl_path = str(TEST_DATA_DIR / "test.jsonl")
+        jsonl_path = str(TEST_DATA_DIR / 'test.jsonl')
         try:
             dataset = IterableDataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
         except NotImplementedError as e:
-            pytest.xfail(f"Known limitation: streaming local file with num_proc is not supported: {e}")
+            pytest.xfail(f'Known limitation: streaming local file with num_proc is not supported: {e}')
         items = self._iter_take(dataset, 4)
         assert len(items) == 4
-        assert items[0]['text'] == "Hello world"
+        assert items[0]['text'] == 'Hello world'
 
 
 class TestHFDatasetLoading:
     """测试 HuggingFace 数据集加载"""
 
-    @pytest.mark.skipif(
-        os.environ.get('TWINKLE_FORBID_HF', '0') == '1',
-        reason="HF hub is disabled"
-    )
+    @pytest.mark.skipif(os.environ.get('TWINKLE_FORBID_HF', '0') == '1', reason='HF hub is disabled')
     def test_load_hf_dataset(self):
         """测试加载 HF 数据集（普通 dataset 方式）"""
         # 使用一个小的公开数据集进行测试
-        dataset_meta = DatasetMeta(
-            dataset_id="hf://squad",
-            subset_name="plain_text",
-            split="train"
-        )
+        dataset_meta = DatasetMeta(dataset_id='hf://squad', subset_name='plain_text', split='train')
         try:
             dataset = Dataset(dataset_meta=dataset_meta)
 
@@ -124,19 +117,12 @@ class TestHFDatasetLoading:
             assert sample is not None
         except Exception as e:
             # 离线环境/企业代理下 SSL 证书链不可用
-            pytest.skip(f"HF dataset not reachable in current environment: {e}")
+            pytest.skip(f'HF dataset not reachable in current environment: {e}')
 
-    @pytest.mark.skipif(
-        os.environ.get('TWINKLE_FORBID_HF', '0') == '1',
-        reason="HF hub is disabled"
-    )
+    @pytest.mark.skipif(os.environ.get('TWINKLE_FORBID_HF', '0') == '1', reason='HF hub is disabled')
     def test_load_hf_dataset_iterable(self):
         """测试加载 HF 数据集（iterable 方式）"""
-        dataset_meta = DatasetMeta(
-            dataset_id="hf://squad",
-            subset_name="plain_text",
-            split="train"
-        )
+        dataset_meta = DatasetMeta(dataset_id='hf://squad', subset_name='plain_text', split='train')
         try:
             dataset = IterableDataset(dataset_meta=dataset_meta)
 
@@ -154,7 +140,7 @@ class TestHFDatasetLoading:
             assert len(items) == 3
             assert items[0] is not None
         except Exception as e:
-            pytest.skip(f"HF dataset not reachable in current environment: {e}")
+            pytest.skip(f'HF dataset not reachable in current environment: {e}')
 
 
 class TestMSDatasetLoading:
@@ -163,7 +149,7 @@ class TestMSDatasetLoading:
     def test_load_ms_dataset(self):
         """测试加载 MS 数据集（普通 dataset 方式）"""
         # 使用一个小的公开数据集进行测试
-        dataset_meta=DatasetMeta('ms://modelscope/competition_math')
+        dataset_meta = DatasetMeta('ms://modelscope/competition_math')
         try:
             dataset = Dataset(dataset_meta=dataset_meta)
             # 只检查是否能成功加载
@@ -174,30 +160,30 @@ class TestMSDatasetLoading:
                 assert sample is not None
         except Exception as e:
             # 如果数据集不存在或无法访问，跳过测试
-            pytest.skip(f"MS dataset not available: {e}")
+            pytest.skip(f'MS dataset not available: {e}')
 
     def test_load_ms_dataset_iterable(self):
         """测试加载 MS 数据集（iterable 方式）"""
-        dataset_meta=DatasetMeta('ms://modelscope/competition_math')
+        dataset_meta = DatasetMeta('ms://modelscope/competition_math')
         try:
             dataset = IterableDataset(dataset_meta=dataset_meta)
-            
+
             # iterable dataset 不支持 __len__
             with pytest.raises(NotImplementedError):
                 _ = len(dataset)
-            
+
             # 测试迭代，只取前几个样本
             items = []
             for i, item in enumerate(dataset):
                 items.append(item)
                 if i >= 2:  # 只取前3个样本
                     break
-            
+
             assert len(items) > 0
             assert items[0] is not None
         except Exception as e:
             # 如果数据集不存在或无法访问，跳过测试
-            pytest.skip(f"MS dataset not available: {e}")
+            pytest.skip(f'MS dataset not available: {e}')
 
 
 class TestDatasetMeta:
@@ -205,22 +191,18 @@ class TestDatasetMeta:
 
     def test_dataset_meta_get_id(self):
         """测试 DatasetMeta.get_id() 方法"""
-        meta = DatasetMeta(
-            dataset_id="test/dataset",
-            subset_name="subset1",
-            split="train"
-        )
-        assert meta.get_id() == "test_dataset:subset1:train"
+        meta = DatasetMeta(dataset_id='test/dataset', subset_name='subset1', split='train')
+        assert meta.get_id() == 'test_dataset:subset1:train'
 
     def test_dataset_meta_with_data_slice(self):
         """测试 DatasetMeta 的 data_slice 功能"""
-        csv_path = str(TEST_DATA_DIR / "test.csv")
+        csv_path = str(TEST_DATA_DIR / 'test.csv')
         meta = DatasetMeta(
             dataset_id=csv_path,
             data_slice=[0, 2]  # 只选择索引 0 和 2
         )
         dataset = Dataset(dataset_meta=meta)
-        
+
         assert len(dataset) == 2
-        assert dataset[0]['text'] == "Hello world"
-        assert dataset[1]['text'] == "Another example"
+        assert dataset[0]['text'] == 'Hello world'
+        assert dataset[1]['text'] == 'Another example'

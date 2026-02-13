@@ -4,7 +4,11 @@
 # for text generation (sampling) via the Tinker-compatible client API.
 # The server must be running first (see server.py and server_config.yaml).
 
+from modelscope import AutoTokenizer
 from tinker import types
+
+from twinkle.data_format import Message, Trajectory
+from twinkle.template import Template
 from twinkle_client import init_tinker_compat_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
@@ -46,11 +50,11 @@ params = types.SamplingParams(
 
 # Step 5: Send the sampling request to the server.
 # num_samples=8 generates 8 independent completions for the same prompt.
-print("Sampling...")
-future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
+print('Sampling...')
+future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
 result = future.result()
 
 # Step 6: Decode and print the generated responses
-print("Responses:")
+print('Responses:')
 for i, seq in enumerate(result.sequences):
     print(f"{i}: {repr(template.decode(seq.tokens))}")

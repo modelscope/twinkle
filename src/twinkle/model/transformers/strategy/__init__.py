@@ -2,4 +2,4 @@
 from .accelerate import AccelerateStrategy
 from .native_fsdp import NativeFSDPStrategy
 
-__all__ = ["AccelerateStrategy", "NativeFSDPStrategy"]
+__all__ = ['AccelerateStrategy', 'NativeFSDPStrategy']

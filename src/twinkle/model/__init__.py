@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING
+
 from twinkle.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
     from .base import TwinkleModel
-    from .transformers import TransformersModel, MultiLoraTransformersModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
+    from .transformers import MultiLoraTransformersModel, TransformersModel
 
 else:
     _import_structure = {

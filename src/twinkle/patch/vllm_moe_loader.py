@@ -3,6 +3,8 @@
 # reference from https://github.com/volcengine/verl/blob/main/verl/utils/vllm/patch.py
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
+from .base import Patch
+
 SUPPORTED_MOE_MODELS = []
 
 try:
@@ -55,7 +57,6 @@ try:
 except ImportError:
     pass
 
-from .base import Patch
 
 class VLLMMoEWeights(Patch):
 
@@ -82,7 +83,7 @@ class VLLMMoEWeights(Patch):
             return
 
         original_model_type = type(model)
-        if hasattr(model, "runnable") and "ACLGraphWrapper" in str(original_model_type):
+        if hasattr(model, 'runnable') and 'ACLGraphWrapper' in str(original_model_type):
             model = model.runnable
             original_model_type = type(model)
 
@@ -91,23 +92,24 @@ class VLLMMoEWeights(Patch):
         try:
             from vllm.model_executor.models.mixtral import MixtralForCausalLM
 
-            MLP_ATTR_MAPPING[MixtralForCausalLM] = "block_sparse_moe"
+            MLP_ATTR_MAPPING[MixtralForCausalLM] = 'block_sparse_moe'
         except ImportError:
             pass
 
-        DEFAULT_MLP_ATTR = "mlp"
+        DEFAULT_MLP_ATTR = 'mlp'
 
         # Get inner model (either model.model or model.language_model)
-        inner_model = getattr(model, "model", None) or getattr(model, "language_model", None)
+        inner_model = getattr(model, 'model', None) or getattr(model, 'language_model', None)
         if inner_model is None:
             raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
 
-        if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+        if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model,
+                                                                                 tuple(SUPPORTED_MOE_MODELS)):
             return
 
         # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
         # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
-        if type(inner_model).__name__ == "Qwen3MoeLLMForCausalLM":
+        if type(inner_model).__name__ == 'Qwen3MoeLLMForCausalLM':
             inner_model = inner_model.model  # Reassign inner_model in Qwen3-vl
 
         for layer_idx, layer in enumerate(inner_model.layers):
@@ -117,11 +119,11 @@ class VLLMMoEWeights(Patch):
             if not mlp:
                 continue
 
-            experts = getattr(mlp, "experts", None)
-            if not experts or not hasattr(experts, "weight_loader"):
+            experts = getattr(mlp, 'experts', None)
+            if not experts or not hasattr(experts, 'weight_loader'):
                 continue
 
             # Patch the weight loaders
             for name, param in mlp.named_parameters():
-                if "w13_weight" in name or "w2_weight" in name:
+                if 'w13_weight' in name or 'w2_weight' in name:
                     param.weight_loader = experts.weight_loader

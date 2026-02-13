@@ -1,38 +1,44 @@
 repos:
-  - repo: https://github.com/pycqa/flake8.git
+  - repo: https://github.com/pycqa/flake8
     rev: 7.3.0
     hooks:
       - id: flake8
-        exclude: |
-            (?x)^(
-                examples/|
-                cookbook/|
-                client_tools/|
-                src/twinkle_client|
-                
-            )$
-  - repo: https://github.com/PyCQA/isort.git
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+
+  - repo: https://github.com/PyCQA/isort
     rev: 7.0.0
     hooks:
       - id: isort
-        exclude: |
-            (?x)^(
-                examples/|
-                cookbook/|
-                client_tools/|
-                src/twinkle_client|
-            )$
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+
   - repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
       - id: yapf
-        exclude: |
-            (?x)^(
-                examples/|
-                cookbook/|
-                client_tools/|
-                src/twinkle_client|
-            )$
-  - repo: https://github.com/pre-commit/pre-commit-hooks.git
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.19.1
+    hooks:
+      - id: pyupgrade
+        args: [--py38-plus]
+        exclude: ^client_tools/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      - id: trailing-whitespace
+        exclude: ^client_tools/
+      - id: check-yaml
+        exclude: ^client_tools/
+      - id: end-of-file-fixer
+        exclude: ^client_tools/
+      - id: requirements-txt-fixer
+        exclude: ^client_tools/
+      - id: double-quote-string-fixer
+        exclude: ^client_tools/
+      - id: check-merge-conflict
+        exclude: ^client_tools/
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        exclude: ^client_tools/

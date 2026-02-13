@@ -1,18 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import socket
+import torch
 from datetime import timedelta
 from typing import Optional
 
-import torch
-
 # ref: https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/maintenref/envvar/envref_07_0144.html
 # HCCL base port anchor. HCCL derives internal listen/connect ports from this base.
-_HCCL_IF_BASE_PORT_ENV = "HCCL_IF_BASE_PORT"
+_HCCL_IF_BASE_PORT_ENV = 'HCCL_IF_BASE_PORT'
 # Host-side socket port pool used by HCCL in multi-process communication.
-_HCCL_HOST_SOCKET_PORT_RANGE_ENV = "HCCL_HOST_SOCKET_PORT_RANGE"
+_HCCL_HOST_SOCKET_PORT_RANGE_ENV = 'HCCL_HOST_SOCKET_PORT_RANGE'
 # NPU-side socket port pool used by HCCL for device communication channels.
-_HCCL_NPU_SOCKET_PORT_RANGE_ENV = "HCCL_NPU_SOCKET_PORT_RANGE"
+_HCCL_NPU_SOCKET_PORT_RANGE_ENV = 'HCCL_NPU_SOCKET_PORT_RANGE'
 
 
 def _derive_hccl_socket_env_defaults(master_port: int) -> dict:
@@ -21,8 +20,8 @@ def _derive_hccl_socket_env_defaults(master_port: int) -> dict:
     host_offset = master_port % 8000
     return {
         _HCCL_IF_BASE_PORT_ENV: str(20000 + ((master_port + 997) % 20000)),
-        _HCCL_HOST_SOCKET_PORT_RANGE_ENV: f"{40000 + host_offset}-{40000 + host_offset + 511}",
-        _HCCL_NPU_SOCKET_PORT_RANGE_ENV: f"{50000 + host_offset}-{50000 + host_offset + 511}",
+        _HCCL_HOST_SOCKET_PORT_RANGE_ENV: f'{40000 + host_offset}-{40000 + host_offset + 511}',
+        _HCCL_NPU_SOCKET_PORT_RANGE_ENV: f'{50000 + host_offset}-{50000 + host_offset + 511}',
     }
 
 
@@ -49,7 +48,7 @@ def is_valid_ipv6_address(ip: str) -> bool:
     try:
         socket.inet_pton(socket.AF_INET6, ip)
         return True
-    except socket.error:
+    except OSError:
         return False
 
 
@@ -88,25 +87,24 @@ def find_free_port(address: str = '', start_port: Optional[int] = None, retry: i
     return port
 
 
-
 def stateless_init_process_group(
     master_address: str,
     master_port: int,
     rank: int,
     world_size: int,
     device: int | torch.device = None,
-    backend: str = "nccl",
+    backend: str = 'nccl',
     listen_socket: socket.socket = None,
     listen_fd: int = None,
 ):
     """Create a stateless process group using vLLM's StatelessProcessGroup.
-    
+
     vLLM provides `StatelessProcessGroup` to create a process group
     without considering the global process group in torch.distributed.
     It is recommended to create `StatelessProcessGroup`, and then initialize
     the data-plane communication (NCCL/HCCL) between external (train processes)
     and vLLM workers.
-    
+
     Args:
         master_address: The IP address of the master (rank 0).
         master_port: The port of the master.
@@ -117,30 +115,26 @@ def stateless_init_process_group(
         listen_socket: Optional pre-created listening socket for master (rank 0).
             If provided, this socket will be reused instead of creating a new one.
         listen_fd: Optional file descriptor of the listening socket.
-        
+
     Returns:
         PyNcclCommunicator or PyHcclCommunicator instance.
     """
     from torch.distributed import TCPStore
     from vllm.distributed.utils import StatelessProcessGroup
-    
-    if backend == "hccl":
+
+    if backend == 'hccl':
         # fix: Stateless PG + HCCL path needs the same port policy, otherwise workers can still collide.
         _ensure_hccl_socket_env(master_port)
-        from vllm_ascend.distributed.device_communicators.pyhccl import (
-            PyHcclCommunicator as Communicator,
-        )
+        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as Communicator
     else:
-        from vllm.distributed.device_communicators.pynccl import (
-            PyNcclCommunicator as Communicator,
-        )
-    
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator as Communicator
+
     if device is None:
-        device = torch.cuda.current_device() if backend == "nccl" else torch.npu.current_device()
-    
+        device = torch.cuda.current_device() if backend == 'nccl' else torch.npu.current_device()
+
     # Create the stateless process group
     launch_server = rank == 0
-    
+
     if launch_server and listen_socket is None:
         # For master, create a listening socket if not provided
         if is_valid_ipv6_address(master_address):
@@ -153,7 +147,7 @@ def stateless_init_process_group(
         listen_fd = listen_socket.fileno()
     elif launch_server and listen_fd is None:
         listen_fd = listen_socket.fileno()
-    
+
     store = TCPStore(
         host_name=master_address,
         port=master_port,
@@ -163,7 +157,7 @@ def stateless_init_process_group(
         use_libuv=False,  # for compatibility
         master_listen_fd=listen_fd,
     )
-    
+
     pg = StatelessProcessGroup(
         rank=rank,
         world_size=world_size,
@@ -171,6 +165,6 @@ def stateless_init_process_group(
         socket=listen_socket,
         data_expiration_seconds=3600,
     )
-    
+
     communicator = Communicator(pg, device=device)
     return communicator

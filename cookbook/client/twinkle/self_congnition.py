@@ -6,6 +6,7 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
+
 dotenv.load_dotenv('.env')
 
 import os
@@ -13,10 +14,10 @@ from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
+from twinkle_client import init_twinkle_client
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client import init_twinkle_client
 
 logger = get_logger()
 
@@ -25,8 +26,7 @@ use_megatron = True
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(
-    base_url='http://127.0.0.1:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.
@@ -51,12 +51,10 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply a chat template so the data matches the model's expected input format
-    dataset.set_template(
-        'Template', model_id='ms://Qwen/Qwen2.5-3B-Instruct', max_length=512)
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-3B-Instruct', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
-    dataset.map('SelfCognitionProcessor', init_args={
-                'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
+    dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
 
     # Tokenize and encode the dataset into model-ready input features
     dataset.encode(batched=True)
@@ -67,19 +65,15 @@ def train():
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
-    model = MultiLoraTransformersModel(
-        model_id='ms://Qwen/Qwen2.5-3B-Instruct')
+    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-3B-Instruct')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
-    lora_config = LoraConfig(
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(target_modules='all-linear')
 
     # Attach the LoRA adapter named 'default' to the model.
     # gradient_accumulation_steps=2 means gradients are accumulated over 2 micro-batches
     # before an optimizer step, effectively doubling the batch size.
-    model.add_adapter_to_model(
-        'default', lora_config, gradient_accumulation_steps=2)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
     # Set the same chat template used during data preprocessing
     model.set_template('Template')
@@ -129,14 +123,14 @@ def train():
 
         # Step 8: Save the trained checkpoint
         twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
-        logger.info(f"Saved checkpoint: {twinkle_path}")
+        logger.info(f'Saved checkpoint: {twinkle_path}')
 
     # Step 9: Upload the checkpoint to ModelScope Hub
     # YOUR_USER_NAME = "your_username"
     # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
     # model.upload_to_hub(
-    #     checkpoint_dir=twinkle_path, 
-    #     hub_model_id=hub_model_id, 
+    #     checkpoint_dir=twinkle_path,
+    #     hub_model_id=hub_model_id,
     #     async_upload=False
     # )
     # logger.info(f"Uploaded checkpoint to hub: {hub_model_id}")

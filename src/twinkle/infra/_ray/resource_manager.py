@@ -3,8 +3,7 @@ import math
 import os
 from typing import Dict, List
 
-from twinkle import DeviceGroup
-from twinkle import Platform
+from twinkle import DeviceGroup, Platform
 from twinkle.utils import get_logger
 
 logger = get_logger()
@@ -12,10 +11,7 @@ logger = get_logger()
 
 class ResourceManager:
 
-    def __init__(self,
-                 nproc_per_node: int,
-                 ncpu_proc_per_node: int,
-                 groups: List[DeviceGroup]):
+    def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
         # CPU placement group default strategy:
         # - Old approach: use node_cpu//4 as CPU bundle per node, even if only 1~2 CPU processes are needed,
         #   this creates a huge PG (e.g., 640 CPU node requests 160 CPU PG).
@@ -23,7 +19,7 @@ class ResourceManager:
         #   such large CPU PGs may stay pending forever, causing Serve replica's __init__ to hang.
         # - New strategy: request based on "actual CPU processes needed on node * CPUs per process",
         #   with node_cpu//4 as the upper bound.
-        cpu_pg_cpus_per_proc = int(os.environ.get("TWINKLE_CPU_PG_CPUS_PER_PROC", 1))
+        cpu_pg_cpus_per_proc = int(os.environ.get('TWINKLE_CPU_PG_CPUS_PER_PROC', 1))
         cpu_pg_cpus_per_proc = max(cpu_pg_cpus_per_proc, 1)
 
         import ray
@@ -31,7 +27,7 @@ class ResourceManager:
         all_ranks = []
         last_rank = -1
         cpu_proc_count = 0
-        device_types = set([group.device_type.upper() for group in groups]) - {'CPU'}
+        device_types = {group.device_type.upper() for group in groups} - {'CPU'}
         assert len(device_types) <= 1
 
         if not device_types:
@@ -57,7 +53,7 @@ class ResourceManager:
             group.ranks = ranks
             last_rank = ranks[-1]
 
-        assert len(set(all_ranks)) == len(all_ranks) # no duplication
+        assert len(set(all_ranks)) == len(all_ranks)  # no duplication
         if device_type != 'CPU':
             # Calculate required nodes based on actual node indices spanned by all_ranks
             if all_ranks:
@@ -81,7 +77,8 @@ class ResourceManager:
             if device_type == 'CPU' and int(node['Resources']['CPU']) // 4 >= ncpu_proc_per_node:
                 self.nodes.append(node)
 
-        assert self.nnodes <= len(self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
+        assert self.nnodes <= len(
+            self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
 
         bundles = []
         cpu_bundles = []
@@ -92,24 +89,24 @@ class ResourceManager:
             node = self.nodes[node_idx]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
-                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)}) # create bundles
+                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)})  # create bundles
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
-            assert cpu_nnodes <= len(self.nodes), (
-                f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
-                f'available: {len(self.nodes)}'
-            )
+            assert cpu_nnodes <= len(self.nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
+                                                   f'available: {len(self.nodes)}')
             for i in range(cpu_nnodes):
                 node = self.nodes[i]
                 node_cpu = int(node['Resources']['CPU'])
-                # How many CPU processes will actually be placed on this node (last node may have fewer than ncpu_proc_per_node)
+                # How many CPU processes will actually be placed on this node
+                # (last node may have fewer than ncpu_proc_per_node)
                 procs_on_node = min(
                     ncpu_proc_per_node,
                     max(cpu_proc_count - i * ncpu_proc_per_node, 0),
                 )
-                # Use node_cpu//4 as the upper bound of "at most 1/4 CPU usage", but don't request 160 CPU for just 1~2 processes.
+                # Use node_cpu//4 as the upper bound of "at most 1/4 CPU usage",
+                # but don't request 160 CPU for just 1~2 processes.
                 node_cap = max(node_cpu // 4, 1)
                 need = max(procs_on_node * cpu_pg_cpus_per_proc, 1)
                 cpu_bundles.append({'CPU': min(node_cap, need)})
@@ -130,8 +127,9 @@ class ResourceManager:
 
         self.node_ranks = []
         if self.placement_groups:
-            self.node_ranks = ray.get(
-                [ray.remote(Platform.get_node_rank).options(placement_group=pg).remote() for pg in self.placement_groups])
+            self.node_ranks = ray.get([
+                ray.remote(Platform.get_node_rank).options(placement_group=pg).remote() for pg in self.placement_groups
+            ])
         if self.node_ranks.count(0) > 1:
             self.node_ranks = list(range(len(self.placement_groups)))
 
@@ -166,10 +164,8 @@ class ResourceManager:
 
                 if gpus_per_worker > 1:
                     if len(normalized_ranks) % gpus_per_worker != 0:
-                        raise ValueError(
-                            f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
-                            f"must be divisible by gpus_per_worker ({gpus_per_worker})"
-                        )
+                        raise ValueError(f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
+                                         f'must be divisible by gpus_per_worker ({gpus_per_worker})')
 
                     num_workers = len(normalized_ranks) // gpus_per_worker
                     for worker_idx in range(num_workers):
@@ -181,10 +177,8 @@ class ResourceManager:
                         gpu_ranks_local = [r % device_per_node for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
-                            raise ValueError(
-                                f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
-                                f"Each worker's GPUs must be on the same node."
-                            )
+                            raise ValueError(f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
+                                             f"Each worker's GPUs must be on the same node.")
 
                         node_rank = node_ranks[0]
                         local_device_groups.append(
@@ -197,13 +191,10 @@ class ResourceManager:
                         node_rank = alloc_rank // nproc_per_node
                         gpu_rank = alloc_rank % device_per_node
                         local_device_groups.append(
-                            dict(
-                                gpu_rank=[gpu_rank],
-                                placement_group=self.node2pg[node_rank],
-                                ray_address=ray_address))
+                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
 
                 self.device_groups[group.name] = local_device_groups
-                
+
                 # Update the group's ranks to reflect actual worker count
                 if gpus_per_worker > 1:
                     # Create virtual ranks for workers (not GPUs)
@@ -223,8 +214,8 @@ class ResourceManager:
 
         self.group_configs = groups
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
-        logger.info(f"node_ranks: {self.node_ranks}")
-        logger.info(f"node2pg keys: {list(self.node2pg.keys())}")
+        logger.info(f'node_ranks: {self.node_ranks}')
+        logger.info(f'node2pg keys: {list(self.node2pg.keys())}')
 
     def get_config(self, group: str):
         for config in self.group_configs:
@@ -233,7 +224,8 @@ class ResourceManager:
         assert False, f'No group {group} found in group list: {[group.name for group in self.group_configs]}'
 
     def get_group(self, group: str):
-        assert group in self.device_groups, f'No group {group} found in group list: {[group.name for group in self.group_configs]}'
+        assert group in self.device_groups, (f'No group {group} found in group '
+                                             f'list: {[group.name for group in self.group_configs]}')
         return self.device_groups[group]
 
     def destroy_placement_group(self):

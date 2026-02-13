@@ -2,29 +2,26 @@
 # Reference: swift/swift/megatron/model/gpt_bridge.py
 
 import math
-from copy import copy
-from typing import List, Optional, Union, Callable
-
+import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
-from twinkle.model.megatron.args import get_args  # Use twinkle's get_args
+from copy import copy
 from packaging import version
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer, AutoConfig
-from transformers.modeling_utils import custom_object_save, PreTrainedModel
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers.modeling_utils import PreTrainedModel, custom_object_save
+from typing import Callable, List, Optional, Union
 
-from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger,
-                           get_multimodal_target_regex, get_modules_to_not_convert, requires)
 from twinkle.hub import HubOperation
-
-import os
+from twinkle.model.megatron.args import get_args  # Use twinkle's get_args
+from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger,
+                           get_modules_to_not_convert, get_multimodal_target_regex, requires)
+from twinkle.utils.platform import is_last_rank
 
 logger = get_logger()
-
-from twinkle.utils.platform import is_last_rank
 
 
 # Some ideas for LoRA conversion are referenced from: https://github.com/modelscope/ms-swift/pull/6225
@@ -43,6 +40,7 @@ class GPTBridge:
         requires('megatron_core')
         import megatron.core as megatron_core
         from megatron.core import mpu
+
         from ..tuners import LoraParallelLinear
         self.megatron_core = megatron_core
         self.mpu = mpu
@@ -114,22 +112,23 @@ class GPTBridge:
 
     def _init_meta_hf_model(self):
         import copy
+
         from .register import get_megatron_model_meta
-        
+
         model_dir = self.args.model_dir
         model_type = self.args.hf_model_type
-        
+
         # Get the correct AutoModel class from MegatronModelMeta
         megatron_model_meta = get_megatron_model_meta(model_type)
         auto_model_cls = megatron_model_meta.auto_model_cls if megatron_model_meta else None
         if auto_model_cls is None:
             from transformers import AutoModelForCausalLM
             auto_model_cls = AutoModelForCausalLM
-        
+
         # Load config first
         config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         config.torch_dtype = self.args.params_dtype
-        
+
         with torch.device('meta'):
             origin_dtype = torch.get_default_dtype()
             torch.set_default_dtype(self.args.params_dtype)
@@ -147,7 +146,6 @@ class GPTBridge:
             auto_tokenizer_cls = AutoTokenizer
 
         self.processor = auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=True)
-
 
     def _get_tp_split_dim(self, mg_key: Optional[str]) -> Optional[int]:
         if mg_key is None:
@@ -258,8 +256,8 @@ class GPTBridge:
     @property
     def fp8_quantizer(self):
         if self._fp8_quantizer is None:
-            from transformer_engine_torch import DType as TE_DType
             from transformer_engine.pytorch import Float8BlockQuantizer
+            from transformer_engine_torch import DType as TE_DType
             self._fp8_quantizer = Float8BlockQuantizer(TE_DType.kFloat8E4M3, rowwise=True, columnwise=True)
         return self._fp8_quantizer
 
@@ -1456,7 +1454,12 @@ class GPTBridge:
             hf_state_dict.update(origin_hf_state_dict)
         return hf_state_dict
 
-    def load_weights(self, mg_model, hf_model_dir: str, is_peft_format: bool = False, adapter_name: str = 'default', lora_converter=None):
+    def load_weights(self,
+                     mg_model,
+                     hf_model_dir: str,
+                     is_peft_format: bool = False,
+                     adapter_name: str = 'default',
+                     lora_converter=None):
         self._is_peft_format = is_peft_format
         self._adapter_name = adapter_name
         hf_model_dir = HubOperation.download_model(hf_model_dir)
@@ -1488,14 +1491,23 @@ class GPTBridge:
         with torch.no_grad():
             yield from self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc)
 
-    def save_weights(self, mg_models, output_dir: str, is_peft_format: bool = False, adapter_name: str = 'default', lora_converter: Callable = None) -> None:
+    def save_weights(self,
+                     mg_models,
+                     output_dir: str,
+                     is_peft_format: bool = False,
+                     adapter_name: str = 'default',
+                     lora_converter: Callable = None) -> None:
         """Save the mg_model checkpoint in HF format"""
         torch.cuda.empty_cache()
         saver = StreamingSafetensorSaver(
             save_dir=output_dir, max_shard_size=self.args.max_shard_size, is_peft_format=is_peft_format)
         for k, v in self.export_weights(
-                mg_models, target_device='cpu', only_last_rank=True, is_peft_format=is_peft_format,
-                adapter_name=adapter_name, tqdm_desc='Saving: '):
+                mg_models,
+                target_device='cpu',
+                only_last_rank=True,
+                is_peft_format=is_peft_format,
+                adapter_name=adapter_name,
+                tqdm_desc='Saving: '):
             if lora_converter is not None:
                 k, v = lora_converter(k, v, adapter_name)
             if k is not None and v is not None:

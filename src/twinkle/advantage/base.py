@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Literal, Union, List
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Literal, Union
+
 if TYPE_CHECKING:
     import torch
 

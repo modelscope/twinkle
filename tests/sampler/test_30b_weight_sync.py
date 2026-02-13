@@ -14,11 +14,11 @@ Usage:
     python tests/sampler/test_30b_weight_sync.py \
         --model-gpus 4 --sampler-gpus 4 --vllm-tp 1
 """
+import argparse
+import datetime
 import os
 import sys
 import time
-import argparse
-import datetime
 
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
@@ -28,12 +28,12 @@ MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3-30B-A3B-Base')
 
 # For MoE models, vLLM does not support LoRA on expert layers.
 # Only target attention QKV + output projection.
-LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+LORA_TARGET_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
 
 
 def log(msg):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', flush=True)
 
 
 def get_model_path():
@@ -48,27 +48,28 @@ def get_model_path():
 
 
 def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
+    from peft import LoraConfig
+
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
-    from twinkle.model.transformers import TransformersModel
-    from twinkle.sampler import vLLMSampler
-    from twinkle.template import Template
     from twinkle.checkpoint_engine import CheckpointEngineManager
     from twinkle.data_format import Trajectory
     from twinkle.data_format.sampling import SamplingParams
-    from peft import LoraConfig
+    from twinkle.model.transformers import TransformersModel
+    from twinkle.sampler import vLLMSampler
+    from twinkle.template import Template
 
     total_gpus = model_gpus + sampler_gpus
     n_sampler_actors = sampler_gpus // vllm_tp
     model_path = get_model_path()
 
-    log("=" * 70)
-    log(f"TEST: Weight Sync with {MODEL_ID}")
-    log(f"  Model GPUs    : {model_gpus}")
-    log(f"  Sampler GPUs  : {sampler_gpus} (vllm_tp={vllm_tp}, actors={n_sampler_actors})")
-    log(f"  LoRA targets  : {LORA_TARGET_MODULES}")
-    log(f"  Model path    : {model_path}")
-    log("=" * 70)
+    log('=' * 70)
+    log(f'TEST: Weight Sync with {MODEL_ID}')
+    log(f'  Model GPUs    : {model_gpus}')
+    log(f'  Sampler GPUs  : {sampler_gpus} (vllm_tp={vllm_tp}, actors={n_sampler_actors})')
+    log(f'  LoRA targets  : {LORA_TARGET_MODULES}')
+    log(f'  Model path    : {model_path}')
+    log('=' * 70)
 
     twinkle.initialize(
         mode='ray',
@@ -109,7 +110,8 @@ def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
     # Sampler — Twinkle sees n_sampler_actors workers, not total GPUs.
     # vLLM TP is internal to each actor.
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=n_sampler_actors, dp_size=n_sampler_actors,
+        world_size=n_sampler_actors,
+        dp_size=n_sampler_actors,
     )
     sampler = vLLMSampler(
         model_id=model_path,
@@ -128,15 +130,15 @@ def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
     )
     sampler.set_template(Template, model_id=model_path)
 
-    log("Waiting for vLLM initialization...")
+    log('Waiting for vLLM initialization...')
     time.sleep(5)
 
     # Print GPU memory before sync
-    log("\n--- GPU memory BEFORE weight sync ---")
-    os.system("nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader")
+    log('\n--- GPU memory BEFORE weight sync ---')
+    os.system('nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader')
 
     # Weight sync
-    log("\n--- Starting weight sync ---")
+    log('\n--- Starting weight sync ---')
     manager = CheckpointEngineManager(model=model, sampler=sampler)
 
     # Base model sync
@@ -145,17 +147,17 @@ def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
     # lora
     manager.sync_weights()
     base_time = time.time() - sync_start
-    log(f"  Base weight sync completed in {base_time:.2f}s")
+    log(f'  Base weight sync completed in {base_time:.2f}s')
 
     # Print GPU memory after base sync
-    log("\n--- GPU memory AFTER base sync ---")
-    os.system("nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader")
+    log('\n--- GPU memory AFTER base sync ---')
+    os.system('nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader')
 
     sampler.reset_prefix_cache()
     lora_time = 0.0
 
     # Quick sample to verify model works
-    log("\n--- Sampling after sync ---")
+    log('\n--- Sampling after sync ---')
     traj = Trajectory(messages=[{'role': 'user', 'content': 'What is 2+2?'}])
     response = sampler.sample(traj, SamplingParams(max_tokens=32, temperature=0.0))
     if callable(response):
@@ -169,8 +171,8 @@ def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
         text = tok.decode(tokens, skip_special_tokens=True)
         log(f"  Output: '{text[:200]}'")
 
-    log("\n--- PASS: Weight sync completed without OOM or hang ---")
-    log(f"  Base sync: {base_time:.2f}s, LoRA sync: {lora_time:.2f}s")
+    log('\n--- PASS: Weight sync completed without OOM or hang ---')
+    log(f'  Base sync: {base_time:.2f}s, LoRA sync: {lora_time:.2f}s')
     sampler.shutdown()
     return True
 
@@ -182,12 +184,12 @@ def main():
     parser.add_argument('--vllm-tp', type=int, default=1)
     args = parser.parse_args()
 
-    log(f"Test config: model_gpus={args.model_gpus}, sampler_gpus={args.sampler_gpus}, vllm_tp={args.vllm_tp}")
+    log(f'Test config: model_gpus={args.model_gpus}, sampler_gpus={args.sampler_gpus}, vllm_tp={args.vllm_tp}')
 
     try:
         success = test_weight_sync(args.model_gpus, args.sampler_gpus, args.vllm_tp)
     except Exception as e:
-        log(f"\nTest FAILED with exception: {e}")
+        log(f'\nTest FAILED with exception: {e}')
         import traceback
         traceback.print_exc()
         success = False

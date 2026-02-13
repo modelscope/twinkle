@@ -29,12 +29,12 @@ logger = get_logger()
 
 class TaskStatus(Enum):
     """Task lifecycle status."""
-    PENDING = "pending"           # Task created, waiting to be processed
-    QUEUED = "queued"             # Task in queue waiting for execution
-    RUNNING = "running"           # Task currently executing
-    COMPLETED = "completed"       # Task completed successfully
-    FAILED = "failed"             # Task failed with error
-    RATE_LIMITED = "rate_limited"  # Task rejected due to rate limiting
+    PENDING = 'pending'  # Task created, waiting to be processed
+    QUEUED = 'queued'  # Task in queue waiting for execution
+    RUNNING = 'running'  # Task currently executing
+    COMPLETED = 'completed'  # Task completed successfully
+    FAILED = 'failed'  # Task failed with error
+    RATE_LIMITED = 'rate_limited'  # Task rejected due to rate limiting
 
 
 class QueueState(Enum):
@@ -43,10 +43,10 @@ class QueueState(Enum):
     These states are returned to the tinker client to indicate the current
     state of the task queue and help the client adjust its retry behavior.
     """
-    ACTIVE = "active"                     # Queue is actively processing tasks
-    PAUSED_RATE_LIMIT = "paused_rate_limit"  # Queue paused due to rate limiting
-    PAUSED_CAPACITY = "paused_capacity"   # Queue paused due to capacity limits
-    UNKNOWN = "unknown"                   # Unknown or unspecified state
+    ACTIVE = 'active'  # Queue is actively processing tasks
+    PAUSED_RATE_LIMIT = 'paused_rate_limit'  # Queue paused due to rate limiting
+    PAUSED_CAPACITY = 'paused_capacity'  # Queue paused due to capacity limits
+    UNKNOWN = 'unknown'  # Unknown or unspecified state
 
 
 @dataclass
@@ -63,18 +63,18 @@ class TaskQueueConfig:
         token_cleanup_interval: How often to run cleanup task (seconds).
         max_input_tokens: Maximum allowed input tokens per request (default 10000).
     """
-    rps_limit: float = 100.0           # 10 requests per second
-    tps_limit: float = 10000.0        # 10000 input tokens per second
-    window_seconds: float = 1.0       # 1 second sliding window
-    queue_timeout: float = 300.0      # 5 minutes queue timeout
-    enabled: bool = True              # Rate limiting enabled by default
+    rps_limit: float = 100.0  # 10 requests per second
+    tps_limit: float = 10000.0  # 10000 input tokens per second
+    window_seconds: float = 1.0  # 1 second sliding window
+    queue_timeout: float = 300.0  # 5 minutes queue timeout
+    enabled: bool = True  # Rate limiting enabled by default
     # Remove tokens after 10x window inactivity
     token_cleanup_multiplier: float = 10.0
     token_cleanup_interval: float = 60.0    # Run cleanup every 60 seconds
     max_input_tokens: int = 10000     # Maximum input tokens per request
 
     @classmethod
-    def from_dict(cls, config_dict: Optional[Dict[str, Any]] = None) -> 'TaskQueueConfig':
+    def from_dict(cls, config_dict: dict[str, Any] | None = None) -> TaskQueueConfig:
         """Create TaskQueueConfig from a dictionary.
 
         Args:
@@ -104,8 +104,7 @@ class TaskQueueConfig:
             if 'enabled' in config_dict:
                 config.enabled = bool(config_dict['enabled'])
             if 'token_cleanup_multiplier' in config_dict:
-                config.token_cleanup_multiplier = float(
-                    config_dict['token_cleanup_multiplier'])
+                config.token_cleanup_multiplier = float(config_dict['token_cleanup_multiplier'])
             if 'token_cleanup_interval' in config_dict:
                 config.token_cleanup_interval = float(
                     config_dict['token_cleanup_interval'])
@@ -156,9 +155,9 @@ class TaskQueueMixin:
     """
 
     # Type hint for state attribute that inheriting classes must provide
-    state: 'ServerStateProxy'
+    state: ServerStateProxy
 
-    def _init_task_queue(self, config: Optional[TaskQueueConfig] = None) -> None:
+    def _init_task_queue(self, config: TaskQueueConfig | None = None) -> None:
         """Initialize the task queue system.
 
         Args:
@@ -478,9 +477,7 @@ class TaskQueueMixin:
 
         # 2. Register PENDING status FIRST
         self.state.store_future_status(
-            request_id, TaskStatus.PENDING.value, model_id,
-            queue_state=QueueState.ACTIVE.value
-        )
+            request_id, TaskStatus.PENDING.value, model_id, queue_state=QueueState.ACTIVE.value)
 
         # 3. Route to per-model/per-token queue
         queue_key = self._queue_key(model_id=model_id, token=token)
@@ -515,7 +512,7 @@ class TaskQueueMixin:
 
         return {'request_id': request_id, 'model_id': model_id}
 
-    def get_queue_stats(self) -> Dict[str, Any]:
+    def get_queue_stats(self) -> dict[str, Any]:
         """Get current queue statistics.
 
         Returns:
@@ -532,7 +529,7 @@ class TaskQueueMixin:
             }
         }
 
-    def get_rate_limit_stats(self, token: str) -> Dict[str, Any]:
+    def get_rate_limit_stats(self, token: str) -> dict[str, Any]:
         """Get rate limiting stats for a specific user token.
 
         Args:
@@ -543,7 +540,7 @@ class TaskQueueMixin:
         """
         return self._rate_limiter.get_stats(token)
 
-    def get_rate_limiter_memory_stats(self) -> Dict[str, Any]:
+    def get_rate_limiter_memory_stats(self) -> dict[str, Any]:
         """Get memory usage statistics from the rate limiter.
 
         Returns:

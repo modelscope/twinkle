@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import List, Union
 
+from twinkle.data_format import InputFeature, ModelOutput
 from .base import Metric
-from twinkle.data_format import ModelOutput, InputFeature
 
 
 class LossMetric(Metric):
@@ -24,19 +24,19 @@ class LossMetric(Metric):
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         if 'loss' not in outputs:
             return
-        loss = outputs["loss"]
+        loss = outputs['loss']
         if self.loss_reduction == 'sum':
             if not isinstance(inputs, list):
                 inputs = [inputs]
             for input in inputs:
                 # `Transformers` models may use reduction=sum, to average grads before step
-                labels = input["labels"]
+                labels = input['labels']
                 self.num_tokens += (labels >= 0).sum().item()
-        grad_norm = kwargs.get("grad_norm")
+        grad_norm = kwargs.get('grad_norm')
         if grad_norm is not None:
             self.grad_norm = grad_norm
 
-        self.total_loss += loss.item() if hasattr(loss, "item") else loss
+        self.total_loss += loss.item() if hasattr(loss, 'item') else loss
         self.total_count += 1
 
     def reset(self):
@@ -46,16 +46,19 @@ class LossMetric(Metric):
         self.num_tokens = 0
 
     def calculate(self):
-        local_results = [
-            {"loss": self.total_loss, "count": self.total_count, "grad_norm": self.grad_norm, "num_tokens": self.num_tokens}
-        ]
+        local_results = [{
+            'loss': self.total_loss,
+            'count': self.total_count,
+            'grad_norm': self.grad_norm,
+            'num_tokens': self.num_tokens
+        }]
 
         all_results = self.gather_results(local_results)
 
-        total_loss = sum(r["loss"] for r in all_results)
-        total_count = sum(r["count"] for r in all_results)
-        grad_norm = max(r["grad_norm"] for r in all_results)
-        num_tokens = sum(r["num_tokens"] for r in all_results)
+        total_loss = sum(r['loss'] for r in all_results)
+        total_count = sum(r['count'] for r in all_results)
+        grad_norm = max(r['grad_norm'] for r in all_results)
+        num_tokens = sum(r['num_tokens'] for r in all_results)
         if num_tokens > 0:
             avg_loss = total_loss / num_tokens
         else:

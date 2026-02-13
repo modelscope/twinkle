@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Dict, List, Optional, TypeVar, Type, Tuple, Any, Literal, Callable, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
+
+from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
 from .resource_manager import ResourceManager
-from twinkle import DeviceGroup, Platform, find_node_ip, find_free_port, requires
 
 T = TypeVar('T')
 
@@ -110,13 +111,13 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name:str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
         """Execute method and return results."""
         import ray
         return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
 
     @staticmethod
-    def execute_all_async(method_name:str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
         """Execute method and return futures."""
         output = []
         for worker_and_args in workers_and_args:
@@ -151,12 +152,12 @@ class RayHelper:
     @staticmethod
     def get_master_id_port(placement_group):
         import ray
+
         @ray.remote
         def get_node_address():
             return find_node_ip(), find_free_port()
 
-        ip, port = ray.get(
-            get_node_address.options(placement_group=placement_group).remote())
+        ip, port = ray.get(get_node_address.options(placement_group=placement_group).remote())
         return ip, port
 
     @staticmethod
@@ -164,6 +165,7 @@ class RayHelper:
         """Return a callable to collect results in the workers."""
 
         class LazyCollect:
+
             def __init__(self, futures, method, collect_func, device_mesh):
                 self._futures = futures
                 self._method = method
@@ -196,7 +198,6 @@ class RayHelper:
             def __len__(self):
                 """Support len() function"""
                 return len(self._get_result())
-
 
         return LazyCollect(futures, method, collect_func, device_mesh)
 
@@ -231,18 +232,25 @@ class RayHelper:
     @staticmethod
     def _noset_env():
         return {
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-            "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
-            "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
-            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-            "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES": "1",
-            "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES": "1",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
-            "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR": "1",
+            'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES': '1',
+            'RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES': '1',
+            'RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS': '1',
+            'RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR': '1',
         }
 
     @staticmethod
-    def create_workers(worker_cls: Type[T], group: str, execute: Literal['all', 'peer', 'first'], *args, instance_id, seed=42, full_determinism=False, **kwargs) -> List[T]:
+    def create_workers(worker_cls: Type[T],
+                       group: str,
+                       execute: Literal['all', 'peer', 'first'],
+                       *args,
+                       instance_id,
+                       seed=42,
+                       full_determinism=False,
+                       **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
@@ -297,10 +305,14 @@ class RayHelper:
                     cluster_name,
                     'WORKER_NAME':
                     worker_name,
-                    Platform.get_platform(device_type_upper).visible_device_env(): ','.join([str(r) for r in deploy_pg['gpu_rank']]),
-                    'TWINKLE_MODE': 'ray',
-                    'TWINKLE_SEED': str(seed),
-                    'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
+                    Platform.get_platform(device_type_upper).visible_device_env():
+                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
+                    'TWINKLE_MODE':
+                    'ray',
+                    'TWINKLE_SEED':
+                    str(seed),
+                    'TWINKLE_FULL_DETERMINISM':
+                    str(int(full_determinism)),
                 })
 
                 env_vars['MASTER_ADDR'] = ip
@@ -309,20 +321,16 @@ class RayHelper:
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
                 env_vars.update(RayHelper._noset_env())
-                
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name':
-                    worker_name,
-                    'namespace':
-                    'default',
-                    'runtime_env':
-                    runtime_env,
-                    'num_cpus':
-                    0.01,
+                    'name': worker_name,
+                    'namespace': 'default',
+                    'runtime_env': runtime_env,
+                    'num_cpus': 0.01,
                 }
 
                 if device_type == 'GPU':
@@ -356,14 +364,10 @@ class RayHelper:
                 worker_options = {
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name':
-                    worker_name,
-                    'namespace':
-                    'default',
-                    'runtime_env':
-                    runtime_env,
-                    'num_cpus':
-                    0.01,
+                    'name': worker_name,
+                    'namespace': 'default',
+                    'runtime_env': runtime_env,
+                    'num_cpus': 0.01,
                 }
 
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)

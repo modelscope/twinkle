@@ -2,6 +2,7 @@ import json
 import os
 from functools import partial
 from typing import Literal
+
 from .platform import is_last_rank, is_master
 
 
@@ -41,7 +42,7 @@ class SafetensorLazyLoader:
         index_path = os.path.join(self.hf_model_dir, 'model.safetensors.index.json')
 
         if os.path.exists(index_path):
-            with open(index_path, 'r') as f:
+            with open(index_path) as f:
                 self._index_file = json.load(f)
                 self._weight_map = self._index_file.get('weight_map', {})
         else:

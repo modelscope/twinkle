@@ -1,10 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from collections import OrderedDict
-from copy import deepcopy
-from typing import Any, Dict, Literal, Optional, Tuple
-
 import megatron.core
 import torch
+from collections import OrderedDict
+from copy import deepcopy
 from megatron.core import mpu
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -18,11 +16,12 @@ from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, 
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from twinkle.model.megatron.args import get_args
-from twinkle import get_logger
-from twinkle.model.megatron.utils import split_cp_inputs
-
 from packaging import version
+from typing import Any, Dict, Literal, Optional, Tuple
+
+from twinkle import get_logger
+from twinkle.model.megatron.args import get_args
+from twinkle.model.megatron.utils import split_cp_inputs
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()

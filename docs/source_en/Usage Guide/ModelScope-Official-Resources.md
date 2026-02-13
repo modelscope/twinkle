@@ -10,6 +10,8 @@ Developers first need to register as a ModelScope user and use the ModelScope co
 
 Registration URL: https://www.modelscope.cn/
 
+The API endpoint is: https://www.modelscope.cn/twinkle
+
 Token can be obtained here: https://www.modelscope.cn/my/access/token — copy your access token.
 
 ## Step 2. Join the twinkle-explorers Organization

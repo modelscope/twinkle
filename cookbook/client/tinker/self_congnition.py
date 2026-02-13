@@ -6,9 +6,9 @@
 #   2. eval():  Load a trained checkpoint and sample from it to verify
 #      that the model has learned the custom identity.
 # The server must be running first (see server.py and server_config.yaml).
-
 import numpy as np
-from tqdm import tqdm
+import os
+from modelscope import AutoTokenizer
 from tinker import types
 from twinkle_client import init_tinker_compat_client
 from twinkle.data_format import Message, Trajectory
@@ -19,7 +19,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
 # The base model to fine-tune / evaluate
-base_model = "Qwen/Qwen2.5-7B-Instruct"
+base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
 
 
 def train():
@@ -43,24 +43,22 @@ def train():
     # Step 2: Initialize the training client
 
     # Connect to the Twinkle server running locally
-    service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+    service_client = init_tinker_compat_client(
+        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
-    training_client = service_client.create_lora_training_client(
-        base_model=base_model,
-        rank=16
-    )
+    training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
     # Step 3: Run the training loop
 
     for epoch in range(3):
-        print(f"Epoch {epoch}")
+        print(f'Epoch {epoch}')
         for step, batch in tqdm(enumerate(dataloader)):
             # Convert each InputFeature into a Datum for the Tinker API
             input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
 
             # Send data to server: forward + backward pass (computes gradients)
-            fwdbwd_future = training_client.forward_backward(input_datum, "cross_entropy")
+            fwdbwd_future = training_client.forward_backward(input_datum, 'cross_entropy')
 
             # Optimizer step: update model weights with Adam
             optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
@@ -72,12 +70,12 @@ def train():
             # Compute weighted average log-loss per token for monitoring
             logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
             weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
-            print(f"Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}")
+            print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
 
         # Save a checkpoint after each epoch
-        save_future = training_client.save_state(f"twinkle-lora-{epoch}")
+        save_future = training_client.save_state(f'twinkle-lora-{epoch}')
         save_result = save_future.result()
-        print(f"Saved checkpoint to {save_result.path}")
+        print(f'Saved checkpoint to {save_result.path}')
 
 
 def eval():
@@ -88,9 +86,7 @@ def eval():
 
     # Connect to the server and create a sampling client with the trained weights
     service_client = init_tinker_compat_client(base_url='http://localhost:8000')
-    sampling_client = service_client.create_sampling_client(
-        model_path=weight_path,
-        base_model=base_model)
+    sampling_client = service_client.create_sampling_client(model_path=weight_path, base_model=base_model)
 
     # Step 2: Prepare the chat prompt
 
@@ -112,18 +108,18 @@ def eval():
 
     prompt = types.ModelInput.from_ints(input_ids)
     params = types.SamplingParams(
-        max_tokens=50,       # Maximum tokens to generate
-        temperature=0.2,     # Low temperature for more focused responses
-        stop=["\n"]          # Stop at newline
+        max_tokens=50,  # Maximum tokens to generate
+        temperature=0.2,  # Low temperature for more focused responses
+        stop=['\n']  # Stop at newline
     )
 
     # Sample 8 independent completions
-    print("Sampling...")
+    print('Sampling...')
     future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
     result = future.result()
 
     # Decode and print each response
-    print("Responses:")
+    print('Responses:')
     for i, seq in enumerate(result.sequences):
         print(f"{i}: {repr(template.decode(seq.tokens))}")
 

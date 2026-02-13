@@ -1,21 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 import multiprocessing as mp
-from typing import TypeVar, Type, Union
 import numpy as np
+import os
+from typing import Type, TypeVar, Union
+
 from twinkle.infra import remote_class, remote_function
+from twinkle.template import Template
 from .base import DatasetMeta
 from .iterable_dataset import IterableDataset
 from .packing_dataset import PackingDataset
-from twinkle.template import Template
 
 _T = TypeVar('_T')
 
 
 @remote_class(execute='first')
 class IterablePackingDataset(IterableDataset):
-    """An iterable packing dataset wrapper, this will use binpacking to pack the iterable dataset rows to minimum number of batches,
-        whose lengths are almost `max_length`
+    """An iterable packing dataset wrapper, this will use binpacking to pack the iterable dataset
+        rows to minimum number of batches, whose lengths are almost `max_length`
 
     Args:
         dataset_meta: The dataset meta
@@ -24,10 +25,12 @@ class IterablePackingDataset(IterableDataset):
         cyclic: cyclic packing will start from the beginning if the dataset has ended, default `False`
     """
 
-    def __init__(self, dataset_meta: DatasetMeta,
+    def __init__(self,
+                 dataset_meta: DatasetMeta,
                  packing_interval: int = 128,
                  packing_num_proc: int = 1,
-                 cyclic: bool = False, **kwargs):
+                 cyclic: bool = False,
+                 **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self.packing_num_proc = packing_num_proc
         kwargs['streaming'] = True
@@ -41,11 +44,12 @@ class IterablePackingDataset(IterableDataset):
         self.workers = []
         self.cyclic = cyclic
         self._packed_called = False
-    
+
     @remote_function()
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
         super().set_template(template_cls, **kwargs)
-        assert self.template.truncation_strategy != 'split', 'Iterable packing does not support truncation_strategy==`split`'
+        assert self.template.truncation_strategy != 'split', ('Iterable packing does not support '
+                                                              'truncation_strategy==`split`')
 
     @remote_function()
     def pack_dataset(self):
@@ -86,8 +90,7 @@ class IterablePackingDataset(IterableDataset):
     @staticmethod
     def _cyclic_iter(iterable):
         while True:
-            for x in iterable:
-                yield x
+            yield from iterable
 
     @remote_function()
     def __iter__(self):
@@ -115,7 +118,8 @@ class IterablePackingDataset(IterableDataset):
                 # rows: [({'input_ids': [0,1,2,...]}, length), ({'input_ids': [0,1,2,...]}, length)]
                 for key in rows[0][0]:
                     output[key] = [r[0][key] for r in rows]
-                    if isinstance(rows[0][0][key], (list, np.ndarray)) and isinstance(rows[0][0][key][0], (int, float, np.number)):
+                    if isinstance(rows[0][0][key],
+                                  (list, np.ndarray)) and isinstance(rows[0][0][key][0], (int, float, np.number)):
                         output[key] = [v for lst in output[key] for v in lst]
                 res.append(output)
             yield from res

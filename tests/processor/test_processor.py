@@ -4,22 +4,19 @@ import pytest
 import torch
 
 import twinkle
-from twinkle.processor import InputProcessor, GRPOLossProcessor
+from twinkle.processor import GRPOLossProcessor, InputProcessor
 
 twinkle.initialize(mode='local')
 
 
 def _make_text_batch(n: int, seq_len: int = 8):
     """Synthetic text batch: input_ids, attention_mask, position_ids, labels (tensors)."""
-    return [
-        {
-            'input_ids': torch.randint(1, 1000, (seq_len,)),
-            'attention_mask': torch.ones(seq_len),
-            'position_ids': torch.arange(seq_len),
-            'labels': torch.full((seq_len,), -100),
-        }
-        for _ in range(n)
-    ]
+    return [{
+        'input_ids': torch.randint(1, 1000, (seq_len, )),
+        'attention_mask': torch.ones(seq_len),
+        'position_ids': torch.arange(seq_len),
+        'labels': torch.full((seq_len, ), -100),
+    } for _ in range(n)]
 
 
 class TestNormalMode:
@@ -109,8 +106,16 @@ class TestGRPOMode:
     def test_grpo_collate(self):
         proc = GRPOLossProcessor()
         batch = [
-            {'input_ids': torch.tensor([1, 2, 3, 4, 5]), 'position_ids': torch.arange(5), 'labels': torch.tensor([-100, -100, 10, 11, 12])},
-            {'input_ids': torch.tensor([6, 7, 8]), 'position_ids': torch.arange(3), 'labels': torch.tensor([-100, 20, 21])},
+            {
+                'input_ids': torch.tensor([1, 2, 3, 4, 5]),
+                'position_ids': torch.arange(5),
+                'labels': torch.tensor([-100, -100, 10, 11, 12])
+            },
+            {
+                'input_ids': torch.tensor([6, 7, 8]),
+                'position_ids': torch.arange(3),
+                'labels': torch.tensor([-100, 20, 21])
+            },
         ]
         out = proc.collate_fn(batch)
         assert len(out) == 1
@@ -121,8 +126,14 @@ class TestGRPOMode:
     def test_grpo_padding_free(self):
         proc = GRPOLossProcessor(padding_free=True)
         batch = [
-            {'input_ids': torch.tensor([1, 2, 3]), 'labels': torch.tensor([-100, -100, -100])},
-            {'input_ids': torch.tensor([4, 5, 6]), 'labels': torch.tensor([10, 11, 12])},
+            {
+                'input_ids': torch.tensor([1, 2, 3]),
+                'labels': torch.tensor([-100, -100, -100])
+            },
+            {
+                'input_ids': torch.tensor([4, 5, 6]),
+                'labels': torch.tensor([10, 11, 12])
+            },
         ]
         out = proc.collate_fn(batch)
         assert out[0]['input_ids'].shape == (1, 6)

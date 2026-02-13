@@ -1,13 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Optional, List, TYPE_CHECKING, Union
+import numpy as np
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from twinkle.data_format import Trajectory
 from twinkle.loss.base import Loss
 from twinkle.utils.torch_utils import selective_log_softmax
-from twinkle.data_format import Trajectory
-import numpy as np
 
 if TYPE_CHECKING:
     import torch
+
 
 class GRPOLoss(Loss):
     """
@@ -33,11 +34,8 @@ class GRPOLoss(Loss):
         self.beta = beta
         self.ignore_index = ignore_index
 
-    def _extract_advantages_from_trajectories(
-        self, 
-        trajectories: List[Trajectory], 
-        device: 'torch.device'
-    ) -> 'torch.Tensor':
+    def _extract_advantages_from_trajectories(self, trajectories: List[Trajectory],
+                                              device: 'torch.device') -> 'torch.Tensor':
         """Extract advantages from trajectory objects."""
         import torch
         advantages_list = []
@@ -53,10 +51,10 @@ class GRPOLoss(Loss):
     def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
         """
         Compute loss mask from labels.
-        
+
         Args:
             labels: [batch, seq_len] target token ids, -100 for ignored positions
-            
+
         Returns:
             mask: [batch, seq_len] float tensor, 1.0 for valid positions, 0.0 for ignored
         """
@@ -73,12 +71,12 @@ class GRPOLoss(Loss):
 
         Override this method in subclasses for different IS strategies.
         Default: token-level importance sampling.
-        
+
         Args:
             per_token_logps: [batch, seq_len] current policy log probabilities
             per_token_old_logps: [batch, seq_len] old policy log probabilities
             loss_mask: [batch, seq_len] mask for valid tokens
-            
+
         Returns:
             log_weights: [batch, seq_len] log importance weights
         """
@@ -98,12 +96,12 @@ class GRPOLoss(Loss):
         Compute per-token loss with PPO clipping.
 
         Override this method in subclasses for different loss formulations.
-        
+
         Args:
             ratio: [batch, seq_len] importance sampling ratio
             advantages: [batch, 1] or [batch, seq_len] advantage values (already expanded)
             per_token_logps: [batch, seq_len] current policy log probabilities
-            
+
         Returns:
             per_token_loss: [batch, seq_len] loss for each token
         """
@@ -124,21 +122,18 @@ class GRPOLoss(Loss):
 
         Override this method in subclasses for different normalization.
         Default: mean over sequences, then mean over batch.
-        
+
         Args:
             per_token_loss: [batch, seq_len] per-token loss values
             loss_mask: [batch, seq_len] mask for valid tokens
             **kwargs: Additional arguments for subclass implementations
-            
+
         Returns:
             loss: scalar loss value
         """
         # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
         # Each sequence contributes equally regardless of length.
-        return (
-            (per_token_loss * loss_mask).sum(-1)
-            / loss_mask.sum(-1).clamp(min=1.0)
-        ).mean()
+        return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 
     def _pad_and_align_to_batch(
         self,
@@ -150,9 +145,9 @@ class GRPOLoss(Loss):
     ) -> 'torch.Tensor':
         """Align data to mask: scalars broadcast, sequences scatter."""
         import torch
-        
+
         batch_size, seq_len = mask.shape
-        
+
         # Convert to tensor if possible
         if isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
@@ -167,15 +162,14 @@ class GRPOLoss(Loss):
                 result[mask] = data[mask.any(dim=1).nonzero(as_tuple=True)[0].repeat_interleave(mask.sum(dim=1)), 0]
                 return result
             data = [data[i] for i in range(batch_size)]  # To list
-        
+
         # Handle list (scalars or sequences)
         if isinstance(data, (list, tuple)):
             if all(isinstance(x, (int, float)) for x in data):  # Flat scalars
                 return self._pad_and_align_to_batch(
-                    torch.tensor(data, dtype=dtype, device=device), mask, device, dtype, fill_value
-                )
+                    torch.tensor(data, dtype=dtype, device=device), mask, device, dtype, fill_value)
             data = [torch.as_tensor(s, dtype=dtype, device=device) for s in data]
-        
+
         # Scatter sequences
         result = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
         for i, sample in enumerate(data):
@@ -186,7 +180,7 @@ class GRPOLoss(Loss):
             else:
                 n = min(len(pos), len(sample))
                 result[i, pos[:n]] = sample[:n]
-        
+
         return result
 
     @staticmethod
@@ -222,8 +216,8 @@ class GRPOLoss(Loss):
         import torch
 
         total_len = logps.shape[1]
-        logps_flat = logps.squeeze(0)        # [total_tokens]
-        mask_flat = loss_mask.squeeze(0)      # [total_tokens]
+        logps_flat = logps.squeeze(0)  # [total_tokens]
+        mask_flat = loss_mask.squeeze(0)  # [total_tokens]
 
         # ── Find sequence boundaries ─────────────────────────────────────
         if position_ids is not None:
@@ -281,7 +275,7 @@ class GRPOLoss(Loss):
         *,
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
-        trajectories: Optional[List[Trajectory]] = None, # TODO: remove this argument
+        trajectories: Optional[List[Trajectory]] = None,  # TODO: remove this argument
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         **kwargs,
     ) -> 'torch.Tensor':
@@ -343,7 +337,10 @@ class GRPOLoss(Loss):
         if is_packed:
             position_ids = inputs.get('position_ids')
             logps, loss_mask = self._unpack_packed_logps(
-                logps, loss_mask, position_ids, num_sequences,
+                logps,
+                loss_mask,
+                position_ids,
+                num_sequences,
             )
 
         # ── Prepare old_logps ────────────────────────────────────────────
@@ -355,41 +352,44 @@ class GRPOLoss(Loss):
             old_logps = logps.detach()
         else:
             old_logps = self._pad_and_align_to_batch(
-                old_logps, loss_mask, device, logps.dtype,
+                old_logps,
+                loss_mask,
+                device,
+                logps.dtype,
             )
 
         # ── Prepare ref_logps (same treatment) ──────────────────────────
         if ref_logps is not None:
             ref_logps = self._pad_and_align_to_batch(
-                ref_logps, loss_mask, device, logps.dtype,
+                ref_logps,
+                loss_mask,
+                device,
+                logps.dtype,
             )
 
-        
         assert advantages is not None, \
-            "advantages must be provided (pass as kwarg to forward_backward)"
+            'advantages must be provided (pass as kwarg to forward_backward)'
 
         advantages = self._pad_and_align_to_batch(
-            advantages, loss_mask, device, logps.dtype,
+            advantages,
+            loss_mask,
+            device,
+            logps.dtype,
         )
 
         # ── Compute loss ────────────────────────────────────────────────
         log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
         ratio = torch.exp(log_importance_weights)
-        
-        per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
-        
-        if self.beta > 0.0 and ref_logps is not None:
-            per_token_kl = (
-                torch.exp(ref_logps - logps) 
-                - (ref_logps - logps) 
-                - 1
-            )
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-        
-        loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
-        
-        return loss
 
+        per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
+
+        if self.beta > 0.0 and ref_logps is not None:
+            per_token_kl = (torch.exp(ref_logps - logps) - (ref_logps - logps) - 1)
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
+
+        return loss
 
     def compute_metrics(
         self,
@@ -401,45 +401,46 @@ class GRPOLoss(Loss):
     ) -> Dict[str, float]:
         """Compute training metrics."""
         import torch
+
         # Ensure labels are shifted for loss_mask
         shift_labels = labels[:, 1:] if labels.shape[1] > per_token_logps.shape[1] else labels
         loss_mask = self._compute_loss_mask(shift_labels)
-        
+
         # Align shapes
         seq_len = min(per_token_logps.shape[1], per_token_old_logps.shape[1], loss_mask.shape[1])
         per_token_logps = per_token_logps[:, -seq_len:]
         per_token_old_logps = per_token_old_logps[:, -seq_len:]
         loss_mask = loss_mask[:, -seq_len:]
-        
+
         token_count = loss_mask.sum().clamp(min=1.0)
-        
+
         def masked_mean(x):
             if x.shape[-1] == 1:
                 return x.mean()
             return (x * loss_mask).sum() / token_count
-        
+
         log_ratio = torch.clamp(per_token_logps - per_token_old_logps, min=-20.0, max=20.0)
         ratio = torch.exp(log_ratio)
-        
+
         # Ensure advantages is 2D
         if advantages.dim() == 1:
             advantages = advantages.unsqueeze(1)
-        
+
         metrics = {}
-        
+
         # KL divergence
         metrics['kl'] = masked_mean(-log_ratio).item()
-        
+
         # Clipping metrics
         is_low_clipped = (ratio < 1 - self.epsilon) & (advantages < 0)
         is_high_clipped = (ratio > 1 + self.epsilon_high) & (advantages > 0)
         metrics['clip_ratio_low'] = masked_mean(is_low_clipped.float()).item()
         metrics['clip_ratio_high'] = masked_mean(is_high_clipped.float()).item()
         metrics['clip_ratio'] = masked_mean((is_low_clipped | is_high_clipped).float()).item()
-        
+
         # Ratio statistics
         metrics['ratio_mean'] = masked_mean(ratio).item()
-        
+
         return metrics
 
 
@@ -460,9 +461,7 @@ class GSPOLoss(GRPOLoss):
         import torch
         log_ratio = per_token_logps - per_token_old_logps
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
-        seq_level_log_weights = (
-            (log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)
-        ).unsqueeze(-1)
+        seq_level_log_weights = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
         return seq_level_log_weights
 
 
@@ -551,10 +550,10 @@ class BNPOLoss(GRPOLoss):
 class DRGRPOLoss(GRPOLoss):
     """
     DR-GRPO (Dynamic Ratio GRPO) Loss.
-    
+
     Normalizes by batch_size * max_completion_length for consistent gradients.
     """
-    
+
     def __init__(
         self,
         epsilon: float = 0.2,

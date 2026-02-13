@@ -1,46 +1,42 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import contextlib
 import json
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Literal, Callable
-from typing import overload, Type, Optional, Union
-import asyncio
 import threading
-from twinkle.utils.framework import Torch
 import torch
 import torch.distributed as dist
 import transformers
-from peft import PeftConfig
-from peft import get_peft_model, PeftModel
-from peft.utils import set_peft_model_state_dict, load_peft_weights
+from dataclasses import dataclass, field
+from peft import PeftConfig, PeftModel, get_peft_model
+from peft.utils import load_peft_weights, set_peft_model_state_dict
 from safetensors.torch import save_file
 from torch import GradScaler
-from torch.optim import Optimizer, AdamW, Adam
+from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union, overload
 
 import twinkle
 import twinkle.module.scheduler
-from twinkle import Platform
-from twinkle import remote_class, remote_function, template, DeviceMesh
+from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
-from twinkle.data_format import InputFeature, Trajectory, ModelOutput
-from twinkle.hub import HubOperation
-from twinkle.loss import Loss, CrossEntropyLoss
-from twinkle.metric import Metric
-from twinkle.patch import Patch, apply_patch
-from twinkle.processor import InputProcessor
-from twinkle.template import Template
-from twinkle.utils import torch_util, construct_class
-from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
+from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.hub import HubOperation
+from twinkle.loss import CrossEntropyLoss, Loss
+from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
-from twinkle.metric import LossMetric, Accuracy, TrainMetric
+from twinkle.patch import Patch, apply_patch
+from twinkle.processor import InputProcessor
+from twinkle.template import Template
+from twinkle.utils import construct_class, torch_util
+from twinkle.utils.framework import Torch
+from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
 
 @dataclass
@@ -72,7 +68,7 @@ class OptimizerGroup:
             gradient_accumulation_steps = self.gradient_accumulation_steps
         else:
             self.gradient_accumulation_steps = gradient_accumulation_steps
-        return (self.cur_step-1) % gradient_accumulation_steps == 0 and self.cur_step > 1
+        return (self.cur_step - 1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
         self._ensure_dp_group()
@@ -121,9 +117,13 @@ class OptimizerGroup:
             metrics = self.eval_metrics
         if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
             for metric in metrics:
-                metric.accumulate(self.inputs, self.outputs, lr=self._get_lr(),
-                                  step=self.cur_step-1, gradient_accumulation_steps=self.gradient_accumulation_steps,
-                                  grad_norm=self._last_grad_norm)
+                metric.accumulate(
+                    self.inputs,
+                    self.outputs,
+                    lr=self._get_lr(),
+                    step=self.cur_step - 1,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    grad_norm=self._last_grad_norm)
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -142,6 +142,7 @@ class OptimizerGroup:
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
+
 
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
@@ -170,17 +171,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def __init__(self, *, model_id: str, config: Optional[PretrainedConfig] = None, **kwargs) -> None:
         ...
 
-    def __init__(self, # noqa
-                 model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
-                 model_id: Optional[str] = None,
-                 config: Optional[PretrainedConfig] = None,
-                 device_mesh: Optional[DeviceMesh] = None,
-                 mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
-                 strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
-                 ddp_config: Dict[str, Any] = None,
-                 fsdp_config: Dict[str, Any] = None,
-                 grad_scaler_config: Dict[str, Any] = None,
-                 **kwargs):
+    def __init__(
+            self,  # noqa
+            model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
+            model_id: Optional[str] = None,
+            config: Optional[PretrainedConfig] = None,
+            device_mesh: Optional[DeviceMesh] = None,
+            mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+            strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+            ddp_config: Dict[str, Any] = None,
+            fsdp_config: Dict[str, Any] = None,
+            grad_scaler_config: Dict[str, Any] = None,
+            **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
@@ -205,14 +207,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
-        self.optimizer_group: Dict[str, OptimizerGroup] = {_default_adapter_name: self._construct_default_optimizer_group()}
+        self.optimizer_group: Dict[str, OptimizerGroup] = {
+            _default_adapter_name: self._construct_default_optimizer_group()
+        }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
-        self._expert_parallel_config = self._fsdp_config.pop("expert_parallel", None)
-        self._enable_expert_parallel = self._should_enable_expert_parallel(
-            self._expert_parallel_config, self.device_mesh)
+        self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
+        self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
+                                                                           self.device_mesh)
         self._expert_parallel_applied = False
         use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
         if use_native_fsdp:
@@ -223,18 +227,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 enable_ep=self._enable_expert_parallel,
             )
         else:
-            self.strategy = AccelerateStrategy(mixed_precision=self.mixed_precision, ddp_config=self._ddp_config,
-                                               fsdp_config=self._fsdp_config, device_mesh=self.device_mesh)
+            self.strategy = AccelerateStrategy(
+                mixed_precision=self.mixed_precision,
+                ddp_config=self._ddp_config,
+                fsdp_config=self._fsdp_config,
+                device_mesh=self.device_mesh)
 
         # Sequence parallel ("ulysses") is derived from dp/fsdp ranks; it does not change world size.
         # We construct `sp_strategy` after the underlying HF model is initialized (see __init__).
         self._enable_sp = False
         if self.device_mesh is not None:
-            sp_size = getattr(self.device_mesh, "ulysses_size", None)
+            sp_size = getattr(self.device_mesh, 'ulysses_size', None)
             self._enable_sp = bool(sp_size and sp_size > 1)
 
     def _ensure_sp_strategy(self) -> None:
-        if not getattr(self, "_enable_sp", False):
+        if not getattr(self, '_enable_sp', False):
             return
         if self.sp_strategy is not None:
             return
@@ -281,12 +288,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                                        device_mesh: Optional[DeviceMesh]) -> bool:
         if expert_parallel_config is None or device_mesh is None:
             return False
-        if not device_mesh.has_dim("ep"):
+        if not device_mesh.has_dim('ep'):
             return False
         ep_world_size = device_mesh.ep_world_size or 1
         if ep_world_size <= 1:
             return False
-        return expert_parallel_config.get("enabled", True)
+        return expert_parallel_config.get('enabled', True)
 
     def _maybe_apply_expert_parallel(self):
         if not self._enable_expert_parallel or self._expert_parallel_applied:
@@ -332,15 +339,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
-            raise ValueError(f'inputs empty, check your DataLoader outputs')
+            raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.train()
-        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
+                                                                        and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
             if isinstance(inputs, dict):
                 inputs = [inputs]
-            inputs = optimizer_config.template.batch_encode(inputs) # noqa
+            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs)
@@ -372,15 +380,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
-            raise ValueError(f'inputs empty, check your DataLoader outputs')
+            raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.eval()
-        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list) and self._not_encoded(inputs[0])):
+        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
+                                                                        and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
             assert optimizer_config.template is not None, \
                 'Use set_template to add a template when trying to input `List[Trajectory]`'
             if isinstance(inputs, dict):
                 inputs = [inputs]
-            inputs = optimizer_config.template.batch_encode(inputs) # noqa
+            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
@@ -425,10 +434,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
-            if "loss_reduction" not in self.sp_strategy.sp_config:
-                reduction = getattr(loss_instance, "reduction", None)
+            if 'loss_reduction' not in self.sp_strategy.sp_config:
+                reduction = getattr(loss_instance, 'reduction', None)
                 if reduction is not None:
-                    self.sp_strategy.sp_config["loss_reduction"] = str(reduction)
+                    self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         optimizer_config.loss_value += loss_value
         outputs['loss'] = optimizer_config.loss_value
@@ -460,7 +469,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect='mean')
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                         **kwargs):
         """Do forward, calculate loss, and backward.
 
         Args:
@@ -478,7 +488,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return loss
 
     @remote_function()
-    def clip_grad_norm(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         """ Clip the gradient norm
 
         Args:
@@ -496,7 +506,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler
-        outputs = optimizer_config.outputs
         context = contextlib.nullcontext
         if self.device_mesh is not None and self.device_mesh.tp_world_size > 1:
             from torch.distributed.tensor.experimental import implicit_replication
@@ -523,60 +532,56 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return grad_norm
 
     @remote_function(dispatch='all')
-    def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         grad_norm = self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
         return grad_norm
 
-    def _create_param_group(self, adapter_name: str, lr: float=DEFAULT_LEARNING_RATE, weight_decay:float=DEFAULT_WEIGHT_DECAY, **kwargs):
+    def _create_param_group(self,
+                            adapter_name: str,
+                            lr: float = DEFAULT_LEARNING_RATE,
+                            weight_decay: float = DEFAULT_WEIGHT_DECAY,
+                            **kwargs):
         # Some code borrowed from transformers
 
         def get_parameter_names(model, forbidden_layer_types, forbidden_layer_names=None):
-            forbidden_layer_patterns = (
-                [re.compile(pattern) for pattern in forbidden_layer_names] if forbidden_layer_names is not None else []
-            )
+            forbidden_layer_patterns = ([re.compile(pattern) for pattern in forbidden_layer_names]
+                                        if forbidden_layer_names is not None else [])
             result = []
             for name, child in model.named_children():
                 child_params = get_parameter_names(child, forbidden_layer_types, forbidden_layer_names)
                 result += [
-                    f"{name}.{n}"
-                    for n in child_params
-                    if not isinstance(child, tuple(forbidden_layer_types))
-                       and not any(pattern.search(f"{name}.{n}".lower()) for pattern in forbidden_layer_patterns)
+                    f'{name}.{n}' for n in child_params
+                    if not isinstance(child, tuple(forbidden_layer_types)) and not any(
+                        pattern.search(f'{name}.{n}'.lower()) for pattern in forbidden_layer_patterns)
                 ]
             # Add model specific parameters that are not in any child
             result += [
-                k for k in model._parameters if
-                not any(pattern.search(k.lower()) for pattern in forbidden_layer_patterns)
+                k for k in model._parameters
+                if not any(pattern.search(k.lower()) for pattern in forbidden_layer_patterns)
             ]
 
             return result
 
-        forbidden_name_patterns = [r"bias", r"layernorm", r"rmsnorm", r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)"]
+        forbidden_name_patterns = [r'bias', r'layernorm', r'rmsnorm', r'(?:^|\.)norm(?:$|\.)', r'_norm(?:$|\.)']
         decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm], forbidden_name_patterns)
         params = self._get_trainable_parameters(adapter_name)
-        decay_param_names = [
-            n for n, p in params.items() if (n in decay_parameters and p.requires_grad)
-        ]
-        no_decay_param_names = [
-            n for n, p in params.items() if (n not in decay_parameters and p.requires_grad)
-        ]
+        decay_param_names = [n for n, p in params.items() if (n in decay_parameters and p.requires_grad)]
+        no_decay_param_names = [n for n, p in params.items() if (n not in decay_parameters and p.requires_grad)]
         optimizer_grouped_parameters = [
             {
-                "params": [
-                    params[n] for n in decay_param_names
-                ],
-                "param_names": decay_param_names,
-                "weight_decay": weight_decay, 'lr': lr
+                'params': [params[n] for n in decay_param_names],
+                'param_names': decay_param_names,
+                'weight_decay': weight_decay,
+                'lr': lr
             },
             {
-                "params": [
-                    params[n] for n in no_decay_param_names
-                ],
-                "param_names": no_decay_param_names,
-                "weight_decay": 0.0, 'lr': lr
+                'params': [params[n] for n in no_decay_param_names],
+                'param_names': no_decay_param_names,
+                'weight_decay': 0.0,
+                'lr': lr
             },
         ]
         return optimizer_grouped_parameters
@@ -620,7 +625,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if scaler is not None:
                 scaler.step(optimizer, **kwargs)
                 scaler.update()
-                optimizer_config.scaler_has_nan = sum(v.item() for v in scaler._found_inf_per_device(optimizer).values()) > 0
+                optimizer_config.scaler_has_nan = sum(v.item()
+                                                      for v in scaler._found_inf_per_device(optimizer).values()) > 0
             else:
                 optimizer.step(**kwargs)
 
@@ -661,7 +667,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lr_scheduler.step(**kwargs)
 
     @remote_function()
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]],
+                 **kwargs):
         """Set the loss instance.
 
         Args:
@@ -700,8 +707,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if self._enable_expert_parallel and 'foreach' not in kwargs:
             is_adam_family = (
                 optimizer_cls in ('AdamW', 'Adam')
-                or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam)))
-            )
+                or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
             if is_adam_family:
                 kwargs['foreach'] = False
         optimizer_config.optimizer = construct_class(
@@ -723,9 +729,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return params
 
     @remote_function()
-    def set_lr_scheduler(self,
-                         scheduler_cls: Union[Type[LRScheduler], str, LRScheduler],
-                         **kwargs):
+    def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str, LRScheduler], **kwargs):
         """Set the lr_scheduler.
 
         Args:
@@ -739,7 +743,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer = optimizer_config.optimizer
         assert isinstance(optimizer, Optimizer), 'Set optimizer correctly before setting lr_scheduler'
         kwargs['optimizer'] = optimizer
-        scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler], **kwargs)
+        scheduler = construct_class(scheduler_cls, LRScheduler, [torch.optim.lr_scheduler, twinkle.module.scheduler],
+                                    **kwargs)
         optimizer_config.lr_scheduler = scheduler
 
     @remote_function()
@@ -783,12 +788,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if isinstance(model, PeftModel):
             if Platform.is_master():
                 model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                save_file(processed_state_dict, os.path.join(checkpoint_dir, "adapter_model.safetensors"))
+                save_file(processed_state_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
         else:
-            model.save_pretrained(checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
+            model.save_pretrained(
+                checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
 
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-        
+
         if kwargs.get('save_optimizer', False):
             self._save_optimizer(checkpoint_dir, adapter_name=adapter_name)
 
@@ -797,14 +803,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
-        
+
         if Platform.is_master():
             optimizer = optimizer_config.optimizer
             lr_scheduler = optimizer_config.lr_scheduler
             if optimizer is not None:
-                torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                torch.save(optimizer.state_dict(), os.path.join(output_dir, 'optimizer.pt'))
             if lr_scheduler is not None:
-                torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -838,11 +844,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             checkpoint_dir = os.path.join(output_dir, name)
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
-            adapter_weights = load_peft_weights(checkpoint_dir, device="cpu")
+            adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
 
-            def load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name="default"):
+            def load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name='default'):
                 from torch.distributed.tensor import DTensor, distribute_tensor
-                
+
                 model_sd = model.state_dict()
                 converted_weights = {}
                 for key, value in adapter_weights.items():
@@ -851,13 +857,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if key in model_sd:
                         param = model_sd[key]
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
-                            value = distribute_tensor(
-                                value.to(param.device),
-                                param.device_mesh,
-                                param.placements
-                            )
+                            value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                     converted_weights[key] = value
-                
+
                 set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
 
             if self.device_mesh.fsdp_world_size > 1:
@@ -866,7 +868,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
         else:
             raise NotImplementedError
-        
+
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
 
@@ -874,14 +876,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         # assume optimizer and lr_scheduler are created
         optimizer_config = self.optimizer_group[adapter_name]
-        
-        optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
-        scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
-        
+
+        optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
+        scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
+
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             state_dict = torch.load(optimizer_path, map_location='cpu')
             optimizer_config.optimizer.load_state_dict(state_dict)
-            
+
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu')
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
@@ -923,9 +925,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         unwrapped_model = self.strategy.unwrap_model(self.model)
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
-            _adapted_model = PeftModel.from_pretrained(unwrapped_model, model_id=config_or_dir,
-                                                        adapter_name=adapter_name,
-                                                        is_trainable=kwargs.get('is_trainable', True))
+            _adapted_model = PeftModel.from_pretrained(
+                unwrapped_model,
+                model_id=config_or_dir,
+                adapter_name=adapter_name,
+                is_trainable=kwargs.get('is_trainable', True))
             if unwrapped_model is self.model:
                 self.model = _adapted_model
             else:
@@ -941,7 +945,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 unwrapped_model.add_adapter(adapter_name, config)
 
         self.optimizer_group[adapter_name] = self.optimizer_group.pop(_default_adapter_name,
-                                                                       self._construct_default_optimizer_group())
+                                                                      self._construct_default_optimizer_group())
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
@@ -983,7 +987,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
         """Set task processor to prepare the task inputs.
         Args:
-            processor_cls: A processor_cls class name, a processor_cls plugin id, or a processor_cls class type/instance.
+            processor_cls: A processor_cls class name, a processor_cls plugin id,
+                or a processor_cls class type/instance.
             **kwargs:
                 adapter_name: Lora adapter name.
                 Any parameters needed to construct the processor_cls instance.
@@ -1054,21 +1059,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         trainable_param_names = self._get_trainable_parameters_example(adapter_name, self.model)
         if optimizer_config.optimizer is not None:
             expr += (f'Adapter config:\n'
-                    f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
-                    f'Trainable parameters examples:\n'
-                    f'{trainable_param_names}\n'
-                    f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}\n'
-                    f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
-                    f'Learning rate: {optimizer_config.optimizer.defaults.get("lr", "No default lr")}\n'
-                    f'Lr scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
-                    f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n')
+                     f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
+                     f'Trainable parameters examples:\n'
+                     f'{trainable_param_names}\n'
+                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || '
+                     f'trainable%: {100 * trainable_params / all_param:.4f}\n'
+                     f'Optimizer: {optimizer_config.optimizer.__class__.__name__}\n'
+                     f'Learning rate: {optimizer_config.optimizer.defaults.get("lr", "No default lr")}\n'
+                     f'Lr scheduler: {optimizer_config.lr_scheduler.__class__.__name__}\n'
+                     f'Gradient accumulation steps: {optimizer_config.gradient_accumulation_steps}\n')
         else:
             expr += (f'Adapter config:\n'
                      f'{json.dumps(config, indent=2, ensure_ascii=False)}\n'
                      f'Trainable parameters examples:\n'
                      f'{trainable_param_names}\n'
-                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}%\n'
-                     )
+                     f'Trainable params: {trainable_params:,d} || all params: {all_param:,d} || '
+                     f'trainable%: {100 * trainable_params / all_param:.4f}%\n')
         return expr
 
     # =========================================================================
@@ -1093,6 +1099,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
+
                 def weight_generator():
                     if isinstance(model, PeftModel):
                         model.merge_adapter()

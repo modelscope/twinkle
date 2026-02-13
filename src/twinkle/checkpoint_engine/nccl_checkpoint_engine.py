@@ -3,18 +3,14 @@
 
 import asyncio
 import time
-from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Generator
-
 import torch
 import torch.distributed as dist
 import zmq
-from twinkle import get_logger
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Generator
 
-from twinkle.utils.network import (
-    find_free_port,
-    is_valid_ipv6_address,
-)
+from twinkle import get_logger
+from twinkle.utils.network import find_free_port, is_valid_ipv6_address
 from .base import CheckpointEngine, TensorMeta
 
 logger = get_logger()
@@ -25,7 +21,7 @@ class MasterMetadata:
     zmq_ip: str
     zmq_port: int
     # TCPStore address for the checkpoint NCCL process group
-    nccl_store_host: str = ""
+    nccl_store_host: str = ''
     nccl_store_port: int = 0
 
 
@@ -105,7 +101,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def __init__(
         self,
         bucket_size: int = 2048 << 20,
-        group_name: str = "twinkle_ckpt",
+        group_name: str = 'twinkle_ckpt',
         rebuild_group: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
         **kwargs,
@@ -117,7 +113,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # Set by Manager before prepare() via attribute assignment
         self.is_master = False
-        self.topic = "bucket_metadata"
+        self.topic = 'bucket_metadata'
 
         # Will be set during prepare / init_process_group
         self.rank = None
@@ -139,16 +135,16 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def _start_zmq_server(self):
         """Start ZMQ PUB server for metadata broadcast (master only)."""
         import ray
-        self.ip = ray.util.get_node_ip_address().strip("[]")
+        self.ip = ray.util.get_node_ip_address().strip('[]')
         self.listen_port = find_free_port()
 
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
         if is_valid_ipv6_address(self.ip):
-            address = f"tcp://[{self.ip}]:{self.listen_port}"
+            address = f'tcp://[{self.ip}]:{self.listen_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
-            address = f"tcp://{self.ip}:{self.listen_port}"
+            address = f'tcp://{self.ip}:{self.listen_port}'
 
         self.socket.bind(address)
 
@@ -157,10 +153,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         context = zmq.Context()
         self.socket = context.socket(zmq.SUB)
         if is_valid_ipv6_address(metadata.zmq_ip):
-            address = f"tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}"
+            address = f'tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
-            address = f"tcp://{metadata.zmq_ip}:{metadata.zmq_port}"
+            address = f'tcp://{metadata.zmq_ip}:{metadata.zmq_port}'
 
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
@@ -190,10 +186,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         if self.is_master:
             # Buffers on CUDA for NCCL broadcast
-            self.send_buf = torch.zeros(
-                self.bucket_size, dtype=torch.uint8, device="cuda")
-            self.recv_buf = torch.zeros(
-                self.bucket_size, dtype=torch.uint8, device="cuda")
+            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='cuda')
+            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='cuda')
             self._start_zmq_server()
 
             # Allocate a TCPStore port for the checkpoint process group
@@ -208,10 +202,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 nccl_store_port=self._nccl_store_port,
             )
         else:
-            self.send_buf = torch.zeros(
-                self.bucket_size, dtype=torch.uint8, device="cuda")
-            self.recv_buf = torch.zeros(
-                self.bucket_size, dtype=torch.uint8, device="cuda")
+            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='cuda')
+            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='cuda')
             self._prepared = True
             return None
 
@@ -230,7 +222,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 try:
                     self.socket.close()
                 except Exception as e:
-                    logger.warning(f"Error closing ZMQ socket: {e}")
+                    logger.warning(f'Error closing ZMQ socket: {e}')
                 self.socket = None
 
             if self._pg is not None:
@@ -274,19 +266,18 @@ class NCCLCheckpointEngine(CheckpointEngine):
         master_metadata = metadata[0]
 
         trainer_kwargs = {
-            "rank": [0] + [-1] * (trainer_world_size - 1),
-            "world_size": [rollout_world_size + 1] * trainer_world_size,
-            "master_metadata": [master_metadata] * trainer_world_size,
+            'rank': [0] + [-1] * (trainer_world_size - 1),
+            'world_size': [rollout_world_size + 1] * trainer_world_size,
+            'master_metadata': [master_metadata] * trainer_world_size,
         }
         rollout_kwargs = {
-            "rank": list(range(1, rollout_world_size + 1)),
-            "world_size": [rollout_world_size + 1] * rollout_world_size,
-            "master_metadata": [master_metadata] * rollout_world_size,
+            'rank': list(range(1, rollout_world_size + 1)),
+            'world_size': [rollout_world_size + 1] * rollout_world_size,
+            'master_metadata': [master_metadata] * rollout_world_size,
         }
         return trainer_kwargs, rollout_kwargs
 
-    def init_process_group(self, rank: int, world_size: int,
-                           master_metadata: MasterMetadata):
+    def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
         """Initialize a dedicated NCCL process group for weight synchronization.
 
         Creates a ``ProcessGroupNCCL`` directly (without registering it in the
@@ -334,28 +325,26 @@ class NCCLCheckpointEngine(CheckpointEngine):
             # with the default process group or any existing torch.distributed
             # state.
             self._pg = dist.ProcessGroupNCCL(
-                self._store, rank, world_size,
+                self._store,
+                rank,
+                world_size,
             )
         else:
-            assert self.rank == rank, f"rank {rank} != self.rank {self.rank}"
-            assert self.world_size == world_size, (
-                f"world_size {world_size} != self.world_size {self.world_size}"
-            )
+            assert self.rank == rank, f'rank {rank} != self.rank {self.rank}'
+            assert self.world_size == world_size, (f'world_size {world_size} != self.world_size {self.world_size}')
 
         # Receivers connect to master's ZMQ PUB server
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
         # Barrier via broadcast to ensure all workers are ready
-        barrier_tensor = torch.zeros(1, dtype=torch.int32, device="cuda")
+        barrier_tensor = torch.zeros(1, dtype=torch.int32, device='cuda')
         _pg_broadcast(self._pg, barrier_tensor, src=0)
         torch.cuda.synchronize()
 
         self._group_initialized = True
-        logger.info(
-            f"init_process_group: rank={self.rank}, "
-            f"world_size={self.world_size}"
-        )
+        logger.info(f'init_process_group: rank={self.rank}, '
+                    f'world_size={self.world_size}')
 
     # ── Send / Receive ───────────────────────────────────────────────────
 
@@ -372,9 +361,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
         Args:
             weights: A generator yielding (name, tensor) pairs.
         """
-        assert self.rank is not None and self.rank <= 0, (
-            "Trainer workers other than rank 0 should not send weights."
-        )
+        assert self.rank is not None and self.rank <= 0, ('Trainer workers other than rank 0 should not send weights.')
 
         # Non-participating ranks: consume the generator without sending
         if self.rank < 0:
@@ -402,7 +389,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     rank=self.rank,
                     pg=self._pg,
                     bucket=send_buf,
-                    metadata={"bucket_meta": bucket_meta, "is_last": False},
+                    metadata={
+                        'bucket_meta': bucket_meta,
+                        'is_last': False
+                    },
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -413,22 +403,19 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 offset = 0
 
             assert offset + weight.nbytes <= self.bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large "
-                f"for bucket ({self.bucket_size / 1e6:.1f} MB). "
-                f"Increase bucket_size."
-            )
+                f'Weight {name}({weight.shape}, {weight.dtype}) is too large '
+                f'for bucket ({self.bucket_size / 1e6:.1f} MB). '
+                f'Increase bucket_size.')
 
             bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
+                'name': name,
+                'shape': weight.shape,
+                'dtype': weight.dtype,
+                'offset': offset,
             }
 
             # Copy weight to buffer (both buffers are on CUDA)
-            send_buf[offset:offset + weight.nbytes].copy_(
-                weight.view(-1).view(torch.uint8), non_blocking=True
-            )
+            send_buf[offset:offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
             offset += weight.nbytes
 
         # Broadcast final bucket
@@ -440,21 +427,20 @@ class NCCLCheckpointEngine(CheckpointEngine):
             rank=self.rank,
             pg=self._pg,
             bucket=send_buf,
-            metadata={"bucket_meta": bucket_meta, "is_last": True},
+            metadata={
+                'bucket_meta': bucket_meta,
+                'is_last': True
+            },
             socket=self.socket,
             topic=self.topic,
         )
         await broadcast_op.wait_for_complete()
 
-        logger.info(
-            f"Rank {self.rank} send weights done, "
-            f"time cost: {time.time() - start_time:.2f}s"
-        )
+        logger.info(f'Rank {self.rank} send weights done, '
+                    f'time cost: {time.time() - start_time:.2f}s')
 
     @torch.no_grad()
-    async def receive_weights(
-        self,
-    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(self, ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         """Receive model weights from trainer via NCCL broadcast.
 
         Uses double buffering: receive into recv_buf while processing
@@ -465,9 +451,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             *view* into the receive buffer -- callers that need to keep it
             should clone it.
         """
-        assert self.rank is not None and self.rank > 0, (
-            "Rank 0 should not receive weights."
-        )
+        assert self.rank is not None and self.rank > 0, ('Rank 0 should not receive weights.')
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         total_bytes, total_params = 0, 0
@@ -484,12 +468,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
         )
         metadata = await broadcast_op.wait_for_complete()
         total_bytes += self.bucket_size
-        total_params += len(metadata["bucket_meta"])
+        total_params += len(metadata['bucket_meta'])
 
         # Swap buffers
         send_buf, recv_buf = recv_buf, send_buf
 
-        while not metadata["is_last"]:
+        while not metadata['is_last']:
             # 1. Start receiving next bucket
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
@@ -501,36 +485,30 @@ class NCCLCheckpointEngine(CheckpointEngine):
             )
 
             # 2. Yield tensors from current buffer (send_buf)
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
+            for name, meta in metadata['bucket_meta'].items():
+                dtype, shape = meta['dtype'], meta['shape']
                 size = dtype.itemsize * shape.numel()
-                tensor = send_buf[
-                    meta["offset"]:meta["offset"] + size
-                ].view(dtype=dtype).view(shape)
+                tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
                 yield name, tensor
 
             # 3. Wait for next bucket
             metadata = await broadcast_op.wait_for_complete()
             total_bytes += self.bucket_size
-            total_params += len(metadata["bucket_meta"])
+            total_params += len(metadata['bucket_meta'])
 
             # 4. Swap buffers
             torch.cuda.synchronize()
             send_buf, recv_buf = recv_buf, send_buf
 
         # Yield tensors from final bucket
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
+        for name, meta in metadata['bucket_meta'].items():
+            dtype, shape = meta['dtype'], meta['shape']
             size = dtype.itemsize * shape.numel()
-            tensor = send_buf[
-                meta["offset"]:meta["offset"] + size
-            ].view(dtype=dtype).view(shape)
+            tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
             yield name, tensor
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024)
-        logger.info(
-            f"receive_weights done: rank={self.rank}, "
-            f"params={total_params}, "
-            f"time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s"
-        )
+        logger.info(f'receive_weights done: rank={self.rank}, '
+                    f'params={total_params}, '
+                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')

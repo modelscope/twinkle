@@ -1,10 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py
 
-from contextlib import nullcontext
-from typing import List, Optional, Union
-
 import torch
+from contextlib import nullcontext
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
@@ -13,16 +11,16 @@ from megatron.core.models.gpt import gpt_model
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 from PIL import Image
+from transformers.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from typing import List, Optional, Union
 
-from twinkle.utils import to_device
 from twinkle.model.megatron.args import get_args
 from twinkle.model.megatron.model.constant import MegatronModelType, ModelType
 from twinkle.model.megatron.model.gpt_bridge import GPTBridge, MultimodalGPTBridge
 from twinkle.model.megatron.model.mm_gpt_model import MultimodalGPTModel
+from twinkle.utils import to_device
 from ..register import MegatronModelMeta, register_megatron_model
 from .utils import HuggingFaceModule
-
-from transformers.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 te_checkpoint = None
 
@@ -40,8 +38,7 @@ class Qwen3Omni_Vit(HuggingFaceModule):
     module_mapping = {'thinker': 'thinker', 'talker': 'talker', 'code2wav': 'code2wav'}
     _vision_tower = ['thinker.audio_tower', 'thinker.visual']
     _aligner = [
-        'thinker.audio_tower.proj1', 'thinker.audio_tower.proj2', 
-        'thinker.visual.merger', 'thinker.visual.merger_list'
+        'thinker.audio_tower.proj1', 'thinker.audio_tower.proj2', 'thinker.visual.merger', 'thinker.visual.merger_list'
     ]
     _generator = ['talker', 'code2wav']
 
@@ -151,7 +148,7 @@ class Qwen3Omni_Vit(HuggingFaceModule):
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         """Merge Qwen-Omni vision features into embeddings with audio support.
-        
+
         Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py:149-169
         """
         input_ids = kwargs['input_ids']
@@ -178,7 +175,7 @@ class Qwen3Omni_Vit(HuggingFaceModule):
 
 class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
     """TransformerBlock with deepstack visual feature injection for Qwen3-VL.
-    
+
     Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py:172-444
     """
 
@@ -200,14 +197,13 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
 
         def custom(start: int, end: int):
 
-            def custom_forward(hidden_states, attention_mask, context, context_mask, rotary_pos_emb, 
-                             visual_pos_masks, deepstack_visual_embeds):
+            def custom_forward(hidden_states, attention_mask, context, context_mask, rotary_pos_emb, visual_pos_masks,
+                               deepstack_visual_embeds):
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1) 
-                        if use_inner_fp8_context else nullcontext()
-                    )
+                        get_fp8_context(self.config, layer.layer_number
+                                        - 1) if use_inner_fp8_context else nullcontext())
                     with inner_fp8_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -276,9 +272,9 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
                         and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
-                        visual_pos_masks, deepstack_visual_embeds)
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(hidden_states, attention_mask, context,
+                                                                              context_mask, rotary_pos_emb,
+                                                                              visual_pos_masks, deepstack_visual_embeds)
         else:
             raise ValueError('Invalid activation recompute method.')
 
@@ -304,14 +300,13 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
         deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
     ):
         """Forward pass through the transformer block with deepstack support.
-        
+
         Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py:285-434
         """
         if deepstack_visual_embeds is not None:
-            assert len(deepstack_visual_embeds) <= len(self.layers), (
-                f'len(deepstack_visual_embeds): {len(deepstack_visual_embeds)}, '
-                f'len(self.layers): {len(self.layers)}.'
-            )
+            assert len(deepstack_visual_embeds) <= len(
+                self.layers), (f'len(deepstack_visual_embeds): {len(deepstack_visual_embeds)}, '
+                               f'len(self.layers): {len(self.layers)}.')
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Delete the obsolete reference to the initial input tensor if necessary
@@ -349,9 +344,8 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
             else:
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1) 
-                        if use_inner_fp8_context else nullcontext()
-                    )
+                        get_fp8_context(self.config, layer.layer_number
+                                        - 1) if use_inner_fp8_context else nullcontext())
                     with self.offload_context, inner_fp8_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -392,7 +386,7 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
     def _deepstack_process(self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor,
                            visual_embeds: torch.Tensor):
         """Inject visual features into hidden states at visual token positions.
-        
+
         Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py:436-444
         """
         if visual_pos_masks is None:
@@ -406,7 +400,7 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
 
 class Qwen3VLGPTModel(MultimodalGPTModel):
     """Qwen3-VL GPT model with deepstack visual feature injection.
-    
+
     Reference: swift/swift/megatron/model/mm_gpts/qwen3_vl.py:447-457
     """
 
@@ -441,9 +435,8 @@ class Qwen3VL_Vit(HuggingFaceModule):
         super().__init__(config, [Qwen3VLTextModel, Qwen3VLMoeTextModel])
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return Qwen3Omni_Vit._get_inputs_embeds(
-            inputs_embeds, kwargs, self.visual, self.processor, self.model_config
-        )
+        return Qwen3Omni_Vit._get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.model_config)
+
 
 register_megatron_model(
     MegatronModelMeta(

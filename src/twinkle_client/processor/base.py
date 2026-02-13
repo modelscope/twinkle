@@ -10,14 +10,20 @@
 # ============================================================================
 
 from typing import List, Literal, Optional, Union
-from twinkle_client.http import http_post, heartbeat_manager
+
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature
+from twinkle_client.http import heartbeat_manager, http_post
 
-class InputProcessor(object):
+
+class InputProcessor:
     """Client wrapper for InputProcessor that calls server HTTP endpoints."""
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, framework: Literal['transformers', 'megatron'] = 'transformers', **kwargs):
+    def __init__(self,
+                 device_mesh: Optional[DeviceMesh] = None,
+                 padding_free: bool = False,
+                 framework: Literal['transformers', 'megatron'] = 'transformers',
+                 **kwargs):
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
@@ -26,9 +32,13 @@ class InputProcessor(object):
             json_data={
                 'processor_type': 'processor',
                 'class_type': 'InputProcessor',
-                **{'device_mesh': device_mesh, 'padding_free': padding_free, 'framework': framework}, **kwargs
-            }
-        )
+                **{
+                    'device_mesh': device_mesh,
+                    'padding_free': padding_free,
+                    'framework': framework
+                },
+                **kwargs
+            })
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -39,17 +49,16 @@ class InputProcessor(object):
         except:
             pass
 
-        
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__call__',
-                **{'inputs': inputs},
+                **{
+                    'inputs': inputs
+                },
                 **kwargs
-            }
-        )
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
+        return response.json()['result']

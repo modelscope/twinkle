@@ -16,10 +16,8 @@ def any_callable(args):
 def check_unsafe(*args, **kwargs):
     if not trust_remote_code():
         if any_callable(args) or any_callable(kwargs):
-            raise ValueError(
-                "Twinkle does not support Callable or Type inputs in safe mode."
-            )
+            raise ValueError('Twinkle does not support Callable or Type inputs in safe mode.')
 
 
 def trust_remote_code():
-    return os.environ.get("TWINKLE_TRUST_REMOTE_CODE", "1") != "0"
+    return os.environ.get('TWINKLE_TRUST_REMOTE_CODE', '1') != '0'

@@ -1,13 +1,12 @@
 import re
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from types import MethodType
-from typing import Dict, Any
-from typing import Optional, Union, List
-from copy import deepcopy
 import torch
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora import LoraLayer, Linear, Embedding
+from peft.tuners.lora import Embedding, Linear, LoraLayer
+from types import MethodType
+from typing import Any, Dict, List, Optional, Union
 
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
@@ -42,7 +41,7 @@ class MultiLora:
 
     def activate_adapter(self, tenant_adapter_name: str):
         if not self.has_lora(tenant_adapter_name):
-            raise ValueError(f"Adapter {tenant_adapter_name} does not exist")
+            raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
         adapter_name = self.find_lora_by_tenant(tenant_adapter_name).adapter_name
         if isinstance(self.module, list):
             for _module in self.module:
@@ -66,7 +65,7 @@ class MultiLora:
         self.activate_adapter(tenant_adapter_name)
         yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
         # self.deactivate_adapter()
-    
+
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
         _lora = self.find_lora_by_tenant(tenant_adapter_name)
@@ -74,7 +73,9 @@ class MultiLora:
 
         def _before(_module):
             peft_config = _module.peft_config
-            config_dict = {tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config}
+            config_dict = {
+                tenant_adapter_name if not isinstance(self.module, list) else adapter_name: _lora.tenant_config
+            }
             _module.peft_config = config_dict
             _module._peft_config_origin = peft_config
             active_adapter = _module.active_adapter
@@ -101,16 +102,16 @@ class MultiLora:
     def check_length(self, inputs: InputFeature):
         total_length = sum(len(_input['input_ids']) for _input in inputs)
         if total_length > self.max_length:
-             raise ValueError(f'Max length exceeds {self.max_length}')
+            raise ValueError(f'Max length exceeds {self.max_length}')
 
     def acquire_lora(self, tenant_adapter_name: str, config: LoraConfig) -> str:
         if self.has_lora(tenant_adapter_name):
             raise ValueError(f'Lora {tenant_adapter_name} already exists')
         _available_lora = self._get_available_lora()
         if _available_lora is None:
-            raise RuntimeError(f"No lora available for tenant {tenant_adapter_name}")
+            raise RuntimeError(f'No lora available for tenant {tenant_adapter_name}')
         if config.r > self.max_r:
-            raise RuntimeError(f"Too big rank for lora: {config.r}")
+            raise RuntimeError(f'Too big rank for lora: {config.r}')
         _available_lora.tenant_config = config
         _available_lora.tenant_adapter_name = tenant_adapter_name
         return _available_lora.adapter_name
@@ -135,8 +136,8 @@ class MultiLora:
 
     @staticmethod
     def match_target_modules(
-            module_name: str,
-            target_modules: Optional[Union[List[str], str]],
+        module_name: str,
+        target_modules: Optional[Union[List[str], str]],
     ) -> bool:
         if target_modules is None:
             return False
@@ -144,7 +145,7 @@ class MultiLora:
         if isinstance(target_modules, list) and len(target_modules) == 0:
             return False
 
-        if target_modules == "all-linear":
+        if target_modules == 'all-linear':
             return True
 
         if isinstance(target_modules, str):
@@ -165,6 +166,7 @@ class MultiLora:
             _LoraParallelLinear = ()
 
         if isinstance(base_layer, Linear):
+
             def _linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
                 self._check_forward_args(x, *args, **kwargs)
 
@@ -186,8 +188,10 @@ class MultiLora:
                     scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
                     x = self._cast_input_dtype(x, lora_A.weight.dtype)
                     dropout_x = dropout(x)
-                    lora_A_out = torch.nn.functional.linear(dropout_x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
-                    lora_B_out = torch.nn.functional.linear(lora_A_out, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
+                    lora_A_out = torch.nn.functional.linear(
+                        dropout_x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
+                    lora_B_out = torch.nn.functional.linear(
+                        lora_A_out, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
                     result = result + lora_B_out * scaling
                 result = result.to(torch_result_dtype)
                 return result
@@ -232,10 +236,10 @@ class MultiLora:
         elif isinstance(base_layer, _LoraParallelLinear):
 
             def _megatron_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
-                from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TELinear, \
-                    TEGroupedLinear
-                from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, \
-                    scatter_to_sequence_parallel_region
+                from megatron.core.extensions.transformer_engine import (TEGroupedLinear,
+                                                                         TELayerNormColumnParallelLinear, TELinear)
+                from megatron.core.tensor_parallel import (gather_from_sequence_parallel_region,
+                                                           scatter_to_sequence_parallel_region)
                 from megatron.core.transformer.moe.router import TopKRouter
 
                 previous_dtype = x.dtype
@@ -258,12 +262,9 @@ class MultiLora:
                     with self._patch_router_gating():
                         result, bias = self.base_layer(x, *args, **kwargs)
                 else:
-                    raise ValueError(
-                        f'Unsupported base layer type: {type(self.base_layer)}')
+                    raise ValueError(f'Unsupported base layer type: {type(self.base_layer)}')
 
-                if not isinstance(
-                        self.base_layer,
-                        TopKRouter) and not self.disable_adapters and not self.merged:
+                if not isinstance(self.base_layer, TopKRouter) and not self.disable_adapters and not self.merged:
                     if self.sequence_parallel and self.base_layer.parallel_mode == 'column':
                         x = gather_from_sequence_parallel_region(x)
 
@@ -283,6 +284,7 @@ class MultiLora:
 
                         def _lora_A(x, *args, **kwargs):
                             if isinstance(lora_A, TEGroupedLinear):
+
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
                                     return [t[:_lora.tenant_config.r, :] for t in tensors]
@@ -294,11 +296,12 @@ class MultiLora:
                                 delattr(lora_A, '_get_weight_tensors_origin')
                                 return output
                             else:
-                                return torch.nn.functional.linear(x, lora_A.weight[:_lora.tenant_config.r, :],
-                                                                        bias=None)
+                                return torch.nn.functional.linear(
+                                    x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
 
                         def _lora_B(x, *args, **kwargs):
                             if isinstance(lora_B, TEGroupedLinear):
+
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
                                     return [t[:, :_lora.tenant_config.r] for t in tensors]
@@ -310,11 +313,10 @@ class MultiLora:
                                 delattr(lora_B, '_get_weight_tensors_origin')
                                 return output
                             else:
-                                return torch.nn.functional.linear(x, lora_B.weight[:, :_lora.tenant_config.r],
-                                                                  bias=None)
+                                return torch.nn.functional.linear(
+                                    x, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
 
-                        dtype = lora_A.weight0.dtype if isinstance(
-                            lora_A, TEGroupedLinear) else lora_A.weight.dtype
+                        dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
                         x = x.to(dtype)
 
                         lora_result = _lora_A(dropout(x), *args, **kwargs)
@@ -328,8 +330,7 @@ class MultiLora:
                         lora_result = lora_result * scaling
 
                         if self.sequence_parallel and self.base_layer.parallel_mode == 'row':
-                            lora_result = scatter_to_sequence_parallel_region(
-                                lora_result)
+                            lora_result = scatter_to_sequence_parallel_region(lora_result)
 
                         result = result + lora_result
 
@@ -419,7 +420,7 @@ class MultiLora:
             if 'embedding_A' in name:
                 r_saved = parameter.shape[1]
                 parameter = torch.cat(
-                    (parameter, torch.zeros(parameter.shape[0], self.max_r-r_saved).to(parameter.dtype)), dim=1)
+                    (parameter, torch.zeros(parameter.shape[0], self.max_r - r_saved).to(parameter.dtype)), dim=1)
             elif 'embedding_B' in name:
                 r_saved = parameter.shape[0]
                 parameter = torch.cat(
@@ -437,20 +438,21 @@ class MultiLora:
         if isinstance(parameter, torch.Tensor):
             return convert_param(name, parameter)
         elif 'lazytensor' in parameter.__class__.__name__.lower():
-            
+
             def _loader(self):
                 tensor = self.loader_origin()
                 return convert_param(name, tensor)[1]
-            
+
             parameter.loader_origin = parameter.loader
             parameter.loader = MethodType(_loader, parameter)
             return name, parameter
-    
+
     def save_lora_converter(self, name, parameter, adapter_name):
         _lora = self.find_lora(adapter_name)
         pattern = re.compile(rf'\.lora_\w+\.{adapter_name}\.')
-        pattern_no_adapter = re.compile(rf'\.lora_\w+\.weight')
-        if (pattern.search(name) or pattern_no_adapter.search(name)) and self.match_target_modules(name, _lora.tenant_config.target_modules):
+        pattern_no_adapter = re.compile(r'\.lora_\w+\.weight')
+        if (pattern.search(name) or pattern_no_adapter.search(name)) and self.match_target_modules(
+                name, _lora.tenant_config.target_modules):
             _param = torch_util.to_local_tensor(parameter)
             if 'embedding_A' in name:
                 _param = _param[:, :_lora.tenant_config.r]
@@ -460,7 +462,7 @@ class MultiLora:
                 _param = _param[:_lora.tenant_config.r, :]
             elif '_B' in name:
                 _param = _param[:, :_lora.tenant_config.r]
-            name = name.replace(f'.{_lora.adapter_name}.', f'.')
+            name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
             return None, None
@@ -472,7 +474,7 @@ class MultiLora:
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.')
+                    name = name.replace(f'.{_lora.adapter_name}.', '.')
                     src_tensor = state_dict[name]
                     if 'embedding_A' in name:
                         r_saved = src_tensor.shape[1]
@@ -493,7 +495,6 @@ class MultiLora:
         else:
             _load_weights(self.module)
 
-
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
         _lora = self.find_lora_by_tenant(tenant_adapter_name)
@@ -512,7 +513,7 @@ class MultiLora:
                         _param = _param[:_lora.tenant_config.r, :]
                     elif '_B' in name:
                         _param = _param[:, :_lora.tenant_config.r]
-                    name = name.replace(f'.{_lora.adapter_name}.', f'.')
+                    name = name.replace(f'.{_lora.adapter_name}.', '.')
                     state_dict[name] = _param
             return state_dict
 
@@ -571,13 +572,13 @@ class MultiLora:
                         param = param[:, :_lora.tenant_config.r]
 
                 num_params = param.numel()
-                if num_params == 0 and hasattr(param, "ds_numel"):
+                if num_params == 0 and hasattr(param, 'ds_numel'):
                     num_params = param.ds_numel
 
-                if param.__class__.__name__ == "Params4bit":
-                    if hasattr(param, "element_size"):
+                if param.__class__.__name__ == 'Params4bit':
+                    if hasattr(param, 'element_size'):
                         num_bytes = param.element_size()
-                    elif not hasattr(param, "quant_storage"):
+                    elif not hasattr(param, 'quant_storage'):
                         num_bytes = 1
                     else:
                         num_bytes = param.quant_storage.itemsize
@@ -608,7 +609,8 @@ class MultiLora:
 
         def _get_parameters(_module):
             for name, parameter in _module.named_parameters():
-                if parameter.requires_grad and pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
+                if parameter.requires_grad and pattern.search(name) and self.match_target_modules(
+                        name, _lora.tenant_config.target_modules):
                     name = name.replace(f'A.{adapter_name}', f'A.{tenant_adapter_name}')
                     name = name.replace(f'B.{adapter_name}', f'B.{tenant_adapter_name}')
                     trainable_param_names.append(name)

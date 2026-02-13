@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Union, List, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Literal, Union
+
 from .base import Advantage
+
 if TYPE_CHECKING:
     import torch
 
@@ -41,7 +43,7 @@ class RLOOAdvantage(Advantage):
 
         # Guard against invalid num_generations
         if num_generations <= 1 or rewards.numel() % num_generations != 0:
-            raise ValueError("Invalid")
+            raise ValueError('Invalid')
 
         K = num_generations
         grouped = rewards.view(-1, K)

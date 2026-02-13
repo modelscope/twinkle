@@ -1,12 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
-from typing import List, Dict, Any, Tuple, Optional, Callable, TYPE_CHECKING
-from copy import deepcopy, copy
-from twinkle.data_format import Trajectory, Message
+from copy import copy, deepcopy
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+from twinkle.data_format import Message, Trajectory
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
-PLACEHOLDER = "<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>"
+PLACEHOLDER = '<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>'
 
 
 def find_subsequence(seq: List[int], subseq: List[int], start: int = 0) -> int:
@@ -36,8 +38,8 @@ def split_by_subsequence(seq: List[int], subseq: List[int]) -> List[List[int]]:
 
 
 def build_labels(
-        full_ids: List[int],
-        template_parts: List[List[int]],
+    full_ids: List[int],
+    template_parts: List[List[int]],
 ) -> List[int]:
     labels = list(full_ids)
     pos = 0
@@ -50,7 +52,7 @@ def build_labels(
 
         if match_pos == -1:
             # should not happen
-            raise ValueError(f"Template part not found in full_ids at position {pos}")
+            raise ValueError(f'Template part not found in full_ids at position {pos}')
 
         for i in range(match_pos, match_pos + len(part)):
             labels[i] = -100
@@ -79,10 +81,10 @@ def _is_vlm_processor(tokenizer) -> bool:
 
 
 def tokenize_with_assistant_labels(
-        tokenizer: 'PreTrainedTokenizer',
-        encode_func: Callable,
-        trajectory: Trajectory,
-        placeholder: str = PLACEHOLDER,
+    tokenizer: 'PreTrainedTokenizer',
+    encode_func: Callable,
+    trajectory: Trajectory,
+    placeholder: str = PLACEHOLDER,
 ) -> Tuple[List[int], List[int], Dict[str, Any]]:
     import torch
     messages = [dict(message) for message in trajectory['messages']]
@@ -92,25 +94,21 @@ def tokenize_with_assistant_labels(
     for msg in messages:
         if msg['role'] == 'assistant':
             msg = deepcopy(msg)
-            if isinstance(msg["content"], str):
-                msg["content"] = placeholder
+            if isinstance(msg['content'], str):
+                msg['content'] = placeholder
             else:
-                msg["content"][0]['text'] = placeholder
+                msg['content'][0]['text'] = placeholder
             assistant_count += 1
         _dummy_messages.append(msg)
 
-    encoded = encode_func(
-        trajectory,
-    )
+    encoded = encode_func(trajectory, )
     full_ids = encoded.pop('input_ids')
     if isinstance(full_ids, torch.Tensor):
         full_ids = full_ids.tolist()[0]
 
     _dummy_trajectory = copy(trajectory)
     _dummy_trajectory['messages'] = _dummy_messages
-    template_ids = encode_func(
-        _dummy_trajectory,
-    )
+    template_ids = encode_func(_dummy_trajectory, )
     template_ids = template_ids['input_ids']
     if isinstance(template_ids, torch.Tensor):
         template_ids = template_ids.tolist()[0]
@@ -122,15 +120,13 @@ def tokenize_with_assistant_labels(
     template_parts = split_by_subsequence(template_ids, placeholder_ids)
 
     if len(template_parts) != assistant_count + 1:
-        raise ValueError(
-            f"Expected {assistant_count + 1} parts, got {len(template_parts)}. "
-            "Placeholder might appear in original content."
-        )
+        raise ValueError(f'Expected {assistant_count + 1} parts, got {len(template_parts)}. '
+                         'Placeholder might appear in original content.')
 
     try:
         labels = build_labels(full_ids, template_parts)
     except ValueError as e:
-        newline_placeholder_ids = tokenizer.encode("\n" + placeholder, **extra_kwargs)
+        newline_placeholder_ids = tokenizer.encode('\n' + placeholder, **extra_kwargs)
         template_parts = split_by_subsequence(template_ids, newline_placeholder_ids)
         if len(template_parts) == assistant_count + 1:
             labels = build_labels(full_ids, template_parts)
@@ -150,8 +146,8 @@ def tokenize_with_assistant_labels(
 
 def _load_image(img: Any) -> Optional[Any]:
     """Load images to PIL format."""
-    from PIL import Image
     import io
+    from PIL import Image
 
     if img is None:
         return None
@@ -211,6 +207,7 @@ def _transfer_single_message(content: str, image_placeholder, video_placeholder,
             remaining = remaining[vid_pos + len(video_placeholder):]
     return new_content
 
+
 def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder, is_mm):
     if is_mm:
         new_content = _transfer_single_message(message['content'], image_placeholder, video_placeholder,
@@ -218,5 +215,8 @@ def transfer_to_standard_message(message: Message, image_placeholder, video_plac
     else:
         new_content = message['content']
 
-    return Message(role=message['role'], content=new_content, tool_calls=message.get('tool_calls'),
-                   reasoning_content=message.get('reasoning_content'))
+    return Message(
+        role=message['role'],
+        content=new_content,
+        tool_calls=message.get('tool_calls'),
+        reasoning_content=message.get('reasoning_content'))

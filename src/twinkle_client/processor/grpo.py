@@ -1,9 +1,10 @@
 from typing import Optional
-from twinkle_client.http import TWINKLE_SERVER_URL
-from twinkle_client.http import http_post, heartbeat_manager
+
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature
+from twinkle_client.http import TWINKLE_SERVER_URL, heartbeat_manager, http_post
 from .base import InputProcessor
+
 
 class GRPOLossProcessor(InputProcessor):
     """Client wrapper for GRPOLossProcessor that calls server HTTP endpoints."""
@@ -17,9 +18,12 @@ class GRPOLossProcessor(InputProcessor):
             json_data={
                 'processor_type': 'processor',
                 'class_type': 'GRPOLossProcessor',
-                **{'device_mesh': device_mesh, 'ignore_index': ignore_index}, **kwargs
-            }
-        )
+                **{
+                    'device_mesh': device_mesh,
+                    'ignore_index': ignore_index
+                },
+                **kwargs
+            })
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -30,16 +34,15 @@ class GRPOLossProcessor(InputProcessor):
         except:
             pass
 
-        
     def prepare_inputs(self, inputs: InputFeature):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'prepare_inputs',
-                **{'inputs': inputs},
-            }
-        )
+                **{
+                    'inputs': inputs
+                },
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
+        return response.json()['result']

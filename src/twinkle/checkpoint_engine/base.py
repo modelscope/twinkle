@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
+import torch
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Generator, TypedDict
-
-import torch
 
 
 class TensorMeta(TypedDict):

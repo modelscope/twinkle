@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
-from typing import List, Any, Tuple
+from typing import Any, List, Tuple
+
 from .message import Message, Tool
 
 if sys.version_info[:2] <= (3, 11):

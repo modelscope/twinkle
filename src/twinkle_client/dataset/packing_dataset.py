@@ -9,10 +9,10 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
-from twinkle_client.http import http_post, heartbeat_manager
-from twinkle.dataset import Dataset
-from twinkle.dataset import DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle_client.http import heartbeat_manager, http_post
 from .base import Dataset
+
 
 class PackingDataset(Dataset):
     """Client wrapper for PackingDataset that calls server HTTP endpoints."""
@@ -39,7 +39,7 @@ class PackingDataset(Dataset):
         except:
             pass
 
-        
+
     def pack_dataset(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -50,9 +50,9 @@ class PackingDataset(Dataset):
             }
         )
         response.raise_for_status()
-        return response.json()["result"]
-    
-    
+        return response.json()['result']
+
+
     def __getitem__(self, index):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -63,9 +63,9 @@ class PackingDataset(Dataset):
             }
         )
         response.raise_for_status()
-        return response.json()["result"]
-    
-    
+        return response.json()['result']
+
+
     def __len__(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -76,5 +76,4 @@ class PackingDataset(Dataset):
             }
         )
         response.raise_for_status()
-        return response.json()["result"]
-    
+        return response.json()['result']

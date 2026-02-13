@@ -1,6 +1,7 @@
-from typing import List
+from typing import TYPE_CHECKING, List
+
 from twinkle.patch import Patch
-from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     import torch.nn as nn
 
@@ -23,13 +24,10 @@ class MegatronPeft(Patch):
                 # Megatron's TransformerConfig doesn't have .get() method
                 # Check share_embeddings_and_output_weights instead
                 tied_target_modules = []
-                if getattr(model, 'share_embeddings_and_output_weights',
-                           False):
+                if getattr(model, 'share_embeddings_and_output_weights', False):
                     for target_module in self.targeted_module_names:
                         module_name = target_module.split('.')[-1]
-                        if module_name in [
-                            'output_layer', 'embedding', 'word_embeddings'
-                        ]:
+                        if module_name in ['output_layer', 'embedding', 'word_embeddings']:
                             tied_target_modules.append(target_module)
                 return tied_target_modules
 

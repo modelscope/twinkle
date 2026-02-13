@@ -71,4 +71,3 @@ applications:
   #         num_cpus: 0.1
   #       logging_config:
   #         log_level: DEBUG
-

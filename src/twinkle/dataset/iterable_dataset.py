@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from torch.utils.data import IterableDataset
 
+from twinkle import remote_class, remote_function
 from .base import Dataset, DatasetMeta
-from twinkle import remote_function, remote_class
 
 
 @remote_class(execute='first')
@@ -11,12 +11,10 @@ class IterableDataset(IterableDataset, Dataset):
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
         kwargs['streaming'] = True
-        super(IterableDataset, self).__init__(dataset_meta, **kwargs)
+        super().__init__(dataset_meta, **kwargs)
 
     @remote_function()
-    def add_dataset(self,
-                    dataset_meta: DatasetMeta,
-                    **kwargs):
+    def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
         kwargs['streaming'] = True
         return super().add_dataset(dataset_meta, **kwargs)
 

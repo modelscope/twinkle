@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import time
-from typing import Union, List
+from typing import List, Union
 
-from .base import Metric
 from ..data_format import InputFeature, ModelOutput
+from .base import Metric
 
 
 class TrainMetric(Metric):
@@ -46,7 +46,7 @@ class TrainMetric(Metric):
                 for idx, lr in enumerate(self.lr):
                     results[f'learning rate(param group {idx+1})'] = lr
             else:
-                results[f'learning rate'] = self.lr
+                results['learning rate'] = self.lr
         if self.step is not None:
             results['iters'] = self.step // self.gradient_accumulation_steps
             interval = time.time() - self.time

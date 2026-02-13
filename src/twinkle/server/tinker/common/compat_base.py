@@ -1,10 +1,11 @@
-import torch
 import numpy as np
-from typing import List
+import torch
 from tinker import types
+from typing import List
+
 from twinkle.template import Template
-from twinkle.utils.torch_utils import selective_log_softmax
 from twinkle.utils.platform import DeviceMesh
+from twinkle.utils.torch_utils import selective_log_softmax
 
 
 def collect_forward_backward_results(results, device_mesh: DeviceMesh):
@@ -119,10 +120,9 @@ class TwinkleCompatModelBase:
         results = []
         for feature, logit in zip(inputs, logits):
             # Ensure 1D shape and correct device to avoid dimension mismatch and device errors
-            labels = feature.loss_fn_inputs['target_tokens'].to_torch(
-            ).long().view(-1).to(logit.device)  # shape (seq_len,)
-            weights = feature.loss_fn_inputs['weights'].to_torch(
-            ).view(-1).to(logit.device)  # shape (seq_len,)
+            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(
+                logit.device)  # shape (seq_len,)
+            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(logit.device)  # shape (seq_len,)
 
             # Slice logits to match the sequence length of labels
             # Labels are assumed to be already shifted/aligned with logits

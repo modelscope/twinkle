@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
 if TYPE_CHECKING:
     from twinkle.server.utils.state import ServerStateProxy
     from twinkle.model import TwinkleModel
-    
+
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -70,7 +71,7 @@ class AdapterManagerMixin:
         self._adapter_counts: Dict[str, int] = {}
 
         # Countdown thread
-        self._adapter_countdown_thread: Optional[threading.Thread] = None
+        self._adapter_countdown_thread: threading.Thread | None = None
         self._adapter_countdown_running = False
 
     def register_adapter(self, adapter_name: str, token: str, session_id: Optional[str] = None) -> None:
@@ -197,7 +198,7 @@ class AdapterManagerMixin:
         info['inactivity_counter'] = 0
         return True
 
-    def get_adapter_info(self, adapter_name: str) -> Optional[Dict[str, Any]]:
+    def get_adapter_info(self, adapter_name: str) -> dict[str, Any] | None:
         """Get information about a registered adapter.
 
         Args:
@@ -252,8 +253,7 @@ class AdapterManagerMixin:
         2. Calls _on_adapter_expired() for adapters that exceed timeout
         3. Removes expired adapters from tracking
         """
-        logger.debug(
-            f"[AdapterManager] Countdown thread started (timeout={self._adapter_timeout}s)")
+        logger.debug(f'[AdapterManager] Countdown thread started (timeout={self._adapter_timeout}s)')
         while self._adapter_countdown_running:
             try:
                 time.sleep(1)
@@ -328,7 +328,7 @@ class AdapterManagerMixin:
                 logger.warning(f"[AdapterManager] Error in countdown loop: {e}")
                 continue
 
-        logger.debug("[AdapterManager] Countdown thread stopped")
+        logger.debug('[AdapterManager] Countdown thread stopped')
 
     def start_adapter_countdown(self) -> None:
         """Start the background adapter countdown thread.
@@ -338,12 +338,9 @@ class AdapterManagerMixin:
         """
         if not self._adapter_countdown_running:
             self._adapter_countdown_running = True
-            self._adapter_countdown_thread = threading.Thread(
-                target=self._adapter_countdown_loop,
-                daemon=True
-            )
+            self._adapter_countdown_thread = threading.Thread(target=self._adapter_countdown_loop, daemon=True)
             self._adapter_countdown_thread.start()
-            logger.debug("[AdapterManager] Countdown thread started")
+            logger.debug('[AdapterManager] Countdown thread started')
 
     def stop_adapter_countdown(self) -> None:
         """Stop the background adapter countdown thread.
@@ -355,7 +352,7 @@ class AdapterManagerMixin:
             if self._adapter_countdown_thread:
                 # Wait for thread to finish (it checks the flag every second)
                 self._adapter_countdown_thread.join(timeout=2.0)
-            logger.debug("[AdapterManager] Countdown thread stopped")
+            logger.debug('[AdapterManager] Countdown thread stopped')
 
     def check_adapter_limit(self, token: str) -> Tuple[bool, Optional[str]]:
         """Check adapter count for a user token.

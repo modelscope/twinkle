@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 from typing import Any
+
 from .base import Loss
 
 
@@ -54,7 +55,7 @@ class ChunkedCrossEntropyLoss(Loss):
                         logits[l_start:l_end] = grad_chunk
 
                 return logits, None, None
-                
+
         logits = outputs['logits']
         labels = inputs['labels']
         return ChunkedCrossEntropyLossFunc.apply(logits, labels, self.chunk_size)

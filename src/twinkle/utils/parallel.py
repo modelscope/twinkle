@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from contextlib import contextmanager
-
 from datasets.utils.filelock import FileLock
 
 os.makedirs('.locks', exist_ok=True)
@@ -38,7 +37,7 @@ def processing_lock(lock_file: str):
     Returns:
 
     """
-    lock: FileLock = FileLock(os.path.join('.locks', f"{lock_file}.lock")) # noqa
+    lock: FileLock = FileLock(os.path.join('.locks', f'{lock_file}.lock'))  # noqa
 
     if acquire_lock(lock, False):
         try:

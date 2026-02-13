@@ -1,11 +1,9 @@
 import os
-
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform
-from twinkle import get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -17,7 +15,7 @@ if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
 
     run = swanlab.init(
-        project="twinkle",
+        project='twinkle',
     )
 
 
@@ -55,7 +53,7 @@ def train():
     # Global batch size = 4, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel, transformer_cls_names_to_wrap=Qwen3MoeSparseMoeBlock to avoid hang of fsdp2
-    model = TransformersModel(model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', fsdp_config={'transformer_cls_names_to_wrap':["Qwen3MoeSparseMoeBlock"]})
+    model = TransformersModel(model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', fsdp_config={'transformer_cls_names_to_wrap':['Qwen3MoeSparseMoeBlock']})
     # Patch MoE model to fix the hang bug, support transformers==4.*
     model.apply_patch('ms://twinkle-kit/qwen3_moe_transformers4_patch')
     lora_config = LoraConfig(
