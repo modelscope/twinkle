@@ -848,13 +848,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         Args:
             name: Checkpoint name or HuggingFace Hub model id.
             output_dir: Parent directory that contains the checkpoint folder.
-                If None **and** ``resume`` is False, downloads from Hub.
-            resume: If True, restore optimizer, lr_scheduler and RNG state
+                If None **and** ``load_optimizer`` is False, downloads from Hub.
+            load_optimizer: If True, restore optimizer, lr_scheduler and RNG state
                 from the mcore sub-checkpoint for training resumption.
             **kwargs: Additional arguments (``adapter_name``, ``no_load_optim``,
                 ``no_load_rng``, etc.).
         """
-        resume = kwargs.pop('resume', False)
+        resume = kwargs.pop('load_optimizer', False)
         if output_dir is None and not resume:
             # Load from hub
             token = kwargs.pop('token', None)

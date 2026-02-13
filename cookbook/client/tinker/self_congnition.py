@@ -8,7 +8,7 @@
 # The server must be running first (see server.py and server_config.yaml).
 import numpy as np
 import os
-from modelscope import AutoTokenizer
+from tqdm import tqdm
 from tinker import types
 from twinkle_client import init_tinker_compat_client
 from twinkle.data_format import Message, Trajectory
@@ -125,5 +125,5 @@ def eval():
 
 
 if __name__ == '__main__':
-    # train()   # Uncomment to run training
-    eval()      # Run evaluation / inference
+    train()   # Uncomment to run training
+    # eval()      # Run evaluation / inference
