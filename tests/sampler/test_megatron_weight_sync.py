@@ -33,6 +33,8 @@ import os
 import sys
 import time
 
+import pytest
+
 # Must set before importing anything
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
@@ -80,6 +82,14 @@ def get_model_path():
 # =============================================================================
 
 
+@pytest.mark.skipif(
+    not os.environ.get('CUDA_VISIBLE_DEVICES') or len(os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',')) < 4,
+    reason='Requires 4+ GPUs',
+)
+@pytest.mark.skipif(
+    not __import__('importlib').util.find_spec('vllm'),
+    reason='vllm not installed',
+)
 def test_megatron_weight_sync(
     model_gpus: int = 2,
     sampler_gpus: int = 2,
