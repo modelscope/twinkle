@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 from typing import Dict, Any, Optional, Literal, Set, TYPE_CHECKING
 
 import torch
@@ -18,13 +19,11 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
-                 enable_ep: bool = True,
-                 enable_ep_fsdp: bool = False):
+                 enable_ep: bool = True):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
         self.enable_ep = enable_ep
-        self.enable_ep_fsdp = enable_ep_fsdp
 
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:
@@ -35,7 +34,6 @@ class NativeFSDPStrategy:
             ep_fsdp_mode = _is_ep_fsdp_mode_enabled(
                 self.device_mesh,
                 self.enable_ep,
-                self.enable_ep_fsdp,
             )
             if self.enable_ep:
                 _ensure_moe_patched_if_needed(model, self.device_mesh)
@@ -49,14 +47,15 @@ class NativeFSDPStrategy:
                 ep_fsdp_mesh = _build_ep_fsdp_mesh(self.device_mesh)
                 if ep_fsdp_mesh is None:
                     raise RuntimeError(
-                        "expert_parallel.ep_fsdp is enabled but could not build an ep_fsdp device mesh."
+                        "Implicit EP_FSDP requires dp dim with size > 1, but could not build an ep_fsdp mesh from dp."
                     )
-                _maybe_shard_ep_expert_blocks(
+                sharded_blocks = _maybe_shard_ep_expert_blocks(
                     model,
                     mesh=ep_fsdp_mesh,
                     reshard_after_forward=reshard_after_forward,
                     mp_policy=mp_policy,
                 )
+                _debug_log_ep_fsdp_sharding(model, self.device_mesh, sharded_blocks)
 
             _maybe_shard_layers(
                 model,
@@ -108,20 +107,18 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
 
 
 def _build_ep_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
-    if device_mesh is None or not device_mesh.has_dim("ep_fsdp"):
+    if device_mesh is None or not device_mesh.has_dim("dp"):
         return None
-    ranks = device_mesh.get_ranks_for_dims("ep_fsdp")
+    ranks = device_mesh.get_ranks_for_dims("dp")
     if len(ranks) <= 1:
         return None
     return TorchDeviceMesh(device_mesh.device_type, ranks, mesh_dim_names=("ep_fsdp",))
 
 
-def _is_ep_fsdp_mode_enabled(device_mesh: Optional[DeviceMesh], enable_ep: bool, enable_ep_fsdp: bool) -> bool:
-    if not enable_ep or not enable_ep_fsdp or device_mesh is None:
+def _is_ep_fsdp_mode_enabled(device_mesh: Optional[DeviceMesh], enable_ep: bool) -> bool:
+    if not enable_ep or device_mesh is None:
         return False
-    if not device_mesh.has_dim("ep_fsdp"):
-        return False
-    return (device_mesh.ep_fsdp_world_size or 1) > 1
+    return device_mesh.is_implicit_ep_fsdp_enabled()
 
 
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
@@ -146,18 +143,6 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     if not ep_patched:
         return None
     return ignored or None
-
-
-def _collect_block_expert_params(block: nn.Module) -> Set[nn.Parameter]:
-    experts = getattr(block, "experts", None)
-    if experts is None:
-        return set()
-    if isinstance(experts, nn.ModuleList):
-        params: Set[nn.Parameter] = set()
-        for expert in experts:
-            params.update(expert.parameters())
-        return params
-    return set(experts.parameters())
 
 
 def _place_ep_experts_on_local_device(model: nn.Module, device_mesh: DeviceMesh) -> None:
@@ -206,25 +191,38 @@ def _maybe_shard_ep_expert_blocks(model: nn.Module,
                                   *,
                                   mesh: TorchDeviceMesh,
                                   reshard_after_forward: Optional[bool],
-                                  mp_policy: MixedPrecisionPolicy) -> None:
+                                  mp_policy: 'MixedPrecisionPolicy') -> int:
+    from torch.distributed.fsdp import fully_shard
+    sharded_blocks = 0
     for module in model.modules():
         if not getattr(module, "_ep_patched", False):
             continue
         experts = getattr(module, "experts", None)
         if experts is None:
             continue
-        expert_params = _collect_block_expert_params(module)
-        if not expert_params:
-            continue
-        block_params = set(module.parameters())
-        non_expert_params = block_params - expert_params
+        # Correct EP+EP_FSDP behavior: only experts are sharded on ep_fsdp mesh.
+        # Non-expert params (router/gate etc.) are left to global FSDP wrapping.
         fully_shard(
-            module,
+            experts,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
             mp_policy=mp_policy,
-            ignored_params=non_expert_params or None,
         )
+        sharded_blocks += 1
+    return sharded_blocks
+
+
+def _debug_log_ep_fsdp_sharding(model: nn.Module, device_mesh: DeviceMesh, sharded_blocks: int) -> None:
+    if os.environ.get("TWINKLE_EP_FSDP_DEBUG", "0") != "1":
+        return
+
+    rank = Platform.get_rank()
+    ep_fsdp_ranks = device_mesh.get_ranks_for_dims("dp")
+    print(
+        f"[EP_FSDP][rank{rank}] enabled=1 sharded_blocks={sharded_blocks} "
+        f"ep_fsdp_group={ep_fsdp_ranks}",
+        flush=True,
+    )
 
 
 def _maybe_shard_layers(model: nn.Module,

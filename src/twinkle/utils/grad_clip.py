@@ -32,7 +32,23 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
 
     has_dtensor_grad = any(hasattr(grad, "to_local") for grad in grads)
     has_local_tensor_grad = any(not hasattr(grad, "to_local") for grad in grads)
-    if not (has_dtensor_grad and has_local_tensor_grad):
+    dtensor_mesh_keys = set()
+    for grad in grads:
+        if not hasattr(grad, "to_local"):
+            continue
+        mesh = getattr(grad, "device_mesh", None)
+        if mesh is None:
+            dtensor_mesh_keys.add("dtensor:unknown")
+            continue
+        try:
+            mesh_key = (tuple(mesh.mesh.flatten().tolist()), tuple(mesh.mesh_dim_names or ()))
+        except Exception:
+            mesh_key = repr(mesh)
+        dtensor_mesh_keys.add(mesh_key)
+
+    has_mixed_dtensor_mesh = len(dtensor_mesh_keys) > 1
+
+    if not (has_dtensor_grad and has_local_tensor_grad) and not has_mixed_dtensor_mesh:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters,
             max_grad_norm,
@@ -62,6 +78,11 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
             reduce_device = torch.device(Platform.get_local_device())
         else:
             reduce_device = torch.device("cpu")
+    reduce_group = group
+    if has_mixed_dtensor_mesh:
+        # Different DTensor meshes cannot be reduced by DTensor op propagation (e.g. aten.stack).
+        # Fall back to world reduction over local shards.
+        reduce_group = None
 
     if norm_type == float("inf"):
         local_norm = 0.0
@@ -72,7 +93,7 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
             local_norm = max(local_norm, local_grad.detach().abs().max().item())
         total_norm_tensor = torch.tensor(local_norm, device=reduce_device, dtype=torch.float32)
         if dist.is_initialized():
-            dist.all_reduce(total_norm_tensor, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(total_norm_tensor, op=dist.ReduceOp.MAX, group=reduce_group)
         total_norm = float(total_norm_tensor.item())
     else:
         local_sq = 0.0
@@ -83,7 +104,7 @@ def normalize_and_clip_grad_norm(parameters: Iterable['torch.nn.Parameter'],
             local_sq += local_grad.detach().float().pow(2).sum().item()
         total_sq_tensor = torch.tensor(local_sq, device=reduce_device, dtype=torch.float32)
         if dist.is_initialized():
-            dist.all_reduce(total_sq_tensor, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(total_sq_tensor, op=dist.ReduceOp.SUM, group=reduce_group)
         total_norm = float(total_sq_tensor.sqrt().item())
 
     clip_coef = float(max_grad_norm) / (total_norm + 1e-6)

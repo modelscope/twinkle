@@ -213,8 +213,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._expert_parallel_config = self._fsdp_config.pop("expert_parallel", None)
         self._enable_expert_parallel = self._should_enable_expert_parallel(
             self._expert_parallel_config, self.device_mesh)
-        self._enable_expert_ep_fsdp = self._should_enable_expert_ep_fsdp(
-            self._expert_parallel_config, self.device_mesh)
         self._expert_parallel_applied = False
         use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
         if use_native_fsdp:
@@ -223,7 +221,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
                 enable_ep=self._enable_expert_parallel,
-                enable_ep_fsdp=self._enable_expert_ep_fsdp,
             )
         else:
             self.strategy = AccelerateStrategy(mixed_precision=self.mixed_precision, ddp_config=self._ddp_config,
@@ -302,17 +299,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             config=self._expert_parallel_config,
         )
         self._expert_parallel_applied = True
-
-    @staticmethod
-    def _should_enable_expert_ep_fsdp(expert_parallel_config: Optional[Dict[str, Any]],
-                                      device_mesh: Optional[DeviceMesh]) -> bool:
-        if expert_parallel_config is None or device_mesh is None:
-            return False
-        if not expert_parallel_config.get("ep_fsdp", False):
-            return False
-        if not device_mesh.has_dim("ep_fsdp"):
-            return False
-        return (device_mesh.ep_fsdp_world_size or 1) > 1
 
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():

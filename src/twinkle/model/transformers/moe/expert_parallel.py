@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -21,6 +22,7 @@ class ExpertParallelConfig:
     keep_router_logits: bool = True
     pad_to_max: bool = False
     ignore_shared_experts: bool = False
+    # Deprecated: EP_FSDP is inferred implicitly from dp/ep mesh topology.
     ep_fsdp: bool = False
 
 
@@ -33,12 +35,7 @@ def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: Opt
     if ep_world_size <= 1:
         return model
 
-    # Only explicit ep_fsdp config enables this mode.
-    ep_fsdp_enabled = bool(
-        cfg.ep_fsdp
-        and device_mesh.has_dim("ep_fsdp")
-        and (device_mesh.ep_fsdp_world_size or 1) > 1
-    )
+    ep_fsdp_enabled = device_mesh.is_implicit_ep_fsdp_enabled()
 
     if cfg.pad_to_max:
         raise NotImplementedError("pad_to_max is not implemented.")
@@ -151,6 +148,8 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
             hidden_states_2d = hidden_states
         else:
             raise ValueError(f"Unsupported hidden_states ndim: {hidden_states.ndim}")
+
+        _debug_log_ep_fsdp_runtime_once(block, gate, hidden_states_2d)
 
         router_logits, routing_weights, selected_experts, cast_weights = _run_router(
             gate=gate,
@@ -347,6 +346,25 @@ def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> to
         expert = block.experts[expert_id]
         return _run_module_with_casting(expert, expert_in)
     experts = block.experts
+    if getattr(block, "_ep_fsdp_enabled", False):
+        # In EP+EP_FSDP mode, execute experts.forward so FSDP hooks can
+        # manage unshard/reshard around forward/backward safely.
+        top_k_index = torch.full(
+            (expert_in.shape[0], 1),
+            int(expert_id),
+            dtype=torch.long,
+            device=expert_in.device,
+        )
+        top_k_weights = torch.ones(
+            (expert_in.shape[0], 1),
+            dtype=expert_in.dtype,
+            device=expert_in.device,
+        )
+        out = experts(expert_in, top_k_index, top_k_weights)
+        if out.dtype != input_dtype:
+            out = out.to(input_dtype)
+        return out
+
     gate_up = experts.gate_up_proj[expert_id]
     down = experts.down_proj[expert_id]
     compute_dtype = gate_up.dtype
@@ -397,3 +415,32 @@ def _run_router(
     if norm_topk_prob:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     return router_logits, routing_weights, selected_experts, True
+
+
+def _debug_log_ep_fsdp_runtime_once(block: nn.Module, gate: nn.Module, hidden_states: torch.Tensor) -> None:
+    if os.environ.get("TWINKLE_EP_FSDP_DEBUG", "1") != "1":
+        return
+    if not getattr(block, "_ep_fsdp_enabled", False):
+        return
+    if getattr(block, "_ep_fsdp_runtime_logged", False):
+        return
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    experts = getattr(block, "experts", None)
+    expert_param = next(experts.parameters(), None) if experts is not None else None
+    gate_param = next(gate.parameters(), None) if gate is not None else None
+    print(
+        f"[EP_FSDP][rank{rank}] runtime input={hidden_states.device} "
+        f"expert_param={_describe_param_mesh(expert_param)} "
+        f"gate_param={_describe_param_mesh(gate_param)}",
+        flush=True,
+    )
+    block._ep_fsdp_runtime_logged = True
+
+
+def _describe_param_mesh(param: Optional[nn.Parameter]) -> str:
+    if param is None:
+        return "none"
+    mesh = getattr(param, "device_mesh", None)
+    if mesh is None:
+        return f"local:{getattr(param, 'device', 'unknown')}"
+    return f"dtensor:{tuple(mesh.mesh_dim_names or ())}:{mesh.mesh.flatten().tolist()}"

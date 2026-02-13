@@ -5,10 +5,10 @@ import shutil
 import subprocess
 from abc import ABC
 from dataclasses import dataclass, field
-from functools import lru_cache
 from itertools import product
-from typing import Dict, List, Optional, Type, Union
-
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Type, Union
+import torch.distributed as dist
 import numpy as np
 
 
@@ -23,7 +23,6 @@ class DeviceMesh:
     - sequence_parallel: megatron sequence parallel
     - cp: Context Parallel
     - ep: Expert Parallel
-    - ep_fsdp: Expert FSDP Parallel
     - vpp: Virtual Pipeline Parallel
 
     Examples:
@@ -36,7 +35,6 @@ class DeviceMesh:
     mesh: np.ndarray
     mesh_dim_names: Optional[tuple[str, ...]]
     ep_size: Optional[int] = None
-    ep_fsdp_size: Optional[int] = None
     etp_size: Optional[int] = None
     # megatron only
     vpp_size: Optional[int] = None
@@ -49,8 +47,7 @@ class DeviceMesh:
     @staticmethod
     def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
                    pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   ep_fsdp_size: int = None, etp_size: int = 1,  vpp_size: int = None, device_type: str = 'cuda',
-                   sequence_parallel: bool = False) -> "DeviceMesh":
+                   etp_size: int = None,vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
         """Create a default device mesh from the given sizes.
 
         Args:
@@ -62,7 +59,6 @@ class DeviceMesh:
             ulysses_size: The ulysses parallel size
             cp_size: The context parallel size
             ep_size: The expert parallel size
-            ep_fsdp_size: The expert fsdp parallel size
             etp_size: The expert tensor parallel size
             vpp_size: The virtual pipeline parallel size
             device_type: The device type
@@ -91,11 +87,6 @@ class DeviceMesh:
             mesh_dim_sizes.append(dp_size)
         else:
             mesh_dim_sizes.append(-1)
-        if ep_size is not None:
-            mesh_dim_sizes.append(ep_size)
-            mesh_dim_names.append("ep")
-            if origin_world_size == 1:
-                world_size *= ep_size
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
             mesh_dim_names.append("cp")
@@ -112,7 +103,6 @@ class DeviceMesh:
             mesh_dim_names=tuple(mesh_dim_names),
             vpp_size=vpp_size,
             ep_size=ep_size,
-            ep_fsdp_size=ep_fsdp_size,
             etp_size=etp_size,
             ulysses_size=ulysses_size,
             sequence_parallel=sequence_parallel,
@@ -122,7 +112,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep", "ep_fsdp"}
+        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep"}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(
@@ -134,12 +124,6 @@ class DeviceMesh:
     def create_process_group(self, dims):
         """Create a process group by dims"""
         import torch.distributed as dist
-        ranks = self.get_ranks_for_dims(dims)
-        return dist.new_group(ranks=ranks)
-
-    def get_ranks_for_dims(self, dims):
-        if isinstance(dims, str):
-            dims = (dims,)
         rank = dist.get_rank()
         coords = np.argwhere(self.mesh == rank)[0]
         slices = []
@@ -149,7 +133,8 @@ class DeviceMesh:
             else:
                 slices.append(coords[i])
 
-        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+        ranks = sorted(self.mesh[tuple(slices)].flatten().tolist())
+        return dist.new_group(ranks=ranks)
 
     def get_dim_group(self, dims):
         import torch.distributed as dist
@@ -192,11 +177,55 @@ class DeviceMesh:
         key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
         return group_map[key]
 
+    def get_ranks_for_dims(self, dims):
+        if self.mesh_dim_names is None:
+            raise ValueError("mesh_dim_names is not set.")
+        if isinstance(dims, str):
+            dims = (dims,)
+        for dim_name in dims:
+            if dim_name not in self.mesh_dim_names:
+                raise ValueError(
+                    f"Dimension '{dim_name}' not found in mesh. Available: {self.mesh_dim_names}"
+                )
+
+        coord = self._get_coord()
+        if coord is None:
+            raise RuntimeError("Current rank is not found in mesh.")
+
+        slices = []
+        for i, dim_name in enumerate(self.mesh_dim_names):
+            if dim_name in dims:
+                slices.append(slice(None))
+            else:
+                slices.append(coord[i])
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def is_implicit_ep_fsdp_enabled(self) -> bool:
+        ep_world_size = self.ep_world_size or 1
+        dp_world_size = self.dp_world_size or 1
+        if ep_world_size <= 1 or dp_world_size <= 1:
+            return False
+
+        world_size = self.world_size or 1
+        if world_size % ep_world_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by ep_world_size ({ep_world_size}) "
+                "to infer implicit EP_FSDP from dp."
+            )
+        expected_dp_size = world_size // ep_world_size
+        if dp_world_size != expected_dp_size:
+            raise ValueError(
+                f"Implicit EP_FSDP requires dp_world_size == world_size // ep_world_size, "
+                f"but got dp_world_size={dp_world_size}, world_size={world_size}, "
+                f"ep_world_size={ep_world_size}."
+            )
+        return True
+
     @property
     def order(self):
         """The order of the dimensions for megatron"""
         # TODO hard coded for now
-        return 'tp-cp-ep-ep_fsdp-dp-pp'
+        return 'tp-cp-ep-dp-pp'
 
     def to_torch_device_mesh(self):
         import torch
@@ -275,10 +304,6 @@ class DeviceMesh:
         return self._get_rank_for_dim("ep")
 
     @property
-    def ep_fsdp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("ep_fsdp")
-
-    @property
     def dp_world_size(self) -> int:
         return self._get_world_size_for_dim("dp")
 
@@ -301,10 +326,6 @@ class DeviceMesh:
     @property
     def ep_world_size(self) -> Optional[int]:
         return self._get_world_size_for_dim("ep")
-
-    @property
-    def ep_fsdp_world_size(self) -> Optional[int]:
-        return self._get_world_size_for_dim("ep_fsdp")
 
     @property
     def etp_world_size(self) -> int:
@@ -371,16 +392,16 @@ class DeviceMesh:
         """Consider all dp/fsdp ranks, uses to determine how to distribute the data"""
         dp_world_size = self.dp_world_size
         fsdp_world_size = self.fsdp_world_size
-        ulysses_size = self.ulysses_size or 1
         if fsdp_world_size is not None and fsdp_world_size > 1:
-            data_world_size = dp_world_size * fsdp_world_size if dp_world_size is not None else fsdp_world_size
-        else:
-            data_world_size = dp_world_size if dp_world_size is not None else 1
+            if dp_world_size is not None:
+                return dp_world_size * fsdp_world_size
+            else:
+                return fsdp_world_size
 
-        assert data_world_size % ulysses_size == 0, (
-            f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
-        )
-        return data_world_size // ulysses_size
+        ulysses_size = self.ulysses_size or 1
+        assert dp_world_size % ulysses_size == 0, f'dp_world_size: {dp_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
+        return dp_world_size // ulysses_size
+
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
         if world_size == 1:
@@ -396,57 +417,6 @@ class DeviceMesh:
         end = (rank + 1) * k + min(rank + 1, m)
         return slice(start, end)
 
-    def get_tp_ranks(self) -> List[int]:
-        """Get all ranks in the same TP group as the current rank."""
-        rank = Platform.get_rank()
-        if not self._has_dim("tp"):
-            return [rank]
-
-        tp_idx = self._get_dim_index("tp")
-        coords = self._get_coord_for_rank(rank)
-        
-        if coords is None:
-            return []
-
-        slices = []
-        for i, dim_val in enumerate(coords):
-            if i == tp_idx:
-                slices.append(slice(None))
-            else:
-                slices.append(dim_val)
-
-        return sorted(self.mesh[tuple(slices)].flatten().tolist())
-
-    def get_tp_last_ranks(self) -> List[int]:
-        """Get a list of all ranks that are the last rank in their respective TP group."""
-        if not self._has_dim("tp"):
-            return self.mesh.flatten().tolist()
-
-        tp_idx = self._get_dim_index("tp")
-        tp_size = self.mesh.shape[tp_idx]
-
-        slices = [slice(None)] * self.mesh.ndim
-        slices[tp_idx] = tp_size - 1
-
-        return sorted(self.mesh[tuple(slices)].flatten().tolist())
-
-    def is_tp_last_rank(self, rank: Optional[int] = None) -> bool:
-        """Check if the given rank is the last rank in its TP group."""
-        if rank is None:
-            rank = Platform.get_rank()
-        
-        if not self._has_dim("tp"):
-            return True
-            
-        tp_idx = self._get_dim_index("tp")
-        coords = self._get_coord_for_rank(rank)
-        
-        if coords is None:
-            return False
-            
-        tp_size = self.mesh.shape[tp_idx]
-        return coords[tp_idx] == tp_size - 1
-    
     def is_pp_first_rank(self) -> bool:
         pp_ranks = self.get_pp_first_ranks()
         if pp_ranks is None:
@@ -506,6 +476,7 @@ class DeviceGroup:
     name: str
     ranks: Union[List[int], int]
     device_type: str
+    visible_devices: Optional[str] = None  # Optional: explicitly set visible devices (e.g., "8,9")
     gpus_per_worker: int = 1
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
@@ -522,16 +493,62 @@ class Platform(ABC):
             ) from exc
 
     @staticmethod
-    def visible_device_env(platform: str = None) -> str:
-        return Platform.get_platform(platform).visible_device_env()
+    def visible_device_env() -> str:
+        return Platform.get_platform().visible_device_env()
 
     @staticmethod
-    def device_prefix(platform: str = None) -> str:
-        return Platform.get_platform(platform).device_prefix()
+    def device_prefix() -> str:
+        return Platform.get_platform().device_prefix()
 
     @staticmethod
     def get_platform_names() -> List[str]:
         return ['GPU', 'NPU', 'MPS']
+
+    @staticmethod
+    def resolve_visible_devices(
+        device_type: str,
+        *,
+        explicit: Any = None,
+        env_values: Optional[List[Any]] = None,
+        include_os_env: bool = True,
+    ) -> Optional[str]:
+        def _normalize(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                return ','.join(str(v) for v in value)
+            if isinstance(value, int):
+                return str(value)
+            if isinstance(value, str):
+                return value
+            return None
+
+        if not device_type:
+            return None
+        if device_type.upper() == "CPU":
+            return None
+
+        try:
+            visible_env = Platform.get_platform(device_type.upper()).visible_device_env()
+        except Exception:
+            visible_env = None
+        if not visible_env:
+            return None
+
+        normalized = _normalize(explicit)
+        if normalized:
+            return normalized
+
+        if env_values:
+            for value in env_values:
+                normalized = _normalize(value)
+                if normalized:
+                    return normalized
+
+        if include_os_env:
+            return _normalize(os.environ.get(visible_env))
+
+        return None
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
