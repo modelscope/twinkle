@@ -44,17 +44,6 @@ reward_fn = FormatReward()
 rewards = reward_fn(trajectories, ground_truths)
 ```
 
-## CountDownAccuracyReward
-
-倒计时准确率奖励函数,在答案接近正确时给予部分奖励。
-
-```python
-from twinkle.reward import CountDownAccuracyReward
-
-reward_fn = CountDownAccuracyReward()
-rewards = reward_fn(trajectories, ground_truths)
-```
-
 ## 自定义奖励函数
 
 你可以通过继承 Reward 基类或使用函数来创建自定义奖励:
