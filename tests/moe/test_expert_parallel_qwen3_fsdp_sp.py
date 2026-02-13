@@ -417,7 +417,8 @@ def _run_worker_ep_fsdp_sp_align(
         model_sp, _ = fsdp_strategy.wrap_model(model_sp, optimizer=None)
 
         # Preprocess labels through SP strategy so they are shifted + split consistently.
-        sp_label_inputs = {'labels': labels_raw, 'position_ids': position_ids}
+        # Keep label semantics consistent with the baseline path: next-token aligned labels.
+        sp_label_inputs = {'labels': labels_shifted, 'position_ids': position_ids}
         sp_label_inputs = sp_strategy.preprocess_inputs(sp_label_inputs)
         sp_local_labels = sp_label_inputs['labels']
 
@@ -613,7 +614,8 @@ def _run_worker_fsdp_sp_align(
         sp_embeds = embed_sp(input_ids).detach().requires_grad_(True)
         model_sp, _ = fsdp_strategy.wrap_model(model_sp, optimizer=None)
 
-        sp_label_inputs = {'labels': labels_raw, 'position_ids': position_ids}
+        # Keep label semantics consistent with the baseline path: next-token aligned labels.
+        sp_label_inputs = {'labels': labels_shifted, 'position_ids': position_ids}
         sp_label_inputs = sp_strategy.preprocess_inputs(sp_label_inputs)
         sp_local_labels = sp_label_inputs['labels']
 
