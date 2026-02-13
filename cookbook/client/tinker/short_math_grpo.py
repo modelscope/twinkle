@@ -176,7 +176,7 @@ class MathFormatReward(Reward):
         return rewards
 
 
-def create_Math_dataset():
+def create_math_dataset():
     """Create Math dataset."""
     meta = DatasetMeta(
         'ms://modelscope/competition_math',
@@ -207,7 +207,7 @@ def main():
     logger.info('Starting Math GRPO training...')
 
     # Step 1: Prepare dataset and dataloader (client-side)
-    dataset = create_Math_dataset()
+    dataset = create_math_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
     template = Template(model_id=f'ms://{BASE_MODEL}')
 

@@ -72,7 +72,7 @@ class InputProcessor:
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
         for pipe in self.process_pipeline:
-            inputs = pipe(inputs)
+            inputs = pipe(inputs, **kwargs)
         return inputs
 
     def prepare_outputs(self, inputs: List[InputFeature], **kwargs) -> Union[List[InputFeature], InputFeature]:
@@ -293,7 +293,7 @@ class InputProcessor:
         return is_padding_free
 
     @staticmethod
-    def to_transformers_dict(inputs: List[InputFeature]) -> List[InputFeature]:
+    def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
         import torch
         results = []
         for _input in inputs:
