@@ -65,7 +65,7 @@ class MathPreprocessor(Preprocessor):
             return Trajectory(messages=[], user_data=[])
 
         def get_boxed_answer(text):
-            match = re.search(r'\\boxed\{([^}]+)\}', text)
+            match = re.search(r'\\boxed{([^}]*)}', text)
             return match.group(1) if match else None
 
         ground_truth = get_boxed_answer(sample['solution'])
