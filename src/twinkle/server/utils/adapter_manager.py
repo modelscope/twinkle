@@ -277,8 +277,10 @@ class AdapterManagerMixin:
                         # Has session: check session expiration and TTL
                         session_expired = not self._is_session_alive(session_id)
                         should_expire = session_expired or exceeded_ttl
-                        logger.debug(f'[AdapterManager] Adapter {adapter_name} session expiration check '
-                                    f'(session_id={session_id}, session_alive={not session_expired}, should_expire={should_expire})')
+                        logger.debug(
+                            f'[AdapterManager] Adapter {adapter_name} session expiration check '
+                            f'(session_id={session_id}, session_alive={not session_expired}, should_expire={should_expire})'  # noqa:E501
+                        )
                         expiration_reasons = []
                         if exceeded_ttl:
                             expiration_reasons.append('ttl_exceeded')
@@ -289,8 +291,10 @@ class AdapterManagerMixin:
                         info['inactivity_counter'] = info.get('inactivity_counter', 0) + 1
                         exceeded_inactivity = info['inactivity_counter'] > self._adapter_timeout
                         should_expire = exceeded_ttl or exceeded_inactivity
-                        logger.debug(f'[AdapterManager] Adapter {adapter_name} inactivity check '
-                                    f'(inactivity_counter={info["inactivity_counter"]}, timeout={self._adapter_timeout}, should_expire={should_expire})')
+                        logger.debug(
+                            f'[AdapterManager] Adapter {adapter_name} inactivity check '
+                            f'(inactivity_counter={info["inactivity_counter"]}, timeout={self._adapter_timeout}, should_expire={should_expire})'  # noqa:E501
+                        )
                         expiration_reasons = []
                         if exceeded_ttl:
                             expiration_reasons.append('ttl_exceeded')
@@ -308,7 +312,7 @@ class AdapterManagerMixin:
                     try:
                         self._on_adapter_expired(adapter_name)
                         logger.info(f'[AdapterManager] Adapter {adapter_name} expired '
-                                     f"(reasons={','.join(expiration_reasons)}, session={session_id})")
+                                    f"(reasons={','.join(expiration_reasons)}, session={session_id})")
                         success = True
                     except Exception as e:
                         logger.warning(f'[AdapterManager] Error while expiring adapter {adapter_name}: {e}')
