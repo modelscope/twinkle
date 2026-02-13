@@ -21,13 +21,11 @@ NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
 # 4 gpus, dp=2, ep=2
 dp_size = 2
 ep_size = 2
-ulysses_size = 2
 
 device_mesh = DeviceMesh(
     device_type=Platform.get_platform().device_prefix(),
     mesh=np.arange(dp_size * ep_size).reshape(dp_size, ep_size),
     mesh_dim_names=('dp', 'ep'),
-    ulysses_size=ulysses_size, # enable sp
 )
 
 twinkle.initialize(
