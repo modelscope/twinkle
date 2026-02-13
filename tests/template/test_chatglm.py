@@ -9,7 +9,7 @@ class TestMMModel(unittest.TestCase):
 
     def test_nlp(self):
         model_dir = HubOperation.download_model('ms://ZhipuAI/chatglm3-6b')
-        template = Template(model_dir, trust_remote_code=True)  # 添加这个参数
+        template = Template(model_dir, trust_remote_code=True)  # Add this parameter
         messages = [
             Message(
                 role='user',

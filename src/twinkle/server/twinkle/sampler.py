@@ -13,7 +13,7 @@ import traceback
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from ray import serve
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
@@ -119,24 +119,6 @@ def build_sampler_app(model_id: str,
     """
     app = FastAPI(
         title='Twinkle Sampler', description='REST API for distributed text generation inference', version='1.0.0')
-    """Build a sampler application for text generation inference.
-
-    Args:
-        model_id: Model identifier (e.g., "Qwen/Qwen2.5-7B-Instruct")
-        nproc_per_node: Number of GPU processes per node
-        device_group: Device group configuration dict
-        device_mesh: Device mesh configuration dict for parallelism
-        deploy_options: Ray Serve deployment options
-        sampler_type: Type of sampler to use ('vllm' or 'torch')
-        engine_args: Additional engine arguments for the sampler
-        adapter_config: Adapter lifecycle config (adapter_timeout, per_token_adapter_limit)
-        **kwargs: Additional arguments passed to the sampler
-
-    Returns:
-        Ray Serve deployment bound with configuration
-    """
-    app = FastAPI(
-        title='Twinkle Sampler', description='REST API for distributed text generation inference', version='1.0.0')
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
@@ -200,17 +182,15 @@ def build_sampler_app(model_id: str,
             try:
                 self.sampler.remove_adapter(adapter_name)
                 logger.info(f'Removed expired adapter {adapter_name}')
-                self.check_adapter_limit(token, False)
+                # Adapter count is now tracked dynamically, no manual update needed
             except Exception as e:
                 logger.warning(f'Failed to remove expired adapter {adapter_name}: {e}')
-            _adapter_config = adapter_config or {}
-            self._init_adapter_manager(**_adapter_config)
-            self.start_adapter_countdown()
 
         @staticmethod
         def _get_adapter_name(request: Request, adapter_name: Optional[str]) -> Optional[str]:
             if adapter_name is None or adapter_name == '':
                 return None
+            return request.state.request_id + '-' + adapter_name
 
         @app.post('/create', response_model=CreateResponse)
         def create(self, request: Request) -> CreateResponse:
@@ -304,13 +284,9 @@ def build_sampler_app(model_id: str,
             from peft import LoraConfig
             config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
-            with self._adapter_lock:
-                self.sampler.add_adapter_to_sampler(full_adapter_name, config)
-
             self.register_adapter(full_adapter_name, token)
-            allowed, reason = self.check_adapter_limit(token, True)
-            if not allowed:
-                raise RuntimeError(reason)
+
+            self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
             return AddAdapterResponse(adapter_name=full_adapter_name)
 

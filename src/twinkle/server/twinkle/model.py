@@ -187,6 +187,27 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
+        def _on_adapter_expired(self, adapter_name: str) -> None:
+            """Handle adapter expiration by removing it from the model.
+
+            This method is called automatically by AdapterManagerMixin when
+            an adapter exceeds its timeout or TTL.
+
+            Args:
+                adapter_name: Name of the expired adapter to remove.
+            """
+            # Remove from model if it exists
+            if self.get_adapter_info(adapter_name):
+                # Clear adapter state
+                self.clear_adapter_state(adapter_name)
+                # Unregister from adapter manager
+                self.unregister_adapter(adapter_name)
+
+                # Remove from server state
+                self.state.unload_model(adapter_name)
+                # Remove adapter from model
+                self.model.remove_adapter(adapter_name)
+
         @app.post('/create')
         def create(self, request: Request, body: CreateRequest):
             return {'status': 'ok'}
@@ -485,16 +506,11 @@ def build_model_app(model_id: str,
             token = request.state.token
             training_run_manager = create_training_run_manager(token)
 
-            with self._adapter_lock:
-                self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
-
-            # Register adapter for lifecycle tracking
+            # Register adapter FIRST (limit check happens inside register_adapter)
             self.register_adapter(adapter_name, token)
 
-            # Check adapter limit (raises if exceeded)
-            allowed, reason = self.check_adapter_limit(token, True)
-            if not allowed:
-                raise RuntimeError(reason)
+            # Create adapter AFTER successful registration
+            self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
 
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration

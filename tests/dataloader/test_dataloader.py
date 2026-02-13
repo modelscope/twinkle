@@ -50,7 +50,7 @@ class TestDataLoaderBasic:
 
 
 class TestDataCollator:
-    """测试data_collator（InputProcessor）功能"""
+    """Test data_collator (InputProcessor) functionality"""
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_dataloader_with_collator(self):

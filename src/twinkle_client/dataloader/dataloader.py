@@ -10,13 +10,11 @@
 # ============================================================================
 
 from typing import Callable, Type, Union
-
+from twinkle_client.http import http_post, heartbeat_manager
 from twinkle.dataset import Dataset
 from twinkle.processor import InputProcessor
-from twinkle_client.http import heartbeat_manager, http_post
 
-
-class DataLoader:
+class DataLoader(object):
     """Client wrapper for DataLoader that calls server HTTP endpoints."""
 
     def __init__(self, dataset: Union[Dataset, Callable], **kwargs):
@@ -28,11 +26,9 @@ class DataLoader:
             json_data={
                 'processor_type': 'dataloader',
                 'class_type': 'DataLoader',
-                **{
-                    'dataset': dataset
-                },
-                **kwargs
-            })
+                **{'dataset': dataset}, **kwargs
+            }
+        )
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -43,6 +39,7 @@ class DataLoader:
         except:
             pass
 
+    
     def __len__(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -50,9 +47,11 @@ class DataLoader:
                 'processor_id': self.processor_id,
                 'function': '__len__',
                 **{},
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
         response = http_post(
@@ -60,13 +59,13 @@ class DataLoader:
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'set_processor',
-                **{
-                    'processor_cls': processor_cls
-                },
+                **{'processor_cls': processor_cls},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __iter__(self):
         response = http_post(
@@ -75,16 +74,19 @@ class DataLoader:
                 'processor_id': self.processor_id,
                 'function': '__iter__',
                 **{},
-            })
+            }
+        )
         response.raise_for_status()
         return self
-
+    
     def __next__(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__next__',
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    

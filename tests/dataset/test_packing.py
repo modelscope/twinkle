@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""测试 dataset packing 功能：普通 packing、iterable packing (cyclic=True/False)"""
+"""Test dataset packing: normal packing, iterable packing (cyclic=True/False)"""
 import os
 import pytest
 from pathlib import Path
@@ -25,10 +25,10 @@ def convert_to_messages(example):
 @pytest.mark.skipif(not HAS_BINPACKING, reason='binpacking not installed')
 @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
 class TestPackingDataset:
-    """普通 packing"""
+    """Normal packing"""
 
     def test_packing_dataset_basic(self):
-        """encode -> pack_dataset -> 索引 packed 样本"""
+        """encode -> pack_dataset -> index packed samples"""
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = PackingDataset(dataset_meta=DatasetMeta(dataset_id=csv_path), packing_num_proc=1)
         dataset.map(convert_to_messages)
@@ -40,13 +40,13 @@ class TestPackingDataset:
         sample = dataset[0]
         assert 'input_ids' in sample
         assert len(sample['input_ids']) > 0
-        assert len(sample['input_ids']) <= 64  # 每包不超过 max_length
+        assert len(sample['input_ids']) <= 64  # Each pack <= max_length
 
 
 @pytest.mark.skipif(not HAS_BINPACKING, reason='binpacking not installed')
 @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
 class TestIterablePackingDataset:
-    """iterable packing (cyclic=True/False)"""
+    """Iterable packing (cyclic=True/False)"""
 
     def _iter_take(self, dataset, n: int):
         items = []
@@ -57,7 +57,7 @@ class TestIterablePackingDataset:
         return items
 
     def test_iterable_packing_cyclic_false(self):
-        """cyclic=False：迭代到数据集结束即停止"""
+        """cyclic=False: stop when dataset exhausted"""
         jsonl_path = str(TEST_DATA_DIR / 'packing_messages.jsonl')
         dataset = IterablePackingDataset(
             dataset_meta=DatasetMeta(dataset_id=jsonl_path),
@@ -73,7 +73,7 @@ class TestIterablePackingDataset:
         assert 'input_ids' in items[0]
 
     def test_iterable_packing_cyclic_true(self):
-        """cyclic=True：数据耗尽后从头循环，可产出超过原始条数"""
+        """cyclic=True: cycle from start when exhausted, can yield more than original count"""
         jsonl_path = str(TEST_DATA_DIR / 'packing_messages.jsonl')
         dataset = IterablePackingDataset(
             dataset_meta=DatasetMeta(dataset_id=jsonl_path),

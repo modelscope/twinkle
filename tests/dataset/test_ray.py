@@ -18,14 +18,14 @@ def convert_to_messages(example):
 
 
 class TestRayDatasetBehavior:
-    """测试Ray模式下dataset表现与local相同
+    """Dataset behavior in Ray mode should match local mode.
 
-    注意：Dataset的核心功能（加载、map、encode等）与twinkle的运行模式（local/ray）无关，
-    这些测试验证dataset在两种模式下都能正常工作。
+    Note: Dataset core functions (load, map, encode, etc.) are independent of twinkle
+    run mode (local/ray). These tests verify dataset works in both modes.
     """
 
     def test_dataset_works_in_ray_mode(self):
-        """测试dataset在Ray模式下正常工作"""
+        """Test dataset works in Ray mode"""
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
@@ -34,7 +34,7 @@ class TestRayDatasetBehavior:
         assert dataset[0]['label'] == 0
 
     def test_dataset_map_works_in_ray_mode(self):
-        """测试dataset map操作在Ray模式下正常工作"""
+        """Test dataset map works in Ray mode"""
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
@@ -45,7 +45,7 @@ class TestRayDatasetBehavior:
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_dataset_encode_works_in_ray_mode(self):
-        """测试dataset encode操作在Ray模式下正常工作"""
+        """Test dataset encode works in Ray mode"""
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
@@ -61,7 +61,7 @@ class TestRayDatasetBehavior:
         assert len(dataset[0]['input_ids']) > 0
 
     def test_dataset_add_dataset_works_in_ray_mode(self):
-        """测试dataset add_dataset操作在Ray模式下正常工作"""
+        """Test dataset add_dataset works in Ray mode"""
         csv_path1 = str(TEST_DATA_DIR / 'test.csv')
         csv_path2 = str(TEST_DATA_DIR / 'test2.csv')
 
@@ -72,7 +72,7 @@ class TestRayDatasetBehavior:
         assert len(dataset.dataset) == 4
 
     def test_dataset_mix_dataset_works_in_ray_mode(self):
-        """测试dataset mix_dataset操作在Ray模式下正常工作"""
+        """Test dataset mix_dataset works in Ray mode"""
         csv_path1 = str(TEST_DATA_DIR / 'test.csv')
         csv_path2 = str(TEST_DATA_DIR / 'test2.csv')
 

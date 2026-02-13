@@ -8,15 +8,15 @@
 # The server must be running first (see server.py and server_config.yaml).
 import numpy as np
 import os
-from modelscope import AutoTokenizer
-from tinker import types
 from tqdm import tqdm
-
+from tinker import types
+from twinkle_client import init_tinker_compat_client
+from twinkle.data_format import Message, Trajectory
+from twinkle.template import Template
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
-from twinkle_client import init_tinker_compat_client
 
 # The base model to fine-tune / evaluate
 base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
@@ -82,32 +82,27 @@ def eval():
     # Step 1: Load the trained LoRA checkpoint for inference
 
     # Path to a previously saved LoRA checkpoint (twinkle:// URI)
-    weight_path = 'twinkle://20260211_112719-Qwen_Qwen2_5-7B-Instruct-a74a4826/weights/twinkle-lora-2'
+    weight_path = 'twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2'
 
     # Connect to the server and create a sampling client with the trained weights
     service_client = init_tinker_compat_client(base_url='http://localhost:8000')
     sampling_client = service_client.create_sampling_client(model_path=weight_path, base_model=base_model)
 
-    # Load the tokenizer for encoding the prompt and decoding the output
-    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
-
     # Step 2: Prepare the chat prompt
 
     # Build a multi-turn conversation to test the model's self-cognition
-    inputs = [{
-        'role': 'system',
-        'content': 'You are a helpful assistant.'
-    }, {
-        'role': 'user',
-        'content': 'what is your name?'
-    }]
+    template = Template(model_id=f'ms://{base_model}')
 
-    # Apply the model's chat template to format the conversation
-    input_ids = tokenizer.apply_chat_template(
-        inputs,
-        tokenize=True,
-        add_generation_prompt=True  # Adds the assistant prompt prefix
+    trajectory = Trajectory(
+        messages=[
+            Message(role='system', content='You are a helpful assistant'),
+            Message(role='user', content='你是谁？'),
+        ]
     )
+
+    input_feature = template.encode(trajectory, add_generation_prompt=True)
+
+    input_ids = input_feature['input_ids'].tolist()
 
     # Step 3: Generate responses
 
@@ -126,9 +121,9 @@ def eval():
     # Decode and print each response
     print('Responses:')
     for i, seq in enumerate(result.sequences):
-        print(f'{i}: {repr(tokenizer.decode(seq.tokens))}')
+        print(f'{i}: {repr(template.decode(seq.tokens))}')
 
 
 if __name__ == '__main__':
-    train()  # Uncomment to run training
+    train()   # Uncomment to run training
     # eval()      # Run evaluation / inference
