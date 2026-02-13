@@ -77,6 +77,12 @@ pip install -e .
 
 - 🎉2026-02-10 Initial version of Twinkle✨ released, including SFT/PT/RL for text models and serverless training capabilities on [ModelScope](https://modelscope.cn).
 
+# ModelScope Community
+
+## ModelScope Official Environment
+
+The ModelScope community provides an official environment for running Twinkle. The API endpoint is: [base_url](https://www.modelscope.cn/twinkle). Developers can refer to our [documentation](docs/source_en/Usage%20Guide/ModelScope-Official-Resources.md) for usage instructions.
+
 ## Supported Hardware
 
 | Hardware Environment | Notes                                                            |
@@ -181,6 +187,7 @@ if __name__ == '__main__':
 ### Tinker-Like Remote API
 
 ```python
+import os
 from tqdm import tqdm
 from tinker import types
 from twinkle_client import init_tinker_compat_client
@@ -191,21 +198,20 @@ from twinkle.server.tinker.common import input_feature_to_datum
 
 base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
-# 使用 Twinkle 的 Dataset 组件加载和预处理数据
+# Use twinkle dataset to load the data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
-dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
+dataset.map(SelfCognitionProcessor('twinkle Model', 'twinkle Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# 初始化 Tinker 兼容客户端
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+# Initialize tinker client
+service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
-# 训练循环：使用 input_feature_to_datum 转换数据格式
+# Training loop: use input_feature_to_datum to transfer the input format
 for epoch in range(3):
     for step, batch in tqdm(enumerate(dataloader)):
-        # 将 Twinkle 的 InputFeature 转换为 Tinker 的 Datum
         input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
 
         fwdbwd_future = training_client.forward_backward(input_datum, "cross_entropy")

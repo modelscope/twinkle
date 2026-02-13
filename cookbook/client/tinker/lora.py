@@ -16,7 +16,7 @@ from twinkle_client import init_tinker_compat_client
 # Step 2: Initialize the Tinker-compatible client to communicate with the server.
 # - base_url: the address of the running server
 # - api_key: authentication token (loaded from environment variable)
-service_client = init_tinker_compat_client(base_url='http://localhost:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 
 # Step 3: List models available on the server to verify the connection
 print("Available models:")
