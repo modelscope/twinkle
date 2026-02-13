@@ -789,7 +789,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True)
     def save(self,
              name: Optional[str] = None,
              output_dir: Optional[str] = None,

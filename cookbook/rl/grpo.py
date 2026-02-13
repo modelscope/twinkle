@@ -159,7 +159,7 @@ def main():
         )
         advantages = advantages.tolist()
 
-        model.forward_backward(inputs=all_input_data, old_logps=all_old_logps, advantages=advantages)
+        model.forward_backward(inputs=all_input_data, old_logps=all_old_logps, advantages=advantages, micro_batch_size=2)
         model.clip_grad_and_step()
         optim_step += 1
         log_dict = metrics.calculate()
