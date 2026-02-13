@@ -35,8 +35,16 @@ def _load_from_hub(
     from kernels._versions import select_revision_or_version
     from kernels.utils import get_kernel
     assert repo_id is not None
-    resolved = select_revision_or_version(repo_id, revision, version)
-    kernel = get_kernel(repo_id, revision=resolved)
+    # kernels API changed across versions; use keyword args for modern API
+    # and fall back to repo_id-only for older variants.
+    try:
+        resolved = select_revision_or_version(repo_id, revision=revision, version=version)
+    except TypeError:
+        resolved = select_revision_or_version(repo_id)
+    try:
+        kernel = get_kernel(repo_id, revision=resolved)
+    except TypeError:
+        kernel = get_kernel(repo_id, resolved)
     func = getattr(kernel, func_name, None)
     if func is None:
         raise AttributeError(f'Kernel repo {repo_id} does not export {func_name}.')
