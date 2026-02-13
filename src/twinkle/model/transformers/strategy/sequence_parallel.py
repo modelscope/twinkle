@@ -183,6 +183,9 @@ class GatherLoss(torch.autograd.Function):
         # Split grads back to local sequence chunk.
         _grad = grad_output[0]
         if sequence_parallel.world_size > 1 and sequence_parallel._sp_group is not None:
+            # Gather replicates the sequence dimension across SP ranks. Scale once here
+            # so downstream FSDP avg does not shrink this path by an extra SP factor.
+            _grad = _grad * sequence_parallel.world_size
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
         return _grad, None, None, None
 
@@ -866,7 +869,8 @@ class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
-    loss_reduction: str = 'mean'
+    loss_reduction: str = "mean"
+    compensate_fsdp_avg: bool = False
 
 
 def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -> int:
@@ -976,6 +980,8 @@ class SequenceParallelStrategy:
                 "SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
                 "Please aggregate per-token losses before calling reduce_loss."
             )
+        compensate_fsdp_avg = bool(self.sp_config.get("compensate_fsdp_avg", False))
+        compensate_factor = float(self.ulysses_size if compensate_fsdp_avg else 1.0)
 
         class _ReduceSequenceParallelLoss(torch.autograd.Function):
             @staticmethod
@@ -997,7 +1003,7 @@ class SequenceParallelStrategy:
                 local_tokens, global_tokens = ctx.saved_tensors
                 if global_tokens.item() == 0:
                     return grad_output, None
-                grad_local_sum = grad_output * (local_tokens / global_tokens)
+                grad_local_sum = grad_output * (local_tokens / global_tokens) * compensate_factor
                 return grad_local_sum, None
 
         class _ReduceSequenceParallelSum(torch.autograd.Function):

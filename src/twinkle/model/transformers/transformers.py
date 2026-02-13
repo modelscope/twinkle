@@ -247,9 +247,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         from .strategy.sequence_parallel import SequenceParallelStrategy
 
+        sp_config = {}
+        # When data-parallel gradient averaging runs across SP shards (native FSDP or
+        # accelerate DDP/FSDP paths), compensate SP loss backward to keep gradient scale.
+        if isinstance(self.strategy, (NativeFSDPStrategy, AccelerateStrategy)) and self.device_mesh is not None:
+            if (self.device_mesh.ulysses_size or 1) > 1 and (self.device_mesh.data_world_size or 1) > 1:
+                sp_config["compensate_fsdp_avg"] = True
         self.sp_strategy = SequenceParallelStrategy(
             self.device_mesh,
-            {},
+            sp_config,
             model=self.model,
             tokenizer_id=self.tokenizer_id,
         )
