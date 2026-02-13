@@ -157,7 +157,6 @@ def main():
         # Split completions into mini-batches and run one optim step per mini-batch.
         total_completions = len(all_input_data)
         for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
-            metrics.reset()
             mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
             mb_inputs = all_input_data[mb_start:mb_end]
             mb_old_logps = all_old_logps[mb_start:mb_end]
