@@ -54,10 +54,21 @@ class TestFunctionKernel(unittest.TestCase):
             self.skipTest(f'HuggingFace unreachable: {e}')
         try:
             from kernels import has_kernel
+            from kernels._versions import select_revision_or_version
+            from kernels.utils import get_kernel
         except Exception:
             self.skipTest('kernels package missing has_kernel.')
         if not has_kernel('kernels-test/flattened-build'):
             self.skipTest('kernels-test/flattened-build not available.')
+        try:
+            revision = select_revision_or_version(
+                'kernels-test/flattened-build',
+                revision=None,
+                version=None,
+            )
+            get_kernel('kernels-test/flattened-build', revision=revision)
+        except Exception as exc:
+            self.skipTest(f'kernels-test/flattened-build cannot be loaded in this env: {exc}')
 
         _ensure_test_packages()
         module_name = 'tests.kernel._tmp_flattened_build_module'
