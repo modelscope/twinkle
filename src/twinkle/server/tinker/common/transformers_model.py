@@ -1,10 +1,11 @@
 from tinker import types
 from typing import List
-from twinkle.model import MultiLoraTransformersModel
+
 from twinkle import remote_class, remote_function
+from twinkle.model import MultiLoraTransformersModel
+from .compat_base import TwinkleCompatModelBase, clean_metrics, collect_forward_backward_results
 from .datum import datum_to_input_feature, extract_rl_feature
 from .io_utils import create_checkpoint_manager
-from .compat_base import TwinkleCompatModelBase, collect_forward_backward_results, clean_metrics
 
 
 @remote_class()
@@ -58,22 +59,21 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         # Set loss first based on loss_fn
         if loss_fn == 'cross_entropy':
-            super().set_loss('CrossEntropyLoss',
-                             adapter_name=adapter_name)
+            super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         elif loss_fn == 'importance_sampling':
-            super().set_loss('GRPOLoss',
-                             adapter_name=adapter_name,
-                             epsilon=0.2,  # Default GRPO epsilon
-                             beta=0.0)     # No KL penalty by default
+            super().set_loss(
+                'GRPOLoss',
+                adapter_name=adapter_name,
+                epsilon=0.2,  # Default GRPO epsilon
+                beta=0.0)  # No KL penalty by default
         else:
-            super().set_loss('CrossEntropyLoss',
-                             adapter_name=adapter_name)
+            super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         # Get template for input processing
         template = self.get_template(adapter_name)
-        
+
         # Convert Datum to InputFeature
         input_features = datum_to_input_feature(inputs, template)
-        
+
         # Forward pass
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
 
@@ -97,8 +97,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         # Gradient clipping
         grad_clip_norm = adam_params.grad_clip_norm
         if grad_clip_norm > 0.0:
-            self.clip_grad_norm(max_grad_norm=grad_clip_norm,
-                                norm_type=2, **kwargs)
+            self.clip_grad_norm(max_grad_norm=grad_clip_norm, norm_type=2, **kwargs)
         # Optimizer step
         optim_params = {
             'lr': adam_params.learning_rate,
@@ -127,7 +126,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         # Extract token from kwargs if provided (for user isolation)
         token = kwargs.pop('token', None)
         if not token:
-            raise ValueError("Token is required for loading checkpoints")
+            raise ValueError('Token is required for loading checkpoints')
 
         # Create checkpoint manager with the token
         checkpoint_manager = create_checkpoint_manager(token)

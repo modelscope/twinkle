@@ -1,11 +1,9 @@
 import os
-
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform
-from twinkle import get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -16,10 +14,7 @@ if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
 
-    run = swanlab.init(
-        project="twinkle",
-    )
-
+    run = swanlab.init(project='twinkle', )
 
 # Construct a device_mesh, fsdp=4, dp=2
 device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
@@ -57,11 +52,7 @@ def train():
     # Use a TransformersModel
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
     # Add a lora to model, with name `default`
     # Comment this to use full-parameter training
@@ -69,7 +60,8 @@ def train():
     # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
     # Add LRScheduler for lora `default`
-    model.set_lr_scheduler(scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
+    model.set_lr_scheduler(
+        scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
     logger.info(get_device_placement())
     # Print the training config
     logger.info(model.get_train_configs())
@@ -89,12 +81,12 @@ def train():
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 40 == 0:
-           metrics = eval(model)
-           logger.info(f'Eval metric: {metrics}')
-           metrics['step'] = step
-           if loss_metric > float(metrics['loss']):
-               model.save(f'checkpoint-{step}')
-               loss_metric = float(metrics['loss'])
+            metrics = eval(model)
+            logger.info(f'Eval metric: {metrics}')
+            metrics['step'] = step
+            if loss_metric > float(metrics['loss']):
+                model.save(f'checkpoint-{step}')
+                loss_metric = float(metrics['loss'])
     model.save(f'last-checkpoint')
 
 

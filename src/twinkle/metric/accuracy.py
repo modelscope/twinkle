@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Union, List
-
 import numpy as np
+from typing import List, Union
 
-from .base import Metric
 from ..data_format import InputFeature, ModelOutput
+from .base import Metric
 
 
 class Accuracy(Metric):
@@ -22,10 +21,10 @@ class Accuracy(Metric):
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         assert not isinstance(inputs, list), 'Accuracy does not support list InputFeature yet.'
-        labels = inputs["labels"]
-        logits = outputs["logits"]
+        labels = inputs['labels']
+        logits = outputs['logits']
         output_token_ids = logits.argmax(dim=-1)
-        mask = inputs.get("completion_mask")
+        mask = inputs.get('completion_mask')
         if mask is not None:
             mask = mask.bool()
 
@@ -50,18 +49,16 @@ class Accuracy(Metric):
         self.total_count = 0
 
     def calculate(self):
-        local_results = [
-            {"correct": self.total_correct, "total": self.total_count}
-        ]
+        local_results = [{'correct': self.total_correct, 'total': self.total_count}]
 
         all_results = self.gather_results(local_results)
 
-        total_correct = sum(r["correct"] for r in all_results)
-        total_count = sum(r["total"] for r in all_results)
+        total_correct = sum(r['correct'] for r in all_results)
+        total_count = sum(r['total'] for r in all_results)
         accuracy = total_correct / total_count if total_count > 0 else np.nan
         self.reset()
         return {
-            "accuracy": f'{accuracy:.2f}',
-            "correct_tokens": total_correct,
-            "total_tokens": total_count,
+            'accuracy': f'{accuracy:.2f}',
+            'correct_tokens': total_correct,
+            'total_tokens': total_count,
         }

@@ -1,14 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 
 import torch
-from typing import List, TYPE_CHECKING, Tuple, Optional, Any
 from tinker import types
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+
 from twinkle import remote_class, remote_function
 from twinkle.utils import exists, requires
+from .compat_base import TwinkleCompatModelBase, clean_metrics, collect_forward_backward_results
 from .datum import datum_to_input_feature, extract_rl_feature
 from .io_utils import create_checkpoint_manager
-from .compat_base import TwinkleCompatModelBase, collect_forward_backward_results, clean_metrics
-
 
 if TYPE_CHECKING:
     from twinkle.model.megatron import MultiLoraMegatronModel as _MegatronBase
@@ -17,7 +17,9 @@ elif exists('megatron_core'):
     import twinkle.model.megatron as megatron_module
     _MegatronBase = megatron_module.MultiLoraMegatronModel
 else:
+
     class _MegatronBase:
+
         def __init__(self, *args, **kwargs):
             requires('megatron_core')
 
@@ -52,16 +54,17 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
     def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass.
-        
+
         Returns:
             Tuple of (outputs, loss) where outputs is a list of dicts with
             'logprobs' and 'elementwise_loss', and loss is a scalar.
         """
         if loss_fn == 'importance_sampling':
-            super().set_loss('GRPOLoss',
-                             adapter_name=adapter_name,
-                             epsilon=0.2,  # Default GRPO epsilon
-                             beta=0.0)     # No KL penalty by default
+            super().set_loss(
+                'GRPOLoss',
+                adapter_name=adapter_name,
+                epsilon=0.2,  # Default GRPO epsilon
+                beta=0.0)  # No KL penalty by default
         # Get template for input processing
         template = self.get_template(adapter_name=adapter_name)
         # Convert Datum to InputFeature
@@ -72,12 +75,12 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         loss_kwargs.update(loss_values)
         # Megatron forward_backward returns loss directly
         loss = super().forward_backward(inputs=input_features, adapter_name=adapter_name, **loss_kwargs)
-        
+
         # Get logits from outputs
         optimizer_config = self.optimizer_group.get(adapter_name)
         outputs = optimizer_config.outputs if optimizer_config else {}
         logits_list = outputs.get('logits', [])
-        
+
         # When PP enabled, only logits from last stage are available
         if not logits_list:
             return [None, None]
@@ -87,15 +90,15 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
             logits = logits_list.detach()
         else:
             # Concatenate logits from multiple microbatches
-            logits = torch.cat([l.detach() for l in logits_list], dim=0)
+            logits = torch.cat([logit.detach() for logit in logits_list], dim=0)
         results = self._get_forward_output(inputs, logits)
-        
+
         # Convert loss to scalar
         if isinstance(loss, torch.Tensor):
             loss = loss.item()
         else:
             loss = float(loss)
-            
+
         return [results, loss]
 
     @remote_function(dispatch='slice_dp', collect='flatten')
@@ -105,33 +108,33 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         template = self.get_template(**kwargs)
         # Convert Datum to InputFeature
         input_features = datum_to_input_feature(inputs, template)
-        
+
         outputs = super().forward_only(inputs=input_features, **kwargs)
-        
+
         # Get logits
         logits = outputs.get('logits', None) if isinstance(outputs, dict) else None
-        
+
         if logits is not None:
             if isinstance(logits, torch.Tensor):
                 logits = logits.detach().cpu()
             elif isinstance(logits, list) and len(logits) > 0:
-                logits = torch.cat([l.detach().cpu() for l in logits], dim=0)
+                logits = torch.cat([logit.detach().cpu() for logit in logits], dim=0)
             results = self._get_forward_output(inputs, logits)
         else:
             # If no logits available (non-last PP stage), return empty results
             results = [{'logprobs': None, 'elementwise_loss': None} for _ in inputs]
-        
+
         return results
 
     @remote_function(dispatch='all')
     def step(self, *, adam_params: types.AdamParams, **kwargs):
         """Optimizer step with AdamParams configuration.
-        
+
         Updates the optimizer configuration and performs the step.
         """
         adapter_name = kwargs.get('adapter_name')
         optimizer_config = self.optimizer_group.get(adapter_name)
-        
+
         if optimizer_config and optimizer_config.optimizer:
             # Update optimizer config with adam_params
             # Megatron optimizer handles gradient clipping internally
@@ -146,24 +149,22 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
                         chained_opt.config.weight_decay = adam_params.weight_decay
                         if adam_params.grad_clip_norm > 0:
                             chained_opt.config.clip_grad = adam_params.grad_clip_norm
-        
+
         # Perform optimizer step
         super().step(**kwargs)
         # Zero gradients
         super().zero_grad(**kwargs)
-
 
     @remote_function(collect='first', lazy_collect=False)
     def calculate_metric(self, is_training, **kwargs):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)
 
-
     @remote_function(dispatch='all', sync=True)
     def load(self, checkpoint_dir: str, **kwargs):
         """
         Load checkpoint with token-based isolation support.
-        
+
         Args:
             checkpoint_dir: The twinkle:// path to the checkpoint or hub model ID
             **kwargs: Additional keyword arguments including optional 'token'
@@ -171,18 +172,17 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         # Extract token from kwargs if provided (for user isolation)
         token = kwargs.pop('token', None)
         if not token:
-            raise ValueError("Token is required for loading checkpoints")
-        
+            raise ValueError('Token is required for loading checkpoints')
+
         # Create checkpoint manager with the token
         checkpoint_manager = create_checkpoint_manager(token)
 
         # Use resolve_load_path to handle path resolution
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
-        
+
         if resolved.is_twinkle_path:
             # Load from twinkle checkpoint
             return super().load(name=resolved.checkpoint_name, output_dir=resolved.checkpoint_dir, **kwargs)
         else:
             # Load from hub
             return super().load(name=resolved.checkpoint_name, **kwargs)
-

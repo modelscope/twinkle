@@ -1,16 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import os
+import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
-import torch
 from twinkle import get_logger
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
 from twinkle.sampler.base_engine import BaseSamplerEngine
-from twinkle.data_format.sampling import StopReason, SamplingParams, SampleResponse, SampledSequence
 from twinkle.utils.platform import get_vllm_device_uuid
 
-import inspect
 logger = get_logger()
+
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
     """Get the nearest allowed vLLM LoRA rank."""
@@ -30,18 +31,18 @@ def get_vllm_max_lora_rank(lora_rank: int) -> int:
 class VLLMEngine(BaseSamplerEngine):
     """
     A vLLM-based inference engine for RL training.
-    
+
     This engine uses vLLM v1's AsyncLLM and supports:
     - Tinker-compatible sample() API with logprobs
     - Multi-tenant LoRA adapters for client-server mode
     - Weight synchronization via load_weights (colocated) or CUDA IPC
     - Sleep/wake_up for GPU memory management in colocated training
-    
+
     Deployment scenarios:
     1. Standalone server (client-server): Multi-tenant, LoRA adapters indexed by URI
     2. Colocated with training (Ray): Single-tenant, weight sync via load_weights
     """
-    
+
     def __init__(
         self,
         model_id: str,
@@ -57,9 +58,9 @@ class VLLMEngine(BaseSamplerEngine):
         enable_prefix_caching: bool = False,
         enforce_eager: bool = False,
         trust_remote_code: bool = True,
-        dtype: str = "auto",
+        dtype: str = 'auto',
         quantization: Optional[str] = None,
-        load_format: str = "auto",
+        load_format: str = 'auto',
         logprobs_mode: Optional[str] = None,
         **kwargs,
     ):
@@ -82,7 +83,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.load_format = load_format
         self.logprobs_mode = logprobs_mode or 'processed_logprobs'
         self.engine_kwargs = kwargs or {}
-        
+
         # Only need to track which users have loaded LoRAs and their IDs
         self._user_lora_ids: Dict[str, int] = {}
         self._next_lora_id = 1
@@ -92,77 +93,76 @@ class VLLMEngine(BaseSamplerEngine):
         # finishes a LoRA sync, so ``sample()`` never needs to call
         # ``list_loras()`` per request.
         self._synced_lora_request: Optional[Any] = None
-        
+
         # Initialize engine
         self.engine = self._create_engine()
 
         # Tokenizer is lazy loaded via get_tokenizer()
         self._tokenizer = None
-    
+
     def _create_engine(self):
         """Create and return the vLLM engine."""
-        os.environ["VLLM_USE_V1"] = "1"
-        from vllm.v1.engine.async_llm import AsyncLLM
+        os.environ['VLLM_USE_V1'] = '1'
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
-        
+        from vllm.v1.engine.async_llm import AsyncLLM
+
         # Build engine config
         engine_config = {
-            "model": self.model_id,
-            "tensor_parallel_size": self.tensor_parallel_size,
-            "gpu_memory_utilization": self.gpu_memory_utilization,
-            "max_num_seqs": self.max_num_seqs,
-            "trust_remote_code": self.trust_remote_code,
-            "enforce_eager": self.enforce_eager,
-            "dtype": self.dtype,
-            "load_format": self.load_format,
-            "disable_log_stats": True,
+            'model': self.model_id,
+            'tensor_parallel_size': self.tensor_parallel_size,
+            'gpu_memory_utilization': self.gpu_memory_utilization,
+            'max_num_seqs': self.max_num_seqs,
+            'trust_remote_code': self.trust_remote_code,
+            'enforce_eager': self.enforce_eager,
+            'dtype': self.dtype,
+            'load_format': self.load_format,
+            'disable_log_stats': True,
         }
-        
+
         if self.tensor_parallel_size > 1:
-            engine_config["distributed_executor_backend"] = "mp"
+            engine_config['distributed_executor_backend'] = 'mp'
 
         if self.max_model_len is not None:
-            engine_config["max_model_len"] = self.max_model_len
-        
+            engine_config['max_model_len'] = self.max_model_len
+
         if self.quantization is not None:
-            engine_config["quantization"] = self.quantization
-        
+            engine_config['quantization'] = self.quantization
+
         if self.enable_prefix_caching:
-            engine_config["enable_prefix_caching"] = True
-        
+            engine_config['enable_prefix_caching'] = True
+
         if self.enable_sleep_mode:
-            engine_config["enable_sleep_mode"] = True
-        
+            engine_config['enable_sleep_mode'] = True
+
         if self.logprobs_mode is not None:
-            engine_config["logprobs_mode"] = self.logprobs_mode
-        
+            engine_config['logprobs_mode'] = self.logprobs_mode
+
         if self.enable_lora:
-            engine_config["enable_lora"] = True
-            engine_config["max_loras"] = self.max_loras
-            engine_config["max_lora_rank"] = get_vllm_max_lora_rank(self.max_lora_rank)
-        
+            engine_config['enable_lora'] = True
+            engine_config['max_loras'] = self.max_loras
+            engine_config['max_lora_rank'] = get_vllm_max_lora_rank(self.max_lora_rank)
+
         # Enable worker extension for weight synchronization
-        engine_config["worker_extension_cls"] = (
-            "twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension"
-        )
-        
+        engine_config['worker_extension_cls'] = (
+            'twinkle.sampler.vllm_sampler.vllm_worker_extension.TwinkleWorkerExtension')
+
         engine_config.update(self.engine_kwargs)
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
         filtered_engine_config = {k: v for k, v in engine_config.items() if k in valid_args}
         invalid_args = set(engine_config.keys()) - set(valid_args)
         if invalid_args:
-            logger.warning(f"VLLMEngine: Filtered out invalid arguments: {invalid_args}")
+            logger.warning(f'VLLMEngine: Filtered out invalid arguments: {invalid_args}')
         # Create engine using vLLM v1 API
         engine_args = AsyncEngineArgs(**filtered_engine_config)
         vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
-        
+
         engine = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=UsageContext.OPENAI_API_SERVER,
         )
-        
-        logger.info(f"VLLMEngine initialized: model={self.model_id}")
+
+        logger.info(f'VLLMEngine initialized: model={self.model_id}')
         return engine
 
     async def get_tokenizer(self):
@@ -170,7 +170,7 @@ class VLLMEngine(BaseSamplerEngine):
         if self._tokenizer is None:
             self._tokenizer = await self.engine.get_tokenizer()
         return self._tokenizer
-    
+
     # =========================================================================
     # Core Sampling API
     # =========================================================================
@@ -192,9 +192,9 @@ class VLLMEngine(BaseSamplerEngine):
     ) -> SampleResponse:
         """
         Sample completions from the model.
-        
+
         This is the core API aligned with tinker's sampling interface.
-        
+
         Args:
             prompt_token_ids: Input token IDs.
             sampling_params: Sampling parameters (tinker.types.SamplingParams or dict).
@@ -209,12 +209,12 @@ class VLLMEngine(BaseSamplerEngine):
                     Can be PIL.Image, file paths, URLs, or bytes.
             videos: Optional list of videos for multimodal models.
                     Can be file paths or list of frames.
-            
+
         Returns:
             tinker.types.SampleResponse containing sequences and optionally prompt_logprobs.
         """
         from vllm.inputs import TokensPrompt
-        
+
         # Convert to vLLM params
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
@@ -224,18 +224,18 @@ class VLLMEngine(BaseSamplerEngine):
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs_k,
         )
-        
+
         # Build request
         if request_id is None:
             request_id = uuid.uuid4().hex
-        
+
         # Build multi_modal_data if images or videos provided
         multi_modal_data = {}
         if images:
             multi_modal_data['image'] = images
         if videos:
             multi_modal_data['video'] = videos
-        
+
         # Build prompt (with or without multimodal data)
         if multi_modal_data:
             prompt = TokensPrompt(
@@ -246,10 +246,8 @@ class VLLMEngine(BaseSamplerEngine):
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
         if lora_request is not None and not self.enable_lora:
-            logger.warning(
-                "lora_request provided but enable_lora is "
-                "False — LoRA will be ignored for this request"
-            )
+            logger.warning('lora_request provided but enable_lora is '
+                           'False — LoRA will be ignored for this request')
             lora_request = None
 
         if lora_request is None and self._synced_lora_request is not None:
@@ -265,20 +263,20 @@ class VLLMEngine(BaseSamplerEngine):
             lora_request=lora_request,
             priority=priority,
         )
-        
+
         # Get final result
         result = None
         async for output in generator:
             result = output
-        
+
         if result is None:
-            raise RuntimeError("Sampling did not produce a result")
-        
+            raise RuntimeError('Sampling did not produce a result')
+
         # Extract sequences
         sequences = []
         for output in result.outputs:
             token_ids = list(output.token_ids)
-            
+
             # Extract logprobs
             seq_logprobs = None
             if output.logprobs is not None:
@@ -286,54 +284,49 @@ class VLLMEngine(BaseSamplerEngine):
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids) and token_ids[i] in lp:
                         seq_logprobs.append(lp[token_ids[i]].logprob)
-            
+
             # Map finish_reason to StopReason
-            stop_reason: StopReason = "length"
-            if output.finish_reason in ("stop", "eos_token"):
-                stop_reason = "stop"
-            
+            stop_reason: StopReason = 'length'
+            if output.finish_reason in ('stop', 'eos_token'):
+                stop_reason = 'stop'
+
             sequences.append(SampledSequence(
                 stop_reason=stop_reason,
                 tokens=token_ids,
                 logprobs=seq_logprobs,
             ))
-        
+
         # Extract prompt logprobs if requested
         result_prompt_logprobs = None
         result_topk_prompt_logprobs = None
         if prompt_logprobs_k > 0 and result.prompt_logprobs is not None:
             result_prompt_logprobs = []
             result_topk_prompt_logprobs = []
-            
+
             for i, lp_dict in enumerate(result.prompt_logprobs):
                 if lp_dict is None:
                     result_prompt_logprobs.append(None)
                     result_topk_prompt_logprobs.append(None)
                     continue
-                
+
                 # Get logprob for the actual token
                 if i < len(prompt_token_ids):
                     token_id = prompt_token_ids[i]
                     if token_id in lp_dict:
                         lp_obj = lp_dict[token_id]
-                        result_prompt_logprobs.append(
-                            lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj
-                        )
+                        result_prompt_logprobs.append(lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
                     else:
                         result_prompt_logprobs.append(None)
                 else:
                     result_prompt_logprobs.append(None)
-                
+
                 # Get top-k logprobs
                 sorted_items = sorted(
-                    lp_dict.items(),
-                    key=lambda x: -(x[1].logprob if hasattr(x[1], 'logprob') else x[1])
-                )[:prompt_logprobs_k]
-                result_topk_prompt_logprobs.append([
-                    (tid, lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
-                    for tid, lp_obj in sorted_items
-                ])
-        
+                    lp_dict.items(), key=lambda x: -(x[1].logprob
+                                                     if hasattr(x[1], 'logprob') else x[1]))[:prompt_logprobs_k]
+                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
+                                                    for tid, lp_obj in sorted_items])
+
         return SampleResponse(
             sequences=sequences,
             prompt_logprobs=result_prompt_logprobs,
@@ -352,9 +345,8 @@ class VLLMEngine(BaseSamplerEngine):
         the cached request object without any ``list_loras()`` RPC.
         """
         from vllm.lora.request import LoRARequest
-        from twinkle.sampler.vllm_sampler.vllm_worker_extension import (
-            VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH,
-        )
+
+        from twinkle.sampler.vllm_sampler.vllm_worker_extension import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH
         loaded = await self.engine.list_loras()
         if VLLM_LORA_INT_ID in loaded:
             self._synced_lora_request = LoRARequest(
@@ -395,7 +387,7 @@ class VLLMEngine(BaseSamplerEngine):
             ``LoRARequest`` or ``None`` if loading fails.
         """
         from vllm.lora.request import LoRARequest
-        user_id = 'default' # TODO, multi-tenant
+        user_id = 'default'  # TODO, multi-tenant
         # Fast path: return cached request if it exists and reload is not forced.
         if user_id in self._user_lora_ids and not force_reload:
             lora_int_id = self._user_lora_ids[user_id]
@@ -414,12 +406,12 @@ class VLLMEngine(BaseSamplerEngine):
             await self.engine.remove_lora(self._user_lora_ids[user_id])
 
         if not os.path.exists(lora_path):
-            logger.error(f"LoRA path does not exist: {lora_path}")
+            logger.error(f'LoRA path does not exist: {lora_path}')
             return None
 
-        config_path = os.path.join(lora_path, "adapter_config.json")
+        config_path = os.path.join(lora_path, 'adapter_config.json')
         if not os.path.exists(config_path):
-            logger.error(f"adapter_config.json not found in {lora_path}")
+            logger.error(f'adapter_config.json not found in {lora_path}')
             return None
 
         lora_int_id = self._generate_lora_id()
@@ -436,33 +428,33 @@ class VLLMEngine(BaseSamplerEngine):
             self._user_lora_ids[user_id] = lora_int_id
             return lora_request
         except Exception as e:
-            logger.error(f"Failed to load LoRA: {e}")
+            logger.error(f'Failed to load LoRA: {e}')
             return None
 
     async def sleep(self, level: int = 2) -> None:
         """
         Offload weights and/or KV cache from GPU memory.
-        
+
         Used in colocated mode to free GPU memory for training.
-        
+
         Args:
             level: Sleep level.
                 1 = offload KV cache only
                 2 = offload KV cache and weights
         """
         if not self.enable_sleep_mode:
-            logger.warning("sleep_mode not enabled, skipping sleep")
+            logger.warning('sleep_mode not enabled, skipping sleep')
             return
-        
+
         await self.engine.sleep(level=level)
-        logger.debug(f"Engine sleeping at level {level}")
-    
+        logger.debug(f'Engine sleeping at level {level}')
+
     async def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """
         Resume weights and/or KV cache to GPU memory.
-        
+
         Used in colocated mode before inference.
-        
+
         Args:
             tags: What to resume. Options: ['weights', 'kv_cache'].
                   If None, resumes both.
@@ -471,15 +463,15 @@ class VLLMEngine(BaseSamplerEngine):
 
         """
         if not self.enable_sleep_mode:
-            logger.warning("sleep_mode not enabled, skipping wake_up")
+            logger.warning('sleep_mode not enabled, skipping wake_up')
             return
-        
+
         if tags is None:
-            tags = ["weights", "kv_cache"]
-        
+            tags = ['weights', 'kv_cache']
+
         await self.engine.wake_up(tags=tags)
-        
-        logger.debug(f"Engine waking up with tags: {tags}")
+
+        logger.debug(f'Engine waking up with tags: {tags}')
 
     async def reset_prefix_cache(self) -> None:
         await self.engine.reset_prefix_cache()
@@ -509,19 +501,21 @@ class VLLMEngine(BaseSamplerEngine):
             base_sync_done: If True with peft_config, load as LoRA adapter.
             bucket_size_mb: Size of transfer bucket in MB.
         """
+        import asyncio
         import gc
         import time
         import zmq
-        import asyncio
         from vllm.platforms import current_platform
 
         start_time = time.time()
 
         # Normalise *weights* into an async iterator regardless of input type.
         if isinstance(weights, dict):
+
             async def _dict_iter():
                 for item in weights.items():
                     yield item
+
             weight_aiter = _dict_iter()
         elif hasattr(weights, '__aiter__'):
             weight_aiter = weights.__aiter__()
@@ -530,13 +524,14 @@ class VLLMEngine(BaseSamplerEngine):
             async def _sync_iter():
                 for item in weights:
                     yield item
+
             weight_aiter = _sync_iter()
 
         # Peek first tensor to detect device (GPU → IPC, CPU → SHM).
         try:
             first_name, first_tensor = await weight_aiter.__anext__()
         except StopAsyncIteration:
-            logger.warning("update_weights called with empty weights")
+            logger.warning('update_weights called with empty weights')
             return
 
         use_gpu_ipc = first_tensor.is_cuda
@@ -547,7 +542,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Get device UUID for ZMQ handle.
         # For NPU, this is resolved from `npu-smi info` Bus-Id when needed.
         device_uuid = get_vllm_device_uuid(0)
-        zmq_handle = f"ipc:///tmp/twinkle-ipc-{device_uuid}.sock"
+        zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}.sock'
 
         bucket_size = bucket_size_mb << 20
 
@@ -561,7 +556,7 @@ class VLLMEngine(BaseSamplerEngine):
             ipc_handle = reduce_tensor(buffer)
         else:
             from multiprocessing import shared_memory
-            shm_name = f"twinkle_weights_{uuid.uuid4().hex}"
+            shm_name = f'twinkle_weights_{uuid.uuid4().hex}'
             shm = shared_memory.SharedMemory(name=shm_name, create=True, size=bucket_size)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
 
@@ -584,17 +579,16 @@ class VLLMEngine(BaseSamplerEngine):
         # Launch worker side concurrently
         worker_task = asyncio.ensure_future(
             self.engine.collective_rpc(
-                "update_weights_from_ipc",
+                'update_weights_from_ipc',
                 kwargs={
-                    "peft_config": peft_config,
-                    "base_sync_done": base_sync_done,
-                    "use_shm": use_shm,
+                    'peft_config': peft_config,
+                    'base_sync_done': base_sync_done,
+                    'use_shm': use_shm,
                 },
-            )
-        )
+            ))
 
         # Send IPC/SHM handle, wait for worker ready (non-blocking)
-        handle_payload = ipc_handle if use_gpu_ipc else {"name": shm_name, "size": bucket_size}
+        handle_payload = ipc_handle if use_gpu_ipc else {'name': shm_name, 'size': bucket_size}
         await loop.run_in_executor(None, _zmq_send_recv, handle_payload)
 
         # Stream weights into buckets and send to worker
@@ -613,31 +607,31 @@ class VLLMEngine(BaseSamplerEngine):
                 weight = weight.cpu()
 
             if weight.nbytes > bucket_size:
-                raise ValueError(
-                    f"Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds "
-                    f"bucket size ({bucket_size_mb} MB). Increase bucket_size_mb."
-                )
+                raise ValueError(f'Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds '
+                                 f'bucket size ({bucket_size_mb} MB). Increase bucket_size_mb.')
 
             # Flush current bucket if it would overflow
             if offset + weight.nbytes > bucket_size:
                 if use_gpu_ipc:
                     torch.cuda.synchronize()
                 await loop.run_in_executor(
-                    None, _zmq_send_recv,
-                    {"bucket_meta": bucket_meta, "is_last": False},
+                    None,
+                    _zmq_send_recv,
+                    {
+                        'bucket_meta': bucket_meta,
+                        'is_last': False
+                    },
                 )
                 bucket_meta = {}
                 offset = 0
 
             bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
+                'name': name,
+                'shape': weight.shape,
+                'dtype': weight.dtype,
+                'offset': offset,
             }
-            buffer[offset:offset + weight.nbytes].copy_(
-                weight.view(-1).view(torch.uint8), non_blocking=True
-            )
+            buffer[offset:offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
             offset += weight.nbytes
             n_weights += 1
 
@@ -645,8 +639,12 @@ class VLLMEngine(BaseSamplerEngine):
         if use_gpu_ipc:
             torch.cuda.synchronize()
         await loop.run_in_executor(
-            None, _zmq_send_recv,
-            {"bucket_meta": bucket_meta, "is_last": True},
+            None,
+            _zmq_send_recv,
+            {
+                'bucket_meta': bucket_meta,
+                'is_last': True
+            },
         )
 
         # Wait for worker to finish loading
@@ -663,20 +661,20 @@ class VLLMEngine(BaseSamplerEngine):
         gc.collect()
 
         elapsed = time.time() - start_time
-        mode = "LoRA" if base_sync_done and peft_config else "base"
-        logger.info(f"Updated {n_weights} {mode} weights via "
-                     f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
-    
+        mode = 'LoRA' if base_sync_done and peft_config else 'base'
+        logger.info(f'Updated {n_weights} {mode} weights via '
+                    f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
+
     async def shutdown(self) -> None:
         """Shutdown the vLLM engine and release all resources.
-        
+
         This method should be called before the process exits to ensure
         proper cleanup of the vLLM AsyncLLM engine and its subprocesses.
         """
         import gc
-        
-        logger.info("Shutting down VLLMEngine...")
-        
+
+        logger.info('Shutting down VLLMEngine...')
+
         if self.engine is not None:
             try:
                 # vLLM v1 AsyncLLM has shutdown() method
@@ -687,20 +685,20 @@ class VLLMEngine(BaseSamplerEngine):
                     if hasattr(self.engine.engine_core, 'shutdown'):
                         await self.engine.engine_core.shutdown()
             except Exception as e:
-                logger.warning(f"Error during engine shutdown: {e}")
+                logger.warning(f'Error during engine shutdown: {e}')
             finally:
                 self.engine = None
-        
+
         # Clear LoRA state
         self._user_lora_ids.clear()
-        
+
         # Force garbage collection
         gc.collect()
-        
+
         # Clear CUDA cache if available
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, 'ipc_collect'):
                 torch.cuda.ipc_collect()
-        
-        logger.info("VLLMEngine shutdown complete")
+
+        logger.info('VLLMEngine shutdown complete')

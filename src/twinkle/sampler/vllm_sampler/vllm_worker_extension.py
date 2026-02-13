@@ -11,15 +11,16 @@ parameter and provides methods for:
 
 Reference: verl's vLLMColocateWorkerExtension implementation.
 """
+import ctypes
 import gc
 import os
 import platform
-import ctypes
 import re
 import signal
-from typing import Dict, List, Optional, Tuple
-from twinkle import get_logger
 import torch
+from typing import Dict, List, Optional, Tuple
+
+from twinkle import get_logger
 from twinkle.utils.framework import Torch
 from twinkle.utils.platform import get_vllm_device_uuid
 
@@ -28,9 +29,9 @@ logger = get_logger()
 
 def set_death_signal():
     """Kill the current process when the parent process exits."""
-    if platform.system() != "Linux":
+    if platform.system() != 'Linux':
         return
-    libc = ctypes.CDLL("libc.so.6")
+    libc = ctypes.CDLL('libc.so.6')
     libc.prctl(1, signal.SIGKILL)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
@@ -38,8 +39,8 @@ def set_death_signal():
 
 # Constants for the RL training LoRA adapter identity.
 VLLM_LORA_INT_ID = 111
-VLLM_LORA_NAME = "twinkle_lora"
-VLLM_LORA_PATH = "twinkle_lora_path"
+VLLM_LORA_NAME = 'twinkle_lora'
+VLLM_LORA_PATH = 'twinkle_lora_path'
 
 
 def _rebuild_ipc(handle, device_id: Optional[int] = None) -> torch.Tensor:
@@ -86,6 +87,7 @@ class TwinkleWorkerExtension:
     def monkey_patch_model(self):
         from twinkle.patch.vllm_moe_loader import VLLMMoEWeights
         VLLMMoEWeights()(self.model_runner.model)
+
     # -----------------------------------------------------------------
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
@@ -113,14 +115,14 @@ class TwinkleWorkerExtension:
             base_sync_done: If True and peft_config, replaces existing LoRA.
             use_shm: If True, use shared memory instead of CUDA IPC.
         """
-        import zmq
         import torch.distributed as dist
+        import zmq
 
         if self.device is None:
             # fix: In some worker paths, omitting local_rank can pick the wrong device / trigger get_device arg issues.
             # fix: Pass local_rank when available so each worker binds to the expected local device.
             print(f"VLLM Worker local_rank: {getattr(self, 'local_rank', None)} <<<<<<<<<<<<< {Torch.get_device()}")
-            self.device = torch.device(Torch.get_device(getattr(self, "local_rank", None)))
+            self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
 
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
@@ -178,11 +180,12 @@ class TwinkleWorkerExtension:
         else:
             from multiprocessing import shared_memory
             buffer, shm = _rebuild_shared_memory(
-                comm_metadata["name"], comm_metadata["size"],
+                comm_metadata['name'],
+                comm_metadata['size'],
             )
 
         if is_driver:
-            socket.send(b"")  # Ready
+            socket.send(b'')  # Ready
 
         # ── Step 3: Receive and process weight buckets ──
         while True:
@@ -196,8 +199,8 @@ class TwinkleWorkerExtension:
                 metadata = _broadcast_obj(metadata)
 
             weights = []
-            for name, meta in metadata["bucket_meta"].items():
-                shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
+            for name, meta in metadata['bucket_meta'].items():
+                shape, dtype, offset = meta['shape'], meta['dtype'], meta['offset']
                 size = dtype.itemsize * shape.numel()
                 tensor = buffer[offset:offset + size].view(dtype=dtype).view(shape)
                 if not use_shm:
@@ -209,7 +212,7 @@ class TwinkleWorkerExtension:
             Torch.synchronize()
 
             if is_driver:
-                socket.send(b"")
+                socket.send(b'')
 
             # Ensure all ranks finish reading the buffer before the driver
             # proceeds to the next bucket (which overwrites the buffer).
@@ -219,7 +222,7 @@ class TwinkleWorkerExtension:
             self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
 
-            if metadata["is_last"]:
+            if metadata['is_last']:
                 break
 
         if is_driver and socket is not None:
@@ -256,7 +259,7 @@ class TwinkleWorkerExtension:
         """
         if self.device is None:
             # fix: Keep device resolution consistent with update_weights_from_ipc to avoid path divergence.
-            self.device = torch.device(Torch.get_device(getattr(self, "local_rank", None)))
+            self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
 
         weight_list = list(weights.items())
         self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
@@ -307,10 +310,7 @@ class TwinkleWorkerExtension:
 
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 
-            converted = {
-                self._convert_peft_to_vllm_lora_name(n): t
-                for n, t in weights
-            }
+            converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
@@ -324,7 +324,9 @@ class TwinkleWorkerExtension:
             # vLLM's model.load_weights() which handles stacked params,
             # prefix normalization, and weight_loader internally.
             vllm_has_lora = getattr(
-                getattr(self, 'vllm_config', None), 'lora_config', None,
+                getattr(self, 'vllm_config', None),
+                'lora_config',
+                None,
             ) is not None
 
             # When vLLM LoRA is enabled, some LinearBase modules are
@@ -340,7 +342,7 @@ class TwinkleWorkerExtension:
                 for mod_name, mod in self.model_runner.model.named_modules():
                     if isinstance(mod, BaseLayerWithLoRA):
                         # mod_name is e.g. "model.layers.0.mlp.gate"
-                        lora_base_prefixes.add(mod_name + ".")
+                        lora_base_prefixes.add(mod_name + '.')
 
             converted = []
             for name, tensor in weights:
@@ -360,7 +362,7 @@ class TwinkleWorkerExtension:
                                 # e.g. "model.layers.0.mlp.gate.weight"
                                 # →    "model.layers.0.mlp.gate.base_layer.weight"
                                 suffix = name[len(pfx):]
-                                name = pfx + "base_layer." + suffix
+                                name = pfx + 'base_layer.' + suffix
                                 break
                 converted.append((name, tensor))
 
@@ -368,11 +370,11 @@ class TwinkleWorkerExtension:
                 return
 
             self.model_runner.model.load_weights(converted)
-            logger.info(f"Loaded {len(converted)} base weights")
+            logger.info(f'Loaded {len(converted)} base weights')
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for IPC communication."""
         if not hasattr(self, '_device_uuid') or not self._device_uuid:
             # fix: Always use platform fallback to avoid worker-side crashes when NPU get_device_uuid is unimplemented.
             self._device_uuid = get_vllm_device_uuid(self.device.index)
-        return f"ipc:///tmp/twinkle-ipc-{self._device_uuid}.sock"
+        return f'ipc:///tmp/twinkle-ipc-{self._device_uuid}.sock'

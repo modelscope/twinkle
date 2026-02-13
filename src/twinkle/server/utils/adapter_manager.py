@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
 if TYPE_CHECKING:
     from twinkle.server.utils.state import ServerStateProxy
     from twinkle.model import TwinkleModel
-    
+
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -40,9 +41,9 @@ class AdapterManagerMixin:
     """
 
     # Type hint for state attribute that inheriting classes must provide
-    state: 'ServerStateProxy'
-    model: 'TwinkleModel'
-    
+    state: ServerStateProxy
+    model: TwinkleModel
+
     def _init_adapter_manager(self, adapter_timeout: float = 1800.0, per_token_adapter_limit: int = 30) -> None:
         """Initialize the adapter manager.
 
@@ -58,14 +59,15 @@ class AdapterManagerMixin:
         self._per_token_adapter_limit = per_token_adapter_limit
 
         # Adapter lifecycle tracking
-        # Dict mapping adapter_name -> {'token': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
-        self._adapter_records: Dict[str, Dict[str, Any]] = {}
+        # Dict mapping adapter_name -> {'token': str, 'last_activity': float, 'created_at': float,
+        # 'inactivity_counter': int}
+        self._adapter_records: dict[str, dict[str, Any]] = {}
         # Track adapter count per token
-        self._adapter_counts: Dict[str, int] = {}
+        self._adapter_counts: dict[str, int] = {}
         self._adapter_lock = threading.Lock()
 
         # Countdown thread
-        self._adapter_countdown_thread: Optional[threading.Thread] = None
+        self._adapter_countdown_thread: threading.Thread | None = None
         self._adapter_countdown_running = False
 
     def register_adapter(self, adapter_name: str, token: str) -> None:
@@ -83,8 +85,7 @@ class AdapterManagerMixin:
                 'created_at': current_time,
                 'inactivity_counter': 0,
             }
-            logger.debug(
-                f"[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...")
+            logger.debug(f'[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...')
 
     def unregister_adapter(self, adapter_name: str) -> bool:
         """Unregister an adapter from lifecycle tracking.
@@ -99,8 +100,8 @@ class AdapterManagerMixin:
             if adapter_name in self._adapter_records:
                 adapter_info = self._adapter_records.pop(adapter_name)
                 token = adapter_info.get('token')
-                logger.debug(
-                    f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}...")
+                logger.debug(f'[AdapterManager] Unregistered adapter {adapter_name} for '
+                             f"token {token[:8] if token else 'unknown'}...")
                 return True
             return False
 
@@ -115,13 +116,12 @@ class AdapterManagerMixin:
         """
         with self._adapter_lock:
             if adapter_name in self._adapter_records:
-                self._adapter_records[adapter_name]['last_activity'] = time.time(
-                )
+                self._adapter_records[adapter_name]['last_activity'] = time.time()
                 self._adapter_records[adapter_name]['inactivity_counter'] = 0
                 return True
             return False
 
-    def get_adapter_info(self, adapter_name: str) -> Optional[Dict[str, Any]]:
+    def get_adapter_info(self, adapter_name: str) -> dict[str, Any] | None:
         """Get information about a registered adapter.
 
         Args:
@@ -133,7 +133,7 @@ class AdapterManagerMixin:
         with self._adapter_lock:
             return self._adapter_records.get(adapter_name)
 
-    def list_adapters(self, token: Optional[str] = None) -> List[str]:
+    def list_adapters(self, token: str | None = None) -> list[str]:
         """List all registered adapters, optionally filtered by token.
 
         Args:
@@ -145,10 +145,7 @@ class AdapterManagerMixin:
         with self._adapter_lock:
             if token is None:
                 return list(self._adapter_records.keys())
-            return [
-                name for name, info in self._adapter_records.items()
-                if info.get('token') == token
-            ]
+            return [name for name, info in self._adapter_records.items() if info.get('token') == token]
 
     def _on_adapter_expired(self, adapter_name: str, token: str) -> None:
         """Hook method called when an adapter expires.
@@ -163,14 +160,12 @@ class AdapterManagerMixin:
         try:
             # Remove adapter from model
             self.model.remove_adapter(adapter_name)
-            logger.info(
-                f"[AdapterManager] Removed expired adapter {adapter_name} for token {token[:8]}...")
+            logger.info(f'[AdapterManager] Removed expired adapter {adapter_name} for token {token[:8]}...')
 
             # Decrement adapter count
             self.check_adapter_limit(token, False)
         except Exception as e:
-            logger.warning(
-                f"[AdapterManager] Failed to remove expired adapter {adapter_name}: {e}")
+            logger.warning(f'[AdapterManager] Failed to remove expired adapter {adapter_name}: {e}')
 
     @staticmethod
     def get_adapter_name(adapter_name: str) -> str:
@@ -196,9 +191,9 @@ class AdapterManagerMixin:
             AssertionError: If adapter doesn't exist
         """
         assert adapter_name and self.get_adapter_info(adapter_name) is not None, \
-            f"Adapter {adapter_name} not found"
+            f'Adapter {adapter_name} not found'
 
-    def assert_adapter_valid(self, adapter_name: Optional[str]) -> None:
+    def assert_adapter_valid(self, adapter_name: str | None) -> None:
         """Validate that an adapter name is valid.
 
         Args:
@@ -209,7 +204,7 @@ class AdapterManagerMixin:
         """
         assert (adapter_name is None or adapter_name == '' or
                 self.get_adapter_info(adapter_name) is not None), \
-            f"Adapter {adapter_name} is invalid"
+            f'Adapter {adapter_name} is invalid'
 
     def _adapter_countdown_loop(self) -> None:
         """Background thread that monitors and handles inactive adapters.
@@ -219,8 +214,7 @@ class AdapterManagerMixin:
         2. Calls _on_adapter_expired() for adapters that exceed timeout
         3. Removes expired adapters from tracking
         """
-        logger.debug(
-            f"[AdapterManager] Countdown thread started (timeout={self._adapter_timeout}s)")
+        logger.debug(f'[AdapterManager] Countdown thread started (timeout={self._adapter_timeout}s)')
         while self._adapter_countdown_running:
             try:
                 time.sleep(1)
@@ -230,35 +224,29 @@ class AdapterManagerMixin:
                 with self._adapter_lock:
                     for adapter_name, info in list(self._adapter_records.items()):
                         # Increment inactivity counter
-                        info['inactivity_counter'] = info.get(
-                            'inactivity_counter', 0) + 1
+                        info['inactivity_counter'] = info.get('inactivity_counter', 0) + 1
 
                         # Check if adapter has timed out
                         if info['inactivity_counter'] > self._adapter_timeout:
                             token = info.get('token')
                             expired_adapters.append((adapter_name, token))
                             self._adapter_records.pop(adapter_name, None)
-                            logger.debug(
-                                f"[AdapterManager] Adapter {adapter_name} timed out after "
-                                f"{info['inactivity_counter']}s of inactivity"
-                            )
+                            logger.debug(f'[AdapterManager] Adapter {adapter_name} timed out after '
+                                         f"{info['inactivity_counter']}s of inactivity")
 
                 # Call hook method outside the lock
                 for adapter_name, token in expired_adapters:
                     try:
                         self._on_adapter_expired(adapter_name, token)
                     except Exception as e:
-                        logger.warning(
-                            f"[AdapterManager] Error in _on_adapter_expired() "
-                            f"for {adapter_name}: {e}"
-                        )
+                        logger.warning(f'[AdapterManager] Error in _on_adapter_expired() '
+                                       f'for {adapter_name}: {e}')
 
             except Exception as e:
-                logger.warning(
-                    f"[AdapterManager] Error in countdown loop: {e}")
+                logger.warning(f'[AdapterManager] Error in countdown loop: {e}')
                 continue
 
-        logger.debug("[AdapterManager] Countdown thread stopped")
+        logger.debug('[AdapterManager] Countdown thread stopped')
 
     def start_adapter_countdown(self) -> None:
         """Start the background adapter countdown thread.
@@ -268,12 +256,9 @@ class AdapterManagerMixin:
         """
         if not self._adapter_countdown_running:
             self._adapter_countdown_running = True
-            self._adapter_countdown_thread = threading.Thread(
-                target=self._adapter_countdown_loop,
-                daemon=True
-            )
+            self._adapter_countdown_thread = threading.Thread(target=self._adapter_countdown_loop, daemon=True)
             self._adapter_countdown_thread.start()
-            logger.debug("[AdapterManager] Countdown thread started")
+            logger.debug('[AdapterManager] Countdown thread started')
 
     def stop_adapter_countdown(self) -> None:
         """Stop the background adapter countdown thread.
@@ -285,9 +270,9 @@ class AdapterManagerMixin:
             if self._adapter_countdown_thread:
                 # Wait for thread to finish (it checks the flag every second)
                 self._adapter_countdown_thread.join(timeout=2.0)
-            logger.debug("[AdapterManager] Countdown thread stopped")
+            logger.debug('[AdapterManager] Countdown thread stopped')
 
-    def get_adapter_stats(self) -> Dict[str, Any]:
+    def get_adapter_stats(self) -> dict[str, Any]:
         """Get adapter manager statistics.
 
         Returns:
@@ -302,7 +287,7 @@ class AdapterManagerMixin:
                 'per_token_adapter_limit': self._per_token_adapter_limit,
             }
 
-    def check_adapter_limit(self, token: str, add: bool) -> Tuple[bool, Optional[str]]:
+    def check_adapter_limit(self, token: str, add: bool) -> tuple[bool, str | None]:
         """Check and update adapter count for a user token.
 
         This method enforces per-user adapter limits to prevent resource exhaustion.
@@ -322,7 +307,7 @@ class AdapterManagerMixin:
             if add:
                 # Check if adding would exceed limit
                 if current_count >= self._per_token_adapter_limit:
-                    return False, f"Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters"
+                    return False, f'Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters'
                 # Increment count in global state
                 self.state.add_config(user_key, current_count + 1)
                 return True, None

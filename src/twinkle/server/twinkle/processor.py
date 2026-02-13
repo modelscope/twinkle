@@ -1,66 +1,67 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import os
 import threading
 import uuid
-from typing import Dict, Any
-import importlib
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from ray import serve
+from typing import Any, Dict
 
 import twinkle
-from twinkle import get_logger
-from twinkle import DeviceGroup, DeviceMesh
+from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
-from twinkle.server.utils.state import get_server_state, ServerStateProxy
 from .common.serialize import deserialize_object
 
 logger = get_logger()
+
 
 class CreateRequest(BaseModel):
     processor_type: str
     class_type: str
 
     class Config:
-        extra = "allow"
+        extra = 'allow'
+
 
 class HeartbeatRequest(BaseModel):
     processor_id: str
+
 
 class CallRequest(BaseModel):
     processor_id: str
     function: str
 
     class Config:
-        extra = "allow"
+        extra = 'allow'
 
-def build_processor_app(nproc_per_node: int,
-                        ncpu_proc_per_node:int,
-                        device_group: Dict[str, Any],
-                        device_mesh: Dict[str, Any],
-                        deploy_options: Dict[str, Any],
-                        **kwargs):
+
+def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_group: Dict[str, Any],
+                        device_mesh: Dict[str, Any], deploy_options: Dict[str, Any], **kwargs):
     app = FastAPI()
 
-    @app.middleware("http")
+    @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
-    processors = ['dataset', 'dataloader', 'preprocessor', 'processor',
-                  'reward', 'template', 'weight_loader']
+    processors = ['dataset', 'dataloader', 'preprocessor', 'processor', 'reward', 'template', 'weight_loader']
 
-
-
-    @serve.deployment(name="ProcessorManagement")
+    @serve.deployment(name='ProcessorManagement')
     @serve.ingress(app)
     class ProcessorManagement:
 
         COUNT_DOWN = 60 * 30
 
-        def __init__(self, nproc_per_node: int, ncpu_proc_per_node:int, device_group: Dict[str, Any], device_mesh: Dict[str, Any]):
+        def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, device_group: Dict[str, Any],
+                     device_mesh: Dict[str, Any]):
             self.device_group = DeviceGroup(**device_group)
-            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group],
-                               lazy_collect=False, ncpu_proc_per_node=ncpu_proc_per_node)
+            twinkle.initialize(
+                mode='ray',
+                nproc_per_node=nproc_per_node,
+                groups=[self.device_group],
+                lazy_collect=False,
+                ncpu_proc_per_node=ncpu_proc_per_node)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:
@@ -70,7 +71,7 @@ def build_processor_app(nproc_per_node: int,
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()
             self.state: ServerStateProxy = get_server_state()
-            self.per_token_processor_limit = int(os.environ.get("TWINKLE_PER_USER_PROCESSOR_LIMIT", 20))
+            self.per_token_processor_limit = int(os.environ.get('TWINKLE_PER_USER_PROCESSOR_LIMIT', 20))
             self.key_token_dict = {}
 
         def countdown(self):
@@ -86,7 +87,7 @@ def build_processor_app(nproc_per_node: int,
                             self.handle_processor_count(self.key_token_dict.pop(key), False)
 
         def assert_processor_exists(self, processor_id: str):
-            assert processor_id and processor_id in self.resource_dict, f"Processor {processor_id} not found"
+            assert processor_id and processor_id in self.resource_dict, f'Processor {processor_id} not found'
 
         def handle_processor_count(self, token: str, add: bool):
             user_key = token + '_' + 'processor'
@@ -103,16 +104,16 @@ def build_processor_app(nproc_per_node: int,
                 if cur_count <= 0:
                     self.state.pop_config(user_key)
 
-        @app.post("/create")
+        @app.post('/create')
         def create(self, request: Request, body: CreateRequest):
 
             processor_type_name = body.processor_type
             class_type = body.class_type
             kwargs = body.model_extra or {}
 
-            assert processor_type_name in processors, f"Invalid processor type: {processor_type_name}"
+            assert processor_type_name in processors, f'Invalid processor type: {processor_type_name}'
             processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
-            assert hasattr(processor_module, class_type), f"Class {class_type} not found in {processor_type_name}"
+            assert hasattr(processor_module, class_type), f'Class {class_type} not found in {processor_type_name}'
             self.handle_processor_count(request.state.token, True)
             processor_id = str(uuid.uuid4().hex)
             self.key_token_dict[processor_id] = request.state.token
@@ -130,16 +131,12 @@ def build_processor_app(nproc_per_node: int,
                     _kwargs[key] = value
 
             processor = getattr(processor_module, class_type)(
-                remote_group=self.device_group.name,
-                device_mesh=self.device_mesh,
-                instance_id=processor_id,
-                **_kwargs
-            )
+                remote_group=self.device_group.name, device_mesh=self.device_mesh, instance_id=processor_id, **_kwargs)
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
             return {'processor_id': 'pid:' + processor_id}
 
-        @app.post("/heartbeat")
+        @app.post('/heartbeat')
         def heartbeat(self, body: HeartbeatRequest):
             processor_ids = body.processor_id.split(',')
             for _id in processor_ids:
@@ -147,7 +144,7 @@ def build_processor_app(nproc_per_node: int,
                     self.resource_records[_id] = 0
             return {'status': 'ok'}
 
-        @app.post("/call")
+        @app.post('/call')
         def call(self, body: CallRequest):
             processor_id = body.processor_id
             function_name = body.function
@@ -179,12 +176,13 @@ def build_processor_app(nproc_per_node: int,
                 except StopIteration:
                     # Use HTTP 410 Gone to indicate iterator exhausted
                     # This is a clean signal that won't be confused with errors
-                    raise HTTPException(status_code=410, detail="Iterator exhausted")
-            
+                    raise HTTPException(status_code=410, detail='Iterator exhausted')
+
             result = function(**_kwargs)
             if function_name == '__iter__':
                 return {'result': 'ok'}
             else:
                 return {'result': result}
 
-    return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, ncpu_proc_per_node, device_group, device_mesh)
+    return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, ncpu_proc_per_node, device_group,
+                                                              device_mesh)

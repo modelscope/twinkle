@@ -24,25 +24,23 @@ import gc
 import os
 import re
 import time
-from typing import List, Tuple, Dict, Any, Optional
-
 from peft import LoraConfig
+from typing import Any, Dict, List, Optional, Tuple
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.data_format import SamplingParams, SampleResponse
-from twinkle.data_format import Trajectory, InputFeature, Message
+from twinkle.data_format import InputFeature, Message, SampleResponse, SamplingParams, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
-from twinkle.metric import CompletionRewardMetric
 
 logger = get_logger()
 
@@ -73,21 +71,22 @@ USE_SWANLAB = bool(int(os.environ.get('USE_SWANLAB', '1')))
 if USE_SWANLAB:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-    swanlab.init(project="twinkle-math", config={
-        'model_id': MODEL_ID,
-        'dataset': 'DAPO-Math-17k',
-        'num_gpus': NUM_GPUS,
-        'model_gpus': MODEL_GPUS,
-        'sampler_gpus': SAMPLER_GPUS,
-        'num_generations': NUM_GENERATIONS,
-        'max_new_tokens': MAX_NEW_TOKENS,
-        'learning_rate': LEARNING_RATE,
-        'grpo_epsilon': GRPO_EPSILON,
-        'grpo_beta': GRPO_BETA,
-        'batch_size': BATCH_SIZE,
-        'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
-    })
-
+    swanlab.init(
+        project='twinkle-math',
+        config={
+            'model_id': MODEL_ID,
+            'dataset': 'DAPO-Math-17k',
+            'num_gpus': NUM_GPUS,
+            'model_gpus': MODEL_GPUS,
+            'sampler_gpus': SAMPLER_GPUS,
+            'num_generations': NUM_GENERATIONS,
+            'max_new_tokens': MAX_NEW_TOKENS,
+            'learning_rate': LEARNING_RATE,
+            'grpo_epsilon': GRPO_EPSILON,
+            'grpo_beta': GRPO_BETA,
+            'batch_size': BATCH_SIZE,
+            'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
+        })
 
 # ========== DAPO Math Reward (adapted from verl/slime math_dapo) ==========
 # All answers in DAPO-Math-17k are integers, so verification is simpler
@@ -95,19 +94,61 @@ if USE_SWANLAB:
 
 # --- Normalization constants (from verl/slime math_dapo_utils) ---
 _SUBSTITUTIONS = [
-    ("an ", ""), ("a ", ""), (".$", "$"), ("\\$", ""), (r"\ ", ""),
-    (" ", ""), ("mbox", "text"), (",\\text{and}", ","),
-    ("\\text{and}", ","), ("\\text{m}", "\\text{}"),
+    ('an ', ''),
+    ('a ', ''),
+    ('.$', '$'),
+    ('\\$', ''),
+    (r'\ ', ''),
+    (' ', ''),
+    ('mbox', 'text'),
+    (',\\text{and}', ','),
+    ('\\text{and}', ','),
+    ('\\text{m}', '\\text{}'),
 ]
 _REMOVED_EXPRESSIONS = [
-    "square", "ways", "integers", "dollars", "mph", "inches", "hours",
-    "km", "units", "\\ldots", "sue", "points", "feet", "minutes",
-    "digits", "cents", "degrees", "cm", "gm", "pounds", "meters",
-    "meals", "edges", "students", "childrentickets", "multiples",
-    "\\text{s}", "\\text{.}", "\\text{\ns}", "\\text{}^2",
-    "\\text{}^3", "\\text{\n}", "\\text{}", r"\mathrm{th}",
-    r"^\circ", r"^{\circ}", r"\;", r",\!", "{,}", '"', "\\dots",
-    "<|im_end|>", "<|endoftext|>",
+    'square',
+    'ways',
+    'integers',
+    'dollars',
+    'mph',
+    'inches',
+    'hours',
+    'km',
+    'units',
+    '\\ldots',
+    'sue',
+    'points',
+    'feet',
+    'minutes',
+    'digits',
+    'cents',
+    'degrees',
+    'cm',
+    'gm',
+    'pounds',
+    'meters',
+    'meals',
+    'edges',
+    'students',
+    'childrentickets',
+    'multiples',
+    '\\text{s}',
+    '\\text{.}',
+    '\\text{\ns}',
+    '\\text{}^2',
+    '\\text{}^3',
+    '\\text{\n}',
+    '\\text{}',
+    r'\mathrm{th}',
+    r'^\circ',
+    r'^{\circ}',
+    r'\;',
+    r',\!',
+    '{,}',
+    '"',
+    '\\dots',
+    '<|im_end|>',
+    '<|endoftext|>',
 ]
 
 
@@ -117,56 +158,56 @@ def _normalize_final_answer(answer: str) -> str:
     Adapted from verl/slime math_dapo_utils.normalize_final_answer.
     """
     answer = str(answer)
-    answer = answer.split("=")[-1]
+    answer = answer.split('=')[-1]
     for before, after in _SUBSTITUTIONS:
         answer = answer.replace(before, after)
     for expr in _REMOVED_EXPRESSIONS:
-        answer = answer.replace(expr, "")
+        answer = answer.replace(expr, '')
     # Strip LaTeX wrappers
-    answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", answer)
-    answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", answer)
-    answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", answer)
-    answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", answer)
-    answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", answer)
-    answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", answer)
-    answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", answer)
-    answer = answer.replace("$", "")
-    if answer.replace(",", "").isdigit():
-        answer = answer.replace(",", "")
+    answer = re.sub(r'(.*?)(\$)(.*?)(\$)(.*)', '$\\3$', answer)
+    answer = re.sub(r'(\\text\{)(.*?)(\})', '\\2', answer)
+    answer = re.sub(r'(\\textbf\{)(.*?)(\})', '\\2', answer)
+    answer = re.sub(r'(\\overline\{)(.*?)(\})', '\\2', answer)
+    answer = re.sub(r'(\\boxed\{)(.*)(\})', '\\2', answer)
+    answer = re.sub(r'(frac)([^{])(.)', 'frac{\\2}{\\3}', answer)
+    answer = re.sub(r'(sqrt)([^{])', 'sqrt{\\2}', answer)
+    answer = answer.replace('$', '')
+    if answer.replace(',', '').isdigit():
+        answer = answer.replace(',', '')
     return answer.strip()
 
 
 def _last_boxed_only_string(string: str) -> Optional[str]:
     """Extract the last \\boxed{...} from a string."""
-    idx = string.rfind("\\boxed{")
+    idx = string.rfind('\\boxed{')
     if idx < 0:
         return None
     i = idx
     right_brace_idx = None
     num_left_braces_open = 0
     while i < len(string):
-        if string[i] == "{":
+        if string[i] == '{':
             num_left_braces_open += 1
-        if string[i] == "}":
+        if string[i] == '}':
             num_left_braces_open -= 1
             if num_left_braces_open == 0:
                 right_brace_idx = i
                 break
         i += 1
-    return string[idx: right_brace_idx + 1] if right_brace_idx is not None else None
+    return string[idx:right_brace_idx + 1] if right_brace_idx is not None else None
 
 
 def _remove_boxed(s: str) -> str:
     """Remove \\boxed{} wrapper."""
-    left = "\\boxed{"
-    if not (s.startswith(left) and s.endswith("}")):
+    left = '\\boxed{'
+    if not (s.startswith(left) and s.endswith('}')):
         return s
-    return s[len(left): -1]
+    return s[len(left):-1]
 
 
 def _extract_answer_minerva(
     solution: str,
-    pattern: str = r"(?i)Answer\s*:\s*([^\n]+)",
+    pattern: str = r'(?i)Answer\s*:\s*([^\n]+)',
 ) -> Optional[str]:
     """Extract answer via 'Answer: ...' pattern (Minerva-style).
 
@@ -217,7 +258,7 @@ def compute_dapo_score(completion: str, ground_truth: str) -> Dict[str, Any]:
             correct = (pred_int == gt_normalized)
         except (ValueError, OverflowError):
             correct = (pred_normalized == gt_normalized)
-        return {"score": 1.0 if correct else 0.0, "acc": correct, "pred": pred}
+        return {'score': 1.0 if correct else 0.0, 'acc': correct, 'pred': pred}
 
     # Fallback: try \boxed{}
     pred = _extract_answer_boxed(tail)
@@ -228,9 +269,9 @@ def compute_dapo_score(completion: str, ground_truth: str) -> Dict[str, Any]:
             correct = (pred_int == gt_normalized)
         except (ValueError, OverflowError):
             correct = (pred_normalized == gt_normalized)
-        return {"score": 1.0 if correct else 0.0, "acc": correct, "pred": pred}
+        return {'score': 1.0 if correct else 0.0, 'acc': correct, 'pred': pred}
 
-    return {"score": 0.0, "acc": False, "pred": None}
+    return {'score': 0.0, 'acc': False, 'pred': None}
 
 
 # ========== Preprocessor ==========
@@ -254,10 +295,7 @@ class DAPOMathProcessor(Preprocessor):
         prompt_messages = row['prompt']
         ground_truth = row['reward_model']['ground_truth']
 
-        messages = [
-            Message(role=msg['role'], content=msg['content'])
-            for msg in prompt_messages
-        ]
+        messages = [Message(role=msg['role'], content=msg['content']) for msg in prompt_messages]
         return Trajectory(
             messages=messages,
             user_data=[('ground_truth', str(ground_truth))],
@@ -273,9 +311,7 @@ class DAPOMathAccuracyReward(Reward):
     Returns 1.0 for correct, 0.0 for incorrect.
     """
 
-    def __call__(
-        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
-    ) -> List[float]:
+    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]) -> List[float]:
         rewards = []
         for trajectory in trajectories:
             messages = trajectory.get('messages', [])
@@ -308,20 +344,18 @@ def create_dapo_math_dataset():
     Downloads from ModelScope: AI-ModelScope/DAPO-Math-17k
     """
     meta = DatasetMeta(
-        "ms://AI-ModelScope/DAPO-Math-17k",
+        'ms://AI-ModelScope/DAPO-Math-17k',
         split='train',
         data_slice=range(DATA_NUM),
     )
     dataset = Dataset(meta)
-    dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(DAPOMathProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
 
 
-def compute_rewards(
-    trajectories: List[Trajectory],
-) -> Tuple[List[float], List[float]]:
+def compute_rewards(trajectories: List[Trajectory], ) -> Tuple[List[float], List[float]]:
     """Compute accuracy rewards for DAPO-Math.
 
     Returns (total_rewards, accuracy_rewards).
@@ -335,7 +369,7 @@ def compute_rewards(
 # ========== Main ==========
 def main():
     from twinkle.utils.import_utils import requires
-    requires("vllm>=0.15.0")
+    requires('vllm>=0.15.0')
 
     device_groups = [
         DeviceGroup(
@@ -353,7 +387,7 @@ def main():
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=1, 
+            dp_size=1,
             tp_size=2,
             pp_size=2,
             ep_size=2,
@@ -361,11 +395,13 @@ def main():
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
-            world_size=MODEL_GPUS, dp_size=MODEL_GPUS,
+            world_size=MODEL_GPUS,
+            dp_size=MODEL_GPUS,
         )
     assert SAMPLER_GPUS % SAMPLER_TP == 0
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // SAMPLER_TP,
+        world_size=SAMPLER_GPUS,
+        dp_size=SAMPLER_GPUS // SAMPLER_TP,
         tp_size=SAMPLER_TP,
     )
     twinkle.initialize(
@@ -392,7 +428,7 @@ def main():
             'max_lora_rank': 32,
             'enable_sleep_mode': False,
             'enable_lora': True,
-            "logprobs_mode": "processed_logprobs",
+            'logprobs_mode': 'processed_logprobs',
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
@@ -424,7 +460,8 @@ def main():
     )
     if USE_MEGATRON:
         model.set_optimizer(
-            'default', lr=LEARNING_RATE,
+            'default',
+            lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
             'default',
@@ -433,10 +470,13 @@ def main():
         )
     else:
         model.set_optimizer(
-            'AdamW', lr=LEARNING_RATE,
+            'AdamW',
+            lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
-            'CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0,
+            'CosineAnnealingLR',
+            T_max=MAX_STEPS,
+            eta_min=0,
         )
     model.set_loss(
         'GRPOLoss',
@@ -496,7 +536,7 @@ def main():
 
         t1 = time.perf_counter()
         sample_response = sampler.sample(
-            global_prompts*NUM_GENERATIONS,
+            global_prompts * NUM_GENERATIONS,
             sampling_params,
             num_samples=1,
         )
@@ -512,9 +552,7 @@ def main():
             all_completion_lengths.append(len(sequence.tokens))
 
         if not all_input_data:
-            logger.warning(
-                f"Optim step {optim_step}: No valid samples, skipping"
-            )
+            logger.warning(f'Optim step {optim_step}: No valid samples, skipping')
             continue
 
         # ========== 3. Rewards ==========
@@ -544,9 +582,7 @@ def main():
         advantages = advantages.tolist()
         timings['advantage'] = time.perf_counter() - t3
 
-        frac_zero_std = (
-            1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
-        )
+        frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
 
         # ========== 5. Training ==========
         t4 = time.perf_counter()
@@ -577,9 +613,9 @@ def main():
 
         if USE_SWANLAB:
             swanlab.log(log_dict)
-        logger.info(f"[Step {optim_step}/{MAX_STEPS}] {log_dict}")
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
-    logger.info(f"Training completed. optim_steps={optim_step}")
+    logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('grpo-math-checkpoint')
 
 

@@ -9,10 +9,10 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
-from twinkle_client.http import http_post, heartbeat_manager
-from twinkle.dataset import Dataset
-from twinkle.dataset import DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle_client.http import heartbeat_manager, http_post
 from .base import Dataset
+
 
 class LazyDataset(Dataset):
     """Client wrapper for LazyDataset that calls server HTTP endpoints."""
@@ -26,9 +26,11 @@ class LazyDataset(Dataset):
             json_data={
                 'processor_type': 'dataset',
                 'class_type': 'LazyDataset',
-                **{'dataset_meta': dataset_meta}, **kwargs
-            }
-        )
+                **{
+                    'dataset_meta': dataset_meta
+                },
+                **kwargs
+            })
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -39,7 +41,6 @@ class LazyDataset(Dataset):
         except:
             pass
 
-        
     def encode(self, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -48,12 +49,10 @@ class LazyDataset(Dataset):
                 'function': 'encode',
                 **{},
                 **kwargs
-            }
-        )
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
-    
+        return response.json()['result']
+
     def check(self, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -62,25 +61,23 @@ class LazyDataset(Dataset):
                 'function': 'check',
                 **{},
                 **kwargs
-            }
-        )
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
-    
+        return response.json()['result']
+
     def __getitem__(self, idx):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__getitem__',
-                **{'idx': idx},
-            }
-        )
+                **{
+                    'idx': idx
+                },
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
-    
+        return response.json()['result']
+
     def __len__(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
@@ -88,8 +85,6 @@ class LazyDataset(Dataset):
                 'processor_id': self.processor_id,
                 'function': '__len__',
                 **{},
-            }
-        )
+            })
         response.raise_for_status()
-        return response.json()["result"]
-    
+        return response.json()['result']

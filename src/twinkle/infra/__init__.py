@@ -1,15 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
-import os
-from typing import Literal, List, Optional, Union, Callable, Any
-from typing import TypeVar
-
 import numpy as np
+import os
+from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
-from twinkle.utils import DeviceGroup, DeviceMesh, Platform
-from twinkle.utils import requires, framework_util, check_unsafe
-
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, requires
 
 T1 = TypeVar('T1', bound=object)
 
@@ -73,15 +69,15 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                     name='default',
                     ranks=list(range(Platform.get_world_size())),
                     device_type=Platform.get_platform().device_prefix(),
-                )]
+                )
+            ]
 
         if _device_mesh is None:
             _device_mesh = DeviceMesh(
                 device_type=Platform.device_prefix(),
                 mesh=np.arange(Platform.get_world_size()),
-                mesh_dim_names=('dp',)
-            )
-            
+                mesh_dim_names=('dp', ))
+
         assert Platform.get_world_size() == _device_mesh.world_size
     else:
         requires('ray')
@@ -89,9 +85,8 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         assert groups is not None
         # groups is needed for ray
         _device_group = groups
-        RayHelper.initialize(nproc_per_node=nproc_per_node,
-                             ncpu_proc_per_node=ncpu_proc_per_node,
-                             device_groups=_device_group)
+        RayHelper.initialize(
+            nproc_per_node=nproc_per_node, ncpu_proc_per_node=ncpu_proc_per_node, device_groups=_device_group)
 
 
 def get_device_placement(device_group=None) -> str:
@@ -103,42 +98,41 @@ def get_device_placement(device_group=None) -> str:
     Returns:
         A string containing the training topology.
     """
-    global _device_group
     if device_group is None:
         device_group = _device_group
 
     WIDTH = 80
 
-    def box_line(content="", align="left", prefix="│", suffix="│"):
+    def box_line(content='', align='left', prefix='│', suffix='│'):
         inner_width = WIDTH - 4
-        if align == "center":
+        if align == 'center':
             text = content.center(inner_width)
         else:
             text = content.ljust(inner_width)
-        return f"{prefix} {text} {suffix}"
+        return f'{prefix} {text} {suffix}'
 
     def header_box(title):
         return [
-            "╔" + "═" * (WIDTH - 2) + "╗",
-            box_line(title, align="center", prefix="║", suffix="║"),
-            "╚" + "═" * (WIDTH - 2) + "╝",
+            '╔' + '═' * (WIDTH - 2) + '╗',
+            box_line(title, align='center', prefix='║', suffix='║'),
+            '╚' + '═' * (WIDTH - 2) + '╝',
         ]
 
-    def section_top(title=""):
-        lines = ["┌" + "─" * (WIDTH - 2) + "┐"]
+    def section_top(title=''):
+        lines = ['┌' + '─' * (WIDTH - 2) + '┐']
         if title:
-            lines.append(box_line(f"◈ {title}", prefix="│", suffix="│"))
-            lines.append("├" + "─" * (WIDTH - 2) + "┤")
+            lines.append(box_line(f'◈ {title}', prefix='│', suffix='│'))
+            lines.append('├' + '─' * (WIDTH - 2) + '┤')
         return lines
 
     def section_bottom():
-        return ["└" + "─" * (WIDTH - 2) + "┘"]
+        return ['└' + '─' * (WIDTH - 2) + '┘']
 
     def format_ranks(ranks):
         if isinstance(ranks, list):
             if len(ranks) <= 16:
                 return str(ranks)
-            return f"{ranks[:6]} ... {ranks[-3:]} ({len(ranks)} total)"
+            return f'{ranks[:6]} ... {ranks[-3:]} ({len(ranks)} total)'
         return str(ranks)
 
     def render_mesh_grid(mesh_array, dim_names):
@@ -149,7 +143,7 @@ def get_device_placement(device_group=None) -> str:
             mesh_array = mesh_array.reshape(1, -1)
 
         if mesh_array.ndim > 2:
-            lines.append(box_line(f"    ⊞ High-dim mesh: shape={mesh_array.shape}"))
+            lines.append(box_line(f'    ⊞ High-dim mesh: shape={mesh_array.shape}'))
             return lines
 
         rows, cols = mesh_array.shape
@@ -158,76 +152,74 @@ def get_device_placement(device_group=None) -> str:
 
         cell_w = max(4, len(str(mesh_array.max())) + 2)
 
-        header = "      " + "".join(f"{i:^{cell_w}}" for i in range(show_cols))
+        header = '      ' + ''.join(f'{i:^{cell_w}}' for i in range(show_cols))
         if cols > max_cols:
-            header += " ⋯"
-        lines.append(box_line(f"    {header}"))
+            header += ' ⋯'
+        lines.append(box_line(f'    {header}'))
 
         # Top border
-        border = "      ╭" + "─" * (cell_w * show_cols + show_cols - 1) + "╮"
-        lines.append(box_line(f"    {border}"))
+        border = '      ╭' + '─' * (cell_w * show_cols + show_cols - 1) + '╮'
+        lines.append(box_line(f'    {border}'))
 
         # Data rows
         for r in range(show_rows):
-            row_data = "│".join(f"{mesh_array[r, c]:^{cell_w}}" for c in range(show_cols))
-            row_str = f"   {r:>2} │{row_data}│"
+            row_data = '│'.join(f'{mesh_array[r, c]:^{cell_w}}' for c in range(show_cols))
+            row_str = f'   {r:>2} │{row_data}│'
             if cols > max_cols:
-                row_str += " ⋯"
-            lines.append(box_line(f"    {row_str}"))
+                row_str += ' ⋯'
+            lines.append(box_line(f'    {row_str}'))
 
         if rows > max_rows:
             lines.append(box_line(f"         {'⋮':^{cell_w * show_cols}}"))
 
         # Bottom border
-        border = "      ╰" + "─" * (cell_w * show_cols + show_cols - 1) + "╯"
-        lines.append(box_line(f"    {border}"))
+        border = '      ╰' + '─' * (cell_w * show_cols + show_cols - 1) + '╯'
+        lines.append(box_line(f'    {border}'))
 
         return lines
 
     # Build output
-    lines = header_box("DEVICE PLACEMENT TOPOLOGY")
-    lines.append("")
+    lines = header_box('DEVICE PLACEMENT TOPOLOGY')
+    lines.append('')
 
     for group in device_group:
-        lines.extend(section_top(f"DeviceGroup: {group.name}"))
-        lines.append(box_line(f"  ├─ Device Type : {group.device_type}"))
-        lines.append(box_line(f"  └─ Ranks       : {format_ranks(group.ranks)}"))
+        lines.extend(section_top(f'DeviceGroup: {group.name}'))
+        lines.append(box_line(f'  ├─ Device Type : {group.device_type}'))
+        lines.append(box_line(f'  └─ Ranks       : {format_ranks(group.ranks)}'))
 
         if not group._device_mesh:
-            lines.append(box_line(""))
-            lines.append(box_line("  (No device meshes configured)", align="center"))
+            lines.append(box_line(''))
+            lines.append(box_line('  (No device meshes configured)', align='center'))
         else:
             for mesh_name, mesh in group._device_mesh.items():
-                lines.append(box_line(""))
-                lines.append(box_line(f"  ┌─ DeviceMesh: {mesh_name}"))
+                lines.append(box_line(''))
+                lines.append(box_line(f'  ┌─ DeviceMesh: {mesh_name}'))
 
                 # Dimensions
                 if mesh.mesh_dim_names:
-                    dim_info = " × ".join(
-                        f"{name}={size}" for name, size in zip(mesh.mesh_dim_names, mesh.mesh.shape)
-                    )
-                    lines.append(box_line(f"  │  Dimensions : {dim_info}"))
+                    dim_info = ' × '.join(f'{name}={size}' for name, size in zip(mesh.mesh_dim_names, mesh.mesh.shape))
+                    lines.append(box_line(f'  │  Dimensions : {dim_info}'))
 
                 # Active parallelism
                 parallelism = []
                 for dim in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
                     ws = mesh._get_world_size_for_dim(dim)
                     if ws is not None and ws > 1:
-                        parallelism.append(f"{dim.upper()}={ws}")
+                        parallelism.append(f'{dim.upper()}={ws}')
 
                 if parallelism:
                     lines.append(box_line(f"  │  Parallelism: {', '.join(parallelism)}"))
 
                 # Mesh layout
-                lines.append(box_line(f"  │"))
-                lines.append(box_line(f"  └─ Mesh Layout:"))
+                lines.append(box_line('  │'))
+                lines.append(box_line('  └─ Mesh Layout:'))
                 lines.extend(render_mesh_grid(mesh.mesh, mesh.mesh_dim_names or []))
 
-        lines.append(box_line(""))
+        lines.append(box_line(''))
         lines.extend(section_bottom())
-        lines.append("")
+        lines.append('')
 
-    return "\n" + "\n".join(lines)
+    return '\n' + '\n'.join(lines)
 
 
 def _get_workers(workers, execute):
@@ -241,7 +233,9 @@ def _get_workers(workers, execute):
         raise ValueError(f'Unsupported execute method: {execute}')
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable], result: List[Any], device_mesh: DeviceMesh=None):
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
+                  result: List[Any],
+                  device_mesh: DeviceMesh = None):
     """Collect results
 
     Args:
@@ -329,9 +323,9 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         # split by dp. each worker in one ep will receive the same argument
         result = []
         # if device_mesh is not None:
-            # TODO this may occurs error when remote calls remote
-            # Comment this because remote_class supports `first``
-            # assert device_mesh.world_size == len(workers)
+        # TODO this may occurs error when remote calls remote
+        # Comment this because remote_class supports `first``
+        # assert device_mesh.world_size == len(workers)
         length = len(workers)
 
         def dispatch_func(arg, n):
@@ -398,12 +392,14 @@ def _prepare_lazy_collect(args, kwargs):
                 arg._lazy_collect = False
         return args, kwargs
 
+
 def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
     """Patch each class used in remote clusters with this decorator.
 
     Use this decorator to wrap your class to enable it to execute in a remote cluster.
 
     """
+
     def decorator(cls):
         # Get device mesh parameter name
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
@@ -419,7 +415,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                         # Local mode can safely assign the default device mesh
                         device_mesh = _device_mesh
                         kwargs[device_mesh_name] = _device_mesh
-                    assert len(_device_group) == 1 # only one device group is allowed
+                    assert len(_device_group) == 1  # only one device group is allowed
                     _device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
                     if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
                         # TODO An ugly special setting for dataloader to set the min batch size
@@ -439,7 +435,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
                 caller_line = frame.f_lineno
                 # Pass an instance_id is recommended
-                instance_id = kwargs.pop('instance_id', '') + f"{caller_file}_{caller_line}"
+                instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
                 # If cannot trust_remote_code, no callable and type can be used.
                 check_unsafe(*args, **kwargs)
@@ -498,7 +494,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                     # Ensure torch.distributed is initialized inside Ray workers.
                     if os.environ.get('WORKER_NAME'):
                         # This will depress the warnings of megatron and reduce overhead
-                        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+                        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
                         # This will prevent the unlimited threads started by torch
                         os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
                         # Use parallelism mode of tokenizers
@@ -510,7 +506,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                         # if any handler is passed to other component, lazy collect should be false
                         # for example, dataset pass to the dataloader
                     args, kwargs = _prepare_lazy_collect(args, kwargs)
-                    kwargs.pop('remote_group', None) # component does not need this
+                    kwargs.pop('remote_group', None)  # component does not need this
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):
@@ -540,17 +536,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                         seed=_seed,
                         full_determinism=_full_determinism,
                         *args,
-                        **kwargs_for_workers
-                    )
+                        **kwargs_for_workers)
                     self._actors = _actors
                     if hasattr(cls, '__iter__'):
                         # wraps again, because ray uses cls method to call remote
-                        cls.__iter__ = remote_function(dispatch=_dispatch,
-                                                        execute=_execute,
-                                                        collect='none')(__iter__)
-                        cls.__next__ = remote_function(dispatch=_dispatch,
-                                                        execute=_execute,
-                                                        collect=_collect)(__next__)
+                        cls.__iter__ = remote_function(dispatch=_dispatch, execute=_execute, collect='none')(__iter__)
+                        cls.__next__ = remote_function(dispatch=_dispatch, execute=_execute, collect=_collect)(__next__)
                     for arg in (list(args) + list(kwargs.values())):
                         # keeps the device_mesh in the handler
                         if isinstance(arg, DeviceMesh):
@@ -598,7 +589,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
         lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
-    """
+    """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
 
@@ -618,8 +609,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         world_size = Platform.get_world_size()
                         rank = Platform.get_rank()
                         # Redispatch here
-                        _workers_and_args = _dispatch_args(_get_workers([None]*world_size, execute), dispatch,
-                                                           execute, device_mesh, args, kwargs)
+                        _workers_and_args = _dispatch_args(
+                            _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args, kwargs)
                         _, args, kwargs = _workers_and_args[rank]
                     return func(self, *args, **kwargs)
                 else:
@@ -629,12 +620,12 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     if RayHelper.has_ref(args, kwargs):
                         # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                         # for example, dataloader returns any data list.
-                        _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), 'all',
-                                                           execute, device_mesh, args, kwargs)
+                        _workers_and_args = _dispatch_args(
+                            _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
                     else:
                         # dispatch now
-                        _workers_and_args = _dispatch_args(_get_workers(self._actors, execute), dispatch,
-                                                           execute, device_mesh, args, kwargs)
+                        _workers_and_args = _dispatch_args(
+                            _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
 
                     result = execute_method(func.__name__, _workers_and_args)
                     # This is a result future, call it to get the actual result
@@ -643,7 +634,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     if func.__name__ == '__iter__':
                         # return self
                         return self
-                    
+
                     if func.__name__ == '__len__':
                         # Get the first result and ignore the `lazy_collect`
                         import ray

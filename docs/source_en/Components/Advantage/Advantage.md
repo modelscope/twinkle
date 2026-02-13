@@ -6,7 +6,7 @@ Advantage functions are components in reinforcement learning used to calculate t
 
 ```python
 class Advantage:
-    
+
     def __call__(self,
                  rewards: Union['torch.Tensor', List[float]],
                  num_generations: int = 1,
@@ -14,7 +14,7 @@ class Advantage:
                  **kwargs) -> 'torch.Tensor':
         """
         Calculate advantage values
-        
+
         Args:
             rewards: List or tensor of reward values
             num_generations: Number of samples generated per prompt
@@ -22,7 +22,7 @@ class Advantage:
                 - 'group': Normalize per group (GRPO)
                 - 'batch': Normalize across entire batch
                 - 'none': No normalization
-        
+
         Returns:
             Advantage tensor
         """

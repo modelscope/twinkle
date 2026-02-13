@@ -1,15 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from abc import abstractmethod, ABC
-from typing import Dict, Any, Union, Type, Optional, Callable, TYPE_CHECKING
 import os
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union
+
+from twinkle import Platform, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
+from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
 from twinkle.patch import Patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle import torch_util, Platform
-from twinkle.hub import HubOperation
 
 if TYPE_CHECKING:
     import torch
@@ -58,11 +59,12 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def clip_grad_and_step(self, max_grad_norm: float=1.0, norm_type=2, **kwargs):
+    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         ...
 
     @abstractmethod
-    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], 'torch.Tensor']], **kwargs):
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...],
+                                                                       'torch.Tensor']], **kwargs):
         ...
 
     @abstractmethod
@@ -113,9 +115,13 @@ class TwinkleModel(ABC):
     def get_train_configs(self, **kwargs) -> str:
         ...
 
-    def upload_to_hub(self, checkpoint_dir: str, hub_model_id: str, hub_token: Optional[str] = None, async_upload: bool = True):
+    def upload_to_hub(self,
+                      checkpoint_dir: str,
+                      hub_model_id: str,
+                      hub_token: Optional[str] = None,
+                      async_upload: bool = True):
         """Upload model checkpoint to hub.
-        
+
         Args:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
@@ -124,18 +130,9 @@ class TwinkleModel(ABC):
         """
         if async_upload:
             HubOperation.async_push_to_hub(
-                repo_id=hub_model_id,
-                folder_path=checkpoint_dir,
-                token=hub_token,
-                private=True
-            )
+                repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
         else:
-            HubOperation.push_to_hub(
-                repo_id=hub_model_id,
-                folder_path=checkpoint_dir,
-                token=hub_token,
-                private=True
-            )
+            HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
     def _try_init_process_group(self):
         import torch
@@ -143,20 +140,20 @@ class TwinkleModel(ABC):
         if not dist.is_initialized() and Platform.get_world_size() > 1:
             torch_util.set_device()
             backend = Platform.device_backend()
-            if backend == "hccl":
+            if backend == 'hccl':
                 # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
                 # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
                 # Keep training-side HCCL sockets on a per-job port layout to
                 # avoid collisions with other jobs on the same host.
                 from twinkle.utils.network import _ensure_hccl_socket_env
-                master_port = int(os.environ.get("MASTER_PORT", "29500"))
+                master_port = int(os.environ.get('MASTER_PORT', '29500'))
                 _ensure_hccl_socket_env(master_port)
             init_kwargs = {
-                "backend": backend,
-                "init_method": "env://",
-                "rank": Platform.get_rank(),
-                "world_size": Platform.get_world_size(),
+                'backend': backend,
+                'init_method': 'env://',
+                'rank': Platform.get_rank(),
+                'world_size': Platform.get_world_size(),
             }
-            if backend in ("nccl", "hccl"):
-                init_kwargs["device_id"] = torch.device(Platform.get_local_device())
+            if backend in ('nccl', 'hccl'):
+                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)

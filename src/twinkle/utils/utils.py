@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import fnmatch
+import glob
 import os
 import shutil
-import glob
-import fnmatch
+
 
 def deep_getattr(obj, attr: str, default=None):
     attrs = attr.split('.')
@@ -14,6 +15,7 @@ def deep_getattr(obj, attr: str, default=None):
         else:
             obj = getattr(obj, a, default)
     return obj
+
 
 def copy_files_by_pattern(source_dir, dest_dir, patterns, exclude_patterns=None):
     if not os.path.exists(dest_dir):

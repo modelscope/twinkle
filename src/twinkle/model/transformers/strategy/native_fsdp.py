@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Any, Optional, Literal, Set, TYPE_CHECKING
-
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform
 
@@ -34,7 +33,7 @@ class NativeFSDPStrategy:
                 _ensure_moe_patched_if_needed(model, self.device_mesh)
                 _place_ep_experts_on_local_device(model, self.device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
-            reshard_after_forward = self.fsdp_config.get("reshard_after_forward", True)
+            reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
             ignored_params = _collect_expert_params(model) if self.enable_ep else None
 
             _maybe_shard_layers(
@@ -63,9 +62,9 @@ class NativeFSDPStrategy:
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
     from torch.distributed.fsdp import MixedPrecisionPolicy
-    if mixed_precision == "bf16":
+    if mixed_precision == 'bf16':
         dtype = torch.bfloat16
-    elif mixed_precision == "fp16":
+    elif mixed_precision == 'fp16':
         dtype = torch.float16
     else:
         return MixedPrecisionPolicy()
@@ -83,15 +82,15 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
     flat_mesh = device_mesh.mesh.flatten()
     if flat_mesh.size <= 1:
         return None
-    return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=("fsdp",))
+    return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=('fsdp', ))
 
 
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     ignored: Set[nn.Parameter] = set()
     ep_patched = False
     for module in model.modules():
-        experts = getattr(module, "experts", None)
-        if experts is not None and getattr(module, "_ep_patched", False):
+        experts = getattr(module, 'experts', None)
+        if experts is not None and getattr(module, '_ep_patched', False):
             ep_patched = True
             if isinstance(experts, nn.ModuleList):
                 for expert in experts:
@@ -99,9 +98,9 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
             else:
                 ignored.update(experts.parameters())
 
-        if getattr(module, "_ep_ignore_shared_experts", False) and getattr(module, "_ep_patched", False):
+        if getattr(module, '_ep_ignore_shared_experts', False) and getattr(module, '_ep_patched', False):
             ep_patched = True
-            shared = getattr(module, "shared_expert", None)
+            shared = getattr(module, 'shared_expert', None)
             if shared is not None:
                 ignored.update(shared.parameters())
 
@@ -116,13 +115,13 @@ def _place_ep_experts_on_local_device(model: nn.Module, device_mesh: DeviceMesh)
         return
     local_device = torch.device(Platform.get_local_device())
     for module in model.modules():
-        if not getattr(module, "_ep_patched", False):
+        if not getattr(module, '_ep_patched', False):
             continue
-        experts = getattr(module, "experts", None)
+        experts = getattr(module, 'experts', None)
         if experts is not None:
             experts.to(local_device)
-        if getattr(module, "_ep_ignore_shared_experts", False):
-            shared = getattr(module, "shared_expert", None)
+        if getattr(module, '_ep_ignore_shared_experts', False):
+            shared = getattr(module, 'shared_expert', None)
             if shared is not None:
                 shared.to(local_device)
 
@@ -132,22 +131,16 @@ def _ensure_moe_patched_if_needed(model: nn.Module, device_mesh: DeviceMesh) -> 
     if ep_world_size <= 1:
         return
     for module in model.modules():
-        experts = getattr(module, "experts", None)
-        if isinstance(experts, nn.ModuleList) and not getattr(module, "_ep_patched", False):
-            raise RuntimeError(
-                "Found MoE experts but expert parallel is not applied. "
-                "Call apply_expert_parallel(model, device_mesh, config) before wrapping with FSDP2."
-            )
+        experts = getattr(module, 'experts', None)
+        if isinstance(experts, nn.ModuleList) and not getattr(module, '_ep_patched', False):
+            raise RuntimeError('Found MoE experts but expert parallel is not applied. '
+                               'Call apply_expert_parallel(model, device_mesh, config) before wrapping with FSDP2.')
 
 
-def _maybe_shard_layers(model: nn.Module,
-                        *,
-                        mesh: TorchDeviceMesh,
-                        reshard_after_forward: Optional[bool],
-                        mp_policy: 'MixedPrecisionPolicy',
-                        ignored_params: Optional[Set[nn.Parameter]]) -> None:
+def _maybe_shard_layers(model: nn.Module, *, mesh: TorchDeviceMesh, reshard_after_forward: Optional[bool],
+                        mp_policy: 'MixedPrecisionPolicy', ignored_params: Optional[Set[nn.Parameter]]) -> None:
     from torch.distributed.fsdp import fully_shard
-    layers = getattr(model, "layers", None)
+    layers = getattr(model, 'layers', None)
     if not isinstance(layers, nn.ModuleList):
         return
     for layer in layers:
@@ -162,29 +155,24 @@ def _maybe_shard_layers(model: nn.Module,
 
 def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> torch.optim.Optimizer:
     if optimizer.state:
-        raise RuntimeError(
-            "Optimizer already has state. Create the optimizer after FSDP wrapping, "
-            "or reinitialize it before training."
-        )
+        raise RuntimeError('Optimizer already has state. Create the optimizer after FSDP wrapping, '
+                           'or reinitialize it before training.')
     name_to_param = dict(model.named_parameters())
-    ep_patched = any(getattr(module, "_ep_patched", False) for module in model.modules())
+    ep_patched = any(getattr(module, '_ep_patched', False) for module in model.modules())
     if len(optimizer.param_groups) != 1:
         for group in optimizer.param_groups:
-            if "param_names" not in group:
-                raise RuntimeError(
-                    "NativeFSDPStrategy cannot rebind optimizer param_groups without param_names. "
-                    "Create the optimizer after wrapping, or include param_names in each group."
-                )
+            if 'param_names' not in group:
+                raise RuntimeError('NativeFSDPStrategy cannot rebind optimizer param_groups without param_names. '
+                                   'Create the optimizer after wrapping, or include param_names in each group.')
             new_params = []
-            for name in group["param_names"]:
+            for name in group['param_names']:
                 if name not in name_to_param:
-                    if ep_patched and ".experts." in name:
+                    if ep_patched and '.experts.' in name:
                         continue
                     raise RuntimeError(
-                        f"NativeFSDPStrategy could not find parameter '{name}' when rebinding optimizer."
-                    )
+                        f"NativeFSDPStrategy could not find parameter '{name}' when rebinding optimizer.")
                 new_params.append(name_to_param[name])
-            group["params"] = new_params
+            group['params'] = new_params
         return optimizer
-    optimizer.param_groups[0]["params"] = list(model.parameters())
+    optimizer.param_groups[0]['params'] = list(model.parameters())
     return optimizer

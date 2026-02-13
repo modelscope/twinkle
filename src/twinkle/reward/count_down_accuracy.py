@@ -25,14 +25,14 @@ class CountDownAccuracy(Reward):
                 return 0.0
             result = eval(equation, {'__builtins__': None}, {})
             return 1.0 if abs(float(result) - float(target)) < 1e-5 else 0.0
-        except Exception: # noqa
+        except Exception:  # noqa
             return 0.0
 
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
         for trajectory in trajectories:
             messages = trajectory.get('messages', [])
-            completion = ""
+            completion = ''
             for msg in reversed(messages):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
@@ -44,4 +44,3 @@ class CountDownAccuracy(Reward):
             acc_reward = self.countdown_accuracy_reward(completion, target, nums)
             rewards.append(acc_reward)
         return rewards
-

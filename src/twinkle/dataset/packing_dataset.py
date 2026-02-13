@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import multiprocessing as mp
-from itertools import chain
-from typing import List, TypeVar
-import os
 import numpy as np
+import os
+from itertools import chain
 from tqdm import tqdm
+from typing import List, TypeVar
 
 from twinkle.infra import remote_class, remote_function
 from .base import Dataset, DatasetMeta

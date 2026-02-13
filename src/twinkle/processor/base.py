@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from dataclasses import dataclass
-from typing import Union, List, Optional, Dict, Any, Literal
 import numpy as np
 import torch
-from twinkle import torch_util
-from twinkle import Platform, DeviceMesh, remote_class, remote_function
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Union
+
+from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
 
 
@@ -39,13 +39,17 @@ class InputProcessor:
 
     # VLM fields to concatenate (not pad) in batch
     VLM_CONCAT_FIELDS = {
-        'pixel_values', 'image_grid_thw',
-        'pixel_values_videos', 'video_grid_thw',
-        'input_features', 'feature_attention_mask',
+        'pixel_values',
+        'image_grid_thw',
+        'pixel_values_videos',
+        'video_grid_thw',
+        'input_features',
+        'feature_attention_mask',
         'grid_thws',
     }
 
-    def __init__(self, device_mesh: Optional[DeviceMesh] = None,
+    def __init__(self,
+                 device_mesh: Optional[DeviceMesh] = None,
                  padding_free: bool = False,
                  framework: Literal['transformers', 'megatron'] = 'transformers',
                  **kwargs):
@@ -65,7 +69,8 @@ class InputProcessor:
         ]
 
     @remote_function()
-    def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs) -> Union[InputFeature, List[InputFeature]]:
+    def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
+                 **kwargs) -> Union[InputFeature, List[InputFeature]]:
         for pipe in self.process_pipeline:
             inputs = pipe(inputs)
         return inputs
@@ -77,6 +82,7 @@ class InputProcessor:
             return inputs
 
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
+
         def to_tensor(_input):
             import torch
             for key in list(_input.keys()):
@@ -97,7 +103,7 @@ class InputProcessor:
 
         return [to_tensor(_input) for _input in inputs]
 
-    def pad_cp(self, inputs: List[InputFeature], **kwargs) ->List[InputFeature]:
+    def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
         def _pad_cp(_input: InputFeature) -> InputFeature:
             # Pad sequence for parallel compatibility
@@ -123,9 +129,7 @@ class InputProcessor:
 
                 if divisor > 1 and seq_len % divisor != 0:
                     pad_len = divisor - (seq_len % divisor)
-                    input_tensor = torch.nn.functional.pad(input_tensor,
-                                                        (0, pad_len),
-                                                        value=padding_value)
+                    input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_len), value=padding_value)
                 return input_tensor
 
             if cp_size > 1:
@@ -185,8 +189,8 @@ class InputProcessor:
                         slices = [slice(None)] * inputs.ndim
                         slices[dim] = slice(cu_seqlens[i], cu_seqlens[i + 1])
                         val = inputs[tuple(slices)]
-                    view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] // (2 * cp_size),
-                                  *inputs.shape[dim + 1:])
+                    view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] //
+                                  (2 * cp_size), *inputs.shape[dim + 1:])
                     val = val.view(view_shape)
                     index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
                                          pin_memory=True).cuda(non_blocking=True)
@@ -239,8 +243,8 @@ class InputProcessor:
         import torch
         seq_lens = [s.shape[0] for s in attention_mask]
         max_len = max(seq_lens)
-        attention_mask = torch.tril(torch.ones(
-            (len(seq_lens), max_len, max_len), dtype=torch.bool)).view(len(seq_lens), 1, max_len, max_len)
+        attention_mask = torch.tril(torch.ones((len(seq_lens), max_len, max_len),
+                                               dtype=torch.bool)).view(len(seq_lens), 1, max_len, max_len)
         assert attention_mask.dtype is torch.bool, f'attention_mask.dtype: {attention_mask.dtype}'
         for i, seq_len in enumerate(seq_lens):
             attention_mask[i, :, :, seq_len:] = 0
@@ -354,8 +358,11 @@ class InputProcessor:
 
         return result
 
-    def collate_fn(self, inputs: List[InputFeature], micro_batch_size: Optional[int] = None,
-                   variable_seq_lengths=False, **kwargs) -> List[InputFeature]:
+    def collate_fn(self,
+                   inputs: List[InputFeature],
+                   micro_batch_size: Optional[int] = None,
+                   variable_seq_lengths=False,
+                   **kwargs) -> List[InputFeature]:
         if len(inputs) == 1:
             return inputs
         if micro_batch_size is None:

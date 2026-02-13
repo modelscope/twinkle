@@ -1,20 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from contextlib import contextmanager
-
 import megatron.core
 import torch
-from megatron.core import InferenceParams
+from contextlib import contextmanager
+from megatron.core import InferenceParams, mpu
+from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import VocabParallelEmbedding, reduce_scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core import mpu
 from packaging import version
 
-from megatron.core.enums import ModelType
-from .gpt_model import GPTModel
 from twinkle.model.megatron.args import get_args
+from .gpt_model import GPTModel
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 

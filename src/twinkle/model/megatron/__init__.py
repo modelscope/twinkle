@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from twinkle.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .megatron import MegatronStrategy, MegatronModel
+    from .megatron import MegatronModel, MegatronStrategy
     from .multi_lora_megatron import MultiLoraMegatronModel
 else:
     _import_structure = {

@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Set, Tuple
 
 AUTO_GEN_WARNING = """# ============================================================================
 # WARNING: AUTO-GENERATED FILE - DO NOT MODIFY MANUALLY!
@@ -15,9 +15,10 @@ AUTO_GEN_WARNING = """# ========================================================
 # ============================================================================
 """
 
+
 def generate_processors():
     """Generate client wrappers for all classes with @remote_function methods."""
-    
+
     # Module mapping: module_name -> directory in src/twinkle
     module_mapping = {
         'dataloader': 'dataloader',
@@ -27,7 +28,7 @@ def generate_processors():
         'template': 'template',
         'weight_loader': 'weight_loader',
     }
-    
+
     # Map module names to processor types in the server
     processor_type_mapping = {
         'dataloader': 'dataloader',
@@ -37,63 +38,63 @@ def generate_processors():
         'template': 'template',
         'weight_loader': 'weight_loader',
     }
-    
+
     # Get the project root directory
     project_root = Path(__file__).parent.parent
     src_twinkle_path = project_root / 'src' / 'twinkle'
     src_client_path = project_root / 'src' / 'twinkle_client'
-    
+
     def get_method_signature(func_node: ast.FunctionDef) -> str:
         """Extract method signature from AST node."""
         args = []
-        
+
         # Regular arguments
         for i, arg in enumerate(func_node.args.args):
             if arg.arg == 'self':
                 continue
-            
+
             # Get argument name
             arg_str = arg.arg
-            
+
             # Get type annotation if available
             if arg.annotation:
                 try:
-                    arg_str += f": {ast.unparse(arg.annotation)}"
+                    arg_str += f': {ast.unparse(arg.annotation)}'
                 except:
                     pass
-            
+
             # Get default value if available
             defaults_offset = len(func_node.args.args) - len(func_node.args.defaults)
             if i >= defaults_offset:
                 default_idx = i - defaults_offset
                 try:
                     default_val = ast.unparse(func_node.args.defaults[default_idx])
-                    arg_str += f" = {default_val}"
+                    arg_str += f' = {default_val}'
                 except:
                     pass
-            
+
             args.append(arg_str)
-        
+
         # *args
         if func_node.args.vararg:
-            vararg_str = f"*{func_node.args.vararg.arg}"
+            vararg_str = f'*{func_node.args.vararg.arg}'
             if func_node.args.vararg.annotation:
                 try:
-                    vararg_str += f": {ast.unparse(func_node.args.vararg.annotation)}"
+                    vararg_str += f': {ast.unparse(func_node.args.vararg.annotation)}'
                 except:
                     pass
             args.append(vararg_str)
-        
+
         # **kwargs
         if func_node.args.kwarg:
-            kwarg_str = f"**{func_node.args.kwarg.arg}"
+            kwarg_str = f'**{func_node.args.kwarg.arg}'
             if func_node.args.kwarg.annotation:
                 try:
-                    kwarg_str += f": {ast.unparse(func_node.args.kwarg.annotation)}"
+                    kwarg_str += f': {ast.unparse(func_node.args.kwarg.annotation)}'
                 except:
                     pass
             args.append(kwarg_str)
-        
+
         return ', '.join(args)
 
     def extract_typing_imports(signatures: List[str]) -> Set[str]:
@@ -128,7 +129,8 @@ def generate_processors():
             'DeviceMesh': ['from twinkle import DeviceMesh'],
             'Template': ['from twinkle.template import Template'],
             'template.Template': ['from twinkle.template import Template', 'from twinkle import template'],
-            'processor.InputProcessor': ['from twinkle.processor import InputProcessor', 'from twinkle import processor'],
+            'processor.InputProcessor':
+            ['from twinkle.processor import InputProcessor', 'from twinkle import processor'],
             'InputProcessor': ['from twinkle.processor import InputProcessor'],
         }
 
@@ -168,7 +170,7 @@ def generate_processors():
             with open(file_path, 'r', encoding='utf-8') as f:
                 tree = ast.parse(f.read(), filename=str(file_path))
         except Exception as e:
-            print(f"Error parsing {file_path}: {e}")
+            print(f'Error parsing {file_path}: {e}')
             return []
 
         def has_remote_decorator(func: ast.FunctionDef) -> bool:
@@ -202,11 +204,8 @@ def generate_processors():
                 continue
 
             methods = [
-                (item.name, get_method_signature(item))
-                for item in node.body
-                if isinstance(item, ast.FunctionDef)
-                   and has_remote_decorator(item)
-                   and is_public_or_dunder(item.name)
+                (item.name, get_method_signature(item)) for item in node.body
+                if isinstance(item, ast.FunctionDef) and has_remote_decorator(item) and is_public_or_dunder(item.name)
             ]
 
             # Extract __init__ signature separately (it may not have @remote_function)
@@ -221,10 +220,14 @@ def generate_processors():
 
         return classes_found
 
-    def generate_client_class(class_name: str, base_class_name: str,
-                              methods: List[Tuple[str, str]], module_name: str,
-                              processor_type: str, source_filename: str,
-                              has_base_file: bool, init_signature: str = '') -> str:
+    def generate_client_class(class_name: str,
+                              base_class_name: str,
+                              methods: List[Tuple[str, str]],
+                              module_name: str,
+                              processor_type: str,
+                              source_filename: str,
+                              has_base_file: bool,
+                              init_signature: str = '') -> str:
         """Generate client wrapper class code."""
 
         def build_imports() -> Tuple[List[str], str]:
@@ -232,7 +235,7 @@ def generate_processors():
             signatures = [sig for _, sig in methods]
             if init_signature:
                 signatures.append(init_signature)
-            
+
             typing_imports = extract_typing_imports(signatures)
             twinkle_imports = extract_twinkle_imports(signatures)
 
@@ -240,22 +243,22 @@ def generate_processors():
             if typing_imports:
                 lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
             lines.extend([
-                "from twinkle_client.http import http_post, heartbeat_manager",
+                'from twinkle_client.http import http_post, heartbeat_manager',
             ])
             lines.extend(sorted(twinkle_imports))
 
             if source_filename == 'base':
-                inheritance = "object"
+                inheritance = 'object'
             elif base_class_name == 'IterableDataset':
-                lines.append("from torch.utils.data import IterableDataset")
-                inheritance = "IterableDataset"
+                lines.append('from torch.utils.data import IterableDataset')
+                inheritance = 'IterableDataset'
             elif has_base_file and base_class_name != 'object':
-                lines.append(f"from .base import {base_class_name}")
+                lines.append(f'from .base import {base_class_name}')
                 inheritance = base_class_name
             else:
-                inheritance = "object"
+                inheritance = 'object'
 
-            lines.append("")
+            lines.append('')
             return lines, inheritance
 
         def build_method(name: str, signature: str) -> str:
@@ -268,7 +271,7 @@ def generate_processors():
                 extra_args = ''
             ret = 'self' if name == '__iter__' else 'response.json()["result"]'
 
-            code = f'''    
+            code = f'''
     def {name}(self{sig_part}):
         response = http_post(
             url=f'{{self.server_url}}/processors/call',
@@ -302,11 +305,11 @@ def generate_processors():
         if init_signature:
             # Extract parameter names from signature (excluding **kwargs)
             param_names = parse_params_from_signature(init_signature)
-            init_params = f"self, {init_signature}" if init_signature else "self"
-            
+            init_params = f'self, {init_signature}' if init_signature else 'self'
+
             # Check if signature has **kwargs
             has_kwargs = '**' in init_signature
-            
+
             # Extract the **kwargs name if present
             kwargs_name = None
             if has_kwargs:
@@ -317,24 +320,24 @@ def generate_processors():
                         # Extract name after **, before : or end
                         kwargs_name = part[2:].split(':')[0].strip()
                         break
-            
+
             # Build kwargs dict for HTTP request
             if param_names:
                 kwargs_items = ', '.join([f"'{p}': {p}" for p in param_names])
                 if has_kwargs and kwargs_name:
                     # Include both named params and **kwargs
-                    kwargs_dict = f"{{{kwargs_items}}}, **{kwargs_name}"
+                    kwargs_dict = f'{{{kwargs_items}}}, **{kwargs_name}'
                 else:
-                    kwargs_dict = f"{{{kwargs_items}}}"
+                    kwargs_dict = f'{{{kwargs_items}}}'
             else:
                 if has_kwargs and kwargs_name:
                     kwargs_dict = kwargs_name
                 else:
-                    kwargs_dict = "{}"
+                    kwargs_dict = '{}'
         else:
             # Fallback to **kwargs if no __init__ found
-            init_params = "self, **kwargs"
-            kwargs_dict = "kwargs"
+            init_params = 'self, **kwargs'
+            kwargs_dict = 'kwargs'
 
         class_template = f'''{AUTO_GEN_WARNING}
 {chr(10).join(import_lines)}
@@ -371,7 +374,7 @@ class {class_name}({inheritance}):
 
     def scan_modules(src_twinkle_path: Path, module_mapping: Dict[str, str]) -> Dict:
         """Scan all modules for classes with @remote_function methods."""
-        print("Scanning src/twinkle modules for classes with @remote_function methods...")
+        print('Scanning src/twinkle modules for classes with @remote_function methods...')
 
         module_files = {}
         for module_name, module_dir in module_mapping.items():
@@ -379,7 +382,7 @@ class {class_name}({inheritance}):
             if not module_path.exists():
                 continue
 
-            print(f"  Scanning {module_name}...")
+            print(f'  Scanning {module_name}...')
             for py_file in module_path.glob('*.py'):
                 if py_file.name.startswith('_'):
                     continue
@@ -389,10 +392,9 @@ class {class_name}({inheritance}):
 
         return module_files
 
-    def write_client_files(module_files: Dict, src_client_path: Path,
-                           processor_type_mapping: Dict[str, str]) -> None:
+    def write_client_files(module_files: Dict, src_client_path: Path, processor_type_mapping: Dict[str, str]) -> None:
         """Generate and write client files."""
-        print("\nGenerating client classes...")
+        print('\nGenerating client classes...')
 
         for module_name, source_files in module_files.items():
             client_module_path = src_client_path / module_name
@@ -403,27 +405,25 @@ class {class_name}({inheritance}):
 
             for source_filename, classes in source_files.items():
                 client_file = client_module_path / f'{source_filename}.py'
-                print(f"  Writing {client_file}...")
+                print(f'  Writing {client_file}...')
 
                 code = '\n\n'.join(
-                    generate_client_class(class_name, base_class_name, methods,
-                                          module_name, processor_type, source_filename, has_base_file, init_signature)
-                    for class_name, base_class_name, methods, init_signature in classes
-                )
+                    generate_client_class(class_name, base_class_name, methods, module_name, processor_type,
+                                          source_filename, has_base_file, init_signature)
+                    for class_name, base_class_name, methods, init_signature in classes)
                 client_file.write_text(code, encoding='utf-8')
 
     def write_init_files(module_files: Dict, src_client_path: Path) -> None:
         """Generate __init__.py files for each module."""
-        print("\nGenerating __init__.py files...")
+        print('\nGenerating __init__.py files...')
 
         for module_name, source_files in module_files.items():
             init_file = src_client_path / module_name / '__init__.py'
-            print(f"  Writing {init_file}...")
+            print(f'  Writing {init_file}...')
 
             init_lines = [
-                f"from .{source_filename} import {class_name}"
-                for source_filename, classes in sorted(source_files.items())
-                for class_name, _, _, _ in classes
+                f'from .{source_filename} import {class_name}'
+                for source_filename, classes in sorted(source_files.items()) for class_name, _, _, _ in classes
             ]
             init_content = AUTO_GEN_WARNING + '\n'.join(sorted(init_lines)) + '\n'
             init_file.write_text(init_content, encoding='utf-8')
@@ -431,7 +431,7 @@ class {class_name}({inheritance}):
     module_files = scan_modules(src_twinkle_path, module_mapping)
     write_client_files(module_files, src_client_path, processor_type_mapping)
     write_init_files(module_files, src_client_path)
-    print("\nProcessor client generation complete!")
+    print('\nProcessor client generation complete!')
     return module_files
 
 
@@ -453,16 +453,16 @@ from twinkle.data_format import InputFeature, Trajectory
 
 class MultiLoraTransformersModel:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
-    
+
     This client manages adapters and sends training/inference requests to the model server.
     Each adapter has its own lifecycle managed through automatic heartbeats.
     """
-    
+
     def __init__(self, model_id: str, **kwargs):
         """Initialize model client."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
-        
+
         self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -472,7 +472,7 @@ class MultiLoraTransformersModel:
             url=f'{self.server_url}/create',
         )
         response.raise_for_status()
-    
+
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""
         response = http_post(
@@ -480,7 +480,7 @@ class MultiLoraTransformersModel:
             json_data={'adapter_name': self.adapter_name}
         )
         response.raise_for_status()
-    
+
     def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs):
         """Add a new adapter to the model and start automatic heartbeat."""
         response = http_post(
@@ -488,21 +488,21 @@ class MultiLoraTransformersModel:
             json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
-        
+
         # Register adapter for automatic heartbeat after successful creation
         self.adapter_name = adapter_name
         heartbeat_manager.register_adapter(
             self.adapter_name,
             self._send_adapter_heartbeat
         )
-    
+
     def __del__(self):
         """Cleanup: unregister adapter from heartbeat manager."""
         try:
             heartbeat_manager.unregister_adapter(self.adapter_name)
         except:
             pass
-    
+
     def forward(self, inputs: Any, **kwargs):
         """Execute forward pass on the model."""
         response = http_post(
@@ -511,7 +511,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def forward_only(self, inputs: Any, **kwargs):
         """Execute forward pass without gradient computation."""
         response = http_post(
@@ -520,7 +520,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def calculate_loss(self, **kwargs):
         """Calculate loss from model outputs."""
         response = http_post(
@@ -529,7 +529,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def get_train_configs(self, **kwargs):
         """Get training configs"""
         response = http_post(
@@ -547,7 +547,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def forward_backward(self, inputs: Any, **kwargs):
         """Execute combined forward and backward pass."""
         response = http_post(
@@ -556,7 +556,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def step(self, **kwargs):
         """Execute optimizer step."""
         response = http_post(
@@ -565,7 +565,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def zero_grad(self, **kwargs):
         """Zero out gradients."""
         response = http_post(
@@ -574,7 +574,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def lr_step(self, **kwargs):
         """Execute learning rate scheduler step."""
         response = http_post(
@@ -583,7 +583,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_loss(self, loss_cls: str, **kwargs):
         """Set the loss function."""
         response = http_post(
@@ -610,7 +610,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs):
         """Set the learning rate scheduler."""
         response = http_post(
@@ -619,7 +619,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def save(self, name: str, **kwargs):
         """Save model checkpoint."""
         response = http_post(
@@ -628,7 +628,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-        
+
     def load(self, name: str, **kwargs):
         """Load model checkpoint."""
         response = http_post(
@@ -637,7 +637,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_template(self, template_cls: str, **kwargs):
         """Set the template for data processing."""
         response = http_post(
@@ -646,7 +646,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_processor(self, processor_cls: str, **kwargs):
         """Set the input processor."""
         response = http_post(
@@ -676,7 +676,7 @@ class MultiLoraTransformersModel:
 
     def upload_to_hub(self, checkpoint_dir: str, hub_model_id: str, hub_token: Optional[str] = None, async_upload: bool = True):
         """Upload model checkpoint to hub.
-        
+
         Args:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
@@ -698,18 +698,18 @@ class MultiLoraTransformersModel:
 
     # Write the model client file
     client_file = client_module_path / 'multi_lora_transformers.py'
-    print(f"Generating {client_file}...")
+    print(f'Generating {client_file}...')
     with open(client_file, 'w', encoding='utf-8') as f:
         f.write(model_code)
 
     # Create/overwrite __init__.py
     init_file = client_module_path / '__init__.py'
-    init_content = AUTO_GEN_WARNING + "from .multi_lora_transformers import MultiLoraTransformersModel\n"
-    print(f"Writing {init_file}...")
+    init_content = AUTO_GEN_WARNING + 'from .multi_lora_transformers import MultiLoraTransformersModel\n'
+    print(f'Writing {init_file}...')
     with open(init_file, 'w', encoding='utf-8') as f:
         f.write(init_content)
 
-    print("Model client generation complete!")
+    print('Model client generation complete!')
 
 
 def generate_samplers():
@@ -730,16 +730,16 @@ from twinkle.data_format import Trajectory, InputFeature
 
 class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
-    
+
     This client manages sampling operations and adapter synchronization with the sampler server.
     Each adapter has its own lifecycle managed through automatic heartbeats.
     """
-    
+
     def __init__(self, model_id: str, **kwargs):
         """Create the sampler instance on server."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
-        
+
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -749,7 +749,7 @@ class vLLMSampler(Sampler):
             json_data=kwargs
         )
         response.raise_for_status()
-    
+
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""
         if not self.adapter_name:
@@ -759,7 +759,7 @@ class vLLMSampler(Sampler):
             json_data={'adapter_name': self.adapter_name}
         )
         response.raise_for_status()
-    
+
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs):
         """Add a new adapter to the sampler and start automatic heartbeat."""
         if isinstance(config, PeftConfig):
@@ -769,16 +769,16 @@ class vLLMSampler(Sampler):
             json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
-        
+
         # Register adapter for automatic heartbeat after successful creation
         self.adapter_name = adapter_name
         heartbeat_manager.register_adapter(
             self.adapter_name,
             self._send_adapter_heartbeat
         )
-        
+
         return response.json()
-    
+
     def __del__(self):
         """Cleanup: unregister adapter from heartbeat manager."""
         try:
@@ -786,7 +786,7 @@ class vLLMSampler(Sampler):
                 heartbeat_manager.unregister_adapter(self.adapter_name)
         except:
             pass
-    
+
     def sample(
         self,
         inputs: Union[List[Trajectory], List[InputFeature]],
@@ -796,14 +796,14 @@ class vLLMSampler(Sampler):
         num_samples: int = 1,
     ) -> Dict[str, Any]:
         """Sample from the model.
-        
+
         Args:
             inputs: List of Trajectory or InputFeature to sample from.
             sampling_params: Sampling parameters dict.
             adapter_name: Adapter name for LoRA inference.
             adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference.
             num_samples: Number of completions to generate per prompt.
-            
+
         Returns:
             Dict with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
@@ -822,7 +822,7 @@ class vLLMSampler(Sampler):
         )
         response.raise_for_status()
         return response.json()
-    
+
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs):
         """Set the template for encoding trajectories."""
         response = http_post(
@@ -835,37 +835,37 @@ class vLLMSampler(Sampler):
 
     # Write the sampler client file
     client_file = client_module_path / 'vllm_sampler.py'
-    print(f"Generating {client_file}...")
+    print(f'Generating {client_file}...')
     with open(client_file, 'w', encoding='utf-8') as f:
         f.write(sampler_code)
 
     # Create/overwrite __init__.py
     init_file = client_module_path / '__init__.py'
-    init_content = AUTO_GEN_WARNING + "from .vllm_sampler import vLLMSampler\n"
-    print(f"Writing {init_file}...")
+    init_content = AUTO_GEN_WARNING + 'from .vllm_sampler import vLLMSampler\n'
+    print(f'Writing {init_file}...')
     with open(init_file, 'w', encoding='utf-8') as f:
         f.write(init_content)
-    
-    print("Sampler client generation complete!")
+
+    print('Sampler client generation complete!')
 
 
 if __name__ == '__main__':
-    print("Starting client code generation...\n")
-    print("=" * 60)
-    
+    print('Starting client code generation...\n')
+    print('=' * 60)
+
     # Generate processor-based clients
-    print("\n[1/3] Generating processor-based clients...")
+    print('\n[1/3] Generating processor-based clients...')
     generate_processors()
-    
+
     # Generate model client
-    print("\n" + "=" * 60)
-    print("\n[2/3] Generating model client...")
+    print('\n' + '=' * 60)
+    print('\n[2/3] Generating model client...')
     generate_models()
-    
+
     # Generate sampler client
-    print("\n" + "=" * 60)
-    print("\n[3/3] Generating sampler client...")
+    print('\n' + '=' * 60)
+    print('\n[3/3] Generating sampler client...')
     generate_samplers()
-    
-    print("\n" + "=" * 60)
-    print("\n✓ All client code generation complete!\n")
+
+    print('\n' + '=' * 60)
+    print('\n✓ All client code generation complete!\n')

@@ -27,12 +27,12 @@ logger = get_logger()
 
 class TaskStatus(Enum):
     """Task lifecycle status."""
-    PENDING = "pending"           # Task created, waiting to be processed
-    QUEUED = "queued"             # Task in queue waiting for execution
-    RUNNING = "running"           # Task currently executing
-    COMPLETED = "completed"       # Task completed successfully
-    FAILED = "failed"             # Task failed with error
-    RATE_LIMITED = "rate_limited"  # Task rejected due to rate limiting
+    PENDING = 'pending'  # Task created, waiting to be processed
+    QUEUED = 'queued'  # Task in queue waiting for execution
+    RUNNING = 'running'  # Task currently executing
+    COMPLETED = 'completed'  # Task completed successfully
+    FAILED = 'failed'  # Task failed with error
+    RATE_LIMITED = 'rate_limited'  # Task rejected due to rate limiting
 
 
 class QueueState(Enum):
@@ -41,10 +41,10 @@ class QueueState(Enum):
     These states are returned to the tinker client to indicate the current
     state of the task queue and help the client adjust its retry behavior.
     """
-    ACTIVE = "active"                     # Queue is actively processing tasks
-    PAUSED_RATE_LIMIT = "paused_rate_limit"  # Queue paused due to rate limiting
-    PAUSED_CAPACITY = "paused_capacity"   # Queue paused due to capacity limits
-    UNKNOWN = "unknown"                   # Unknown or unspecified state
+    ACTIVE = 'active'  # Queue is actively processing tasks
+    PAUSED_RATE_LIMIT = 'paused_rate_limit'  # Queue paused due to rate limiting
+    PAUSED_CAPACITY = 'paused_capacity'  # Queue paused due to capacity limits
+    UNKNOWN = 'unknown'  # Unknown or unspecified state
 
 
 @dataclass
@@ -62,17 +62,17 @@ class TaskQueueConfig:
         per_token_adapter_limit: Maximum number of adapters per user token.
         adapter_timeout: Timeout in seconds for inactive adapters (default 30 minutes).
     """
-    rps_limit: float = 100.0           # 10 requests per second
-    tps_limit: float = 10000.0        # 10000 input tokens per second
-    window_seconds: float = 1.0       # 1 second sliding window
-    queue_timeout: float = 300.0      # 5 minutes queue timeout
-    enabled: bool = True              # Rate limiting enabled by default
+    rps_limit: float = 100.0  # 10 requests per second
+    tps_limit: float = 10000.0  # 10000 input tokens per second
+    window_seconds: float = 1.0  # 1 second sliding window
+    queue_timeout: float = 300.0  # 5 minutes queue timeout
+    enabled: bool = True  # Rate limiting enabled by default
     # Remove tokens after 10x window inactivity
     token_cleanup_multiplier: float = 10.0
-    token_cleanup_interval: float = 60.0    # Run cleanup every 60 seconds
+    token_cleanup_interval: float = 60.0  # Run cleanup every 60 seconds
 
     @classmethod
-    def from_dict(cls, config_dict: Optional[Dict[str, Any]] = None) -> 'TaskQueueConfig':
+    def from_dict(cls, config_dict: dict[str, Any] | None = None) -> TaskQueueConfig:
         """Create TaskQueueConfig from a dictionary.
 
         Args:
@@ -101,11 +101,9 @@ class TaskQueueConfig:
             if 'enabled' in config_dict:
                 config.enabled = bool(config_dict['enabled'])
             if 'token_cleanup_multiplier' in config_dict:
-                config.token_cleanup_multiplier = float(
-                    config_dict['token_cleanup_multiplier'])
+                config.token_cleanup_multiplier = float(config_dict['token_cleanup_multiplier'])
             if 'token_cleanup_interval' in config_dict:
-                config.token_cleanup_interval = float(
-                    config_dict['token_cleanup_interval'])
+                config.token_cleanup_interval = float(config_dict['token_cleanup_interval'])
         return config
 
 
@@ -140,9 +138,9 @@ class TaskQueueMixin:
     """
 
     # Type hint for state attribute that inheriting classes must provide
-    state: 'ServerStateProxy'
+    state: ServerStateProxy
 
-    def _init_task_queue(self, config: Optional[TaskQueueConfig] = None) -> None:
+    def _init_task_queue(self, config: TaskQueueConfig | None = None) -> None:
         """Initialize the task queue system.
 
         Args:
@@ -162,7 +160,7 @@ class TaskQueueMixin:
         # Start the rate limiter cleanup task
         self._rate_limiter.start_cleanup_task()
 
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
         self._worker_started = False
         self._worker_start_lock = asyncio.Lock()
 
@@ -180,11 +178,10 @@ class TaskQueueMixin:
         async with self._worker_start_lock:
             # Double-check after acquiring lock (another coroutine might have started it)
             if not self._worker_started:
-                logger.debug(f"[TaskQueue] Starting background worker...")
+                logger.debug('[TaskQueue] Starting background worker...')
                 self._worker_task = asyncio.create_task(self._queue_worker())
                 self._worker_started = True
-                logger.debug(
-                    f"[TaskQueue] Background worker started: {self._worker_task}")
+                logger.debug(f'[TaskQueue] Background worker started: {self._worker_task}')
 
     async def _queue_worker(self) -> None:
         """Background worker that processes tasks from the queue serially.
@@ -193,60 +190,48 @@ class TaskQueueMixin:
         executing them one at a time. This ensures thread-safe execution
         of model operations that cannot be parallelized.
         """
-        logger.debug(f"[TaskQueue] Worker started")
+        logger.debug('[TaskQueue] Worker started')
         while True:
             try:
                 # Wait for a task from the queue
-                logger.debug(
-                    f"[TaskQueue] Waiting for task... (queue size: {self._task_queue.qsize()})")
+                logger.debug(f'[TaskQueue] Waiting for task... (queue size: {self._task_queue.qsize()})')
                 request_id, coro, model_id = await self._task_queue.get()
 
-                logger.debug(f"[TaskQueue] Processing task {request_id}")
+                logger.debug(f'[TaskQueue] Processing task {request_id}')
                 try:
                     # Update status to RUNNING
                     self.state.store_future_status(
-                        request_id, TaskStatus.RUNNING.value, model_id,
-                        queue_state=QueueState.ACTIVE.value
-                    )
+                        request_id, TaskStatus.RUNNING.value, model_id, queue_state=QueueState.ACTIVE.value)
 
                     # Execute the task
                     result = await coro
 
-                    logger.debug(
-                        f"[TaskQueue] Task {request_id} completed successfully")
+                    logger.debug(f'[TaskQueue] Task {request_id} completed successfully')
                     # Store completed result
-                    self.state.store_future_status(
-                        request_id, TaskStatus.COMPLETED.value, model_id, result=result
-                    )
+                    self.state.store_future_status(request_id, TaskStatus.COMPLETED.value, model_id, result=result)
                 except Exception:
                     # Store error result
-                    logger.debug(
-                        f"[TaskQueue] Task {request_id} failed with error")
-                    error_payload = {
-                        'error': traceback.format_exc(),
-                        'category': 'Server'
-                    }
-                    self.state.store_future_status(
-                        request_id, TaskStatus.FAILED.value, model_id, result=error_payload
-                    )
+                    logger.debug(f'[TaskQueue] Task {request_id} failed with error')
+                    error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
+                    self.state.store_future_status(request_id, TaskStatus.FAILED.value, model_id, result=error_payload)
                 finally:
                     self._task_queue.task_done()
 
             except asyncio.CancelledError:
-                logger.warning(f"[TaskQueue] Worker cancelled")
+                logger.warning('[TaskQueue] Worker cancelled')
                 break
             except Exception:
                 # Log but don't crash the worker
-                logger.warning("Error in task queue worker")
+                logger.warning('Error in task queue worker')
                 continue
 
     async def schedule_task(
         self,
         coro: Coroutine,
-        model_id: Optional[str] = None,
-        token: Optional[str] = None,
+        model_id: str | None = None,
+        token: str | None = None,
         input_tokens: int = 0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Schedule an async task with rate limiting and status tracking.
 
         This method replaces the old `schedule_task` function with proper
@@ -267,50 +252,44 @@ class TaskQueueMixin:
         Returns:
             Dict containing request_id and model_id for future retrieval.
         """
-        request_id = f"req_{uuid.uuid4().hex}"
+        request_id = f'req_{uuid.uuid4().hex}'
 
-        logger.debug(
-            f"[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}")
+        logger.debug(f'[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, '
+                     f'enabled={self._task_queue_config.enabled}')
 
         # 1. Register PENDING status FIRST (fixes race condition)
         self.state.store_future_status(
-            request_id, TaskStatus.PENDING.value, model_id,
-            queue_state=QueueState.ACTIVE.value
-        )
+            request_id, TaskStatus.PENDING.value, model_id, queue_state=QueueState.ACTIVE.value)
 
         # 2. Check rate limiting if enabled and token provided
         if self._task_queue_config.enabled and token:
-            logger.debug(
-                f"[TaskQueue] Checking rate limit for token={token[:8]}... input_tokens={input_tokens}")
+            logger.debug(f'[TaskQueue] Checking rate limit for token={token[:8]}... input_tokens={input_tokens}')
             allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
             if not allowed:
-                logger.debug(f"[TaskQueue] Rate limited: {reason}")
+                logger.debug(f'[TaskQueue] Rate limited: {reason}')
                 self.state.store_future_status(
-                    request_id, TaskStatus.RATE_LIMITED.value, model_id,
+                    request_id,
+                    TaskStatus.RATE_LIMITED.value,
+                    model_id,
                     reason=reason,
                     queue_state=QueueState.PAUSED_RATE_LIMIT.value,
-                    queue_state_reason=reason
-                )
+                    queue_state_reason=reason)
                 return {'request_id': request_id, 'model_id': model_id}
-            logger.debug(f"[TaskQueue] Rate limit check passed")
+            logger.debug('[TaskQueue] Rate limit check passed')
 
         # 3. Ensure worker is started
         await self._ensure_worker_started()
 
         # 4. Put task in queue and update status
-        logger.debug(
-            f"[TaskQueue] Adding task {request_id} to queue (current size: {self._task_queue.qsize()})")
+        logger.debug(f'[TaskQueue] Adding task {request_id} to queue (current size: {self._task_queue.qsize()})')
         await self._task_queue.put((request_id, coro, model_id))
         self.state.store_future_status(
-            request_id, TaskStatus.QUEUED.value, model_id,
-            queue_state=QueueState.ACTIVE.value
-        )
-        logger.debug(
-            f"[TaskQueue] Task {request_id} queued, new queue size: {self._task_queue.qsize()}")
+            request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
+        logger.debug(f'[TaskQueue] Task {request_id} queued, new queue size: {self._task_queue.qsize()}')
 
         return {'request_id': request_id, 'model_id': model_id}
 
-    def get_queue_stats(self) -> Dict[str, Any]:
+    def get_queue_stats(self) -> dict[str, Any]:
         """Get current queue statistics.
 
         Returns:
@@ -326,7 +305,7 @@ class TaskQueueMixin:
             }
         }
 
-    def get_rate_limit_stats(self, token: str) -> Dict[str, Any]:
+    def get_rate_limit_stats(self, token: str) -> dict[str, Any]:
         """Get rate limiting stats for a specific user token.
 
         Args:
@@ -337,7 +316,7 @@ class TaskQueueMixin:
         """
         return self._rate_limiter.get_stats(token)
 
-    def get_rate_limiter_memory_stats(self) -> Dict[str, Any]:
+    def get_rate_limiter_memory_stats(self) -> dict[str, Any]:
         """Get memory usage statistics from the rate limiter.
 
         Returns:
@@ -362,4 +341,4 @@ class TaskQueueMixin:
             except asyncio.CancelledError:
                 pass
 
-        logger.debug("[TaskQueue] Task queue shutdown complete")
+        logger.debug('[TaskQueue] Task queue shutdown complete')

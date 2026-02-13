@@ -7,7 +7,7 @@ A message represents a single round of information in a model conversation. The 
 class ToolCall(TypedDict, total=False):
     tool_name: str
     arguments: str
-    
+
 class Message(TypedDict, total=False):
     role: Literal['system', 'user', 'assistant', 'tool']
     type: str

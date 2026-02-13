@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from ..constant import ModelType, MegatronModelType
+from ..constant import MegatronModelType, ModelType
 from ..register import MegatronModelMeta, register_megatron_model
 
 register_megatron_model(

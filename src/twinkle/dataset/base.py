@@ -2,19 +2,17 @@
 import os.path
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Type, Union, Dict, Any
-
-from datasets import interleave_datasets, concatenate_datasets, load_dataset, IterableDataset, DatasetDict
+from datasets import DatasetDict, IterableDataset, concatenate_datasets, interleave_datasets, load_dataset
 from torch.utils.data import Dataset as TorchDataset
+from typing import Any, Callable, Dict, Type, Union
 
 import twinkle
 from twinkle import preprocessor
 from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
-from twinkle.preprocessor import Preprocessor, DataFilter
+from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
-from twinkle.utils import construct_class
-from twinkle.utils import processing_lock
+from twinkle.utils import construct_class, processing_lock
 
 
 @dataclass
@@ -33,7 +31,7 @@ class DatasetMeta:
 
     def get_id(self):
         return self.dataset_id.replace(os.sep, '_').replace('.', '_') + ':' + self.subset_name + ':' + self.split
-    
+
     def __post_init__(self):
         if self.data_slice is not None and not isinstance(self.data_slice, Iterable):
             raise ValueError('data_slice must be an iterable')
@@ -54,9 +52,7 @@ class Dataset(TorchDataset):
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
         dataset = self._load_dataset(dataset_meta, **kwargs)
-        self.datasets = {
-            dataset_meta.get_id(): dataset
-        }
+        self.datasets = {dataset_meta.get_id(): dataset}
         self.dataset = dataset
         self.template = None
 
@@ -80,16 +76,19 @@ class Dataset(TorchDataset):
                 Useful when the encoded dataset will be used for sampling/inference.
             **kwargs: The mapping and filter kwargs of the `datasets.map`.
         """
-        kwargs['batched'] = True # Only supported batched, because a single row may explode to several rows
+        kwargs['batched'] = True  # Only supported batched, because a single row may explode to several rows
         if 'load_from_cache_file' not in kwargs:
-            # By default, we don't use load_from_cache_file, because read cache will not consider the changes in the same file,
+            # By default, we don't use load_from_cache_file, because read cache will not consider
+            # the changes in the same file,
             # which will cause unexpected behaviors.
             kwargs['load_from_cache_file'] = False
         from functools import partial
         encode_fn = partial(self.template.batch_encode, add_generation_prompt=add_generation_prompt)
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
-            self.dataset = self.dataset.map(encode_fn, **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']], **kwargs)
+            self.dataset = self.dataset.map(encode_fn,
+                                            **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']],
+                                                             **kwargs)
 
     @remote_function()
     def check(self, **kwargs):
@@ -142,13 +141,11 @@ class Dataset(TorchDataset):
                 dataset = dataset['train']
             else:
                 available_splits = list(dataset.keys())
-                raise KeyError(
-                    f"Split '{split}' not found for dataset '{dataset_id}'. "
-                    f'Available splits: {available_splits}'
-                )
+                raise KeyError(f"Split '{split}' not found for dataset '{dataset_id}'. "
+                               f'Available splits: {available_splits}')
 
         if isinstance(dataset_meta.data_slice, Iterable) and hasattr(dataset, '__len__'):
-            
+
             iter_list = []
             _data_len = len(dataset)
             for idx in dataset_meta.data_slice:
@@ -161,8 +158,11 @@ class Dataset(TorchDataset):
         return dataset
 
     @remote_function()
-    def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
-            dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs) -> None:
+    def map(self,
+            preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
+            dataset_meta: DatasetMeta = None,
+            init_args: Dict[str, Any] = None,
+            **kwargs) -> None:
         """An inplace method to operate or transform the dataset.
 
         Args:
@@ -173,7 +173,8 @@ class Dataset(TorchDataset):
         """
         init_args = init_args or {}
         if 'load_from_cache_file' not in kwargs:
-            # By default, we don't use load_from_cache_file, because read cache will not consider the changes in the same file,
+            # By default, we don't use load_from_cache_file, because read cache will not consider
+            # the changes in the same file,
             # which will cause unexpected behaviors.
             kwargs['load_from_cache_file'] = False
         preprocess_func = construct_class(preprocess_func, Preprocessor, twinkle.preprocessor, **init_args)
@@ -182,14 +183,16 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
-        kwargs['batched'] = False # TODO temporary change to False, because the interface does not support batched
+        kwargs['batched'] = False  # TODO temporary change to False, because the interface does not support batched
         with processing_lock(key):
             self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
         if len(self.datasets) == 1:
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None,
+    def filter(self,
+               filter_func: Union[Callable, str, Type[DataFilter], DataFilter],
+               dataset_meta: DatasetMeta = None,
                init_args: Dict[str, Any] = None,
                **kwargs) -> None:
         """An inplace method to operate or transform the dataset.
@@ -214,9 +217,7 @@ class Dataset(TorchDataset):
             self.dataset = self.datasets[key]
 
     @remote_function()
-    def add_dataset(self,
-                    dataset_meta: DatasetMeta,
-                    **kwargs):
+    def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
         """Add a new dataset.
 
         Args:
@@ -234,7 +235,8 @@ class Dataset(TorchDataset):
         """
         if len(self.datasets) > 1:
             dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
-            assert all(dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
+            assert all(
+                dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
             if interleave:
                 self.dataset = interleave_datasets(list(self.datasets.values()))
             else:

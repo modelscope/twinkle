@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import sys
-from typing import List, Union, Any, TYPE_CHECKING
 import numpy as np
+import sys
+from typing import TYPE_CHECKING, Any, List, Union
 
 if sys.version_info[:2] <= (3, 11):
     # Pydantic requirements.

@@ -1,20 +1,19 @@
-from peft import LoraConfig
-import twinkle
 import os
+from peft import LoraConfig
 from tqdm import tqdm
-from twinkle import Platform, DeviceMesh
-from twinkle import get_device_placement, get_logger
+
+import twinkle
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
+from twinkle.dataset import Dataset, DatasetMeta, IterableDataset, IterablePackingDataset, LazyDataset, PackingDataset
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
+
 if Platform.get_rank() == 0:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
 
-    run = swanlab.init(
-        project="TransformersModel",
-    )
+    run = swanlab.init(project='TransformersModel', )
 
 device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=2)
 
@@ -36,6 +35,7 @@ def eval(model):
     metrics = model.calculate_metric(is_training=False)
     return metrics
 
+
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
@@ -46,14 +46,10 @@ def train():
 
     model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
     model.set_optimizer('AdamW', lr=1e-4)
-    model.set_lr_scheduler('CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader)//8)
+    model.set_lr_scheduler('CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader) // 8)
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)//8}')

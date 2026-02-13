@@ -10,6 +10,7 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
+
 dotenv.load_dotenv('.env')
 
 import os
@@ -28,7 +29,7 @@ MODEL_ID = 'Qwen/Qwen2.5-3B-Instruct'
 # or None to use the base model
 # ADAPTER_URI = None
 # Example:
-ADAPTER_URI = "twinkle://20260208_224851-fa3cdd11-default/weights/twinkle-epoch-2"
+ADAPTER_URI = 'twinkle://20260208_224851-fa3cdd11-default/weights/twinkle-epoch-2'
 
 
 def sample():
@@ -48,8 +49,14 @@ def sample():
     # Each trajectory is a conversation with system and user messages
     trajectory = {
         'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {'role': 'user', 'content': 'Who are you?'},
+            {
+                'role': 'system',
+                'content': 'You are a helpful assistant.'
+            },
+            {
+                'role': 'user',
+                'content': 'Who are you?'
+            },
         ]
     }
 
@@ -78,11 +85,11 @@ def sample():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
     logger.info(f"Generated {len(response['sequences'])} sequences "
-                f"({num_prompts} prompts x {num_samples} samples)")
+                f'({num_prompts} prompts x {num_samples} samples)')
 
     for i, seq in enumerate(response['sequences']):
         text = tokenizer.decode(seq['tokens'], skip_special_tokens=True)
-        logger.info(f"Sequence {i}:\n  {text}\n")
+        logger.info(f'Sequence {i}:\n  {text}\n')
 
 
 if __name__ == '__main__':

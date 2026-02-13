@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 from PIL import Image
+from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLForConditionalGeneration
 
-from ..constant import ModelType, MegatronModelType
+from twinkle.utils.torch_utils import to_device
+from ..constant import MegatronModelType, ModelType
 from ..gpt_bridge import MultimodalGPTBridge
 from ..register import MegatronModelMeta, register_megatron_model
 from .utils import HuggingFaceModule
-from twinkle.utils.torch_utils import to_device
-from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
 
 
 class Qwen2_5VL_Vit(HuggingFaceModule):
@@ -85,7 +85,6 @@ class Qwen2_5VL_Vit(HuggingFaceModule):
                 video_mask = video_mask.to(inputs_embeds.device)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
         return inputs_embeds
-
 
 
 class Qwen2_5VLBridge(MultimodalGPTBridge):

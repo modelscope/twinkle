@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from types import MethodType
 from typing import Optional
+
 from .platform import Platform
 
 
@@ -52,7 +53,10 @@ def warning_once(self, msg, *args, **kwargs):
     self.warning(msg)
 
 
-def get_logger(log_file: Optional[str] = None, log_level: Optional[int] = None, file_mode: str = 'w', only_local_master: bool = True) -> logging.Logger:
+def get_logger(log_file: Optional[str] = None,
+               log_level: Optional[int] = None,
+               file_mode: str = 'w',
+               only_local_master: bool = True) -> logging.Logger:
     """ Get logging logger
 
     Args:

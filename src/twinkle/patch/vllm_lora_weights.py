@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from dataclasses import field
-from typing import Optional, Dict
-
-from .base import Patch
-from twinkle import requires
 import torch
+from dataclasses import field
+from typing import Dict, Optional
+
+from twinkle import requires
+from .base import Patch
 
 try:
     from vllm.lora.request import LoRARequest
@@ -26,18 +26,17 @@ class TensorLoRARequest(LoRARequest):
         return self.lora_embeddings
 
 
-
 class VLLMLoraWeights(Patch):
 
     def __call__(self, sampler, **kwargs):
         _sampler_ref = sampler
-        
+
         def _get_tokenizer():
             """Get tokenizer lazily from sampler's template."""
             if _sampler_ref and _sampler_ref.template is not None:
                 return _sampler_ref.template.tokenizer
             return None
-        
+
         from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
         try:
             from vllm.lora.models import LoRAModel
@@ -120,11 +119,11 @@ class VLLMLoraWeights(Patch):
                     )
             except Exception as e:
                 raise e
-                
+
             if hasattr(self.lora_config, 'lora_extra_vocab_size'):
                 if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
                     raise ValueError(f'LoRA added vocab size {lora.extra_vocab_size} is greater than '
-                                    f'lora_extra_vocab_size {self.lora_config.lora_extra_vocab_size}.')
+                                     f'lora_extra_vocab_size {self.lora_config.lora_extra_vocab_size}.')
             return lora
 
         def patched_get_lora_tokenizer(self: TokenizerGroup, lora_request: LoRARequest):

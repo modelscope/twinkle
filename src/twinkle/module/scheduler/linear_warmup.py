@@ -14,4 +14,6 @@ class LinearWarmupScheduler(LambdaLR):
     def _lr_lambda(self, cur_step):
         if cur_step < self.num_warmup_steps:
             return float(cur_step) / float(max(1, self.num_warmup_steps))
-        return max(0.0, float(self.num_training_steps - cur_step) / float(max(1, self.num_training_steps - self.num_warmup_steps)))
+        return max(
+            0.0,
+            float(self.num_training_steps - cur_step) / float(max(1, self.num_training_steps - self.num_warmup_steps)))

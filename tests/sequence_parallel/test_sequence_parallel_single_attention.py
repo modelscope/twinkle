@@ -1,33 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import os
 import socket
 import sys
-import contextlib
-from datetime import timedelta
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_PATH = str(REPO_ROOT / "src")
-if SRC_PATH not in sys.path:
-    sys.path.insert(0, SRC_PATH)
-
-import unittest
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import unittest
+from datetime import timedelta
+from pathlib import Path
 
-from twinkle.model.transformers.strategy.sequence_parallel import (
-    DistributedAttention,
-    sequence_parallel,
-)
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
+from twinkle.model.transformers.strategy.sequence_parallel import DistributedAttention, sequence_parallel
 from twinkle.utils import DeviceMesh
 
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
 
 
@@ -39,23 +29,24 @@ def _broadcast_params(module: torch.nn.Module) -> None:
 def _enable_strict_determinism() -> None:
     # Reduce kernel variability: avoid TF32 and prefer deterministic algorithms.
     # Note: some collectives/kernels may not have deterministic variants; keep warn_only.
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
         torch.backends.cuda.matmul.allow_tf32 = False
-    if hasattr(torch.backends, "cudnn"):
+    if hasattr(torch.backends, 'cudnn'):
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cudnn.benchmark = False
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("highest")
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('highest')
     torch.use_deterministic_algorithms(True, warn_only=True)
+
 
 def _to_local(x: torch.Tensor) -> torch.Tensor:
     # FSDP2 grads can be DTensors; unwrap to local for comparison.
-    if hasattr(x, "to_local"):
+    if hasattr(x, 'to_local'):
         try:
             return x.to_local()
         except Exception:  # noqa: BLE001
             pass
-    if hasattr(x, "local_tensor"):
+    if hasattr(x, 'local_tensor'):
         try:
             return x.local_tensor
         except Exception:  # noqa: BLE001
@@ -76,12 +67,12 @@ def _force_sdpa_math():
         pass
 
     # Fallback for older torch versions.
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'sdp_kernel'):
         with torch.backends.cuda.sdp_kernel(
-            enable_flash=False,
-            enable_math=True,
-            enable_mem_efficient=False,
-            enable_cudnn=False,
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+                enable_cudnn=False,
         ):
             yield
     else:
@@ -89,6 +80,7 @@ def _force_sdpa_math():
 
 
 class _SingleAttention(torch.nn.Module):
+
     def __init__(self, hidden_dim: int, num_heads: int, sp_enabled: bool):
         super().__init__()
         assert hidden_dim % num_heads == 0
@@ -121,8 +113,7 @@ class _SingleAttention(torch.nn.Module):
         v = value.permute(0, 2, 1, 3).contiguous()
         with _force_sdpa_math():
             out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
-        )
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal)
         return out.permute(0, 2, 1, 3).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,22 +132,22 @@ class _SingleAttention(torch.nn.Module):
 
 
 def _init_dist(rank: int, world_size: int, port: int) -> torch.device:
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = str(port)
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this test.")
-    device = torch.device(f"cuda:{rank}")
+        raise RuntimeError('CUDA is required for this test.')
+    device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
     dist.init_process_group(
-        backend="nccl",
+        backend='nccl',
         rank=rank,
         world_size=world_size,
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=f'tcp://127.0.0.1:{port}',
         device_id=device,
         timeout=timedelta(minutes=15),
     )
@@ -178,7 +169,7 @@ def _run_worker_single_attn(rank: int, world_size: int, port: int, padding: bool
 
         # Align with VeOmni's test semantics: one SP group across the whole world.
         sp_size = world_size
-        device_mesh = DeviceMesh.from_sizes(dp_size=world_size, ulysses_size=sp_size, device_type="cuda")
+        device_mesh = DeviceMesh.from_sizes(dp_size=world_size, ulysses_size=sp_size, device_type='cuda')
         _setup_sp(device_mesh, sp_size)
         sp_group = sequence_parallel._sp_group
 
@@ -268,9 +259,8 @@ def _run_worker_single_attn_fsdp(rank: int, world_size: int, port: int):
         # Use sp_size=world_size to avoid multiple independent SP groups while FSDP shards globally.
         sp_size = world_size
         # For FSDP+SP, SP is derived from dp/fsdp ranks. Use fsdp=world, dp=1.
-        device_mesh = DeviceMesh.from_sizes(fsdp_size=world_size, dp_size=1, ulysses_size=sp_size, device_type="cuda")
+        device_mesh = DeviceMesh.from_sizes(fsdp_size=world_size, dp_size=1, ulysses_size=sp_size, device_type='cuda')
         _setup_sp(device_mesh, sp_size)
-        sp_group = sequence_parallel._sp_group
 
         batch_size = 2
         unpad_seq_len = 128
@@ -290,7 +280,7 @@ def _run_worker_single_attn_fsdp(rank: int, world_size: int, port: int):
         _broadcast_params(attn_sp)
         attn_dp.load_state_dict(attn_sp.state_dict())
 
-        fsdp = NativeFSDPStrategy(device_mesh=device_mesh, mixed_precision="no", fsdp_config={})
+        fsdp = NativeFSDPStrategy(device_mesh=device_mesh, mixed_precision='no', fsdp_config={})
         attn_sp, _ = fsdp.wrap_model(attn_sp, optimizer=None)
         attn_dp, _ = fsdp.wrap_model(attn_dp, optimizer=None)
 
@@ -338,12 +328,12 @@ class TestSequenceParallelSingleAttention(unittest.TestCase):
     @unittest.skip('Hang in CI env')
     def test_single_attention(self):
         if not dist.is_available():
-            self.skipTest("torch.distributed is not available")
+            self.skipTest('torch.distributed is not available')
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for this test.")
+            self.skipTest('CUDA is required for this test.')
         world_size = 4
         if torch.cuda.device_count() < world_size:
-            self.skipTest("Requires at least 4 GPUs for sequence-parallel attention test.")
+            self.skipTest('Requires at least 4 GPUs for sequence-parallel attention test.')
         port = _find_free_port()
         mp.spawn(
             _run_worker_single_attn,
@@ -355,12 +345,12 @@ class TestSequenceParallelSingleAttention(unittest.TestCase):
     @unittest.skip('Hang in CI env')
     def test_single_attention_padding(self):
         if not dist.is_available():
-            self.skipTest("torch.distributed is not available")
+            self.skipTest('torch.distributed is not available')
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for this test.")
+            self.skipTest('CUDA is required for this test.')
         world_size = 4
         if torch.cuda.device_count() < world_size:
-            self.skipTest("Requires at least 4 GPUs for sequence-parallel attention test.")
+            self.skipTest('Requires at least 4 GPUs for sequence-parallel attention test.')
         port = _find_free_port()
         mp.spawn(
             _run_worker_single_attn,
@@ -372,12 +362,12 @@ class TestSequenceParallelSingleAttention(unittest.TestCase):
     @unittest.skip('Hang in CI env')
     def test_single_attention_fsdp(self):
         if not dist.is_available():
-            self.skipTest("torch.distributed is not available")
+            self.skipTest('torch.distributed is not available')
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for this test.")
+            self.skipTest('CUDA is required for this test.')
         world_size = 4
         if torch.cuda.device_count() < world_size:
-            self.skipTest("Requires at least 4 GPUs for sequence-parallel attention test.")
+            self.skipTest('Requires at least 4 GPUs for sequence-parallel attention test.')
         port = _find_free_port()
         mp.spawn(
             _run_worker_single_attn_fsdp,

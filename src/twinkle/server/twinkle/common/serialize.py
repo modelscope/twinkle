@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 from numbers import Number
-from typing import Mapping, Any
-
 from peft import LoraConfig
+from typing import Any, Mapping
 
 from twinkle.dataset import DatasetMeta
 
@@ -25,10 +24,8 @@ def _serialize_data_slice(data_slice):
         return {'_slice_type_': 'range', 'start': data_slice.start, 'stop': data_slice.stop, 'step': data_slice.step}
     if isinstance(data_slice, (list, tuple)):
         return {'_slice_type_': 'list', 'values': list(data_slice)}
-    raise ValueError(
-        f'Http mode does not support data_slice of type {type(data_slice).__name__}. '
-        'Supported types: range, list, tuple.'
-    )
+    raise ValueError(f'Http mode does not support data_slice of type {type(data_slice).__name__}. '
+                     'Supported types: range, list, tuple.')
 
 
 def _deserialize_data_slice(data_slice):
@@ -70,7 +67,7 @@ def serialize_object(obj) -> str:
 def deserialize_object(data: str) -> Any:
     try:
         data = json.loads(data)
-    except Exception: # noqa
+    except Exception:  # noqa
         return data
 
     if '_TWINKLE_TYPE_' in data:
@@ -84,6 +81,3 @@ def deserialize_object(data: str) -> Any:
             raise ValueError(f'Unsupported type: {_type}')
     else:
         return data
-
-
-

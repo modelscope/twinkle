@@ -16,18 +16,17 @@ import gc
 import os
 import re
 import time
-from typing import List, Tuple, Dict, Any
-
 from peft import LoraConfig
+from typing import Any, Dict, List, Tuple
 
 import twinkle
-from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.data_format import SamplingParams
-from twinkle.data_format import Trajectory, Message
+from twinkle.data_format import Message, SamplingParams, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
@@ -35,7 +34,6 @@ from twinkle.reward import MathReward
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
-from twinkle.metric import CompletionRewardMetric
 
 logger = get_logger()
 
@@ -67,27 +65,26 @@ USE_SWANLAB = bool(int(os.environ.get('USE_SWANLAB', '1')))
 if USE_SWANLAB:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-    swanlab.init(project="twinkle-gsm8k", config={
-        'model_id': MODEL_ID,
-        'num_gpus': NUM_GPUS,
-        'model_gpus': MODEL_GPUS,
-        'sampler_gpus': SAMPLER_GPUS,
-        'num_generations': NUM_GENERATIONS,
-        'max_new_tokens': MAX_NEW_TOKENS,
-        'learning_rate': LEARNING_RATE,
-        'grpo_epsilon': GRPO_EPSILON,
-        'grpo_beta': GRPO_BETA,
-        'batch_size': BATCH_SIZE,
-        'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
-    })
+    swanlab.init(
+        project='twinkle-gsm8k',
+        config={
+            'model_id': MODEL_ID,
+            'num_gpus': NUM_GPUS,
+            'model_gpus': MODEL_GPUS,
+            'sampler_gpus': SAMPLER_GPUS,
+            'num_generations': NUM_GENERATIONS,
+            'max_new_tokens': MAX_NEW_TOKENS,
+            'learning_rate': LEARNING_RATE,
+            'grpo_epsilon': GRPO_EPSILON,
+            'grpo_beta': GRPO_BETA,
+            'batch_size': BATCH_SIZE,
+            'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
+        })
 
-
-SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the problem step by step. "
-    "YOU MUST Show your reasoning in <think> </think> tags, then give the final "
-    "numerical answer with boxed \\boxed{}.\n"
-    "For example:\n<think> ... reasoning ... </think>\n\\boxed{42}"
-)
+SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem step by step. '
+                 'YOU MUST Show your reasoning in <think> </think> tags, then give the final '
+                 'numerical answer with boxed \\boxed{}.\n'
+                 'For example:\n<think> ... reasoning ... </think>\n\\boxed{42}')
 
 
 class MathPreprocessor(Preprocessor):
@@ -106,13 +103,10 @@ class MathPreprocessor(Preprocessor):
         problem = sample['problem']
         solution = sample['solution']
         return Trajectory(
-            messages=[
-                Message(role='user', content=problem),
-                Message(role='assistant', content=solution)
-            ],
+            messages=[Message(role='user', content=problem),
+                      Message(role='assistant', content=solution)],
             user_data=[('ground_truth', ground_truth)],
         )
-
 
 
 class GSM8KProcessor(Preprocessor):
@@ -163,9 +157,7 @@ class GSM8KAccuracyReward(Reward):
             return matches[-1].replace(',', '').replace(' ', '').strip()
         return ''
 
-    def __call__(
-        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
-    ) -> List[float]:
+    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]) -> List[float]:
         rewards = []
         for trajectory in trajectories:
             messages = trajectory.get('messages', [])
@@ -206,9 +198,7 @@ class GSM8KFormatReward(Reward):
     Returns 1.0 if format is correct, 0.0 otherwise.
     """
 
-    def __call__(
-        self, trajectories: List[Trajectory], ground_truths: List[Trajectory]
-    ) -> List[float]:
+    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]) -> List[float]:
         rewards = []
         for trajectory in trajectories:
             messages = trajectory.get('messages', [])
@@ -217,9 +207,7 @@ class GSM8KFormatReward(Reward):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_think = bool(
-                re.search(r'<think>.*?</think>', completion, re.DOTALL)
-            )
+            has_think = bool(re.search(r'<think>.*?</think>', completion, re.DOTALL))
             has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
             rewards.append(1.0 if (has_think and has_answer) else 0.0)
         return rewards
@@ -228,20 +216,19 @@ class GSM8KFormatReward(Reward):
 def create_gsm8k_dataset():
     """Create GSM8K dataset."""
     meta = DatasetMeta(
-        "ms://modelscope/competition_math",
-        subset_name='default', split='train',
+        'ms://modelscope/competition_math',
+        subset_name='default',
+        split='train',
         data_slice=range(2000),
     )
     dataset = Dataset(meta)
-    dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(MathPreprocessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
 
 
-def compute_rewards(
-    trajectories: List[Trajectory],
-) -> Tuple[List[float], List[float], List[float]]:
+def compute_rewards(trajectories: List[Trajectory], ) -> Tuple[List[float], List[float], List[float]]:
     """Compute accuracy and format rewards for GSM8K."""
     accuracy_reward_fn = MathReward()
     format_reward_fn = GSM8KFormatReward()
@@ -270,16 +257,18 @@ def main():
     ]
     if USE_MEGATRON:
         model_mesh = DeviceMesh.from_sizes(
-            dp_size=MODEL_GPUS//PP_SIZE, pp_size=PP_SIZE, ep_size=MODEL_GPUS // PP_SIZE,
+            dp_size=MODEL_GPUS // PP_SIZE,
+            pp_size=PP_SIZE,
+            ep_size=MODEL_GPUS // PP_SIZE,
         )
     else:
         model_mesh = DeviceMesh.from_sizes(
-            world_size=MODEL_GPUS, dp_size=MODEL_GPUS,
+            world_size=MODEL_GPUS,
+            dp_size=MODEL_GPUS,
         )
     assert SAMPLER_GPUS % SAMPLER_TP == 0
     sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // SAMPLER_TP, tp_size=SAMPLER_TP
-    )
+        world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // SAMPLER_TP, tp_size=SAMPLER_TP)
     twinkle.initialize(
         mode='ray',
         nproc_per_node=NUM_GPUS,
@@ -288,7 +277,7 @@ def main():
     )
 
     lora_config = LoraConfig(
-        target_modules="all-linear",
+        target_modules='all-linear',
         r=8,
         lora_alpha=32,
         lora_dropout=0.05,
@@ -316,7 +305,8 @@ def main():
     )
     if USE_MEGATRON:
         model.set_optimizer(
-            'default', lr=LEARNING_RATE,
+            'default',
+            lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
             'default',
@@ -325,10 +315,13 @@ def main():
         )
     else:
         model.set_optimizer(
-            'AdamW', lr=LEARNING_RATE,
+            'AdamW',
+            lr=LEARNING_RATE,
         )
         model.set_lr_scheduler(
-            'CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0,
+            'CosineAnnealingLR',
+            T_max=MAX_STEPS,
+            eta_min=0,
         )
     model.set_loss(
         'GRPOLoss',
@@ -348,7 +341,7 @@ def main():
             'max_lora_rank': 32,
             'enable_sleep_mode': False,
             'enable_lora': True,
-            "logprobs_mode": "processed_logprobs",
+            'logprobs_mode': 'processed_logprobs',
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
@@ -405,7 +398,7 @@ def main():
 
         t1 = time.perf_counter()
         sample_response = sampler.sample(
-            global_prompts*NUM_GENERATIONS,
+            global_prompts * NUM_GENERATIONS,
             sampling_params,
             num_samples=1,
         )
@@ -421,16 +414,12 @@ def main():
             all_completion_lengths.append(len(sequence.tokens))
 
         if not all_input_data:
-            logger.warning(
-                f"Optim step {optim_step}: No valid samples, skipping"
-            )
+            logger.warning(f'Optim step {optim_step}: No valid samples, skipping')
             continue
 
         # ========== 3. Rewards ==========
         t2 = time.perf_counter()
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
-            all_input_data
-        )
+        total_rewards, format_rewards, accuracy_rewards = compute_rewards(all_input_data)
         timings['reward'] = time.perf_counter() - t2
 
         metrics.accumulate(
@@ -456,9 +445,7 @@ def main():
         advantages = advantages.tolist()
         timings['advantage'] = time.perf_counter() - t3
 
-        frac_zero_std = (
-            1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0
-        )
+        frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
 
         # ========== 5. Training ==========
         t4 = time.perf_counter()
@@ -489,9 +476,9 @@ def main():
 
         if USE_SWANLAB:
             swanlab.log(log_dict)
-        logger.info(f"[Step {optim_step}/{MAX_STEPS}] {log_dict}")
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
-    logger.info(f"Training completed. optim_steps={optim_step}")
+    logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('grpo-gsm8k-checkpoint')
 
 

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import List, Dict, Any
 import statistics
+from typing import Any, Dict, List
 
 from .base import Metric
 
@@ -21,7 +21,9 @@ class CompletionRewardMetric(Metric):
         self.completion_lengths = []
 
     def accumulate(self,
-                   _, __, *,
+                   _,
+                   __,
+                   *,
                    rewards=None,
                    completion_lengths=None,
                    generate_time: float = None,

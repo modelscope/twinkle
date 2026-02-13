@@ -6,11 +6,11 @@ This module defines the interface that all sampler engines must implement.
 Engines are the low-level components that handle token-based inference.
 """
 
+import torch
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-import torch
-from twinkle.data_format import SamplingParams, SampleResponse
+from twinkle.data_format import SampleResponse, SamplingParams
 
 
 class BaseSamplerEngine(ABC):
@@ -33,7 +33,7 @@ class BaseSamplerEngine(ABC):
     ) -> SampleResponse:
         """
         Sample completions from the model.
-        
+
         Args:
             prompt_token_ids: Input token IDs.
             sampling_params: Sampling parameters.
@@ -49,17 +49,17 @@ class BaseSamplerEngine(ABC):
                     TransformersEngine requires pre-processed inputs via extra_model_inputs.
             videos: Optional list of videos for multimodal models.
             **kwargs: Additional engine-specific arguments.
-            
+
         Returns:
             SampleResponse containing sequences and optionally prompt_logprobs.
         """
         pass
-    
+
     @abstractmethod
     async def get_tokenizer(self):
         """Get the tokenizer."""
         pass
-    
+
     async def update_weights(
         self,
         weights: Dict[str, torch.Tensor],
@@ -68,13 +68,13 @@ class BaseSamplerEngine(ABC):
     ) -> None:
         """
         Update model weights.
-        
+
         Args:
             weights: Dict of (name, tensor) pairs.
             adapter_name: If provided, update LoRA adapter weights instead of base model.
         """
         pass
-    
+
     async def save_weights_for_sampler(
         self,
         weights: Dict[str, torch.Tensor],
@@ -83,22 +83,22 @@ class BaseSamplerEngine(ABC):
     ) -> str:
         """
         Save weights as a LoRA adapter for sampling (client-server mode).
-        
+
         Args:
             weights: LoRA weight tensors.
             peft_config: PEFT/LoRA configuration dict.
-            
+
         Returns:
             URI string for the adapter.
         """
-        raise NotImplementedError("save_weights_for_sampler not implemented")
-    
+        raise NotImplementedError('save_weights_for_sampler not implemented')
+
     async def sleep(self, **kwargs) -> None:
         """
         Offload weights from GPU memory (for colocated training).
         """
         pass
-    
+
     async def wake_up(self, **kwargs) -> None:
         """
         Reload weights to GPU memory (for colocated training).

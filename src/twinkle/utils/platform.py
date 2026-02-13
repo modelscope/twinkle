@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import hashlib
+import numpy as np
 import os
 import platform
-import hashlib
 import re
 import shutil
 import socket
@@ -11,8 +12,6 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import product
 from typing import Dict, List, Optional, Type, Union
-
-import numpy as np
 
 
 @dataclass
@@ -48,9 +47,19 @@ class DeviceMesh:
     device_type: str = 'cuda'
 
     @staticmethod
-    def from_sizes(*, world_size: int = 1, dp_size: int = 1, fsdp_size: int = None, tp_size: int = None,
-                   pp_size: int = None, ulysses_size: int = None, cp_size: int = None, ep_size: int = None,
-                   etp_size: int = 1, vpp_size: int = None, device_type: str = 'cuda', sequence_parallel: bool = False) -> "DeviceMesh":
+    def from_sizes(*,
+                   world_size: int = 1,
+                   dp_size: int = 1,
+                   fsdp_size: int = None,
+                   tp_size: int = None,
+                   pp_size: int = None,
+                   ulysses_size: int = None,
+                   cp_size: int = None,
+                   ep_size: int = None,
+                   etp_size: int = 1,
+                   vpp_size: int = None,
+                   device_type: str = 'cuda',
+                   sequence_parallel: bool = False) -> 'DeviceMesh':
         """Create a default device mesh from the given sizes.
 
         Args:
@@ -75,16 +84,16 @@ class DeviceMesh:
         mesh_dim_sizes = []
         if fsdp_size is not None:
             mesh_dim_sizes.append(fsdp_size)
-            mesh_dim_names.append("fsdp")
+            mesh_dim_names.append('fsdp')
             if origin_world_size == 1:
                 world_size *= fsdp_size
         if pp_size is not None:
             mesh_dim_sizes.append(pp_size)
-            mesh_dim_names.append("pp")
+            mesh_dim_names.append('pp')
             if origin_world_size == 1:
                 world_size *= pp_size
         if dp_size is not None:
-            mesh_dim_names.append("dp")
+            mesh_dim_names.append('dp')
             if origin_world_size == 1:
                 world_size *= dp_size
             mesh_dim_sizes.append(dp_size)
@@ -92,12 +101,12 @@ class DeviceMesh:
             mesh_dim_sizes.append(-1)
         if cp_size is not None:
             mesh_dim_sizes.append(cp_size)
-            mesh_dim_names.append("cp")
+            mesh_dim_names.append('cp')
             if origin_world_size == 1:
                 world_size *= cp_size
         if tp_size is not None:
             mesh_dim_sizes.append(tp_size)
-            mesh_dim_names.append("tp")
+            mesh_dim_names.append('tp')
             if origin_world_size == 1:
                 world_size *= tp_size
         return DeviceMesh(
@@ -115,13 +124,11 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {"dp", "fsdp", "tp", "pp", "cp", "ep"}
+        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep'}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
-                raise ValueError(
-                    f"The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) "
-                    f"does not match the shape of `mesh`: ({len(self.mesh.shape)})"
-                )
+                raise ValueError(f'The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) '
+                                 f'does not match the shape of `mesh`: ({len(self.mesh.shape)})')
         assert all([name in valid_dim_names for name in self.mesh_dim_names])
 
     def create_process_group(self, dims):
@@ -142,7 +149,7 @@ class DeviceMesh:
     def get_dim_group(self, dims):
         import torch.distributed as dist
         if isinstance(dims, str):
-            dims = (dims,)
+            dims = (dims, )
         if len(dims) != 1:
             return self.create_process_group(dims)
 
@@ -151,7 +158,7 @@ class DeviceMesh:
         if dim_idx is None:
             raise ValueError(f"Dimension '{dim_name}' not found in mesh_dim_names")
 
-        cache = getattr(self, "_dim_group_cache", {})
+        cache = getattr(self, '_dim_group_cache', {})
         if dim_name in cache:
             coord = self._get_coord()
             key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
@@ -174,7 +181,7 @@ class DeviceMesh:
             group_map[other_coord] = group
 
         cache[dim_name] = group_map
-        setattr(self, "_dim_group_cache", cache)
+        setattr(self, '_dim_group_cache', cache)
 
         coord = self._get_coord()
         key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
@@ -188,11 +195,7 @@ class DeviceMesh:
 
     def to_torch_device_mesh(self):
         import torch
-        return torch.distributed.DeviceMesh(
-            self.device_type,
-            self.mesh,
-            mesh_dim_names=self.mesh_dim_names
-        )
+        return torch.distributed.DeviceMesh(self.device_type, self.mesh, mesh_dim_names=self.mesh_dim_names)
 
     def _get_coord(self) -> Optional[tuple[int, ...]]:
         rank = Platform.get_rank()
@@ -230,7 +233,7 @@ class DeviceMesh:
     def _get_world_size_for_dim(self, dim_name: str) -> int:
         dim_idx = self._get_dim_index(dim_name)
         if dim_idx is None:
-            return 0 # not valid
+            return 0  # not valid
         return self.mesh.shape[dim_idx]
 
     @property
@@ -239,52 +242,52 @@ class DeviceMesh:
 
     @property
     def dp_rank(self) -> Optional[int]:
-        rank = self._get_rank_for_dim("dp")
+        rank = self._get_rank_for_dim('dp')
         return rank
 
     @property
     def fsdp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("fsdp")
+        return self._get_rank_for_dim('fsdp')
 
     @property
     def tp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("tp")
+        return self._get_rank_for_dim('tp')
 
     @property
     def pp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("pp")
+        return self._get_rank_for_dim('pp')
 
     @property
     def cp_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("cp")
+        return self._get_rank_for_dim('cp')
 
     @property
     def ep_rank(self) -> Optional[int]:
-        return self._get_rank_for_dim("ep")
+        return self._get_rank_for_dim('ep')
 
     @property
     def dp_world_size(self) -> int:
-        return self._get_world_size_for_dim("dp")
+        return self._get_world_size_for_dim('dp')
 
     @property
     def fsdp_world_size(self) -> int:
-        return self._get_world_size_for_dim("fsdp")
+        return self._get_world_size_for_dim('fsdp')
 
     @property
     def tp_world_size(self) -> int:
-        return self._get_world_size_for_dim("tp")
+        return self._get_world_size_for_dim('tp')
 
     @property
     def pp_world_size(self) -> int:
-        return self._get_world_size_for_dim("pp")
+        return self._get_world_size_for_dim('pp')
 
     @property
     def cp_world_size(self) -> int:
-        return self._get_world_size_for_dim("cp")
+        return self._get_world_size_for_dim('cp')
 
     @property
     def ep_world_size(self) -> Optional[int]:
-        return self._get_world_size_for_dim("ep")
+        return self._get_world_size_for_dim('ep')
 
     @property
     def etp_world_size(self) -> int:
@@ -318,31 +321,31 @@ class DeviceMesh:
         if data_rank is None:
             return None
         return data_rank // ulysses_size
-    
+
     def get_data_rank_from_global_rank(self, global_rank: int) -> int:
         """Consider all dp/fsdp ranks and get the data rank of the global_rank,
         uses to determine how to distribute the data in driver"""
         coord = self._get_coord_for_rank(global_rank)
         if coord is None:
             return 0
-        
-        dp_idx = self._get_dim_index("dp")
-        fsdp_idx = self._get_dim_index("fsdp")
-        
+
+        dp_idx = self._get_dim_index('dp')
+        fsdp_idx = self._get_dim_index('fsdp')
+
         dp_rank = coord[dp_idx] if dp_idx is not None else None
         fsdp_rank = coord[fsdp_idx] if fsdp_idx is not None else None
         fsdp_world_size = self.fsdp_world_size if fsdp_idx is not None else 0
-        
+
         data_rank = dp_rank
         if fsdp_world_size > 1:
             if dp_rank is not None and fsdp_rank is not None:
                 data_rank = dp_rank * fsdp_world_size + fsdp_rank
             elif fsdp_rank is not None:
                 data_rank = fsdp_rank
-        
+
         if data_rank is None:
             data_rank = 0
-        
+
         ulysses_size = self.ulysses_size or 1
         return data_rank // ulysses_size
 
@@ -358,9 +361,9 @@ class DeviceMesh:
             data_world_size = dp_world_size if dp_world_size is not None else 1
 
         assert data_world_size % ulysses_size == 0, (
-            f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.'
-        )
+            f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.')
         return data_world_size // ulysses_size
+
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
         if world_size == 1:
@@ -379,12 +382,12 @@ class DeviceMesh:
     def get_tp_ranks(self) -> List[int]:
         """Get all ranks in the same TP group as the current rank."""
         rank = Platform.get_rank()
-        if not self._has_dim("tp"):
+        if not self._has_dim('tp'):
             return [rank]
 
-        tp_idx = self._get_dim_index("tp")
+        tp_idx = self._get_dim_index('tp')
         coords = self._get_coord_for_rank(rank)
-        
+
         if coords is None:
             return []
 
@@ -399,10 +402,10 @@ class DeviceMesh:
 
     def get_tp_last_ranks(self) -> List[int]:
         """Get a list of all ranks that are the last rank in their respective TP group."""
-        if not self._has_dim("tp"):
+        if not self._has_dim('tp'):
             return self.mesh.flatten().tolist()
 
-        tp_idx = self._get_dim_index("tp")
+        tp_idx = self._get_dim_index('tp')
         tp_size = self.mesh.shape[tp_idx]
 
         slices = [slice(None)] * self.mesh.ndim
@@ -414,19 +417,19 @@ class DeviceMesh:
         """Check if the given rank is the last rank in its TP group."""
         if rank is None:
             rank = Platform.get_rank()
-        
-        if not self._has_dim("tp"):
+
+        if not self._has_dim('tp'):
             return True
-            
-        tp_idx = self._get_dim_index("tp")
+
+        tp_idx = self._get_dim_index('tp')
         coords = self._get_coord_for_rank(rank)
-        
+
         if coords is None:
             return False
-            
+
         tp_size = self.mesh.shape[tp_idx]
         return coords[tp_idx] == tp_size - 1
-    
+
     def is_pp_first_rank(self) -> bool:
         pp_ranks = self.get_pp_first_ranks()
         if pp_ranks is None:
@@ -440,7 +443,7 @@ class DeviceMesh:
         return Platform.get_rank() in pp_ranks
 
     def get_pp_stage_ranks(self, stage: int) -> Optional[list[int]]:
-        pp_dim_idx = self._get_dim_index("pp")
+        pp_dim_idx = self._get_dim_index('pp')
 
         if pp_dim_idx is None:
             if stage == 0:
@@ -497,9 +500,7 @@ class Platform(ABC):
         try:
             import torch_npu  # noqa: F401
         except Exception as exc:
-            raise RuntimeError(
-                "NPU backend is not available. Please install torch_npu/Ascend PyTorch."
-            ) from exc
+            raise RuntimeError('NPU backend is not available. Please install torch_npu/Ascend PyTorch.') from exc
 
     @staticmethod
     def visible_device_env(platform: str = None) -> str:
@@ -516,24 +517,24 @@ class Platform(ABC):
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
         if platform is None:
-            if shutil.which("npu-smi"):
+            if shutil.which('npu-smi'):
                 Platform._ensure_npu_backend()
                 return NPU
-            elif shutil.which("nvidia-smi"):
+            elif shutil.which('nvidia-smi'):
                 return GPU
             elif MPS.is_mps_available():
                 return MPS
             else:
                 return GPU
-        elif platform.upper() in ("GPU", "CUDA"):
+        elif platform.upper() in ('GPU', 'CUDA'):
             return GPU
-        elif platform.upper() == "NPU":
+        elif platform.upper() == 'NPU':
             Platform._ensure_npu_backend()
             return NPU
-        elif platform.upper() == "MPS":
+        elif platform.upper() == 'MPS':
             return MPS
         else:
-            raise ValueError(f"Unsupported platform: {platform}.")
+            raise ValueError(f'Unsupported platform: {platform}.')
 
     @staticmethod
     def get_rank() -> int:
@@ -618,6 +619,7 @@ class Platform(ABC):
         platform = Platform.get_platform(platform)
         return platform.device_backend()
 
+
 class GPU(Platform):
 
     @staticmethod
@@ -669,7 +671,7 @@ class MPS(Platform):
 
     @staticmethod
     def get_local_device(idx, **kwargs) -> str:
-        return f'mps'
+        return 'mps'
 
     @staticmethod
     def device_backend(platform: str = None):
@@ -678,16 +680,16 @@ class MPS(Platform):
     @lru_cache
     @staticmethod
     def is_mps_available():
-        if platform.system() != "Darwin":
+        if platform.system() != 'Darwin':
             return False
         try:
-            output = subprocess.check_output(
-                ["system_profiler", "SPDisplaysDataType"],
-                stderr=subprocess.DEVNULL, text=True
-            )
-            return "Metal Support" in output
-        except Exception: # noqa
+            output = subprocess.check_output(['system_profiler', 'SPDisplaysDataType'],
+                                             stderr=subprocess.DEVNULL,
+                                             text=True)
+            return 'Metal Support' in output
+        except Exception:  # noqa
             return False
+
 
 def is_last_rank():
     import torch.distributed as dist
@@ -698,10 +700,10 @@ def is_last_rank():
 
 def _resolve_ascend_physical_device_id(device_id: int) -> int:
     """Map local NPU device index to physical device id via visible devices."""
-    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    visible = os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '').strip()
     if not visible:
         return device_id
-    parts = [p.strip() for p in visible.split(",") if p.strip()]
+    parts = [p.strip() for p in visible.split(',') if p.strip()]
     if device_id < 0 or device_id >= len(parts):
         return device_id
     return int(parts[device_id])
@@ -716,7 +718,7 @@ def _get_npu_bus_id_from_npu_smi(device_id: int) -> Optional[str]:
 
     try:
         output = subprocess.check_output(
-            ["npu-smi", "info"],
+            ['npu-smi', 'info'],
             text=True,
             stderr=subprocess.STDOUT,
             timeout=5,
@@ -729,8 +731,8 @@ def _get_npu_bus_id_from_npu_smi(device_id: int) -> Optional[str]:
     # Typical line:
     # | 0     0                   | 0000:9D:00.0  | ...
     pattern = re.compile(
-        r"^\|\s*\d+\s+(\d+)\s*\|\s*"
-        r"([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s*\|",
+        r'^\|\s*\d+\s+(\d+)\s*\|\s*'
+        r'([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s*\|',
         re.MULTILINE,
     )
     for match in pattern.finditer(output):
@@ -755,11 +757,9 @@ def get_vllm_device_uuid(device_id: int = 0) -> str:
             return bus_id
         # fix: If npu-smi is unavailable, fall back to deterministic hash instead of failing hard.
         # Generic deterministic fallback to keep sender/receiver socket names aligned.
-        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
-            "CUDA_VISIBLE_DEVICES", ""
-        )
-        raw = f"{socket.gethostname()}:{visible}:{device_id}"
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        visible = os.environ.get('ASCEND_RT_VISIBLE_DEVICES') or os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        raw = f'{socket.gethostname()}:{visible}:{device_id}'
+        return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
 
 def is_master():

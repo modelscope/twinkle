@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
-
 import torch
 import torch.distributed as dist
-from transformers import PreTrainedTokenizer
 from dataclasses import asdict, dataclass, is_dataclass
+from functools import partial
+from transformers import PreTrainedTokenizer
+from typing import Any, Dict, Optional, Tuple, Union
 
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
@@ -18,13 +17,9 @@ def get_config_attr(config, key, default=None):
 def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     position_ids = position_ids[0]
     seq_start_indices = torch.where(position_ids == 0)[0]
-    seq_end_indices = torch.cat(
-        [seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)]
-    )
+    seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)])
     seq_lengths = seq_end_indices - seq_start_indices
-    cu_seqlens = torch.cumsum(
-        torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0
-    )
+    cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0)
     return cu_seqlens
 
 
@@ -45,10 +40,10 @@ def _get_raw_data_rank(device_mesh: DeviceMesh, rank: int) -> Optional[int]:
 
     dp_rank = None
     fsdp_rank = None
-    if device_mesh.has_dim("dp"):
-        dp_rank = coord[device_mesh._get_dim_index("dp")]
-    if device_mesh.has_dim("fsdp"):
-        fsdp_rank = coord[device_mesh._get_dim_index("fsdp")]
+    if device_mesh.has_dim('dp'):
+        dp_rank = coord[device_mesh._get_dim_index('dp')]
+    if device_mesh.has_dim('fsdp'):
+        fsdp_rank = coord[device_mesh._get_dim_index('fsdp')]
 
     fsdp_world_size = device_mesh.fsdp_world_size
     data_rank = dp_rank if dp_rank is not None else None
@@ -106,16 +101,14 @@ def _get_sp_group_from_device_mesh(
     """
     if device_mesh is None or sp_size <= 1:
         return None
-    if device_mesh.has_dim("sp"):
-        return device_mesh.create_process_group(["sp"])
+    if device_mesh.has_dim('sp'):
+        return device_mesh.create_process_group(['sp'])
     if not dist.is_available() or not dist.is_initialized():
         return None
 
     raw_data_world_size = _get_raw_data_world_size(device_mesh)
     if raw_data_world_size % sp_size != 0:
-        raise ValueError(
-            f"data_world_size ({raw_data_world_size}) must be divisible by sp_size ({sp_size})."
-        )
+        raise ValueError(f'data_world_size ({raw_data_world_size}) must be divisible by sp_size ({sp_size}).')
 
     rank = dist.get_rank()
     ref_coord = device_mesh._get_coord_for_rank(rank)
@@ -125,7 +118,7 @@ def _get_sp_group_from_device_mesh(
     non_data_indices = []
     if device_mesh.mesh_dim_names is not None:
         for i, name in enumerate(device_mesh.mesh_dim_names):
-            if name in ("dp", "fsdp"):
+            if name in ('dp', 'fsdp'):
                 continue
             non_data_indices.append(i)
 
@@ -148,9 +141,7 @@ def _get_sp_group_from_device_mesh(
     for key, ranks in groups.items():
         ranks = sorted(ranks)
         if len(ranks) != sp_size:
-            raise ValueError(
-                f"SP group size mismatch for key={key}: expected {sp_size}, got {len(ranks)}"
-            )
+            raise ValueError(f'SP group size mismatch for key={key}: expected {sp_size}, got {len(ranks)}')
         group_list.append((key, ranks))
 
     group_list.sort(key=lambda item: item[0])
@@ -294,14 +285,14 @@ class DistributedAttention(torch.nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 1,
     ) -> None:
-        super(DistributedAttention, self).__init__()
+        super().__init__()
         self.local_attn = local_attention
         self.sequence_parallel = sequence_parallel
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor,
-                *args: Any, **kwargs) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor, *args:
+                Any, **kwargs) -> torch.Tensor:
         if self.sequence_parallel.world_size == 1:
             return self.local_attn(query, key, value, attention_mask, *args, **kwargs)
 
@@ -316,10 +307,9 @@ class DistributedAttention(torch.nn.Module):
         position_ids = kwargs.pop('position_ids')
         if position_ids is not None:
             shape0 = position_ids.shape[0]
-            position_ids_output = torch.empty(
-                (shape0 * self.sequence_parallel.sp_world_size, position_ids.shape[1]),
-                dtype=position_ids.dtype,
-                device=position_ids.device)
+            position_ids_output = torch.empty((shape0 * self.sequence_parallel.sp_world_size, position_ids.shape[1]),
+                                              dtype=position_ids.dtype,
+                                              device=position_ids.device)
             dist.all_gather_into_tensor(position_ids_output, position_ids, group=self.sequence_parallel._sp_group)
             position_ids = torch.cat(position_ids_output.split(shape0, dim=0), dim=1)
 
@@ -333,6 +323,7 @@ class DistributedAttention(torch.nn.Module):
             output = context_layer
 
         return output
+
 
 # main content copied from ms-swift
 class SequenceParallel:
@@ -518,8 +509,7 @@ class SequenceParallel:
             if self.extra_kwargs.get('is_packed', False):
                 raise RuntimeError(
                     'SequenceParallel: detected packed batch (position_ids contains multiple sequences). '
-                    'SDPA backend is not supported for packed batches; please use flash_attention_2.'
-                )
+                    'SDPA backend is not supported for packed batches; please use flash_attention_2.')
             if dist_attn.local_attn is None:
 
                 def _attention(query, key, value, *args, **kwargs):
@@ -571,6 +561,7 @@ class SequenceParallel:
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
 
     def _prepare_moe_aux_loss(self, base_model: torch.nn.Module):
+
         def moe_aux_loss_hook(module, args, kwargs, output):
             router_logits = getattr(output, 'router_logits', None)
             if router_logits is None:
@@ -624,8 +615,7 @@ class SequenceParallel:
         assert self.num_heads is not None, 'Cannot find num_heads config in config.json'
         if sp_size > 1 and self.num_heads % sp_size != 0:
             raise ValueError(
-                f'sp_size ({sp_size}) must divide num_heads ({self.num_heads}) for ulysses sequence parallel.'
-            )
+                f'sp_size ({sp_size}) must divide num_heads ({self.num_heads}) for ulysses sequence parallel.')
         self.world_size = sp_size
 
         llm_model = get_llm_model(model)
@@ -645,7 +635,7 @@ class SequenceParallel:
 
         self._prepare_forward_hook(llm_model)
 
-        if SequenceParallel._is_moe_model(getattr(model, "config", None)):
+        if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
             self._prepare_moe_aux_loss(llm_model)
 
         self.model_dtype = next(model.parameters()).dtype
@@ -696,14 +686,12 @@ class SequenceParallel:
         # Split along sequence dimension; each rank keeps its local slice.
         rank = dist.get_rank(self._sp_group) if self._sp_group is not None else 0
         dim_size = input.size(dim)
-        assert dim_size % self.sp_world_size == 0, (
-            f'The dimension to split ({dim_size}) is not a multiple of '
-            f'world size ({self.sp_world_size}), cannot split tensor evenly')
+        assert dim_size % self.sp_world_size == 0, (f'The dimension to split ({dim_size}) is not a multiple of '
+                                                    f'world size ({self.sp_world_size}), cannot split tensor evenly')
 
         tensor_list = torch.split(input, dim_size // self.sp_world_size, dim=dim)
         output = tensor_list[rank].contiguous()
         return output
-
 
     def pad_and_split_inputs(self,
                              input_ids,
@@ -818,14 +806,14 @@ class SequenceParallel:
     def _init_device_mesh(self, device_mesh: Optional[DeviceMesh] = None):
         """Initialize process groups for sequence parallel."""
         if not isinstance(device_mesh, DeviceMesh):
-            raise RuntimeError("SequenceParallel requires a twinkle DeviceMesh for initialization.")
+            raise RuntimeError('SequenceParallel requires a twinkle DeviceMesh for initialization.')
 
         self.device_mesh = device_mesh
         self.sp_world_size = self.world_size
         self.dp_world_size = device_mesh.data_world_size or 1
         self._sp_group = _get_sp_group_from_device_mesh(device_mesh, self.sp_world_size)
         if self._sp_group is None and self.sp_world_size > 1:
-            raise RuntimeError("Failed to create sequence-parallel group from DeviceMesh.")
+            raise RuntimeError('Failed to create sequence-parallel group from DeviceMesh.')
 
     @staticmethod
     def _is_packed_position_ids(position_ids: Optional[torch.Tensor]) -> bool:
@@ -847,7 +835,6 @@ class SequenceParallel:
             if zero_count > 1 and one_count > 1:
                 return True
         return False
-
 
     def prepare_inputs(self, inputs):
         """Prepare inputs
@@ -879,17 +866,17 @@ class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
-    loss_reduction: str = "mean"
+    loss_reduction: str = 'mean'
 
 
 def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -> int:
     if sp_config:
-        cfg_size = sp_config.get("ulysses_size")
+        cfg_size = sp_config.get('ulysses_size')
         if cfg_size is not None:
             return int(cfg_size)
     if device_mesh is None:
         return 1
-    if getattr(device_mesh, "ulysses_size", None) is not None:
+    if getattr(device_mesh, 'ulysses_size', None) is not None:
         return int(device_mesh.ulysses_size)
     return 1
 
@@ -911,7 +898,7 @@ class SequenceParallelStrategy:
             self.sp_config = asdict(sp_config)
         else:
             self.sp_config = sp_config or {}
-        self.enabled = bool(self.sp_config.get("enabled", True))
+        self.enabled = bool(self.sp_config.get('enabled', True))
         self.ulysses_size = _get_ulysses_size(device_mesh, self.sp_config)
         self._model_ref = model
         self._tokenizer_id = tokenizer_id
@@ -935,14 +922,14 @@ class SequenceParallelStrategy:
         if not self.enabled or self.ulysses_size <= 1:
             return False
         if not dist.is_initialized():
-            raise RuntimeError("torch.distributed must be initialized before enabling sequence parallel.")
+            raise RuntimeError('torch.distributed must be initialized before enabling sequence parallel.')
         if not isinstance(self.device_mesh, DeviceMesh):
-            raise RuntimeError("SequenceParallelStrategy requires a twinkle DeviceMesh when ulysses_size > 1.")
+            raise RuntimeError('SequenceParallelStrategy requires a twinkle DeviceMesh when ulysses_size > 1.')
         if self._model_ref is None:
-            raise RuntimeError("SequenceParallelStrategy requires a model reference to initialize.")
+            raise RuntimeError('SequenceParallelStrategy requires a model reference to initialize.')
         tokenizer = self._get_tokenizer()
         if tokenizer is None:
-            raise RuntimeError("SequenceParallelStrategy requires a tokenizer to initialize.")
+            raise RuntimeError('SequenceParallelStrategy requires a tokenizer to initialize.')
         sequence_parallel.prepare(
             self.ulysses_size,
             self._model_ref,
@@ -958,31 +945,23 @@ class SequenceParallelStrategy:
         return sequence_parallel.prepare_inputs(inputs)
 
     def postprocess_outputs(self, outputs: Any) -> Any:
-        if (
-            not self.enabled
-            or self.ulysses_size <= 1
-            or not self.sp_config.get("gather_logits", True)
-        ):
+        if (not self.enabled or self.ulysses_size <= 1 or not self.sp_config.get('gather_logits', True)):
             return outputs
         # Twinkle expects dict-like ModelOutput containers in the main training path
         # (uses `.get(...)` and `outputs[...] = ...`). Keep SP postprocess consistent.
-        if outputs is None or not hasattr(outputs, "get") or not hasattr(outputs, "__setitem__"):
-            raise TypeError(
-                "SequenceParallelStrategy.postprocess_outputs expects a dict-like ModelOutput. "
-                f"Got type={type(outputs)}"
-            )
-        logits = outputs.get("logits", None)
+        if outputs is None or not hasattr(outputs, 'get') or not hasattr(outputs, '__setitem__'):
+            raise TypeError('SequenceParallelStrategy.postprocess_outputs expects a dict-like ModelOutput. '
+                            f'Got type={type(outputs)}')
+        logits = outputs.get('logits', None)
         if logits is None or not torch.is_tensor(logits) or logits.dim() < 2:
             return outputs
-        gathered = sequence_parallel.gather(
-            logits, dim=1, position_ids=sequence_parallel.real_position_ids
-        )
+        gathered = sequence_parallel.gather(logits, dim=1, position_ids=sequence_parallel.real_position_ids)
         # Scheme A: SP pads to make seq_len divisible by sp_size. Trim back to the original
         # (unpadded) length using the cached real_position_ids.
         real_pos = sequence_parallel.real_position_ids
         if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
-            gathered = gathered[:, : real_pos.shape[1]].contiguous()
-        outputs["logits"] = gathered
+            gathered = gathered[:, :real_pos.shape[1]].contiguous()
+        outputs['logits'] = gathered
         return outputs
 
     def reduce_loss(self, loss: torch.Tensor, labels: Optional[torch.Tensor], ignore_index: int = -100) -> torch.Tensor:
@@ -991,14 +970,12 @@ class SequenceParallelStrategy:
         if labels is None or sequence_parallel._sp_group is None:
             return loss
         # Compute full-sequence loss in forward, but keep backward local to this rank.
-        reduction = str(self.sp_config.get("loss_reduction", "mean")).lower()
-        if reduction == "none":
-            raise ValueError(
-                "SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
-                "Please aggregate per-token losses before calling reduce_loss."
-            )
+        reduction = str(self.sp_config.get('loss_reduction', 'mean')).lower()
+        if reduction == 'none':
+            raise ValueError("SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
+                             'Please aggregate per-token losses before calling reduce_loss.')
         num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
-        if reduction == "sum":
+        if reduction == 'sum':
             local_sum = loss
             global_sum = local_sum.detach().clone()
             dist.all_reduce(global_sum, group=sequence_parallel._sp_group)

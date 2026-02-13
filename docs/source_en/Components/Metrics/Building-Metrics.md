@@ -8,7 +8,7 @@ class Metric:
     def __init__(self, device_mesh, process_group, **kwargs):
         self.process_group = process_group
         self.device_mesh = device_mesh
-    
+
     # Due to the existence of microbatch, the inputs to Metric may be a List
     def accumulate(self, inputs: 'Union[InputFeature, List[InputFeature]]', outputs: 'ModelOutput'):
         ...

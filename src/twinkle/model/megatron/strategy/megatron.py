@@ -1,8 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Literal, Optional, List
-
 import torch
 import torch.nn as nn
+from typing import List, Literal, Optional
 
 from twinkle import DeviceMesh
 
@@ -21,7 +20,7 @@ class MegatronStrategy:
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
         self._params_dtype = params_dtype
-    
+
     @property
     def sequence_parallel(self) -> bool:
         """Read from device_mesh so auto-enable in args.py is visible."""
@@ -37,7 +36,7 @@ class MegatronStrategy:
         if self.device_mesh.tp_world_size > 1:
             assert self.device_mesh.tp_world_size == mpu.get_tensor_model_parallel_world_size()
             assert self.device_mesh.tp_rank == mpu.get_tensor_model_parallel_rank()
-        
+
         if self.device_mesh.pp_world_size > 1:
             assert self.device_mesh.pp_world_size == mpu.get_pipeline_model_parallel_world_size()
             assert self.device_mesh.pp_rank == mpu.get_pipeline_model_parallel_rank()
@@ -47,7 +46,7 @@ class MegatronStrategy:
         if self.device_mesh.cp_world_size > 1:
             assert self.device_mesh.cp_world_size == mpu.get_context_parallel_world_size()
             assert self.device_mesh.cp_rank == mpu.get_context_parallel_rank()
-        
+
         if self.device_mesh.vpp_size is not None and self.device_mesh.vpp_size > 1:
             assert self.device_mesh.vpp_size == mpu.get_virtual_pipeline_model_parallel_world_size()
 
@@ -84,8 +83,7 @@ class MegatronStrategy:
             return model
 
         self._check_device_mesh()
-        return self._wrap_with_megatron_ddp(model,
-                                            use_distributed_optimizer)
+        return self._wrap_with_megatron_ddp(model, use_distributed_optimizer)
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
@@ -104,16 +102,16 @@ class MegatronStrategy:
         model: List[nn.Module],
         use_distributed_optimizer: bool,
     ) -> List[nn.Module]:
-        from megatron.core.distributed import DistributedDataParallelConfig
-        from megatron.core.transformer.module import Float16Module
-        from megatron.core.transformer import TransformerConfig
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+        from megatron.core.distributed import DistributedDataParallelConfig
+        from megatron.core.transformer import TransformerConfig
+        from megatron.core.transformer.module import Float16Module
 
         wrapped_models = []
         for _model in model:
-            config: TransformerConfig = _model.config # noqa
+            config: TransformerConfig = _model.config  # noqa
 
-            if not isinstance(model, Float16Module) and  (config.fp16 or config.bf16):
+            if not isinstance(model, Float16Module) and (config.fp16 or config.bf16):
                 _model = Float16Module(config, _model)
 
             ddp_config = DistributedDataParallelConfig(
@@ -145,18 +143,12 @@ class MegatronStrategy:
             # All-reduce the count across CP ranks
             total_count = local_count.clone()
             torch.distributed.nn.all_reduce(
-                total_count,
-                op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_context_parallel_group()
-            )
+                total_count, op=torch.distributed.ReduceOp.SUM, group=mpu.get_context_parallel_group())
 
             # All-reduce the loss sum
             total_loss_sum = local_loss_sum.clone()
             torch.distributed.nn.all_reduce(
-                total_loss_sum,
-                op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_context_parallel_group()
-            )
+                total_loss_sum, op=torch.distributed.ReduceOp.SUM, group=mpu.get_context_parallel_group())
 
             # Return global mean, divided by cp_size to counteract Megatron's multiplication
             loss = (total_loss_sum / total_count.clamp(min=1)) / cp_size
@@ -197,4 +189,3 @@ class MegatronStrategy:
         )
 
         return config
-

@@ -67,6 +67,10 @@ pip install -e .
 
 - 🎉2026-02-10 Twinkle✨ 初始版本发布，包含文本模型的 SFT/PT/RL 以及在 [ModelScope](https://modelscope.cn) 上的无服务器训练能力。
 
+## 魔搭社区官方环境
+
+魔搭社区提供了Twinkle运行的官方环境，调用端点为:[base_url](https://www.modelscope.cn/twinkle)，开发者可以参考我们的[文档](docs/source_zh/使用指引/魔搭官方环境.md)来进行使用。
+
 ## 支持的硬件
 
 | 硬件环境 | 备注                                                            |
@@ -169,6 +173,7 @@ if __name__ == '__main__':
 ### Tinker兼容的远程训练
 
 ```python
+import os
 from tqdm import tqdm
 from tinker import types
 from twinkle_client import init_tinker_compat_client
@@ -187,7 +192,7 @@ dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
 # 初始化 Tinker 兼容客户端
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
 # 训练循环：使用 input_feature_to_datum 转换数据格式

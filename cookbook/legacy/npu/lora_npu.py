@@ -1,11 +1,11 @@
-import os
 import numpy as np
+import os
 from peft import LoraConfig
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 
 import twinkle
-from twinkle import get_device_placement, get_logger, DeviceMesh, DeviceGroup, Platform
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import CrossEntropyLoss
@@ -22,20 +22,13 @@ os.environ.setdefault('TWINKLE_FULL_DETERMINISM', '1')
 MODEL_PATH = 'ms://Qwen/Qwen2.5-7B-Instruct'
 NPROC_PER_NODE = 4
 BATCH_SIZE = 8
-device_group = [
-    DeviceGroup(
-        name='model',
-        ranks=[0,1,2,3],
-        device_type=Platform.get_platform().device_prefix(),
-    )
-]
+device_group = [DeviceGroup(
+    name='model',
+    ranks=[0, 1, 2, 3],
+    device_type=Platform.get_platform().device_prefix(),
+)]
 
-
-device_mesh = DeviceMesh(
-    device_type='npu',
-    mesh=np.array([[0,1], [2,3]]),
-    mesh_dim_names=('dp', 'fsdp')
-)
+device_mesh = DeviceMesh(device_type='npu', mesh=np.array([[0, 1], [2, 3]]), mesh_dim_names=('dp', 'fsdp'))
 
 twinkle.initialize(
     mode='ray',
@@ -61,9 +54,7 @@ def train():
 
     model = TransformersModel(model_id=MODEL_PATH, remote_group='model')
 
-    lora_config = LoraConfig(
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(target_modules='all-linear')
 
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=16)
     model.set_template('Template')
