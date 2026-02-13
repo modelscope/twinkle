@@ -64,14 +64,14 @@ class TaskQueueConfig:
         max_input_tokens: Maximum allowed input tokens per request (default 10000).
     """
     rps_limit: float = 100.0  # 10 requests per second
-    tps_limit: float = 10000.0  # 10000 input tokens per second
+    tps_limit: float = 16000.0  # 10000 input tokens per second
     window_seconds: float = 1.0  # 1 second sliding window
     queue_timeout: float = 300.0  # 5 minutes queue timeout
     enabled: bool = True  # Rate limiting enabled by default
     # Remove tokens after 10x window inactivity
     token_cleanup_multiplier: float = 10.0
     token_cleanup_interval: float = 60.0  # Run cleanup every 60 seconds
-    max_input_tokens: int = 10000  # Maximum input tokens per request
+    max_input_tokens: int = 16000  # Maximum input tokens per request
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any] | None = None) -> TaskQueueConfig:
