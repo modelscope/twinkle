@@ -1,5 +1,6 @@
-from typing import List, Dict, Any
 import re
+from typing import Any, Dict, List
+
 from twinkle.reward.base import Reward
 
 
@@ -64,9 +65,7 @@ class GSM8KFormatReward(Reward):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_think = bool(
-                re.search(r'<think>.*?</think>', completion, re.DOTALL)
-            )
+            has_think = bool(re.search(r'<think>.*?</think>', completion, re.DOTALL))
             has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
             rewards.append(1.0 if (has_think and has_answer) else 0.0)
         return rewards
