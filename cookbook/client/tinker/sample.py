@@ -4,7 +4,6 @@
 # for text generation (sampling) via the Tinker-compatible client API.
 # The server must be running first (see server.py and server_config.yaml).
 
-from modelscope import AutoTokenizer
 from tinker import types
 
 from twinkle.data_format import Message, Trajectory

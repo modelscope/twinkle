@@ -21,15 +21,17 @@ import gc
 import numpy as np
 import os
 import re
-from modelscope import AutoTokenizer
 from tinker import types
 from typing import List, Tuple
 
+from twinkle_client import init_tinker_compat_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.preprocessor import Preprocessor
+from twinkle.reward.base import Reward
 from twinkle.metric import CompletionRewardMetric
 from twinkle.template import Template
 
@@ -332,6 +334,10 @@ def main():
         ).tolist()
 
         frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
+        if frac_zero_std == 1.0:
+            logger.info(f'Step {step}: All advantages are zero, skipping training')
+            step += 1
+            continue
 
         # ========== 6. Train the policies with GRPO loss ==========
         # Train the policies with the Advantage-Regularized policy
