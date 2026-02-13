@@ -28,17 +28,17 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: check-yaml
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: end-of-file-fixer
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: requirements-txt-fixer
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: double-quote-string-fixer
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: check-merge-conflict
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: mixed-line-ending
         args: ["--fix=lf"]
-        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
+        exclude: ^(client_tools/|src/twinkle_client/)

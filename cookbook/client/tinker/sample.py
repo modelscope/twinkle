@@ -9,19 +9,20 @@ from tinker import types
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 from twinkle_client import init_tinker_compat_client
-from twinkle.data_format import Message, Trajectory
-from twinkle.template import Template
 
 # Step 1: Define the base model and connect to the server
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
-
+base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+service_client = init_tinker_compat_client(
+    base_url='http://www.modelscope.cn/twinkle',
+    api_key=os.environ.get('MODELSCOPE_SDK_TOKEN')
+)
 # Step 2: Create a sampling client by loading weights from a saved checkpoint.
 # The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.
 # The server will load the base model and apply the LoRA adapter weights.
-sampling_client = service_client.create_sampling_client(
-    model_path='twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2',
-    base_model=base_model)
+service_client.create_sampling_client(
+    model_path='twinkle://xxx-Qwen_Qwen3-30B-A3B-Instruct-2507-xxx/weights/twinkle-lora-1',
+    base_model=base_model
+)
 
 # Step 3: Load the tokenizer locally to encode the prompt and decode the results
 print(f'Using model {base_model}')
