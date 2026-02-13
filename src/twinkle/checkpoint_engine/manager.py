@@ -77,6 +77,25 @@ class CheckpointEngineManager:
             raise NotImplementedError
 
     def sync_weights(self, merge_and_sync=True):
+        """
+        Synchronize the weights between the model and the sampler.
+
+        This method ensures that the sampler's weights are consistent with the model's
+        current state. It supports two synchronization modes: full merge-and-sync or
+        separate base-and-LoRA sync.
+
+        Args:
+            merge_and_sync (bool, optional): Whether to merge and sync the weights.
+                - If True: LoRA weights are merged into the base model, then the
+                combined weights are synchronized to the sampler on every call.
+                - If False: On the first call, base model weights are synced to the
+                sampler. On subsequent calls, only the LoRA adapter weights are
+                synced incrementally.
+                Defaults to True.
+
+        Returns:
+            None
+        """
         start_time = time.time()
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))

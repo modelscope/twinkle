@@ -9,16 +9,6 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
-    # rank0 recording
-    import swanlab
-    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
-
-    run = swanlab.init(
-        project='twinkle',
-    )
-
-
 # Construct a device_mesh, fsdp=4, dp=2
 device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
 # use torchrun mode
@@ -83,8 +73,6 @@ def train():
         if step % 20 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
-            if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
-                swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 40 == 0:
            metrics = eval(model)

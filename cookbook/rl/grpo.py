@@ -1,4 +1,3 @@
-# WIP, not working yet
 import os
 from typing import List, Tuple, Dict, Any
 
@@ -32,7 +31,9 @@ NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 16)) # global prompt-level, global completion-level batch size = BATCH_SIZE * num_generations * dp_size
+MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 16)) # global completion-level mini-batch-size
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2)) # per-device-micro-batch-size (completion-level), batch_size in forward_backward
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
 
@@ -150,19 +151,31 @@ def main():
             },
         )
 
-        advantages = advantage_fn(
-            total_rewards,
-            num_generations=NUM_GENERATIONS,
-            scale='group',
-        )
-        advantages = advantages.tolist()
+        advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
 
-        model.forward_backward(inputs=all_input_data, old_logps=all_old_logps, advantages=advantages, micro_batch_size=2)
-        model.clip_grad_and_step()
-        optim_step += 1
-        log_dict = metrics.calculate()
-        log_dict.update(model.calculate_metric(is_training=True))
-        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
+        # Split completions into mini-batches and run one optim step per mini-batch.
+        total_completions = len(all_input_data)
+        for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
+            mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
+            mb_inputs = all_input_data[mb_start:mb_end]
+            mb_old_logps = all_old_logps[mb_start:mb_end]
+            mb_advantages = advantages[mb_start:mb_end]
+
+            model.forward_backward(
+                inputs=mb_inputs,
+                old_logps=mb_old_logps,
+                advantages=mb_advantages,
+                micro_batch_size=MICRO_BATCH_SIZE,
+            )
+            model.clip_grad_and_step()
+            optim_step += 1
+
+            if optim_step >= MAX_STEPS:
+                break
+            log_dict = metrics.calculate()
+            log_dict.update(model.calculate_metric(is_training=True))
+            metrics.reset()
+            logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('grpo-gsm8k-checkpoint')

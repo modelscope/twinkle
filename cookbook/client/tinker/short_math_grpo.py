@@ -56,15 +56,6 @@ SYSTEM_PROMPT = ('You are a math assistant that values brevity. '
                  '2. Final answer after ####\n\n'
                  'Example:\n<step>Key step1 -> Ket step 2 -> conclusion</step>\n#### 42')
 
-# SwanLab experiment tracking
-USE_SWANLAB = True
-if USE_SWANLAB:
-    import swanlab
-    swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
-    swanlab.init(
-        project='twinkle-Math', config={
-            'model_id': BASE_MODEL,
-        })
 
 
 class MathPreprocessor(Preprocessor):
@@ -403,8 +394,6 @@ def main():
         log_dict['train/num_training_samples'] = len(training_data)
         logger.info(f'Step {step}: {log_dict}')
         step += 1
-        if USE_SWANLAB:
-            swanlab.log(log_dict)
 
     # Save final checkpoint
     save_future = training_client.save_state('Math-grpo-final')
