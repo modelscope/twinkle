@@ -6,15 +6,15 @@ Reward functions are components in RLHF training used to evaluate the quality of
 
 ```python
 class Reward:
-    
+
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         """
         Calculate reward values
-        
+
         Args:
             trajectories: List of model-generated trajectories
             ground_truths: List of ground truth trajectories
-        
+
         Returns:
             List of reward values
         """
@@ -65,7 +65,7 @@ from twinkle.data_format import Trajectory
 from typing import List
 
 class CustomReward(Reward):
-    
+
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
         for traj, gt in zip(trajectories, ground_truths):
@@ -73,7 +73,7 @@ class CustomReward(Reward):
             score = self._evaluate(traj, gt)
             rewards.append(score)
         return rewards
-    
+
     def _evaluate(self, traj, gt):
         # Implement specific evaluation logic
         ...
@@ -105,13 +105,13 @@ advantage_fn = GRPOAdvantage()
 for batch in dataloader:
     # 1. Sample and generate multiple candidate answers
     response = sampler.sample(batch, num_samples=4)
-    
+
     # 2. Evaluate quality using reward function
     rewards = reward_fn(response.trajectories, batch.ground_truths)
-    
+
     # 3. Calculate advantages
     advantages = advantage_fn(rewards, num_generations=4)
-    
+
     # 4. Update policy using advantage values
     ...
 ```

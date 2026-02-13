@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .mse import MSELoss
-from .cross_entropy import CrossEntropyLoss
-from .chunked_cross_entropy import ChunkedCrossEntropyLoss
-from .grpo import GRPOLoss, GSPOLoss, SAPOLoss, CISPOLoss, BNPOLoss, DRGRPOLoss
 from .base import Loss
+from .chunked_cross_entropy import ChunkedCrossEntropyLoss
+from .cross_entropy import CrossEntropyLoss
+from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
+from .mse import MSELoss
 from .vocab_parallel_cross_entropy import VocabParallelCrossEntropyLoss
 
 torch_loss_mapping = {

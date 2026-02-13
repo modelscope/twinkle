@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import importlib
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
+
 from twinkle import get_logger
-from typing import Callable, Iterable, List, Optional, TYPE_CHECKING
+from .base import ModeType, is_kernels_available, validate_device_type, validate_mode
 from .registry import FunctionKernelSpec, get_global_function_registry
-from .base import (
-    ModeType,
-    is_kernels_available,
-    validate_device_type,
-    validate_mode,
-)
+
 if TYPE_CHECKING:
     from kernels.layer.func import FuncRepositoryProtocol
 
@@ -19,10 +16,10 @@ logger = get_logger()
 
 def _load_from_hub(
     *,
-    repo: Optional['FuncRepositoryProtocol'],
-    repo_id: Optional[str],
-    revision: Optional[str],
-    version: Optional[str],
+    repo: FuncRepositoryProtocol | None,
+    repo_id: str | None,
+    revision: str | None,
+    version: str | None,
     func_name: str,
 ) -> tuple[Callable, object]:
     """Resolve function implementation from a repo or Hub repo_id."""
@@ -42,7 +39,7 @@ def _load_from_hub(
     kernel = get_kernel(repo_id, revision=resolved)
     func = getattr(kernel, func_name, None)
     if func is None:
-        raise AttributeError(f"Kernel repo {repo_id} does not export {func_name}.")
+        raise AttributeError(f'Kernel repo {repo_id} does not export {func_name}.')
     return func, func
 
 
@@ -50,20 +47,20 @@ def register_function_kernel(
     *,
     func_name: str,
     target_module: str,
-    func_impl: Optional[Callable] = None,
-    repo: Optional['FuncRepositoryProtocol'] = None,
-    repo_id: Optional[str] = None,
-    revision: Optional[str] = None,
-    version: Optional[str] = None,
-    device: Optional[str] = None,
-    mode: Optional[ModeType] = None,
+    func_impl: Callable | None = None,
+    repo: FuncRepositoryProtocol | None = None,
+    repo_id: str | None = None,
+    revision: str | None = None,
+    version: str | None = None,
+    device: str | None = None,
+    mode: ModeType | None = None,
 ) -> None:
     """Register a function kernel with the registry."""
     sources = [func_impl is not None, repo is not None, repo_id is not None]
     if sum(sources) != 1:
-        raise ValueError("Provide exactly one of func_impl, repo, or repo_id.")
+        raise ValueError('Provide exactly one of func_impl, repo, or repo_id.')
     if revision is not None and version is not None:
-        raise ValueError("Either revision or version must be specified, not both.")
+        raise ValueError('Either revision or version must be specified, not both.')
     if mode is not None:
         validate_mode(mode)
 
@@ -78,33 +75,32 @@ def register_function_kernel(
             version=version,
             device=device,
             mode=mode,
-        )
-    )
+        ))
 
 
 def register_function_batch(function_registry: Iterable[dict]) -> None:
     """Batch register function kernels from a list of spec dicts."""
     for spec in function_registry:
         register_function_kernel(
-            func_name=spec["func_name"],
-            target_module=spec["target_module"],
-            func_impl=spec.get("func_impl"),
-            repo=spec.get("repo"),
-            repo_id=spec.get("repo_id"),
-            revision=spec.get("revision"),
-            version=spec.get("version"),
-            device=spec.get("device"),
-            mode=spec.get("mode"),
+            func_name=spec['func_name'],
+            target_module=spec['target_module'],
+            func_impl=spec.get('func_impl'),
+            repo=spec.get('repo'),
+            repo_id=spec.get('repo_id'),
+            revision=spec.get('revision'),
+            version=spec.get('version'),
+            device=spec.get('device'),
+            mode=spec.get('mode'),
         )
 
 
 def apply_function_kernel(
     *,
-    target_module: Optional[str] = None,
-    device: Optional[str] = None,
-    mode: Optional[ModeType] = None,
+    target_module: str | None = None,
+    device: str | None = None,
+    mode: ModeType | None = None,
     strict: bool = False,
-) -> List[str]:
+) -> list[str]:
     """Apply registered function kernels by monkey-patching target modules.
     target_module: If specified, only apply kernels targeting this module.
     device: If specified, only apply kernels matching this device or with no device.
@@ -122,10 +118,8 @@ def apply_function_kernel(
         if device is not None and spec.device is not None and spec.device != device:
             continue
         if spec.mode is not None and mode is None:
-            msg = (
-                "Function kernel registered with mode but apply_function_kernel "
-                "was called without mode; skipping."
-            )
+            msg = ('Function kernel registered with mode but apply_function_kernel '
+                   'was called without mode; skipping.')
             if strict:
                 raise ValueError(msg)
             logger.warning(msg)
@@ -140,7 +134,7 @@ def apply_function_kernel(
             if strict:
                 raise
             logger.warning(
-                "Failed to import target module %s: %s",
+                'Failed to import target module %s: %s',
                 spec.target_module,
                 exc,
             )
@@ -151,11 +145,9 @@ def apply_function_kernel(
             impl = spec.func_impl
         else:
             if not is_kernels_available():
-                msg = (
-                    "HF kernels package not available. "
-                    f"Cannot load function kernel: {spec.func_name}. "
-                    "Install it with `pip install kernels`."
-                )
+                msg = ('HF kernels package not available. '
+                       f'Cannot load function kernel: {spec.func_name}. '
+                       'Install it with `pip install kernels`.')
                 raise RuntimeError(msg)
             impl, _ = _load_from_hub(
                 repo=spec.repo,
@@ -166,9 +158,9 @@ def apply_function_kernel(
             )
         # Final patch (or reapply when no mode gating is used).
         setattr(module, spec.func_name, impl)
-        applied.append(f"{spec.target_module}.{spec.func_name}")
+        applied.append(f'{spec.target_module}.{spec.func_name}')
 
     if strict and not applied:
-        raise ValueError("No function kernels applied for the given filters.")
+        raise ValueError('No function kernels applied for the given filters.')
 
     return applied

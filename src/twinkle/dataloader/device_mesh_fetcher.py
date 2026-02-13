@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Callable, Any
-
 from torch.utils.data import Dataset
 from torch.utils.data._utils.fetch import _BaseDatasetFetcher
+from typing import Any, Callable
+
 from twinkle import DeviceMesh
 
 
@@ -19,8 +19,15 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
         max_retries: The maximum number of retries when fetching failed.
     """
 
-    def __init__(self, dataset: Dataset, auto_collation: bool, collate_fn: Callable[[Any], Any],
-                 drop_last: bool, batch_size: int, device_mesh: DeviceMesh, min_batch_size: int = None, max_retries:int=20):
+    def __init__(self,
+                 dataset: Dataset,
+                 auto_collation: bool,
+                 collate_fn: Callable[[Any], Any],
+                 drop_last: bool,
+                 batch_size: int,
+                 device_mesh: DeviceMesh,
+                 min_batch_size: int = None,
+                 max_retries: int = 20):
         super().__init__(dataset, auto_collation, collate_fn, drop_last)
         self.dataset_iter = iter(dataset)
         self.ended = False
@@ -53,7 +60,7 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                                 continue
                         except StopIteration as e:
                             raise e
-                        except Exception: # noqa
+                        except Exception:  # noqa
                             continue
                         else:
                             break
@@ -61,9 +68,7 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                 except StopIteration:
                     self.ended = True
                     break
-            if len(data) == 0 or (
-                self.drop_last and len(data) < self.batch_size
-            ):
+            if len(data) == 0 or (self.drop_last and len(data) < self.batch_size):
                 raise StopIteration
         else:
             data = next(self.dataset_iter)

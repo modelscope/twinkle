@@ -16,7 +16,7 @@ class MegatronModel:
         **kwargs,
     ):
         ...
-    
+
     ...
 ```
 

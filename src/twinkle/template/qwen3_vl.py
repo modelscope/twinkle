@@ -1,6 +1,6 @@
-from typing import Any, Dict, List, Optional, Union
-from PIL import Image
 import torch
+from PIL import Image
+from typing import Any, Dict, List, Optional, Union
 
 from twinkle import remote_class
 from twinkle.template import Template
@@ -51,32 +51,28 @@ class Qwen3VLTemplate(Template):
             else:
                 # Fallback to base class for tensor inputs
                 return super().preprocess_image(image)
-            
+
             # Use qwen_vl_utils with correct patch_size
             return fetch_image(image_input, image_patch_size=self.patch_size)
-            
+
         except ImportError:
             return super().preprocess_image(image)
 
     def preprocess_video(self, video: VideoInput) -> Union[List[Image.Image], torch.Tensor]:
         try:
             from qwen_vl_utils.vision_process import fetch_video
-            
+
             if isinstance(video, str):
                 # Use qwen_vl_utils for video loading
                 video_input = {'video': video}
-                result = fetch_video(
-                    video_input,
-                    image_patch_size=self.patch_size,
-                    return_video_sample_fps=False
-                )
+                result = fetch_video(video_input, image_patch_size=self.patch_size, return_video_sample_fps=False)
                 return result
             elif isinstance(video, list):
                 # List of images - preprocess each frame
                 return [self.preprocess_image(frame) for frame in video]
             else:
                 return super().preprocess_video(video)
-                
+
         except ImportError:
             return super().preprocess_video(video)
 
@@ -117,12 +113,8 @@ class Qwen3VLTemplate(Template):
             return None
 
         try:
-            position_ids, _ = get_rope_index(
-                input_ids,
-                inputs.get('image_grid_thw'),
-                inputs.get('video_grid_thw'),
-                inputs.get('attention_mask')
-            )
+            position_ids, _ = get_rope_index(input_ids, inputs.get('image_grid_thw'), inputs.get('video_grid_thw'),
+                                             inputs.get('attention_mask'))
             return position_ids
         except Exception:
             return None

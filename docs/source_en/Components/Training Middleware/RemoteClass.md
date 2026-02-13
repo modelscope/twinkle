@@ -7,10 +7,10 @@ from twinkle import remote_class, remote_function
 
 @remote_class(execute='first')
 class MyComponent:
-    
+
     def __init__(self, **kwargs):
         ...
-    
+
     @remote_function(dispatch='slice_dp', collect='first')
     def func(self, *args, **kwargs):
         ...

@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
-import importlib.util
 import importlib.metadata
+import importlib.util
 import os
+from functools import lru_cache
 from itertools import chain
+from packaging.requirements import Requirement
 from types import ModuleType
 from typing import Any
-from functools import lru_cache
-from packaging.requirements import Requirement
 
 
 @lru_cache
@@ -18,13 +18,11 @@ def requires(package: str):
         installed_version = importlib.metadata.version(pkg_name)
         if req.specifier:
             if not req.specifier.contains(installed_version):
-                raise ImportError(
-                    f"Package '{pkg_name}' version {installed_version} "
-                    f"does not satisfy {req.specifier}"
-                )
+                raise ImportError(f"Package '{pkg_name}' version {installed_version} "
+                                  f'does not satisfy {req.specifier}')
     except importlib.metadata.PackageNotFoundError:
         raise ImportError(f"Required package '{pkg_name}' is not installed")
-        
+
 
 @lru_cache
 def exists(package: str):

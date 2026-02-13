@@ -3,7 +3,7 @@
 import time
 from typing import Optional
 
-from twinkle import get_logger, Platform
+from twinkle import Platform, get_logger
 from .base import CheckpointEngine
 from .mixin import CheckpointEngineMixin
 
@@ -44,8 +44,8 @@ class CheckpointEngineManager:
 
     def __init__(
         self,
-        model: "CheckpointEngineMixin",
-        sampler: "CheckpointEngineMixin",
+        model: 'CheckpointEngineMixin',
+        sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
     ) -> None:
         self.model = model
@@ -54,9 +54,9 @@ class CheckpointEngineManager:
 
         # Validate Ray actors
         assert hasattr(model, '_actors') and model._actors, \
-            "CheckpointEngineManager requires model to be deployed as Ray actors"
+            'CheckpointEngineManager requires model to be deployed as Ray actors'
         assert hasattr(sampler, '_actors') and sampler._actors, \
-            "CheckpointEngineManager requires sampler to be deployed as Ray actors"
+            'CheckpointEngineManager requires sampler to be deployed as Ray actors'
 
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
@@ -66,7 +66,7 @@ class CheckpointEngineManager:
         self._peft_config: dict | None = None
 
     @staticmethod
-    def decide_backend_engine(platform: Optional[str] = None) -> "CheckpointEngine":
+    def decide_backend_engine(platform: Optional[str] = None) -> 'CheckpointEngine':
         if Platform.get_platform(platform).__name__ == 'GPU':
             from twinkle.checkpoint_engine import NCCLCheckpointEngine
             return NCCLCheckpointEngine
@@ -78,18 +78,21 @@ class CheckpointEngineManager:
 
     def sync_weights(self, merge_and_sync=True):
         start_time = time.time()
-        model_metadata = self.model.prepare_checkpoint_engine([True] + [False]*(self.model.device_mesh.world_size -1))
+        model_metadata = self.model.prepare_checkpoint_engine([True]
+                                                              + [False] * (self.model.device_mesh.world_size - 1))
         self.sampler.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
-            self.model.device_mesh.world_size, self.sampler.device_mesh.data_world_size, [model_metadata],
+            self.model.device_mesh.world_size,
+            self.sampler.device_mesh.data_world_size,
+            [model_metadata],
         )
         # Launch both init calls concurrently — TCPStore server (model rank 0)
         # blocks until all clients (sampler ranks) connect, so these MUST NOT
         # be serialised.  lazy_collect=True makes them return futures.
         model_init = self.model.init_checkpoint_process_group(**model_kwargs)
         sampler_init = self.sampler.init_checkpoint_process_group(**sampler_kwargs)
-        model_init()   # wait for model init to complete
-        sampler_init() # wait for sampler init to complete
+        model_init()  # wait for model init to complete
+        sampler_init()  # wait for sampler init to complete
 
         peft_config = None
         if self.base_sync_done and not merge_and_sync:
@@ -98,8 +101,7 @@ class CheckpointEngineManager:
             peft_config = self._peft_config
 
         model_result = self.model.send_weights(base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync)
-        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done,
-                peft_config=peft_config)
+        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
         model_result()
         sampler_result()
 
@@ -108,7 +110,7 @@ class CheckpointEngineManager:
 
         if not self.base_sync_done:
             self.base_sync_done = True
-            logger.info("Base model sync completed, subsequent syncs will be LoRA-only")
+            logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
 
         elapsed = time.time() - start_time
-        logger.info(f"Weight sync completed in {elapsed:.2f}s")
+        logger.info(f'Weight sync completed in {elapsed:.2f}s')

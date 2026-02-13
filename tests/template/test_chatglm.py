@@ -1,11 +1,12 @@
 import unittest
 
 from twinkle.data_format import Message, Trajectory
-from twinkle.template import Template
 from twinkle.hub import HubOperation
+from twinkle.template import Template
 
 
 class TestMMModel(unittest.TestCase):
+
     def test_nlp(self):
         model_dir = HubOperation.download_model('ms://ZhipuAI/chatglm3-6b')
         template = Template(model_dir, trust_remote_code=True)  # 添加这个参数
@@ -38,4 +39,4 @@ class TestMMModel(unittest.TestCase):
             ),
         ]
         trajectory = Trajectory(messages=messages)
-        encoded = template.batch_encode([trajectory])
+        template.batch_encode([trajectory])

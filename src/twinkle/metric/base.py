@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Any, List, Union
+from typing import Any, Dict, List, Union
 
 from twinkle import torch_util
 from twinkle.data_format import InputFeature, ModelOutput

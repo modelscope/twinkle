@@ -6,15 +6,15 @@ Reward (奖励函数) 是 RLHF 训练中用于评估模型输出质量的组件�
 
 ```python
 class Reward:
-    
+
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         """
         计算奖励值
-        
+
         Args:
             trajectories: 模型生成的轨迹列表
             ground_truths: 真实答案轨迹列表
-        
+
         Returns:
             奖励值列表
         """
@@ -65,7 +65,7 @@ from twinkle.data_format import Trajectory
 from typing import List
 
 class CustomReward(Reward):
-    
+
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
         for traj, gt in zip(trajectories, ground_truths):
@@ -73,7 +73,7 @@ class CustomReward(Reward):
             score = self._evaluate(traj, gt)
             rewards.append(score)
         return rewards
-    
+
     def _evaluate(self, traj, gt):
         # 实现具体评估逻辑
         ...
@@ -105,13 +105,13 @@ advantage_fn = GRPOAdvantage()
 for batch in dataloader:
     # 1. 采样生成多个候选答案
     response = sampler.sample(batch, num_samples=4)
-    
+
     # 2. 使用奖励函数评估质量
     rewards = reward_fn(response.trajectories, batch.ground_truths)
-    
+
     # 3. 计算优势值
     advantages = advantage_fn(rewards, num_generations=4)
-    
+
     # 4. 用优势值进行策略梯度更新
     ...
 ```

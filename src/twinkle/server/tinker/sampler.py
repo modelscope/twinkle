@@ -10,21 +10,19 @@ It supports:
 4. Flexible sampling parameters
 """
 import traceback
-from typing import Any, Dict, Optional
-
 from fastapi import FastAPI, Request
 from ray import serve
 from tinker import types
+from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.utils.validation import verify_request_token
-from twinkle.server.utils.state import get_server_state, ServerStateProxy
-from twinkle.server.utils.task_queue import TaskQueueMixin, TaskQueueConfig
 from twinkle.data_format import SamplingParams
+from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
+from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager
-
 
 logger = get_logger()
 
@@ -39,10 +37,10 @@ def build_sampler_app(model_id: str,
                       queue_config: Optional[Dict[str, Any]] = None,
                       **kwargs):
     """Build a sampler application for tinker-compatible inference.
-    
+
     This factory function creates a Ray Serve deployment that manages a sampler
     (inference engine) with support for LoRA adapters and rate limiting.
-    
+
     Args:
         model_id: Model identifier (e.g., "ms://Qwen/Qwen2.5-0.5B-Instruct")
         nproc_per_node: Number of processes per node
@@ -53,7 +51,7 @@ def build_sampler_app(model_id: str,
         engine_args: Additional engine arguments for the sampler
         queue_config: Task queue configuration dict (rps_limit, tps_limit, etc.)
         **kwargs: Additional arguments passed to the sampler
-        
+
     Returns:
         Ray Serve deployment bound with configuration
     """
@@ -68,7 +66,7 @@ def build_sampler_app(model_id: str,
     @serve.ingress(app)
     class SamplerManagement(TaskQueueMixin):
         """Sampler management service for text generation inference.
-        
+
         This class manages:
         - vLLM or Torch sampler initialization and lifecycle
         - Inference requests with LoRA adapter support
@@ -76,12 +74,16 @@ def build_sampler_app(model_id: str,
         - Sampling parameter conversion between Tinker and Twinkle formats
         """
 
-        def __init__(self, nproc_per_node: int, device_group: Dict[str, Any],
-                     device_mesh: Dict[str, Any], sampler_type: str = 'vllm',
+        def __init__(self,
+                     nproc_per_node: int,
+                     device_group: Dict[str, Any],
+                     device_mesh: Dict[str, Any],
+                     sampler_type: str = 'vllm',
                      engine_args: Optional[Dict[str, Any]] = None,
-                     queue_config: Optional[Dict[str, Any]] = None, **kwargs):
+                     queue_config: Optional[Dict[str, Any]] = None,
+                     **kwargs):
             """Initialize the sampler management service.
-            
+
             Args:
                 nproc_per_node: Number of processes per node
                 device_group: Device group configuration
@@ -92,16 +94,14 @@ def build_sampler_app(model_id: str,
                 **kwargs: Additional sampler initialization arguments
             """
             self.device_group = DeviceGroup(**device_group)
-            twinkle.initialize(mode='ray',
-                               nproc_per_node=nproc_per_node,
-                               groups=[self.device_group],
-                               lazy_collect=False)
+            twinkle.initialize(
+                mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.sampler_type = sampler_type
-            
+
             # Initialize sampler based on type
             if sampler_type == 'vllm':
                 from twinkle.sampler import vLLMSampler
@@ -111,61 +111,55 @@ def build_sampler_app(model_id: str,
                     engine_args=sampler_kwargs,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
-                    **{k: v for k, v in kwargs.items() if k not in ['engine_args']}
-                )
+                    **{
+                        k: v
+                        for k, v in kwargs.items() if k not in ['engine_args']
+                    })
             else:  # torch sampler
                 from twinkle.sampler import TorchSampler
-                self.sampler = TorchSampler(
-                    model_id=model_id,
-                    device_mesh=self.device_mesh,
-                    **kwargs
-                )
+                self.sampler = TorchSampler(model_id=model_id, device_mesh=self.device_mesh, **kwargs)
             self.sampler.set_template('Template', model_id=model_id)
             self.state: ServerStateProxy = get_server_state()
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
         @app.post('/asample')
-        async def asample(
-                self, request: Request,
-                body: types.SampleRequest) -> types.UntypedAPIFuture:
+        async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
             """Execute text generation (inference).
-            
+
             This endpoint:
             1. Extracts prompt token IDs from the request
             2. Determines adapter URI from model_path if provided
             3. Converts Tinker sampling params to Twinkle format
             4. Calls the sampler engine to generate text
             5. Converts results back to Tinker format
-            
+
             Args:
                 request: FastAPI request with auth token
                 body: SampleRequest with prompt, sampling params, and adapter info
-                
+
             Returns:
                 UntypedAPIFuture wrapping SampleResponse with generated sequences
             """
+
             async def _do_sample():
                 try:
                     # Extract prompt token IDs from ModelInput
                     prompt_inputs = {'input_ids': body.prompt.to_ints()}
-                    
+
                     # Get model_path: use body.model_path or look up from sampling session
                     model_path = body.model_path
-                    base_model = body.base_model
                     if not model_path and body.sampling_session_id:
                         session = self.state.get_sampling_session(body.sampling_session_id)
                         if session:
                             model_path = session.get('model_path')
-                            base_model = session.get('base_model')
-                    
+
                     # Parse and resolve adapter URI from model_path
                     adapter_uri = None
-                    adapter_name = None
                     if model_path:
                         token = request.state.token
                         checkpoint_manager = create_checkpoint_manager(token)
                         adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
-                    
+
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
                     if body.sampling_params:
@@ -176,7 +170,7 @@ def build_sampler_app(model_id: str,
                             top_k=body.sampling_params.top_k,
                             stop=body.sampling_params.stop,
                         )
-                    
+
                     # Only request logprobs when the client asks for them. Some backends may
                     # return None entries in logprobs, which breaks pydantic validation.
                     response = self.sampler.sample(
@@ -185,7 +179,7 @@ def build_sampler_app(model_id: str,
                         adapter_path=adapter_uri,
                         # adapter_name=adapter_name,
                     )
-                    
+
                     # Convert twinkle SampleResponse to tinker types.SampleResponse
                     tinker_sequences = []
                     for seq in response.sequences:
@@ -203,8 +197,7 @@ def build_sampler_app(model_id: str,
                                 stop_reason=seq.stop_reason,
                                 tokens=list(seq.tokens),
                                 logprobs=logprobs,
-                            )
-                        )
+                            ))
                     return types.SampleResponse(
                         sequences=tinker_sequences,
                         prompt_logprobs=response.prompt_logprobs,
@@ -225,5 +218,5 @@ def build_sampler_app(model_id: str,
                 input_tokens=input_tokens,
             )
 
-    return SamplerManagement.options(**deploy_options).bind(
-        nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config, **kwargs)
+    return SamplerManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, sampler_type,
+                                                            engine_args, queue_config, **kwargs)

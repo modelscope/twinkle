@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass
-from twinkle import get_logger
-from typing import Dict, Any, Optional, Type, List, Callable, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
+from twinkle import get_logger
 from .base import DeviceType, ModeType, is_kernels_available
+
 if TYPE_CHECKING:
     from kernels.layer.func import FuncRepositoryProtocol
 
@@ -17,7 +18,7 @@ class LayerRegistry:
         self._registry: Dict[str, Dict[DeviceType, Dict[Any, Any]]] = {}
         self._synced = False
 
-    def register(self, kernel_name: str, repo_spec: Any, device: DeviceType = "cuda", mode: Any = None) -> None:
+    def register(self, kernel_name: str, repo_spec: Any, device: DeviceType = 'cuda', mode: Any = None) -> None:
         if kernel_name not in self._registry:
             self._registry[kernel_name] = {}
         if device not in self._registry[kernel_name]:
@@ -117,7 +118,6 @@ class FunctionKernelSpec:
     mode: Optional[ModeType]
 
 
-
 class FunctionRegistry:
     """Manages function-level kernel registrations."""
 
@@ -139,7 +139,7 @@ class FunctionRegistry:
 _global_function_registry = FunctionRegistry()
 
 
-def register_layer(kernel_name: str, repo_spec: Any, device: DeviceType = "cuda", mode: Any = None) -> None:
+def register_layer(kernel_name: str, repo_spec: Any, device: DeviceType = 'cuda', mode: Any = None) -> None:
     _global_layer_registry.register(kernel_name, repo_spec, device, mode)
 
 
@@ -161,12 +161,10 @@ def register_external_layer(layer_class: Type, kernel_name: str) -> None:
     if is_kernels_available():
         from kernels import replace_kernel_forward_from_hub
         replace_kernel_forward_from_hub(layer_class, kernel_name)
-        logger.info(f"Registered {layer_class.__name__} -> kernel: {kernel_name}")
+        logger.info(f'Registered {layer_class.__name__} -> kernel: {kernel_name}')
     else:
-        logger.warning(
-            f"HF kernels not available. {layer_class.__name__} mapping registered "
-            f"but kernel replacement will not work without kernels package."
-        )
+        logger.warning(f'HF kernels not available. {layer_class.__name__} mapping registered '
+                       f'but kernel replacement will not work without kernels package.')
 
 
 def get_external_kernel_name(layer_class: Type) -> Optional[str]:

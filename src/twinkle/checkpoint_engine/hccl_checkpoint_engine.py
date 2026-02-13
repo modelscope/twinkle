@@ -11,20 +11,14 @@ across different processes/nodes. It supports:
 
 import asyncio
 import time
+import torch
+import zmq
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
-import torch
-import zmq
-
-from twinkle.utils.network import (
-    find_node_ip,
-    find_free_port,
-    is_valid_ipv6_address,
-    stateless_init_process_group,
-)
-from .base import CheckpointEngine, TensorMeta
 from twinkle import get_logger
+from twinkle.utils.network import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
+from .base import CheckpointEngine, TensorMeta
 
 logger = get_logger()
 
@@ -109,7 +103,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
     def __init__(
         self,
         bucket_size: int = 2048 << 20,
-        group_name: str = "twinkle_ckpt",
+        group_name: str = 'twinkle_ckpt',
         rebuild_group: bool = True,
         rollout_dtype: torch.dtype = torch.bfloat16,
         **kwargs,
@@ -128,7 +122,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         # Set by Manager before prepare() via attribute assignment
         self.is_master = False
-        self.topic = "bucket_metadata"
+        self.topic = 'bucket_metadata'
 
         # Will be set during prepare / init_process_group
         self.rank = None
@@ -152,27 +146,27 @@ class HCCLCheckpointEngine(CheckpointEngine):
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
         if is_valid_ipv6_address(self.ip):
-            address = f"tcp://[{self.ip}]:{self.zmq_port}"
+            address = f'tcp://[{self.ip}]:{self.zmq_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
-            address = f"tcp://{self.ip}:{self.zmq_port}"
+            address = f'tcp://{self.ip}:{self.zmq_port}'
 
         self.socket.bind(address)
-        logger.debug(f"ZMQ PUB server started at {address}")
+        logger.debug(f'ZMQ PUB server started at {address}')
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
         """Connect to the ZMQ PUB server as a subscriber (receiver only)."""
         context = zmq.Context()
         self.socket = context.socket(zmq.SUB)
         if is_valid_ipv6_address(metadata.zmq_ip):
-            address = f"tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}"
+            address = f'tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
-            address = f"tcp://{metadata.zmq_ip}:{metadata.zmq_port}"
+            address = f'tcp://{metadata.zmq_ip}:{metadata.zmq_port}'
 
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
-        logger.debug(f"ZMQ SUB client connected to {address}")
+        logger.debug(f'ZMQ SUB client connected to {address}')
 
     # ── Core lifecycle ───────────────────────────────────────────────────
 
@@ -187,20 +181,24 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if self._prepared:
             if self.is_master:
                 return MasterMetadata(
-                    zmq_ip=self.ip, zmq_port=self.zmq_port,
-                    dist_ip=self.ip, dist_port=self.dist_port,
+                    zmq_ip=self.ip,
+                    zmq_port=self.zmq_port,
+                    dist_ip=self.ip,
+                    dist_port=self.dist_port,
                 )
             return None
 
-        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
-        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
+        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
+        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
 
         if self.is_master:
             self._start_zmq_server()
             self._prepared = True
             return MasterMetadata(
-                zmq_ip=self.ip, zmq_port=self.zmq_port,
-                dist_ip=self.ip, dist_port=self.dist_port,
+                zmq_ip=self.ip,
+                zmq_port=self.zmq_port,
+                dist_ip=self.ip,
+                dist_port=self.dist_port,
             )
         self._prepared = True
         return None
@@ -216,7 +214,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 try:
                     self.socket.close()
                 except Exception as e:
-                    logger.warning(f"Error closing ZMQ socket: {e}")
+                    logger.warning(f'Error closing ZMQ socket: {e}')
                 self.socket = None
 
             if self.rank is not None and self.rank >= 0 and self.pyhccl is not None:
@@ -251,14 +249,14 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 break
 
         trainer_kwargs = {
-            "rank": [0] + [-1] * (trainer_world_size - 1),
-            "world_size": [rollout_world_size + 1] * trainer_world_size,
-            "master_metadata": [master_metadata] * trainer_world_size,
+            'rank': [0] + [-1] * (trainer_world_size - 1),
+            'world_size': [rollout_world_size + 1] * trainer_world_size,
+            'master_metadata': [master_metadata] * trainer_world_size,
         }
         rollout_kwargs = {
-            "rank": list(range(1, rollout_world_size + 1)),
-            "world_size": [rollout_world_size + 1] * rollout_world_size,
-            "master_metadata": [master_metadata] * rollout_world_size,
+            'rank': list(range(1, rollout_world_size + 1)),
+            'world_size': [rollout_world_size + 1] * rollout_world_size,
+            'master_metadata': [master_metadata] * rollout_world_size,
         }
         return trainer_kwargs, rollout_kwargs
 
@@ -291,7 +289,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 rank=rank,
                 world_size=world_size,
                 device=self.device,
-                backend="hccl",
+                backend='hccl',
             )
             self.rank = rank
             self.world_size = world_size
@@ -308,7 +306,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.pyhccl.all_reduce(signal)
 
         self._group_initialized = True
-        logger.info(f"init_process_group: rank={self.rank}, world_size={self.world_size}")
+        logger.info(f'init_process_group: rank={self.rank}, world_size={self.world_size}')
 
     # ── Send / Receive ───────────────────────────────────────────────────
 
@@ -340,7 +338,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
                     rank=self.rank,
                     process_group=self.pyhccl,
                     bucket=send_buf,
-                    metadata={"bucket_meta": bucket_meta, "is_last": False},
+                    metadata={
+                        'bucket_meta': bucket_meta,
+                        'is_last': False
+                    },
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -352,10 +353,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
             assert offset + weight.nbytes <= self.bucket_size
 
             bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
+                'name': name,
+                'shape': weight.shape,
+                'dtype': weight.dtype,
+                'offset': offset,
             }
             send_buf[offset:offset + weight.nbytes] = weight.view(-1).view(torch.uint8)
             offset += weight.nbytes
@@ -368,14 +369,17 @@ class HCCLCheckpointEngine(CheckpointEngine):
             rank=self.rank,
             process_group=self.pyhccl,
             bucket=send_buf,
-            metadata={"bucket_meta": bucket_meta, "is_last": True},
+            metadata={
+                'bucket_meta': bucket_meta,
+                'is_last': True
+            },
             socket=self.socket,
             topic=self.topic,
         )
         await broadcast_op.wait_for_complete()
 
         elapsed = time.time() - start_time
-        logger.info(f"send_weights done: rank={self.rank}, time={elapsed:.2f}s")
+        logger.info(f'send_weights done: rank={self.rank}, time={elapsed:.2f}s')
 
     @torch.no_grad()
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
@@ -396,11 +400,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
         )
         metadata = await broadcast_op.wait_for_complete()
         total_bytes += self.bucket_size
-        total_params += len(metadata["bucket_meta"])
+        total_params += len(metadata['bucket_meta'])
 
         send_buf, recv_buf = recv_buf, send_buf
 
-        while not metadata["is_last"]:
+        while not metadata['is_last']:
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
                 process_group=self.pyhccl,
@@ -410,28 +414,26 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 topic=self.topic,
             )
 
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
+            for name, meta in metadata['bucket_meta'].items():
+                dtype, shape = meta['dtype'], meta['shape']
                 size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"]:meta["offset"] + size].view(dtype=dtype).view(shape)
+                tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
                 yield name, tensor
 
             metadata = await broadcast_op.wait_for_complete()
             total_bytes += self.bucket_size
-            total_params += len(metadata["bucket_meta"])
+            total_params += len(metadata['bucket_meta'])
 
             torch.npu.synchronize()
             send_buf, recv_buf = recv_buf, send_buf
 
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
+        for name, meta in metadata['bucket_meta'].items():
+            dtype, shape = meta['dtype'], meta['shape']
             size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"]:meta["offset"] + size].view(dtype=dtype).view(shape)
+            tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
             yield name, tensor
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024)
-        logger.info(
-            f"receive_weights done: rank={self.rank}, params={total_params}, "
-            f"time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s"
-        )
+        logger.info(f'receive_weights done: rank={self.rank}, params={total_params}, '
+                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')

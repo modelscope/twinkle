@@ -3,8 +3,8 @@ import re
 from typing import List, Union
 
 from twinkle import remote_class, remote_function
-from twinkle.reward.base import Reward
 from twinkle.data_format import Trajectory
+from twinkle.reward.base import Reward
 
 
 class MathReward(Reward):
@@ -43,7 +43,7 @@ class MathReward(Reward):
         try:
             expr = parse_latex(latex_str)
             return simplify(expr)
-        except Exception: # noqa
+        except Exception:  # noqa
             return None
 
     @staticmethod
@@ -63,6 +63,7 @@ class MathReward(Reward):
 
     def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]):
         rewards = []
+
         def _last_content(traj):
             # Trajectories can be dicts after serialization in distributed runs.
             if isinstance(traj, dict):

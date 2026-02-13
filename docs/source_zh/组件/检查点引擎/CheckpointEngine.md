@@ -7,30 +7,30 @@ CheckpointEngine (检查点引擎) 是用于在训练器和推理进程之间同
 ```python
 class CheckpointEngine(ABC):
     """检查点引擎基类
-    
+
     检查点引擎处理训练器和推理进程之间的权重同步。
     """
-    
+
     @abstractmethod
     def prepare(self) -> dict[str, Any]:
         """准备权重同步前的准备工作"""
         ...
-    
+
     @abstractmethod
     def init_process_group(self, rank: int, world_size: int, **kwargs):
         """初始化进程组"""
         ...
-    
+
     @abstractmethod
     async def send_weights(self, weight_generator):
         """发送权重(在训练器进程中调用)"""
         ...
-    
+
     @abstractmethod
     def receive_weights(self) -> AsyncGenerator:
         """接收权重(在推理进程中调用)"""
         ...
-    
+
     @abstractmethod
     def finalize(self):
         """清理资源"""
@@ -67,4 +67,3 @@ Twinkle 提供了两种检查点引擎实现:
 - **HCCLCheckpointEngine**: 适用于昇腾 NPU 环境
 
 > 检查点引擎是 RLHF 训练基础设施的关键组件,确保训练器和采样器使用一致的模型权重。
-

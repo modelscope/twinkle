@@ -6,7 +6,7 @@ Sampler (采样器) 是 Twinkle 中用于生成模型输出的组件,主要用�
 
 ```python
 class Sampler(ABC):
-    
+
     @abstractmethod
     def sample(
         self,
@@ -18,11 +18,11 @@ class Sampler(ABC):
     ) -> SampleResponse:
         """对给定输入进行采样"""
         ...
-    
+
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs):
         """添加 LoRA 适配器"""
         ...
-    
+
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
         """设置模板"""
         ...

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .message import Tool, ToolCall, Message
-from .trajectory import Trajectory
 from .input_feature import InputFeature
+from .message import Message, Tool, ToolCall
 from .output import ModelOutput
-from .sampling import SamplingParams, SampleResponse, SampledSequence
+from .sampling import SampledSequence, SampleResponse, SamplingParams
+from .trajectory import Trajectory

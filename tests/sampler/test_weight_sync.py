@@ -23,11 +23,11 @@ Note:
     - Set TEST_MODEL_ID environment variable to use a different model
 """
 
+import argparse
+import logging
 import os
 import sys
 import time
-import argparse
-import logging
 
 # Must set before importing anything
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 def log(msg):
     """Print message with timestamp."""
     import datetime
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', flush=True)
 
 
 def wait_result(result):
@@ -76,6 +76,7 @@ def get_model_path():
 # Test: Standalone Weight Sync
 # =============================================================================
 
+
 def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     """Test weight sync in STANDALONE mode (model and sampler on different GPUs).
 
@@ -90,25 +91,26 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
         4. send / receive      — NCCL broadcast (parallel)
         5. finalize            — release buffers, close ZMQ
     """
+    from transformers import AutoTokenizer
+
     import twinkle
     from twinkle import DeviceGroup, DeviceMesh
+    from twinkle.checkpoint_engine import CheckpointEngineManager
+    from twinkle.data_format import Trajectory
+    from twinkle.data_format.sampling import SamplingParams
     from twinkle.model.transformers import TransformersModel
     from twinkle.sampler import vLLMSampler
     from twinkle.template import Template
-    from twinkle.checkpoint_engine import CheckpointEngineManager
-    from transformers import AutoTokenizer
-    from twinkle.data_format import Trajectory
-    from twinkle.data_format.sampling import SamplingParams
 
     total_gpus = model_gpus + sampler_gpus
     model_path = get_model_path()
 
-    log("=" * 70)
-    log(f"TEST: Standalone Weight Sync")
-    log(f"  Model  : GPU 0-{model_gpus - 1}  ({model_gpus} workers)")
-    log(f"  Sampler: GPU {model_gpus}-{total_gpus - 1}  ({sampler_gpus} workers)")
-    log(f"  Model  : {model_path}")
-    log("=" * 70)
+    log('=' * 70)
+    log('TEST: Standalone Weight Sync')
+    log(f'  Model  : GPU 0-{model_gpus - 1}  ({model_gpus} workers)')
+    log(f'  Sampler: GPU {model_gpus}-{total_gpus - 1}  ({sampler_gpus} workers)')
+    log(f'  Model  : {model_path}')
+    log('=' * 70)
 
     # ── Initialize Twinkle in Ray mode ────────────────────────────────
     twinkle.initialize(
@@ -139,12 +141,15 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
         remote_group='model',
     )
     from peft import LoraConfig
-    model.add_adapter_to_model('default', LoraConfig(r=8, lora_alpha=32, lora_dropout=0.05, target_modules="all-linear"), gradient_accumulation_steps=1)
+    model.add_adapter_to_model(
+        'default',
+        LoraConfig(r=8, lora_alpha=32, lora_dropout=0.05, target_modules='all-linear'),
+        gradient_accumulation_steps=1)
     # ── Create Sampler (dummy weights) ────────────────────────────────
     sampler = vLLMSampler(
         model_id=model_path,
         engine_args={
-            'load_format': 'dummy',         # start with random weights
+            'load_format': 'dummy',  # start with random weights
             'gpu_memory_utilization': 0.3,
             'max_model_len': 256,
             'enforce_eager': True,
@@ -158,29 +163,27 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     sampler.set_template(Template, model_id=model_path)
 
     # Wait for vLLM initialization
-    log("Waiting for vLLM initialization...")
+    log('Waiting for vLLM initialization...')
     time.sleep(3)
 
     # ── Helper: sample one prompt ─────────────────────────────────────
     def do_sample(prompt: str, max_tokens: int = 32) -> str:
         traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
-        response = wait_result(
-            sampler.sample(traj, SamplingParams(max_tokens=max_tokens, temperature=0.0))
-        )
+        response = wait_result(sampler.sample(traj, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
         if response and response.sequences:
             tokens = response.sequences[0].tokens
             if hasattr(tokens, 'tolist'):
                 tokens = tokens.tolist()
             return tokenizer.decode(tokens, skip_special_tokens=True)
-        return ""
+        return ''
 
     # ── Sample BEFORE sync (dummy weights → garbage) ──────────────────
-    log("\n--- Sampling BEFORE weight sync (dummy weights) ---")
+    log('\n--- Sampling BEFORE weight sync (dummy weights) ---')
     text_before = do_sample("What's your name?")
     log(f"  Output: '{text_before[:100]}'")
 
     # ── Sync weights: Model → Sampler via NCCL ────────────────────────
-    log("\n--- Syncing weights via CheckpointEngineManager ---")
+    log('\n--- Syncing weights via CheckpointEngineManager ---')
     manager = CheckpointEngineManager(
         model=model,
         sampler=sampler,
@@ -194,27 +197,27 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     manager.sync_weights('default')
     sampler.reset_prefix_cache()
     sync_time = time.time() - sync_start
-    log(f"  Weight sync completed in {sync_time:.2f}s")
+    log(f'  Weight sync completed in {sync_time:.2f}s')
 
     # ── Sample AFTER sync (real weights → coherent) ───────────────────
-    log("\n--- Sampling AFTER weight sync (real weights) ---")
+    log('\n--- Sampling AFTER weight sync (real weights) ---')
     text_after = do_sample("What's your name?")
     log(f"  Output: '{text_after[:100]}'")
 
     # ── Verification ──────────────────────────────────────────────────
-    log("\n" + "=" * 70)
-    log("VERIFICATION")
-    log("=" * 70)
+    log('\n' + '=' * 70)
+    log('VERIFICATION')
+    log('=' * 70)
 
     outputs_differ = text_before != text_after
-    log(f"  Outputs differ after sync: {outputs_differ}")
+    log(f'  Outputs differ after sync: {outputs_differ}')
 
     if outputs_differ:
-        log("  PASS: Weight sync verified — outputs changed after sync.")
-        if "4" in text_after.lower() or "four" in text_after.lower():
+        log('  PASS: Weight sync verified — outputs changed after sync.')
+        if '4' in text_after.lower() or 'four' in text_after.lower():
             log("  BONUS: Model correctly answered '2+2' question!")
     else:
-        log("  FAIL: Outputs are identical — weight sync may have failed.")
+        log('  FAIL: Outputs are identical — weight sync may have failed.')
     sampler.shutdown()
 
     return outputs_differ
@@ -224,30 +227,29 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
 # Main
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description='Test STANDALONE weight synchronization')
-    parser.add_argument('--model-gpus', type=int, default=1,
-                        help='Number of GPUs for model (training)')
-    parser.add_argument('--sampler-gpus', type=int, default=1,
-                        help='Number of GPUs for sampler (inference)')
+    parser.add_argument('--model-gpus', type=int, default=1, help='Number of GPUs for model (training)')
+    parser.add_argument('--sampler-gpus', type=int, default=1, help='Number of GPUs for sampler (inference)')
     args = parser.parse_args()
 
-    log(f"Starting standalone weight sync test...")
-    log(f"  Model GPUs:   {args.model_gpus}")
-    log(f"  Sampler GPUs: {args.sampler_gpus}")
-    log(f"  Model ID:     {MODEL_ID}")
+    log('Starting standalone weight sync test...')
+    log(f'  Model GPUs:   {args.model_gpus}')
+    log(f'  Sampler GPUs: {args.sampler_gpus}')
+    log(f'  Model ID:     {MODEL_ID}')
 
     try:
         success = test_standalone_weight_sync(args.model_gpus, args.sampler_gpus)
     except Exception as e:
-        log(f"\nTest failed with exception: {e}")
+        log(f'\nTest failed with exception: {e}')
         import traceback
         traceback.print_exc()
         success = False
 
-    log("\n" + "=" * 70)
+    log('\n' + '=' * 70)
     log(f"RESULT: {'PASS' if success else 'FAIL'}")
-    log("=" * 70)
+    log('=' * 70)
 
     return 0 if success else 1
 

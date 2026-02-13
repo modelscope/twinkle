@@ -6,7 +6,7 @@ Advantage (优势函数) 是强化学习中用于计算动作相对于平均水�
 
 ```python
 class Advantage:
-    
+
     def __call__(self,
                  rewards: Union['torch.Tensor', List[float]],
                  num_generations: int = 1,
@@ -14,7 +14,7 @@ class Advantage:
                  **kwargs) -> 'torch.Tensor':
         """
         计算优势值
-        
+
         Args:
             rewards: 奖励值列表或张量
             num_generations: 每个 prompt 生成的样本数量
@@ -22,7 +22,7 @@ class Advantage:
                 - 'group': 对每组样本进行归一化 (GRPO)
                 - 'batch': 对整个 batch 进行归一化
                 - 'none': 不进行归一化
-        
+
         Returns:
             优势值张量
         """

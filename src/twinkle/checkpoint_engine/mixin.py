@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from twinkle import remote_function, Platform
+from twinkle import Platform, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 
 
@@ -8,7 +8,7 @@ class CheckpointEngineMixin:
     _checkpoint_engine: CheckpointEngine = None
     _bucket_size: int = 2048 << 20  # 2 GB
 
-    def _get_or_create_checkpoint_engine(self) -> "CheckpointEngine":
+    def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
         if self._checkpoint_engine is None:
             if Platform.get_platform().__name__ == 'GPU':

@@ -8,25 +8,26 @@
 #   1. Modify the source files in src/twinkle/
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
-from typing import Any, Optional, Union, Type, Dict, Literal, List
 import uuid
-from twinkle_client.http import http_post, heartbeat_manager
+from typing import Any, Dict, List, Literal, Optional, Type, Union
+
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle_client.http import heartbeat_manager, http_post
 
 
 class MultiLoraTransformersModel:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
-    
+
     This client manages adapters and sends training/inference requests to the model server.
     Each adapter has its own lifecycle managed through automatic heartbeats.
     """
-    
+
     def __init__(self, model_id: str, **kwargs):
         """Initialize model client."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
-        
+
         self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -36,7 +37,7 @@ class MultiLoraTransformersModel:
             url=f'{self.server_url}/create',
         )
         response.raise_for_status()
-    
+
     def _send_adapter_heartbeat(self):
         """Internal method to send adapter heartbeat."""
         response = http_post(
@@ -44,7 +45,7 @@ class MultiLoraTransformersModel:
             json_data={'adapter_name': self.adapter_name}
         )
         response.raise_for_status()
-    
+
     def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs):
         """Add a new adapter to the model and start automatic heartbeat."""
         response = http_post(
@@ -52,21 +53,21 @@ class MultiLoraTransformersModel:
             json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
-        
+
         # Register adapter for automatic heartbeat after successful creation
         self.adapter_name = adapter_name
         heartbeat_manager.register_adapter(
             self.adapter_name,
             self._send_adapter_heartbeat
         )
-    
+
     def __del__(self):
         """Cleanup: unregister adapter from heartbeat manager."""
         try:
             heartbeat_manager.unregister_adapter(self.adapter_name)
         except:
             pass
-    
+
     def forward(self, inputs: Any, **kwargs):
         """Execute forward pass on the model."""
         response = http_post(
@@ -75,7 +76,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def forward_only(self, inputs: Any, **kwargs):
         """Execute forward pass without gradient computation."""
         response = http_post(
@@ -84,7 +85,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def calculate_loss(self, **kwargs):
         """Calculate loss from model outputs."""
         response = http_post(
@@ -93,7 +94,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def get_train_configs(self, **kwargs):
         """Get training configs"""
         response = http_post(
@@ -111,7 +112,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def forward_backward(self, inputs: Any, **kwargs):
         """Execute combined forward and backward pass."""
         response = http_post(
@@ -120,7 +121,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def step(self, **kwargs):
         """Execute optimizer step."""
         response = http_post(
@@ -129,7 +130,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def zero_grad(self, **kwargs):
         """Zero out gradients."""
         response = http_post(
@@ -138,7 +139,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def lr_step(self, **kwargs):
         """Execute learning rate scheduler step."""
         response = http_post(
@@ -147,7 +148,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_loss(self, loss_cls: str, **kwargs):
         """Set the loss function."""
         response = http_post(
@@ -174,7 +175,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs):
         """Set the learning rate scheduler."""
         response = http_post(
@@ -183,7 +184,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def save(self, name: str, **kwargs):
         """Save model checkpoint."""
         response = http_post(
@@ -192,7 +193,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-        
+
     def load(self, name: str, **kwargs):
         """Load model checkpoint."""
         response = http_post(
@@ -201,7 +202,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_template(self, template_cls: str, **kwargs):
         """Set the template for data processing."""
         response = http_post(
@@ -210,7 +211,7 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         return response.json()['result']
-    
+
     def set_processor(self, processor_cls: str, **kwargs):
         """Set the input processor."""
         response = http_post(
@@ -240,7 +241,7 @@ class MultiLoraTransformersModel:
 
     def upload_to_hub(self, checkpoint_dir: str, hub_model_id: str, hub_token: Optional[str] = None, async_upload: bool = True):
         """Upload model checkpoint to hub.
-        
+
         Args:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.

@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch.nn as nn
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Type
-
-import torch.nn as nn
 
 from .constant import MLLMMegatronModelType
 
@@ -34,11 +33,11 @@ class MegatronModelMeta:
             from .gpt_bridge import GPTBridge, MultimodalGPTBridge
             self.bridge_cls = MultimodalGPTBridge if self.is_multimodal else GPTBridge
         if self.model_cls is None:
-            from .mm_gpt_model import MultimodalGPTModel
             from .gpt_model import GPTModel
+            from .mm_gpt_model import MultimodalGPTModel
             self.model_cls = MultimodalGPTModel if self.is_multimodal else GPTModel
         if self.auto_model_cls is None:
-            from transformers import AutoModelForCausalLM, AutoModel
+            from transformers import AutoModel, AutoModelForCausalLM
             self.auto_model_cls = AutoModel if self.is_multimodal else AutoModelForCausalLM
 
 

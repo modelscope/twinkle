@@ -6,7 +6,7 @@ Sampler is a component in Twinkle for generating model outputs, primarily used f
 
 ```python
 class Sampler(ABC):
-    
+
     @abstractmethod
     def sample(
         self,
@@ -18,11 +18,11 @@ class Sampler(ABC):
     ) -> SampleResponse:
         """Sample from given inputs"""
         ...
-    
+
     def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs):
         """Add LoRA adapter"""
         ...
-    
+
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
         """Set template"""
         ...

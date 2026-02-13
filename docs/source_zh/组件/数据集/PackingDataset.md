@@ -43,5 +43,3 @@ dataset.pack_dataset()
 ```
 
 本数据集也有`@remote_class`装饰器，可以在ray的worker中运行。
-
-

@@ -12,6 +12,3 @@ trajectory = next(dataset)
 ```
 
 流式数据集也有`@remote_class`装饰器，可以在ray的worker中运行。
-
-
-

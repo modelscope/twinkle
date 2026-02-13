@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Union, List, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Literal, Union
+
 from .base import Advantage
+
 if TYPE_CHECKING:
     import torch
 
@@ -41,7 +43,7 @@ class GRPOAdvantage(Advantage):
             rewards = rewards.sum(dim=-1)
 
         if num_generations <= 0 or rewards.numel() % num_generations != 0:
-            raise ValueError("Invalid")
+            raise ValueError('Invalid')
 
         if num_generations == 1:
             if scale == 'batch':

@@ -1,18 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Kernel module layer - Layer-level replacement with HF kernels integration."""
-from twinkle import get_logger
 from pathlib import Path
-from typing import Optional, Union, Any
+from typing import Any, Optional, Union
 
-from .base import (
-    DeviceType,
-    ModeType,
-    is_kernels_available,
-    is_kernels_enabled,
-    to_kernels_mode,
-)
-from .registry import register_layer, get_global_layer_registry
-from twinkle import Platform
+from twinkle import Platform, get_logger
+from .base import DeviceType, ModeType, is_kernels_available, is_kernels_enabled, to_kernels_mode
+from .registry import get_global_layer_registry, register_layer
 
 logger = get_logger()
 
@@ -24,7 +17,7 @@ def register_layer_kernel(
     package_name: Optional[str] = None,
     layer_name: Optional[str] = None,
     version: Optional[str] = None,
-    device: DeviceType = "cuda",
+    device: DeviceType = 'cuda',
     mode: Optional[ModeType] = None,
 ) -> None:
     """Register a layer kernel with the registry.
@@ -40,14 +33,14 @@ def register_layer_kernel(
         mode: Mode (train/inference/compile), None means FALLBACK
     """
     if not is_kernels_available():
-        logger.warning(f"HF kernels package not available. Skipping registration for kernel: {kernel_name}")
+        logger.warning(f'HF kernels package not available. Skipping registration for kernel: {kernel_name}')
         return
 
     from kernels import LayerRepository, LocalLayerRepository
 
     if repo_path is not None:
         if package_name is None:
-            raise ValueError(f"package_name must be provided when using repo_path for kernel: {kernel_name}")
+            raise ValueError(f'package_name must be provided when using repo_path for kernel: {kernel_name}')
         if isinstance(repo_path, str):
             repo_path = Path(repo_path)
         repo_spec = LocalLayerRepository(
@@ -57,7 +50,7 @@ def register_layer_kernel(
         )
     else:
         if repo_id is None:
-            raise ValueError(f"Either repo_id or repo_path must be provided for kernel: {kernel_name}")
+            raise ValueError(f'Either repo_id or repo_path must be provided for kernel: {kernel_name}')
         repo_spec = LayerRepository(
             repo_id=repo_id,
             layer_name=layer_name or kernel_name,
@@ -67,8 +60,8 @@ def register_layer_kernel(
     hf_mode = _to_hf_mode(mode)
     register_layer(kernel_name, repo_spec, device, mode=hf_mode)
 
-    mode_str = mode or "FALLBACK"
-    logger.info(f"Registered layer kernel: {kernel_name} for device: {device}, mode: {mode_str}")
+    mode_str = mode or 'FALLBACK'
+    logger.info(f'Registered layer kernel: {kernel_name} for device: {device}, mode: {mode_str}')
 
 
 def _to_hf_mode(mode: Optional[ModeType]) -> Any:
@@ -81,7 +74,7 @@ def _to_hf_mode(mode: Optional[ModeType]) -> Any:
 
 def apply_layer_kernel(
     model,
-    mode: ModeType = "inference",
+    mode: ModeType = 'inference',
     device: Optional[DeviceType] = None,
     use_fallback: bool = True,
 ) -> Any:
@@ -98,29 +91,29 @@ def apply_layer_kernel(
         The kernelized model.
     """
     if not is_kernels_enabled():
-        logger.debug("Kernels not enabled, returning original model")
+        logger.debug('Kernels not enabled, returning original model')
         return model
 
     get_global_layer_registry().sync_to_hf_kernels()
 
     if device is None:
-        device = Platform.get_platform().device_prefix() or "cuda"
+        device = Platform.get_platform().device_prefix() or 'cuda'
 
     kernel_mode = to_kernels_mode(mode)
 
     try:
         from kernels import kernelize
-        logger.debug(f"Applying kernels with mode: {mode}, device: {device}, use_fallback: {use_fallback}")
+        logger.debug(f'Applying kernels with mode: {mode}, device: {device}, use_fallback: {use_fallback}')
         return kernelize(model, mode=kernel_mode, device=device, use_fallback=use_fallback)
     except Exception as e:
         if use_fallback:
-            logger.warning(f"Failed to apply kernels: {e}. Returning original model.")
+            logger.warning(f'Failed to apply kernels: {e}. Returning original model.')
             return model
         raise
 
 
-def register_layer_batch(mapping: dict, default_device: DeviceType = "cuda") -> None:
+def register_layer_batch(mapping: dict, default_device: DeviceType = 'cuda') -> None:
     """Batch register layer kernels."""
     for kernel_name, spec in mapping.items():
-        device = spec.pop("device", default_device)
+        device = spec.pop('device', default_device)
         register_layer_kernel(kernel_name=kernel_name, device=device, **spec)

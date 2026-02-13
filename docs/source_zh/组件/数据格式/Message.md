@@ -7,7 +7,7 @@
 class ToolCall(TypedDict, total=False):
     tool_name: str
     arguments: str
-    
+
 class Message(TypedDict, total=False):
     role: Literal['system', 'user', 'assistant', 'tool']
     type: str

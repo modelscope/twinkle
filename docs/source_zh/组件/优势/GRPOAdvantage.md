@@ -50,13 +50,13 @@ advantage_fn = GRPOAdvantage()
 for batch in dataloader:
     # 1. 采样生成
     response = sampler.sample(batch, num_samples=4)
-    
+
     # 2. 计算奖励
     rewards = reward_fn(response.trajectories, batch.ground_truths)
-    
+
     # 3. 计算优势
     advantages = advantage_fn(rewards, num_generations=4)
-    
+
     # 4. 策略优化
     loss = actor.forward_backward(
         inputs=response.inputs,

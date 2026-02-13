@@ -1,11 +1,9 @@
 import os
-
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform
-from twinkle import get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
@@ -16,10 +14,7 @@ if Platform.get_rank() == 0 and os.environ.get('SWANLAB_API_KEY'):
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
 
-    run = swanlab.init(
-        project="twinkle",
-    )
-
+    run = swanlab.init(project='twinkle', )
 
 # Construct a device_mesh, tp=pp=cp=ep=2, dp=1
 device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, cp_size=2, ep_size=2)
@@ -56,11 +51,7 @@ def train():
     # Use a MegatronModel
     model = MegatronModel(model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507')
 
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
     # Add a lora to model, with name `default`
     # Comment this to use full-parameter training
@@ -87,12 +78,12 @@ def train():
                 swanlab.log(metric)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
         if step > 0 and step % 20 == 0:
-           metrics = eval(model)
-           logger.info(f'Eval metric: {metrics}')
-           metrics['step'] = step
-           if loss_metric > float(metrics['loss']):
-               model.save(f'checkpoint-{step}')
-               loss_metric = float(metrics['loss'])
+            metrics = eval(model)
+            logger.info(f'Eval metric: {metrics}')
+            metrics['step'] = step
+            if loss_metric > float(metrics['loss']):
+                model.save(f'checkpoint-{step}')
+                loss_metric = float(metrics['loss'])
     model.save(f'last-checkpoint')
 
 

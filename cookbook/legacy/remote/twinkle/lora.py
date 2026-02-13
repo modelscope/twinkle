@@ -1,14 +1,15 @@
 import dotenv
+
 dotenv.load_dotenv('.env')
 import os
 from peft import LoraConfig
 
 from twinkle import get_device_placement, get_logger
 from twinkle.dataset import DatasetMeta
+from twinkle_client import init_twinkle_client
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
-from twinkle_client import init_twinkle_client
 
 logger = get_logger()
 
@@ -25,6 +26,8 @@ for run in runs:
     for checkpoint in checkpoints:
         logger.info(checkpoint.model_dump_json(indent=2))
         resume_path = checkpoint.twinkle_path
+
+
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
@@ -34,9 +37,7 @@ def train():
 
     model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
 
-    lora_config = LoraConfig(
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(target_modules='all-linear')
 
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
     model.set_template('Template')

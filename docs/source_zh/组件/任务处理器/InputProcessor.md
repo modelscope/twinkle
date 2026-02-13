@@ -14,7 +14,7 @@ class InputProcessor:
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]], **kwargs) -> Union[InputFeature, List[InputFeature]]:
         # 整体处理的入口
         ...
-    
+
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
         # 移动到 cuda 设备上
         ...

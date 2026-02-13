@@ -1,6 +1,8 @@
-from typing import Any, Union, Mapping, TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
+
 if TYPE_CHECKING:
     import torch
+
 
 def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: bool = False) -> Any:
     """Move inputs to a device"""
@@ -23,13 +25,13 @@ def pad_sequence_to_length(
 ) -> 'torch.Tensor':
     """
     Pad a 2D tensor in the last dimension to max_seq_len.
-    
+
     Args:
         tensor: Input tensor of shape [batch, seq_len]
         max_seq_len: Target sequence length
         pad_value: Value to use for padding
         left_pad: If True, pad on the left; otherwise pad on the right
-        
+
     Returns:
         Padded tensor of shape [batch, max_seq_len]
     """
@@ -39,7 +41,8 @@ def pad_sequence_to_length(
     pad_len = max_seq_len - tensor.shape[-1]
     # F.pad uses (left, right) for last dim
     pad_tuple = (pad_len, 0) if left_pad else (0, pad_len)
-    return F.pad(tensor, pad_tuple, mode="constant", value=pad_value)
+    return F.pad(tensor, pad_tuple, mode='constant', value=pad_value)
+
 
 # TODO: check and remove
 def pad_2d_list_to_tensor(
@@ -52,7 +55,7 @@ def pad_2d_list_to_tensor(
 ) -> 'torch.Tensor':
     """
     Pad a 2D list (e.g., list of logprobs) to a 2D tensor.
-    
+
     Args:
         data_list: List of lists, each inner list can have different lengths
         max_length: Target length. If None, uses the max length in data_list
@@ -60,7 +63,7 @@ def pad_2d_list_to_tensor(
         left_pad: If True, pad on the left (right-align data); otherwise pad on the right
         dtype: Output tensor dtype
         device: Output tensor device
-        
+
     Returns:
         Padded tensor of shape [batch, max_length]
     """
@@ -69,18 +72,18 @@ def pad_2d_list_to_tensor(
         dtype = torch.float32
     if not data_list:
         return torch.tensor([], dtype=dtype, device=device)
-    
+
     # Find max length
     lengths = [len(item) if item is not None else 0 for item in data_list]
     data_max_len = max(lengths) if lengths else 0
     target_len = max_length if max_length is not None and max_length > data_max_len else data_max_len
-    
+
     if target_len == 0:
         return torch.full((len(data_list), 0), pad_value, dtype=dtype, device=device)
-    
+
     batch_size = len(data_list)
     result = torch.full((batch_size, target_len), pad_value, dtype=dtype, device=device)
-    
+
     for i, item in enumerate(data_list):
         if item is None or len(item) == 0:
             continue
@@ -89,13 +92,14 @@ def pad_2d_list_to_tensor(
             values = item[-seq_len:] if left_pad else item[:seq_len]
         else:
             values = torch.tensor(item[-seq_len:] if left_pad else item[:seq_len], dtype=dtype, device=device)
-        
+
         if left_pad:
             result[i, -seq_len:] = values
         else:
             result[i, :seq_len] = values
-    
+
     return result
+
 
 def selective_log_softmax(logits, index) -> 'torch.Tensor':
     """
@@ -151,8 +155,8 @@ def _vocab_parallel_selective_log_softmax(
     logits: 'torch.Tensor',
     index: 'torch.Tensor',
 ) -> 'torch.Tensor':
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
     from megatron.core import mpu
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
     tp_group = mpu.get_tensor_model_parallel_group()
 
     return -fused_vocab_parallel_cross_entropy(logits, index, tp_group)

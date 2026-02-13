@@ -1,26 +1,25 @@
 import os
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
+os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-from peft import LoraConfig
-import twinkle
 import time
-from tqdm import tqdm
-from twinkle import DeviceMesh, Platform
-from twinkle import get_device_placement, get_logger
-from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, LazyDataset, PackingDataset, IterableDataset, IterablePackingDataset
-from twinkle.model import MultiLoraMegatronModel, MegatronModel, TransformersModel
-from twinkle.preprocessor import SelfCognitionProcessor
 import torch
+from peft import LoraConfig
+from tqdm import tqdm
+
+import twinkle
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta, IterableDataset, IterablePackingDataset, LazyDataset, PackingDataset
+from twinkle.model import MegatronModel, MultiLoraMegatronModel, TransformersModel
+from twinkle.preprocessor import SelfCognitionProcessor
+
 torch._dynamo.disable()
 if Platform.get_rank() == 0:
     import swanlab
     swanlab.login(api_key=os.environ['SWANLAB_API_KEY'], save=True)
 
-    run = swanlab.init(
-        project="megatron-swift",
-    )
-
+    run = swanlab.init(project='megatron-swift', )
 
 device_mesh = DeviceMesh.from_sizes(dp_size=2, fsdp_size=4)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
@@ -41,6 +40,7 @@ def eval(model):
     metrics = model.calculate_metric(is_training=False)
     return metrics
 
+
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     dataset.set_template('Template', model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', max_length=256)
@@ -49,17 +49,16 @@ def train():
     # dataset.pack_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=16, num_workers=0)
 
-    model = TransformersModel(model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507', fsdp_config={'transformer_cls_names_to_wrap':["Qwen3MoeSparseMoeBlock"]})
+    model = TransformersModel(
+        model_id='ms://Qwen/Qwen3-30B-A3B-Instruct-2507',
+        fsdp_config={'transformer_cls_names_to_wrap': ['Qwen3MoeSparseMoeBlock']})
 
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules='all-linear'
-    )
+    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
     model.apply_patch('ms://twinkle-kit/qwen3_moe_transformers4_patch')
     # model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
-    model.set_lr_scheduler(scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
+    model.set_lr_scheduler(
+        scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')

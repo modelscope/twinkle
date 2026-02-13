@@ -11,6 +11,7 @@ class DeviceMeshSampler(BatchSampler):
         original_sampler: The original BatchSampler.
         device_mesh: The device mesh.
     """
+
     def __init__(self, original_sampler: BatchSampler, device_mesh: DeviceMesh, min_batch_size: int = None):
         self.original_sampler = original_sampler
         self.device_mesh = device_mesh

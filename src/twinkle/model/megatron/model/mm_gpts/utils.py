@@ -1,14 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Reference: swift/swift/megatron/model/mm_gpts/utils.py
+import torch
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-
-import torch
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
-from twinkle.model.megatron.args import get_args
-from twinkle.utils import deep_getattr
 from transformers import PreTrainedModel
 from transformers.utils import ContextManagers
+
+from twinkle.model.megatron.args import get_args
+from twinkle.utils import deep_getattr
 
 
 @contextmanager
@@ -51,8 +51,7 @@ class HuggingFaceModule(_HuggingFaceModule, ABC):
         attn_impl = getattr(args, 'attn_impl', None) or 'flash_attn'
         # Handle both enum and string attention_backend
         attn_backend = args.attention_backend
-        is_flash = (getattr(attn_backend, 'name', attn_backend) == 'flash'
-                    if attn_backend else False)
+        is_flash = (getattr(attn_backend, 'name', attn_backend) == 'flash' if attn_backend else False)
         kwargs = {'attn_impl': attn_impl} if is_flash else {}
         ignore_init_model_cls = ignore_init_model_cls or []
         if not isinstance(ignore_init_model_cls, list):
@@ -60,13 +59,13 @@ class HuggingFaceModule(_HuggingFaceModule, ABC):
         context_list = [patch_device_map_meta(model_cls) for model_cls in ignore_init_model_cls]
         context_list.append(patch_hf_initialize_weight())
         kwargs['model_type'] = args.hf_model_type
-        from ..register import get_megatron_model_meta
         from transformers import AutoModel, AutoProcessor
+
+        from ..register import get_megatron_model_meta
         megatron_model_meta = get_megatron_model_meta(args.hf_model_type)
         auto_model_cls = megatron_model_meta.auto_model_cls if megatron_model_meta else AutoModel
         with ContextManagers(context_list):
-            model = auto_model_cls.from_pretrained(
-                args.model_dir, torch_dtype=args.torch_dtype, trust_remote_code=True)
+            model = auto_model_cls.from_pretrained(args.model_dir, torch_dtype=args.torch_dtype, trust_remote_code=True)
             self.processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
 
         self.model_config = model.config

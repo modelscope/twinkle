@@ -47,13 +47,13 @@ advantage_fn = RLOOAdvantage()
 for batch in dataloader:
     # 1. Sample generation (generate more samples to improve RLOO effectiveness)
     response = sampler.sample(batch, num_samples=8)
-    
+
     # 2. Calculate rewards
     rewards = reward_fn(response.trajectories, batch.ground_truths)
-    
+
     # 3. Calculate advantages
     advantages = advantage_fn(rewards, num_generations=8)
-    
+
     # 4. Policy optimization
     loss = actor.forward_backward(
         inputs=response.inputs,

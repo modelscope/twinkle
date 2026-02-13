@@ -46,13 +46,13 @@ class ServerLauncher:
 
     # Mapping of simplified import_path names to actual builder functions
     # These will be populated lazily to avoid circular imports
-    _TINKER_BUILDERS: Dict[str, str] = {
+    _TINKER_BUILDERS: dict[str, str] = {
         'server': 'build_server_app',
         'model': 'build_model_app',
         'sampler': 'build_sampler_app',
     }
 
-    _TWINKLE_BUILDERS: Dict[str, str] = {
+    _TWINKLE_BUILDERS: dict[str, str] = {
         'server': 'build_server_app',
         'model': 'build_model_app',
         'sampler': 'build_sampler_app',
@@ -61,9 +61,9 @@ class ServerLauncher:
 
     def __init__(
         self,
-        server_type: str = "twinkle",
-        config: Optional[Dict[str, Any]] = None,
-        ray_namespace: Optional[str] = None,
+        server_type: str = 'twinkle',
+        config: dict[str, Any] | None = None,
+        ray_namespace: str | None = None,
     ):
         """
         Initialize the server launcher.
@@ -73,18 +73,17 @@ class ServerLauncher:
             config: Configuration dictionary
             ray_namespace: Ray namespace (default: 'twinkle_cluster' for tinker, None for twinkle)
         """
-        if server_type not in ("tinker", "twinkle"):
-            raise ValueError(
-                f"server_type must be 'tinker' or 'twinkle', got '{server_type}'")
+        if server_type not in ('tinker', 'twinkle'):
+            raise ValueError(f"server_type must be 'tinker' or 'twinkle', got '{server_type}'")
 
         self.server_type = server_type
         self.config = config or {}
         self.ray_namespace = ray_namespace
-        self._builders: Dict[str, Callable] = {}
+        self._builders: dict[str, Callable] = {}
         self._ray_initialized = False
         self._serve_started = False
 
-    def _get_builders(self) -> Dict[str, Callable]:
+    def _get_builders(self) -> dict[str, Callable]:
         """
         Get the appropriate builder functions for the server type.
 
@@ -94,24 +93,15 @@ class ServerLauncher:
         if self._builders:
             return self._builders
 
-        if self.server_type == "tinker":
-            from twinkle.server.tinker import (
-                build_model_app,
-                build_sampler_app,
-                build_server_app,
-            )
+        if self.server_type == 'tinker':
+            from twinkle.server.tinker import build_model_app, build_sampler_app, build_server_app
             self._builders = {
                 'build_server_app': build_server_app,
                 'build_model_app': build_model_app,
                 'build_sampler_app': build_sampler_app,
             }
         else:  # twinkle
-            from twinkle.server import (
-                build_model_app,
-                build_processor_app,
-                build_sampler_app,
-                build_server_app,
-            )
+            from twinkle.server import build_model_app, build_processor_app, build_sampler_app, build_server_app
             self._builders = {
                 'build_server_app': build_server_app,
                 'build_model_app': build_model_app,
@@ -135,7 +125,7 @@ class ServerLauncher:
             ValueError: If the import_path cannot be resolved
         """
         builders = self._get_builders()
-        builder_map = self._TINKER_BUILDERS if self.server_type == "tinker" else self._TWINKLE_BUILDERS
+        builder_map = self._TINKER_BUILDERS if self.server_type == 'tinker' else self._TWINKLE_BUILDERS
 
         # Try to resolve through the mapping
         if import_path in builder_map:
@@ -147,10 +137,8 @@ class ServerLauncher:
         if import_path in builders:
             return builders[import_path]
 
-        raise ValueError(
-            f"Unknown import_path '{import_path}' for server_type '{self.server_type}'. "
-            f"Available: {list(builder_map.keys())}"
-        )
+        raise ValueError(f"Unknown import_path '{import_path}' for server_type '{self.server_type}'. "
+                         f'Available: {list(builder_map.keys())}')
 
     def _init_ray(self) -> None:
         """Initialize Ray if not already initialized."""
@@ -160,14 +148,14 @@ class ServerLauncher:
         import ray
 
         # Determine namespace
-        namespace = self.ray_namespace or self.config.get('ray_namespace') or "twinkle_cluster"
+        namespace = self.ray_namespace or self.config.get('ray_namespace') or 'twinkle_cluster'
 
         init_kwargs = {}
         init_kwargs['namespace'] = namespace
 
         if not ray.is_initialized():
             ray.init(**init_kwargs)
-            logger.info(f"Ray initialized with namespace={namespace}")
+            logger.info(f'Ray initialized with namespace={namespace}')
 
         self._ray_initialized = True
 
@@ -194,11 +182,11 @@ class ServerLauncher:
             http_options = dict(http_options) if http_options else {}
 
         serve.start(http_options=http_options)
-        logger.info(f"Ray Serve started with http_options={http_options}")
+        logger.info(f'Ray Serve started with http_options={http_options}')
 
         self._serve_started = True
 
-    def _deploy_application(self, app_config: Dict[str, Any]) -> None:
+    def _deploy_application(self, app_config: dict[str, Any]) -> None:
         """
         Deploy a single application.
 
@@ -213,7 +201,7 @@ class ServerLauncher:
         args = app_config.get('args', {}) or {}
         deployments = app_config.get('deployments', [])
 
-        logger.info(f"Starting {name} at {route_prefix}...")
+        logger.info(f'Starting {name} at {route_prefix}...')
 
         # Resolve builder function
         builder = self._resolve_builder(import_path)
@@ -226,15 +214,11 @@ class ServerLauncher:
                 # Copy all deployment options from the config, except 'name'.
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
 
-        
         # Build and deploy the application
-        app = builder(
-            deploy_options=deploy_options,
-            **{k: v for k, v in args.items()}
-        )
+        app = builder(deploy_options=deploy_options, **{k: v for k, v in args.items()})
 
         serve.run(app, name=name, route_prefix=route_prefix)
-        logger.info(f"Deployed {name} at {route_prefix}")
+        logger.info(f'Deployed {name} at {route_prefix}')
 
     def launch(self, wait: bool = True) -> None:
         """
@@ -248,7 +232,7 @@ class ServerLauncher:
 
         applications = self.config.get('applications', [])
         if not applications:
-            logger.warning("No applications configured")
+            logger.warning('No applications configured')
             return
 
         # Deploy each application
@@ -264,12 +248,12 @@ class ServerLauncher:
         host = http_options.get('host', 'localhost')
         port = http_options.get('port', 8000)
 
-        print("\nAll applications started!")
-        print("Endpoints:")
+        print('\nAll applications started!')
+        print('Endpoints:')
         for app_config in applications:
-            route_prefix = app_config.get(
-                'route_prefix', '/') if isinstance(app_config, dict) else app_config.route_prefix
-            print(f"  - http://{host}:{port}{route_prefix}")
+            route_prefix = app_config.get('route_prefix', '/') if isinstance(app_config,
+                                                                             dict) else app_config.route_prefix
+            print(f'  - http://{host}:{port}{route_prefix}')
 
         if wait:
             while True:
@@ -278,10 +262,10 @@ class ServerLauncher:
     @classmethod
     def from_yaml(
         cls,
-        config_path: Union[str, Path],
-        server_type: str = "twinkle",
-        ray_namespace: Optional[str] = None,
-    ) -> "ServerLauncher":
+        config_path: str | Path,
+        server_type: str = 'twinkle',
+        ray_namespace: str | None = None,
+    ) -> ServerLauncher:
         """
         Create a ServerLauncher from a YAML config file.
 
@@ -297,7 +281,7 @@ class ServerLauncher:
 
         config_path = Path(config_path)
         if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_path}")
+            raise FileNotFoundError(f'Config file not found: {config_path}')
 
         config = OmegaConf.load(config_path)
         config_dict = OmegaConf.to_container(config, resolve=True)
@@ -314,10 +298,10 @@ class ServerLauncher:
 
 
 def launch_server(
-    config: Optional[Dict[str, Any]] = None,
-    config_path: Optional[Union[str, Path]] = None,
-    server_type: str = "twinkle",
-    ray_namespace: Optional[str] = None,
+    config: dict[str, Any] | None = None,
+    config_path: str | Path | None = None,
+    server_type: str = 'twinkle',
+    ray_namespace: str | None = None,
     wait: bool = True,
 ) -> ServerLauncher:
     """

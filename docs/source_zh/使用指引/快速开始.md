@@ -71,7 +71,7 @@ device_group = [
             device_type='cuda',
         )
     ]
-  
+
 device_mesh = DeviceMesh.from_sizes(pp_size=2, tp_size=2, dp_size=2)
 twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_group)
 ```

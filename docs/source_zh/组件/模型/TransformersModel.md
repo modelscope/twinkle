@@ -4,7 +4,7 @@
 
 ```python
 class TransformersModel:
- 
+
     def __init__(self, # noqa
                  model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
                  model_id: Optional[str] = None,
