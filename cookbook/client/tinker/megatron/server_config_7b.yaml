@@ -21,8 +21,7 @@ applications:
     route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
     import_path: server            # Python module to import
     args:
-      server_config:
-        per_token_adapter_limit: 30      # Max concurrent LoRA adapters per user (global limit)
+
     deployments:
       - name: TinkerCompatServer
         autoscaling_config:
@@ -56,6 +55,7 @@ applications:
       adapter_config:
         adapter_timeout: 30                        # Seconds before idle adapter unload
         adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
+        per_token_adapter_limit: 30
     deployments:
       - name: ModelManagement
         autoscaling_config:

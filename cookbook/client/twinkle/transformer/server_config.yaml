@@ -49,8 +49,7 @@ applications:
         device_type: cuda
       device_mesh:                    # Distributed training mesh configuration
         device_type: cuda
-        mesh: [0,1]                   # Device indices in the mesh
-        mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
+        dp_size: 2                    # Mesh dimension names: 'dp' = data parallel
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -59,6 +58,10 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 3. Processor Service - Handles data preprocessing on CPU
   #    Runs tokenization, template application, and other CPU-bound tasks.
@@ -84,6 +87,10 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 4. Sampler Service - Handles text generation inference
   #    Uses vLLM for efficient batched generation with optional LoRA adapters.
@@ -93,7 +100,7 @@ applications:
     args:
       model_id: "ms://Qwen/Qwen2.5-3B-Instruct"        # ModelScope model identifier to load
       sampler_type: vllm                                 # Sampler backend (vllm or torch)
-      nproc_per_node: 1                                  # Number of GPU processes per node
+      nproc_per_node: 2                                  # Number of GPU processes per node
       engine_args:                                       # vLLM engine configuration
         gpu_memory_utilization: 0.4
         max_model_len: 1024
@@ -102,12 +109,11 @@ applications:
         adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
       device_group:
         name: sampler
-        ranks: [0]                                     # GPU rank indices to use
+        ranks: [4]                                     # GPU rank indices to use
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0]
-        mesh_dim_names: ['dp']
+        dp_size: 1
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -116,3 +122,7 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
