@@ -20,15 +20,16 @@ class CompletionRewardMetric(Metric):
         self.rewards = {}
         self.completion_lengths = []
 
-    def accumulate(self,
-                   inputs=None, # ignore
-                   outputs=None,# ignore
-                   *,
-                   rewards=None,
-                   completion_lengths=None,
-                   generate_time: float = None,
-                   weight_sync_time: float = None,
-                   **kwargs):
+    def accumulate(
+            self,
+            inputs=None,  # ignore
+            outputs=None,  # ignore
+            *,
+            rewards=None,
+            completion_lengths=None,
+            generate_time: float = None,
+            weight_sync_time: float = None,
+            **kwargs):
         if completion_lengths is None:
             completion_lengths = []
         if rewards is None:
