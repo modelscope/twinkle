@@ -2,7 +2,6 @@
 import re
 from typing import List, Union
 
-from twinkle import remote_class, remote_function
 from twinkle.data_format import Trajectory
 from twinkle.reward.base import Reward
 

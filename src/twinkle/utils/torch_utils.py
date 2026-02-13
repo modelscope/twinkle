@@ -44,63 +44,6 @@ def pad_sequence_to_length(
     return F.pad(tensor, pad_tuple, mode='constant', value=pad_value)
 
 
-# TODO: check and remove
-def pad_2d_list_to_tensor(
-    data_list: List[List],
-    max_length: Optional[int] = None,
-    pad_value: float = 0.0,
-    left_pad: bool = False,
-    dtype: 'torch.dtype' = None,
-    device: Optional[Union[str, 'torch.device']] = None,
-) -> 'torch.Tensor':
-    """
-    Pad a 2D list (e.g., list of logprobs) to a 2D tensor.
-
-    Args:
-        data_list: List of lists, each inner list can have different lengths
-        max_length: Target length. If None, uses the max length in data_list
-        pad_value: Value to use for padding
-        left_pad: If True, pad on the left (right-align data); otherwise pad on the right
-        dtype: Output tensor dtype
-        device: Output tensor device
-
-    Returns:
-        Padded tensor of shape [batch, max_length]
-    """
-    import torch
-    if dtype is None:
-        dtype = torch.float32
-    if not data_list:
-        return torch.tensor([], dtype=dtype, device=device)
-
-    # Find max length
-    lengths = [len(item) if item is not None else 0 for item in data_list]
-    data_max_len = max(lengths) if lengths else 0
-    target_len = max_length if max_length is not None and max_length > data_max_len else data_max_len
-
-    if target_len == 0:
-        return torch.full((len(data_list), 0), pad_value, dtype=dtype, device=device)
-
-    batch_size = len(data_list)
-    result = torch.full((batch_size, target_len), pad_value, dtype=dtype, device=device)
-
-    for i, item in enumerate(data_list):
-        if item is None or len(item) == 0:
-            continue
-        seq_len = min(len(item), target_len)
-        if torch.is_tensor(item):
-            values = item[-seq_len:] if left_pad else item[:seq_len]
-        else:
-            values = torch.tensor(item[-seq_len:] if left_pad else item[:seq_len], dtype=dtype, device=device)
-
-        if left_pad:
-            result[i, -seq_len:] = values
-        else:
-            result[i, :seq_len] = values
-
-    return result
-
-
 def selective_log_softmax(logits, index) -> 'torch.Tensor':
     """
     refer: trl/trainer/utils

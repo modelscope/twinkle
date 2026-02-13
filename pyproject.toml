@@ -22,6 +22,7 @@ transformers = [
   "torch>=2.6.0,<3.0.0",
   "torchvision",
 ]
+kernels = ["kernels"]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]"]
 vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]

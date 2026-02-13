@@ -17,6 +17,7 @@ Usage:
 import argparse
 import datetime
 import os
+import pytest
 import sys
 import time
 
@@ -47,7 +48,8 @@ def get_model_path():
     return MODEL_ID
 
 
-def test_weight_sync(model_gpus: int, sampler_gpus: int, vllm_tp: int):
+@pytest.mark.skip(reason='Requires 4+ GPUs and 30B model, run manually: python tests/sampler/test_30b_weight_sync.py')
+def test_weight_sync(model_gpus: int = 2, sampler_gpus: int = 1, vllm_tp: int = 1):
     from peft import LoraConfig
 
     import twinkle
