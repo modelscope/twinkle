@@ -28,6 +28,7 @@ wheels/
 /package
 /temp
 MANIFEST
+.locks/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -134,7 +135,6 @@ wandb/
 benchmarks/
 eval_output/
 eval_outputs/
-transformers/
 vlmeval/
 my_model/
 /data
@@ -142,6 +142,7 @@ result/
 images
 /custom/
 megatron_output/
+.qoder
 
 # Pytorch
 *.pth
@@ -149,3 +150,6 @@ megatron_output/
 
 # ast template
 ast_index_file.py
+test_cookbook/
+/test*.py
+swanlog/

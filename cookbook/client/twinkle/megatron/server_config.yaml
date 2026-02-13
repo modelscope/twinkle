@@ -1,0 +1,87 @@
+# Twinkle Server Configuration - Megatron Backend
+
+# Server protocol type: "twinkle" for the native Twinkle client protocol
+server_type: twinkle
+
+# proxy_location: determines where the HTTP proxy runs.
+# "EveryNode" means each Ray node runs its own proxy (good for multi-node).
+proxy_location: EveryNode
+
+# HTTP listener settings
+http_options:
+  host: 0.0.0.0        # Listen on all network interfaces
+  port: 8000            # Port number for the server
+
+# Applications: each entry defines a service component deployed on the server
+applications:
+
+  # 1. TwinkleServer - The central management server
+  #    Handles client connections, training run tracking, checkpoint listing.
+  - name: server
+    route_prefix: /server          # API endpoint prefix
+    import_path: server            # Python module to import
+    args:
+
+    deployments:
+      - name: TwinkleServer
+        autoscaling_config:
+          min_replicas: 1                # Minimum number of replicas
+          max_replicas: 1                # Maximum number of replicas
+          target_ongoing_requests: 128   # Target concurrent requests per replica
+        ray_actor_options:
+          num_cpus: 0.1                  # CPU resources allocated to this actor
+
+  # 2. Model Service - Hosts the base model for training (Megatron backend)
+  #    This is the actual model worker that performs forward/backward passes.
+  - name: models-Qwen2.5-3B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
+    import_path: model
+    args:
+      use_megatron: true                               # Use Megatron-LM backend (not HuggingFace)
+      mixed_precision: bf16
+      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
+      nproc_per_node: 2               # Number of GPU processes per node
+      device_group:                   # Logical device group for this model
+        name: model
+        ranks: [0,1]                  # GPU rank indices to use
+        device_type: cuda
+      device_mesh:                    # Distributed training mesh configuration
+        device_type: cuda
+        mesh: [0,1]                   # Device indices in the mesh
+        mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
+      adapter_config:
+        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
+        adapter_timeout: 1800                      # Seconds before idle adapter unload
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  # 3. Processor Service - Handles data preprocessing on CPU
+  #    Runs tokenization, template application, and other CPU-bound tasks.
+  - name: processor
+    route_prefix: /processors
+    import_path: processor
+    args:
+      nproc_per_node: 2               # Number of processor workers per node
+      ncpu_proc_per_node: 2           # Number of CPU processes per node
+      device_group:
+        name: model
+        ranks: 2                      # CPU rank index
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        mesh: [0,1]
+        mesh_dim_names: ['dp']
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1

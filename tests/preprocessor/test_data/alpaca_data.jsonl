@@ -1,0 +1,5 @@
+{"instruction": "Explain what AI is", "input": "", "output": "AI (Artificial Intelligence) is the simulation of human intelligence by machines."}
+{"instruction": "Translate the following text", "input": "Hello", "output": "你好"}
+{"instruction": "Summarize this text", "input": "Python is a programming language.", "output": "Python is a programming language."}
+{"instruction": "What is the capital of France?", "output": "The capital of France is Paris."}
+{"instruction": "Write a poem", "input": "about nature", "output": "Nature's beauty surrounds us..."}

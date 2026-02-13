@@ -1,0 +1,15 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+
+from ..utils import wrap_builder_with_device_group_env
+from .model import build_model_app as _build_model_app
+from .sampler import build_sampler_app as _build_sampler_app
+from .server import build_server_app
+
+build_model_app = wrap_builder_with_device_group_env(_build_model_app)
+build_sampler_app = wrap_builder_with_device_group_env(_build_sampler_app)
+
+__all__ = [
+    'build_model_app',
+    'build_sampler_app',
+    'build_server_app',
+]

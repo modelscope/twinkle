@@ -1,0 +1,13 @@
+product_id,name,price,category,stock,rating,description,supplier,created_date
+P001,"Laptop Pro 15",1299.99,"Electronics",50,4.5,"High-performance laptop with 16GB RAM","Supplier A","2024-01-01"
+P002,"Wireless Mouse",29.99,"Accessories",200,4.2,"Ergonomic wireless mouse","Supplier B","2024-01-02"
+P003,"Mechanical Keyboard",149.99,"Accessories",75,4.7,"RGB mechanical keyboard","Supplier A","2024-01-03"
+P004,"Monitor 27inch",399.99,"Electronics",30,4.6,"4K UHD monitor","Supplier C","2024-01-04"
+P005,"USB-C Cable",19.99,"Accessories",500,4.0,"Fast charging USB-C cable","Supplier B","2024-01-05"
+P006,"Webcam HD",79.99,"Electronics",100,4.3,"1080p HD webcam","Supplier A","2024-01-06"
+P007,"Headphones Pro",199.99,"Audio",80,4.8,"Noise-cancelling headphones","Supplier C","2024-01-07"
+P008,"Speaker System",299.99,"Audio",40,4.4,"2.1 channel speaker system","Supplier B","2024-01-08"
+P009,"Tablet 10inch",499.99,"Electronics",60,4.5,"10-inch Android tablet","Supplier A","2024-01-09"
+P010,"Smart Watch",249.99,"Wearables",90,4.6,"Fitness tracking smartwatch","Supplier C","2024-01-10"
+P011,"Phone Case",24.99,"Accessories",300,4.1,"Protective phone case","Supplier B","2024-01-11"
+P012,"Power Bank",49.99,"Accessories",150,4.3,"20000mAh power bank","Supplier A","2024-01-12"

@@ -1,0 +1,105 @@
+# Twinkle Server Configuration - Tinker-Compatible Transformers Backend
+
+# Server protocol type: "tinker" enables the Tinker-compatible API
+server_type: tinker
+
+# proxy_location: determines where the HTTP proxy runs.
+# "EveryNode" means each Ray node runs its own proxy (good for multi-node).
+proxy_location: EveryNode
+
+# HTTP listener settings
+http_options:
+  host: 0.0.0.0        # Listen on all network interfaces
+  port: 8000            # Port number for the server
+
+# Applications: each entry defines a service component deployed on the server
+applications:
+
+  # 1. TinkerCompatServer - The central API server
+  #    Handles client connections, training run tracking, checkpoint listing.
+  - name: server
+    route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
+    import_path: server            # Python module to import
+    args:
+
+    deployments:
+      - name: TinkerCompatServer
+        autoscaling_config:
+          min_replicas: 1                # Minimum number of replicas
+          max_replicas: 1                # Maximum number of replicas
+          target_ongoing_requests: 128   # Target concurrent requests per replica
+        ray_actor_options:
+          num_cpus: 0.1                  # CPU resources allocated to this actor
+
+  # 2. Model Service (commented out) - Would host the base model for training.
+  #    Uncomment and configure if you need a training model worker.
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
+    import_path: model
+    args:
+      use_megatron: false                          # Use HuggingFace Transformers backend
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
+      max_length: 10240
+      nproc_per_node: 2                            # Number of GPU processes per node
+      device_group:
+        name: model
+        ranks: [0,1]                              # GPU rank indices
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 2
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 100000                           # Max tokens per second
+      adapter_config:
+        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
+        adapter_timeout: 1800                      # Seconds before idle adapter unload
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
+
+  # 3. Sampler Service - Runs inference / sampling using vLLM engine
+  #    Used for generating text from the model (e.g., evaluating LoRA results).
+  - name: sampler-Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-7B-Instruct
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"   # ModelScope model identifier
+      nproc_per_node: 2               # Number of GPU processes per node
+      sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
+      engine_args:                    # vLLM engine-specific settings
+        max_model_len: 4096           # Maximum sequence length the engine supports
+        gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
+        enable_lora: true             # Allow loading LoRA adapters during inference
+        logprobs_mode: processed_logprobs # Logprobs mode for sampling results
+      device_group:                   # Logical device group for the sampler
+        name: sampler
+        ranks: [2]                    # GPU rank indices to use
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100                             # Max requests per second
+        tps_limit: 100000                           # Max tokens per second
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"

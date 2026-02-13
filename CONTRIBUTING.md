@@ -1,63 +1,67 @@
-# Contributor Guide
+# Contributor Guidelines
 
-_Welcome to offer PRs, bug reports, documentation supplements or other types of contributions to SWIFT!_
+*Welcome to contribute Feature PRs, Bug reports, documentation, or other types of contributions to twinkle!*
 
 ## Table of Contents
+
 - [Code of Conduct](#-code-of-conduct)
 - [Contribution Process](#-contribution-process)
-- [Hardware support](#-Hardware-support)
+- [Resource Support](#-resource-support)
 
 ## 📖 Code of Conduct
-Please refer to our [Code of Conduct documentation](./CODE_OF_CONDUCT.md).
+
+Please refer to our [Code of Conduct document](./CODE_OF_CONDUCT.md).
 
 ## 🔁 Contribution Process
+
 ### What We Need
-- New Technologies and New Models: SWIFT needs to support more open-source models and datasets, or new technologies that we have not paid attention to. If you are interested please submit a PR to us.
-- Technical Propagation: If you are interested in technical propagation, you are welcome to help us write tutorials, documents or videos on any website, and send us the link.
-- Community Contribution: You can write technical articles related to SWIFT, and submit them to us. After review and approval, we will publish them on the official ModelScope accounts (Zhihu, WeChat, etc.), with your name assigned.
+
+- New components: You can contribute excellent components to the twinkle project, or contribute them to the modelhub in the ModelScope/Hugging Face community following the component protocol, making them available for other developers to use
+- New kernels: You can contribute low-level kernels to the twinkle project. These kernels can be integrated into models to achieve better training value
+
+Your contributions will help other developers. Please add your component name, location, and usage documentation link in the Community Components section of the README in your code PR.
 
 ### Incentives
-- we will issue electronic certificates to contributors on behalf of the ModelScope community, to encourage your selfless contributions.
-- We will offer small souvenirs related to the ModelScope Community.
-- We will provide free A10 computing power during the development period. For more details, please refer to [Hardware-support](#-Hardware-support) section.
 
-### Submitting PR (Pull Requests)
+- We will issue electronic certificates to contributors on behalf of the ModelScope community to acknowledge your selfless contributions.
+- We will give away ModelScope community merchandise and small gifts.
 
-Any feature development is carried out in the form of Fork and then PR on GitHub.
-1. Fork: Go to the [ms-swift](https://github.com/modelscope/ms-swift) page and click the **Fork button**. After completion, a SWIFT code repository will be cloned under your personal organization.
-2. Clone: Clone the code repository generated in the first step to your local machine and **create a new branch** for development. During development, please click the **Sync Fork button** in time to synchronize with the `main` branch to prevent code expiration and conflicts.
-3. Submit PR: After development and testing, push the code to the remote branch. On GitHub, go to the **Pull Requests page**, create a new PR, select your code branch as the source branch, and the `modelscope/swift:main` branch as the target branch.
+### Submitting PRs (Pull Requests)
 
-4. Write Description: It is necessary to provide a good feature description in the PR, so that the reviewers know the content of your modification.
-5. Review: We hope that the code to be merged is concise and efficient, so we may raise some questions and discuss them. Please note that any issues raised in the review are aimed at the code itself, not at you personally. Once all issues are discussed and resolved, your code will be approved.
+All feature development is conducted on GitHub using a Fork-then-PR workflow.
 
-### Code Standards and Development Approach
-SWIFT has conventional variable naming conventions and development approaches. Please follow these approaches as much as possible during development.
-1. Variable names are separated by underscores, and class names are named with the first letter of each word capitalized.
-2. All Python indentation uses four spaces instead of a tab.
-3. Choose well-known open-source libraries, avoid using closed-source libraries or unstable open-source libraries, and avoid repeating the existing code.
+1. Fork: Go to the [twinkle](https://github.com/modelscope/twinkle) page and click the **Fork button**. This will clone a twinkle repository under your personal organization
 
-After the PR is submitted, SWIFT will perform two types of tests:
-- Code Lint Test: A static code compliance check test. please make sure that you have performed code lint locally in advance.
-```shell
-pip install pre-commit # In the swift folder
-pre-commit run --all-files # Fix the errors reported by pre-commit until all checks are successful
-```
-- CI Tests: Smoke tests and unit tests, please refer to the next section.
+2. Clone: Clone the repository created in step one to your local machine and **create a new branch** for development. During development, please click the **Sync Fork button** regularly to sync with the `main` branch to prevent code from becoming outdated and causing conflicts
+
+3. Submit PR: After development and testing are complete, push your code to the remote branch. On GitHub, click the **Pull Requests page** and create a new PR. Select your code branch as the source branch and `modelscope/twinkle:main` as the target branch
+
+4. Write Description: It is essential to provide a good feature description in your PR so that reviewers understand your changes
+
+5. Review: We want the merged code to be clean and efficient, so we may raise some questions for discussion. Please note that any questions raised during review are about the code itself, not about you personally. Once all issues have been discussed and resolved, your code will be approved
+
+### Code Standards and Development Practices
+
+twinkle has established conventions for variable naming and development practices. Please try to follow these conventions during development.
+
+1. Variable names use underscore separation; class names use PascalCase (capitalize the first letter of each word)
+2. All Python indentation uses four spaces instead of one tab
+3. Use well-known open-source libraries; avoid closed-source or unstable open-source libraries; avoid reinventing the wheel
+
+twinkle runs two types of tests after a PR is submitted:
+
+- Code Lint Tests: Static code analysis tests. To ensure this test passes, please run Code lint locally beforehand. Here's how:
+
+  ```shell
+  pip install pre-commit
+  pre-commit run --all-files
+  # Fix any errors reported by pre-commit until all checks pass
+  ```
+
+- CI Tests: Smoke tests and unit tests. Please refer to the next section
 
 ### Running CI Tests
-Before submitting the PR, please ensure that your development code is protected by test cases, such as smoke tests for new features, or unit tests for various edge cases. Reviewers will also pay attention to this during code review. At the same time, there will be dedicated services running CI Tests, running all test cases, and the code can only be merged after the test cases pass.
 
-Additionally, since some important tests have been skipped due to long running time, to ensure that your logic is correct, you can run the test locally:
-```shell
-python tests/llm/test_run.py
-```
-Please make sure this test can pass normally.
+Before submitting a PR, please ensure your development code is protected by test cases. For example, smoke tests for new features, or unit tests for various edge cases. Reviewers will also pay attention to this during code review. Additionally, a dedicated service will run CI Tests, executing all test cases. Code can only be merged after all test cases pass.
 
-## ✅ Hardware support
-
-SWIFT will provide hardware support for developers, including free GPUs. If needed, please email us ([contact@modelscope.cn](mailto:contact@modelscope.cn)) or join our WeChat group:
-
-<p align="left">
-<img src="asset/wechat.png" width="250" style="display: inline-block;">
-</p>
+Please ensure these tests pass successfully.
