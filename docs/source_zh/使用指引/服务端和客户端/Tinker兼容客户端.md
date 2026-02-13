@@ -45,7 +45,7 @@ from twinkle_client import init_tinker_compat_client
 # Step 1: 初始化客户端（会自动 patch Tinker SDK）
 service_client = init_tinker_compat_client(
     base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_SDK_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
 )
 
 # Step 2: 查询已有训练运行（可选）

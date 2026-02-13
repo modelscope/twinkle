@@ -216,7 +216,7 @@ def main():
     # Step 2: Initialize the Tinker-compatible client
     logger.info('Connecting to Tinker server...')
     service_client = init_tinker_compat_client(
-        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
     logger.info('Creating LoRA training client...')
     # Create a LoRA training client for GRPO

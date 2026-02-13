@@ -44,7 +44,7 @@ def train():
 
     # Connect to the Twinkle server running locally
     service_client = init_tinker_compat_client(
-        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
     training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
