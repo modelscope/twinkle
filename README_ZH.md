@@ -331,3 +331,12 @@ for epoch in range(3):
 | 组件类型 | 组件链接                                                                                           | 组件功能                                                                      | 作者              |
 | -------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------- |
 | Patch    | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | 修复 Qwen3 MoE 模型在 FSDP2 训练期间挂起的问题，适用于 transformers==4.x | ModelScope 官方 |
+
+## 致谢
+
+本项目由 Workshop 组织下的多个团队共同维护和支持：
+
+- ModelScope官方团队
+- 招商银行开源技术团队
+
+Twinkle 的构建基于多个优秀的开源项目，包括 [Transformers](https://github.com/huggingface/transformers)、[MS-SWIFT](https://github.com/modelscope/swift)、[veRL](https://github.com/verl-project/verl) 等。

@@ -352,3 +352,12 @@ foundation for building customizable, enterprise-grade training services.
 | Component Type | Component Link                                                                                           | Component Function                                                                      | Author              |
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
+
+## Acknowledgements
+
+This project is maintained and supported by multiple teams under Workshop:
+
+- ModelScope Team
+- CMB-Tech Team
+
+Twinkle is built on the shoulders of giants, including [Transformers](https://github.com/huggingface/transformers),[MS-SWIFT](https://github.com/modelscope/swift), [veRL](https://github.com/verl-project/verl), and other excellent projects.
