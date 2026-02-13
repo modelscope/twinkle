@@ -14,7 +14,7 @@ from twinkle_client import init_tinker_compat_client
 base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
 service_client = init_tinker_compat_client(
     base_url='http://www.modelscope.cn/twinkle',
-    api_key=os.environ.get('MODELSCOPE_SDK_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
 )
 # Step 2: Create a sampling client by loading weights from a saved checkpoint.
 # The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.

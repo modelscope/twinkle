@@ -26,7 +26,7 @@ use_megatron = True
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.

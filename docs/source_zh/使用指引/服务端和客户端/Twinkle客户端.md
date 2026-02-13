@@ -76,7 +76,7 @@ logger = get_logger()
 # Step 1: 初始化客户端
 client = init_twinkle_client(
     base_url='http://127.0.0.1:8000',
-    api_key=os.environ.get('MODELSCOPE_SDK_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
 )
 
 # Step 2: 查询已有训练运行（可选，用于恢复训练）
