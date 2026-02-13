@@ -31,7 +31,8 @@ class ServerState:
     def __init__(
             self,
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
-            cleanup_interval: float = 3600.0) -> None:  # 1 hour in seconds
+            cleanup_interval: float = 3600.0,
+            **kwargs) -> None:  # 1 hour in seconds
         # Session tracking
         self.sessions: dict[str, dict[str, Any]] = {}
         # Model registration
@@ -67,6 +68,7 @@ class ServerState:
             'user_metadata': payload.get('user_metadata') or {},
             'sdk_version': payload.get('sdk_version'),
             'created_at': datetime.now().isoformat(),
+            'last_heartbeat': time.time(),
         }
         return session_id
 
@@ -84,6 +86,21 @@ class ServerState:
             return False
         self.sessions[session_id]['last_heartbeat'] = time.time()
         return True
+
+    def get_session_last_heartbeat(self, session_id: str) -> float | None:
+        """
+        Get the last heartbeat timestamp for a session.
+
+        Args:
+            session_id: The session ID to query
+
+        Returns:
+            Last heartbeat timestamp, or None if session doesn't exist
+        """
+        session_info = self.sessions.get(session_id)
+        if not session_info:
+            return None
+        return session_info.get('last_heartbeat')
 
     # ----- Model Registration -----
 
@@ -461,6 +478,9 @@ class ServerStateProxy:
     def touch_session(self, session_id: str) -> bool:
         return ray.get(self._actor.touch_session.remote(session_id))
 
+    def get_session_last_heartbeat(self, session_id: str) -> float | None:
+        return ray.get(self._actor.get_session_last_heartbeat.remote(session_id))
+
     # ----- Model Registration -----
 
     def register_model(self, payload: dict[str, Any], model_id: str | None = None, token: str | None = None) -> str:
@@ -553,7 +573,9 @@ class ServerStateProxy:
         return ray.get(self._actor.get_cleanup_stats.remote())
 
 
-def get_server_state(actor_name: str = 'twinkle_server_state', auto_start_cleanup: bool = True) -> ServerStateProxy:
+def get_server_state(actor_name: str = 'twinkle_server_state',
+                     auto_start_cleanup: bool = True,
+                     **server_state_kwargs) -> ServerStateProxy:
     """
     Get or create the ServerState Ray actor.
 
@@ -563,6 +585,8 @@ def get_server_state(actor_name: str = 'twinkle_server_state', auto_start_cleanu
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state')
         auto_start_cleanup: Whether to automatically start the cleanup task (default: True)
+        **server_state_kwargs: Additional keyword arguments passed to ServerState constructor
+            (e.g., expiration_timeout, cleanup_interval, per_token_adapter_limit)
 
     Returns:
         A ServerStateProxy for interacting with the actor
@@ -572,7 +596,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state', auto_start_cleanu
     except ValueError:
         try:
             _ServerState = ray.remote(ServerState)
-            actor = _ServerState.options(name=actor_name, lifetime='detached').remote()
+            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(**server_state_kwargs)
             # Start cleanup task for newly created actor
             if auto_start_cleanup:
                 try:

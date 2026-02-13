@@ -56,11 +56,6 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
-    # adapter_config can be None; expanding with ** would raise TypeError and break Serve init.
-    # Normalize to {} so AdapterManagerMixin uses its default timeout/limits.
-    if adapter_config is None:
-        adapter_config = {}
-
     app = FastAPI()
 
     @app.middleware('http')
@@ -123,6 +118,37 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
+        def _cleanup_adapter(self, adapter_name: str) -> None:
+            """Common adapter cleanup logic used by both manual unload and automatic expiration.
+
+            This method handles:
+            1. Clearing adapter state
+            2. Removing adapter from model
+            3. Unregistering from adapter manager
+            4. Removing from server state
+
+            Args:
+                adapter_name: Name of the adapter to clean up
+            """
+            # Remove from model if it exists
+            if self.get_adapter_info(adapter_name):
+                # Clear adapter state
+                self.clear_adapter_state(adapter_name)
+
+                self.model.remove_adapter(adapter_name)
+                # Unregister from adapter manager
+                self.unregister_adapter(adapter_name)
+
+                # Remove from server state
+                self.state.unload_model(adapter_name)
+
+        def _on_adapter_expired(self, adapter_name: str) -> None:
+            # Called from AdapterManagerMixin's countdown thread.
+            # Fail any pending tasks for this adapter/model.
+            self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
+            # Perform common cleanup (without token since it's automatic)
+            self._cleanup_adapter(adapter_name)
+
         @app.post('/create_model')
         async def create_model(self, request: Request, body: types.CreateModelRequest) -> types.UntypedAPIFuture:
             """Create a new model adapter for training.
@@ -146,31 +172,32 @@ def build_model_app(model_id: str,
             async def _create_adapter():
                 try:
                     if body.lora_config:
-                        # Check adapter limit before creating
-                        allowed, reason = self.check_adapter_limit(request.state.token, True)
-                        if not allowed:
-                            raise RuntimeError(reason)
-
                         # TODO: support more lora config parameters, train_unembed, etc.
                         lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
 
                         adapter_name = self.get_adapter_name(adapter_name=model_id)
-                        self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
 
-                        # Register adapter with rate limiter for lifecycle tracking
-                        self.register_adapter(adapter_name, request.state.token)
+                        # Register adapter FIRST (limit check happens inside register_adapter)
+                        self.register_adapter(adapter_name, request.state.token, session_id=body.session_id)
+
+                        # Create adapter AFTER successful registration
+                        self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
 
                         self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                         self.model.set_processor('InputProcessor', adapter_name=adapter_name)
                         self.model.set_optimizer('Adam', adapter_name=adapter_name)
+
+                        # Fresh adapter has no accumulated gradients.
+                        self.set_adapter_state(adapter_name, 'grad_ready', False)
 
                     training_run_manager = create_training_run_manager(request.state.token)
                     training_run_manager.save(model_id, body)
 
                     return types.CreateModelResponse(model_id=model_id)
                 except Exception:
-                    # If adapter creation fails, decrement the count
-                    self.check_adapter_limit(request.state.token, False)
+                    # Ensure we don't leave stale grad state.
+                    adapter_name = self.get_adapter_name(adapter_name=model_id)
+                    self._cleanup_adapter(adapter_name)
 
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
@@ -179,9 +206,10 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _create_adapter(),
+                _create_adapter,
                 model_id=model_id,
                 token=request.state.token,
+                task_type='create_model',
             )
 
         @app.post('/get_info')
@@ -230,19 +258,15 @@ def build_model_app(model_id: str,
             async def _do_unload():
                 # Only remove adapter, not the base model
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                if self.get_adapter_info(adapter_name):
-                    self.model.remove_adapter(adapter_name)
-                    # Unregister adapter from rate limiter
-                    self.unregister_adapter(adapter_name)
-                    # Decrement adapter count via rate limiter
-                    self.check_adapter_limit(request.state.token, False)
-                self.state.unload_model(body.model_id)
+                # Use common cleanup logic
+                self._cleanup_adapter(adapter_name)
                 return types.UnloadModelResponse(model_id=body.model_id)
 
             return await self.schedule_task(
-                _do_unload(),
+                _do_unload,
                 model_id=body.model_id,
                 token=request.state.token,
+                task_type='unload_model',
             )
 
         @app.post('/forward')
@@ -268,10 +292,6 @@ def build_model_app(model_id: str,
                     self.touch_adapter(adapter_name)
 
                     datum_list = body.forward_input.data
-                    assert len(datum_list) >= self.device_mesh.data_world_size, (f'Batch size {len(datum_list)} must '
-                                                                                 f'be greater than data world size '
-                                                                                 f'{self.device_mesh.data_world_size}')
-
                     loss_fn_config = body.forward_input.loss_fn_config or {}
 
                     output = self.model.forward_only(inputs=datum_list, adapter_name=adapter_name)
@@ -288,13 +308,18 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            # Calculate input tokens for rate limiting
-            input_tokens = sum(len(d.model_input.to_ints()) for d in body.forward_input.data)
+            # Calculate input tokens and batch size for validation
+            datum_list = body.forward_input.data
+            input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
+            batch_size = len(datum_list)
             return await self.schedule_task(
-                _do_forward(),
+                _do_forward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
+                task_type='forward',
             )
 
         @app.post('/forward_backward')
@@ -324,18 +349,18 @@ def build_model_app(model_id: str,
                     self.touch_adapter(adapter_name)
 
                     datum_list = body.forward_backward_input.data
-                    assert len(datum_list) >= self.device_mesh.data_world_size, (
-                        f'Batch size {len(datum_list)} must be greater '
-                        f'than data world size {self.device_mesh.data_world_size}')
-
                     loss_fn = body.forward_backward_input.loss_fn
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
                     # Unified forward_backward for both Megatron and Transformers
                     output, loss = self.model.forward_backward(
                         inputs=datum_list, adapter_name=adapter_name, loss_fn=loss_fn, **loss_fn_config)
-                    output_type = ('ImportanceSamplingLossReturn'
-                                   if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn')
+                    if loss_fn == 'importance_sampling':
+                        output_type = 'ImportanceSamplingLossReturn'
+                    else:
+                        output_type = 'CrossEntropyLossReturn'
+                    # Mark gradients as ready after a successful forward_backward.
+                    self.set_adapter_state(adapter_name, 'grad_ready', True)
                     return types.ForwardBackwardOutput(
                         loss_fn_output_type=output_type,
                         loss_fn_outputs=output,
@@ -348,13 +373,18 @@ def build_model_app(model_id: str,
                         category=types.RequestErrorCategory.Server,
                     )
 
-            # Calculate input tokens for rate limiting
-            input_tokens = sum(len(d.model_input.to_ints()) for d in body.forward_backward_input.data)
+            # Calculate input tokens and batch size for validation
+            datum_list = body.forward_backward_input.data
+            input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
+            batch_size = len(datum_list)
             return await self.schedule_task(
-                _do_forward_backward(),
+                _do_forward_backward,
                 model_id=body.model_id,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
+                task_type='forward_backward',
             )
 
         @app.post('/optim_step')
@@ -376,10 +406,18 @@ def build_model_app(model_id: str,
                     adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
+                    # Disallow empty step (must have at least one forward_backward since last step)
+                    if not self.get_adapter_state(adapter_name, 'grad_ready', False):
+                        raise RuntimeError(
+                            f'No accumulated gradients for adapter={adapter_name}; call forward_backward before optim_step'  # noqa: E501
+                        )
+
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
                     self.model.step(adam_params=body.adam_params, adapter_name=adapter_name)
+                    # Clear grad-ready after a successful step.
+                    self.set_adapter_state(adapter_name, 'grad_ready', False)
                     metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
                     return types.OptimStepResponse(metrics=metrics)
                 except Exception:
@@ -390,9 +428,10 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_optim(),
+                _do_optim,
                 model_id=body.model_id,
                 token=request.state.token,
+                task_type='optim_step',
             )
 
         @app.post('/save_weights')
@@ -440,9 +479,10 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_save(),
+                _do_save,
                 model_id=body.model_id,
                 token=request.state.token,
+                task_type='save_weights',
             )
 
         @app.post('/save_weights_for_sampler')
@@ -504,9 +544,10 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_save_for_sampler(),
+                _do_save_for_sampler,
                 model_id=body.model_id,
                 token=request.state.token,
+                task_type='save_weights_for_sampler',
             )
 
         @app.post('/load_weights')
@@ -545,6 +586,9 @@ def build_model_app(model_id: str,
                         load_optimizer=load_optimizer,
                         adapter_name=adapter_name,
                         token=token)
+
+                    # Loading a checkpoint should reset step readiness.
+                    self.set_adapter_state(adapter_name, 'grad_ready', False)
                     return types.LoadWeightsResponse(path=body.path, type='load_weights')
                 except Exception:
                     logger.error(traceback.format_exc())
@@ -554,9 +598,10 @@ def build_model_app(model_id: str,
                     )
 
             return await self.schedule_task(
-                _do_load(),
+                _do_load,
                 model_id=body.model_id,
                 token=request.state.token,
+                task_type='load_weights',
             )
 
     return ModelManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, use_megatron,
