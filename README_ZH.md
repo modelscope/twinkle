@@ -33,6 +33,10 @@ Twinkle✨ 是一个轻量级的客户端-服务端训练框架，采用模块�
 
 注意：Twinkle✨ 由 [ms-swift](https://github.com/modelscope/ms-swift) 背后的团队构建，我们期望这两个项目能够共同发展。我们预计 Twinkle✨ 中的一些基础组件将可能被 [ms-swift](https://github.com/modelscope/ms-swift) 复用。
 
+|                    魔搭社区twinkle算法交流群                    |
+|:------------------------------------------------------:|
+| <img src="assets/wechat.jpg" width="200" height="200"> |
+
 ## 安装
 
 ### 使用包安装：
