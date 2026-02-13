@@ -410,7 +410,7 @@ class VLLMEngine(BaseSamplerEngine):
             await self.engine.add_lora(lora_request)
             self._lora_request_cache[lora_path] = lora_request
             return lora_request
-        except Exception as e:
+        except Exception:  # noqa
             return None
 
     async def sleep(self, level: int = 2) -> None:
