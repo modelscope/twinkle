@@ -359,6 +359,6 @@ foundation for building customizable, enterprise-grade training services.
 This project is maintained and supported by multiple teams under Workshop:
 
 - ModelScope Team
-- CMB-Tech Team
+- China Merchants Bank Tech Team
 
 Twinkle is built on the shoulders of giants, including [Transformers](https://github.com/huggingface/transformers),[MS-SWIFT](https://github.com/modelscope/swift), [veRL](https://github.com/verl-project/verl), and other excellent projects.
