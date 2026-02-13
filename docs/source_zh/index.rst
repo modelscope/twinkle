@@ -13,6 +13,7 @@ Twinkle DOCUMENTATION
    使用指引/安装.md
    使用指引/服务端和客户端/index.rst
    使用指引/NPU的支持.md
+   使用指引/训练服务.md
 
 .. toctree::
    :maxdepth: 2

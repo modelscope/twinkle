@@ -81,7 +81,7 @@ pip install -e .
 
 We are rolling out training service built atop Twinkle✨ on ModelScope. It is currently in _Beta_. You may
 sign up for free access by joining the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, and
-train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to 
+train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
 our [documentation](docs/source_en/Usage%20Guide/ModelScope-Official-Resources.md).
 
 ## Supported Hardware
@@ -96,9 +96,9 @@ our [documentation](docs/source_en/Usage%20Guide/ModelScope-Official-Resources.m
 ## Supported Models
 
 We will be adding support for more models as new models are released. The following table lists current models
-supported on Twinkle✨ framework. 
+supported on Twinkle✨ framework.
 
->[!Note] 
+>[!Note]
 > For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it currently supports
 > one training base at a time, and currently it is [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507).
 
@@ -203,7 +203,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen2.5-0.5B-Instruct'
+base_model = 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507'
 base_url='http://www.modelscope.cn/twinkle'
 api_key=os.environ.get('MODELSCOPE_TOKEN')
 

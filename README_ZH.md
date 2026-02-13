@@ -22,16 +22,16 @@
         <a href="https://twinkle-kit.readthedocs.io/en/latest/">英文文档</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
 </p>
 
-## ✨ 什么是 Twinkle？
+## ✨ Twinkle 是什么？
 
-Twinkle✨ 是一个轻量级的客户端-服务端训练框架，采用模块化、高内聚的接口设计。无论你是使用 `torchrun` 在本地执行，还是在 Ray 集群上扩展训练，Twinkle✨ 通过将训练逻辑封装为标准化 API 来消除基础设施的复杂性。除了简单的抽象之外，Twinkle✨ 还可作为强大的后端和网关，支持无服务器训练即服务（TaaS）。它提供的接口是 [Tinker](https://thinkingmachines.ai/tinker/) API 的_超集_，因此可以通过 Tinker 客户端或提供更多功能的原生 Twinkle✨ 客户端访问 Twinkle✨ 训练服务。
+Twinkle✨ 是一个轻量级的客户端-服务端训练框架，采用模块化、高内聚的接口设计。无论你是使用 `torchrun` 在本地执行，还是跨 Ray 集群扩展训练，Twinkle✨ 通过将训练逻辑封装成标准化 API 来消除基础设施层面的摩擦。除了简单的抽象之外，Twinkle✨ 还作为强大的后端和网关，实现无服务器训练即服务（TaaS）。它提供的接口是 [Tinker](https://thinkingmachines.ai/tinker/) API 的_超集_，因此可以通过 Tinker 客户端或原生 Twinkle✨ 客户端（提供更多功能）来访问 Twinkle✨ 训练服务。
 
 🧩 <b>解耦架构</b>：标准化接口，向后兼容 Tinker API。<br>
 🚀 <b>多种运行模式</b>：torchrun / Ray / HTTP。<br>
 🔌 <b>多样化后端</b>：Transformers / Megatron。<br>
-👥 <b>多租户训练服务</b>：在共享一个基座模型部署的情况下训练多个 LoRA。<br>
+👥 <b>多租户训练服务</b>：在共享一个基础模型部署的情况下训练多个 LoRA。<br>
 
-注意：Twinkle✨ 由 [ms-swift](https://github.com/modelscope/ms-swift) 背后的团队构建，我们期望这两个项目能够共同发展。我们预计 Twinkle✨ 中的一些基础组件可能会在 [ms-swift](https://github.com/modelscope/ms-swift) 中复用。
+注意：Twinkle✨ 由 [ms-swift](https://github.com/modelscope/ms-swift) 背后的团队构建，我们期望这两个项目能够共同发展。我们预计 Twinkle✨ 中的一些基础组件将可能被 [ms-swift](https://github.com/modelscope/ms-swift) 复用。
 
 ## 安装
 
@@ -52,64 +52,68 @@ pip install -e .
 ## 教程
 
 | 训练类型                     | 模型框架 | Cookbook 路径                                     |
-| --------------------------------- | --------------- | ------------------------------------------------- |
-| FSDP 微调                   | transformers    | [脚本](cookbook/transformers/fsdp2.py)             |
-| FSDP MoE 微调               | transformers    | [脚本](cookbook/transformers/fsdp2_moe.py)         |
-| EP MoE 微调                 | transformers    | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
-| pp/tp/cp 微调               | megatron        | [脚本](cookbook/megatron/tp.py)                    |
-| pp/tp/cp MoE 微调           | megatron        | [脚本](cookbook/megatron/tp_moe.py)                |
-| tinker 客户端微调          | megatron        | [脚本](cookbook/client/tinker/megatron)            |
-| tinker 客户端微调/采样 | transformers    | [脚本](cookbook/client/tinker/transformer)         |
-| twinkle 客户端微调         | megatron        | [脚本](cookbook/client/twinkle/megatron)           |
-| twinkle 客户端微调         | transformer     | [脚本](cookbook/client/twinkle/transformer)        |
+| ---------------------------- | -------- | ------------------------------------------------- |
+| FSDP 微调                    | transformers    | [脚本](cookbook/transformers/fsdp2.py)             |
+| FSDP MoE 微调                | transformers    | [脚本](cookbook/transformers/fsdp2_moe.py)         |
+| EP MoE 微调                  | transformers    | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
+| pp/tp/cp 微调                | megatron        | [脚本](cookbook/megatron/tp.py)                    |
+| pp/tp/cp MoE 微调            | megatron        | [脚本](cookbook/megatron/tp_moe.py)                |
+| tinker 客户端微调            | megatron        | [脚本](cookbook/client/tinker/megatron)            |
+| tinker 客户端微调/采样       | transformers    | [脚本](cookbook/client/tinker/transformer)         |
+| twinkle 客户端微调           | megatron        | [脚本](cookbook/client/twinkle/megatron)           |
+| twinkle 客户端微调           | transformer     | [脚本](cookbook/client/twinkle/transformer)        |
 
 ## 更新日志
 
-- 🎉2026-02-10 Twinkle✨ 初始版本发布，包含文本模型的 SFT/PT/RL 以及在 [ModelScope](https://modelscope.cn) 上的无服务器训练能力。
+- 🎉2026-02-13 Twinkle✨ 初始版本发布，包括对文本模型的 SFT/PT/RL 支持以及在 [ModelScope](https://modelscope.cn) 上的无服务器训练能力。
 
-## 魔搭社区官方环境
+## ModelScope 的训练服务
 
-魔搭社区提供了Twinkle运行的官方环境，调用端点为:[base_url](https://www.modelscope.cn/twinkle)，开发者可以参考我们的[文档](docs/source_zh/使用指引/训练服务.md)来进行使用。
+我们正在 ModelScope 上推出基于 Twinkle✨ 构建的训练服务。目前处于 _Beta_ 阶段。你可以通过加入 [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) 组织来注册免费访问，并通过 API 端点 `base_url=https://www.modelscope.cn/twinkle` 进行训练。更多详情请参阅我们的[文档](docs/source_zh/使用指引/训练服务.md)。
 
 ## 支持的硬件
 
 | 硬件环境 | 备注                                                            |
-| -------------------- | ---------------------------------------------------------------- |
-| Nvidia GPU          | ✅ 早期 GPU 对 BF16/Flash-Attn 的支持可能不完整 |
-| 昇腾 NPU           | ✅ 部分算子可能不支持                              |
-| PPU                  | ✅                                                               |
-| CPU                  | 支持部分组件如数据集、数据加载器             |
+| -------- | --------------------------------------------------------------- |
+| Nvidia GPU | ✅ 早期 GPU 对 BF16/Flash-Attn 的支持可能不完整 |
+| 昇腾 NPU   | ✅ 部分算子可能不支持                              |
+| PPU        | ✅                                                               |
+| CPU        | 支持部分组件如 dataset、dataloader             |
 
 ## 支持的模型
 
-随着新模型的发布，我们将持续添加更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。但是，我们无服务器训练后端支持的模型可能是一个更小的子集。更多信息请参阅[文档](link)部分。
+随着新模型的发布，我们将添加对更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。
 
-| 模型类型          | [ModelScope](https://modelscope.cn) 上的模型 ID                                                                           | 依赖             | Megatron 支持 | HF 模型 ID                                                                                                |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------- | -------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| qwen3 系列        | [Qwen/Qwen3-0.6B-Base](https://modelscope.cn/models/Qwen/Qwen3-0.6B-Base)~32B                                            | transformers>=4.51   | ✔               | [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                                           |
-| qwen3_moe 系列    | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                          | transformers>=4.51   | ✔               | [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                                     |
-|                     | [Qwen/Qwen3-30B-A3B](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B)~235B                                               | transformers>=4.51   | ✔               | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)                                               |
-| qwen2 系列        | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct) ~72B                                   | transformers>=4.37   | ✔               | [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)                                   |
-|                     | [Qwen/Qwen2.5-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct)~72B                                | transformers>=4.37   | ✔               | [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)                               |
-|                     | [Qwen/Qwen2.5-0.5B](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B)~72B                                                  | transformers>=4.37   | ✔               | [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)                                                 |
-| qwen2_moe 系列    | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://modelscope.cn/models/Qwen/Qwen1.5-MoE-A2.7B-Chat)                                  | transformers>=4.40   | ✔               | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat)                             |
+>[!注意]
+> 对于通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前一次只支持一个训练基座，当前是 [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507)。
+
+
+| 模型类型          | [ModelScope](https://modelscope.cn) 上的模型 ID                                                                          | 要求             | Megatron 支持 | HF 模型 ID                                                                                                |
+| ----------------- |--------------------------------------------------------------------------------------------------------------------------| -------------------- | -------------- | ---------------------------------------------------------------------------------------------------------- |
+| qwen3 系列        | [Qwen/Qwen3-0.6B-Base](https://modelscope.cn/models/Qwen/Qwen3-0.6B-Base)~32B                                            | transformers>=4.51   | ✅               | [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)                                           |
+| qwen3_moe 系列    | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base)                                          | transformers>=4.51   | ✅               | [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base)                                     |
+|                   | [Qwen/Qwen3-30B-A3B](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B)~235B                                               | transformers>=4.51   | ✅               | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)                                               |
+| qwen2 系列        | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct) ~72B                                   | transformers>=4.37   | ✅               | [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)                                   |
+|                   | [Qwen/Qwen2.5-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct)~72B                                | transformers>=4.37   | ✅               | [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)                               |
+|                   | [Qwen/Qwen2.5-0.5B](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B)~72B                                                  | transformers>=4.37   | ✅               | [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)                                                 |
+| qwen2_moe 系列    | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://modelscope.cn/models/Qwen/Qwen1.5-MoE-A2.7B-Chat)                                  | transformers>=4.40   | ✅               | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat)                             |
 | chatglm4 系列     | [ZhipuAI/glm-4-9b-chat](https://modelscope.cn/models/ZhipuAI/glm-4-9b-chat)                                              | transformers>=4.42   | ✘               | [zai-org/glm-4-9b-chat](https://huggingface.co/zai-org/glm-4-9b-chat)                                         |
-|                     | [ZhipuAI/LongWriter-glm4-9b](https://modelscope.cn/models/ZhipuAI/LongWriter-glm4-9b)                                    | transformers>=4.42   | ✘               | [zai-org/LongWriter-glm4-9b](https://huggingface.co/zai-org/LongWriter-glm4-9b)                               |
+|                   | [ZhipuAI/LongWriter-glm4-9b](https://modelscope.cn/models/ZhipuAI/LongWriter-glm4-9b)                                    | transformers>=4.42   | ✘               | [zai-org/LongWriter-glm4-9b](https://huggingface.co/zai-org/LongWriter-glm4-9b)                               |
 | glm_edge 系列     | [ZhipuAI/glm-edge-1.5b-chat](https://modelscope.cn/models/ZhipuAI/glm-edge-1.5b-chat)                                    | transformers>=4.46   | ✘               | [zai-org/glm-edge-1.5b-chat](https://huggingface.co/zai-org/glm-edge-1.5b-chat)                               |
-|                     | [ZhipuAI/glm-edge-4b-chat](https://modelscope.cn/models/ZhipuAI/glm-edge-4b-chat)                                        | transformers>=4.46   | ✘               | [zai-org/glm-edge-4b-chat](https://huggingface.co/zai-org/glm-edge-4b-chat)                                   |
+|                   | [ZhipuAI/glm-edge-4b-chat](https://modelscope.cn/models/ZhipuAI/glm-edge-4b-chat)                                        | transformers>=4.46   | ✘               | [zai-org/glm-edge-4b-chat](https://huggingface.co/zai-org/glm-edge-4b-chat)                                   |
 | internlm2 系列    | [Shanghai_AI_Laboratory/internlm2-1_8b](https://modelscope.cn/models/Shanghai_AI_Laboratory/internlm2-1_8b)              | transformers>=4.38   | ✘               | [internlm/internlm2-1_8b](https://huggingface.co/internlm/internlm2-1_8b)                                     |
-|                     | [Shanghai_AI_Laboratory/internlm2-chat-7b](https://modelscope.cn/models/Shanghai_AI_Laboratory/internlm2-chat-7b)        | transformers>=4.38   | ✘               | [internlm/internlm2-chat-7b](https://huggingface.co/internlm/internlm2-chat-7b)                               |
-| deepseek_v1         | [deepseek-ai/deepseek-vl-7b-chat](https://modelscope.cn/models/deepseek-ai/deepseek-vl-7b-chat)                          | transformers>=4.39.4 | ✔               | ——                                                                                                       |
-|                     | [deepseek-ai/DeepSeek-V2-Lite](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite)                                | transformers>=4.39.3 | ✔               | [deepseek-ai/DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)                           |
-|                     | [deepseek-ai/DeepSeek-V2.5](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2.5)                                      | transformers>=4.39.3 | ✔               | [deepseek-ai/DeepSeek-V2.5](https://huggingface.co/deepseek-ai/DeepSeek-V2.5)                                 |
-|                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                          | transformers>=4.39.3 | ✔               | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                                     |
-| deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) ~32B | transformers>=4.37   | ✔               | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |
+|                   | [Shanghai_AI_Laboratory/internlm2-chat-7b](https://modelscope.cn/models/Shanghai_AI_Laboratory/internlm2-chat-7b)        | transformers>=4.38   | ✘               | [internlm/internlm2-chat-7b](https://huggingface.co/internlm/internlm2-chat-7b)                               |
+| deepseek_v1       | [deepseek-ai/deepseek-vl-7b-chat](https://modelscope.cn/models/deepseek-ai/deepseek-vl-7b-chat)                          | transformers>=4.39.4 | ✅               | ——                                                                                                       |
+|                   | [deepseek-ai/DeepSeek-V2-Lite](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite)                                | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)                           |
+|                   | [deepseek-ai/DeepSeek-V2.5](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2.5)                                      | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-V2.5](https://huggingface.co/deepseek-ai/DeepSeek-V2.5)                                 |
+|                   | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                          | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                                     |
+| deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) ~32B | transformers>=4.37   | ✅               | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |
 
-更详细的模型支持列表 👉 [快速开始.md](https://github.com/modelscope/twinkle/blob/dev/docs/source/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%BC%95/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B.md)
+更详细的模型支持列表 👉  [快速开始.md](https://github.com/modelscope/twinkle/blob/dev/docs/source/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%BC%95/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B.md)
 
 ## 示例代码
 
-### 使用Ray训练
+### 使用 Ray 训练
 
 ```python
 from peft import LoraConfig
@@ -122,23 +126,25 @@ from twinkle.preprocessor import SelfCognitionProcessor
 
 device_group = [DeviceGroup(name='default',ranks=8,device_type='cuda')]
 device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
-# local 模式使用 torchrun
+# local for torchrun
 twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_mesh)
 
 
 def train():
-    # 1000 个样本
+    # to load model from Hugging Face, use 'hf://...'
+    base_model = 'ms://Qwen/Qwen2.5-7B-Instruct'
+    # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
-    # 设置模板以准备编码
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
-    # 将数据集预处理为标准格式
+    # Set template to prepare encoding
+    dataset.set_template('Template', model_id=base_model)
+    # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
-    # 编码数据集
+    # Encode dataset
     dataset.encode()
-    # 全局批次大小 = 8，对于 GPU，即每个 GPU 1 个样本
+    # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8, min_batch_size=8)
-    # 使用 TransformersModel
-    model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', remote_group='default')
+    # Use a TransformersModel
+    model = TransformersModel(model_id=base_model, remote_group='default')
 
     lora_config = LoraConfig(
         r=8,
@@ -146,23 +152,23 @@ def train():
         target_modules='all-linear'
     )
 
-    # 向模型添加一个名为 `default` 的 lora
-    # 注释此行以使用全参数训练
+    # Add a lora to model, with name `default`
+    # Comment this to use full-parameter training
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
-    # 为 lora `default` 添加优化器
+    # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
-    # 为 lora `default` 添加学习率调度器
+    # Add LRScheduler for lora `default`
     model.set_lr_scheduler(scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5,
                            num_training_steps=len(dataloader))
     for step, batch in enumerate(dataloader):
-        # 执行前向和反向传播
+        # Do forward and backward
         model.forward_backward(inputs=batch)
-        # 步进
+        # Step
         model.clip_grad_and_step()
         if step % 20 == 0:
-            # 打印指标
+            # Print metric
             metric = model.calculate_metric(is_training=True)
-            print(f'当前是第 {step} 步，共 {len(dataloader)} 步，指标：{metric}')
+            print(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
     model.save(f'last-checkpoint')
 
 
@@ -170,7 +176,7 @@ if __name__ == '__main__':
     train()
 ```
 
-### Tinker兼容的远程训练
+### 使用类 Tinker API
 
 ```python
 import os
@@ -182,23 +188,24 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_url='http://www.modelscope.cn/twinkle'
+api_key=os.environ.get('MODELSCOPE_TOKEN')
 
-# 使用 Twinkle 的 Dataset 组件加载和预处理数据
+# Use twinkle dataset to load the data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
-dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
+dataset.set_template('Template', model_id=base_model, max_length=256)
+dataset.map(SelfCognitionProcessor('twinkle Model', 'twinkle Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# 初始化 Tinker 兼容客户端
-service_client = init_tinker_compat_client(base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+# Initialize tinker client
+service_client = init_tinker_compat_client(base_model, api_key)
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
-# 训练循环：使用 input_feature_to_datum 转换数据格式
+# Training loop: use input_feature_to_datum to transfer the input format
 for epoch in range(3):
     for step, batch in tqdm(enumerate(dataloader)):
-        # 将 Twinkle 的 InputFeature 转换为 Tinker 的 Datum
         input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
 
         fwdbwd_future = training_client.forward_backward(input_datum, "cross_entropy")
@@ -210,26 +217,20 @@ for epoch in range(3):
     training_client.save_state(f"twinkle-lora-{epoch}").result()
 ```
 
-启动训练：
-
-```shell
-python3 train.py
-```
-
 ## 架构设计
 
 <img src="assets/framework.jpg" style="max-width: 500px; width: 100%;" />
 
 **Twinkle✨** 采用解耦的**客户端-服务端架构**设计，以实现最大的灵活性。客户端提供两种不同的集成路径：
 
-* **Twinkle✨ 原生：** 符合标准的 API，镜像服务端接口，实现无缝的端到端集成。
+* **Twinkle✨ 原生：** 符合服务端接口的 API，实现无缝的端到端集成。
 * **Tinker 兼容：** 完全支持原生 Tinker API，使开发者能够使用 Tinker 客户端来利用 Twinkle✨ 的后端。
 
-这种双路径设计确保可以使用 Tinker API 访问 Twinkle✨ 的训练服务，只需简单修改 Tinker 的基础 URL。
+这种双路径设计确保可以使用 Tinker API 访问 Twinkle✨ 的训练服务，只需简单修改 Tinker 的 base URL。
 
 ## 多租户
 
-**Twinkle✨** 支持在共享基座模型上同时进行多租户训练。利用 **LoRA 池 + 租户应用**架构，Twinkle 支持最多 **N 个租户**并行训练，并保持完全隔离。这种设计提供了前所未有的灵活性：从模型的角度来看，每个租户的会话都是独立的，支持异构配置，包括独特的**数据填充策略、优化器和损失函数**——所有这些都在同一个基座模型上并发运行。
+**Twinkle✨** 支持在共享基础模型上同时进行多租户训练。利用 **LoRA 池 + 租户应用** 架构，Twinkle 能够让多达 **N 个租户** 在完全隔离的情况下并行训练。这种设计提供了前所未有的灵活性：从模型的角度来看，每个租户的会话是独立的，支持异构配置，包括独特的**数据填充策略、优化器和损失函数**——所有这些都在同一个基础模型上并发运行。
 
 *注意：此功能目前针对 [LoRA](https://github.com/huggingface/peft) 进行了优化。*
 
@@ -237,14 +238,14 @@ python3 train.py
 
 例如：
 
-- 租户 A：在本地加载本地私有数据集，LoRA rank=8，使用基座模型进行 SFT
-- 租户 B：从 Hub 远程加载开源数据集，LoRA rank=32，使用基座模型进行 PT
-- 租户 C：使用基座模型进行 GRPO 损失计算，使用采样器进行采样
-- 租户 D：使用基座模型进行 logps 推理
+- 租户 A：在本地加载私有数据集，LoRA rank=8，使用基础模型进行 SFT
+- 租户 B：从 Hub 远程加载开源数据集，LoRA rank=32，使用基础模型进行 PT
+- 租户 C：使用基础模型进行 GRPO 损失计算，使用 Sampler 进行采样
+- 租户 D：使用基础模型进行 logps 推理
 
-这些过程在单个基座模型上并发执行，因为**模型和采样器**在 Twinkle✨ 生态系统中被集成为**与任务无关的组件**。完成后，检查点会自动推送到 **ModelScope** 或 **HuggingFace** 仓库（默认为私有）。在服务端，Twinkle✨ 提供了强大的多租户套件，具有**自动化集群管理**和**动态扩展**功能，使其成为构建可定制的企业级训练服务的基础。
+这些过程在单个基础模型上并发执行，因为**模型和采样器**作为 Twinkle✨ 生态系统中的**任务无关组件**被集成。完成后，检查点会自动推送到 **ModelScope** 或 **HuggingFace** 仓库（默认为私有）。在服务端，Twinkle✨ 提供强大的多租户套件，具备**自动化集群管理**和**动态扩展**功能，使其成为构建可定制、企业级训练服务的基础。
 
-> 作为模块化框架，Twinkle✨ 还支持远程临时独占训练，即全参数训练模式。
+> 作为模块化框架，Twinkle✨ 也支持远程临时独占训练，即全参数模式训练。
 
 ## 🛠️ Twinkle✨ 模块化生态系统
 
@@ -264,7 +265,7 @@ python3 train.py
         <p align="center"><b>Preprocessor</b><br><sub>数据 ETL</sub></p>
       </td>
       <td width="20%" bgcolor="#f6f8fa" style="border: 1px solid #d0d7de; border-radius: 8px; padding: 12px;">
-        <p align="center"><b>InputProcessor</b><br><sub>特定任务的输入处理</sub></p>
+        <p align="center"><b>InputProcessor</b><br><sub>任务特定的输入处理</sub></p>
       </td>
     </tr>
     <tr>
@@ -309,7 +310,7 @@ python3 train.py
         <p align="center"><b>Client</b><br><sub>客户端代码</sub></p>
       </td>
       <td bgcolor="#f6f8fa" style="border: 1px solid #d0d7de; border-radius: 8px; padding: 12px;">
-        <p align="center"><b>Infra</b><br><sub>隔离 ray 和 torchrun 差异</sub></p>
+        <p align="center"><b>Infra</b><br><sub>隔离 ray 和 torchrun 的差异</sub></p>
       </td>
       <td style="border: 1px solid #d0d7de; border-radius: 8px; padding: 12px;">
         <p align="center"><b>Plugin</b><br><sub>使用 hub 组件</sub></p>
@@ -324,5 +325,5 @@ python3 train.py
 ## 社区组件
 
 | 组件类型 | 组件链接                                                                                           | 组件功能                                                                      | 作者              |
-| -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
-| Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | 修复 Qwen3 MoE 模型在 FSDP2 训练期间的挂起问题，对 transformers==4.x 有效 | ModelScope 官方 |
+| -------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------- |
+| Patch    | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | 修复 Qwen3 MoE 模型在 FSDP2 训练期间挂起的问题，适用于 transformers==4.x | ModelScope 官方 |
