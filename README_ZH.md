@@ -204,8 +204,8 @@ dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
 # Initialize tinker client
-service_client = init_tinker_compat_client(base_model, api_key)
-training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
+service_client = init_tinker_compat_client(base_url, api_key)
+training_client = service_client.create_lora_training_client(base_model=base_model[len('ms://'):], rank=16)
 
 # Training loop: use input_feature_to_datum to transfer the input format
 for epoch in range(3):
