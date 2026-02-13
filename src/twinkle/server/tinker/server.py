@@ -28,12 +28,11 @@ from .common.io_utils import create_checkpoint_manager, create_training_run_mana
 
 logger = logging.getLogger(__name__)
 
-def build_server_app(
-    deploy_options: Dict[str, Any],
-    supported_models: Optional[List[types.SupportedModel]] = None,
-    server_config: Dict[str, Any] = {},
-    **kwargs
-):
+
+def build_server_app(deploy_options: dict[str, Any],
+                     supported_models: list[types.SupportedModel] | None = None,
+                     server_config: dict[str, Any] = {},
+                     **kwargs):
     """Build and configure the Tinker-compatible server application.
 
     This factory function creates a FastAPI application with Ray Serve deployment
@@ -66,8 +65,11 @@ def build_server_app(
         - Proxying to model/sampler deployments
         - Training run and checkpoint CRUD operations
         """
-        
-        def __init__(self, supported_models: Optional[List[types.SupportedModel]] = None, server_config: Dict[str, Any] = {}, **kwargs) -> None:
+
+        def __init__(self,
+                     supported_models: list[types.SupportedModel] | None = None,
+                     server_config: dict[str, Any] = {},
+                     **kwargs) -> None:
             """Initialize the Tinker-compatible server.
 
             Args:
@@ -78,13 +80,13 @@ def build_server_app(
             self.state = get_server_state(**server_config)
             # Disable proxy for internal requests to avoid routing through external proxies
             self.client = httpx.AsyncClient(timeout=None, trust_env=False)
-            self.route_prefix = kwargs.get("route_prefix", "/api/v1")
+            self.route_prefix = kwargs.get('route_prefix', '/api/v1')
             self.supported_models = self.normalize_models(supported_models) or [
-                types.SupportedModel(model_name="Qwen/Qwen2.5-0.5B-Instruct"),
-                types.SupportedModel(model_name="Qwen/Qwen2.5-3B-Instruct"),
-                types.SupportedModel(model_name="Qwen/Qwen2.5-7B-Instruct"),
-                types.SupportedModel(model_name="Qwen/Qwen2.5-72B-Instruct"),
-                types.SupportedModel(model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"),
+                types.SupportedModel(model_name='Qwen/Qwen2.5-0.5B-Instruct'),
+                types.SupportedModel(model_name='Qwen/Qwen2.5-3B-Instruct'),
+                types.SupportedModel(model_name='Qwen/Qwen2.5-7B-Instruct'),
+                types.SupportedModel(model_name='Qwen/Qwen2.5-72B-Instruct'),
+                types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)
             self._modelscope_config_lock = asyncio.Lock()
@@ -682,7 +684,4 @@ def build_server_app(
             return await self._proxy_to_model(request, 'save_weights_for_sampler', base_model)
 
     return TinkerCompatServer.options(**deploy_options).bind(
-        supported_models=supported_models,
-        server_config=server_config,
-        **kwargs
-    )
+        supported_models=supported_models, server_config=server_config, **kwargs)

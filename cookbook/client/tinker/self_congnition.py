@@ -82,7 +82,7 @@ def eval():
     # Step 1: Load the trained LoRA checkpoint for inference
 
     # Path to a previously saved LoRA checkpoint (twinkle:// URI)
-    weight_path = "twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2"
+    weight_path = 'twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2'
 
     # Connect to the server and create a sampling client with the trained weights
     service_client = init_tinker_compat_client(base_url='http://localhost:8000')
@@ -96,7 +96,7 @@ def eval():
     trajectory = Trajectory(
         messages=[
             Message(role='system', content='You are a helpful assistant'),
-            Message(role='user', content="你是谁？"),
+            Message(role='user', content='你是谁？'),
         ]
     )
 
@@ -121,9 +121,9 @@ def eval():
     # Decode and print each response
     print('Responses:')
     for i, seq in enumerate(result.sequences):
-        print(f"{i}: {repr(template.decode(seq.tokens))}")
+        print(f'{i}: {repr(template.decode(seq.tokens))}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     # train()   # Uncomment to run training
     eval()      # Run evaluation / inference

@@ -208,8 +208,8 @@ def main():
     dataset = create_Math_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
     template = Template(model_id=f'ms://{BASE_MODEL}')
-    
-    logger.info("Dataset and template initialized")
+
+    logger.info('Dataset and template initialized')
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info('Connecting to Tinker server...')

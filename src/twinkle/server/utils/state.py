@@ -86,13 +86,13 @@ class ServerState:
         self.sessions[session_id]['last_heartbeat'] = time.time()
         return True
 
-    def get_session_last_heartbeat(self, session_id: str) -> Optional[float]:
+    def get_session_last_heartbeat(self, session_id: str) -> float | None:
         """
         Get the last heartbeat timestamp for a session.
-        
+
         Args:
             session_id: The session ID to query
-            
+
         Returns:
             Last heartbeat timestamp, or None if session doesn't exist
         """
@@ -477,7 +477,7 @@ class ServerStateProxy:
     def touch_session(self, session_id: str) -> bool:
         return ray.get(self._actor.touch_session.remote(session_id))
 
-    def get_session_last_heartbeat(self, session_id: str) -> Optional[float]:
+    def get_session_last_heartbeat(self, session_id: str) -> float | None:
         return ray.get(self._actor.get_session_last_heartbeat.remote(session_id))
 
     # ----- Model Registration -----
@@ -586,7 +586,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
         auto_start_cleanup: Whether to automatically start the cleanup task (default: True)
         **server_state_kwargs: Additional keyword arguments passed to ServerState constructor
             (e.g., expiration_timeout, cleanup_interval, per_token_adapter_limit)
-        
+
     Returns:
         A ServerStateProxy for interacting with the actor
     """

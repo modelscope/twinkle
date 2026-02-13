@@ -70,8 +70,8 @@ class TaskQueueConfig:
     enabled: bool = True  # Rate limiting enabled by default
     # Remove tokens after 10x window inactivity
     token_cleanup_multiplier: float = 10.0
-    token_cleanup_interval: float = 60.0    # Run cleanup every 60 seconds
-    max_input_tokens: int = 10000     # Maximum input tokens per request
+    token_cleanup_interval: float = 60.0  # Run cleanup every 60 seconds
+    max_input_tokens: int = 10000  # Maximum input tokens per request
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any] | None = None) -> TaskQueueConfig:
@@ -106,22 +106,22 @@ class TaskQueueConfig:
             if 'token_cleanup_multiplier' in config_dict:
                 config.token_cleanup_multiplier = float(config_dict['token_cleanup_multiplier'])
             if 'token_cleanup_interval' in config_dict:
-                config.token_cleanup_interval = float(
-                    config_dict['token_cleanup_interval'])
+                config.token_cleanup_interval = float(config_dict['token_cleanup_interval'])
             if 'max_input_tokens' in config_dict:
                 config.max_input_tokens = int(config_dict['max_input_tokens'])
         return config
+
 
 @dataclass
 class _QueuedTask:
     request_id: str
     coro_factory: Callable[[], Coroutine]
-    model_id: Optional[str]
-    token: Optional[str]
+    model_id: str | None
+    token: str | None
     input_tokens: int
-    task_type: Optional[str]
+    task_type: str | None
     created_at: float
-    first_rate_limited_at: Optional[float] = None
+    first_rate_limited_at: float | None = None
 
 
 class TaskQueueMixin:
@@ -165,7 +165,7 @@ class TaskQueueMixin:
         """
         self._task_queue_config = config or TaskQueueConfig()
         # Per-key queues, but executed by a single global worker.
-        self._task_queues: Dict[str, asyncio.Queue] = {}
+        self._task_queues: dict[str, asyncio.Queue] = {}
         self._queue_order: Deque[str] = deque()
         self._new_task_event: asyncio.Event = asyncio.Event()
 
@@ -181,23 +181,23 @@ class TaskQueueMixin:
         self._rate_limiter.start_cleanup_task()
 
         # Single worker to ensure model operations remain serial.
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
         self._worker_started = False
         self._worker_start_lock = asyncio.Lock()
 
         # Event loop reference for thread-safe callbacks (e.g., adapter expiration thread)
-        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
 
     @staticmethod
     def _queue_key(
-        model_id: Optional[str],
-        token: Optional[str],
+        model_id: str | None,
+        token: str | None,
     ) -> str:
         if model_id:
-            return f"model:{model_id}"
+            return f'model:{model_id}'
         if token:
-            return f"token:{token}"
-        return "default"
+            return f'token:{token}'
+        return 'default'
 
     async def _ensure_worker_started(self) -> None:
         """Ensure the single background worker is running."""
@@ -222,7 +222,7 @@ class TaskQueueMixin:
         Selection policy: round-robin across queue keys. If a task is rate-limited
         at execution time, it is requeued and the worker tries other queues.
         """
-        print("[TaskQueue] Worker started")
+        print('[TaskQueue] Worker started')
         while True:
             try:
                 # Wait until there is at least one queue with a task
@@ -252,11 +252,14 @@ class TaskQueueMixin:
                     # Global queue timeout
                     if (now - task.created_at) > self._task_queue_config.queue_timeout:
                         error_payload = {
-                            'error': f"Queue timeout exceeded: waited {now - task.created_at:.2f}s",
+                            'error': f'Queue timeout exceeded: waited {now - task.created_at:.2f}s',
                             'category': 'Server'
                         }
                         self.state.store_future_status(
-                            task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                            task.request_id,
+                            TaskStatus.FAILED.value,
+                            task.model_id,
+                            result=error_payload,
                             queue_state=QueueState.PAUSED_CAPACITY.value,
                             queue_state_reason=error_payload['error'],
                         )
@@ -268,26 +271,25 @@ class TaskQueueMixin:
                     # Execute
                     executed_any = True
                     self.state.store_future_status(
-                        task.request_id, TaskStatus.RUNNING.value, task.model_id,
-                        queue_state=QueueState.ACTIVE.value
-                    )
+                        task.request_id, TaskStatus.RUNNING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
 
                     try:
                         coro = task.coro_factory()
                         result = await coro
                         self.state.store_future_status(
-                            task.request_id, TaskStatus.COMPLETED.value, task.model_id, result=result,
-                            queue_state=QueueState.ACTIVE.value
-                        )
+                            task.request_id,
+                            TaskStatus.COMPLETED.value,
+                            task.model_id,
+                            result=result,
+                            queue_state=QueueState.ACTIVE.value)
                     except Exception:
-                        error_payload = {
-                            'error': traceback.format_exc(),
-                            'category': 'Server'
-                        }
+                        error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
                         self.state.store_future_status(
-                            task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
-                            queue_state=QueueState.ACTIVE.value
-                        )
+                            task.request_id,
+                            TaskStatus.FAILED.value,
+                            task.model_id,
+                            result=error_payload,
+                            queue_state=QueueState.ACTIVE.value)
                     finally:
                         q.task_done()
 
@@ -299,10 +301,10 @@ class TaskQueueMixin:
                     await asyncio.sleep(min(self._task_queue_config.window_seconds, 0.1))
 
             except asyncio.CancelledError:
-                logger.warning("[TaskQueue] Worker cancelled")
+                logger.warning('[TaskQueue] Worker cancelled')
                 break
             except Exception:
-                logger.warning("Error in task queue worker")
+                logger.warning('Error in task queue worker')
                 continue
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
@@ -316,14 +318,14 @@ class TaskQueueMixin:
                 drained.append(q.get_nowait())
             except asyncio.QueueEmpty:
                 break
-        
+
         for task in drained:
-            error_payload = {
-                'error': reason,
-                'category': 'Server'
-            }
+            error_payload = {'error': reason, 'category': 'Server'}
             self.state.store_future_status(
-                task.request_id, TaskStatus.FAILED.value, task.model_id, result=error_payload,
+                task.request_id,
+                TaskStatus.FAILED.value,
+                task.model_id,
+                result=error_payload,
                 queue_state=QueueState.UNKNOWN.value,
                 queue_state_reason=reason,
             )
@@ -337,14 +339,12 @@ class TaskQueueMixin:
         except ValueError:
             pass
 
-
     def fail_pending_tasks_for_model(self, model_id: str, reason: str) -> None:
         """Fail and drop queued tasks for a model. Safe to call from non-async threads."""
         queue_key = self._queue_key(model_id=model_id, token=None)
         if self._event_loop is None:
             # Best-effort: nothing we can do safely without a loop.
-            logger.warning(
-                f"[TaskQueue] fail_pending_tasks_for_model called without event loop: {queue_key}")
+            logger.warning(f'[TaskQueue] fail_pending_tasks_for_model called without event loop: {queue_key}')
             return
 
         def _schedule() -> None:
@@ -355,12 +355,12 @@ class TaskQueueMixin:
     async def _perform_preflight_checks(
         self,
         request_id: str,
-        model_id: Optional[str],
-        token: Optional[str],
+        model_id: str | None,
+        token: str | None,
         input_tokens: int,
-        batch_size: Optional[int] = None,
-        data_world_size: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
+        batch_size: int | None = None,
+        data_world_size: int | None = None,
+    ) -> dict[str, Any] | None:
         """Perform pre-flight checks including rate limiting and token validation.
 
         Args:
@@ -379,13 +379,13 @@ class TaskQueueMixin:
 
         # Check max input tokens
         if input_tokens > self._task_queue_config.max_input_tokens:
-            error_msg = f"Input tokens ({input_tokens}) exceed maximum allowed ({self._task_queue_config.max_input_tokens})"
-            error_payload = {
-                'error': error_msg,
-                'category': 'User'
-            }
+            error_msg = f'Input tokens ({input_tokens}) exceed maximum allowed ({self._task_queue_config.max_input_tokens})'  # noqa: E501
+            error_payload = {'error': error_msg, 'category': 'User'}
             self.state.store_future_status(
-                request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                request_id,
+                TaskStatus.FAILED.value,
+                model_id,
+                result=error_payload,
                 queue_state=QueueState.UNKNOWN.value,
                 queue_state_reason=error_msg,
             )
@@ -394,13 +394,13 @@ class TaskQueueMixin:
         # Check batch size if provided
         if batch_size is not None and data_world_size is not None:
             if batch_size < data_world_size:
-                error_msg = f"Batch size {batch_size} must be greater than or equal to data world size {data_world_size}"
-                error_payload = {
-                    'error': error_msg,
-                    'category': 'User'
-                }
+                error_msg = f'Batch size {batch_size} must be greater than or equal to data world size {data_world_size}'  # noqa: E501
+                error_payload = {'error': error_msg, 'category': 'User'}
                 self.state.store_future_status(
-                    request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                    request_id,
+                    TaskStatus.FAILED.value,
+                    model_id,
+                    result=error_payload,
                     queue_state=QueueState.UNKNOWN.value,
                     queue_state_reason=error_msg,
                 )
@@ -409,30 +409,30 @@ class TaskQueueMixin:
         # Check rate limits
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
-            error_msg = f"Rate limit exceeded: {reason}"
-            error_payload = {
-                'error': error_msg,
-                'category': 'User'
-            }
+            error_msg = f'Rate limit exceeded: {reason}'
+            error_payload = {'error': error_msg, 'category': 'User'}
             self.state.store_future_status(
-                request_id, TaskStatus.FAILED.value, model_id, result=error_payload,
+                request_id,
+                TaskStatus.FAILED.value,
+                model_id,
+                result=error_payload,
                 queue_state=QueueState.PAUSED_RATE_LIMIT.value,
                 queue_state_reason=error_msg,
             )
             return {'request_id': request_id, 'model_id': model_id}
-        
+
         return None
 
     async def schedule_task(
         self,
         coro_factory: Callable[[], Coroutine],
-        model_id: Optional[str] = None,
-        token: Optional[str] = None,
+        model_id: str | None = None,
+        token: str | None = None,
         input_tokens: int = 0,
-        batch_size: Optional[int] = None,
-        data_world_size: Optional[int] = None,
-        task_type: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        batch_size: int | None = None,
+        data_world_size: int | None = None,
+        task_type: str | None = None,
+    ) -> dict[str, Any]:
         """Schedule an async task with rate limiting and status tracking.
 
         This method replaces the old `schedule_task` function with proper
@@ -459,12 +459,11 @@ class TaskQueueMixin:
             Dict containing request_id and model_id for future retrieval.
         """
         # Generate request_id first so it can be included in error responses
-        request_id = f"req_{uuid.uuid4().hex}"
-        
+        request_id = f'req_{uuid.uuid4().hex}'
+
         # 1. Pre-flight checks: rate limiting, max token validation, and batch size validation
-        preflight_result = await self._perform_preflight_checks(
-            request_id, model_id, token, input_tokens, batch_size, data_world_size
-        )
+        preflight_result = await self._perform_preflight_checks(request_id, model_id, token, input_tokens, batch_size,
+                                                                data_world_size)
         if preflight_result is not None:
             return preflight_result
 
@@ -472,8 +471,8 @@ class TaskQueueMixin:
             self._event_loop = asyncio.get_running_loop()
 
         print(
-            f"[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}")
-
+            f'[TaskQueue] Scheduling task {request_id}, rps_limit={self._task_queue_config.rps_limit}, enabled={self._task_queue_config.enabled}'  # noqa: E501
+        )
 
         # 2. Register PENDING status FIRST
         self.state.store_future_status(
@@ -489,7 +488,8 @@ class TaskQueueMixin:
         # 5. Put task in queue and update status
         q = self._task_queues[queue_key]
         print(
-            f"[TaskQueue] Adding task {request_id} to queue key={queue_key} (current size: {q.qsize()}) type={task_type}")
+            f'[TaskQueue] Adding task {request_id} to queue key={queue_key} (current size: {q.qsize()}) type={task_type}'  # noqa: E501
+        )
         await q.put(
             _QueuedTask(
                 request_id=request_id,
@@ -499,14 +499,10 @@ class TaskQueueMixin:
                 input_tokens=input_tokens,
                 task_type=task_type,
                 created_at=time.monotonic(),
-            )
-        )
+            ))
         self.state.store_future_status(
-            request_id, TaskStatus.QUEUED.value, model_id,
-            queue_state=QueueState.ACTIVE.value
-        )
-        print(
-            f"[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}")
+            request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
+        print(f'[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}')
 
         self._new_task_event.set()
 
@@ -571,4 +567,4 @@ class TaskQueueMixin:
         self._task_queues.clear()
         self._queue_order.clear()
 
-        print("[TaskQueue] Task queue shutdown complete")
+        print('[TaskQueue] Task queue shutdown complete')

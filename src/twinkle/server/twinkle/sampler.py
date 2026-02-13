@@ -10,25 +10,23 @@ It supports:
 4. Flexible sampling parameters
 """
 import traceback
-from typing import Dict, Any, List, Optional, Union
-
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from ray import serve
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.data_format import Trajectory, InputFeature, SamplingParams
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.server.utils.adapter_manager import AdapterManagerMixin
-from twinkle.server.utils.validation import verify_request_token, get_token_from_request
-from twinkle.server.utils.state import get_server_state, ServerStateProxy
+from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
-
 # ----- Request/Response Models -----
+
 
 class SampleRequest(BaseModel):
     """Request body for the /sample endpoint."""
@@ -183,10 +181,10 @@ def build_sampler_app(model_id: str,
             """Handle expired adapters by removing them from the sampler."""
             try:
                 self.sampler.remove_adapter(adapter_name)
-                logger.info(f"Removed expired adapter {adapter_name}")
+                logger.info(f'Removed expired adapter {adapter_name}')
                 # Adapter count is now tracked dynamically, no manual update needed
             except Exception as e:
-                logger.warning(f"Failed to remove expired adapter {adapter_name}: {e}")
+                logger.warning(f'Failed to remove expired adapter {adapter_name}: {e}')
 
         @staticmethod
         def _get_adapter_name(request: Request, adapter_name: Optional[str]) -> Optional[str]:
@@ -285,14 +283,14 @@ def build_sampler_app(model_id: str,
 
             from peft import LoraConfig
             config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
-            
+
             self.register_adapter(full_adapter_name, token)
 
             self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
             return AddAdapterResponse(adapter_name=full_adapter_name)
 
-        @app.post("/heartbeat", response_model=HeartbeatResponse)
+        @app.post('/heartbeat', response_model=HeartbeatResponse)
         def heartbeat(self, request: Request, body: HeartbeatRequest) -> HeartbeatResponse:
             """Keep an adapter alive by resetting its inactivity timer."""
             full_adapter_name = self._get_adapter_name(request, body.adapter_name)
@@ -300,5 +298,5 @@ def build_sampler_app(model_id: str,
             self.touch_adapter(full_adapter_name)
             return HeartbeatResponse()
 
-    return SamplerManagement.options(**deploy_options).bind(
-        nproc_per_node, device_group, device_mesh, sampler_type, engine_args, adapter_config, **kwargs)
+    return SamplerManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, sampler_type,
+                                                            engine_args, adapter_config, **kwargs)

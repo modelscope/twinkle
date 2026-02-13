@@ -200,18 +200,17 @@ def build_model_app(model_id: str,
             if self.get_adapter_info(adapter_name):
                 # Clear adapter state
                 self.clear_adapter_state(adapter_name)
-                
+
                 self.model.remove_adapter(adapter_name)
                 # Unregister from adapter manager
                 self.unregister_adapter(adapter_name)
-                
+
                 # Remove from server state
                 self.state.unload_model(adapter_name)
                 # Remove adapter from model
                 self.model.remove_adapter(adapter_name)
 
-
-        @app.post("/create")
+        @app.post('/create')
         def create(self, request: Request, body: CreateRequest):
             return {'status': 'ok'}
 
@@ -508,13 +507,13 @@ def build_model_app(model_id: str,
             # Extract token for metadata storage
             token = request.state.token
             training_run_manager = create_training_run_manager(token)
-            
+
             # Register adapter FIRST (limit check happens inside register_adapter)
             self.register_adapter(adapter_name, token)
-            
+
             # Create adapter AFTER successful registration
             self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
-            
+
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration
             lora_config = None

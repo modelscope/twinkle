@@ -39,8 +39,8 @@ class AdapterManagerMixin:
     """
 
     # Type hint for state attribute that inheriting classes must provide
-    state: 'ServerStateProxy'
-    
+    state: ServerStateProxy
+
     def _init_adapter_manager(
         self,
         adapter_timeout: float = 1800.0,
@@ -65,16 +65,17 @@ class AdapterManagerMixin:
         self._adapter_max_lifetime = adapter_max_lifetime
 
         # Adapter lifecycle tracking
-        # Dict mapping adapter_name -> {'token': str, 'session_id': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
-        self._adapter_records: Dict[str, Dict[str, Any]] = {}
+        # Dict mapping adapter_name ->
+        # {'token': str, 'session_id': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
+        self._adapter_records: dict[str, dict[str, Any]] = {}
         # Track adapter count per token
-        self._adapter_counts: Dict[str, int] = {}
+        self._adapter_counts: dict[str, int] = {}
 
         # Countdown thread
         self._adapter_countdown_thread: threading.Thread | None = None
         self._adapter_countdown_running = False
 
-    def register_adapter(self, adapter_name: str, token: str, session_id: Optional[str] = None) -> None:
+    def register_adapter(self, adapter_name: str, token: str, session_id: str | None = None) -> None:
         """Register a new adapter for lifecycle tracking.
 
         Args:
@@ -82,7 +83,7 @@ class AdapterManagerMixin:
             token: User token that owns this adapter.
             session_id: Optional session ID to associate with this adapter.
                 If provided, adapter will expire when the session expires.
-        
+
         Raises:
             RuntimeError: If adapter limit is exceeded for this token.
         """
@@ -90,7 +91,7 @@ class AdapterManagerMixin:
         allowed, reason = self.check_adapter_limit(token)
         if not allowed:
             raise RuntimeError(reason)
-        
+
         current_time = time.time()
         self._adapter_records[adapter_name] = {
             'token': token,
@@ -101,9 +102,8 @@ class AdapterManagerMixin:
             'state': {},
             'expiring': False,
         }
-        logger.debug(
-            f"[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}..." + 
-            (f" (session: {session_id})" if session_id else ""))
+        logger.debug(f'[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...'
+                     + (f' (session: {session_id})' if session_id else ''))
 
     def _is_session_alive(self, session_id: str) -> bool:
         """Check if a session is still alive via state proxy.
@@ -116,12 +116,12 @@ class AdapterManagerMixin:
         """
         if not session_id:
             return True  # No session association means always alive
-        
+
         # Get session last heartbeat through proxy
         last_heartbeat = self.state.get_session_last_heartbeat(session_id)
         if last_heartbeat is None:
             return False  # Session doesn't exist
-        
+
         # Check if session has timed out using adapter_timeout
         return (time.time() - last_heartbeat) < self._adapter_timeout
 
@@ -138,7 +138,8 @@ class AdapterManagerMixin:
             adapter_info = self._adapter_records.pop(adapter_name)
             token = adapter_info.get('token')
             logger.debug(
-                f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}...")
+                f"[AdapterManager] Unregistered adapter {adapter_name} for token {token[:8] if token else 'unknown'}..."
+            )
             return True
         return False
 
@@ -217,13 +218,11 @@ class AdapterManagerMixin:
 
         Args:
             adapter_name: Name of the expired adapter.
-        
+
         Raises:
             NotImplementedError: If not overridden by inheriting class.
         """
-        raise NotImplementedError(
-            f"_on_adapter_expired must be implemented by {self.__class__.__name__}"
-        )
+        raise NotImplementedError(f'_on_adapter_expired must be implemented by {self.__class__.__name__}')
 
     @staticmethod
     def get_adapter_name(adapter_name: str) -> str:
@@ -243,7 +242,7 @@ class AdapterManagerMixin:
         """Validate that an adapter exists and is not expiring."""
         info = self._adapter_records.get(adapter_name)
         assert adapter_name and info is not None and not info.get('expiring'), \
-            f"Adapter {adapter_name} not found"
+            f'Adapter {adapter_name} not found'
 
     def _adapter_countdown_loop(self) -> None:
         """Background thread that monitors and handles inactive adapters.
@@ -259,7 +258,7 @@ class AdapterManagerMixin:
                 time.sleep(1)
                 now = time.time()
 
-                expired_adapters: List[Tuple[str, Optional[str]]] = []
+                expired_adapters: list[tuple[str, str | None]] = []
                 # Create snapshot to avoid modification during iteration
                 adapter_snapshot = list(self._adapter_records.items())
                 for adapter_name, info in adapter_snapshot:
@@ -267,15 +266,13 @@ class AdapterManagerMixin:
                         continue
 
                     session_id = info.get('session_id')
-                    created_at = info.get("created_at")
-                    
+                    created_at = info.get('created_at')
+
                     # Check TTL for both cases
                     exceeded_ttl = (
-                        self._adapter_max_lifetime
-                        and self._adapter_max_lifetime > 0
-                        and (now - created_at) > self._adapter_max_lifetime
-                    )
-                    
+                        self._adapter_max_lifetime and self._adapter_max_lifetime > 0
+                        and (now - created_at) > self._adapter_max_lifetime)
+
                     # Different logic based on session association
                     if session_id:
                         # Has session: check session expiration and TTL
@@ -283,29 +280,27 @@ class AdapterManagerMixin:
                         should_expire = session_expired or exceeded_ttl
                         expiration_reasons = []
                         if exceeded_ttl:
-                            expiration_reasons.append("ttl_exceeded")
+                            expiration_reasons.append('ttl_exceeded')
                         if session_expired:
-                            expiration_reasons.append("session_expired")
+                            expiration_reasons.append('session_expired')
                     else:
                         # No session: check inactivity timeout and TTL
-                        info["inactivity_counter"] = info.get("inactivity_counter", 0) + 1
-                        exceeded_inactivity = info["inactivity_counter"] > self._adapter_timeout
+                        info['inactivity_counter'] = info.get('inactivity_counter', 0) + 1
+                        exceeded_inactivity = info['inactivity_counter'] > self._adapter_timeout
                         should_expire = exceeded_ttl or exceeded_inactivity
                         expiration_reasons = []
                         if exceeded_ttl:
-                            expiration_reasons.append("ttl_exceeded")
+                            expiration_reasons.append('ttl_exceeded')
                         if exceeded_inactivity:
-                            expiration_reasons.append("inactivity_timeout")
-                    
+                            expiration_reasons.append('inactivity_timeout')
+
                     if should_expire:
                         info['expiring'] = True
                         info['state'] = {}  # best-effort clear
                         token = info.get('token')
                         expired_adapters.append((adapter_name, token))
-                        logger.debug(
-                            f"[AdapterManager] Adapter {adapter_name} expired "
-                            f"(reasons={','.join(expiration_reasons)}, session={session_id})"
-                        )
+                        logger.debug(f'[AdapterManager] Adapter {adapter_name} expired '
+                                     f"(reasons={','.join(expiration_reasons)}, session={session_id})")
 
                 for adapter_name, token in expired_adapters:
                     success = False
@@ -313,9 +308,7 @@ class AdapterManagerMixin:
                         self._on_adapter_expired(adapter_name)
                         success = True
                     except Exception as e:
-                        logger.warning(
-                            f"[AdapterManager] Error while expiring adapter {adapter_name}: {e}"
-                        )
+                        logger.warning(f'[AdapterManager] Error while expiring adapter {adapter_name}: {e}')
                     finally:
                         if success:
                             self._adapter_records.pop(adapter_name, None)
@@ -325,7 +318,7 @@ class AdapterManagerMixin:
                                 info['expiring'] = False
 
             except Exception as e:
-                logger.warning(f"[AdapterManager] Error in countdown loop: {e}")
+                logger.warning(f'[AdapterManager] Error in countdown loop: {e}')
                 continue
 
         logger.debug('[AdapterManager] Countdown thread stopped')
@@ -354,7 +347,7 @@ class AdapterManagerMixin:
                 self._adapter_countdown_thread.join(timeout=2.0)
             logger.debug('[AdapterManager] Countdown thread stopped')
 
-    def check_adapter_limit(self, token: str) -> Tuple[bool, Optional[str]]:
+    def check_adapter_limit(self, token: str) -> tuple[bool, str | None]:
         """Check adapter count for a user token.
 
         This method enforces per-user adapter limits to prevent resource exhaustion.
@@ -368,13 +361,10 @@ class AdapterManagerMixin:
             If allowed is False, reason contains the explanation.
         """
         # Count adapters directly from _adapter_records
-        current_count = sum(
-            1 for record in self._adapter_records.values() 
-            if record.get('token') == token and not record.get('expiring', False)
-        )
+        current_count = sum(1 for record in self._adapter_records.values()
+                            if record.get('token') == token and not record.get('expiring', False))
 
         # Check if current count exceeds limit
         if current_count >= self._per_token_adapter_limit:
-            return False, f"Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters"
+            return False, f'Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters'
         return True, None
-

@@ -101,7 +101,7 @@ def clean_metrics(metrics: dict) -> dict:
                     head, unit = s.split()  # ignore unit/tail
                     cleaned[f'{key}/{unit}'] = float(head)
                 except Exception:
-                    m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", s)
+                    m = re.match(r'^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)', s)
                     if m:
                         cleaned[key] = float(m.group(1))
 

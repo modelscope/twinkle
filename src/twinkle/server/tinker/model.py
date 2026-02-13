@@ -120,13 +120,13 @@ def build_model_app(model_id: str,
 
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.
-            
+
             This method handles:
             1. Clearing adapter state
             2. Removing adapter from model
             3. Unregistering from adapter manager
             4. Removing from server state
-            
+
             Args:
                 adapter_name: Name of the adapter to clean up
             """
@@ -134,11 +134,11 @@ def build_model_app(model_id: str,
             if self.get_adapter_info(adapter_name):
                 # Clear adapter state
                 self.clear_adapter_state(adapter_name)
-                
+
                 self.model.remove_adapter(adapter_name)
                 # Unregister from adapter manager
                 self.unregister_adapter(adapter_name)
-                
+
                 # Remove from server state
                 self.state.unload_model(adapter_name)
 
@@ -175,16 +175,13 @@ def build_model_app(model_id: str,
                         # TODO: support more lora config parameters, train_unembed, etc.
                         lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
 
-                        adapter_name = self.get_adapter_name(
-                            adapter_name=model_id)
-                        
+                        adapter_name = self.get_adapter_name(adapter_name=model_id)
+
                         # Register adapter FIRST (limit check happens inside register_adapter)
-                        self.register_adapter(
-                            adapter_name, request.state.token, session_id=body.session_id)
-                        
+                        self.register_adapter(adapter_name, request.state.token, session_id=body.session_id)
+
                         # Create adapter AFTER successful registration
-                        self.model.add_adapter_to_model(
-                            adapter_name=adapter_name, config_or_dir=lora_cfg)
+                        self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
 
                         self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                         self.model.set_processor('InputProcessor', adapter_name=adapter_name)
@@ -193,8 +190,7 @@ def build_model_app(model_id: str,
                         # Fresh adapter has no accumulated gradients.
                         self.set_adapter_state(adapter_name, 'grad_ready', False)
 
-                    training_run_manager = create_training_run_manager(
-                        request.state.token)
+                    training_run_manager = create_training_run_manager(request.state.token)
                     training_run_manager.save(model_id, body)
 
                     return types.CreateModelResponse(model_id=model_id)
@@ -261,8 +257,7 @@ def build_model_app(model_id: str,
 
             async def _do_unload():
                 # Only remove adapter, not the base model
-                adapter_name = self.get_adapter_name(
-                    adapter_name=body.model_id)
+                adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 # Use common cleanup logic
                 self._cleanup_adapter(adapter_name)
                 return types.UnloadModelResponse(model_id=body.model_id)
@@ -315,9 +310,7 @@ def build_model_app(model_id: str,
 
             # Calculate input tokens and batch size for validation
             datum_list = body.forward_input.data
-            input_tokens = sum(
-                len(d.model_input.to_ints()) for d in datum_list
-            )
+            input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
             batch_size = len(datum_list)
             return await self.schedule_task(
                 _do_forward,
@@ -360,11 +353,12 @@ def build_model_app(model_id: str,
                     loss_fn_config = body.forward_backward_input.loss_fn_config or {}
 
                     # Unified forward_backward for both Megatron and Transformers
-                    output, loss = self.model.forward_backward(inputs=datum_list,
-                                                                adapter_name=adapter_name,
-                                                                loss_fn=loss_fn,
-                                                                **loss_fn_config)
-                    output_type = 'ImportanceSamplingLossReturn' if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn'
+                    output, loss = self.model.forward_backward(
+                        inputs=datum_list, adapter_name=adapter_name, loss_fn=loss_fn, **loss_fn_config)
+                    if loss_fn == 'importance_sampling':
+                        output_type = 'ImportanceSamplingLossReturn'
+                    else:
+                        output_type = 'CrossEntropyLossReturn'
                     # Mark gradients as ready after a successful forward_backward.
                     self.set_adapter_state(adapter_name, 'grad_ready', True)
                     return types.ForwardBackwardOutput(
@@ -381,9 +375,7 @@ def build_model_app(model_id: str,
 
             # Calculate input tokens and batch size for validation
             datum_list = body.forward_backward_input.data
-            input_tokens = sum(
-                len(d.model_input.to_ints()) for d in datum_list
-            )
+            input_tokens = sum(len(d.model_input.to_ints()) for d in datum_list)
             batch_size = len(datum_list)
             return await self.schedule_task(
                 _do_forward_backward,
@@ -417,14 +409,13 @@ def build_model_app(model_id: str,
                     # Disallow empty step (must have at least one forward_backward since last step)
                     if not self.get_adapter_state(adapter_name, 'grad_ready', False):
                         raise RuntimeError(
-                            f"No accumulated gradients for adapter={adapter_name}; call forward_backward before optim_step"
+                            f'No accumulated gradients for adapter={adapter_name}; call forward_backward before optim_step'  # noqa: E501
                         )
 
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
-                    self.model.step(adam_params=body.adam_params,
-                                    adapter_name=adapter_name)
+                    self.model.step(adam_params=body.adam_params, adapter_name=adapter_name)
                     # Clear grad-ready after a successful step.
                     self.set_adapter_state(adapter_name, 'grad_ready', False)
                     metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
@@ -590,15 +581,15 @@ def build_model_app(model_id: str,
                     weight_path = body.path
                     load_optimizer = body.optimizer
 
-                    self.model.load(checkpoint_dir=weight_path,
-                                    load_optimizer=load_optimizer,
-                                    adapter_name=adapter_name,
-                                    token=token)
+                    self.model.load(
+                        checkpoint_dir=weight_path,
+                        load_optimizer=load_optimizer,
+                        adapter_name=adapter_name,
+                        token=token)
 
                     # Loading a checkpoint should reset step readiness.
                     self.set_adapter_state(adapter_name, 'grad_ready', False)
-                    return types.LoadWeightsResponse(path=body.path,
-                                                     type='load_weights')
+                    return types.LoadWeightsResponse(path=body.path, type='load_weights')
                 except Exception:
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
