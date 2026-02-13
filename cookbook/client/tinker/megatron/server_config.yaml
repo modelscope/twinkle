@@ -56,6 +56,9 @@ applications:
       device_mesh:
         device_type: cuda
         dp_size: 4
+      queue_config:
+        rps_limit: 20                               # Max requests per second
+        tps_limit: 10000                            # Max tokens per second
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -90,11 +93,12 @@ applications:
         ep_size: 2
 
       queue_config:
-        rps_limit: 100                             # Max requests per second
-        tps_limit: 100000                           # Max tokens per second
+        rps_limit: 20                               # Max requests per second
+        tps_limit: 10000                            # Max tokens per second
       adapter_config:
-        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
-        adapter_timeout: 1800                      # Seconds before idle adapter unload
+        per_token_adapter_limit: 3                # Max concurrent LoRA adapters
+        adapter_timeout: 30                       # Seconds before idle adapter unload
+        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
         autoscaling_config:
