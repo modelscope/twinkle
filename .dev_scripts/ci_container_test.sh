@@ -1,3 +1,7 @@
+install_twinkle_with_kernels() {
+    pip install ".[kernels]" -i https://mirrors.aliyun.com/pypi/simple/ || pip install ".[kernels]"
+}
+
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     # pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
     git config --global --add safe.directory /twinkle
@@ -25,8 +29,9 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip install optimum
 
     # test with install
-    pip install .
+    install_twinkle_with_kernels
 else
+    install_twinkle_with_kernels
     echo "Running case in release image, run case directly!"
 fi
 # remove torch_extensions folder to avoid ci hang.
