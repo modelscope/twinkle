@@ -255,22 +255,12 @@ def _compare_grad_dicts(
         a = baseline.get(k)
         b = sp.get(k)
         if a is None or b is None:
-            raise AssertionError(
-                f'[rank{rank}] Missing grad key={k} baseline={a is not None} sp={b is not None} '
-                f'baseline_keys={len(baseline)} sp_keys={len(sp)}')
+            raise AssertionError(f'[rank{rank}] Missing grad key={k} baseline={a is not None} sp={b is not None}')
         a32 = a.to(dtype=torch.float32)
         b32 = b.to(dtype=torch.float32)
         diff = b32 - a32
         rel = diff.norm() / (a32.norm() + 1e-12)
-        if rel.item() > rel_tol:
-            abs_diff = diff.abs()
-            max_idx = int(abs_diff.reshape(-1).argmax().item())
-            raise AssertionError(
-                f'[rank{rank}] {k} grad not close: shape={tuple(a32.shape)} '
-                f'base_norm={a32.norm().item():.6e} sp_norm={b32.norm().item():.6e} '
-                f'mean_abs={abs_diff.mean().item():.6e} max_abs={abs_diff.max().item():.6e} '
-                f'max_flat_idx={max_idx} rel_norm={rel.item():.6e} tol={rel_tol:.1e}',
-            )
+        assert rel.item() <= rel_tol
 
 
 def _run_worker_ep_fsdp_sp_align(
@@ -437,10 +427,7 @@ def _run_worker_ep_fsdp_sp_align(
         sp_logits = sp_out.logits.detach()
 
         # Forward alignment (full-seq logits reconstructed by SP gather).
-        if not torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4):
-            diff = (sp_logits - base_logits).abs()
-            raise AssertionError(f'[rank{rank}] logits not close: mean_abs={diff.mean().item():.6e} '
-                                 f'max_abs={diff.max().item():.6e} (rtol=1e-3, atol=1e-4)')
+        assert torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4)
 
         # Router alignment on this rank's slice: compare selected experts exactly.
         # SP captures only local tokens; baseline captures full tokens (we slice it).
@@ -452,11 +439,7 @@ def _run_worker_ep_fsdp_sp_align(
             sp_sel = sp_state['selected_experts']
             if sp_sel.dim() == 2:
                 sp_sel = sp_sel.view(batch_size, end - start, -1)
-            if not torch.equal(base_sel, sp_sel):
-                mismatch = (base_sel != sp_sel).sum().item()
-                raise AssertionError(
-                    f'[rank{rank}] block[{idx}] selected_experts mismatch count={mismatch} '
-                    f'base_shape={tuple(base_sel.shape)} sp_shape={tuple(sp_sel.shape)}')
+            assert torch.equal(base_sel, sp_sel)
 
         # Backward alignment (expert grads on active local experts for this slice).
         sp_loss_sum = F.cross_entropy(
@@ -631,12 +614,7 @@ def _run_worker_fsdp_sp_align(
         sp_logits = sp_out.logits.detach()
 
         # Forward alignment (full-seq logits reconstructed by SP gather).
-        if not torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4):
-            diff = (sp_logits - base_logits).abs()
-            raise AssertionError(
-                f'[rank{rank}] logits not close: mean_abs={diff.mean().item():.6e} '
-                f'max_abs={diff.max().item():.6e} (rtol=1e-3, atol=1e-4)',
-            )
+        assert torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4)
 
         # Backward alignment: local CE(sum) on SP, compare gathered full-seq inputs_embeds grads.
         sp_loss_sum = F.cross_entropy(
@@ -656,11 +634,7 @@ def _run_worker_fsdp_sp_align(
         diff = sp_full - base_full
         rel = diff.norm() / (base_full.norm() + 1e-12)
         grad_rel_tol = float(os.environ.get('TWINKLE_INPUT_GRAD_REL_TOL', '1e-2'))
-        if rel.item() > grad_rel_tol:
-            abs_diff = diff.abs()
-            raise AssertionError(
-                f'[rank{rank}] inputs_embeds.grad(full) not close: mean_abs={abs_diff.mean().item():.6e} '
-                f'max_abs={abs_diff.max().item():.6e} rel_norm={rel.item():.6e} tol={grad_rel_tol:.1e}')
+        assert rel.item() <= grad_rel_tol
     finally:
         dist.destroy_process_group()
 
