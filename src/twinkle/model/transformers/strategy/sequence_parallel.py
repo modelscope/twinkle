@@ -183,6 +183,9 @@ class GatherLoss(torch.autograd.Function):
         # Split grads back to local sequence chunk.
         _grad = grad_output[0]
         if sequence_parallel.world_size > 1 and sequence_parallel._sp_group is not None:
+            # Gather replicates the sequence dimension across SP ranks. Scale once here
+            # so downstream FSDP avg does not shrink this path by an extra SP factor.
+            _grad = _grad * sequence_parallel.world_size
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
         return _grad, None, None, None
 
@@ -785,7 +788,8 @@ class SequenceParallel:
                 # - In next-token-aligned labels, this appears at labels[b-1]
                 boundary_starts = (real_position_ids == 0)
                 prev = torch.zeros_like(boundary_starts, dtype=torch.bool)
-                prev[..., 1:] = boundary_starts[..., :-1]
+                # Mask token b-1 when boundary starts at b.
+                prev[..., :-1] = boundary_starts[..., 1:]
                 labels = labels.clone()
                 labels[prev] = -100
                 # Also avoid any potential wrap-around supervision at the end of the concatenated stream.
@@ -867,6 +871,7 @@ class SequenceParallelConfig:
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
     loss_reduction: str = 'mean'
+    compensate_fsdp_avg: bool = False
 
 
 def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -> int:
@@ -969,34 +974,64 @@ class SequenceParallelStrategy:
             return loss
         if labels is None or sequence_parallel._sp_group is None:
             return loss
-        # Compute full-sequence loss in forward, but keep backward local to this rank.
+        # Compute global loss via autograd-aware all-reduce.
         reduction = str(self.sp_config.get('loss_reduction', 'mean')).lower()
         if reduction == 'none':
             raise ValueError("SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
                              'Please aggregate per-token losses before calling reduce_loss.')
-        num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
+        compensate_fsdp_avg = bool(self.sp_config.get('compensate_fsdp_avg', False))
+        compensate_factor = float(self.ulysses_size if compensate_fsdp_avg else 1.0)
+        sum_metric_scale = float(self.ulysses_size)
+
+        class _ReduceSequenceParallelLoss(torch.autograd.Function):
+
+            @staticmethod
+            def forward(ctx, local_mean: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
+                local_tokens = num_valid_tokens.detach().clone()
+                local_sum = local_mean * local_tokens
+                if local_tokens.item() == 0:
+                    local_sum = torch.nan_to_num(local_sum)
+                global_sum = local_sum.detach().clone()
+                dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+                global_tokens = num_valid_tokens.detach().clone()
+                dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
+                ctx.save_for_backward(local_tokens, global_tokens)
+                if global_tokens.item() == 0:
+                    return local_sum
+                return global_sum / global_tokens
+
+            @staticmethod
+            def backward(ctx, grad_output: torch.Tensor):
+                local_tokens, global_tokens = ctx.saved_tensors
+                if global_tokens.item() == 0:
+                    return torch.zeros_like(grad_output), None
+                # d(global_mean)/d(local_mean) = local_tokens / global_tokens.
+                grad_local_mean = grad_output * (local_tokens / global_tokens) * compensate_factor
+                return grad_local_mean, None
+
+        class _ReduceSequenceParallelSum(torch.autograd.Function):
+
+            @staticmethod
+            def forward(ctx, local_sum: torch.Tensor) -> torch.Tensor:
+                ctx.sum_metric_scale = sum_metric_scale
+                global_sum = local_sum.detach().clone()
+                dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
+                # Keep logging/metric value aligned with non-SP sum semantics under
+                # outer collect='mean' by removing one SP replication factor.
+                return global_sum / ctx.sum_metric_scale
+
+            @staticmethod
+            def backward(ctx, grad_output: torch.Tensor):
+                # Keep training gradient scale unchanged; forward-side scaling is for
+                # logging/metric alignment under outer collect='mean'.
+                return grad_output
+
         if reduction == 'sum':
-            local_sum = loss
-            global_sum = local_sum.detach().clone()
-            dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-            out = global_sum + (local_sum - local_sum.detach())
-            if sequence_parallel.world_size > 1:
-                out_metric = out.detach() / sequence_parallel.world_size
-                return out_metric + (out - out.detach())
-            return out
-        # Default to mean reduction.
-        local_sum = loss * num_valid_tokens
-        global_sum = local_sum.detach().clone()
-        dist.all_reduce(global_sum, group=sequence_parallel._sp_group)
-        global_tokens = num_valid_tokens.detach().clone()
-        dist.all_reduce(global_tokens, group=sequence_parallel._sp_group)
-        if global_tokens.item() == 0:
-            return loss
-        out = (global_sum + (local_sum - local_sum.detach())) / global_tokens
-        if sequence_parallel.world_size > 1:
-            out_metric = out.detach() / sequence_parallel.world_size
-            return out_metric + (out - out.detach())
-        return out
+            return _ReduceSequenceParallelSum.apply(loss)
+
+        # Default to mean reduction: `loss` is local mean.
+        num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
+        return _ReduceSequenceParallelLoss.apply(loss, num_valid_tokens)
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()
