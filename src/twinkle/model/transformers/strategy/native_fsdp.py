@@ -193,6 +193,7 @@ def _maybe_shard_ep_expert_blocks(model: nn.Module,
                                   reshard_after_forward: Optional[bool],
                                   mp_policy: 'MixedPrecisionPolicy') -> int:
     from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import Shard
     sharded_blocks = 0
     for module in model.modules():
         if not getattr(module, "_ep_patched", False):
@@ -207,6 +208,7 @@ def _maybe_shard_ep_expert_blocks(model: nn.Module,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
             mp_policy=mp_policy,
+            shard_placement_fn=lambda param: Shard(1),
         )
         sharded_blocks += 1
     return sharded_blocks
