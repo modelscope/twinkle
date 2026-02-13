@@ -36,7 +36,7 @@ def sample():
     # Step 2: Initialize the Twinkle client to communicate with the remote server.
     client = init_twinkle_client(
         base_url='http://127.0.0.1:8000',
-        api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'),
+        api_key=os.environ.get('MODELSCOPE_TOKEN'),
     )
 
     # Step 3: Create the sampler client pointing to the model on the server
