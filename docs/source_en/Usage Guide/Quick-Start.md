@@ -1,17 +1,11 @@
-<div align="center">
-
 ## ✨ What is Twinkle?
 
 A component library for large model training. Based on PyTorch, simpler, more flexible, production-ready.
 
-<p align="center">
 🧩 <b>Loosely Coupled Architecture</b> · Standardized Interfaces<br>
 🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
 🔌 <b>Multi-Framework Compatible</b> · Transformers / Megatron<br>
 👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment
-</p>
-
-</div>
 
 ## Twinkle Compatibility
 
@@ -23,7 +17,6 @@ Twinkle and [ms-swift](https://github.com/modelscope/ms-swift) are both model tr
 - If you are a large model researcher who wants to customize models or training methods
 - If you are good at writing training loops and want to customize the training process
 - If you want to provide enterprise-level or commercial training platforms
-- If you lack training hardware and want to use community resources
 
 ### When to Choose ms-swift
 

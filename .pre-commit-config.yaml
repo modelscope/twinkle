@@ -22,23 +22,23 @@ repos:
     hooks:
       - id: pyupgrade
         args: [--py38-plus]
-        exclude: ^client_tools/
+        exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: check-yaml
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: end-of-file-fixer
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: requirements-txt-fixer
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: double-quote-string-fixer
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: check-merge-conflict
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)
       - id: mixed-line-ending
         args: ["--fix=lf"]
-        exclude: ^client_tools/
+        exclude: ^(client_tools/|src/twinkle_client/)

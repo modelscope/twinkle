@@ -37,8 +37,8 @@ GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 
 ADAPTER_NAME = 'default'
 
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta("ms://modelscope/gsm8k", subset_name='main', split='train'))
-    dataset.set_template("Template", model_id=MODEL_ID, max_length=2048)
+    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -67,7 +67,7 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
-    lora_config = LoraConfig(target_modules="all-linear", r=32, lora_alpha=64, lora_dropout=0.05)
+    lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
 
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
@@ -164,9 +164,9 @@ def main():
         optim_step += 1
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
-        logger.info(f"[Step {optim_step}/{MAX_STEPS}] {log_dict}")
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
-    logger.info(f"Training completed. optim_steps={optim_step}")
+    logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('grpo-gsm8k-checkpoint')
 
 if __name__ == '__main__':

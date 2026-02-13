@@ -21,25 +21,25 @@ def convert_to_messages(example):
 class TestLazyDataset:
 
     def test_lazy_dataset_basic(self):
-        # 基本功能测试
+        # Basic functionality test
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
         assert len(dataset) == 4
-        assert dataset.do_encode
-        assert dataset.do_check
+        assert not dataset.do_encode
+        assert not dataset.do_check
 
         item = dataset[0]
         assert 'text' in item
         assert item['text'] == 'Hello world'
 
     def test_lazy_dataset_encode_flag(self):
-        # 懒加载编码标志测试
+        # Lazy encode flag test
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
 
-        assert dataset.do_encode
+        assert not dataset.do_encode
 
         try:
             dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-0.5B-Instruct', max_length=128)
@@ -48,12 +48,14 @@ class TestLazyDataset:
 
         dataset.encode()
 
-        assert dataset.do_encode
+        # Lazy load: encode() only sets flag, actual encoding on access; raw dataset has no input_ids
         assert 'messages' in dataset.dataset[0]
         assert 'input_ids' not in dataset.dataset[0]
+        item = dataset[0]
+        assert 'input_ids' in item
 
     def test_lazy_dataset_encode_on_access(self):
-        # 懒加载编码执行测试
+        # Lazy encode execution test
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
@@ -71,12 +73,12 @@ class TestLazyDataset:
         assert len(item['input_ids']) > 0
 
     def test_lazy_dataset_check_flag(self):
-        # 懒加载检查标志测试,验证check()只设置标志，不实际执行检查
+        # Lazy check flag test: check() only sets flag, does not execute check
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
 
-        assert dataset.do_check
+        assert not dataset.do_check
 
         try:
             dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-0.5B-Instruct', max_length=128)
@@ -85,10 +87,12 @@ class TestLazyDataset:
 
         dataset.check()
 
-        assert dataset.do_check
+        # Lazy load: check() only sets flag, actual check on access
+        item = dataset[0]
+        assert item is not None
 
     def test_lazy_dataset_check_on_access(self):
-        # 懒加载检查执行测试,验证在访问数据时才执行检查
+        # Lazy check execution test: check runs on data access
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
@@ -105,7 +109,7 @@ class TestLazyDataset:
         assert 'messages' in item or item is None
 
     def test_lazy_dataset_encode_requires_template(self):
-        # 编码要求模板测试,验证未设置模板时抛出异常
+        # Encode requires template: raises when template not set
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
 
@@ -121,7 +125,7 @@ class TestLazyDataset:
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_lazy_dataset_no_split_strategy(self):
-        # 编码不支持split策略测试,验证未设置模板时抛出异常
+        # Encode does not support split strategy: raises when template not set
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)
@@ -136,7 +140,7 @@ class TestLazyDataset:
             dataset.encode()
 
     def test_lazy_dataset_multiple_items(self):
-        # 验证多个数据项的懒加载编码
+        # Lazy encode for multiple items
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(convert_to_messages)

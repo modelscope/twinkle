@@ -9,11 +9,10 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
+from twinkle_client.http import http_post, heartbeat_manager
+from twinkle.dataset import Dataset
+from twinkle.dataset import DatasetMeta
 from torch.utils.data import IterableDataset
-
-from twinkle.dataset import Dataset, DatasetMeta
-from twinkle_client.http import heartbeat_manager, http_post
-
 
 class IterableDataset(IterableDataset):
     """Client wrapper for IterableDataset that calls server HTTP endpoints."""
@@ -27,11 +26,9 @@ class IterableDataset(IterableDataset):
             json_data={
                 'processor_type': 'dataset',
                 'class_type': 'IterableDataset',
-                **{
-                    'dataset_meta': dataset_meta
-                },
-                **kwargs
-            })
+                **{'dataset_meta': dataset_meta}, **kwargs
+            }
+        )
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
         heartbeat_manager.register_processor(self.processor_id)
@@ -42,19 +39,20 @@ class IterableDataset(IterableDataset):
         except:
             pass
 
+    
     def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'add_dataset',
-                **{
-                    'dataset_meta': dataset_meta
-                },
+                **{'dataset_meta': dataset_meta},
                 **kwargs
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __len__(self):
         response = http_post(
@@ -63,9 +61,11 @@ class IterableDataset(IterableDataset):
                 'processor_id': self.processor_id,
                 'function': '__len__',
                 **{},
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __getitem__(self, idx):
         response = http_post(
@@ -73,12 +73,12 @@ class IterableDataset(IterableDataset):
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__getitem__',
-                **{
-                    'idx': idx
-                },
-            })
+                **{'idx': idx},
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    
 
     def __iter__(self):
         response = http_post(
@@ -87,16 +87,19 @@ class IterableDataset(IterableDataset):
                 'processor_id': self.processor_id,
                 'function': '__iter__',
                 **{},
-            })
+            }
+        )
         response.raise_for_status()
         return self
-
+    
     def __next__(self):
         response = http_post(
             url=f'{self.server_url}/processors/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__next__',
-            })
+            }
+        )
         response.raise_for_status()
-        return response.json()['result']
+        return response.json()["result"]
+    

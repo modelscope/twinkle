@@ -45,7 +45,7 @@ from twinkle_client import init_tinker_compat_client
 # Step 1: Initialize client (automatically patches Tinker SDK)
 service_client = init_tinker_compat_client(
     base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_SDK_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
 )
 
 # Step 2: Query existing training runs (optional)

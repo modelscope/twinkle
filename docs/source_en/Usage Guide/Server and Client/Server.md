@@ -50,9 +50,78 @@ This configuration starts 3 nodes:
 - **Node 1** (Worker): 4 GPUs (cards 4-7)
 - **Node 2** (Worker): CPU-only node
 
+#### 4. Set Environment Variables
+
+Before starting the Server, you need to set the following environment variables:
+
+```bash
+export DEVICE_COUNT_PER_PHYSICAL_NODE=8  # Specify the total number of GPUs on each physical machine
+export TWINKLE_TRUST_REMOTE_CODE=0       # Whether to trust remote code (security consideration)
+```
+
+> **Important Note**: `DEVICE_COUNT_PER_PHYSICAL_NODE` must be set to the actual number of physical GPUs on the machine, which is crucial for correctly parsing the `ranks` configuration.
+
 ### Node Rank in YAML Configuration
 
-In the YAML configuration file, **each component needs to occupy a separate Node**, and the `ranks` within each Node are numbered starting from 0.
+In the YAML configuration file, **each component needs to occupy a separate Node**.
+
+**Example configuration:**
+
+```yaml
+applications:
+  # Model service occupies GPU 0-3 (physical card numbers)
+  - name: models-Qwen2.5-7B-Instruct
+    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+    import_path: model
+    args:
+      nproc_per_node: 4
+      device_group:
+        name: model
+        ranks: [0, 1, 2, 3]    # Physical GPU card numbers
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 4             # Data parallel size
+        # tp_size: 1           # Tensor parallel size (optional)
+        # pp_size: 1           # Pipeline parallel size (optional)
+        # ep_size: 1           # Expert parallel size (optional)
+
+  # Sampler service occupies GPU 4-5 (physical card numbers)
+  - name: sampler-Qwen2.5-7B-Instruct
+    route_prefix: /sampler/Qwen/Qwen2.5-7B-Instruct
+    import_path: sampler
+    args:
+      nproc_per_node: 2
+      device_group:
+        name: sampler
+        ranks: [4, 5]          # Physical GPU card numbers 4-5
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 2             # Data parallel size
+
+  # Processor service occupies CPU
+  - name: processor
+    route_prefix: /processors
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 4
+      device_group:
+        name: processor
+        ranks: 0               # CPU index
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 4             # Data parallel size
+```
+**Important notes:**
+- The `ranks` configuration uses **physical GPU card numbers**, directly corresponding to the actual GPU devices on the machine
+- The `device_mesh` configuration uses parameters like `dp_size`, `tp_size`, `pp_size`, `ep_size` instead of the original `mesh` and `mesh_dim_names`
+- The environment variable `DEVICE_COUNT_PER_PHYSICAL_NODE` must be set to inform the system of the total number of physical GPUs on each machine
+- Different components will be automatically assigned to different Nodes
+- Ray will automatically schedule to the appropriate Node based on resource requirements (`num_gpus`, `num_cpus` in `ray_actor_options`)
+
+In the YAML configuration file, **each component needs to occupy a separate Node**.
 
 **Example configuration:**
 
@@ -204,8 +273,9 @@ applications:
         device_type: cuda
       device_mesh:                    # Distributed training mesh
         device_type: cuda
-        mesh: [0, 1]                  # Device indices in the mesh
-        mesh_dim_names: ['dp']        # Mesh dimensions: dp=data parallel
+        dp_size: 2                    # Data parallel size
+        # tp_size: 1                  # Tensor parallel size (optional)
+        # pp_size: 1                  # Pipeline parallel size (optional)
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -229,8 +299,7 @@ applications:
         device_type: CPU
       device_mesh:
         device_type: CPU
-        mesh: [0, 1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
     deployments:
       - name: ProcessorManagement
         autoscaling_config:
@@ -260,8 +329,7 @@ The difference from the Transformers backend is only in the `use_megatron` param
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0, 1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
 ```
 
 > **Note**: The Megatron backend does not need `adapter_config` (LoRA adapter management is handled internally by Megatron).
@@ -314,8 +382,7 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0, 1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -324,6 +391,9 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"  # Total number of physical GPUs on each machine
 
   # 3. Sampler service (optional, for inference sampling)
   - name: sampler-Qwen2.5-0.5B-Instruct
@@ -343,8 +413,7 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        mesh: [0]
-        mesh_dim_names: ['dp']
+        dp_size: 1                    # Data parallel size
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -354,6 +423,9 @@ applications:
         ray_actor_options:
           num_cpus: 0.1
           num_gpus: 1                 # Sampler needs independent GPU
+          runtime_env:
+            env_vars:
+              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"  # Total number of physical GPUs on each machine
 ```
 
 ## Configuration Item Description
@@ -375,11 +447,30 @@ applications:
 ```yaml
 device_group:
   name: model          # Device group name
-  ranks: [0, 1]        # GPU card number list
+  ranks: [0, 1]        # Physical GPU card number list
   device_type: cuda     # Device type: cuda / CPU
 
 device_mesh:
   device_type: cuda
-  mesh: [0, 1]                    # Device indices in the mesh
-  mesh_dim_names: ['dp']          # Dimension names, commonly used: dp (data parallel), tp (tensor parallel), pp (pipeline parallel)
+  dp_size: 2           # Data parallel size
+  # tp_size: 1         # Tensor parallel size (optional)
+  # pp_size: 1         # Pipeline parallel size (optional)
+  # ep_size: 1         # Expert parallel size (optional)
+```
+
+**Important configuration parameters:**
+
+| Parameter | Type | Description |
+|------|------|------|
+| `ranks` | list[int] | **Physical GPU card numbers**, directly corresponding to the actual GPU devices on the machine |
+| `dp_size` | int | Data parallel size |
+| `tp_size` | int (optional) | Tensor parallel size |
+| `pp_size` | int (optional) | Pipeline parallel size |
+| `ep_size` | int (optional) | Expert parallel size (for MoE models) |
+
+**Environment variables:**
+
+```bash
+export DEVICE_COUNT_PER_PHYSICAL_NODE=8  # Total number of GPUs on each physical machine (must be set)
+export TWINKLE_TRUST_REMOTE_CODE=0       # Whether to trust remote code
 ```

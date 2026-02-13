@@ -20,7 +20,7 @@ def _make_text_batch(n: int, seq_len: int = 8):
 
 
 class TestNormalMode:
-    """普通模式: padding + collate."""
+    """Normal mode: padding + collate."""
 
     def test_normal_padding(self):
         proc = InputProcessor(padding_free=False, padding_side='right')
@@ -39,7 +39,7 @@ class TestNormalMode:
 
 
 class TestPaddingFreeMode:
-    """padding_free: 拼接多样本为单行."""
+    """padding_free: concatenate multiple samples into single row."""
 
     def test_padding_free_concatenate(self):
         proc = InputProcessor(padding_free=True)
@@ -52,7 +52,7 @@ class TestPaddingFreeMode:
 
 
 class TestMicroBatchMode:
-    """micro_batch 切分."""
+    """micro_batch split."""
 
     def test_micro_batch_fixed_length(self):
         proc = InputProcessor(padding_free=False)
@@ -72,7 +72,7 @@ class TestMicroBatchMode:
 
 
 class TestMultimodalMode:
-    """多模态: pixel_values, image_grid_thw."""
+    """Multimodal: pixel_values, image_grid_thw."""
 
     def test_multimodal_collate(self):
         proc = InputProcessor()
@@ -95,7 +95,7 @@ class TestMultimodalMode:
         b = out[0]
         assert 'input_ids' in b
         assert 'pixel_values' in b
-        # 2 images × 3 channels after squeeze, cat along dim=0 -> shape[0]=6
+        # 2 images x 3 channels after squeeze, cat along dim=0 -> shape[0]=6
         assert b['pixel_values'].shape[0] == 6
         assert b['image_grid_thw'].shape[0] == 6
 

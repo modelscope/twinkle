@@ -42,13 +42,13 @@ logger = get_logger()
 
 # ========== Configuration ==========
 MODEL_ID = 'ms://Qwen/Qwen2.5-3B-Instruct'
-NUM_GENERATIONS = 8
+NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
 MAX_STEPS = 10
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 TEMPERATURE = 1.0
-SYNC_INTERVAL = 5  # Save weights for sampler every N steps
+SYNC_INTERVAL = 1  # Save weights for sampler every N steps
 GRADIENT_ACCUMULATION_STEPS = 4
 
 
@@ -75,7 +75,7 @@ def train():
     # Step 1: Initialize the Twinkle client
     client = init_twinkle_client(
         base_url='http://127.0.0.1:8000',
-        api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'),
+        api_key=os.environ.get('MODELSCOPE_TOKEN'),
     )
 
     # Step 2: Prepare dataset and dataloader

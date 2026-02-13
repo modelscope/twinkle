@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from twinkle.data_format import Message, Trajectory
-from .base import Preprocessor
 import re
 
-from twinkle.data_format import Trajectory, Message
+from twinkle.data_format import Message, Trajectory
+from .base import Preprocessor
+
 
 class CompetitionMathProcessor(Preprocessor):
 
@@ -83,6 +83,7 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
         ]
         return Trajectory(messages=messages, user_data=[{'target': target, 'nums': nums}])
 
+
 class GSM8KProcessor(Preprocessor):
     """Preprocessor for GSM8K dataset.
 
@@ -90,12 +91,10 @@ class GSM8KProcessor(Preprocessor):
     Extracts the ground truth number and stores it in user_data for reward.
     """
 
-    system_prompt = (
-        "You are a helpful math assistant. Solve the problem step by step. "
-        "Show your reasoning in <think> </think> tags, then give the final "
-        "numerical answer after ####.\n"
-        "For example:\n<think> ... reasoning ... </think>\n#### 42"
-    )
+    system_prompt = ('You are a helpful math assistant. Solve the problem step by step. '
+                     'Show your reasoning in <think> </think> tags, then give the final '
+                     'numerical answer after ####.\n'
+                     'For example:\n<think> ... reasoning ... </think>\n#### 42')
 
     def extract_ground_truth(self, answer_str: str) -> str:
         """Extract the number after '####' from GSM8K answer."""

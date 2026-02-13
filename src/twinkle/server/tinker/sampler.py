@@ -9,6 +9,7 @@ It supports:
 3. Multi-user inference with rate limiting
 4. Flexible sampling parameters
 """
+import os
 import traceback
 from fastapi import FastAPI, Request
 from ray import serve
@@ -160,6 +161,13 @@ def build_sampler_app(model_id: str,
                         checkpoint_manager = create_checkpoint_manager(token)
                         adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
+                    # Validate adapter URI existence if provided
+                    if not adapter_uri or not os.path.exists(adapter_uri):
+                        return types.RequestFailedResponse(
+                            error=f'Adapter URI {model_path} does not exist. Please check the model_path.',
+                            category=types.RequestErrorCategory.User,
+                        )
+
                     # Convert tinker SamplingParams to twinkle SamplingParams if needed
                     sampling_params = None
                     if body.sampling_params:
@@ -213,9 +221,10 @@ def build_sampler_app(model_id: str,
             # Calculate input tokens for rate limiting
             input_tokens = len(body.prompt.to_ints())
             return await self.schedule_task(
-                _do_sample(),
+                _do_sample,
                 token=request.state.token,
                 input_tokens=input_tokens,
+                task_type='sample',
             )
 
     return SamplerManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, sampler_type,

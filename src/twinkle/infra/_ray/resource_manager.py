@@ -86,7 +86,11 @@ class ResourceManager:
         for i in range(self.nnodes):
             # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
             node_idx = self.min_node_idx + i if device_type != 'CPU' else i
-            node = self.nodes[node_idx]
+            try:
+                node = self.nodes[node_idx]
+            except IndexError:
+                # node_idx may not be continuous
+                node = self.nodes[0]
             node_cpu = int(node['Resources']['CPU'])
             if device_type != 'CPU':
                 bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)})  # create bundles

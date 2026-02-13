@@ -45,7 +45,7 @@ applications:
       nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
-        max_model_len: 8192           # Maximum sequence length the engine supports
+        max_model_len: 16000           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.85   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
       device_group:                   # Logical device group for the sampler
@@ -56,6 +56,9 @@ applications:
       device_mesh:
         device_type: cuda
         dp_size: 4
+      queue_config:
+        rps_limit: 20                               # Max requests per second
+        tps_limit: 16000                            # Max tokens per second
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -77,7 +80,9 @@ applications:
     args:
       use_megatron: true                          # Use HuggingFace Transformers backend
       model_id: "ms://Qwen/Qwen3-30B-A3B-Instruct-2507" # ModelScope model identifier
-      nproc_per_node: 4                            # Number of GPU processes per node
+      max_length: 16000                           # model max length
+      max_loras: 5                                # model max loras
+      nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
         name: model
         ranks: [4,5,6,7]                              # GPU rank indices
@@ -88,11 +93,12 @@ applications:
         ep_size: 2
 
       queue_config:
-        rps_limit: 100                             # Max requests per second
-        tps_limit: 100000                           # Max tokens per second
+        rps_limit: 20                               # Max requests per second
+        tps_limit: 16000                            # Max tokens per second
       adapter_config:
-        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
-        adapter_timeout: 1800                      # Seconds before idle adapter unload
+        per_token_adapter_limit: 3                # Max concurrent LoRA adapters
+        adapter_timeout: 30                       # Seconds before idle adapter unload
+        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
         autoscaling_config:

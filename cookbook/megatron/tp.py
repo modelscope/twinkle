@@ -30,7 +30,7 @@ def eval(model):
     dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct')
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     dataset.encode()
-    dataloader = DataLoader(dataset=dataset, batch_size=1)
+    dataloader = DataLoader(dataset=dataset, batch_size=16)
     for step, batch in tqdm(enumerate(dataloader)):
         model.forward_only(inputs=batch)
     metrics = model.calculate_metric(is_training=False)

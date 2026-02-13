@@ -21,19 +21,19 @@ import gc
 import numpy as np
 import os
 import re
-from modelscope import AutoTokenizer
 from tinker import types
 from typing import List, Tuple
 
+from twinkle_client import init_tinker_compat_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.metric import CompletionRewardMetric
 from twinkle.preprocessor import Preprocessor
 from twinkle.reward.base import Reward
-from twinkle_client import init_tinker_compat_client
+from twinkle.metric import CompletionRewardMetric
+from twinkle.template import Template
 
 logger = get_logger()
 
@@ -176,7 +176,7 @@ class MathFormatReward(Reward):
         return rewards
 
 
-def create_Math_dataset():
+def create_math_dataset():
     """Create Math dataset."""
     meta = DatasetMeta(
         'ms://modelscope/competition_math',
@@ -207,16 +207,16 @@ def main():
     logger.info('Starting Math GRPO training...')
 
     # Step 1: Prepare dataset and dataloader (client-side)
-    dataset = create_Math_dataset()
+    dataset = create_math_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    template = Template(model_id=f'ms://{BASE_MODEL}')
 
-    logger.info('Dataset and tokenizer initialized')
+    logger.info('Dataset and template initialized')
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info('Connecting to Tinker server...')
     service_client = init_tinker_compat_client(
-        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_SDK_TOKEN'))
+        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
     logger.info('Creating LoRA training client...')
     # Create a LoRA training client for GRPO
@@ -291,7 +291,7 @@ def main():
         completion_lengths = []
 
         for idx, seq in enumerate(all_sequences):
-            decoded_text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
+            decoded_text = template.decode(seq.tokens, skip_special_tokens=True)
             # Use the corresponding user data for this sequence
             trajectories.append({
                 'messages': [
@@ -334,6 +334,10 @@ def main():
         ).tolist()
 
         frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
+        if frac_zero_std == 1.0:
+            logger.info(f'Step {step}: All advantages are zero, skipping training')
+            step += 1
+            continue
 
         # ========== 6. Train the policies with GRPO loss ==========
         # Train the policies with the Advantage-Regularized policy
