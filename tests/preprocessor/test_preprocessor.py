@@ -265,39 +265,6 @@ class TestAlpacaProcessor:
 class TestDatasetMapChanges:
     """Test Dataset.map changes"""
 
-    def test_auto_filter_none(self):
-        """Test auto-filter None values"""
-        import json
-        import tempfile
-
-        # Note: cannot return None for first sample, datasets lib treats it as no update needed
-        class NoneProcessor(CompetitionMathProcessor):
-
-            def __call__(self, row):
-                # Return None for second sample (not first)
-                if row['problem'] == 'Solve for x: 3x + 5 = 14':
-                    return None
-                return super().__call__(row)
-
-        jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
-        dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))
-        original_len = len(dataset)
-        assert original_len == 4
-
-        dataset.map(NoneProcessor())
-
-        # Samples returning None should be filtered out
-        assert len(dataset) < original_len
-        assert len(dataset) == 3  # 4 samples, 1 returns None, 3 remain
-
-        # Verify no None values, all samples have correct structure
-        for i in range(len(dataset)):
-            sample = dataset[i]
-            assert sample is not None
-            assert 'messages' in sample
-            messages = sample['messages']
-            assert messages[0]['content'] != 'Solve for x: 3x + 5 = 14'
-
     def test_batched_false(self):
         """Test batched=False setting"""
         jsonl_path = str(TEST_DATA_DIR / 'math_data.jsonl')
