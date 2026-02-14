@@ -129,10 +129,18 @@ class MultiLora:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0
 
     def find_lora_by_tenant(self, tenant_adapter_name):
-        return [_lora for _lora in self.loras if _lora.tenant_adapter_name == tenant_adapter_name][0]
+        _loras = [_lora for _lora in self.loras if _lora.tenant_adapter_name == tenant_adapter_name]
+        if len(_loras) > 0:
+            return _loras[0]
+        else:
+            raise ValueError(f'No lora found for tenant {tenant_adapter_name}')
 
     def find_lora(self, adapter_name):
-        return [_lora for _lora in self.loras if _lora.adapter_name == adapter_name][0]
+        _loras = [_lora for _lora in self.loras if _lora.adapter_name == adapter_name]
+        if len(_loras) > 0:
+            return _loras[0]
+        else:
+            raise ValueError(f'No lora found for real adapter_name {adapter_name}')
 
     @staticmethod
     def match_target_modules(
