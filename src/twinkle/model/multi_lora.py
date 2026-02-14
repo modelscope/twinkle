@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Union
 
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
+from twinkle.utils import get_logger
+
+logger = get_logger()
 
 
 @dataclass
@@ -38,6 +41,9 @@ class MultiLora:
             if _lora.tenant_adapter_name is None:
                 return _lora
         return None
+
+    def _count_available_loras(self):
+        return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
     def activate_adapter(self, tenant_adapter_name: str):
         if not self.has_lora(tenant_adapter_name):
@@ -114,16 +120,18 @@ class MultiLora:
             raise RuntimeError(f'Too big rank for lora: {config.r}')
         _available_lora.tenant_config = config
         _available_lora.tenant_adapter_name = tenant_adapter_name
+        logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         return _available_lora.adapter_name
 
     def release_lora(self, tenant_adapter_name: str) -> Optional[str]:
-        _lora = self.find_lora_by_tenant(tenant_adapter_name)
-        if _lora is not None:
+        try:
+            _lora = self.find_lora_by_tenant(tenant_adapter_name)
             _lora.tenant_config = None
             _lora.tenant_adapter_name = None
             self._load_initial_weights(_lora.adapter_name)
-        else:
-            raise ValueError(f'No lora found for tenant {tenant_adapter_name}')
+            logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
+        except ValueError:
+            return
 
     def has_lora(self, adapter_name: str) -> bool:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0
