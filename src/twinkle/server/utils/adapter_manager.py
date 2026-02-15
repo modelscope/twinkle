@@ -74,7 +74,7 @@ class AdapterManagerMixin:
         self._adapter_countdown_thread: threading.Thread | None = None
         self._adapter_countdown_running = False
 
-    def register_adapter(self, adapter_name: str, token: str, session_id: str | None = None, request_id: str | None = None) -> None:
+    def register_adapter(self, adapter_name: str, token: str, session_id: str | None = None) -> None:
         """Register a new adapter for lifecycle tracking.
 
         Args:
@@ -82,7 +82,6 @@ class AdapterManagerMixin:
             token: User token that owns this adapter.
             session_id: Optional session ID to associate with this adapter.
                 If provided, adapter will expire when the session expires.
-            request_id: The client request_id from `serve_multiplexed_model_id`
 
         Raises:
             RuntimeError: If adapter limit is exceeded for this token.
@@ -101,7 +100,6 @@ class AdapterManagerMixin:
             'inactivity_counter': 0,
             'state': {},
             'expiring': False,
-            'request_id': request_id,
         }
         logger.debug(f'[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}...'
                      + (f' (session: {session_id})' if session_id else ''))

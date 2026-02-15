@@ -122,13 +122,6 @@ def build_model_app(model_id: str,
         async def get_multiplexed_adapter(self, request_id: str):
             return request_id
 
-        def remove_multiplexed_adapter(self, adapter_name: str):
-            adapter_info = self.get_adapter_info(adapter_name)
-            if adapter_info is None or adapter_info.get('request_id') is None:
-                return
-            if hasattr(self, '_serve_multiplexed_models'):
-                self._serve_multiplexed_models.pop(adapter_info['request_id'], None)
-
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.
 
@@ -143,7 +136,6 @@ def build_model_app(model_id: str,
             """
             # Remove from model if it exists
             if self.get_adapter_info(adapter_name):
-                self.remove_multiplexed_adapter(adapter_name)
                 # Clear adapter state
                 self.clear_adapter_state(adapter_name)
 
@@ -190,7 +182,7 @@ def build_model_app(model_id: str,
                         adapter_name = self.get_adapter_name(adapter_name=model_id)
 
                         # Register adapter FIRST (limit check happens inside register_adapter)
-                        self.register_adapter(adapter_name, request.state.token, session_id=body.session_id, request_id=request.state.request_id)
+                        self.register_adapter(adapter_name, request.state.token, session_id=body.session_id)
 
                         # Create adapter AFTER successful registration
                         self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)

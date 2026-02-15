@@ -29,7 +29,8 @@ async def verify_request_token(request: Request, call_next):
     request_id = request.headers.get('serve_multiplexed_model_id')
     if not request_id:
         return JSONResponse(
-            status_code=400, content={'detail': 'Missing serve_multiplexed_model_id header, required for sticky session'})
+            status_code=400,
+            content={'detail': 'Missing serve_multiplexed_model_id header, required for sticky session'})
     request.state.request_id = request_id
     request.state.token = token
     response = await call_next(request)

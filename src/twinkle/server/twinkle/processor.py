@@ -68,7 +68,6 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.resource_dict = {}
             self.resource_records: Dict[str, int] = {}
-            self.resource_client_ids = Dict[str, str] = {}
             self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
             self.hb_thread.start()
             self.state: ServerStateProxy = get_server_state()
@@ -84,20 +83,12 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                     if self.resource_records[key] > self.COUNT_DOWN:
                         self.resource_records.pop(key, None)
                         self.resource_dict.pop(key, None)
-                        self.remove_multiplexed_adapter(key)
                         if key in self.key_token_dict:
                             self.handle_processor_count(self.key_token_dict.pop(key), False)
 
         @serve.multiplexed(max_num_models_per_replica=100)
         async def get_multiplexed_adapter(self, request_id: str):
             return request_id
-
-        def remove_multiplexed_adapter(self, processor_id: str):
-            request_id = self.resource_client_ids.pop(processor_id, None)
-            if request_id is None:
-                return
-            if hasattr(self, '_serve_multiplexed_models'):
-                self._serve_multiplexed_models.pop(request_id, None)
 
         def assert_processor_exists(self, processor_id: str):
             assert processor_id and processor_id in self.resource_dict, f'Processor {processor_id} not found'
@@ -147,7 +138,6 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 remote_group=self.device_group.name, device_mesh=self.device_mesh, instance_id=processor_id, **_kwargs)
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
-            self.resource_client_ids[processor_id] = request.state.request_id
             await self.get_multiplexed_adapter(request.state.request_id)
             return {'processor_id': 'pid:' + processor_id}
 
