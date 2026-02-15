@@ -189,6 +189,17 @@ def build_model_app(model_id: str,
 
         @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
         async def get_multiplexed_adapter(self, request_id: str):
+            """
+            Reference docs:
+            1. https://docs.ray.io/en/latest/serve/model-multiplexing.html
+            2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
+            3. https://github.com/ray-project/ray/pull/56855/changes
+            Args:
+                request_id:
+
+            Returns:
+
+            """
             return request_id
 
         def _on_adapter_expired(self, adapter_name: str) -> None:
