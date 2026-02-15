@@ -89,7 +89,6 @@ applications:
       device_mesh:
         device_type: cuda
         dp_size: 4
-        ep_size: 2
 
       queue_config:
         rps_limit: 20                               # Max requests per second

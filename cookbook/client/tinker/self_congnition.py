@@ -19,7 +19,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen2.5-7B-Instruct'
 
 
 def train():
@@ -44,7 +44,7 @@ def train():
 
     # Connect to the Twinkle server running locally
     service_client = init_tinker_compat_client(
-        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
+        base_url='localhost:9000', api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
     training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
@@ -68,14 +68,12 @@ def train():
             optim_result = optim_future.result()
 
             # Compute weighted average log-loss per token for monitoring
-            logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
-            weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
-            print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
+            print(f'Metric: {optim_result}')
 
         # Save a checkpoint after each epoch
-        save_future = training_client.save_state(f'twinkle-lora-{epoch}')
-        save_result = save_future.result()
-        print(f'Saved checkpoint to {save_result.path}')
+        #save_future = training_client.save_state(f'twinkle-lora-{epoch}')
+        #save_result = save_future.result()
+        #print(f'Saved checkpoint to {save_result.path}')
 
 
 def eval():
@@ -85,7 +83,7 @@ def eval():
     weight_path = 'twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2'
 
     # Connect to the server and create a sampling client with the trained weights
-    service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+    service_client = init_tinker_compat_client(base_url='http://localhost:9000')
     sampling_client = service_client.create_sampling_client(model_path=weight_path, base_model=base_model)
 
     # Step 2: Prepare the chat prompt

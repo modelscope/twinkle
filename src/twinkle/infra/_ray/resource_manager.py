@@ -153,9 +153,9 @@ class ResourceManager:
         visible_devices = []
         for visible_device in self.visible_devices:
             if visible_device:
-                visible_device = int(visible_device.split(',')[0])
+                visible_device = [int(device) for device in visible_device.split(',')]
             else:
-                visible_device = 0
+                visible_device = list(range(nproc_per_node))
             visible_devices.append(visible_device)
         self.visible_devices = visible_devices
 
@@ -174,7 +174,7 @@ class ResourceManager:
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
         assert len(groups) == len(visible_devices)
-        for group, visible_start_device in zip(groups, self.visible_devices):
+        for group, visible_device_list in zip(groups, self.visible_devices):
             if group.device_type != 'CPU':
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
@@ -196,7 +196,7 @@ class ResourceManager:
 
                         # All GPUs for a worker should be on the same node
                         node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [r % nproc_per_node + visible_start_device for r in worker_ranks]
+                        gpu_ranks_local = [visible_device_list[r % nproc_per_node] for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
@@ -211,7 +211,7 @@ class ResourceManager:
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = alloc_rank % nproc_per_node + visible_start_device
+                        gpu_rank = visible_device_list[alloc_rank % nproc_per_node]
                         local_device_groups.append(
                             dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
 

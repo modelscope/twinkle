@@ -307,7 +307,7 @@ class RayHelper:
 
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
-                env_vars.update(RayHelper._noset_env())
+                env_vars.update(ResourceManager.noset_env())
 
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 

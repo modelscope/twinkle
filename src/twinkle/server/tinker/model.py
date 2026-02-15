@@ -9,7 +9,6 @@ It handles:
 3. Checkpoint management (save/load weights)
 4. Multi-user support with token-based isolation
 """
-import os
 import traceback
 from fastapi import FastAPI, Request
 from peft import LoraConfig
@@ -56,6 +55,7 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
+    import ray
     app = FastAPI()
 
     @app.middleware('http')
@@ -172,7 +172,10 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping CreateModelResponse with model_id
             """
+            if isinstance(body, dict):
+                body = types.CreateModelRequest(**body)
             # Register a new model_id for each create_model call
+            await self.get_multiplexed_adapter(request.state.request_id)
             model_id = self.state.register_model(body.model_dump(), token=request.state.token)
 
             async def _create_adapter():
@@ -195,7 +198,7 @@ def build_model_app(model_id: str,
 
                         # Fresh adapter has no accumulated gradients.
                         self.set_adapter_state(adapter_name, 'grad_ready', False)
-                        await self.get_multiplexed_adapter(request.state.request_id)
+                        logger.info(f'Create adapter: {adapter_name}, request_id: {request.state.request_id}, ray node: {ray.get_runtime_context().get_node_id()}')
 
                     training_run_manager = create_training_run_manager(request.state.token)
                     training_run_manager.save(model_id, body)
@@ -346,10 +349,12 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping ForwardBackwardOutput with loss and metrics
             """
-
+            if isinstance(body, dict):
+                body = types.ForwardBackwardRequest(**body)
             async def _do_forward_backward():
                 try:
                     adapter_name = self.get_adapter_name(adapter_name=body.model_id)
+                    logger.info(f'forward_backward: {adapter_name}, request_id: {request.state.request_id},  ray: {ray.get_runtime_context().get_node_id()}')
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
                     # Touch adapter to reset inactivity counter
@@ -407,10 +412,12 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping OptimStepResponse
             """
-
+            if isinstance(body, dict):
+                body = types.OptimStepRequest(**body)
             async def _do_optim():
                 try:
                     adapter_name = self.get_adapter_name(adapter_name=body.model_id)
+                    logger.info(f'optim_step: {adapter_name}, request_id: {request.state.request_id}, ray: {ray.get_runtime_context().node_id}')
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
                     # Disallow empty step (must have at least one forward_backward since last step)
