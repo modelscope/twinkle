@@ -88,7 +88,7 @@ pip install -e .
 We are rolling out training service built atop Twinkle✨ on ModelScope. It is currently in _Beta_. You may
 sign up for free access by joining the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, and
 train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
-our [documentation](docs/source_en/Usage%20Guide/ModelScope-Official-Resources.md).
+our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
 
 ## Supported Hardware
 
@@ -130,7 +130,7 @@ supported on Twinkle✨ framework.
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                          | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                                     |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) ~32B | transformers>=4.37   | ✅               | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |
 
-For a more detailed model support list 👉  [Quick Start.md](https://github.com/modelscope/twinkle/blob/dev/docs/source/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%BC%95/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B.md)
+For a more detailed model support list 👉  [Quick Start.md](docs/source_en/Usage%20Guide/Quick-Start.md)
 
 ## Sample Code
 
