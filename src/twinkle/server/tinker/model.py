@@ -100,15 +100,17 @@ def build_model_app(model_id: str,
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.use_megatron = use_megatron
+            replica_context = serve.get_replica_context()
+            replica_id = replica_context.replica_id.unique_id
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
                 from .common.megatron_model import TwinkleCompatMegatronModel
                 self.model = TwinkleCompatMegatronModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, **kwargs)
+                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
             else:
                 from .common.transformers_model import TwinkleCompatTransformersModel
                 self.model = TwinkleCompatTransformersModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, **kwargs)
+                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 

@@ -137,6 +137,19 @@ class ResourceManager:
         if self.node_ranks.count(0) > 1:
             self.node_ranks = list(range(len(self.placement_groups)))
 
+        self.visible_devices = []
+
+        @ray.remote
+        def get_visible_devices():
+            return os.environ.get(Platform.get_platform(group.device_type).visible_device_env())
+
+        if self.placement_groups:
+            self.visible_devices = ray.get([
+                get_visible_devices.options(placement_group=pg).remote() for pg in self.placement_groups
+            ])
+
+        breakpoint()
+
         self.node2pg: Dict[int, PlacementGroup] = {}
         # Map actual node indices to placement groups
         # For GPU/NPU groups, node indices start from self.min_node_idx
