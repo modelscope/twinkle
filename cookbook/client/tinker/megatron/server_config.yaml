@@ -70,7 +70,6 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "16"
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
@@ -110,4 +109,3 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "16"

@@ -65,7 +65,6 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -102,4 +101,3 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
