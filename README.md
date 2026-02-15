@@ -130,7 +130,7 @@ supported on Twinkle✨ framework.
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                          | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                                     |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) ~32B | transformers>=4.37   | ✅               | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |
 
-For a more detailed model support list 👉  [Quick Start.md](docs/source_en/Usage%20Guide/Quick-Start.md)
+For more detailed model support list 👉  [Quick Start](docs/source_en/Usage%20Guide/Quick-Start.md)
 
 ## Sample Code
 
