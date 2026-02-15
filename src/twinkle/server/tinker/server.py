@@ -82,10 +82,6 @@ def build_server_app(deploy_options: dict[str, Any],
             self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get('route_prefix', '/api/v1')
             self.supported_models = self.normalize_models(supported_models) or [
-                types.SupportedModel(model_name='Qwen/Qwen2.5-0.5B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-3B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-7B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-72B-Instruct'),
                 types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)
@@ -165,8 +161,8 @@ def build_server_app(deploy_options: dict[str, Any],
 
             try:
                 if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
-                    logger.info('proxy_to_model endpoint=%s target_url=%s x-ray-serve-request-id=%s', endpoint,
-                                target_url, headers.get('x-ray-serve-request-id'))
+                    logger.info('proxy_to_model endpoint=%s target_url=%s serve_multiplexed_model_id=%s', endpoint,
+                                target_url, headers.get('serve_multiplexed_model_id'))
                 rp_ = await self.client.request(
                     method=request.method,
                     url=target_url,

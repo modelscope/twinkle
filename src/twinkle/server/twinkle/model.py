@@ -187,6 +187,17 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
+        @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
+        async def get_multiplexed_adapter(self, request_id: str):
+            return request_id
+
+        def remove_multiplexed_adapter(self, adapter_name: str):
+            adapter_info = self.get_adapter_info(adapter_name)
+            if adapter_info is None or adapter_info.get('request_id') is None:
+                return
+            if hasattr(self, '_serve_multiplexed_models'):
+                self._serve_multiplexed_models.pop(adapter_info['request_id'], None)
+
         def _on_adapter_expired(self, adapter_name: str) -> None:
             """Handle adapter expiration by removing it from the model.
 
@@ -198,6 +209,7 @@ def build_model_app(model_id: str,
             """
             # Remove from model if it exists
             if self.get_adapter_info(adapter_name):
+                self.remove_multiplexed_adapter(adapter_name)
                 # Clear adapter state
                 self.clear_adapter_state(adapter_name)
                 # Unregister from adapter manager
@@ -481,7 +493,7 @@ def build_model_app(model_id: str,
             return {'result': body.hub_model_id}
 
         @app.post('/add_adapter_to_model')
-        def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
+        async def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
             """
             Add a new adapter to the model.
 
@@ -507,10 +519,11 @@ def build_model_app(model_id: str,
             training_run_manager = create_training_run_manager(token)
 
             # Register adapter FIRST (limit check happens inside register_adapter)
-            self.register_adapter(adapter_name, token)
+            self.register_adapter(adapter_name, token, request_id=request.state.request_id)
 
             # Create adapter AFTER successful registration
             self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
+            await self.get_multiplexed_adapter(request.state.request_id)
 
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration
