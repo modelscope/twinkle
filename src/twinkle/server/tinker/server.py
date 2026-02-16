@@ -12,6 +12,7 @@ training and inference. It acts as a routing layer that:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import httpx
 import logging
 import os
@@ -82,10 +83,6 @@ def build_server_app(deploy_options: dict[str, Any],
             self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get('route_prefix', '/api/v1')
             self.supported_models = self.normalize_models(supported_models) or [
-                types.SupportedModel(model_name='Qwen/Qwen2.5-0.5B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-3B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-7B-Instruct'),
-                types.SupportedModel(model_name='Qwen/Qwen2.5-72B-Instruct'),
                 types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)

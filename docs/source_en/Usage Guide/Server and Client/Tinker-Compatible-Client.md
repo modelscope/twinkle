@@ -25,7 +25,7 @@ for item in service_client.get_server_capabilities().supported_models:
 When calling `init_tinker_compat_client`, the following operations are automatically executed:
 
 1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
-2. **Set Request Headers**: Inject necessary authentication headers such as `X-Ray-Serve-Request-Id` and `Authorization`
+2. **Set Request Headers**: Inject necessary authentication headers such as `serve_multiplexed_model_id` and `Authorization`
 3. **Return `ServiceClient`**: Returns a standard Tinker `ServiceClient` object, subsequent operations are completely identical to native Tinker
 
 This means that after initialization, **all existing Tinker training code can be used directly** without any modifications.

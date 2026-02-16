@@ -65,6 +65,7 @@
 - [ ] 支持DPO对齐训练
 - [ ] 支持colocate RL训练
 - [ ] Preprocess支持batched
+- [ ] 对多replica的支持和粘滞路由
 
 ### 网络能力
 
@@ -84,5 +85,6 @@
 - [ ] Support for DPO alignment training
 - [ ] Support for colocate RL training
 - [ ] Support for batched preprocessing
+- [ ] Support for multiple replicas and sticky routing
 
 ### Networking Capabilities
