@@ -137,6 +137,28 @@ class ResourceManager:
         if self.node_ranks.count(0) > 1:
             self.node_ranks = list(range(len(self.placement_groups)))
 
+        self.visible_devices = []
+
+        @ray.remote
+        def get_visible_devices():
+            return os.environ.get(Platform.get_platform(group.device_type).visible_device_env())
+
+        if self.placement_groups:
+            self.visible_devices = ray.get([
+                get_visible_devices.options(placement_group=pg, runtime_env={
+                    'env_vars': self.noset_env()
+                }).remote() for pg in self.placement_groups
+            ])
+
+        visible_devices = []
+        for visible_device in self.visible_devices:
+            if visible_device:
+                visible_device = [int(device) for device in visible_device.split(',')]
+            else:
+                visible_device = list(range(nproc_per_node))
+            visible_devices.append(visible_device)
+        self.visible_devices = visible_devices
+
         self.node2pg: Dict[int, PlacementGroup] = {}
         # Map actual node indices to placement groups
         # For GPU/NPU groups, node indices start from self.min_node_idx
@@ -151,12 +173,8 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
-        if 'DEVICE_COUNT_PER_PHYSICAL_NODE' in os.environ:
-            # Sometimes, multiply nodes are in one physical node, there may be error in `gpu_rank`
-            device_per_node = int(os.environ['DEVICE_COUNT_PER_PHYSICAL_NODE'])
-        else:
-            device_per_node = nproc_per_node
-        for group in groups:
+        assert len(groups) == len(visible_devices)
+        for group, visible_device_list in zip(groups, self.visible_devices):
             if group.device_type != 'CPU':
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
@@ -178,7 +196,7 @@ class ResourceManager:
 
                         # All GPUs for a worker should be on the same node
                         node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [r % device_per_node for r in worker_ranks]
+                        gpu_ranks_local = [visible_device_list[r % nproc_per_node] for r in worker_ranks]
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
@@ -193,7 +211,7 @@ class ResourceManager:
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = alloc_rank % device_per_node
+                        gpu_rank = visible_device_list[alloc_rank % nproc_per_node]
                         local_device_groups.append(
                             dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
 
@@ -220,6 +238,19 @@ class ResourceManager:
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
         logger.info(f'node_ranks: {self.node_ranks}')
         logger.info(f'node2pg keys: {list(self.node2pg.keys())}')
+
+    @staticmethod
+    def noset_env():
+        return {
+            'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES': '1',
+            'RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES': '1',
+            'RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES': '1',
+            'RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS': '1',
+            'RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR': '1',
+        }
 
     def get_config(self, group: str):
         for config in self.group_configs:

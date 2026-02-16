@@ -230,19 +230,6 @@ class RayHelper:
         return False
 
     @staticmethod
-    def _noset_env():
-        return {
-            'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES': '1',
-            'RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES': '1',
-            'RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS': '1',
-            'RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR': '1',
-        }
-
-    @staticmethod
     def create_workers(worker_cls: Type[T],
                        group: str,
                        execute: Literal['all', 'peer', 'first'],
@@ -320,7 +307,7 @@ class RayHelper:
 
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
-                env_vars.update(RayHelper._noset_env())
+                env_vars.update(ResourceManager.noset_env())
 
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 

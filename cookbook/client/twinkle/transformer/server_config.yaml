@@ -61,7 +61,6 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 3. Processor Service - Handles data preprocessing on CPU
   #    Runs tokenization, template application, and other CPU-bound tasks.
@@ -90,7 +89,6 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"
 
   # 4. Sampler Service - Handles text generation inference
   #    Uses vLLM for efficient batched generation with optional LoRA adapters.
@@ -125,4 +123,3 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
-              DEVICE_COUNT_PER_PHYSICAL_NODE: "8"

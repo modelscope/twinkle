@@ -9,7 +9,6 @@ It handles:
 3. Checkpoint management (save/load weights)
 4. Multi-user support with token-based isolation
 """
-import os
 import traceback
 from fastapi import FastAPI, Request
 from peft import LoraConfig
@@ -100,15 +99,25 @@ def build_model_app(model_id: str,
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.use_megatron = use_megatron
+            replica_context = serve.get_replica_context()
+            replica_id = replica_context.replica_id.unique_id
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
                 from .common.megatron_model import TwinkleCompatMegatronModel
                 self.model = TwinkleCompatMegatronModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
             else:
                 from .common.transformers_model import TwinkleCompatTransformersModel
                 self.model = TwinkleCompatTransformersModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
@@ -117,6 +126,19 @@ def build_model_app(model_id: str,
 
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
+
+        """
+        TODO This is a cache system, we must change to sticky routing
+            Reference docs:
+            1. [Now]https://docs.ray.io/en/latest/serve/model-multiplexing.html
+            2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
+            3. https://github.com/ray-project/ray/pull/56855/changes
+            4. Direct call actor instead of http or handler in server.py
+        """
+
+        # @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
+        # async def get_multiplexed_adapter(self, request_id: str):
+        # return request_id
 
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.

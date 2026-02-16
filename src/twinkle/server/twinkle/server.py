@@ -12,10 +12,10 @@ access their own resources.
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from ray import serve
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token

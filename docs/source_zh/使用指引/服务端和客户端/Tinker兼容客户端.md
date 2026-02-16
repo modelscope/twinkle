@@ -25,7 +25,7 @@ for item in service_client.get_server_capabilities().supported_models:
 调用 `init_tinker_compat_client` 时，会自动执行以下操作：
 
 1. **Patch Tinker SDK**：绕过 Tinker 的 `tinker://` 前缀校验，使其可以连接到标准 HTTP 地址
-2. **设置请求头**：注入 `X-Ray-Serve-Request-Id` 和 `Authorization` 等必要的认证头
+2. **设置请求头**：注入 `serve_multiplexed_model_id` 和 `Authorization` 等必要的认证头
 3. **返回 `ServiceClient`**：返回一个标准的 Tinker `ServiceClient` 对象，后续操作与原生 Tinker 完全一致
 
 这意味着在初始化之后，**所有已有的 Tinker 训练代码都可以直接使用**，无需任何修改。

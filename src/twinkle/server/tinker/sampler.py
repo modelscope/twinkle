@@ -102,6 +102,8 @@ def build_sampler_app(model_id: str,
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.sampler_type = sampler_type
+            replica_context = serve.get_replica_context()
+            replica_id = replica_context.replica_id.unique_id
 
             # Initialize sampler based on type
             if sampler_type == 'vllm':
@@ -112,6 +114,7 @@ def build_sampler_app(model_id: str,
                     engine_args=sampler_kwargs,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
+                    instance_id=replica_id,
                     **{
                         k: v
                         for k, v in kwargs.items() if k not in ['engine_args']
