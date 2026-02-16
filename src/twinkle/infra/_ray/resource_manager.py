@@ -146,7 +146,7 @@ class ResourceManager:
         if self.placement_groups:
             self.visible_devices = ray.get([
                 get_visible_devices.options(placement_group=pg, runtime_env={
-                    "env_vars": self.noset_env()
+                    'env_vars': self.noset_env()
                 }).remote() for pg in self.placement_groups
             ])
 

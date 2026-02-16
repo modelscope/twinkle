@@ -106,11 +106,19 @@ def build_model_app(model_id: str,
             if use_megatron:
                 from .common.megatron_model import TwinkleCompatMegatronModel
                 self.model = TwinkleCompatMegatronModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
             else:
                 from .common.transformers_model import TwinkleCompatTransformersModel
                 self.model = TwinkleCompatTransformersModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
 
@@ -120,9 +128,18 @@ def build_model_app(model_id: str,
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
 
-        @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
-        async def get_multiplexed_adapter(self, request_id: str):
-            return request_id
+        """
+        TODO This is a cache system, we must change to sticky routing
+            Reference docs:
+            1. [Now]https://docs.ray.io/en/latest/serve/model-multiplexing.html
+            2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
+            3. https://github.com/ray-project/ray/pull/56855/changes
+            4. Direct call actor instead of http or handler in server.py
+        """
+
+        # @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
+        # async def get_multiplexed_adapter(self, request_id: str):
+        # return request_id
 
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.
@@ -172,10 +189,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping CreateModelResponse with model_id
             """
-            if isinstance(body, dict):
-                body = types.CreateModelRequest(**body)
             # Register a new model_id for each create_model call
-            await self.get_multiplexed_adapter(request.state.request_id)
             model_id = self.state.register_model(body.model_dump(), token=request.state.token)
 
             async def _create_adapter():
@@ -198,7 +212,6 @@ def build_model_app(model_id: str,
 
                         # Fresh adapter has no accumulated gradients.
                         self.set_adapter_state(adapter_name, 'grad_ready', False)
-                        logger.info(f'Create adapter: {adapter_name}, request_id: {request.state.request_id}, ray node: {ray.get_runtime_context().get_node_id()}')
 
                     training_run_manager = create_training_run_manager(request.state.token)
                     training_run_manager.save(model_id, body)
@@ -349,12 +362,10 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping ForwardBackwardOutput with loss and metrics
             """
-            if isinstance(body, dict):
-                body = types.ForwardBackwardRequest(**body)
+
             async def _do_forward_backward():
                 try:
                     adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                    logger.info(f'forward_backward: {adapter_name}, request_id: {request.state.request_id},  ray: {ray.get_runtime_context().get_node_id()}')
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
                     # Touch adapter to reset inactivity counter
@@ -412,12 +423,10 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping OptimStepResponse
             """
-            if isinstance(body, dict):
-                body = types.OptimStepRequest(**body)
+
             async def _do_optim():
                 try:
                     adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                    logger.info(f'optim_step: {adapter_name}, request_id: {request.state.request_id}, ray: {ray.get_runtime_context().node_id}')
                     self.assert_adapter_exists(adapter_name=adapter_name)
 
                     # Disallow empty step (must have at least one forward_backward since last step)

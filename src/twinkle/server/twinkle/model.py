@@ -176,11 +176,19 @@ def build_model_app(model_id: str,
             if use_megatron:
                 from twinkle.model import MultiLoraMegatronModel
                 self.model = MultiLoraMegatronModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
             else:
                 from twinkle.model import MultiLoraTransformersModel
                 self.model = MultiLoraTransformersModel(
-                    model_id=model_id, device_mesh=self.device_mesh, remote_group=self.device_group.name, instance_id=replica_id, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    remote_group=self.device_group.name,
+                    instance_id=replica_id,
+                    **kwargs)
 
             # Initialize state before adapter manager (mixin needs self.state)
             self.state: ServerStateProxy = get_server_state()
@@ -188,21 +196,6 @@ def build_model_app(model_id: str,
             # Initialize adapter manager from mixin
             self._init_adapter_manager(**adapter_config)
             self.start_adapter_countdown()
-
-        @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
-        async def get_multiplexed_adapter(self, request_id: str):
-            """
-            Reference docs:
-            1. https://docs.ray.io/en/latest/serve/model-multiplexing.html
-            2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
-            3. https://github.com/ray-project/ray/pull/56855/changes
-            Args:
-                request_id:
-
-            Returns:
-
-            """
-            return request_id
 
         def _on_adapter_expired(self, adapter_name: str) -> None:
             """Handle adapter expiration by removing it from the model.
@@ -528,7 +521,6 @@ def build_model_app(model_id: str,
 
             # Create adapter AFTER successful registration
             self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
-            await self.get_multiplexed_adapter(request.state.request_id)
 
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration

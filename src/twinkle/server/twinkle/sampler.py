@@ -171,7 +171,11 @@ def build_sampler_app(model_id: str,
             else:
                 from twinkle.sampler import TorchSampler
                 self.sampler = TorchSampler(
-                    model_id=model_id, device_mesh=self.device_mesh, instance_id=replica_id, remote_group=self.device_group.name, **kwargs)
+                    model_id=model_id,
+                    device_mesh=self.device_mesh,
+                    instance_id=replica_id,
+                    remote_group=self.device_group.name,
+                    **kwargs)
 
             # Initialize state and adapter manager
             self.state: ServerStateProxy = get_server_state()

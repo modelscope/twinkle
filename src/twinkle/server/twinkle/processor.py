@@ -86,10 +86,6 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                         if key in self.key_token_dict:
                             self.handle_processor_count(self.key_token_dict.pop(key), False)
 
-        @serve.multiplexed(max_num_models_per_replica=100)
-        async def get_multiplexed_adapter(self, request_id: str):
-            return request_id
-
         def assert_processor_exists(self, processor_id: str):
             assert processor_id and processor_id in self.resource_dict, f'Processor {processor_id} not found'
 
@@ -109,7 +105,7 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                     self.state.pop_config(user_key)
 
         @app.post('/create')
-        async def create(self, request: Request, body: CreateRequest):
+        def create(self, request: Request, body: CreateRequest):
 
             processor_type_name = body.processor_type
             class_type = body.class_type
@@ -138,7 +134,6 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 remote_group=self.device_group.name, device_mesh=self.device_mesh, instance_id=processor_id, **_kwargs)
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
-            await self.get_multiplexed_adapter(request.state.request_id)
             return {'processor_id': 'pid:' + processor_id}
 
         @app.post('/heartbeat')

@@ -19,7 +19,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
 
 
 def train():
@@ -68,12 +68,15 @@ def train():
             optim_result = optim_future.result()
 
             # Compute weighted average log-loss per token for monitoring
-            print(f'Metric: {optim_result}')
+            # logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
+            # weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
+            # print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
+            print(f'Training Metrics: {optim_result}')
 
         # Save a checkpoint after each epoch
-        #save_future = training_client.save_state(f'twinkle-lora-{epoch}')
-        #save_result = save_future.result()
-        #print(f'Saved checkpoint to {save_result.path}')
+        save_future = training_client.save_state(f'twinkle-lora-{epoch}')
+        save_result = save_future.result()
+        print(f'Saved checkpoint to {save_result.path}')
 
 
 def eval():

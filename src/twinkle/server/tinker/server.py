@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-
 import httpx
 import logging
 import os
@@ -84,7 +83,6 @@ def build_server_app(deploy_options: dict[str, Any],
             self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get('route_prefix', '/api/v1')
             self.supported_models = self.normalize_models(supported_models) or [
-                types.SupportedModel(model_name='Qwen/Qwen2.5-7B-Instruct'),
                 types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
             # Lock for ModelScope config file operations (login writes, get_user_info reads)
@@ -167,9 +165,7 @@ def build_server_app(deploy_options: dict[str, Any],
                     logger.info('proxy_to_model endpoint=%s target_url=%s serve_multiplexed_model_id=%s', endpoint,
                                 target_url, headers.get('serve_multiplexed_model_id'))
                 handle = serve.get_deployment_handle(
-                    deployment_name="ModelManagement",
-                    app_name="models-Qwen3-30B-A3B-Instruct-2507"
-                )
+                    deployment_name='ModelManagement', app_name='models-Qwen3-30B-A3B-Instruct-2507')
 
                 def make_fake_request(original_request: Request):
                     """用 SimpleNamespace 模拟 Request"""
@@ -184,12 +180,11 @@ def build_server_app(deploy_options: dict[str, Any],
 
                 fake_request = make_fake_request(request)
                 import json
-                result = await getattr(handle.options(
-                            multiplexed_model_id=headers.get('serve_multiplexed_model_id')
-                        ), endpoint).remote(
-                            body=json.loads(body_bytes),
-                            request=fake_request,
-                        )
+                result = await getattr(
+                    handle.options(multiplexed_model_id=headers.get('serve_multiplexed_model_id')), endpoint).remote(
+                        body=json.loads(body_bytes),
+                        request=fake_request,
+                    )
                 if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
                     logger.info('proxy_to_model response status=%s body=%s', rp_.status_code, rp_.text[:200])
 
