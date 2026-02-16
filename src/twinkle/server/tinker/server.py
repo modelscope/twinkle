@@ -161,56 +161,23 @@ def build_server_app(deploy_options: dict[str, Any],
             headers.pop('content-length', None)
 
             try:
-                if os.environ.get('TWINKLE_DEBUG_PROXY', '1') == '1':
-                    logger.info('proxy_to_model endpoint=%s target_url=%s serve_multiplexed_model_id=%s', endpoint,
-                                target_url, headers.get('serve_multiplexed_model_id'))
-                handle = serve.get_deployment_handle(
-                    deployment_name='ModelManagement', app_name='models-Qwen3-30B-A3B-Instruct-2507')
-
-                def make_fake_request(original_request: Request):
-                    """用 SimpleNamespace 模拟 Request"""
-                    from types import SimpleNamespace
-                    fake = SimpleNamespace()
-                    fake.headers = dict(original_request.headers)
-
-                    fake.state = SimpleNamespace()
-                    fake.state.request_id = headers.get('serve_multiplexed_model_id')
-                    fake.state.token = getattr(original_request.state, 'token', None)
-                    return fake
-
-                fake_request = make_fake_request(request)
-                import json
-                result = await getattr(
-                    handle.options(multiplexed_model_id=headers.get('serve_multiplexed_model_id')), endpoint).remote(
-                        body=json.loads(body_bytes),
-                        request=fake_request,
-                    )
+                if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
+                    logger.info('proxy_to_model endpoint=%s target_url=%s x-ray-serve-request-id=%s', endpoint,
+                                target_url, headers.get('x-ray-serve-request-id'))
+                rp_ = await self.client.request(
+                    method=request.method,
+                    url=target_url,
+                    content=body_bytes,
+                    headers=headers,
+                    params=request.query_params,
+                )
                 if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
                     logger.info('proxy_to_model response status=%s body=%s', rp_.status_code, rp_.text[:200])
-
-                # 处理返回值
-                if hasattr(result, 'model_dump'):
-                    # Pydantic v2
-                    content = json.dumps(result.model_dump())
-                elif hasattr(result, 'dict'):
-                    # Pydantic v1
-                    content = json.dumps(result.dict())
-                elif isinstance(result, dict):
-                    content = json.dumps(result)
-                elif isinstance(result, (str, bytes)):
-                    content = result
-                else:
-                    content = json.dumps(result)
-
-                # 判断是否是错误响应
-                if isinstance(result, types.RequestFailedResponse):
-                    status_code = 500
-                else:
-                    status_code = 200
                 return Response(
-                    content=content,
-                    status_code=status_code,
-                    media_type='application/json',
+                    content=rp_.content,
+                    status_code=rp_.status_code,
+                    headers=dict(rp_.headers),
+                    media_type=rp_.headers.get('content-type'),
                 )
             except Exception as e:
                 return Response(content=f'Proxy Error: {str(e)}', status_code=502)

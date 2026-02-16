@@ -55,7 +55,6 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
-    import ray
     app = FastAPI()
 
     @app.middleware('http')

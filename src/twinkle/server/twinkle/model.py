@@ -491,7 +491,7 @@ def build_model_app(model_id: str,
             return {'result': body.hub_model_id}
 
         @app.post('/add_adapter_to_model')
-        async def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
+        def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
             """
             Add a new adapter to the model.
 
