@@ -7,9 +7,7 @@ build:
     python: "3.11"
   jobs:
     pre_install:
-      - pip install poetry
-      - poetry config virtualenvs.create false
-      - poetry install --only docs --no-interaction --no-ansi
+      - pip install .[docs]
 
 sphinx:
   configuration: docs/source_en/conf.py
