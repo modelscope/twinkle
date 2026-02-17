@@ -6,7 +6,7 @@ Twinkle DOCUMENTATION
 ========================
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: 使用指引
 
    使用指引/快速开始.md
