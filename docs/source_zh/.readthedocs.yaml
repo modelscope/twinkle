@@ -10,4 +10,4 @@ build:
       - pip install .[docs]
 
 sphinx:
-  configuration: docs/source/conf.py
+  configuration: docs/source_zh/conf.py
