@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath('../../src'))
 # -- Project information -----------------------------------------------------
 
 project = 'twinkle'
-copyright = '2022-2025, Alibaba ModelScope'
+copyright = '2022-2026, ModelScope Community'
 author = 'ModelScope Authors'
 version_file = '../../src/twinkle/version.py'
 html_theme = 'sphinx_rtd_theme'
