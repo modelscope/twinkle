@@ -131,7 +131,7 @@ def is_link_outside_docs(url: str, current_file: Path, docs_dir: Path) -> bool:
     Check if a local relative link points to a file outside the docs directory.
 
     Args:
-        url: The link URL (relative path)
+        url: The link URL (relative path, may include fragment like 'path/file.md#anchor')
         current_file: The markdown file containing this link
         docs_dir: Root docs directory
 
@@ -141,11 +141,17 @@ def is_link_outside_docs(url: str, current_file: Path, docs_dir: Path) -> bool:
     if not is_local_relative_link(url):
         return False
 
+    # Handle URL fragments by splitting at '#'
+    url_path = url.split('#')[0]
+    if not url_path:
+        # This is an anchor-only link like '#section', not a file link
+        return False
+
     # Resolve the target path relative to the current file's directory
     current_dir = current_file.parent
     try:
         # Resolve the target path
-        target_path = (current_dir / url).resolve()
+        target_path = (current_dir / url_path).resolve()
 
         # Check if target is within docs directory
         try:
@@ -253,9 +259,6 @@ class TestMarkdownLinks:
                 error_msg += f"  Message: {v['message']}\n"
             pytest.fail(error_msg)
 
-    @pytest.mark.skipif(
-        os.getenv('SKIP_HTTP_LINK_CHECK', 'false').lower() == 'true',
-        reason='Skipping HTTP link validation (set SKIP_HTTP_LINK_CHECK=false to enable)')
     def test_http_links_are_accessible(self):
         """
         Test that all HTTP/HTTPS links are accessible.

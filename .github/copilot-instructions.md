@@ -40,8 +40,9 @@ These instructions help AI agents work productively in this repo. Focus on concr
   - Initialize infra: `twinkle.initialize(mode='local', seed=42)`
   - Inspect device placement: call `twinkle.infra.get_device_placement()`.
 - **Ray Serve demo (HTTP services):**
-  - Config and launcher: [cookbook/client/tinker/server.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/tinker/megatron/server.py), [cookbook/client/tinker/server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/tinker/megatron/server_config.yaml)
+  - Config and launcher: [cookbook/client/tinker/megatron/server.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/tinker/megatron/server.py), [cookbook/client/tinker/megatron/server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/tinker/megatron/server_config.yaml)
   - Start:
+    - `cd cookbook/client/tinker/megatron`
     - `python server.py`
     - Endpoints print on startup (default `localhost:8000` or `https://www.modelscope.cn/twinkle`).
   - Model app binds `MultiLoraTransformersModel` and exposes routes like `/add_adapter_to_model`, `/forward`, `/calculate_loss`, etc. See [src/twinkle/server/twinkle/model.py](src/twinkle/server/twinkle/model.py).
