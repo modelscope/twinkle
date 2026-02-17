@@ -6,13 +6,13 @@ This document describes how to install and use the Twinkle framework in Huawei A
 
 Before getting started, please ensure your system meets the following requirements:
 
-| Component | Version Requirement | Description |
-|------|---------|------|
-| Python | >= 3.11, < 3.13 | Twinkle framework requirement |
-| Ascend Firmware Driver (HDK) | Latest version recommended | Hardware driver and firmware |
-| CANN Toolkit | 8.3.RC1 or higher | Heterogeneous Computing Architecture |
-| PyTorch | 2.7.1 | Deep learning framework |
-| torch_npu | 2.7.1 | Ascend PyTorch adapter plugin |
+| Component                    | Version Requirement        | Description                          |
+|------------------------------|----------------------------|--------------------------------------|
+| Python                       | >= 3.11, < 3.13            | Twinkle framework requirement        |
+| Ascend Firmware Driver (HDK) | Latest version recommended | Hardware driver and firmware         |
+| CANN Toolkit                 | 8.3.RC1 or higher          | Heterogeneous Computing Architecture |
+| PyTorch                      | 2.7.1                      | Deep learning framework              |
+| torch_npu                    | 2.7.1                      | Ascend PyTorch adapter plugin        |
 
 **Important Notes**:
 - torch and torch_npu versions **must be exactly the same** (e.g., both 2.7.1)
