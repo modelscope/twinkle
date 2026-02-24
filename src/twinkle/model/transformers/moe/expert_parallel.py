@@ -31,6 +31,8 @@ def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: dic
     if ep_world_size <= 1:
         return model
 
+    ep_fsdp_enabled = device_mesh.is_implicit_ep_fsdp_enabled()
+
     if cfg.pad_to_max:
         raise NotImplementedError('pad_to_max is not implemented.')
     if cfg.all_to_all != 'torch':
@@ -44,7 +46,7 @@ def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: dic
         raise RuntimeError('EP process group is not available in device_mesh.')
 
     for block in find_moe_blocks(model):
-        shard_experts(block, device_mesh, cfg)
+        shard_experts(block, device_mesh, cfg, ep_fsdp_enabled=ep_fsdp_enabled)
         patch_forward(block, device_mesh, cfg)
 
     return model
@@ -75,7 +77,8 @@ def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
     return blocks
 
 
-def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:
+def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig, *,
+                  ep_fsdp_enabled: bool) -> None:
     num_experts = _get_num_experts(block)
     ep_world_size = device_mesh.ep_world_size
     ep_rank = device_mesh.ep_rank
@@ -88,6 +91,9 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     local_end = local_start + experts_per_rank
 
     if isinstance(block.experts, nn.ModuleList):
+        if ep_fsdp_enabled:
+            raise NotImplementedError('EP+EP_FSDP currently does not support MoE experts stored as nn.ModuleList. '
+                                      'Only tensor experts (gate_up_proj/down_proj) are supported.')
         local_experts = nn.ModuleList(block.experts[local_start:local_end])
         block.experts = local_experts
         block._ep_tensor_experts = False
@@ -102,6 +108,7 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     block._ep_rank = ep_rank
     block._ep_world_size = ep_world_size
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
+    block._ep_fsdp_enabled = ep_fsdp_enabled
 
 
 def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:
@@ -120,6 +127,7 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     ep_group = device_mesh.get_dim_group('ep')
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
+        ep_rank = block._ep_rank
         if args or kwargs:
             raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
 
@@ -193,11 +201,14 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
             group=ep_group,
         )
         recv_out = torch.empty_like(recv_tokens)
-        for expert_id in torch.unique(recv_expert_ids).tolist():
-            idx = (recv_expert_ids == expert_id).nonzero(as_tuple=False).view(-1)
-            expert_in = recv_tokens.index_select(0, idx)
-            expert_out = _run_expert(block, expert_id, expert_in)
-            recv_out.index_copy_(0, idx, expert_out)
+        if getattr(block, '_ep_fsdp_enabled', False) and getattr(block, '_ep_tensor_experts', False):
+            recv_out = _run_experts_ep_fsdp_batch(block, recv_tokens, recv_expert_ids)
+        else:
+            for expert_id in torch.unique(recv_expert_ids).tolist():
+                idx = (recv_expert_ids == expert_id).nonzero(as_tuple=False).view(-1)
+                expert_in = recv_tokens.index_select(0, idx)
+                expert_out = _run_expert(block, expert_id, expert_in)
+                recv_out.index_copy_(0, idx, expert_out)
 
         send_out = torch.empty_like(send_tokens)
         send_out = dist_nn.functional.all_to_all_single(
@@ -327,6 +338,25 @@ def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> to
         expert = block.experts[expert_id]
         return _run_module_with_casting(expert, expert_in)
     experts = block.experts
+    if getattr(block, '_ep_fsdp_enabled', False):
+        # In EP+EP_FSDP mode, execute experts.forward so FSDP hooks can
+        # manage unshard/reshard around forward/backward safely.
+        top_k_index = torch.full(
+            (expert_in.shape[0], 1),
+            int(expert_id),
+            dtype=torch.long,
+            device=expert_in.device,
+        )
+        top_k_weights = torch.ones(
+            (expert_in.shape[0], 1),
+            dtype=expert_in.dtype,
+            device=expert_in.device,
+        )
+        out = experts(expert_in, top_k_index, top_k_weights)
+        if out.dtype != input_dtype:
+            out = out.to(input_dtype)
+        return out
+
     gate_up = experts.gate_up_proj[expert_id]
     down = experts.down_proj[expert_id]
     compute_dtype = gate_up.dtype
@@ -335,6 +365,27 @@ def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> to
     gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
     out = experts.act_fn(gate) * up
     out = F.linear(out, down)
+    if out.dtype != input_dtype:
+        out = out.to(input_dtype)
+    return out
+
+
+def _run_experts_ep_fsdp_batch(
+    block: nn.Module,
+    expert_in: torch.Tensor,
+    local_expert_ids: torch.Tensor,
+) -> torch.Tensor:
+    input_dtype = expert_in.dtype
+    if expert_in.numel() == 0:
+        return torch.empty_like(expert_in)
+    experts = block.experts
+    top_k_index = local_expert_ids.view(-1, 1).to(torch.long)
+    top_k_weights = torch.ones(
+        (expert_in.shape[0], 1),
+        dtype=expert_in.dtype,
+        device=expert_in.device,
+    )
+    out = experts(expert_in, top_k_index, top_k_weights)
     if out.dtype != input_dtype:
         out = out.to(input_dtype)
     return out

@@ -29,12 +29,29 @@ class NativeFSDPStrategy:
         from torch.distributed.fsdp import fully_shard
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
+            ep_fsdp_mode = _is_ep_fsdp_mode_enabled(
+                self.device_mesh,
+                self.enable_ep,
+            )
             if self.enable_ep:
                 _ensure_moe_patched_if_needed(model, self.device_mesh)
                 _place_ep_experts_on_local_device(model, self.device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
             reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
             ignored_params = _collect_expert_params(model) if self.enable_ep else None
+
+            if ep_fsdp_mode:
+                _ensure_ep_fsdp_supported(model)
+                ep_fsdp_mesh = _build_ep_fsdp_mesh(self.device_mesh)
+                if ep_fsdp_mesh is None:
+                    raise RuntimeError(
+                        'Implicit EP_FSDP requires dp dim with size > 1, but could not build an ep_fsdp mesh from dp.')
+                sharded_blocks = _maybe_shard_ep_expert_blocks(
+                    model,
+                    mesh=ep_fsdp_mesh,
+                    reshard_after_forward=reshard_after_forward,
+                    mp_policy=mp_policy,
+                )
 
             _maybe_shard_layers(
                 model,
@@ -83,6 +100,21 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
     if flat_mesh.size <= 1:
         return None
     return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=('fsdp', ))
+
+
+def _build_ep_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
+    if device_mesh is None or not device_mesh.has_dim('dp'):
+        return None
+    ranks = device_mesh.get_ranks_for_dims('dp')
+    if len(ranks) <= 1:
+        return None
+    return TorchDeviceMesh(device_mesh.device_type, ranks, mesh_dim_names=('ep_fsdp', ))
+
+
+def _is_ep_fsdp_mode_enabled(device_mesh: Optional[DeviceMesh], enable_ep: bool) -> bool:
+    if not enable_ep or device_mesh is None:
+        return False
+    return device_mesh.is_implicit_ep_fsdp_enabled()
 
 
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
@@ -135,6 +167,40 @@ def _ensure_moe_patched_if_needed(model: nn.Module, device_mesh: DeviceMesh) -> 
         if isinstance(experts, nn.ModuleList) and not getattr(module, '_ep_patched', False):
             raise RuntimeError('Found MoE experts but expert parallel is not applied. '
                                'Call apply_expert_parallel(model, device_mesh, config) before wrapping with FSDP2.')
+
+
+def _ensure_ep_fsdp_supported(model: nn.Module) -> None:
+    for module in model.modules():
+        if not getattr(module, '_ep_patched', False):
+            continue
+        experts = getattr(module, 'experts', None)
+        if isinstance(experts, nn.ModuleList):
+            raise NotImplementedError('EP+EP_FSDP currently does not support MoE experts stored as nn.ModuleList. '
+                                      'Only tensor experts (gate_up_proj/down_proj) are supported.')
+
+
+def _maybe_shard_ep_expert_blocks(model: nn.Module, *, mesh: TorchDeviceMesh, reshard_after_forward: Optional[bool],
+                                  mp_policy: 'MixedPrecisionPolicy') -> int:
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import Shard
+    sharded_blocks = 0
+    for module in model.modules():
+        if not getattr(module, '_ep_patched', False):
+            continue
+        experts = getattr(module, 'experts', None)
+        if experts is None:
+            continue
+        # Correct EP+EP_FSDP behavior: only experts are sharded on ep_fsdp mesh.
+        # Non-expert params (router/gate etc.) are left to global FSDP wrapping.
+        fully_shard(
+            experts,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
+            shard_placement_fn=lambda param: Shard(1),
+        )
+        sharded_blocks += 1
+    return sharded_blocks
 
 
 def _maybe_shard_layers(model: nn.Module, *, mesh: TorchDeviceMesh, reshard_after_forward: Optional[bool],

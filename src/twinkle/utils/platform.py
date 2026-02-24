@@ -187,6 +187,44 @@ class DeviceMesh:
         key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
         return group_map[key]
 
+    def get_ranks_for_dims(self, dims):
+        if self.mesh_dim_names is None:
+            raise ValueError('mesh_dim_names is not set.')
+        if isinstance(dims, str):
+            dims = (dims, )
+        for dim_name in dims:
+            if dim_name not in self.mesh_dim_names:
+                raise ValueError(f"Dimension '{dim_name}' not found in mesh. Available: {self.mesh_dim_names}")
+
+        coord = self._get_coord()
+        if coord is None:
+            raise RuntimeError('Current rank is not found in mesh.')
+
+        slices = []
+        for i, dim_name in enumerate(self.mesh_dim_names):
+            if dim_name in dims:
+                slices.append(slice(None))
+            else:
+                slices.append(coord[i])
+        return sorted(self.mesh[tuple(slices)].flatten().tolist())
+
+    def is_implicit_ep_fsdp_enabled(self) -> bool:
+        ep_world_size = self.ep_world_size or 1
+        dp_world_size = self.dp_world_size or 1
+        if ep_world_size <= 1 or dp_world_size <= 1:
+            return False
+
+        world_size = self.world_size or 1
+        if world_size % ep_world_size != 0:
+            raise ValueError(f'world_size ({world_size}) must be divisible by ep_world_size ({ep_world_size}) '
+                             'to infer implicit EP_FSDP from dp.')
+        expected_dp_size = world_size // ep_world_size
+        if dp_world_size != expected_dp_size:
+            raise ValueError(f'Implicit EP_FSDP requires dp_world_size == world_size // ep_world_size, '
+                             f'but got dp_world_size={dp_world_size}, world_size={world_size}, '
+                             f'ep_world_size={ep_world_size}.')
+        return True
+
     @property
     def order(self):
         """The order of the dimensions for megatron"""
