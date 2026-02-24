@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
+from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform
@@ -26,7 +27,6 @@ class NativeFSDPStrategy:
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:
             return model, optimizer
-        from torch.distributed.fsdp import fully_shard
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_fsdp_mode = _is_ep_fsdp_mode_enabled(
@@ -181,7 +181,6 @@ def _ensure_ep_fsdp_supported(model: nn.Module) -> None:
 
 def _maybe_shard_ep_expert_blocks(model: nn.Module, *, mesh: TorchDeviceMesh, reshard_after_forward: Optional[bool],
                                   mp_policy: 'MixedPrecisionPolicy') -> int:
-    from torch.distributed.fsdp import fully_shard
     from torch.distributed.tensor import Shard
     sharded_blocks = 0
     for module in model.modules():
@@ -205,7 +204,6 @@ def _maybe_shard_ep_expert_blocks(model: nn.Module, *, mesh: TorchDeviceMesh, re
 
 def _maybe_shard_layers(model: nn.Module, *, mesh: TorchDeviceMesh, reshard_after_forward: Optional[bool],
                         mp_policy: 'MixedPrecisionPolicy', ignored_params: Optional[Set[nn.Parameter]]) -> None:
-    from torch.distributed.fsdp import fully_shard
     layers = getattr(model, 'layers', None)
     if not isinstance(layers, nn.ModuleList):
         return

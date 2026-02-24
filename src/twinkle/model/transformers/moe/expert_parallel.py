@@ -337,24 +337,6 @@ def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> to
         expert = block.experts[expert_id]
         return _run_module_with_casting(expert, expert_in)
     experts = block.experts
-    if getattr(block, '_ep_fsdp_enabled', False):
-        # In EP+EP_FSDP mode, execute experts.forward so FSDP hooks can
-        # manage unshard/reshard around forward/backward safely.
-        top_k_index = torch.full(
-            (expert_in.shape[0], 1),
-            int(expert_id),
-            dtype=torch.long,
-            device=expert_in.device,
-        )
-        top_k_weights = torch.ones(
-            (expert_in.shape[0], 1),
-            dtype=expert_in.dtype,
-            device=expert_in.device,
-        )
-        out = experts(expert_in, top_k_index, top_k_weights)
-        if out.dtype != input_dtype:
-            out = out.to(input_dtype)
-        return out
 
     gate_up = experts.gate_up_proj[expert_id]
     down = experts.down_proj[expert_id]
