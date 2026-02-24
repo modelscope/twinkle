@@ -145,9 +145,9 @@ class TwinkleModel(ABC):
                 # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
                 # Keep training-side HCCL sockets on a per-job port layout to
                 # avoid collisions with other jobs on the same host.
-                from twinkle.utils.network import _ensure_hccl_socket_env
+                from twinkle.utils.platforms import ensure_hccl_socket_env
                 master_port = int(os.environ.get('MASTER_PORT', '29500'))
-                _ensure_hccl_socket_env(master_port)
+                ensure_hccl_socket_env(master_port)
             init_kwargs = {
                 'backend': backend,
                 'init_method': 'env://',

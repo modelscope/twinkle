@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
-from twinkle.utils.network import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
+from twinkle.utils import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
 from .base import CheckpointEngine, TensorMeta
 
 logger = get_logger()

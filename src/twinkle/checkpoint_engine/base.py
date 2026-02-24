@@ -1,15 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
-import torch
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Generator, TypedDict
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Generator, TypedDict
+
+if TYPE_CHECKING:
+    import torch
 
 
 class TensorMeta(TypedDict):
     """Metadata for a tensor in the weight bucket."""
     name: str
-    shape: torch.Size
-    dtype: torch.dtype
+    shape: 'torch.Size'
+    dtype: 'torch.dtype'
     offset: int
 
 
@@ -99,7 +101,7 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, 'torch.Tensor'], None, None]):
         """Send model weights to rollout workers.
 
         This method streams weights in buckets to avoid memory issues with
@@ -112,7 +114,7 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(self) -> AsyncGenerator[tuple[str, 'torch.Tensor'], None]:
         """Receive model weights from trainer.
 
         This method receives weights in buckets and yields them as they

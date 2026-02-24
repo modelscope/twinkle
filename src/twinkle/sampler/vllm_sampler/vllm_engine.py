@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 from twinkle import get_logger
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
 from twinkle.sampler.base_engine import BaseSamplerEngine
-from twinkle.utils.platform import get_vllm_device_uuid
+from twinkle.utils import Platform
 
 logger = get_logger()
 
@@ -524,7 +524,7 @@ class VLLMEngine(BaseSamplerEngine):
         # fix: Route through platform-level fallback so IPC socket name remains stable.
         # Get device UUID for ZMQ handle.
         # For NPU, this is resolved from `npu-smi info` Bus-Id when needed.
-        device_uuid = get_vllm_device_uuid(0)
+        device_uuid = Platform.get_vllm_device_uuid(0)
         zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}.sock'
 
         bucket_size = bucket_size_mb << 20

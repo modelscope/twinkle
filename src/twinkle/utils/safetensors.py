@@ -3,7 +3,7 @@ import os
 from functools import partial
 from typing import Literal
 
-from .platform import is_last_rank, is_master
+from .device_mesh import is_last_rank, is_master
 
 
 class LazyTensor:

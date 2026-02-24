@@ -754,7 +754,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
-        apply_patch(self, patch_cls, **kwargs)
+        apply_patch(self.model, patch_cls, **kwargs)
 
     def __del__(self):
         HubOperation.wait_for()

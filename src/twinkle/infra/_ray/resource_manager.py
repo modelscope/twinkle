@@ -173,8 +173,7 @@ class ResourceManager:
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
-        assert len(groups) == len(visible_devices)
-        for group, visible_device_list in zip(groups, self.visible_devices):
+        for group in groups:
             if group.device_type != 'CPU':
                 ranks = group.ranks
                 gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
@@ -195,8 +194,12 @@ class ResourceManager:
                         worker_ranks = normalized_ranks[start_idx:start_idx + gpus_per_worker]
 
                         # All GPUs for a worker should be on the same node
-                        node_ranks = [r // nproc_per_node for r in worker_ranks]
-                        gpu_ranks_local = [visible_device_list[r % nproc_per_node] for r in worker_ranks]
+                        gpu_ranks_local = []
+                        for r in worker_ranks:
+                            node_rank = r // nproc_per_node
+                            node_ranks.append(node_rank)
+                            gpu_ranks = self.visible_devices[node_rank][r % nproc_per_node]
+                            gpu_ranks_local.append(gpu_ranks)
 
                         if len(set(node_ranks)) > 1:
                             raise ValueError(f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
@@ -211,7 +214,7 @@ class ResourceManager:
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
-                        gpu_rank = visible_device_list[alloc_rank % nproc_per_node]
+                        gpu_rank = self.visible_devices[node_rank][alloc_rank % nproc_per_node]
                         local_device_groups.append(
                             dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
 

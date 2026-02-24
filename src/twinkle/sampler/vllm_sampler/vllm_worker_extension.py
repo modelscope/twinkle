@@ -21,8 +21,8 @@ import torch
 from typing import Dict, List, Optional, Tuple
 
 from twinkle import get_logger
+from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
-from twinkle.utils.platform import get_vllm_device_uuid
 
 logger = get_logger()
 
@@ -376,5 +376,5 @@ class TwinkleWorkerExtension:
         """Get ZMQ handle for IPC communication."""
         if not hasattr(self, '_device_uuid') or not self._device_uuid:
             # fix: Always use platform fallback to avoid worker-side crashes when NPU get_device_uuid is unimplemented.
-            self._device_uuid = get_vllm_device_uuid(self.device.index)
+            self._device_uuid = Platform.get_vllm_device_uuid(self.device.index)
         return f'ipc:///tmp/twinkle-ipc-{self._device_uuid}.sock'
