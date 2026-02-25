@@ -24,7 +24,7 @@ import re
 from tinker import types
 from typing import List, Tuple
 
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import Message, Trajectory
@@ -206,8 +206,13 @@ def main():
 
     # Step 2: Initialize the Tinker-compatible client
     logger.info('Connecting to Tinker server...')
-    service_client = init_tinker_compat_client(
-        base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
+    init_tinker_client()
+
+    from tinker import ServiceClient
+    service_client = ServiceClient(
+        base_url='http://www.modelscope.cn/twinkle',
+        api_key=os.environ.get('MODELSCOPE_TOKEN')
+    )
 
     logger.info('Creating LoRA training client...')
     # Create a LoRA training client for GRPO

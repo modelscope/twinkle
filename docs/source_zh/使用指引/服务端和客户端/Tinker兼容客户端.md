@@ -1,18 +1,21 @@
-# Tinker 兼容客户端
+# Tinker 客户端
 
-Tinker 兼容 Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker_compat_client` 初始化后，会对 Tinker SDK 进行 patch，使其指向 Twinkle Server，**其余代码可直接复用已有的 Tinker 训练代码**。
+Tinker Client 适用于已有 Tinker 训练代码的场景。通过 `init_tinker_client` 初始化后，会对 Tinker SDK 进行 patch，使其指向 Twinkle Server，**其余代码可直接复用已有的 Tinker 训练代码**。
 
 ## 初始化
 
 ```python
-from twinkle_client import init_tinker_compat_client
+# 在导入 ServiceClient 之前，先初始化 Tinker 客户端
+from twinkle_client import init_tinker_client
 
-# 初始化 Tinker 兼容客户端
-# init_tinker_compat_client 会自动 patch Tinker SDK，
-# 使其可以连接到 Twinkle Server 而非 Tinker Server
-service_client = init_tinker_compat_client(
-    base_url='http://localhost:8000',    # Server 地址
-    api_key='your-api-key'               # 认证令牌
+init_tinker_client()
+
+# 直接使用 tinker 中的 ServiceClient
+from tinker import ServiceClient
+
+service_client = ServiceClient(
+    base_url='http://localhost:8000',                    # Server 地址
+    api_key=os.environ.get('MODELSCOPE_TOKEN')           # 建议设置为 ModelScope Token
 )
 
 # 验证连接：列出 Server 上可用的模型
@@ -20,15 +23,14 @@ for item in service_client.get_server_capabilities().supported_models:
     print("- " + item.model_name)
 ```
 
-### init_tinker_compat_client 做了什么？
+### init_tinker_client 做了什么？
 
-调用 `init_tinker_compat_client` 时，会自动执行以下操作：
+调用 `init_tinker_client` 时，会自动执行以下操作：
 
 1. **Patch Tinker SDK**：绕过 Tinker 的 `tinker://` 前缀校验，使其可以连接到标准 HTTP 地址
 2. **设置请求头**：注入 `serve_multiplexed_model_id` 和 `Authorization` 等必要的认证头
-3. **返回 `ServiceClient`**：返回一个标准的 Tinker `ServiceClient` 对象，后续操作与原生 Tinker 完全一致
 
-这意味着在初始化之后，**所有已有的 Tinker 训练代码都可以直接使用**，无需任何修改。
+初始化之后，直接导入 `from tinker import ServiceClient` 即可连接到 Twinkle Server，**所有已有的 Tinker 训练代码都可以直接使用**，无需任何修改。
 
 ## 完整训练示例
 
@@ -38,14 +40,16 @@ import numpy as np
 import dotenv
 dotenv.load_dotenv('.env')
 
-from tinker import types
-from modelscope import AutoTokenizer
-from twinkle_client import init_tinker_compat_client
+# Step 1: 在导入 ServiceClient 之前，先初始化 Tinker 客户端
+from twinkle_client import init_tinker_client
+init_tinker_client()
 
-# Step 1: 初始化客户端（会自动 patch Tinker SDK）
-service_client = init_tinker_compat_client(
+from tinker import types, ServiceClient
+from modelscope import AutoTokenizer
+
+service_client = ServiceClient(
     base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # 建议设置为 ModelScope Token
 )
 
 # Step 2: 查询已有训练运行（可选）
@@ -135,11 +139,16 @@ Tinker 兼容模式也可以利用 Twinkle 的数据集组件来简化数据准�
 ```python
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
+
+# 在导入 ServiceClient 之前，先初始化 Tinker 客户端
+init_tinker_client()
+
+from tinker import ServiceClient
 
 base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -150,8 +159,11 @@ dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# 初始化 Tinker 兼容客户端
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+# 初始化客户端
+service_client = ServiceClient(
+    base_url='http://localhost:8000',
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # 建议设置为 ModelScope Token
+)
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
 # 训练循环：使用 input_feature_to_datum 转换数据格式
@@ -201,14 +213,22 @@ for i, seq in enumerate(result.sequences):
 也可以加载已保存的检查点进行推理：
 
 ```python
+import os
 from tinker import types
 from modelscope import AutoTokenizer
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
+
+# 在导入 ServiceClient 之前，先初始化 Tinker 客户端
+init_tinker_client()
+
+from tinker import ServiceClient
 
 base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
-# 初始化客户端
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+service_client = ServiceClient(
+    base_url='http://localhost:8000',
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # 建议设置为 ModelScope Token
+)
 
 # 从已保存的检查点创建采样客户端
 sampling_client = service_client.create_sampling_client(

@@ -10,7 +10,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 from twinkle.dataloader import DataLoader
@@ -18,8 +18,15 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
+# Initialize the Tinker client before importing ServiceClient
+init_tinker_client()
+
+from tinker import ServiceClient
+
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+# base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_url = 'http://localhost:8000'
 
 
 def train():
@@ -42,9 +49,11 @@ def train():
 
     # Step 2: Initialize the training client
 
-    # Connect to the Twinkle server running locally
-    service_client = init_tinker_compat_client(
-        base_url='localhost:9000', api_key=os.environ.get('MODELSCOPE_TOKEN'))
+
+    service_client = ServiceClient(
+        base_url=base_url,
+        api_key=os.environ.get('MODELSCOPE_TOKEN')
+    )
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
     training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
@@ -85,8 +94,7 @@ def eval():
     # Path to a previously saved LoRA checkpoint (twinkle:// URI)
     weight_path = 'twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2'
 
-    # Connect to the server and create a sampling client with the trained weights
-    service_client = init_tinker_compat_client(base_url='http://localhost:9000')
+    service_client = ServiceClient(base_url=base_url, api_key=os.environ.get('MODELSCOPE_TOKEN'))
     sampling_client = service_client.create_sampling_client(model_path=weight_path, base_model=base_model)
 
     # Step 2: Prepare the chat prompt

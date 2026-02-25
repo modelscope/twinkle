@@ -220,12 +220,9 @@ class ServerLauncher:
         serve.run(app, name=name, route_prefix=route_prefix)
         logger.info(f'Deployed {name} at {route_prefix}')
 
-    def launch(self, wait: bool = True) -> None:
+    def launch(self) -> None:
         """
         Launch the server with all configured applications.
-
-        Args:
-            wait: If True, block and wait for Enter to stop the server
         """
         self._init_ray()
         self._start_serve()
@@ -255,9 +252,8 @@ class ServerLauncher:
                                                                              dict) else app_config.route_prefix
             print(f'  - http://{host}:{port}{route_prefix}')
 
-        if wait:
-            while True:
-                time.sleep(3600)
+        while True:
+            time.sleep(3600)
 
     @classmethod
     def from_yaml(
@@ -302,7 +298,6 @@ def launch_server(
     config_path: str | Path | None = None,
     server_type: str = 'twinkle',
     ray_namespace: str | None = None,
-    wait: bool = True,
 ) -> ServerLauncher:
     """
     Launch a twinkle server with flexible configuration options.
@@ -314,7 +309,6 @@ def launch_server(
         config_path: Path to YAML config file
         server_type: Server type ('tinker' or 'twinkle'), default is 'twinkle'
         ray_namespace: Ray namespace
-        wait: If True, block and wait for Enter to stop the server
 
     Returns:
         The ServerLauncher instance
@@ -357,5 +351,5 @@ def launch_server(
             ray_namespace=ray_namespace,
         )
 
-    launcher.launch(wait=wait)
+    launcher.launch()
     return launcher

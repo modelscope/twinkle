@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch
 
 import twinkle
-from twinkle.utils.platform import DeviceMesh, Platform
+from twinkle import DeviceMesh, Platform
 
 twinkle.initialize(mode='local')
 

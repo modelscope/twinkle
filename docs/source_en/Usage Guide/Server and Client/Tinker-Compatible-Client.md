@@ -1,18 +1,21 @@
-# Tinker Compatible Client
+# Tinker Client
 
-The Tinker Compatible Client is suitable for scenarios with existing Tinker training code. After initializing with `init_tinker_compat_client`, it patches the Tinker SDK to point to the Twinkle Server, **and the rest of the code can directly reuse existing Tinker training code**.
+The Tinker Client is suitable for scenarios with existing Tinker training code. After initializing with `init_tinker_client`, it patches the Tinker SDK to point to the Twinkle Server, **and the rest of the code can directly reuse existing Tinker training code**.
 
 ## Initialization
 
 ```python
-from twinkle_client import init_tinker_compat_client
+# Initialize Tinker client before importing ServiceClient
+from twinkle_client import init_tinker_client
 
-# Initialize Tinker compatible client
-# init_tinker_compat_client automatically patches the Tinker SDK,
-# allowing it to connect to Twinkle Server instead of Tinker Server
-service_client = init_tinker_compat_client(
-    base_url='http://localhost:8000',    # Server address
-    api_key='your-api-key'               # Authentication token
+init_tinker_client()
+
+# Use ServiceClient directly from tinker
+from tinker import ServiceClient
+
+service_client = ServiceClient(
+    base_url='http://localhost:8000',                    # Server address
+    api_key=os.environ.get('MODELSCOPE_TOKEN')           # Recommended: set to ModelScope Token
 )
 
 # Verify connection: List available models on Server
@@ -20,15 +23,14 @@ for item in service_client.get_server_capabilities().supported_models:
     print("- " + item.model_name)
 ```
 
-### What does init_tinker_compat_client do?
+### What does init_tinker_client do?
 
-When calling `init_tinker_compat_client`, the following operations are automatically executed:
+When calling `init_tinker_client`, the following operations are automatically executed:
 
 1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
 2. **Set Request Headers**: Inject necessary authentication headers such as `serve_multiplexed_model_id` and `Authorization`
-3. **Return `ServiceClient`**: Returns a standard Tinker `ServiceClient` object, subsequent operations are completely identical to native Tinker
 
-This means that after initialization, **all existing Tinker training code can be used directly** without any modifications.
+After initialization, simply import `from tinker import ServiceClient` to connect to Twinkle Server, and **all existing Tinker training code can be used directly** without any modifications.
 
 ## Complete Training Example
 
@@ -38,14 +40,16 @@ import numpy as np
 import dotenv
 dotenv.load_dotenv('.env')
 
-from tinker import types
-from modelscope import AutoTokenizer
-from twinkle_client import init_tinker_compat_client
+# Step 1: Initialize Tinker client before importing ServiceClient
+from twinkle_client import init_tinker_client
+init_tinker_client()
 
-# Step 1: Initialize client (automatically patches Tinker SDK)
-service_client = init_tinker_compat_client(
+from tinker import types, ServiceClient
+from modelscope import AutoTokenizer
+
+service_client = ServiceClient(
     base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
 )
 
 # Step 2: Query existing training runs (optional)
@@ -135,11 +139,16 @@ Tinker compatible mode can also leverage Twinkle's dataset components to simplif
 ```python
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
+
+# Initialize Tinker client before importing ServiceClient
+init_tinker_client()
+
+from tinker import ServiceClient
 
 base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -150,8 +159,11 @@ dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_c
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# Initialize Tinker compatible client
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+# Initialize client
+service_client = ServiceClient(
+    base_url='http://localhost:8000',
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
+)
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
 # Training loop: Use input_feature_to_datum to convert data format
@@ -201,14 +213,22 @@ for i, seq in enumerate(result.sequences):
 You can also load saved checkpoints for inference:
 
 ```python
+import os
 from tinker import types
 from modelscope import AutoTokenizer
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
+
+# Initialize Tinker client before importing ServiceClient
+init_tinker_client()
+
+from tinker import ServiceClient
 
 base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 
-# Initialize client
-service_client = init_tinker_compat_client(base_url='http://localhost:8000')
+service_client = ServiceClient(
+    base_url='http://localhost:8000',
+    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
+)
 
 # Create sampling client from saved checkpoint
 sampling_client = service_client.create_sampling_client(

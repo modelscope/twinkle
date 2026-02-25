@@ -210,7 +210,6 @@ CLI supported parameters:
 | `-c, --config` | YAML configuration file path (required) | — |
 | `-t, --server-type` | Server mode: `twinkle` or `tinker` | `twinkle` |
 | `--namespace` | Ray namespace | tinker mode defaults to `twinkle_cluster` |
-| `--no-wait` | Do not block and wait (daemon mode) | `False` |
 | `--log-level` | Log level | `INFO` |
 
 ## YAML Configuration Details
