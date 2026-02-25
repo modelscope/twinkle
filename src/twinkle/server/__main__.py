@@ -36,9 +36,6 @@ Examples:
 
   # Start tinker server with specific config
   python -m twinkle.server -c config.yaml -t tinker
-
-  # Run in background (daemon mode)
-  python -m twinkle.server -c config.yaml --no-wait
         """,
     )
 
@@ -72,11 +69,6 @@ Examples:
     )
 
     # Runtime options
-    parser.add_argument(
-        '--no-wait',
-        action='store_true',
-        help="Don't block waiting for Enter (daemon mode)",
-    )
     parser.add_argument(
         '--log-level',
         type=str,
@@ -115,7 +107,6 @@ def main(args: list[str] | None = None) -> int:
             config_path=config_path,
             server_type=parsed_args.server_type,
             ray_namespace=parsed_args.namespace,
-            wait=not parsed_args.no_wait,
         )
 
         return 0
