@@ -21,7 +21,8 @@ applications:
     route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
     import_path: server            # Python module to import
     args:
-
+      supported_models:
+        - Qwen/Qwen2.5-7B-Instruct
     deployments:
       - name: TinkerCompatServer
         autoscaling_config:

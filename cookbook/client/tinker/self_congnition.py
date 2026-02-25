@@ -24,7 +24,9 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+# base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_url = 'http://localhost:8000'
 
 
 def train():
@@ -49,7 +51,7 @@ def train():
 
 
     service_client = ServiceClient(
-        base_url='localhost:9000',
+        base_url=base_url,
         api_key=os.environ.get('MODELSCOPE_TOKEN')
     )
 
@@ -92,7 +94,7 @@ def eval():
     # Path to a previously saved LoRA checkpoint (twinkle:// URI)
     weight_path = 'twinkle://20260212_174205-Qwen_Qwen2_5-7B-Instruct-51edc9ed/weights/twinkle-lora-2'
 
-    service_client = ServiceClient(base_url='http://localhost:9000')
+    service_client = ServiceClient(base_url=base_url, api_key=os.environ.get('MODELSCOPE_TOKEN'))
     sampling_client = service_client.create_sampling_client(model_path=weight_path, base_model=base_model)
 
     # Step 2: Prepare the chat prompt
