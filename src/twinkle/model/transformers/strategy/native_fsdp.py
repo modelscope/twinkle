@@ -38,7 +38,6 @@ class NativeFSDPStrategy:
                 _place_ep_experts_on_local_device(model, self.device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
             reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
-            ignored_params = _collect_expert_params(model) if self.enable_ep else None
 
             if ep_fsdp_mode:
                 _ensure_ep_fsdp_supported(model)
@@ -52,6 +51,8 @@ class NativeFSDPStrategy:
                     reshard_after_forward=reshard_after_forward,
                     mp_policy=mp_policy,
                 )
+
+            ignored_params = _collect_expert_params(model) if self.enable_ep else None
 
             _maybe_shard_layers(
                 model,
