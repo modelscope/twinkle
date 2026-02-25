@@ -30,7 +30,7 @@ from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
-from twinkle.utils.platform import Platform
+from twinkle.utils import Platform
 
 logger = get_logger()
 
