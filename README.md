@@ -203,7 +203,7 @@ if __name__ == '__main__':
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_compat_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
@@ -220,8 +220,11 @@ dataset.map(SelfCognitionProcessor('twinkle Model', 'twinkle Team'), load_from_c
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# Initialize tinker client
-service_client = init_tinker_compat_client(base_url, api_key)
+# Initialize Tinker client before importing ServiceClient
+init_tinker_client()
+from tinker import ServiceClient
+
+service_client = ServiceClient(base_url=base_url, api_key=api_key)
 training_client = service_client.create_lora_training_client(base_model=base_model[len('ms://'):], rank=16)
 
 # Training loop: use input_feature_to_datum to transfer the input format
