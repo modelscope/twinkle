@@ -123,6 +123,7 @@ def patch_tinker():
     1. InternalClientHolder._create_sampling_session to bypass 'tinker://' prefix validation
     2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
     3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
+    4. _get_default_headers to inject Twinkle-specific headers
 
     This patch is idempotent - calling it multiple times has no additional effect.
     """
@@ -142,6 +143,22 @@ def patch_tinker():
         # Patch 3: support both tinker:// and twinkle:// prefixes for checkpoint paths
         from tinker.types.checkpoint import ParsedCheckpointTinkerPath
         ParsedCheckpointTinkerPath.from_tinker_path = classmethod(_patched_from_tinker_path)
+
+        # Patch 4: inject Twinkle-specific headers
+        from tinker.lib.public_interfaces import service_client
+        from twinkle_client.http.utils import get_api_key, get_request_id
+        
+        original_get_default_headers = service_client._get_default_headers
+        
+        def _patched_get_default_headers():
+            headers = original_get_default_headers()
+            # Add Twinkle-specific headers
+            headers['serve_multiplexed_model_id'] = get_request_id()
+            headers['Authorization'] = 'Bearer ' + get_api_key()
+            headers['Twinkle-Authorization'] = 'Bearer ' + get_api_key()
+            return headers
+        
+        service_client._get_default_headers = _patched_get_default_headers
 
         _patched = True
     except ImportError:
