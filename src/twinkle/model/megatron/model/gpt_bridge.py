@@ -784,6 +784,8 @@ class GPTBridge:
         args = self.args
         if is_expert:
             hf_mlp = hf_mlp.experts
+            # When converting to_mcore, hf_grouped is determined by default from the hf_state_dict condition.
+            # When converting to_hf, it is determined by default from the hf_mlp condition.
             if to_mcore:
                 pattern = r'\d+\.down_proj'
                 hf_grouped = not any(re.match(pattern, k) is not None for k in hf_state_dict.keys())
@@ -796,6 +798,7 @@ class GPTBridge:
             is_gate_up = any('gate_up_proj' in k for k in hf_state_dict.keys())
         else:
             is_gate_up = hasattr(hf_mlp, 'gate_up_proj')
+        # transformers 5.0 compatibility
         if self.is_transformers_5 and not to_mcore and is_expert:
             _hf_grouped, _is_gate_up = self._get_hf_grouped()
             if _hf_grouped is not None:
@@ -811,6 +814,7 @@ class GPTBridge:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         elif not to_mcore:
             hf_state_dict = {}
+
         # linear_fc1
         if to_mcore:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())

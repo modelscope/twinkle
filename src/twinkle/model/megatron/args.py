@@ -604,7 +604,6 @@ class TwinkleMegatronArgs:
             attention_softmax_in_fp32=True,  # Numerical stability
             attention_backend=AttnBackend.flash,  # FlashAttention for speed
             # Activation recomputation for memory efficiency
-            calculate_per_token_loss=True,
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
             recompute_method=recompute_method,

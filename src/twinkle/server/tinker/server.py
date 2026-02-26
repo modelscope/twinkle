@@ -91,16 +91,17 @@ def build_server_app(deploy_options: dict[str, Any],
         def normalize_models(self, supported_models):
             # Normalize supported_models to objects; passing raw dicts can trigger internal errors
             # when creating LoRA training clients via the tinker API.
-            if supported_models:
-                normalized = []
-                for item in supported_models:
-                    if isinstance(item, types.SupportedModel):
-                        normalized.append(item)
-                    elif isinstance(item, dict):
-                        normalized.append(types.SupportedModel(**item))
-                    else:
-                        normalized.append(types.SupportedModel(name=item))
-                return normalized
+            if not supported_models:
+                return []
+            normalized = []
+            for item in supported_models:
+                if isinstance(item, types.SupportedModel):
+                    normalized.append(item)
+                elif isinstance(item, dict):
+                    normalized.append(types.SupportedModel(**item))
+                elif isinstance(item, str):
+                    normalized.append(types.SupportedModel(model_name=item))
+            return normalized
 
         def _validate_base_model(self, base_model: str) -> None:
             """Validate that base_model is in supported_models list.
