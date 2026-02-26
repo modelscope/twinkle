@@ -1,6 +1,4 @@
-import os
 from peft import LoraConfig
-from tqdm import tqdm
 
 import twinkle
 from twinkle import DeviceMesh, get_device_placement, get_logger
