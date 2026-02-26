@@ -24,14 +24,16 @@ DISABLE_CLIP = os.environ.get('DISABLE_CLIP', '1') == '1'
 MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 KEEP_ROUTER_LOGITS = os.environ.get('KEEP_ROUTER_LOGITS', '0') == '1'
 
-# 4 gpus, dp=2, ep=2
-dp_size = 2
+# 4 gpus, fsdp=4 (data parallel), ep_size=2 (expert parallel)
+# The main mesh does NOT include 'ep' dimension - EP is handled by separate ep_fsdp_device_mesh
+fsdp_size = 4
 ep_size = 2
 
 device_mesh = DeviceMesh(
     device_type=Platform.get_platform().device_prefix(),
-    mesh=np.arange(dp_size * ep_size).reshape(dp_size, ep_size),
-    mesh_dim_names=('dp', 'ep'),
+    mesh=np.arange(fsdp_size).reshape(fsdp_size),
+    mesh_dim_names=('fsdp',),
+    ep_size=ep_size,  # ep_size is stored as attribute, not a mesh dimension
 )
 
 twinkle.initialize(
@@ -69,7 +71,6 @@ def train():
             'expert_parallel': {
                 'enabled': True,
                 'router_dtype': 'fp32',
-                'all_to_all': 'torch',
                 'keep_router_logits': KEEP_ROUTER_LOGITS,
             }
         },

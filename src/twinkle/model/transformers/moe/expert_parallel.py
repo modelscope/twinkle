@@ -6,50 +6,72 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from dataclasses import dataclass
 from torch import nn
-from torch.distributed import nn as dist_nn
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from twinkle.utils import DeviceMesh
+from twinkle.model.transformers.moe.ep_utils import (
+    preprocess,
+    token_pre_all2all,
+    tokens_post_all2all,
+)
 
 
 @dataclass
 class ExpertParallelConfig:
     enabled: bool = True
     router_dtype: str = 'fp32'
-    all_to_all: str = 'torch'
     keep_router_logits: bool = True
-    pad_to_max: bool = False
     ignore_shared_experts: bool = False
+    ep_size: Optional[int] = None  # consumed by TransformersModel, not used in expert_parallel logic
 
 
-def apply_expert_parallel(model: nn.Module, device_mesh: DeviceMesh, config: dict[str, Any] | None = None):
+@dataclass
+class ExpertShardingSpec:
+    """Describes expert sharding info for a single MoE block. Extensible for other models."""
+    block: nn.Module
+    experts_module: nn.Module
+    num_experts: int
+    experts_per_rank: int
+    local_start: int
+    local_end: int
+    ep_rank: int
+    ep_world_size: int
+    is_tensor_experts: bool
+
+
+def apply_expert_parallel(
+    model: nn.Module,
+    device_mesh: DeviceMesh,
+    config: dict[str, Any] | None = None,
+    ep_fsdp_device_mesh: Optional['torch.distributed.DeviceMesh'] = None,
+) -> List[ExpertShardingSpec]:
+    """Apply expert parallelism to all MoE blocks in the model."""
     cfg = _merge_config(config)
-    if not cfg.enabled or device_mesh is None or not device_mesh.has_dim('ep'):
-        return model
 
-    ep_world_size = device_mesh.ep_world_size
+    # EP info comes from the separate ep_fsdp_device_mesh, not from main mesh
+    if not cfg.enabled or ep_fsdp_device_mesh is None:
+        return []
+
+    # Always query EP via the 1D submesh to avoid relying on Tensor named dims.
+    ep_mesh = ep_fsdp_device_mesh['ep']
+    ep_world_size = ep_mesh.size()
     if ep_world_size <= 1:
-        return model
-
-    ep_fsdp_enabled = device_mesh.is_implicit_ep_fsdp_enabled()
-
-    if cfg.pad_to_max:
-        raise NotImplementedError('pad_to_max is not implemented.')
-    if cfg.all_to_all != 'torch':
-        raise NotImplementedError(f'all_to_all={cfg.all_to_all} is not supported.')
+        return []
 
     if not dist.is_initialized():
         raise RuntimeError('torch.distributed is not initialized, cannot enable expert parallel.')
 
-    ep_group = device_mesh.get_dim_group('ep')
-    if ep_group is None:
-        raise RuntimeError('EP process group is not available in device_mesh.')
+    # Get process group and local rank from EP submesh.
+    ep_group = ep_mesh.get_group()
+    ep_rank = ep_mesh.get_local_rank()
 
+    specs = []
     for block in find_moe_blocks(model):
-        shard_experts(block, device_mesh, cfg, ep_fsdp_enabled=ep_fsdp_enabled)
-        patch_forward(block, device_mesh, cfg)
+        spec = shard_experts(block, ep_world_size, ep_rank, cfg)
+        patch_forward(block, ep_group, ep_world_size, cfg)
+        specs.append(spec)
 
-    return model
+    return specs
 
 
 def _merge_config(config: dict[str, Any] | None) -> ExpertParallelConfig:
@@ -77,11 +99,23 @@ def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
     return blocks
 
 
-def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig, *,
-                  ep_fsdp_enabled: bool) -> None:
+def shard_experts(
+    block: nn.Module,
+    ep_world_size: int,
+    ep_rank: int,
+    cfg: ExpertParallelConfig,
+) -> ExpertShardingSpec:
+    """Shard experts in a MoE block across EP ranks.
+
+    Args:
+        block: The MoE block containing experts.
+        ep_world_size: The world size for expert parallelism.
+        ep_rank: The current rank in the EP group.
+        cfg: Expert parallel configuration.
+
+    Returns an ExpertShardingSpec describing the sharding.
+    """
     num_experts = _get_num_experts(block)
-    ep_world_size = device_mesh.ep_world_size
-    ep_rank = device_mesh.ep_rank
 
     if num_experts % ep_world_size != 0:
         raise ValueError(f'num_experts ({num_experts}) must be divisible by ep_world_size ({ep_world_size}).')
@@ -91,15 +125,12 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     local_end = local_start + experts_per_rank
 
     if isinstance(block.experts, nn.ModuleList):
-        if ep_fsdp_enabled:
-            raise NotImplementedError('EP+EP_FSDP currently does not support MoE experts stored as nn.ModuleList. '
-                                      'Only tensor experts (gate_up_proj/down_proj) are supported.')
         local_experts = nn.ModuleList(block.experts[local_start:local_end])
         block.experts = local_experts
-        block._ep_tensor_experts = False
+        is_tensor_experts = False
     else:
         _shard_tensor_experts(block.experts, local_start, local_end)
-        block._ep_tensor_experts = True
+        is_tensor_experts = True
 
     block._ep_num_experts = num_experts
     block._ep_experts_per_rank = experts_per_rank
@@ -107,11 +138,39 @@ def shard_experts(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     block._ep_local_end = local_end
     block._ep_rank = ep_rank
     block._ep_world_size = ep_world_size
+    block._ep_tensor_experts = is_tensor_experts
     block._ep_ignore_shared_experts = cfg.ignore_shared_experts
-    block._ep_fsdp_enabled = ep_fsdp_enabled
+
+    return ExpertShardingSpec(
+        block=block,
+        experts_module=block.experts,
+        num_experts=num_experts,
+        experts_per_rank=experts_per_rank,
+        local_start=local_start,
+        local_end=local_end,
+        ep_rank=ep_rank,
+        ep_world_size=ep_world_size,
+        is_tensor_experts=is_tensor_experts,
+    )
 
 
-def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallelConfig) -> None:
+def patch_forward(
+    block: nn.Module,
+    ep_group: dist.ProcessGroup,
+    ep_world_size: int,
+    cfg: ExpertParallelConfig,
+) -> None:
+    """Replace the MoE block forward with EP-aware communication flow.
+
+    Communication pattern follows VeOmni:
+        preprocess → token_pre_all2all → expert_compute (F.linear loop) → tokens_post_all2all
+
+    Args:
+        block: The MoE block to patch.
+        ep_group: The process group for EP communication (from ep_fsdp_device_mesh["ep"]).
+        ep_world_size: The world size for expert parallelism.
+        cfg: Expert parallel configuration.
+    """
     if getattr(block, '_ep_patched', False):
         return
 
@@ -124,13 +183,15 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
         raise ValueError('MoE block must define top_k/num_experts_per_tok.')
 
     orig_forward = block.forward
-    ep_group = device_mesh.get_dim_group('ep')
+    num_experts = block._ep_num_experts
+    experts_per_rank = block._ep_experts_per_rank
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
         if args or kwargs:
             raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
 
         input_dtype = hidden_states.dtype
+        orig_shape = hidden_states.shape
         if hidden_states.ndim == 3:
             batch_size, seq_len, hidden_dim = hidden_states.shape
             hidden_states_2d = hidden_states.view(-1, hidden_dim)
@@ -151,92 +212,71 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
         if cast_weights:
             routing_weights = routing_weights.to(hidden_states_2d.dtype)
 
-        num_tokens = hidden_states_2d.shape[0]
-        flat_token_idx = torch.arange(num_tokens, device=hidden_states_2d.device).repeat_interleave(top_k)
-        flat_expert_id = selected_experts.reshape(-1)
-        flat_weight = routing_weights.reshape(-1)
+        # Build expert_mask: [num_experts, top_k, num_tokens] (VeOmni convention)
+        expert_mask = torch.nn.functional.one_hot(
+            selected_experts, num_classes=num_experts
+        ).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
 
-        experts_per_rank = block._ep_experts_per_rank
-        dest_rank = flat_expert_id // experts_per_rank
-        local_expert_id = flat_expert_id - dest_rank * experts_per_rank
+        # 1. preprocess: compute splits and token counts
+        (
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            num_global_sum_tokens_per_local_expert,
+        ) = preprocess(expert_mask, num_experts, ep_group)
 
-        order = torch.argsort(dest_rank)
-        ordered_token_idx = flat_token_idx[order]
-        ordered_weight = flat_weight[order]
-        ordered_global_expert_id = flat_expert_id[order]
-        ordered_expert_id = local_expert_id[order]
-
-        send_counts = torch.bincount(dest_rank, minlength=block._ep_world_size)
-        send_counts_list = send_counts.cpu().tolist()
-
-        recv_counts = _exchange_counts(send_counts, ep_group)
-        recv_counts_list = recv_counts.cpu().tolist()
-
-        send_tokens = hidden_states_2d.index_select(0, ordered_token_idx)
-        recv_tokens = torch.empty(
-            (int(recv_counts.sum().item()), hidden_dim),
-            device=hidden_states_2d.device,
-            dtype=hidden_states_2d.dtype,
-        )
-        send_expert_ids = ordered_expert_id.to(torch.int64)
-        recv_expert_ids = torch.empty(
-            (int(recv_counts.sum().item()), ),
-            device=hidden_states_2d.device,
-            dtype=torch.int64,
+        # 2. token_pre_all2all: permute → all_to_all → sort_chunks
+        (
+            global_permuted_hidden_states,
+            routing_map,
+            local_input_permutation_mapping,
+            org_hidden_states_shape,
+        ) = token_pre_all2all(
+            hidden_states_2d,
+            expert_mask,
+            num_experts,
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            ep_group,
         )
 
-        recv_tokens = dist_nn.functional.all_to_all_single(
-            recv_tokens,
-            send_tokens,
-            input_split_sizes=send_counts_list,
-            output_split_sizes=recv_counts_list,
-            group=ep_group,
+        # 3. expert_compute: F.linear loop per local expert (no routing weight here)
+        # When FSDP2 wraps experts, params are sharded DTensors. Manually
+        # unshard (all-gather) so _run_local_experts sees full tensors.
+        _experts_mod = block.experts
+        _need_unshard = hasattr(_experts_mod, 'unshard') and hasattr(_experts_mod, 'reshard')
+        if _need_unshard:
+            _experts_mod.unshard()
+        expert_outputs = _run_local_experts(
+            block,
+            global_permuted_hidden_states,
+            num_global_sum_tokens_per_local_expert,
+            experts_per_rank,
         )
-        dist.all_to_all_single(
-            recv_expert_ids,
-            send_expert_ids.to(torch.int64),
-            input_split_sizes=send_counts_list,
-            output_split_sizes=recv_counts_list,
-            group=ep_group,
-        )
-        recv_out = torch.empty_like(recv_tokens)
-        if getattr(block, '_ep_fsdp_enabled', False) and getattr(block, '_ep_tensor_experts', False):
-            recv_out = _run_experts_ep_fsdp_batch(block, recv_tokens, recv_expert_ids)
-        else:
-            for expert_id in torch.unique(recv_expert_ids).tolist():
-                idx = (recv_expert_ids == expert_id).nonzero(as_tuple=False).view(-1)
-                expert_in = recv_tokens.index_select(0, idx)
-                expert_out = _run_expert(block, expert_id, expert_in)
-                recv_out.index_copy_(0, idx, expert_out)
+        if _need_unshard:
+            _experts_mod.reshard()
 
-        send_out = torch.empty_like(send_tokens)
-        send_out = dist_nn.functional.all_to_all_single(
-            send_out,
-            recv_out,
-            input_split_sizes=recv_counts_list,
-            output_split_sizes=send_counts_list,
-            group=ep_group,
+        # 4. tokens_post_all2all: sort_chunks → all_to_all → unpermute (with routing weight)
+        final_hidden = tokens_post_all2all(
+            expert_outputs,
+            routing_weights,
+            selected_experts,
+            num_experts,
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            routing_map,
+            local_input_permutation_mapping,
+            org_hidden_states_shape,
+            ep_group,
         )
-
-        final_hidden = torch.zeros((num_tokens, hidden_dim), device=hidden_states_2d.device, dtype=input_dtype)
-        expert_hit = torch.unique(ordered_global_expert_id)
-        if expert_hit.numel() > 0:
-            expert_hit, _ = torch.sort(expert_hit)
-        for expert_id in expert_hit:
-            idx = (ordered_global_expert_id == expert_id).nonzero(as_tuple=False).view(-1)
-            if idx.numel() == 0:
-                continue
-            token_idx = ordered_token_idx.index_select(0, idx)
-            weight = ordered_weight.index_select(0, idx)
-            contrib = send_out.index_select(0, idx)
-            scaled = contrib * weight.unsqueeze(-1)
-            final_hidden.index_add_(0, token_idx, scaled.to(input_dtype))
 
         shared_out = _maybe_run_shared_expert(block, hidden_states_2d, cfg)
         if shared_out is not None:
             final_hidden = final_hidden + shared_out
 
-        if hidden_states.ndim == 3:
+        if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
 
         if cfg.keep_router_logits and not getattr(block, '_ep_tensor_experts', False):
@@ -246,19 +286,6 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     block._ep_original_forward = orig_forward
     block.forward = forward
     block._ep_patched = True
-
-
-def _exchange_counts(send_counts: torch.Tensor, group) -> torch.Tensor:
-    ep_world_size = int(send_counts.numel())
-    recv_counts = torch.empty_like(send_counts)
-    dist.all_to_all_single(
-        recv_counts,
-        send_counts.to(torch.int64),
-        input_split_sizes=[1] * ep_world_size,
-        output_split_sizes=[1] * ep_world_size,
-        group=group,
-    )
-    return recv_counts
 
 
 def _get_gate(block: nn.Module):
@@ -331,45 +358,59 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
         experts.num_experts = end - start
 
 
-def _run_expert(block: nn.Module, expert_id: int, expert_in: torch.Tensor) -> torch.Tensor:
-    input_dtype = expert_in.dtype
-    if not getattr(block, '_ep_tensor_experts', False):
-        expert = block.experts[expert_id]
-        return _run_module_with_casting(expert, expert_in)
-    experts = block.experts
-
-    gate_up = experts.gate_up_proj[expert_id]
-    down = experts.down_proj[expert_id]
-    compute_dtype = gate_up.dtype
-    if expert_in.dtype != compute_dtype:
-        expert_in = expert_in.to(compute_dtype)
-    gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
-    out = experts.act_fn(gate) * up
-    out = F.linear(out, down)
-    if out.dtype != input_dtype:
-        out = out.to(input_dtype)
-    return out
-
-
-def _run_experts_ep_fsdp_batch(
+def _run_local_experts(
     block: nn.Module,
-    expert_in: torch.Tensor,
-    local_expert_ids: torch.Tensor,
+    permuted_tokens: torch.Tensor,
+    num_global_sum_tokens_per_local_expert: torch.Tensor,
+    experts_per_rank: int,
 ) -> torch.Tensor:
-    input_dtype = expert_in.dtype
-    if expert_in.numel() == 0:
-        return torch.empty_like(expert_in)
+    """Run local experts on permuted tokens using F.linear loop.
+
+    Tokens are already grouped by expert (contiguous chunks), sizes given by
+    num_global_sum_tokens_per_local_expert. No routing weight is applied here;
+    that happens in unpermute.
+    """
+    if permuted_tokens.numel() == 0:
+        return torch.empty_like(permuted_tokens)
+
+    input_dtype = permuted_tokens.dtype
+    is_tensor_experts = getattr(block, '_ep_tensor_experts', False)
     experts = block.experts
-    top_k_index = local_expert_ids.view(-1, 1).to(torch.long)
-    top_k_weights = torch.ones(
-        (expert_in.shape[0], 1),
-        dtype=expert_in.dtype,
-        device=expert_in.device,
-    )
-    out = experts(expert_in, top_k_index, top_k_weights)
-    if out.dtype != input_dtype:
-        out = out.to(input_dtype)
-    return out
+
+    cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
+    for i in range(experts_per_rank):
+        cumsum[i + 1] = cumsum[i] + int(num_global_sum_tokens_per_local_expert[i].item())
+
+    output_chunks = []
+    for i in range(experts_per_rank):
+        start = int(cumsum[i].item())
+        end = int(cumsum[i + 1].item())
+        expert_in = permuted_tokens[start:end]
+        if expert_in.numel() == 0:
+            output_chunks.append(expert_in)
+            continue
+
+        if is_tensor_experts:
+            gate_up = experts.gate_up_proj[i]
+            down = experts.down_proj[i]
+            compute_dtype = gate_up.dtype
+            if expert_in.dtype != compute_dtype:
+                expert_in = expert_in.to(compute_dtype)
+            gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
+            out = experts.act_fn(gate) * up
+            out = F.linear(out, down)
+        else:
+            expert = experts[i]
+            compute_dtype = _module_compute_dtype(expert, input_dtype)
+            if expert_in.dtype != compute_dtype:
+                expert_in = expert_in.to(compute_dtype)
+            out = expert(expert_in)
+
+        if out.dtype != input_dtype:
+            out = out.to(input_dtype)
+        output_chunks.append(out)
+
+    return torch.cat(output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(0, permuted_tokens.size(-1))
 
 
 def _module_compute_dtype(module: nn.Module, default: torch.dtype) -> torch.dtype:
