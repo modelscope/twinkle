@@ -67,8 +67,6 @@ class AdapterManagerMixin:
         # Dict mapping adapter_name ->
         # {'token': str, 'session_id': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
         self._adapter_records: dict[str, dict[str, Any]] = {}
-        # Track adapter count per token
-        self._adapter_counts: dict[str, int] = {}
 
         # Countdown thread
         self._adapter_countdown_thread: threading.Thread | None = None
