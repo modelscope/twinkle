@@ -22,7 +22,7 @@ applications:
     import_path: server            # Python module to import
     args:
       server_config:
-        per_token_adapter_limit: 1      # Maximum number of adapters per token (globally)
+        per_token_model_limit: 1      # Maximum number of models (adapters) per token (server-globally enforced)
       supported_models:
         - Qwen/Qwen2.5-7B-Instruct
     deployments:

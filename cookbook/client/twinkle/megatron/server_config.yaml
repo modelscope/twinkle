@@ -21,7 +21,8 @@ applications:
     route_prefix: /server          # API endpoint prefix
     import_path: server            # Python module to import
     args:
-
+      server_config:
+        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
     deployments:
       - name: TwinkleServer
         autoscaling_config:
@@ -50,7 +51,6 @@ applications:
         mesh: [0,1]                   # Device indices in the mesh
         mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
       adapter_config:
-        per_token_adapter_limit: 30                # Max concurrent LoRA adapters
         adapter_timeout: 1800                      # Seconds before idle adapter unload
     deployments:
       - name: ModelManagement

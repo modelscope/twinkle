@@ -36,7 +36,7 @@ class ModelManager(BaseManager[ModelRecord]):
         token = record.token
         current_ids = self._token_models.get(token, set())
         if len(current_ids) >= self._per_token_model_limit:
-            raise RuntimeError(f'Model limit exceeded for token {token[:8]}...: '
+            raise RuntimeError(f'Model limit exceeded: '
                                f'{len(current_ids)}/{self._per_token_model_limit} models')
         self._token_models.setdefault(token, set()).add(model_id)
         self._store[model_id] = record
