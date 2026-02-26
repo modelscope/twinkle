@@ -111,29 +111,6 @@ class GPTBridge:
     def _get_hf_mlp(self, layer_idx):
         return getattr(self.hf_layers[layer_idx], self.get_hf_mlp_prefix(layer_idx))
 
-    _HF_GROUPED_FALSE_TYPES = {
-        'qwen2_moe',
-        'qwen3_moe',
-        'deepseek_v2',
-        'deepseek_v3',
-        'dots1',
-        'ernie4_5_moe',
-        'glm4_moe',
-        'glm4_moe_lite',
-        'glm4v_moe',
-        'minimax_m2',
-        'olmoe',
-        'qwen3_next',
-        'kimi_vl',
-        'qwen3_omni_moe',
-        'qwen3_5_moe',
-    }
-
-    def _get_hf_grouped(self):
-        if self.args.hf_model_type in self._HF_GROUPED_FALSE_TYPES:
-            return False, False
-        return None, None
-
     def _get_transpose(self):
         if self.args.hf_model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
             return True
@@ -176,6 +153,15 @@ class GPTBridge:
             auto_tokenizer_cls = AutoTokenizer
 
         self.processor = auto_tokenizer_cls.from_pretrained(model_dir, trust_remote_code=True)
+
+    def _get_hf_grouped(self):
+        if self.args.hf_model_type in {
+                'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'dots1', 'ernie4_5_moe', 'glm4_moe',
+                'glm4_moe_lite', 'glm4v_moe', 'minimax_m2', 'olmoe', 'qwen3_next', 'kimi_vl', 'qwen3_omni_moe',
+                'qwen3_5_moe'
+        }:
+            return False, False
+        return None, None
 
     def _get_tp_split_dim(self, mg_key: Optional[str]) -> Optional[int]:
         if mg_key is None:
@@ -764,16 +750,14 @@ class GPTBridge:
             hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
         return hf_state_dict
 
-    def _set_mlp_state(
-        self,
-        mg_mlp,
-        hf_state_dict,
-        hf_prefix: str,
-        layer_idx: int,
-        to_mcore: bool,
-        ep_rank: Optional[int] = None,
-        hf_mlp=None,
-    ):
+    def _set_mlp_state(self,
+                       mg_mlp,
+                       hf_state_dict,
+                       hf_prefix: str,
+                       layer_idx: int,
+                       to_mcore: bool,
+                       ep_rank: Optional[int] = None,
+                       hf_mlp=None):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         if hf_mlp is None:
