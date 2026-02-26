@@ -188,18 +188,21 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping CreateModelResponse with model_id
             """
-            # Register a new model_id for each create_model call
-            model_id = self.state.register_model(body.model_dump(), token=request.state.token)
 
             async def _create_adapter():
+                model_id = None
                 try:
+                    # Register a new model_id for each create_model call
+                    model_id = self.state.register_model(body.model_dump(), token=request.state.token)
+
+                    # Create a new LoRA adapter for the model
                     if body.lora_config:
                         # TODO: support more lora config parameters, train_unembed, etc.
                         lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
 
                         adapter_name = self.get_adapter_name(adapter_name=model_id)
 
-                        # Register adapter FIRST (limit check happens inside register_adapter)
+                        # Register adapter FIRST
                         self.register_adapter(adapter_name, request.state.token, session_id=body.session_id)
 
                         # Create adapter AFTER successful registration
@@ -218,8 +221,9 @@ def build_model_app(model_id: str,
                     return types.CreateModelResponse(model_id=model_id)
                 except Exception:
                     # Ensure we don't leave stale grad state.
-                    adapter_name = self.get_adapter_name(adapter_name=model_id)
-                    self._cleanup_adapter(adapter_name)
+                    if model_id:
+                        adapter_name = self.get_adapter_name(adapter_name=model_id)
+                        self._cleanup_adapter(adapter_name)
 
                     logger.error(traceback.format_exc())
                     return types.RequestFailedResponse(
@@ -229,7 +233,6 @@ def build_model_app(model_id: str,
 
             return await self.schedule_task(
                 _create_adapter,
-                model_id=model_id,
                 token=request.state.token,
                 task_type='create_model',
             )

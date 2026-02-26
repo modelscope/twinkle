@@ -6,7 +6,6 @@
 #   2. eval():  Load a trained checkpoint and sample from it to verify
 #      that the model has learned the custom identity.
 # The server must be running first (see server.py and server_config.yaml).
-import numpy as np
 import os
 from tqdm import tqdm
 from tinker import types

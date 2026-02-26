@@ -11,7 +11,51 @@ class ModelManager(BaseManager[ModelRecord]):
 
     Expiry is based on `created_at`.  A model is also considered expired if
     its owning session has already been removed (cascade expiry).
+
+    Enforces a per-token model limit across all model instances (server-global).
     """
+
+    def __init__(self, expiration_timeout: float, per_token_model_limit: int = 30) -> None:
+        super().__init__(expiration_timeout)
+        self._per_token_model_limit = per_token_model_limit
+        # token -> set of model_ids owned by that token
+        self._token_models: dict[str, set[str]] = {}
+
+    # ----- CRUD -----
+
+    def add(self, model_id: str, record: ModelRecord) -> None:
+        """Store a record under the given ID.
+
+        Args:
+            model_id: Unique identifier for the model.
+            record: ModelRecord to store.
+
+        Raises:
+            RuntimeError: If the token has reached per_token_model_limit.
+        """
+        token = record.token
+        current_ids = self._token_models.get(token, set())
+        if len(current_ids) >= self._per_token_model_limit:
+            raise RuntimeError(f'Model limit exceeded for token {token[:8]}...: '
+                               f'{len(current_ids)}/{self._per_token_model_limit} models')
+        self._token_models.setdefault(token, set()).add(model_id)
+        self._store[model_id] = record
+
+    def remove(self, model_id: str) -> bool:
+        """Remove a record by ID and clean up token ownership.
+
+        Returns:
+            True if the record existed and was removed, False otherwise.
+        """
+        record = self._store.pop(model_id, None)
+        if record is None:
+            return False
+        token = record.token
+        if token and token in self._token_models:
+            self._token_models[token].discard(model_id)
+            if not self._token_models[token]:
+                del self._token_models[token]
+        return True
 
     # ----- Cleanup -----
 
@@ -42,6 +86,11 @@ class ModelManager(BaseManager[ModelRecord]):
                 expired_ids.append(model_id)
 
         for model_id in expired_ids:
-            del self._store[model_id]
+            record = self._store.pop(model_id)
+            token = record.token
+            if token and token in self._token_models:
+                self._token_models[token].discard(model_id)
+                if not self._token_models[token]:
+                    del self._token_models[token]
 
         return len(expired_ids)

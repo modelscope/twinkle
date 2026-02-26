@@ -38,9 +38,10 @@ class ServerState:
             self,
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
             cleanup_interval: float = 3600.0,  # 1 hour in seconds
+            per_token_model_limit: int = 30,
             **kwargs) -> None:
         self._session_mgr = SessionManager(expiration_timeout)
-        self._model_mgr = ModelManager(expiration_timeout)
+        self._model_mgr = ModelManager(expiration_timeout, per_token_model_limit)
         self._sampling_mgr = SamplingSessionManager(expiration_timeout)
         self._future_mgr = FutureManager(expiration_timeout)
         self._config_mgr = ConfigManager()
@@ -88,13 +89,13 @@ class ServerState:
 
     # ----- Model Registration -----
 
-    def register_model(self, payload: dict[str, Any], model_id: str | None = None, token: str | None = None) -> str:
+    def register_model(self, payload: dict[str, Any], token: str, model_id: str | None = None) -> str:
         """Register a new model with the server state.
 
         Args:
             payload: Model configuration containing base_model, lora_config, etc.
+            token: User token that owns this model. Required.
             model_id: Optional explicit model_id; otherwise auto-generated.
-            token: Optional user token for tracking ownership.
 
         Returns:
             The model_id for the registered model.
@@ -343,8 +344,8 @@ class ServerStateProxy:
 
     # ----- Model Registration -----
 
-    def register_model(self, payload: dict[str, Any], model_id: str | None = None, token: str | None = None) -> str:
-        return ray.get(self._actor.register_model.remote(payload, model_id, token))
+    def register_model(self, payload: dict[str, Any], token: str, model_id: str | None = None) -> str:
+        return ray.get(self._actor.register_model.remote(payload, token, model_id))
 
     def unload_model(self, model_id: str) -> bool:
         return ray.get(self._actor.unload_model.remote(model_id))
@@ -417,9 +418,7 @@ class ServerStateProxy:
 # ---------------------------------------------------------------------------
 
 
-def get_server_state(actor_name: str = 'twinkle_server_state',
-                     auto_start_cleanup: bool = True,
-                     **server_state_kwargs) -> ServerStateProxy:
+def get_server_state(actor_name: str = 'twinkle_server_state', **kwargs) -> ServerStateProxy:
     """Get or create the ServerState Ray actor.
 
     Ensures only one ServerState actor exists with the given name.  Uses a
@@ -427,8 +426,7 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
 
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state').
-        auto_start_cleanup: Whether to automatically start the cleanup task (default: True).
-        **server_state_kwargs: Additional keyword arguments passed to ServerState constructor
+        **kwargs: Additional keyword arguments passed to ServerState constructor
             (e.g., expiration_timeout, cleanup_interval).
 
     Returns:
@@ -439,12 +437,11 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     except ValueError:
         try:
             _ServerState = ray.remote(ServerState)
-            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(**server_state_kwargs)
-            if auto_start_cleanup:
-                try:
-                    ray.get(actor.start_cleanup_task.remote())
-                except Exception as e:
-                    logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
+            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(**kwargs)
+            try:
+                ray.get(actor.start_cleanup_task.remote())
+            except Exception as e:
+                logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
         except ValueError:
             actor = ray.get_actor(actor_name)
     assert actor is not None

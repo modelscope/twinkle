@@ -516,7 +516,7 @@ def build_model_app(model_id: str,
             token = request.state.token
             training_run_manager = create_training_run_manager(token)
 
-            # Register adapter FIRST (limit check happens inside register_adapter)
+            # Register adapter FIRST
             self.register_adapter(adapter_name, token)
 
             # Create adapter AFTER successful registration

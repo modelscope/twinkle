@@ -24,12 +24,12 @@ class SessionRecord(BaseModel):
 class ModelRecord(BaseModel):
     """Represents a registered model."""
 
+    token: str
     session_id: str | None = None
     model_seq_id: Any = None
     base_model: str | None = None
     user_metadata: dict[str, Any] = Field(default_factory=dict)
     lora_config: Any = None
-    token: str | None = None
     created_at: str = Field(default_factory=_now_iso)
 
 
