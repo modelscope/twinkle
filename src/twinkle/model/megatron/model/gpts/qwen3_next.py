@@ -139,8 +139,10 @@ class Qwen3NextSelfAttention(SelfAttention):
         try:
             from megatron.core.utils import nvtx_range_pop, nvtx_range_push
         except ImportError:
+
             def nvtx_range_pop(*args, **kwargs):
                 return
+
             def nvtx_range_push(*args, **kwargs):
                 return
 
@@ -194,7 +196,14 @@ class Qwen3NextSelfAttention(SelfAttention):
             raise ValueError('CUDA graphs must use flash decode with static batching!')
 
         result = self._adjust_key_value_for_inference(
-            inference_context, query, key, value, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset,
+            inference_context,
+            query,
+            key,
+            value,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
         )
         if mcore_013:
             query, key, value, rotary_pos_emb, attn_mask_type, block_table = result
@@ -217,19 +226,19 @@ class Qwen3NextSelfAttention(SelfAttention):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
-                cu_seqlens_q = (packed_seq_params.cu_seqlens_q_padded
-                                if packed_seq_params.cu_seqlens_q_padded is not None
-                                else packed_seq_params.cu_seqlens_q)
-                cu_seqlens_kv = (packed_seq_params.cu_seqlens_kv_padded
-                                 if packed_seq_params.cu_seqlens_kv_padded is not None
-                                 else packed_seq_params.cu_seqlens_kv)
+                cu_seqlens_q = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q)
+                cu_seqlens_kv = (
+                    packed_seq_params.cu_seqlens_kv_padded
+                    if packed_seq_params.cu_seqlens_kv_padded is not None else packed_seq_params.cu_seqlens_kv)
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if q_pos_emb is not None:
                 if inference_context is None or inference_context.is_static_batching():
-                    query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q,
-                                                 **kwargs_cp)
+                    query = apply_rotary_pos_emb(
+                        query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, **kwargs_cp)
                 else:
                     query = inference_context.apply_rotary_emb_query(query, q_pos_emb, self.config, cu_seqlens_q,
                                                                      **kwargs_cp)
@@ -240,22 +249,40 @@ class Qwen3NextSelfAttention(SelfAttention):
         nvtx_range_push(suffix='core_attention')
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias, packed_seq_params=packed_seq_params,
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
                 core_attn_out = self.core_attention(
-                    query, key, value, attention_mask, attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias, packed_seq_params=packed_seq_params,
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
                 )
             else:
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, kv_lengths_decode_only, max_seqlen_k = (inference_context.cu_kv_lengths())
                 core_attn_out = self.flash_decode_and_prefill(
-                    q, k, v, max_seqlen_q, max_seqlen_k, cu_query_lengths, cu_kv_lengths,
-                    kv_lengths, kv_lengths_decode_only, block_table,
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_query_lengths,
+                    cu_kv_lengths,
+                    kv_lengths,
+                    kv_lengths_decode_only,
+                    block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
@@ -315,8 +342,8 @@ def _gated_delta_net_forward(self, hidden_states: torch.Tensor, **kwargs):
     if thd_format and not getattr(args, 'packing', False):
         new_hidden_states = hidden_states.new_zeros(
             (packed_seq_params.num_samples, packed_seq_params.max_seqlen_q.item(), hidden_states.shape[-1]))
-        attention_mask = hidden_states.new_zeros(
-            (packed_seq_params.num_samples, packed_seq_params.max_seqlen_q.item()), dtype=torch.bool)
+        attention_mask = hidden_states.new_zeros((packed_seq_params.num_samples, packed_seq_params.max_seqlen_q.item()),
+                                                 dtype=torch.bool)
         cu_seqlens_q = packed_seq_params.cu_seqlens_q
         for i in range(packed_seq_params.num_samples):
             start, end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
@@ -438,6 +465,9 @@ def get_qwen3_next_layer_spec(config, args, gated_delta_net_cls):
             layer_spec.submodules.self_attention.submodules.q_layernorm = layer_norm_impl
         if hasattr(layer_spec.submodules.self_attention.submodules, 'k_layernorm'):
             layer_spec.submodules.self_attention.submodules.k_layernorm = layer_norm_impl
+        if (getattr(config, 'moe_use_shared_expert_gate', False) and hasattr(layer_spec.submodules, 'mlp')
+                and hasattr(layer_spec.submodules.mlp.submodules, 'shared_experts')):
+            layer_spec.submodules.mlp.submodules.shared_experts.params = {'gate': True}
         layer_specs.append(layer_spec)
 
     local_layer_specs = get_local_layer_specs(config, layer_specs)

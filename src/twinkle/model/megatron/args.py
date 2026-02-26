@@ -107,6 +107,7 @@ class TwinkleMegatronArgs:
     num_experts: int = 0
     num_experts_per_tok: int = 2
     shared_expert_intermediate_size: int = 0
+    moe_router_enable_expert_bias: bool = False
 
     # =========================================================================
     # Training/inference settings
@@ -259,6 +260,10 @@ class TwinkleMegatronArgs:
     @property
     def intermediate_size(self) -> int:
         return self.ffn_hidden_size
+
+    @property
+    def moe_shared_expert_intermediate_size(self) -> int:
+        return self.shared_expert_intermediate_size
 
     @property
     def num_query_groups(self) -> int:
@@ -477,8 +482,6 @@ class TwinkleMegatronArgs:
             from megatron.core.distributed import DistributedDataParallel as MegatronDDP
             from peft import PeftModel as _PeftModel
 
-            # Check if model is DDP-wrapped (has ddp_config)
-            # Need to unwrap PeftModel to check the underlying model
             def _get_base_model(m):
                 if isinstance(m, _PeftModel):
                     return _get_base_model(m.base_model.model)
@@ -563,20 +566,6 @@ class TwinkleMegatronArgs:
         bias_activation_fusion = use_swiglu and not has_bias
         if 'moe_token_dispatcher_type' not in moe_kwargs:
             moe_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
-
-        # Handle use_shared_expert_gate from config
-        use_shared_expert_gate = mg_config_dict.get('use_shared_expert_gate', False)
-
-        # Handle rotary_interleaved for models like Qwen3.5 with mrope
-        rotary_interleaved = mg_config_dict.get('rotary_interleaved', False)
-        partial_rotary_factor = mg_config_dict.get('partial_rotary_factor')
-
-        # Determine position_embedding_type
-        position_embedding_type = mg_config_dict.get('position_embedding_type', 'rope')
-        apply_rope_fusion = True
-        if position_embedding_type != 'rope' or rotary_interleaved:
-            apply_rope_fusion = False
-
         config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=mg_config_dict['hidden_size'],
@@ -608,10 +597,10 @@ class TwinkleMegatronArgs:
             attention_dropout=0.0,
             masked_softmax_fusion=True,
             bias_dropout_fusion=True,
-            apply_rope_fusion=apply_rope_fusion,
+            apply_rope_fusion=True,
             attention_softmax_in_fp32=True,
             attention_backend=AttnBackend.flash,
-            rotary_interleaved=rotary_interleaved,
+            calculate_per_token_loss=True,
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
             recompute_method=recompute_method,
@@ -622,32 +611,39 @@ class TwinkleMegatronArgs:
         if exists('megatron_core>=0.13'):
             config.expert_tensor_parallel_size = self.etp_size
 
-        # Store layer_types on config for Qwen3-Next/Qwen3.5 heterogeneous layers
+        if mg_config_dict.get('use_shared_expert_gate'):
+            config.moe_use_shared_expert_gate = True
+        if mg_config_dict.get('rotary_interleaved'):
+            config.rotary_interleaved = True
+        partial_rotary_factor = mg_config_dict.get('partial_rotary_factor')
+        if partial_rotary_factor is not None:
+            config.rotary_percent = partial_rotary_factor
+            config.apply_rope_fusion = False
+        mrope_section = mg_config_dict.get('mrope_section')
+        if mrope_section is not None:
+            config.mrope_section = mrope_section
+        if mg_config_dict.get('mrope_interleaved'):
+            config.mrope_interleaved = True
+
         layer_types = mg_config_dict.get('layer_types')
         if layer_types is not None:
             config.layer_types = layer_types
-            self.layer_types = layer_types
-            for attr in ['linear_num_value_heads', 'linear_num_key_heads', 'linear_key_head_dim',
-                         'linear_value_head_dim', 'linear_conv_kernel_dim']:
+            for attr in ('linear_num_value_heads', 'linear_num_key_heads', 'linear_key_head_dim',
+                         'linear_value_head_dim', 'linear_conv_kernel_dim'):
                 val = mg_config_dict.get(attr)
                 if val is not None:
                     setattr(config, attr, val)
-
-        # Store partial_rotary_factor on config
-        if partial_rotary_factor is not None:
-            config.partial_rotary_factor = partial_rotary_factor
-
-        # Store args reference on config for HuggingFaceModule compatibility
-        config.args = self
 
         self.config = config
 
         # Get layer spec
         moe_grouped_gemm = num_experts > 0
         if layer_types is not None:
-            from .model.gpts.qwen3_next import get_qwen3_next_layer_spec, Qwen3NextGatedDeltaNet, Qwen3_5MoeGatedDeltaNet
-            hf_model_type = mg_config_dict.get('hf_model_type', '')
-            if hf_model_type in {'qwen3_5_moe', 'qwen3_5'}:
+            from .model.gpts.qwen3_next import (Qwen3_5MoeGatedDeltaNet, Qwen3NextGatedDeltaNet,
+                                                get_qwen3_next_layer_spec)
+            llm_model_type = mg_config_dict.get('llm_model_type', '')
+            hf_mt = mg_config_dict.get('hf_model_type', '')
+            if 'qwen3_5_moe' in (llm_model_type, hf_mt):
                 gated_delta_net_cls = Qwen3_5MoeGatedDeltaNet
             else:
                 gated_delta_net_cls = Qwen3NextGatedDeltaNet
@@ -663,34 +659,14 @@ class TwinkleMegatronArgs:
                 raise RuntimeError(
                     'TransformerEngine is not installed or not compatible with this version of Megatron-Core.')
 
-        # Set shared_expert_gate if needed
-        if use_shared_expert_gate and num_experts > 0 and moe_shared_expert_intermediate_size:
-            if hasattr(layer_spec, 'layer_specs'):
-                for ls in layer_spec.layer_specs:
-                    if hasattr(ls.submodules.mlp.submodules, 'shared_experts'):
-                        ls.submodules.mlp.submodules.shared_experts.params = {'gate': True}
-            elif hasattr(layer_spec.submodules.mlp.submodules, 'shared_experts'):
-                layer_spec.submodules.mlp.submodules.shared_experts.params = {'gate': True}
-
         # Create model
-        text_config = hf_config
-        if hasattr(hf_config, 'text_config') and hf_config.text_config is not None:
-            text_config = hf_config.text_config
-        max_seq_length = getattr(text_config, 'max_position_embeddings', 4096)
+        max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
-        rotary_percent = 1.0
-        if partial_rotary_factor is not None:
-            rotary_percent = partial_rotary_factor
+        position_embedding_type = mg_config_dict.get('position_embedding_type', 'rope')
         extra_init_args = {}
-        rope_scaling_dict = getattr(text_config, 'rope_scaling', None) or getattr(text_config, 'rope_parameters', None)
-        if rope_scaling_dict is not None and isinstance(rope_scaling_dict, dict):
-            if 'factor' in rope_scaling_dict:
-                extra_init_args['seq_len_interpolation_factor'] = rope_scaling_dict['factor']
-            if 'rope_theta' in rope_scaling_dict:
-                rotary_base = int(rope_scaling_dict['rope_theta'])
-        mrope_section = mg_config_dict.get('mrope_section')
-        if position_embedding_type == 'mrope' and mrope_section is not None:
-            config.mrope_section = mrope_section
+        if hasattr(hf_config,
+                   'rope_scaling') and hf_config.rope_scaling is not None and 'factor' in hf_config.rope_scaling:
+            extra_init_args = {'seq_len_interpolation_factor': hf_config.rope_scaling['factor']}
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         if vpp_size is not None and vpp_size > 1:
             model = []
@@ -710,7 +686,6 @@ class TwinkleMegatronArgs:
                     parallel_output=True,
                     share_embeddings_and_output_weights=getattr(hf_config, 'tie_word_embeddings', False),
                     position_embedding_type=position_embedding_type,
-                    rotary_percent=rotary_percent,
                     rotary_base=rotary_base,
                     **extra_init_args)
                 model.append(_model)
@@ -726,7 +701,6 @@ class TwinkleMegatronArgs:
                 parallel_output=True,
                 share_embeddings_and_output_weights=getattr(hf_config, 'tie_word_embeddings', False),
                 position_embedding_type=position_embedding_type,
-                rotary_percent=rotary_percent,
                 rotary_base=rotary_base,
                 **extra_init_args,
             )

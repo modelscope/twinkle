@@ -9,13 +9,13 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-# tp=2, pp=2, ep=2 on 4 GPUs, dp=1
-device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, ep_size=2)
+device_mesh = DeviceMesh.from_sizes(dp_size=4, tp_size=1, pp_size=1, ep_size=4)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
 
-MODEL_ID = '/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-35B-A3B'
+MODEL_ID = 'Qwen/Qwen3.5-35B-A3B'
+MAX_STEPS = 100
 
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
@@ -39,7 +39,7 @@ def train():
         if step % 5 == 0:
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Step {step}/{len(dataloader)}, metric: {metric}')
-        if step >= 10:
+        if step >= MAX_STEPS:
             break
     model.save('last-checkpoint')
     logger.info('Training completed.')
