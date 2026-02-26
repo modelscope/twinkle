@@ -364,6 +364,8 @@ class InputProcessor:
                    variable_seq_lengths=False,
                    **kwargs) -> List[InputFeature]:
         if len(inputs) == 1:
+            if self.framework == 'megatron' and 'attention_mask' in inputs[0]:
+                inputs[0]['attention_mask'] = self._create_4d_attention_mask([inputs[0]['attention_mask'].squeeze(0)])
             return inputs
         if micro_batch_size is None:
             # normal collate

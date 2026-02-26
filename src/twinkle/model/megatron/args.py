@@ -161,7 +161,6 @@ class TwinkleMegatronArgs:
     # =========================================================================
     untie_embeddings_and_output_weights: bool = True
     max_shard_size: str = '5GB'
-    llm_model_type: str = 'gpt'  # For transformers 5.0 compatibility
     use_cpu_initialization: bool = False
 
     def __post_init__(self):
@@ -335,10 +334,12 @@ class TwinkleMegatronArgs:
         # Get rope_scaling
         rope_scaling = getattr(text_config, 'rope_scaling', None)
 
-        # Detect multimodal model
         model_type = getattr(hf_config, 'model_type', 'qwen2')
-        is_multimodal = ('vl' in model_type.lower() or 'vision' in model_type.lower() or 'omni' in model_type.lower()
-                         or hasattr(hf_config, 'vision_config'))
+
+        # Detect multimodal model from the registered MegatronModelMeta
+        from .model.register import get_megatron_model_meta
+        model_meta = get_megatron_model_meta(model_type)
+        is_multimodal = model_meta.is_multimodal if model_meta is not None else False
 
         # Determine QKV bias
         if hasattr(text_config, 'attention_bias'):
@@ -441,7 +442,6 @@ class TwinkleMegatronArgs:
         if self._model is not None:
             return self._model
         from megatron.core import parallel_state as mpu
-        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
         from megatron.core.transformer import TransformerConfig
         from megatron.core.transformer.enums import AttnBackend
 
@@ -482,6 +482,8 @@ class TwinkleMegatronArgs:
             from megatron.core.distributed import DistributedDataParallel as MegatronDDP
             from peft import PeftModel as _PeftModel
 
+            # Check if model is DDP-wrapped (has ddp_config)
+            # Need to unwrap PeftModel to check the underlying model
             def _get_base_model(m):
                 if isinstance(m, _PeftModel):
                     return _get_base_model(m.base_model.model)
@@ -582,24 +584,26 @@ class TwinkleMegatronArgs:
             params_dtype=self.params_dtype,
             fp16=self.params_dtype == torch.float16,
             bf16=self.params_dtype == torch.bfloat16,
-            pipeline_dtype=self.params_dtype,
+            pipeline_dtype=self.params_dtype,  # Required when using pipeline parallelism
             use_cpu_initialization=self.use_cpu_initialization,
             add_qkv_bias=self.add_qkv_bias,
             variable_seq_lengths=self.variable_seq_lengths,
             add_bias_linear=not mg_config_dict.get('disable_bias_linear', True),
             gated_linear_unit=use_swiglu,
-            activation_func=activation_func,
-            bias_activation_fusion=bias_activation_fusion,
+            activation_func=activation_func,  # SiLU for SwiGLU, GELU otherwise
+            bias_activation_fusion=bias_activation_fusion,  # Fused SwiGLU for performance
             normalization='RMSNorm',
             layernorm_epsilon=mg_config_dict.get('norm_epsilon', 1e-6),
             qk_layernorm=mg_config_dict.get('qk_layernorm', False),
             hidden_dropout=0.0,
             attention_dropout=0.0,
-            masked_softmax_fusion=True,
-            bias_dropout_fusion=True,
-            apply_rope_fusion=True,
-            attention_softmax_in_fp32=True,
-            attention_backend=AttnBackend.flash,
+            # Performance optimizations
+            masked_softmax_fusion=True,  # Fused attention softmax
+            bias_dropout_fusion=True,  # Fused bias + dropout
+            apply_rope_fusion=True,  # Fused RoPE application
+            attention_softmax_in_fp32=True,  # Numerical stability
+            attention_backend=AttnBackend.flash,  # FlashAttention for speed
+            # Activation recomputation for memory efficiency
             calculate_per_token_loss=True,
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
@@ -625,39 +629,18 @@ class TwinkleMegatronArgs:
         if mg_config_dict.get('mrope_interleaved'):
             config.mrope_interleaved = True
 
-        layer_types = mg_config_dict.get('layer_types')
-        if layer_types is not None:
-            config.layer_types = layer_types
-            for attr in ('linear_num_value_heads', 'linear_num_key_heads', 'linear_key_head_dim',
-                         'linear_value_head_dim', 'linear_conv_kernel_dim'):
-                val = mg_config_dict.get(attr)
-                if val is not None:
-                    setattr(config, attr, val)
-
         self.config = config
 
-        # Get layer spec
-        moe_grouped_gemm = num_experts > 0
-        if layer_types is not None:
-            from .model.gpts.qwen3_next import (Qwen3_5MoeGatedDeltaNet, Qwen3NextGatedDeltaNet,
-                                                get_qwen3_next_layer_spec)
-            llm_model_type = mg_config_dict.get('llm_model_type', '')
-            hf_mt = mg_config_dict.get('hf_model_type', '')
-            if 'qwen3_5_moe' in (llm_model_type, hf_mt):
-                gated_delta_net_cls = Qwen3_5MoeGatedDeltaNet
-            else:
-                gated_delta_net_cls = Qwen3NextGatedDeltaNet
-            layer_spec = get_qwen3_next_layer_spec(config, self, gated_delta_net_cls)
+        # Delegate model-specific config & layer spec construction to the loader
+        loader = model_meta.loader() if model_meta else None
+        if loader is not None:
+            loader.post_config(config, self, mg_config_dict)
+            layer_spec = loader.get_layer_spec(config, self, mg_config_dict)
         else:
-            try:
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=mg_config_dict.get('num_experts'),
-                    moe_grouped_gemm=moe_grouped_gemm,
-                    qk_layernorm=mg_config_dict.get('qk_layernorm', False),
-                )
-            except (ImportError, AttributeError):
-                raise RuntimeError(
-                    'TransformerEngine is not installed or not compatible with this version of Megatron-Core.')
+            from .model.register import MegatronModelLoader
+            default_loader = MegatronModelLoader()
+            default_loader.post_config(config, self, mg_config_dict)
+            layer_spec = default_loader.get_layer_spec(config, self, mg_config_dict)
 
         # Create model
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)

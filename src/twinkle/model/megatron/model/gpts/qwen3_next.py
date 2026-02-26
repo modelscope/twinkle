@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple, Union
 
 from twinkle import get_logger
 from twinkle.model.megatron.args import get_args
+from twinkle.model.megatron.model.register import MegatronModelLoader
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 mcore_015 = version.parse(megatron.core.__version__) >= version.parse('0.15.0rc0')
@@ -484,3 +485,24 @@ def get_qwen3_next_mtp_block_spec(config, transformer_layer_spec, **kwargs):
         layer_spec.submodules.hnorm = Qwen3NextRMSNorm
         layer_spec.submodules.layer_norm = Qwen3NextRMSNorm
     return mtp_block_spec
+
+
+class Qwen3NextLoader(MegatronModelLoader):
+    """Loader for Qwen3-Next models with heterogeneous linear/full attention layers."""
+    gated_delta_net = Qwen3NextGatedDeltaNet
+
+    def post_config(self, config, args, mg_config_dict):
+        layer_types = mg_config_dict.get('layer_types')
+        if layer_types is not None:
+            config.layer_types = layer_types
+            for attr in ('linear_num_value_heads', 'linear_num_key_heads', 'linear_key_head_dim',
+                         'linear_value_head_dim', 'linear_conv_kernel_dim'):
+                val = mg_config_dict.get(attr)
+                if val is not None:
+                    setattr(config, attr, val)
+
+    def get_layer_spec(self, config, args, mg_config_dict):
+        return get_qwen3_next_layer_spec(config, args, self.gated_delta_net)
+
+    def get_mtp_block_spec(self, config, layer_spec, **kwargs):
+        return get_qwen3_next_mtp_block_spec(config, layer_spec, **kwargs)

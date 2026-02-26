@@ -129,7 +129,7 @@ class GPTBridge:
         'qwen3_5_moe',
     }
 
-    def _get_hf_grouped(self, is_mtp_layer: bool = False):
+    def _get_hf_grouped(self):
         if self.args.hf_model_type in self._HF_GROUPED_FALSE_TYPES:
             return False, False
         return None, None
@@ -712,7 +712,6 @@ class GPTBridge:
         hf_prefix: str,
         layer_idx: int,
         to_mcore: bool,
-        is_mtp_layer: bool = False,
     ):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
@@ -758,14 +757,7 @@ class GPTBridge:
                 else:
                     mg_experts = None
             hf_state_dict.update(
-                self._set_mlp_state(
-                    mg_experts,
-                    hf_state_dict,
-                    'experts.',
-                    layer_idx,
-                    to_mcore,
-                    ep_rank=ep_rank,
-                    is_mtp_layer=is_mtp_layer))
+                self._set_mlp_state(mg_experts, hf_state_dict, 'experts.', layer_idx, to_mcore, ep_rank=ep_rank))
         if to_mcore:
             hf_state_dict = {}
         else:
@@ -781,7 +773,6 @@ class GPTBridge:
         to_mcore: bool,
         ep_rank: Optional[int] = None,
         hf_mlp=None,
-        is_mtp_layer: bool = False,
     ):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
@@ -806,7 +797,7 @@ class GPTBridge:
         else:
             is_gate_up = hasattr(hf_mlp, 'gate_up_proj')
         if self.is_transformers_5 and not to_mcore and is_expert:
-            _hf_grouped, _is_gate_up = self._get_hf_grouped(is_mtp_layer)
+            _hf_grouped, _is_gate_up = self._get_hf_grouped()
             if _hf_grouped is not None:
                 hf_grouped = _hf_grouped
             if _is_gate_up is not None:
@@ -904,7 +895,7 @@ class GPTBridge:
                                 gate_up_proj_bias = hf_state_dict['gate_up_proj_bias'].load()
                                 gate_up_proj_bias = gate_up_proj_bias[ep_rank * num_local_experts:(ep_rank + 1)
                                                                       * num_local_experts]
-                            if args.llm_model_type == 'gpt_oss':
+                            if args.hf_model_type == 'gpt_oss':
                                 gate_proj_weight = gate_up_proj_weight[:, ::2]
                                 up_proj_weight = gate_up_proj_weight[:, 1::2]
                                 gate_proj_bias, up_proj_bias = gate_up_proj_bias[:, ::2], gate_up_proj_bias[:, 1::2]
@@ -1059,7 +1050,7 @@ class GPTBridge:
                                     gate_up_proj_weight = torch.concat(
                                         [hf_state_dict['gate_up_proj'], gate_up_proj_weight], dim=0)
                                 is_last_ckpt = gate_up_proj_weight.shape[0] == args.num_experts
-                                if args.llm_model_type == 'gpt_oss' and is_last_ckpt:
+                                if args.hf_model_type == 'gpt_oss' and is_last_ckpt:
                                     gate_proj_weight, up_proj_weight = gate_up_proj_weight.chunk(2, dim=2)
                                     new_gate_up_proj_weight = torch.empty_like(gate_up_proj_weight)
                                     new_gate_up_proj_weight[..., ::2] = gate_proj_weight
@@ -1079,7 +1070,7 @@ class GPTBridge:
                                     if 'gate_up_proj_bias' in hf_state_dict:
                                         gate_up_proj_bias = torch.concat(
                                             [hf_state_dict['gate_up_proj_bias'], gate_up_proj_bias], dim=0)
-                                    if args.llm_model_type == 'gpt_oss' and is_last_ckpt:
+                                    if args.hf_model_type == 'gpt_oss' and is_last_ckpt:
                                         gate_proj_bias, up_proj_bias = gate_up_proj_bias.chunk(2, dim=1)
                                         new_gate_up_proj_bias = torch.empty_like(gate_up_proj_bias)
                                         new_gate_up_proj_bias[:, ::2] = gate_proj_bias
@@ -1324,15 +1315,13 @@ class GPTBridge:
                                  'input_layernorm.weight', to_mcore)
         return hf_state_dict
 
-    def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp_layer: bool = False):
+    def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
         hf_mlp_prefix = self.get_hf_mlp_prefix(layer_idx)
         hf_mlp = self._get_hf_mlp(layer_idx)
         is_moe = self._is_moe(hf_mlp.state_dict())
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         if is_moe:
-            hf_state_dict.update(
-                self._set_moe_state(
-                    mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore, is_mtp_layer=is_mtp_layer))
+            hf_state_dict.update(self._set_moe_state(mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict, 'post_attention_layernorm.weight',
                                  to_mcore)
         else:
@@ -1518,7 +1507,7 @@ class GPTBridge:
                 self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, 'shared_head.head.weight',
                                      to_mcore)
         hf_state_dict.update(self._set_layer_attn(transformer_layer, hf_state_dict, -1, to_mcore))
-        hf_state_dict.update(self._set_layer_mlp(transformer_layer, hf_state_dict, -1, to_mcore, is_mtp_layer=True))
+        hf_state_dict.update(self._set_layer_mlp(transformer_layer, hf_state_dict, -1, to_mcore))
         if to_mcore:
             hf_state_dict = {}
         else:

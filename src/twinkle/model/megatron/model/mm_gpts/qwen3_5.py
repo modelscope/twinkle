@@ -9,6 +9,7 @@ from twinkle.model.megatron.args import get_args
 from twinkle.utils.torch_utils import to_device
 from ..constant import MegatronModelType, ModelType
 from ..gpt_bridge import GPTBridge, MultimodalGPTBridge
+from ..gpts.qwen3_next import Qwen3_5MoeGatedDeltaNet, Qwen3NextLoader
 from ..register import MegatronModelMeta, register_megatron_model
 from .utils import HuggingFaceModule
 
@@ -146,6 +147,11 @@ if _auto_model_cls is None:
     except ImportError:
         _auto_model_cls = None
 
+
+class Qwen3_5MoeLoader(Qwen3NextLoader):
+    gated_delta_net = Qwen3_5MoeGatedDeltaNet
+
+
 register_megatron_model(
     MegatronModelMeta(
         MegatronModelType.qwen3_5,
@@ -156,4 +162,5 @@ register_megatron_model(
         bridge_cls=Qwen3_5Bridge,
         visual_cls=Qwen3_5Vit,
         auto_model_cls=_auto_model_cls,
+        loader=Qwen3_5MoeLoader,
     ))
