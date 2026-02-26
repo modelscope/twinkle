@@ -609,7 +609,10 @@ class TwinkleMegatronArgs:
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
             recompute_method=recompute_method,
             recompute_num_layers=recompute_num_layers,
+            # Critical: Set finalize_model_grads_func for DP gradient synchronization
+            # Uses custom wrapper that handles both DDP and PEFT/LoRA models
             finalize_model_grads_func=finalize_model_grads_for_lora,
+            # MoE configuration
             **moe_kwargs,
         )
         if exists('megatron_core>=0.13'):
