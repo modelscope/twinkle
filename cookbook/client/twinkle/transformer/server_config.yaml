@@ -21,7 +21,8 @@ applications:
     route_prefix: /server          # API endpoint prefix
     import_path: server            # Python module to import
     args:
-
+      server_config:
+        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
     deployments:
       - name: TwinkleServer
         autoscaling_config:
@@ -40,7 +41,6 @@ applications:
       use_megatron: false                              # Use HuggingFace Transformers (not Megatron)
       model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
       adapter_config:
-        per_token_adapter_limit: 30   # Max LoRA adapters that can be active simultaneously
         adapter_timeout: 1800         # Seconds before an idle adapter is unloaded
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
@@ -103,7 +103,6 @@ applications:
         gpu_memory_utilization: 0.4
         max_model_len: 1024
       adapter_config:                                    # Adapter lifecycle management
-        per_token_adapter_limit: 30                      # Max LoRA adapters per user
         adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
       device_group:
         name: sampler

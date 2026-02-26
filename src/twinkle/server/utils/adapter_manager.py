@@ -43,7 +43,6 @@ class AdapterManagerMixin:
     def _init_adapter_manager(
         self,
         adapter_timeout: float = 1800.0,
-        per_token_adapter_limit: int = 30,
         adapter_max_lifetime: float = 12 * 60 * 60,
     ) -> None:
         """Initialize the adapter manager.
@@ -54,21 +53,16 @@ class AdapterManagerMixin:
             adapter_timeout: Timeout in seconds for inactive adapters and session-based expiration.
                 Default is 1800.0 (30 minutes). Adapters linked to sessions will expire
                 when their session hasn't been touched for this duration.
-            per_token_adapter_limit: Maximum number of adapters per user token.
-                Default is 30.
             adapter_max_lifetime: Maximum lifetime in seconds for an adapter since creation.
                 Default is 43200.0 (12 hours). If <= 0, lifetime enforcement is disabled.
         """
         self._adapter_timeout = adapter_timeout
-        self._per_token_adapter_limit = per_token_adapter_limit
         self._adapter_max_lifetime = adapter_max_lifetime
 
         # Adapter lifecycle tracking
         # Dict mapping adapter_name ->
         # {'token': str, 'session_id': str, 'last_activity': float, 'created_at': float, 'inactivity_counter': int}
         self._adapter_records: dict[str, dict[str, Any]] = {}
-        # Track adapter count per token
-        self._adapter_counts: dict[str, int] = {}
 
         # Countdown thread
         self._adapter_countdown_thread: threading.Thread | None = None
@@ -82,15 +76,7 @@ class AdapterManagerMixin:
             token: User token that owns this adapter.
             session_id: Optional session ID to associate with this adapter.
                 If provided, adapter will expire when the session expires.
-
-        Raises:
-            RuntimeError: If adapter limit is exceeded for this token.
         """
-        # Check adapter limit BEFORE registering
-        allowed, reason = self.check_adapter_limit(token)
-        if not allowed:
-            raise RuntimeError(reason)
-
         current_time = time.time()
         self._adapter_records[adapter_name] = {
             'token': token,
@@ -353,25 +339,3 @@ class AdapterManagerMixin:
                 # Wait for thread to finish (it checks the flag every second)
                 self._adapter_countdown_thread.join(timeout=2.0)
             logger.debug('[AdapterManager] Countdown thread stopped')
-
-    def check_adapter_limit(self, token: str) -> tuple[bool, str | None]:
-        """Check adapter count for a user token.
-
-        This method enforces per-user adapter limits to prevent resource exhaustion.
-        Counts adapters directly from _adapter_records instead of using state storage.
-
-        Args:
-            token: User token to check.
-
-        Returns:
-            Tuple of (allowed: bool, reason: Optional[str]).
-            If allowed is False, reason contains the explanation.
-        """
-        # Count adapters directly from _adapter_records
-        current_count = sum(1 for record in self._adapter_records.values()
-                            if record.get('token') == token and not record.get('expiring', False))
-
-        # Check if current count exceeds limit
-        if current_count >= self._per_token_adapter_limit:
-            return False, f'Adapter limit exceeded: {current_count}/{self._per_token_adapter_limit} adapters'
-        return True, None
