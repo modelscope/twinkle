@@ -771,7 +771,7 @@ class GPTBridge:
                 hf_grouped = not hasattr(hf_mlp, '__len__')
             if hasattr(hf_mlp, '__len__'):
                 hf_mlp = hf_mlp[0]
-            num_local_experts = args.num_moe_experts // self.ep_size
+            num_local_experts = args.num_experts // self.ep_size
         if to_mcore:
             is_gate_up = any('gate_up_proj' in k for k in hf_state_dict.keys())
         else:
@@ -788,6 +788,7 @@ class GPTBridge:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         elif not to_mcore:
             hf_state_dict = {}
+
         # linear_fc1
         if to_mcore:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())
