@@ -363,7 +363,7 @@ class InputProcessor:
                    micro_batch_size: Optional[int] = None,
                    variable_seq_lengths=False,
                    **kwargs) -> List[InputFeature]:
-        if len(inputs) == 1:
+        if len(inputs) == 1 and self.framework != 'megatron':
             return inputs
         if micro_batch_size is None:
             # normal collate

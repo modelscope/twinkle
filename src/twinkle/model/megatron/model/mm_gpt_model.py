@@ -82,7 +82,8 @@ class MultimodalGPTModel(MegatronModule):
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 group_kwargs = {'group': _self.tp_group} if mcore_013 else {}
-                res = reduce_scatter_to_sequence_parallel_region(res, **group_kwargs) / args.tensor_model_parallel_size
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                res = reduce_scatter_to_sequence_parallel_region(res, **group_kwargs) / tp_size
             return res
 
         VocabParallelEmbedding.forward = forward

@@ -211,10 +211,12 @@ class GPTModel(McoreGPTModel):
                                          f'current_attention_scaling: {attention_scaling}.')
                 packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 if self.position_embedding_type == 'mrope':
+                    mrope_position_ids = position_ids
+                    if mrope_position_ids.dim() == 2:
+                        mrope_position_ids = mrope_position_ids.unsqueeze(0).expand(3, -1, -1)
                     rotary_pos_emb = self.rotary_pos_emb(
-                        position_ids,
+                        mrope_position_ids,
                         mrope_section=self.mrope_section,
-                        packed_seq=packed_seq,
                     )
                 else:
                     rotary_pos_emb = self.rotary_pos_emb(
