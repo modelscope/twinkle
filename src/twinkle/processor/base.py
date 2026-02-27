@@ -105,6 +105,9 @@ class InputProcessor:
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
+        if self.device_mesh is None:
+            return inputs
+
         def _pad_cp(_input: InputFeature) -> InputFeature:
             # Pad sequence for parallel compatibility
             # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
