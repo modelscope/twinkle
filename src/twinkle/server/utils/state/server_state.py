@@ -89,13 +89,18 @@ class ServerState:
 
     # ----- Model Registration -----
 
-    def register_model(self, payload: dict[str, Any], token: str, model_id: str | None = None) -> str:
+    def register_model(self,
+                       payload: dict[str, Any],
+                       token: str,
+                       model_id: str | None = None,
+                       replica_id: str | None = None) -> str:
         """Register a new model with the server state.
 
         Args:
             payload: Model configuration containing base_model, lora_config, etc.
             token: User token that owns this model. Required.
             model_id: Optional explicit model_id; otherwise auto-generated.
+            replica_id: Optional replica that is hosting this model.
 
         Returns:
             The model_id for the registered model.
@@ -112,6 +117,7 @@ class ServerState:
             user_metadata=payload.get('user_metadata') or {},
             lora_config=payload.get('lora_config'),
             token=token,
+            replica_id=replica_id,
         )
         self._model_mgr.add(_model_id, record)
         return _model_id
@@ -128,6 +134,36 @@ class ServerState:
         """Get metadata for a registered model as a plain dict."""
         record = self._model_mgr.get(model_id)
         return record.model_dump() if record is not None else None
+
+    # ----- Replica Management -----
+
+    def register_replica(self, replica_id: str, max_loras: int) -> None:
+        """Register a replica and its LoRA capacity.
+
+        Args:
+            replica_id: Unique identifier for the replica.
+            max_loras: Maximum number of LoRA adapters the replica can hold.
+        """
+        self._model_mgr.register_replica(replica_id, max_loras)
+
+    def unregister_replica(self, replica_id: str) -> None:
+        """Remove a replica from the registry.
+
+        Args:
+            replica_id: Unique identifier for the replica to remove.
+        """
+        self._model_mgr.unregister_replica(replica_id)
+
+    def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
+        """Return candidate replica IDs that have not reached their max_loras limit.
+
+        Args:
+            candidate_ids: Replica IDs to evaluate.
+
+        Returns:
+            Filtered list of replica IDs with remaining capacity.
+        """
+        return self._model_mgr.get_available_replica_ids(candidate_ids)
 
     # ----- Sampling Session Management -----
 
@@ -344,14 +380,29 @@ class ServerStateProxy:
 
     # ----- Model Registration -----
 
-    def register_model(self, payload: dict[str, Any], token: str, model_id: str | None = None) -> str:
-        return ray.get(self._actor.register_model.remote(payload, token, model_id))
+    def register_model(self,
+                       payload: dict[str, Any],
+                       token: str,
+                       model_id: str | None = None,
+                       replica_id: str | None = None) -> str:
+        return ray.get(self._actor.register_model.remote(payload, token, model_id, replica_id))
 
     def unload_model(self, model_id: str) -> bool:
         return ray.get(self._actor.unload_model.remote(model_id))
 
     def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
         return ray.get(self._actor.get_model_metadata.remote(model_id))
+
+    # ----- Replica Management -----
+
+    def register_replica(self, replica_id: str, max_loras: int) -> None:
+        ray.get(self._actor.register_replica.remote(replica_id, max_loras))
+
+    def unregister_replica(self, replica_id: str) -> None:
+        ray.get(self._actor.unregister_replica.remote(replica_id))
+
+    def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
+        return ray.get(self._actor.get_available_replica_ids.remote(candidate_ids))
 
     # ----- Sampling Session Management -----
 

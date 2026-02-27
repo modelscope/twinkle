@@ -22,7 +22,7 @@ applications:
     import_path: server            # Python module to import
     args:
       server_config:
-        per_token_model_limit: 1      # Maximum number of models (adapters) per token (server-globally enforced)
+        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
       supported_models:
         - Qwen/Qwen2.5-7B-Instruct
     deployments:
@@ -58,11 +58,12 @@ applications:
       adapter_config:
         adapter_timeout: 30                        # Seconds before idle adapter unload
         adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
+      max_loras: 1                                 # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
         autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
+          min_replicas: 2
+          max_replicas: 2
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
