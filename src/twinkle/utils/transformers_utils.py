@@ -70,6 +70,7 @@ def find_all_linears(model, model_arch=None, extra_layers=None, sub_module=None)
 
     return find_layers(model, _cond, sub_module=sub_module)
 
+
 def get_modules_to_not_convert(model):
     if not hasattr(model, 'model_meta') or not hasattr(model, 'model_info'):
         return
