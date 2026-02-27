@@ -20,7 +20,7 @@ from typing import Callable, List, Optional, Union
 from twinkle.hub import HubOperation
 from twinkle.model.megatron.args import get_args  # Use twinkle's get_args
 from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger,
-                           get_modules_to_not_convert, get_multimodal_target_regex, is_last_rank, requires)
+                           get_modules_to_not_convert, is_last_rank, requires)
 
 logger = get_logger()
 
@@ -306,6 +306,9 @@ class GPTBridge:
                     if self._is_peft_format:
                         if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k:
                             k = k.replace(f'{self._adapter_name}.', '')
+                            if '.lora_A.' in k:
+                                module_name = k.split('.lora_A.')[0].rsplit('.', 1)[-1]
+                                self._peft_target_modules.add(module_name)
                             new_state_dict[k] = v
                     else:
                         if '.lora_A.' in k or '.lora_B.' in k or 'original_module.' in k:
@@ -1568,16 +1571,7 @@ class GPTBridge:
                 peft_config = copy(mg_models[0].peft_config[self._adapter_name])
                 if args.task_type == 'seq_cls':
                     peft_config.task_type = 'SEQ_CLS'
-                if args.is_multimodal and 'all-linear' in args.target_modules:
-                    peft_config.target_modules = get_multimodal_target_regex(
-                        self.hf_model,
-                        freeze_llm=args.freeze_llm,
-                        freeze_vit=args.freeze_vit,
-                        freeze_aligner=args.freeze_aligner,
-                        include_embedding='all-embedding' in args.target_modules,
-                        exclude_router='all-router' not in args.target_modules)
-                else:
-                    peft_config.target_modules = self._peft_target_modules
+                peft_config.target_modules = self._peft_target_modules
                 peft_config.modules_to_save = self._peft_modules_to_save
                 peft_config.save_pretrained(output_dir)
             else:

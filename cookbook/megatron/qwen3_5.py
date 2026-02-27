@@ -13,7 +13,6 @@ twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 logger = get_logger()
 
 MODEL_ID = 'Qwen/Qwen3.5-35B-A3B'
-MAX_STEPS = 100
 
 def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
@@ -37,9 +36,9 @@ def train():
         if step % 5 == 0:
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Step {step}/{len(dataloader)}, metric: {metric}')
-        if step >= MAX_STEPS:
-            break
-    model.save('last-checkpoint')
+
+    # NOTE: you should merge lora for Qwen3.5 model when using Megatron
+    model.save('last-checkpoint', merge_lora=True)
     logger.info('Training completed.')
 
 

@@ -138,9 +138,6 @@ class TwinkleMegatronArgs:
     # =========================================================================
     merge_lora: bool = False
     target_modules: List[str] = field(default_factory=list)
-    freeze_llm: bool = False
-    freeze_vit: bool = False
-    freeze_aligner: bool = False
 
     # =========================================================================
     # FP8 quantization settings
