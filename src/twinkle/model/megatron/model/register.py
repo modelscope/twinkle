@@ -55,10 +55,10 @@ class MegatronModelLoader:
             A ``ModuleSpec`` or ``TransformerBlockSubmodules`` instance.
         """
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-        num_experts = mg_config_dict.get('num_experts', 0) or 0
+        num_experts = mg_config_dict.get('num_experts') or None
         return get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
-            moe_grouped_gemm=num_experts > 0,
+            moe_grouped_gemm=num_experts is not None,
             qk_layernorm=mg_config_dict.get('qk_layernorm', False),
         )
 
