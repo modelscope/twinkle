@@ -81,7 +81,9 @@ pip install -e .
 
 ## Changelog
 
-- 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models and serverless training capabilities on [ModelScope](https://modelscope.cn).
+- 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models.
+We also made available serverless training capabilities on [ModelScope](https://modelscope.cn) via
+Tinker-compatible APIs.
 
 ## Training as a Service on ModelScope
 
@@ -105,8 +107,10 @@ We will be adding support for more models as new models are released. The follow
 supported on Twinkle✨ framework.
 
 >[!Note]
-> For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it currently supports
-> one training base at a time, and currently it is [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507).
+> For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it
+> is currently provided via the Tinker-compatible APIs. We will be rolling out services that support
+> both Tinker APIs, as well as the full-fledged Twinkle✨ native APIs. The serverless endpoint is backed
+> by one training base at a time, and currently it is [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507).
 
 
 | Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                          | Requires             | Megatron Support | HF Model ID                                                                                                |
@@ -197,7 +201,7 @@ if __name__ == '__main__':
     train()
 ```
 
-### Using Tinker-Like API
+### Access the Serverless Training Services via Tinker-compatible API
 
 ```python
 import os
