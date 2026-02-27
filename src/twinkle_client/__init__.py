@@ -1,12 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from twinkle.utils import requires
-from .http.utils import get_api_key, get_base_url, set_api_key, set_base_url
-from .manager import TwinkleClient, TwinkleClientError
-
-
-
 def init_tinker_client(**kwargs) -> None:
     """Initialize Tinker client with Twinkle-specific headers.
 
@@ -20,11 +14,13 @@ def init_tinker_client(**kwargs) -> None:
         **kwargs: Additional keyword arguments (currently unused, reserved for future)
 
     Example:
-        >>> from twinkle_client import init_tinker_client
+        >>> from twinkle import init_tinker_client
         >>> init_tinker_client()
         >>> from tinker import ServiceClient
         >>> client = ServiceClient(base_url='http://localhost:8000', api_key='your_token')
     """
+    from twinkle.utils import requires
+    
     requires('tinker')
     from twinkle_client.utils.patch_tinker import patch_tinker
 
@@ -36,6 +32,9 @@ def init_twinkle_client(base_url: str | None = None, api_key: str | None = None,
     """
     Initialize a Twinkle client and setup context variables.
     """
+    from .http.utils import get_api_key, get_base_url, set_api_key, set_base_url
+    from .manager import TwinkleClient, TwinkleClientError
+    
     if base_url is not None:
         set_base_url(base_url)
     else:
@@ -49,4 +48,4 @@ def init_twinkle_client(base_url: str | None = None, api_key: str | None = None,
     return TwinkleClient(base_url=base_url, api_key=api_key, **kwargs)
 
 
-__all__ = ['TwinkleClient', 'TwinkleClientError', 'init_tinker_client', 'init_twinkle_client']
+__all__ = ['init_tinker_client', 'init_twinkle_client']

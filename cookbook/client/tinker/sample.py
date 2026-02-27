@@ -9,7 +9,7 @@ from tinker import types
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 # Step 1: Initialize Tinker client
 init_tinker_client()

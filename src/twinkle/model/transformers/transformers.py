@@ -842,9 +842,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if output_dir is None:
-            # load from hub
-            token = kwargs.pop('token', None)
-            checkpoint_dir = HubOperation.download_model(name, token=token)
+            if os.path.exists(name):
+                checkpoint_dir = name
+            else:
+                # load from hub
+                token = kwargs.pop('token', None)
+                checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             checkpoint_dir = os.path.join(output_dir, name)
         model = self.strategy.unwrap_model(self.model)
