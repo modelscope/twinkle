@@ -44,7 +44,7 @@ class TrainMetric(Metric):
                 self.lr = self.lr[0]
             if isinstance(self.lr, list):
                 for idx, lr in enumerate(self.lr):
-                    results[f'learning rate(param group {idx+1})'] = lr
+                    results[f'learning rate(param group {idx + 1})'] = lr
             else:
                 results['learning rate'] = self.lr
         if self.step is not None:
@@ -54,7 +54,7 @@ class TrainMetric(Metric):
             if interval < 60:
                 results['total time elapse'] = f'{(time.time() - self.start_time):.0f} seconds'
             else:
-                results['total time elapse'] = f'{(time.time() - self.start_time)/60:.1f} minutes'
+                results['total time elapse'] = f'{(time.time() - self.start_time) / 60:.1f} minutes'
             results['speed'] = f'{speed:.2f} iters/s'
         self.reset()
         return results
