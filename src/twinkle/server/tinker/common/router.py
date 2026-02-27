@@ -3,6 +3,9 @@ from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest,
 from typing import Dict, List, Optional
 
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.utils.logger import get_logger
+
+logger = get_logger()
 
 
 class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
@@ -37,7 +40,7 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
 
             # If found any replica, return it
             if ranked_replicas_multiplex:
-                print('[Router] Found replica for multiplexed model !!!')
+                logger.debug('[Router] Found replica for multiplexed model !!!')
                 return [ranked_replicas_multiplex]
 
         # Dictionary to hold the top-ranked replicas
@@ -60,10 +63,10 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
 
         if not top_ranked_replicas:
             # No replica has remaining LoRA capacity – fall back to all candidates
-            print('[Router] No replica has remaining LoRA capacity')
+            logger.debug('[Router] No replica has remaining LoRA capacity')
             return [candidate_replicas]
 
-        print('[Router] StickyLoraRequestRouter choosing replica for request')
+        logger.debug('[Router] StickyLoraRequestRouter choosing replica for request')
 
         # Take the replica with minimum throughput.
         min_throughput_replicas = min(
