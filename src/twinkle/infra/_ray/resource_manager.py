@@ -195,6 +195,7 @@ class ResourceManager:
 
                         # All GPUs for a worker should be on the same node
                         gpu_ranks_local = []
+                        node_ranks = []
                         for r in worker_ranks:
                             node_rank = r // nproc_per_node
                             node_ranks.append(node_rank)

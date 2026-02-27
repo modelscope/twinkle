@@ -6,7 +6,7 @@ from twinkle.checkpoint_engine.base import CheckpointEngine
 class CheckpointEngineMixin:
 
     _checkpoint_engine: CheckpointEngine = None
-    _bucket_size: int = 2048 << 20  # 2 GB
+    _bucket_size: int = 3072 << 20  # 2 GB
 
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
