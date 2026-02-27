@@ -11,4 +11,8 @@ class CrossEntropyLoss(Loss):
         import torch
         logits = outputs['logits'].view(-1, outputs['logits'].shape[-1])
         labels = inputs['labels'].view(-1)
-        return torch.nn.CrossEntropyLoss(reduction=self.reduction)(logits, labels)
+        loss = torch.nn.CrossEntropyLoss(reduction=self.reduction)(logits, labels)
+        if self.reduction != 'sum':
+            return loss
+        else:
+            return loss, (labels != -100).sum()
