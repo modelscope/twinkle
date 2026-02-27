@@ -102,7 +102,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
     def __init__(
         self,
-        bucket_size: int = 2048 << 20,
+        bucket_size: int = 3072 << 20,
         group_name: str = 'twinkle_ckpt',
         rebuild_group: bool = True,
         rollout_dtype: torch.dtype = torch.bfloat16,
