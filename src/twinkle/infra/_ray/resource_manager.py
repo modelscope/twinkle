@@ -99,7 +99,10 @@ class ResourceManager:
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
             assert cpu_nnodes <= len(self.nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
-                                                   f'available: {len(self.nodes)}')
+                                                   f'available: {len(self.nodes)}, ensure your ray cluster '
+                                                   f'has enough nodes, or '
+                                                   f'setting `twinkle.initialize(nproc_per_node=N(default 8), ...) '
+                                                   f'to reduce per node GPU usage.`')
             for i in range(cpu_nnodes):
                 node = self.nodes[i]
                 node_cpu = int(node['Resources']['CPU'])
