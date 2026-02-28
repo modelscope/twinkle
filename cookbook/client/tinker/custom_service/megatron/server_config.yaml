@@ -24,7 +24,7 @@ applications:
       server_config:
         per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
       supported_models:
-        - Qwen/Qwen2.5-7B-Instruct
+        - Qwen/Qwen3-4B
     deployments:
       - name: TinkerCompatServer
         autoscaling_config:
@@ -37,11 +37,11 @@ applications:
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
   - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen3-4B
     import_path: model
     args:
       use_megatron: true
-      model_id: "ms://Qwen/Qwen2.5-7B-Instruct" # ModelScope model identifier
+      model_id: "ms://Qwen/Qwen3-4B" # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
@@ -74,10 +74,10 @@ applications:
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
   # - name: sampler-Qwen2.5-7B-Instruct
-  #   route_prefix: /api/v1/sampler/Qwen/Qwen2.5-7B-Instruct
+  #   route_prefix: /api/v1/sampler/Qwen/Qwen3-4B
   #   import_path: sampler
   #   args:
-  #     model_id: "ms://Qwen/Qwen2.5-7B-Instruct"   # ModelScope model identifier
+  #     model_id: "ms://Qwen/Qwen3-4B"   # ModelScope model identifier
   #     nproc_per_node: 2               # Number of GPU processes per node
   #     sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
   #     engine_args:                    # vLLM engine-specific settings

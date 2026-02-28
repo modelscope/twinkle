@@ -22,9 +22,9 @@ service_client = ServiceClient(
 	# BASE_URL can be a local server endpoint such as http://localhost:8000, or
 	# points to a previously deployed remote server, or
 	# modelscope server such as 'http://www.modelscope.cn/twinkle'
-    base_url='<BASE_URL>',
+    base_url='http://localhost:8000',
 	# API_KEY can be empty or a meaninful one according to sever configuration
-    api_key='<API_KEY>'
+    api_key='EMPTY-TOKEN'
 )
 
 # Step 4: List models available on the server to verify the connection
@@ -61,7 +61,7 @@ for tr in response.training_runs:
 
 # Step 6: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen3-4B'
 if not resume_path:
     training_client = service_client.create_lora_training_client(base_model=base_model)
 else:

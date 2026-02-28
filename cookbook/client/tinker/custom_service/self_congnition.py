@@ -23,8 +23,7 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-# base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_model = 'Qwen/Qwen3-4B'
 base_url = 'http://localhost:8000'
 
 
