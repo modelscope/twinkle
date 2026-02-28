@@ -81,7 +81,7 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
         else:
             tokens = [int(t) for t in input_ids]
     else:
-        tokens = np.asarray(input_ids, dtype=np.int64).flatten().tolist()
+        tokens = np.asarray(input_ids.cpu(), dtype=np.int64).flatten().tolist()
 
     model_input = types.ModelInput.from_ints(tokens)
 
@@ -93,7 +93,7 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
         if isinstance(labels_raw, np.ndarray):
             labels_arr = labels_raw.astype(np.int64)
         else:
-            labels_arr = np.asarray(labels_raw, dtype=np.int64)
+            labels_arr = np.asarray(labels_raw.cpu(), dtype=np.int64)
 
         labels_arr = labels_arr.reshape(-1)
 

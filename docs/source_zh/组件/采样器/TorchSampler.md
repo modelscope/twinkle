@@ -9,7 +9,7 @@ from twinkle.sampler import TorchSampler
 from twinkle import DeviceMesh
 
 sampler = TorchSampler(
-    model_id='ms://Qwen/Qwen2.5-7B-Instruct',
+    model_id='ms://Qwen/Qwen3-4B',
     device_mesh=DeviceMesh.from_sizes(dp_size=1),
 )
 

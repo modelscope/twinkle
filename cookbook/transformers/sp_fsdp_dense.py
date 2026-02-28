@@ -10,7 +10,7 @@ from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
-MODEL_ID = 'ms://Qwen/Qwen2.5-7B-Instruct'
+MODEL_ID = 'ms://Qwen/Qwen3-4B'
 DATASETS = 'ms://swift/self-cognition'
 
 device_group = [DeviceGroup(

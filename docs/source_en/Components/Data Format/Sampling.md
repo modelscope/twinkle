@@ -62,7 +62,7 @@ Usage example:
 from twinkle.data_format import SamplingParams, SampleResponse
 from twinkle.sampler import vLLMSampler
 
-sampler = vLLMSampler(model_id='Qwen/Qwen2.5-7B-Instruct')
+sampler = vLLMSampler(model_id='ms://Qwen/Qwen3-4B')
 params = SamplingParams(max_tokens=512, temperature=0.7, top_p=0.9)
 response: SampleResponse = sampler.sample(trajectories, sampling_params=params, num_samples=4)
 

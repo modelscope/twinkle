@@ -67,9 +67,11 @@ pip install -e .
 | twinkle 客户端微调           | megatron        | [脚本](cookbook/client/twinkle/megatron)           |
 | twinkle 客户端微调           | transformer     | [脚本](cookbook/client/twinkle/transformer)        |
 
+Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](docs/source_zh/使用指引/快速开始.md)
+
 ## 更新日志
 
-- 🎉2026-02-13 Twinkle✨ 初始版本发布，包括对文本模型的 SFT/PT/RL 支持以及在 [ModelScope](https://modelscope.cn) 上的无服务器训练能力。
+🎉2026-02-13 Twinkle✨ 初始版本发布，支持文本模型的SFT/PT/RL训练。我们还通过兼容Tinker的API，在魔搭社区上提供了无服务器训练功能。
 
 ## ModelScope 的训练服务
 
@@ -88,8 +90,8 @@ pip install -e .
 
 随着新模型的发布，我们将添加对更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。
 
->[!注意]
-> 对于通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前一次只支持一个训练基座，当前是 [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507)。
+>[!Note]
+> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507)。
 
 
 | 模型类型          | [ModelScope](https://modelscope.cn) 上的模型 ID                                                                          | 要求             | Megatron 支持 | HF 模型 ID                                                                                                |
@@ -117,6 +119,8 @@ pip install -e .
 
 ## 示例代码
 
+下面列出了示例代码的一部分能力。完整的训练能力介绍请参考[快速开始](docs/source_zh/使用指引/快速开始.md)以及[cookbook](cookbook)。
+
 ### 使用 Ray 训练
 
 ```python
@@ -136,7 +140,7 @@ twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_me
 
 def train():
     # to load model from Hugging Face, use 'hf://...'
-    base_model = 'ms://Qwen/Qwen2.5-7B-Instruct'
+    base_model = 'ms://Qwen/Qwen3-4B'
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
@@ -180,7 +184,7 @@ if __name__ == '__main__':
     train()
 ```
 
-### 使用类 Tinker API
+### 使用类 Tinker API实现无服务器式训练
 
 ```python
 import os
@@ -193,13 +197,13 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507'
-base_url='http://www.modelscope.cn/twinkle'
-api_key=os.environ.get('MODELSCOPE_TOKEN')
+base_url='your-base-url'
+api_key='your-api-key'
 
 # Use twinkle dataset to load the data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Template', model_id=base_model, max_length=256)
-dataset.map(SelfCognitionProcessor('twinkle Model', 'twinkle Team'), load_from_cache_file=False)
+dataset.map(SelfCognitionProcessor('twinkle Model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 

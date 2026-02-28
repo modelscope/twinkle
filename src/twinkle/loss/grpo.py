@@ -2,7 +2,7 @@
 import numpy as np
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 from twinkle.utils.torch_utils import selective_log_softmax
 
@@ -263,7 +263,7 @@ class GRPOLoss(Loss):
         ref_logps: Optional['torch.Tensor'] = None,
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         **kwargs,
-    ) -> 'torch.Tensor':
+    ):
         """
         Compute GRPO loss.
 
@@ -280,9 +280,6 @@ class GRPOLoss(Loss):
                       Same padding/alignment rules as old_logps.
             advantages: advantage values
             **kwargs: Additional arguments
-
-        Returns:
-            loss: Scalar loss value
         """
         import torch
         labels = inputs.get('labels')
@@ -369,7 +366,7 @@ class GRPOLoss(Loss):
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
-        return loss
+        return LossOutput(loss=loss, num_tokens=0)
 
     def compute_metrics(
         self,

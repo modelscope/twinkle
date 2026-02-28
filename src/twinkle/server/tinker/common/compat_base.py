@@ -114,7 +114,7 @@ class TwinkleCompatModelBase:
         return self.optimizer_group[adapter_name].template
 
     @staticmethod
-    def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor) -> List[dict]:
+    def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor, logps: torch.Tensor) -> List[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss."""
         from twinkle.utils.torch_utils import selective_log_softmax
 
@@ -129,11 +129,16 @@ class TwinkleCompatModelBase:
             # Labels are assumed to be already shifted/aligned with logits
             seq_len = labels.numel()
 
-            # Check if index is within logits bounds
-            feature_logits = logit[:seq_len, :]
+            if logps is None:
+                assert logits is not None
+                # Check if index is within logits bounds
+                # Right padding
+                feature_logits = logit[:seq_len, :]
 
-            # Calculate log probs for all labels
-            token_log_probs = selective_log_softmax(feature_logits, labels)
+                # Calculate log probs for all labels
+                token_log_probs = selective_log_softmax(feature_logits, labels)
+            else:
+                token_log_probs = logps[:seq_len, :]
 
             # elementwise_loss: positive NLL loss (0.0 where masked)
             elementwise_loss = -token_log_probs * weights

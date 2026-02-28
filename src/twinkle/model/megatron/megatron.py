@@ -32,7 +32,7 @@ from twinkle.model.base import TwinkleModel
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, exists
+from twinkle.utils import construct_class, exists, selective_log_softmax
 from .strategy import MegatronStrategy
 
 
@@ -195,7 +195,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
 
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
@@ -416,18 +416,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs):
+        def post_loss_function(output_tensor, inputs, logps):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
             outputs = ModelOutput(logits=output_tensor)
             result = loss_instance(inputs, outputs, **current_kwargs)
-            if isinstance(result, tuple):
-                losses, counts = result
-            else:
-                losses = result
+            losses = result['loss']
+            counts = result['num_tokens']
+            if not counts:
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.gather_loss_for_cp(losses, counts, output_tensor)
+            return self.strategy.gather_loss_for_cp(losses, counts, output_tensor, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -436,7 +435,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             labels = batch.pop('labels', None)
             output_tensor = model(**batch)
             batch['labels'] = labels
-            return output_tensor, partial(post_loss_function, inputs=batch)
+            if labels is not None:
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.clone()
+                masked_labels[~loss_mask] = 0
+                logps = selective_log_softmax(output_tensor, masked_labels)
+            return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -467,6 +471,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
         logits = []
+        logps = []
         count = 0
         if losses:
             for loss_dict in losses:
@@ -476,6 +481,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         count += 1
                     if 'logits' in loss_dict:
                         logits.append(loss_dict['logits'])
+                    if 'logps' in loss_dict:
+                        logps.append(loss_dict['logps'])
                 elif isinstance(loss_dict, torch.Tensor):
                     loss += loss_dict
                     count += 1
@@ -507,23 +514,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         optimizer_config.inputs = inputs
-        if forward_only:
-            if len({logit.shape[0] for logit in logits}) == 1:
-                logits = torch.cat(logits, dim=0)
-            return {
-                'loss': loss,
-                'logits': logits,
-            }
-        else:
-            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss)
-            if isinstance(loss, torch.Tensor):
-                return loss.detach().cpu().float().numpy()
-            return float(loss)
+        if len({_logps.shape[1] for _logps in logps}) == 1:
+            logps = torch.cat(logps, dim=0)
+        if isinstance(loss, torch.Tensor):
+            loss = loss.detach().cpu().float().numpy()
+        if not forward_only:
+            optimizer_config.outputs = ModelOutput(logits=None, loss=loss, logps=logps)
+        return ModelOutput(logits=None, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):
         # Megatron optimizer will cover this function.
-        pass
+        return 0
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):

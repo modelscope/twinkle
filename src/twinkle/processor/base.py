@@ -165,6 +165,9 @@ class InputProcessor:
 
     def split_cp(self, inputs: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
 
+        if self.device_mesh is None:
+            return inputs
+
         def _split_cp(inputs: Dict[str, Any]) -> Dict[str, Any]:
 
             cp_size = self.device_mesh.cp_world_size

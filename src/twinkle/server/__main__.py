@@ -10,7 +10,7 @@ Usage:
     python -m twinkle.server --config server_config.yaml --server-type tinker
 
     # Quick start with minimal args
-    python -m twinkle.server --server-type tinker --port 8000 --model-id "Qwen/Qwen2.5-7B-Instruct"
+    python -m twinkle.server --server-type tinker --port 8000 --model-id "Qwen/Qwen3-4B"
 """
 from __future__ import annotations
 

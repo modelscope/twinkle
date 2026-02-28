@@ -87,7 +87,7 @@ from twinkle.sampler import vLLMSampler
 from twinkle.reward import MathReward
 from twinkle.advantage import GRPOAdvantage
 
-sampler = vLLMSampler(model_id='Qwen/Qwen2.5-7B-Instruct')
+sampler = vLLMSampler(model_id='ms://Qwen/Qwen3-4B')
 reward_fn = MathReward()
 advantage_fn = GRPOAdvantage()
 

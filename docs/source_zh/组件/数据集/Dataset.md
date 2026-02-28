@@ -60,7 +60,7 @@ dataset = Dataset(DatasetMeta(dataset_id='my/custom/dataset.jsonl', data_slice=r
 Template 组件是负责将字符串/图片多模态原始数据转换为模型输入 token 的组件。数据集可以设置一个 Template 来完成 `encode` 过程。
 
 ```python
-dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B', max_length=512)
 ```
 
 set_template 方法支持传入 `kwargs`（例如例子中的 `max_length`），作为 `Template` 的构造参数使用。

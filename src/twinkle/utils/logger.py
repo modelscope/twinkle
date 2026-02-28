@@ -8,6 +8,8 @@ from typing import Optional
 
 from .platforms import Platform
 
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
 
 # Avoid circular reference
 def _is_local_master():
@@ -116,10 +118,9 @@ def get_logger(log_file: Optional[str] = None,
     return logger
 
 
-logger = get_logger()
+logger = get_logger(log_level=log_level)
 
 logger.handlers[0].setFormatter(logger_format)
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 
 @contextmanager

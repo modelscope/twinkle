@@ -41,7 +41,7 @@ from twinkle.model import TransformersModel
 from twinkle import DeviceMesh
 from twinkle.dataloader import DataLoader
 dataloader = DataLoader(...)
-model = TransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct', device_mesh=DeviceMesh.from_sizes(dp_size=2, fsdp_size=2), remote_group='actor')
+model = TransformersModel(model_id='ms://Qwen/Qwen3-4B', device_mesh=DeviceMesh.from_sizes(dp_size=2, fsdp_size=2), remote_group='actor')
 model.add_adapter_to_model(...)
 model.set_optimizer(..., adapter_name='...')
 for data in dataloader:

@@ -155,7 +155,7 @@ base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 # Use Twinkle's Dataset component to load and preprocess data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
-dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_cache_file=False)
+dataset.map(SelfCognitionProcessor('twinkle model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 

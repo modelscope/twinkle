@@ -11,7 +11,7 @@ from twinkle import DeviceMesh
 
 # Create sampler
 sampler = vLLMSampler(
-    model_id='ms://Qwen/Qwen2.5-7B-Instruct',
+    model_id='ms://Qwen/Qwen3-4B',
     device_mesh=DeviceMesh.from_sizes(dp_size=2, tp_size=2),
     remote_group='sampler_group'
 )
@@ -60,7 +60,7 @@ twinkle.initialize('ray', groups=device_groups)
 
 # Create remote sampler
 sampler = vLLMSampler(
-    model_id='ms://Qwen/Qwen2.5-7B-Instruct',
+    model_id='ms://Qwen/Qwen3-4B',
     device_mesh=DeviceMesh.from_sizes(dp_size=4),
     remote_group='sampler'
 )

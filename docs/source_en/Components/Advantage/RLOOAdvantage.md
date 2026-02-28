@@ -29,7 +29,7 @@ RLOO advantages:
 - More accurate counterfactual baseline estimation
 - Better performance when there are more samples
 
-## Complete Training Example
+## Training Example
 
 ```python
 from twinkle.advantage import RLOOAdvantage
@@ -38,10 +38,11 @@ from twinkle.sampler import vLLMSampler
 from twinkle.reward import MathReward
 
 # Create components
-actor = TransformersModel(model_id='Qwen/Qwen2.5-7B-Instruct')
-sampler = vLLMSampler(model_id='Qwen/Qwen2.5-7B-Instruct')
+actor = TransformersModel(model_id='ms://Qwen/Qwen3-4B')
+sampler = vLLMSampler(model_id='ms://Qwen/Qwen3-4B')
 reward_fn = MathReward()
 advantage_fn = RLOOAdvantage()
+dataloader = ...
 
 # Training loop
 for batch in dataloader:

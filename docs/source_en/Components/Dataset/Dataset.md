@@ -60,7 +60,7 @@ dataset = Dataset(DatasetMeta(dataset_id='my/custom/dataset.jsonl', data_slice=r
 The Template component is responsible for converting string/image multimodal raw data into model input tokens. The dataset can set a Template to complete the `encode` process.
 
 ```python
-dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B', max_length=512)
 ```
 
 The set_template method supports passing `kwargs` (such as `max_length` in the example) to be used as constructor parameters for `Template`.

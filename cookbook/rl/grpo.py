@@ -20,7 +20,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-3B-Instruct')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))

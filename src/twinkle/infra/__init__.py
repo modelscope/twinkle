@@ -103,6 +103,9 @@ def get_device_placement(device_group=None) -> str:
     if device_group is None:
         device_group = _device_group
 
+    if device_group is None:
+        return 'No device group provided.'
+
     WIDTH = 80
 
     def box_line(content='', align='left', prefix='│', suffix='│'):

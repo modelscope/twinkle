@@ -104,7 +104,7 @@ def build_sampler_app(model_id: str,
     """Build a sampler application for text generation inference.
 
     Args:
-        model_id: Model identifier (e.g., "Qwen/Qwen2.5-7B-Instruct")
+        model_id: Model identifier (e.g., "Qwen/Qwen3-4B")
         nproc_per_node: Number of GPU processes per node
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
