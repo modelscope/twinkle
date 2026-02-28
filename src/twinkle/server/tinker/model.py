@@ -13,6 +13,7 @@ import traceback
 from fastapi import FastAPI, Request
 from peft import LoraConfig
 from ray import serve
+from ray.serve.config import RequestRouterConfig
 from tinker import types
 from typing import Any, Dict, Optional
 
@@ -21,9 +22,10 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.adapter_manager import AdapterManagerMixin
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager, create_training_run_manager
+from .common.router import StickyLoraRequestRouter
 
 logger = get_logger()
 
@@ -62,7 +64,10 @@ def build_model_app(model_id: str,
         """Middleware to verify authentication token for all requests."""
         return await verify_request_token(request=request, call_next=call_next)
 
-    @serve.deployment(name='ModelManagement')
+    @serve.deployment(
+        name='ModelManagement',
+        request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter, ),
+    )
     @serve.ingress(app)
     class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         """Model management service handling training operations.
@@ -99,8 +104,8 @@ def build_model_app(model_id: str,
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.use_megatron = use_megatron
-            replica_context = serve.get_replica_context()
-            replica_id = replica_context.replica_id.unique_id
+            self.replica_id = serve.get_replica_context().replica_id.unique_id
+            self.max_loras = kwargs.get('max_loras', 5)
             # Initialize model immediately - choose backend based on use_megatron
             if use_megatron:
                 from .common.megatron_model import TwinkleCompatMegatronModel
@@ -108,7 +113,7 @@ def build_model_app(model_id: str,
                     model_id=model_id,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
-                    instance_id=replica_id,
+                    instance_id=self.replica_id,
                     **kwargs)
             else:
                 from .common.transformers_model import TwinkleCompatTransformersModel
@@ -116,10 +121,13 @@ def build_model_app(model_id: str,
                     model_id=model_id,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
-                    instance_id=replica_id,
+                    instance_id=self.replica_id,
                     **kwargs)
             self.base_model = model_id
             self.state: ServerStateProxy = get_server_state()
+
+            # Register this replica so the router can track capacity
+            self.state.register_replica(self.replica_id, self.max_loras)
 
             # Initialize task queue
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
@@ -128,7 +136,7 @@ def build_model_app(model_id: str,
             self.start_adapter_countdown()
 
         """
-        TODO This is a cache system, we must change to sticky routing
+        This is a cache system, we must change to sticky routing
             Reference docs:
             1. [Now]https://docs.ray.io/en/latest/serve/model-multiplexing.html
             2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
@@ -136,9 +144,21 @@ def build_model_app(model_id: str,
             4. Direct call actor instead of http or handler in server.py
         """
 
-        # @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
-        # async def get_multiplexed_adapter(self, request_id: str):
-        # return request_id
+        @serve.multiplexed(max_num_models_per_replica=kwargs.get('max_loras', 5))
+        async def _sticky_entry(self, sticky_key: str):
+            return sticky_key
+
+        async def _ensure_sticky(self):
+            sticky_key = serve.get_multiplexed_model_id()
+            await self._sticky_entry(sticky_key)
+
+        async def _on_request_start(self, request: Request) -> str:
+            await self._ensure_sticky()
+            token = get_token_from_request(request)
+            return token
+
+        def __del__(self):
+            self.state.unregister_replica(self.replica_id)
 
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.
@@ -188,12 +208,13 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping CreateModelResponse with model_id
             """
+            token = await self._on_request_start(request)
 
             async def _create_adapter():
                 model_id = None
                 try:
                     # Register a new model_id for each create_model call
-                    model_id = self.state.register_model(body.model_dump(), token=request.state.token)
+                    model_id = self.state.register_model(body.model_dump(), token=token, replica_id=self.replica_id)
 
                     # Create a new LoRA adapter for the model
                     if body.lora_config:
@@ -203,7 +224,7 @@ def build_model_app(model_id: str,
                         adapter_name = self.get_adapter_name(adapter_name=model_id)
 
                         # Register adapter FIRST
-                        self.register_adapter(adapter_name, request.state.token, session_id=body.session_id)
+                        self.register_adapter(adapter_name, token, session_id=body.session_id)
 
                         # Create adapter AFTER successful registration
                         self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
@@ -215,7 +236,7 @@ def build_model_app(model_id: str,
                         # Fresh adapter has no accumulated gradients.
                         self.set_adapter_state(adapter_name, 'grad_ready', False)
 
-                    training_run_manager = create_training_run_manager(request.state.token)
+                    training_run_manager = create_training_run_manager(token)
                     training_run_manager.save(model_id, body)
 
                     return types.CreateModelResponse(model_id=model_id)
@@ -233,7 +254,7 @@ def build_model_app(model_id: str,
 
             return await self.schedule_task(
                 _create_adapter,
-                token=request.state.token,
+                token=token,
                 task_type='create_model',
             )
 
@@ -248,9 +269,10 @@ def build_model_app(model_id: str,
             Returns:
                 GetInfoResponse with model metadata (name, lora_rank, etc.)
             """
+            token = await self._on_request_start(request)
             # Note: get_info doesn't require token for reading metadata in tinker
             # Using a default token or None since this is read-only
-            training_run_manager = create_training_run_manager(request.state.token)
+            training_run_manager = create_training_run_manager(token)
             metadata = training_run_manager.get(str(body.model_id))
             model_name = metadata.base_model if metadata else model_id
             lora_rank = None
@@ -279,6 +301,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping UnloadModelResponse
             """
+            token = await self._on_request_start(request)
 
             async def _do_unload():
                 # Only remove adapter, not the base model
@@ -290,7 +313,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_unload,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 task_type='unload_model',
             )
 
@@ -307,6 +330,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping ForwardBackwardOutput with loss
             """
+            token = await self._on_request_start(request)
 
             async def _do_forward():
                 try:
@@ -340,7 +364,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_forward,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
                 data_world_size=self.device_mesh.data_world_size,
@@ -364,6 +388,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping ForwardBackwardOutput with loss and metrics
             """
+            token = await self._on_request_start(request)
 
             async def _do_forward_backward():
                 try:
@@ -405,7 +430,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_forward_backward,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
                 data_world_size=self.device_mesh.data_world_size,
@@ -425,6 +450,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping OptimStepResponse
             """
+            token = await self._on_request_start(request)
 
             async def _do_optim():
                 try:
@@ -455,7 +481,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_optim,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 task_type='optim_step',
             )
 
@@ -473,6 +499,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping SaveWeightsResponse with saved path
             """
+            token = await self._on_request_start(request)
 
             async def _do_save():
                 try:
@@ -482,8 +509,6 @@ def build_model_app(model_id: str,
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
-                    # Extract token from request for user isolation
-                    token = request.state.token
                     checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
@@ -506,7 +531,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_save,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 task_type='save_weights',
             )
 
@@ -525,6 +550,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping SaveWeightsForSamplerResponseInternal
             """
+            token = await self._on_request_start(request)
 
             async def _do_save_for_sampler():
                 try:
@@ -535,8 +561,6 @@ def build_model_app(model_id: str,
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
 
-                    # Extract token from request for user isolation
-                    token = request.state.token
                     checkpoint_manager = create_checkpoint_manager(token)
 
                     # get save dir with token-based isolation
@@ -571,7 +595,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_save_for_sampler,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 task_type='save_weights_for_sampler',
             )
 
@@ -589,6 +613,7 @@ def build_model_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping LoadWeightsResponse
             """
+            token = await self._on_request_start(request)
 
             async def _do_load():
                 try:
@@ -599,9 +624,6 @@ def build_model_app(model_id: str,
 
                     # Touch adapter to reset inactivity counter
                     self.touch_adapter(adapter_name)
-
-                    # Extract token from request for user isolation
-                    token = request.state.token
 
                     weight_path = body.path
                     load_optimizer = body.optimizer
@@ -625,7 +647,7 @@ def build_model_app(model_id: str,
             return await self.schedule_task(
                 _do_load,
                 model_id=body.model_id,
-                token=request.state.token,
+                token=token,
                 task_type='load_weights',
             )
 

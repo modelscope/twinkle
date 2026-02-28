@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Mapping, Union
 
+from twinkle_client.http.utils import get_api_key, get_request_id
+
 _patched = False
 
 
@@ -115,6 +117,29 @@ def _patched_from_tinker_path(cls, tinker_path: str) -> Any:
     )
 
 
+def _make_patched_service_client_init(original):
+    def _patched_service_client_init(self, user_metadata=None, **kwargs):
+        """Patched version of ServiceClient.__init__ that injects Twinkle-specific headers."""
+        # Resolve api_key with the same priority order used by AsyncTinker:
+        #   1. explicit kwarg  2. TINKER_API_KEY env var  3. TWINKLE_SERVER_TOKEN env var
+        api_key = kwargs.get('api_key')
+        if api_key is None:
+            api_key = get_api_key()
+
+        twinkle_headers = {
+            'serve_multiplexed_model_id': get_request_id(),
+            'Authorization': 'Bearer ' + api_key,
+            'Twinkle-Authorization': 'Bearer ' + api_key,
+        }
+        # Merge: caller-supplied default_headers take precedence over twinkle_headers
+        user_default_headers = kwargs.pop('default_headers', {})
+        kwargs['default_headers'] = twinkle_headers | user_default_headers
+
+        original(self, user_metadata=user_metadata, **kwargs)
+
+    return _patched_service_client_init
+
+
 def patch_tinker():
     """
     Apply patches to tinker library.
@@ -146,29 +171,7 @@ def patch_tinker():
 
         # Patch 4: inject Twinkle-specific headers by patching ServiceClient.__init__.
         from tinker.lib.public_interfaces.service_client import ServiceClient
-        from twinkle_client.http.utils import get_request_id, get_api_key
-
-        _original_service_client_init = ServiceClient.__init__
-
-        def _patched_service_client_init(self, user_metadata=None, **kwargs):
-            # Resolve api_key with the same priority order used by AsyncTinker:
-            #   1. explicit kwarg  2. TINKER_API_KEY env var  3. TWINKLE_SERVER_TOKEN env var
-            api_key = kwargs.get('api_key')
-            if api_key is None:
-                api_key = get_api_key()
-
-            twinkle_headers = {
-                'serve_multiplexed_model_id': get_request_id(),
-                'Authorization': 'Bearer ' + api_key,
-                'Twinkle-Authorization': 'Bearer ' + api_key,
-            }
-            # Merge: caller-supplied default_headers take precedence over twinkle_headers
-            user_default_headers = kwargs.pop('default_headers', {})
-            kwargs['default_headers'] = twinkle_headers | user_default_headers
-
-            _original_service_client_init(self, user_metadata=user_metadata, **kwargs)
-
-        ServiceClient.__init__ = _patched_service_client_init
+        ServiceClient.__init__ = _make_patched_service_client_init(ServiceClient.__init__)
 
         _patched = True
     except ImportError:

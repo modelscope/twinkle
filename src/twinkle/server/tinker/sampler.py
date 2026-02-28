@@ -21,7 +21,7 @@ from twinkle import DeviceGroup, DeviceMesh
 from twinkle.data_format import SamplingParams
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import verify_request_token
+from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager
 
@@ -126,6 +126,19 @@ def build_sampler_app(model_id: str,
             self.state: ServerStateProxy = get_server_state()
             self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
 
+        @serve.multiplexed(max_num_models_per_replica=5)
+        async def _sticky_entry(self, sticky_key: str):
+            return sticky_key
+
+        async def _ensure_sticky(self):
+            sticky_key = serve.get_multiplexed_model_id()
+            await self._sticky_entry(sticky_key)
+
+        async def _on_request_start(self, request: Request) -> str:
+            await self._ensure_sticky()
+            token = get_token_from_request(request)
+            return token
+
         @app.post('/asample')
         async def asample(self, request: Request, body: types.SampleRequest) -> types.UntypedAPIFuture:
             """Execute text generation (inference).
@@ -144,6 +157,7 @@ def build_sampler_app(model_id: str,
             Returns:
                 UntypedAPIFuture wrapping SampleResponse with generated sequences
             """
+            token = await self._on_request_start(request)
 
             async def _do_sample():
                 try:
@@ -160,7 +174,6 @@ def build_sampler_app(model_id: str,
                     # Parse and resolve adapter URI from model_path
                     adapter_uri = None
                     if model_path:
-                        token = request.state.token
                         checkpoint_manager = create_checkpoint_manager(token)
                         adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
@@ -225,7 +238,7 @@ def build_sampler_app(model_id: str,
             input_tokens = len(body.prompt.to_ints())
             return await self.schedule_task(
                 _do_sample,
-                token=request.state.token,
+                token=token,
                 input_tokens=input_tokens,
                 task_type='sample',
             )

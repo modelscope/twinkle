@@ -9,7 +9,7 @@
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 from twinkle.dataloader import DataLoader
@@ -23,9 +23,9 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-# base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_model = 'Qwen/Qwen3-4B'
 base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
 
 
 def train():
@@ -51,7 +51,7 @@ def train():
 
     service_client = ServiceClient(
         base_url=base_url,
-        api_key=os.environ.get('MODELSCOPE_TOKEN')
+        api_key=api_key
     )
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)

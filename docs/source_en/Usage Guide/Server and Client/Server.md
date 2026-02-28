@@ -74,7 +74,7 @@ applications:
       nproc_per_node: 4
       device_group:
         name: model
-        ranks: [0, 1, 2, 3]    # Physical GPU card numbers
+        ranks: 4               # Number of GPUs to use
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -91,7 +91,7 @@ applications:
       nproc_per_node: 2
       device_group:
         name: sampler
-        ranks: [4, 5]          # Physical GPU card numbers 4-5
+        ranks: 2               # Number of GPUs to use
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -112,67 +112,10 @@ applications:
         dp_size: 4             # Data parallel size
 ```
 **Important notes:**
-- The `ranks` configuration uses **physical GPU card numbers**, directly corresponding to the actual GPU devices on the machine
-- The `device_mesh` configuration uses parameters like `dp_size`, `tp_size`, `pp_size`, `ep_size` instead of the original `mesh` and `mesh_dim_names`
+- The `ranks` configuration specifies the **number of GPUs** to allocate for the component
+- The `device_mesh` configuration uses parameters like `dp_size`, `tp_size`, `pp_size`, `ep_size` to define the parallelization strategy
 - Different components will be automatically assigned to different Nodes
 - Ray will automatically schedule to the appropriate Node based on resource requirements (`num_gpus`, `num_cpus` in `ray_actor_options`)
-
-In the YAML configuration file, **each component needs to occupy a separate Node**.
-
-**Example configuration:**
-
-```yaml
-applications:
-  # Model service occupies Node 0 (Head node, GPU 0-3)
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
-    import_path: model
-    args:
-      nproc_per_node: 4
-      device_group:
-        name: model
-        ranks: [0, 1, 2, 3]    # GPU indices within Node 0
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        mesh: [0, 1, 2, 3]
-        mesh_dim_names: ['dp']
-
-  # Sampler service occupies Node 1 (Worker node, GPU 4-7)
-  - name: sampler-Qwen2.5-7B-Instruct
-    route_prefix: /sampler/Qwen/Qwen2.5-7B-Instruct
-    import_path: sampler
-    args:
-      nproc_per_node: 2
-      device_group:
-        name: sampler
-        ranks: [0, 1]          # GPU indices within Node 1 (corresponding to physical GPU 4-5)
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        mesh: [0, 1]
-        mesh_dim_names: ['dp']
-
-  # Processor service occupies Node 2 (CPU node)
-  - name: processor
-    route_prefix: /processors
-    import_path: processor
-    args:
-      ncpu_proc_per_node: 4
-      device_group:
-        name: processor
-        ranks: 0               # CPU index within Node 2
-        device_type: CPU
-      device_mesh:
-        device_type: CPU
-        mesh: [0, 1, 2, 3]
-        mesh_dim_names: ['dp']
-```
-
-**Important notes:**
-- The `ranks` configuration for each component is relative to the Ray Node it occupies
-- Different components are automatically assigned to different Nodes
-- Ray automatically schedules components to the appropriate Node based on resource requirements (`num_gpus`, `num_cpus` in `ray_actor_options`)
 
 ## Startup Methods
 
@@ -263,7 +206,7 @@ applications:
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group
         name: model
-        ranks: [0, 1]                 # GPU card numbers to use
+        ranks: 2                    # Number of GPUs to use
         device_type: cuda
       device_mesh:                    # Distributed training mesh
         device_type: cuda
@@ -319,7 +262,7 @@ The difference from the Transformers backend is only in the `use_megatron` param
       nproc_per_node: 2
       device_group:
         name: model
-        ranks: [0, 1]
+        ranks: 2
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -374,7 +317,7 @@ applications:
       nproc_per_node: 2
       device_group:
         name: model
-        ranks: [0, 1]
+        ranks: 2
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -404,7 +347,7 @@ applications:
         enable_lora: true             # Support loading LoRA during inference
       device_group:
         name: sampler
-        ranks: [0]
+        ranks: 1
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -435,13 +378,13 @@ applications:
 
 ### device_group and device_mesh
 
-- **device_group**: Defines logical device groups, specifying which GPU cards to use
+- **device_group**: Defines logical device groups, specifying how many GPUs to use
 - **device_mesh**: Defines distributed training mesh, controls parallelization strategy
 
 ```yaml
 device_group:
   name: model          # Device group name
-  ranks: [0, 1]        # Physical GPU card number list
+  ranks: 2             # Number of GPUs to use
   device_type: cuda     # Device type: cuda / CPU
 
 device_mesh:
@@ -456,7 +399,7 @@ device_mesh:
 
 | Parameter | Type | Description |
 |------|------|------|
-| `ranks` | list[int] | **Physical GPU card numbers**, directly corresponding to the actual GPU devices on the machine |
+| `ranks` | int | **Number of GPUs to use** for this component |
 | `dp_size` | int | Data parallel size |
 | `tp_size` | int (optional) | Tensor parallel size |
 | `pp_size` | int (optional) | Pipeline parallel size |

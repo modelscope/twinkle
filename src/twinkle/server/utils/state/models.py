@@ -30,6 +30,7 @@ class ModelRecord(BaseModel):
     base_model: str | None = None
     user_metadata: dict[str, Any] = Field(default_factory=dict)
     lora_config: Any = None
+    replica_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
 
 

@@ -8,13 +8,10 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-
 dotenv.load_dotenv('.env')
 
-import os
-
 # Step 2: Initialize Tinker client before importing ServiceClient
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 init_tinker_client()
 
@@ -22,8 +19,12 @@ init_tinker_client()
 from tinker import ServiceClient
 
 service_client = ServiceClient(
-    base_url='http://www.modelscope.cn/twinkle',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
+	# BASE_URL can be a local server endpoint such as http://localhost:8000, or
+	# points to a previously deployed remote server, or
+	# modelscope server such as 'http://www.modelscope.cn/twinkle'
+    base_url='http://localhost:8000',
+	# API_KEY can be empty or a meaninful one according to sever configuration
+    api_key='EMPTY-TOKEN'
 )
 
 # Step 4: List models available on the server to verify the connection
@@ -40,10 +41,12 @@ response = future.result()
 
 # You can resume from either:
 #   1. A twinkle path:  "twinkle://.../<run_id>/weights/<checkpoint_name>"
-#   2. A model id on hub: "<user>/<model_id>"
+#   2. A model id on ModelScope hub: "ms://<user>/<model_id>"
+#   3. A local path to a checkpoint directory
 # Example:
 # resume_path = "twinkle://20260131_170251-Qwen_Qwen2_5-0_5B-Instruct-7275126c/weights/pig-latin-lora-epoch-1"
-# resume_path = "AlexEz/20260205_163645-Qwen_Qwen2_5-7B-Instruct-385d5c17_pig-latin-lora-epoch-1"
+# resume_path = "ms://AlexEz/20260205_163645-Qwen_Qwen2_5-7B-Instruct-385d5c17_pig-latin-lora-epoch-1"
+# resume_path = "/path/to/local/checkpoint/directory"
 resume_path = ''
 
 print(f'Found {len(response.training_runs)} training runs')
@@ -58,7 +61,7 @@ for tr in response.training_runs:
 
 # Step 6: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_model = 'Qwen/Qwen3-4B'
 if not resume_path:
     training_client = service_client.create_lora_training_client(base_model=base_model)
 else:
@@ -85,19 +88,7 @@ examples = [
     {
         'input': 'pickle jar',
         'output': 'ickle-pay ar-jay'
-    },
-    {
-        'input': 'space exploration',
-        'output': 'ace-spay exploration-way'
-    },
-    {
-        'input': 'rubber duck',
-        'output': 'ubber-ray uck-day'
-    },
-    {
-        'input': 'coding wizard',
-        'output': 'oding-cay izard-way'
-    },
+    }
 ]
 
 from modelscope import AutoTokenizer
@@ -181,6 +172,7 @@ for epoch in range(2):
 
 # Step 9: Publish the final checkpoint to ModelScope Hub.
 # NOTE: Requires a valid ModelScope token set as api_key when initializing the client.
-# The published model name will be: {run_id}_{checkpoint_name}
+# The model will be published under the owner of the supplied ModelScope token,
+# with model name formatted as: {run_id}_{checkpoint_name}
 rest_client.publish_checkpoint_from_tinker_path(save_result.path).result()
 print('Published checkpoint')

@@ -9,7 +9,7 @@ from tinker import types
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 # Step 1: Initialize Tinker client
 init_tinker_client()
@@ -17,10 +17,10 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # Step 2: Define the base model and connect to the server
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen3-4B'
 service_client = ServiceClient(
-    base_url='http://www.modelscope.cn/twinkle',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
+    base_url='http://localhost:8000',
+    api_key='EMPTY-TOKEN'
 )
 
 # Step 3: Create a sampling client by loading weights from a saved checkpoint.

@@ -24,7 +24,7 @@ import re
 from tinker import types
 from typing import List, Tuple
 
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import Message, Trajectory
