@@ -136,7 +136,7 @@ def build_model_app(model_id: str,
             self.start_adapter_countdown()
 
         """
-        TODO This is a cache system, we must change to sticky routing
+        This is a cache system, we must change to sticky routing
             Reference docs:
             1. [Now]https://docs.ray.io/en/latest/serve/model-multiplexing.html
             2. https://docs.ray.io/en/latest/serve/llm/architecture/routing-policies.html
@@ -156,6 +156,9 @@ def build_model_app(model_id: str,
             await self._ensure_sticky()
             token = get_token_from_request(request)
             return token
+
+        def __del__(self):
+            self.state.unregister_replica(self.replica_id)
 
         def _cleanup_adapter(self, adapter_name: str) -> None:
             """Common adapter cleanup logic used by both manual unload and automatic expiration.

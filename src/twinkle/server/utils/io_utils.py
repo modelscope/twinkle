@@ -38,7 +38,7 @@ def _hash_token(token: str) -> str:
     The digest is used as the per-user base directory name so that the raw
     token value is never written to the filesystem.
     """
-    return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()
+    return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
 
 
 # ----- Common Pydantic Models -----
