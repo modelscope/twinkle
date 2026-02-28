@@ -24,15 +24,16 @@ DISABLE_CLIP = os.environ.get('DISABLE_CLIP', '1') == '1'
 MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 KEEP_ROUTER_LOGITS = os.environ.get('KEEP_ROUTER_LOGITS', '0') == '1'
 
-# 4 gpus, fsdp=4 (data parallel), ep_size=2 (expert parallel)
+# 4 gpus, dp=1, fsdp=4 (data parallel), ep_size=2 (expert parallel)
 # The main mesh does NOT include 'ep' dimension - EP is handled by separate ep_fsdp_device_mesh
+dp_size = 1
 fsdp_size = 4
 ep_size = 2
 
 device_mesh = DeviceMesh(
     device_type=Platform.get_platform().device_prefix(),
-    mesh=np.arange(fsdp_size).reshape(fsdp_size),
-    mesh_dim_names=('fsdp',),
+    mesh=np.arange(fsdp_size * dp_size).reshape(fsdp_size, dp_size),
+    mesh_dim_names=('fsdp', 'dp'),
     ep_size=ep_size,  # ep_size is stored as attribute, not a mesh dimension
 )
 
@@ -49,7 +50,7 @@ def train():
     if hasattr(config, 'use_cache'):
         config.use_cache = False
 
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=range(1000)))
     try:
         dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)
     except ValueError:

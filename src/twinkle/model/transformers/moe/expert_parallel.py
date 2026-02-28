@@ -163,7 +163,15 @@ def patch_forward(
     """Replace the MoE block forward with EP-aware communication flow.
 
     Communication pattern follows VeOmni:
-        preprocess → token_pre_all2all → expert_compute (F.linear loop) → tokens_post_all2all
+        preprocess → token_pre_all2all → expert_compute → tokens_post_all2all
+
+    For tensor experts (gate_up_proj/down_proj), the expert compute is delegated
+    to block.experts(...) via nn.Module.__call__ so that FSDP2 pre/post-forward
+    hooks fire correctly (automatic unshard before forward, backward hook
+    registration, and reshard after forward). No manual unshard/reshard is needed.
+
+    For ModuleList experts, each sub-expert is already called via __call__ inside
+    _run_local_experts, so the same principle applies.
 
     Args:
         block: The MoE block to patch.
@@ -185,12 +193,18 @@ def patch_forward(
     orig_forward = block.forward
     num_experts = block._ep_num_experts
     experts_per_rank = block._ep_experts_per_rank
+    is_tensor_experts = block._ep_tensor_experts
+
+    # For tensor experts, install an ep_forward on the experts module so we can
+    # call block.experts(permuted_tokens, counts, experts_per_rank) via __call__,
+    # letting FSDP2 manage unshard/reshard automatically.
+    if is_tensor_experts:
+        _install_ep_forward(block.experts, experts_per_rank)
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
         if args or kwargs:
             raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
 
-        input_dtype = hidden_states.dtype
         orig_shape = hidden_states.shape
         if hidden_states.ndim == 3:
             batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -202,14 +216,15 @@ def patch_forward(
         else:
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
-        router_logits, routing_weights, selected_experts, cast_weights = _run_router(
+        router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
             hidden_states=hidden_states_2d,
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
             norm_topk_prob=getattr(block, 'norm_topk_prob', False),
         )
-        if cast_weights:
+        # Keep routing weights in activation dtype before unpermute weighting.
+        if routing_weights.dtype != hidden_states_2d.dtype:
             routing_weights = routing_weights.to(hidden_states_2d.dtype)
 
         # Build expert_mask: [num_experts, top_k, num_tokens] (VeOmni convention)
@@ -241,21 +256,23 @@ def patch_forward(
             ep_group,
         )
 
-        # 3. expert_compute: F.linear loop per local expert (no routing weight here)
-        # When FSDP2 wraps experts, params are sharded DTensors. Manually
-        # unshard (all-gather) so _run_local_experts sees full tensors.
-        _experts_mod = block.experts
-        _need_unshard = hasattr(_experts_mod, 'unshard') and hasattr(_experts_mod, 'reshard')
-        if _need_unshard:
-            _experts_mod.unshard()
-        expert_outputs = _run_local_experts(
-            block,
-            global_permuted_hidden_states,
-            num_global_sum_tokens_per_local_expert,
-            experts_per_rank,
-        )
-        if _need_unshard:
-            _experts_mod.reshard()
+        # 3. expert_compute: call experts via nn.Module.__call__ so FSDP2 hooks fire.
+        # For tensor experts: block.experts(permuted_tokens, counts, experts_per_rank)
+        #   → FSDP2 pre-forward unshard → ep_forward → FSDP2 post-forward reshard
+        # For ModuleList experts: _run_local_experts calls each expert[i](...) via __call__.
+        if is_tensor_experts:
+            expert_outputs = block.experts(
+                global_permuted_hidden_states,
+                num_global_sum_tokens_per_local_expert,
+                experts_per_rank,
+            )
+        else:
+            expert_outputs = _run_local_experts(
+                block,
+                global_permuted_hidden_states,
+                num_global_sum_tokens_per_local_expert,
+                experts_per_rank,
+            )
 
         # 4. tokens_post_all2all: sort_chunks → all_to_all → unpermute (with routing weight)
         final_hidden = tokens_post_all2all(
@@ -279,13 +296,63 @@ def patch_forward(
         if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
 
-        if cfg.keep_router_logits and not getattr(block, '_ep_tensor_experts', False):
+        if cfg.keep_router_logits:
             return final_hidden, router_logits
         return final_hidden
 
     block._ep_original_forward = orig_forward
     block.forward = forward
     block._ep_patched = True
+
+
+def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
+    if getattr(experts_mod, '_ep_forward_installed', False):
+        return
+
+    def ep_forward(
+        self,
+        permuted_tokens: torch.Tensor,
+        num_global_sum_tokens_per_local_expert: torch.Tensor,
+        experts_per_rank: int,
+    ) -> torch.Tensor:
+        if permuted_tokens.numel() == 0:
+            return torch.empty_like(permuted_tokens)
+
+        input_dtype = permuted_tokens.dtype
+
+        cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
+        for i in range(experts_per_rank):
+            cumsum[i + 1] = cumsum[i] + int(num_global_sum_tokens_per_local_expert[i].item())
+
+        output_chunks = []
+        for i in range(experts_per_rank):
+            start = int(cumsum[i].item())
+            end = int(cumsum[i + 1].item())
+            expert_in = permuted_tokens[start:end]
+            if expert_in.numel() == 0:
+                output_chunks.append(expert_in)
+                continue
+
+            gate_up = self.gate_up_proj[i]
+            down = self.down_proj[i]
+            compute_dtype = gate_up.dtype
+            if expert_in.dtype != compute_dtype:
+                expert_in = expert_in.to(compute_dtype)
+            gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
+            out = self.act_fn(gate) * up
+            out = F.linear(out, down)
+
+            if out.dtype != input_dtype:
+                out = out.to(input_dtype)
+            output_chunks.append(out)
+
+        return torch.cat(output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(
+            0, permuted_tokens.size(-1)
+        )
+
+    import types
+    experts_mod.forward = types.MethodType(ep_forward, experts_mod)
+    experts_mod._ep_forward_installed = True
 
 
 def _get_gate(block: nn.Module):
@@ -364,8 +431,7 @@ def _run_local_experts(
     num_global_sum_tokens_per_local_expert: torch.Tensor,
     experts_per_rank: int,
 ) -> torch.Tensor:
-    """Run local experts on permuted tokens using F.linear loop.
-
+    """Run ModuleList experts on permuted tokens via nn.Module.__call__.
     Tokens are already grouped by expert (contiguous chunks), sizes given by
     num_global_sum_tokens_per_local_expert. No routing weight is applied here;
     that happens in unpermute.
@@ -374,7 +440,6 @@ def _run_local_experts(
         return torch.empty_like(permuted_tokens)
 
     input_dtype = permuted_tokens.dtype
-    is_tensor_experts = getattr(block, '_ep_tensor_experts', False)
     experts = block.experts
 
     cumsum = torch.zeros(experts_per_rank + 1, dtype=torch.long)
@@ -390,21 +455,11 @@ def _run_local_experts(
             output_chunks.append(expert_in)
             continue
 
-        if is_tensor_experts:
-            gate_up = experts.gate_up_proj[i]
-            down = experts.down_proj[i]
-            compute_dtype = gate_up.dtype
-            if expert_in.dtype != compute_dtype:
-                expert_in = expert_in.to(compute_dtype)
-            gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
-            out = experts.act_fn(gate) * up
-            out = F.linear(out, down)
-        else:
-            expert = experts[i]
-            compute_dtype = _module_compute_dtype(expert, input_dtype)
-            if expert_in.dtype != compute_dtype:
-                expert_in = expert_in.to(compute_dtype)
-            out = expert(expert_in)
+        expert = experts[i]
+        compute_dtype = _module_compute_dtype(expert, input_dtype)
+        if expert_in.dtype != compute_dtype:
+            expert_in = expert_in.to(compute_dtype)
+        out = expert(expert_in)
 
         if out.dtype != input_dtype:
             out = out.to(input_dtype)
@@ -438,15 +493,15 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_out = gate(hidden_states)
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
         router_logits, routing_weights, selected_experts = gate_out[:3]
-        return router_logits, routing_weights, selected_experts, False
+        return router_logits, routing_weights, selected_experts
 
     router_logits = gate_out
     routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
     routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
     if norm_topk_prob:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-    return router_logits, routing_weights, selected_experts, True
+    return router_logits, routing_weights, selected_experts

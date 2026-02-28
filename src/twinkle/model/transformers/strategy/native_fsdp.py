@@ -60,11 +60,15 @@ class NativeFSDPStrategy:
 
                 if experts_mod is not None and ep_fsdp_mesh_1d is not None:
                     from torch.distributed.tensor import Shard
+                    # PreMulSum (used by set_gradient_divide_factor) only supports
+                    # float16/float32/float64; override reduce_dtype to float32
+                    # when the base policy uses bfloat16.
+                    ep_mp_policy = _build_ep_mp_policy(mp_policy)
                     fully_shard(
                         experts_mod,
                         mesh=ep_fsdp_mesh_1d,
                         reshard_after_forward=reshard_after_forward,
-                        mp_policy=mp_policy,
+                        mp_policy=ep_mp_policy,
                         shard_placement_fn=lambda param: Shard(1),
                     )
                     # gradient_divide_factor = world_size (VeOmni convention)
@@ -123,6 +127,25 @@ def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
         reduce_dtype=dtype,
         output_dtype=dtype,
         cast_forward_inputs=True,
+    )
+
+
+def _build_ep_mp_policy(base_policy: 'MixedPrecisionPolicy') -> 'MixedPrecisionPolicy':
+    """Build a MixedPrecisionPolicy for EP experts with reduce_dtype=float32.
+
+    NCCL's PreMulSum (used by set_gradient_divide_factor) only supports
+    float16/float32/float64. When the base policy uses bfloat16 as reduce_dtype,
+    we must override it to float32 for the expert FSDP group.
+    """
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    reduce_dtype = base_policy.reduce_dtype
+    if reduce_dtype == torch.bfloat16:
+        reduce_dtype = torch.float32
+    return MixedPrecisionPolicy(
+        param_dtype=base_policy.param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=base_policy.output_dtype,
+        cast_forward_inputs=base_policy.cast_forward_inputs,
     )
 
 
