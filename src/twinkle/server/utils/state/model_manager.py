@@ -13,6 +13,9 @@ class ModelManager(BaseManager[ModelRecord]):
     its owning session has already been removed (cascade expiry).
 
     Enforces a per-token model limit across all model instances (server-global).
+
+    Also tracks replica registrations so the router can query which replicas
+    still have capacity (i.e. their loaded-model count < max_loras).
     """
 
     def __init__(self, expiration_timeout: float, per_token_model_limit: int = 30) -> None:
@@ -20,6 +23,58 @@ class ModelManager(BaseManager[ModelRecord]):
         self._per_token_model_limit = per_token_model_limit
         # token -> set of model_ids owned by that token
         self._token_models: dict[str, set[str]] = {}
+        # replica_id -> set of model_ids currently loaded on that replica
+        self._replica_models: dict[str, set[str]] = {}
+        # replica_id -> max_loras limit declared at registration time
+        self._replica_max_loras: dict[str, int] = {}
+
+    # ----- Replica Registration -----
+
+    def register_replica(self, replica_id: str, max_loras: int) -> None:
+        """Register a replica and its LoRA capacity.
+
+        Args:
+            replica_id: Unique identifier for the replica.
+            max_loras: Maximum number of LoRA adapters the replica can hold.
+        """
+        self._replica_max_loras[replica_id] = max_loras
+        self._replica_models.setdefault(replica_id, set())
+
+    def unregister_replica(self, replica_id: str) -> None:
+        """Remove a replica from the registry.
+
+        Any model associations for this replica are also cleared.
+
+        Args:
+            replica_id: Unique identifier for the replica to remove.
+        """
+        self._replica_max_loras.pop(replica_id, None)
+        self._replica_models.pop(replica_id, None)
+
+    def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
+        """Return the subset of candidate replica IDs that still have capacity.
+
+        A replica has capacity when its current loaded-model count is strictly
+        less than its declared ``max_loras``.  Replicas that are not registered
+        (unknown to this manager) are included as-is (conservative fallback).
+
+        Args:
+            candidate_ids: Replica IDs to evaluate.
+
+        Returns:
+            Filtered list preserving the original order.
+        """
+        available = []
+        for rid in candidate_ids:
+            max_loras = self._replica_max_loras.get(rid)
+            if max_loras is None:
+                # Unknown replica – include conservatively
+                available.append(rid)
+                continue
+            current = len(self._replica_models.get(rid, set()))
+            if current < max_loras:
+                available.append(rid)
+        return available
 
     # ----- CRUD -----
 
@@ -39,10 +94,12 @@ class ModelManager(BaseManager[ModelRecord]):
             raise RuntimeError(f'Model limit exceeded: '
                                f'{len(current_ids)}/{self._per_token_model_limit} models')
         self._token_models.setdefault(token, set()).add(model_id)
+        if record.replica_id is not None:
+            self._replica_models.setdefault(record.replica_id, set()).add(model_id)
         self._store[model_id] = record
 
     def remove(self, model_id: str) -> bool:
-        """Remove a record by ID and clean up token ownership.
+        """Remove a record by ID and clean up token and replica ownership.
 
         Returns:
             True if the record existed and was removed, False otherwise.
@@ -50,11 +107,7 @@ class ModelManager(BaseManager[ModelRecord]):
         record = self._store.pop(model_id, None)
         if record is None:
             return False
-        token = record.token
-        if token and token in self._token_models:
-            self._token_models[token].discard(model_id)
-            if not self._token_models[token]:
-                del self._token_models[token]
+        self._cleanup_ownership(model_id, record)
         return True
 
     # ----- Cleanup -----
@@ -87,10 +140,23 @@ class ModelManager(BaseManager[ModelRecord]):
 
         for model_id in expired_ids:
             record = self._store.pop(model_id)
-            token = record.token
-            if token and token in self._token_models:
-                self._token_models[token].discard(model_id)
-                if not self._token_models[token]:
-                    del self._token_models[token]
+            self._cleanup_ownership(model_id, record)
 
         return len(expired_ids)
+
+    # ----- Internal helpers -----
+
+    def _cleanup_ownership(self, model_id: str, record: ModelRecord) -> None:
+        """Remove token and replica ownership entries for a model record.
+
+        Args:
+            model_id: The model ID being removed.
+            record: The associated ModelRecord.
+        """
+        token = record.token
+        if token and token in self._token_models:
+            self._token_models[token].discard(model_id)
+            if not self._token_models[token]:
+                del self._token_models[token]
+        if record.replica_id and record.replica_id in self._replica_models:
+            self._replica_models[record.replica_id].discard(model_id)

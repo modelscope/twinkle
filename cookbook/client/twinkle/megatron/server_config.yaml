@@ -34,22 +34,21 @@ applications:
 
   # 2. Model Service - Hosts the base model for training (Megatron backend)
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-3B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
+  - name: models-Qwen3-4B
+    route_prefix: /models/Qwen/Qwen3-4B   # REST path for this model
     import_path: model
     args:
       use_megatron: true                               # Use Megatron-LM backend (not HuggingFace)
       mixed_precision: bf16
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen3-4B"     # ModelScope model identifier to load
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
         name: model
-        ranks: [0,1]                  # GPU rank indices to use
+        ranks: 2                      # Number of GPUs to use
         device_type: cuda
       device_mesh:                    # Distributed training mesh configuration
         device_type: cuda
-        mesh: [0,1]                   # Device indices in the mesh
-        mesh_dim_names: ['dp']        # Mesh dimension names: 'dp' = data parallel
+        dp_size: 2                    # Data parallel size
       adapter_config:
         adapter_timeout: 1800                      # Seconds before idle adapter unload
     deployments:
@@ -71,12 +70,11 @@ applications:
       ncpu_proc_per_node: 2           # Number of CPU processes per node
       device_group:
         name: model
-        ranks: 2                      # CPU rank index
+        ranks: 2                      # Number of CPU workers to use
         device_type: CPU
       device_mesh:
         device_type: CPU
-        mesh: [0,1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
     deployments:
       - name: ProcessorManagement
         autoscaling_config:

@@ -34,18 +34,18 @@ applications:
 
   # 2. Model Service - Hosts the base model for training
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen2.5-3B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-3B-Instruct   # REST path for this model
+  - name: models-Qwen3-4B
+    route_prefix: /models/Qwen/Qwen3-4B   # REST path for this model
     import_path: model
     args:
       use_megatron: false                              # Use HuggingFace Transformers (not Megatron)
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"     # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen3-4B"     # ModelScope model identifier to load
       adapter_config:
         adapter_timeout: 1800         # Seconds before an idle adapter is unloaded
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
         name: model
-        ranks: [0,1]                  # GPU rank indices to use
+        ranks: 2                      # Number of GPUs to use
         device_type: cuda
       device_mesh:                    # Distributed training mesh configuration
         device_type: cuda
@@ -72,12 +72,11 @@ applications:
       ncpu_proc_per_node: 2           # Number of CPU processes per node
       device_group:
         name: model
-        ranks: 2                      # CPU rank index
+        ranks: 2                      # Number of CPU workers to use
         device_type: CPU
       device_mesh:
         device_type: CPU
-        mesh: [0,1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
     deployments:
       - name: ProcessorManagement
         autoscaling_config:
@@ -92,11 +91,11 @@ applications:
 
   # 4. Sampler Service - Handles text generation inference
   #    Uses vLLM for efficient batched generation with optional LoRA adapters.
-  - name: sampler-Qwen2.5-3B-Instruct
-    route_prefix: /samplers/Qwen/Qwen2.5-3B-Instruct   # REST path for this sampler
+  - name: sampler-Qwen3-4B
+    route_prefix: /samplers/Qwen/Qwen3-4B   # REST path for this sampler
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen2.5-3B-Instruct"        # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen3-4B"        # ModelScope model identifier to load
       sampler_type: vllm                                 # Sampler backend (vllm or torch)
       nproc_per_node: 2                                  # Number of GPU processes per node
       engine_args:                                       # vLLM engine configuration
@@ -106,7 +105,7 @@ applications:
         adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
       device_group:
         name: sampler
-        ranks: [2]                                     # GPU rank indices to use
+        ranks: 1                                     # Number of GPUs to use
         device_type: cuda
       device_mesh:
         device_type: cuda

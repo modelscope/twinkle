@@ -6,6 +6,8 @@ This module provides abstract base classes that encapsulate common logic for
 file-based storage of training run metadata and checkpoint information.
 Both tinker and twinkle servers inherit from these classes.
 """
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -24,6 +26,20 @@ logger = get_logger()
 TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
 CHECKPOINT_INFO_FILENAME = 'checkpoint_metadata.json'
 TRAIN_RUN_INFO_FILENAME = 'twinkle_metadata.json'
+
+# Salt used when hashing tokens for directory isolation.
+# Override via env var TWINKLE_TOKEN_SALT to customise per-deployment.
+_TOKEN_SALT = os.environ.get('TWINKLE_TOKEN_SALT', 'twinkle-path-salt-v1').encode('utf-8')
+
+
+def _hash_token(token: str) -> str:
+    """Return a salted HMAC-SHA256 hex digest of *token*.
+
+    The digest is used as the per-user base directory name so that the raw
+    token value is never written to the filesystem.
+    """
+    return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+
 
 # ----- Common Pydantic Models -----
 
@@ -275,13 +291,15 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """
         Get base directory with token-based isolation.
 
+        The token is never written to disk in plaintext; instead a salted
+        HMAC-SHA256 digest is used as the directory name so that the real
+        token cannot be recovered by inspecting the filesystem.
+
         Returns:
             Path to token-specific base directory
         """
         base_path = Path(TWINKLE_DEFAULT_SAVE_DIR).absolute()
-        # Sanitize token to avoid filesystem issues
-        sanitized_token = re.sub(r'[^\w\-]', '_', self.token)
-        return base_path / sanitized_token
+        return base_path / _hash_token(self.token)
 
     def get_model_dir(self, model_id: str) -> Path:
         """
