@@ -25,6 +25,7 @@ from tinker import ServiceClient
 # The base model to fine-tune / evaluate
 base_model = 'Qwen/Qwen3-4B'
 base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
 
 
 def train():
@@ -50,7 +51,7 @@ def train():
 
     service_client = ServiceClient(
         base_url=base_url,
-        api_key=os.environ.get('MODELSCOPE_TOKEN')
+        api_key=api_key
     )
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
