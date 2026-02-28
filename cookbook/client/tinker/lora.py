@@ -13,20 +13,25 @@ dotenv.load_dotenv('.env')
 
 import os
 
-from twinkle_client import init_tinker_compat_client
+# Step 2: Initialize Tinker client before importing ServiceClient
+from twinkle_client import init_tinker_client
 
-# Step 2: Initialize the Tinker-compatible client to communicate with the server.
-# - base_url: the address of the running server
-# - api_key: authentication token (loaded from environment variable)
-service_client = init_tinker_compat_client(
-    base_url='http://www.modelscope.cn/twinkle', api_key=os.environ.get('MODELSCOPE_TOKEN'))
+init_tinker_client()
 
-# Step 3: List models available on the server to verify the connection
+# Step 3: Use ServiceClient directly from tinker
+from tinker import ServiceClient
+
+service_client = ServiceClient(
+    base_url='http://www.modelscope.cn/twinkle',
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
+)
+
+# Step 4: List models available on the server to verify the connection
 print('Available models:')
 for item in service_client.get_server_capabilities().supported_models:
     print('- ' + item.model_name)
 
-# Step 4: Create a REST client for querying training runs and checkpoints.
+# Step 5: Create a REST client for querying training runs and checkpoints.
 # This is useful for inspecting previous training sessions or resuming training.
 rest_client = service_client.create_rest_client()
 
@@ -51,7 +56,7 @@ for tr in response.training_runs:
         # Uncomment the line below to resume from the last checkpoint:
         # resume_path = chpt.tinker_path
 
-# Step 5: Create or resume a training client.
+# Step 6: Create or resume a training client.
 # If resume_path is set, it restores both model weights and optimizer state.
 base_model = 'Qwen/Qwen2.5-7B-Instruct'
 if not resume_path:
@@ -60,7 +65,7 @@ else:
     print('Resuming from ' + resume_path)
     training_client = service_client.create_training_client_from_state_with_optimizer(path=resume_path)
 
-# Step 6: Prepare training data manually
+# Step 7: Prepare training data manually
 #
 # This example teaches the model to translate English into Pig Latin.
 # Each example has an "input" (English phrase) and "output" (Pig Latin).
@@ -146,7 +151,7 @@ for i, (inp, tgt, wgt) in enumerate(
             datum0.loss_fn_inputs['weights'].tolist())):
     print(f'{repr(tokenizer.decode([inp])):<20} {repr(tokenizer.decode([tgt])):<20} {wgt:<10}')
 
-# Step 7: Run the training loop
+# Step 8: Run the training loop
 #
 # For each epoch, iterate over multiple batches:
 #   - forward_backward: sends data to the server, computes loss & gradients
@@ -174,7 +179,7 @@ for epoch in range(2):
     save_result = save_future.result()
     print(f'Saved checkpoint for epoch {epoch} to {save_result.path}')
 
-# Step 8: Publish the final checkpoint to ModelScope Hub.
+# Step 9: Publish the final checkpoint to ModelScope Hub.
 # NOTE: Requires a valid ModelScope token set as api_key when initializing the client.
 # The published model name will be: {run_id}_{checkpoint_name}
 rest_client.publish_checkpoint_from_tinker_path(save_result.path).result()

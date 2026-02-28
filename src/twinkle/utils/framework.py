@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from .platform import DeviceMesh, Platform
+from .device_mesh import DeviceMesh, Platform
 
 if TYPE_CHECKING:
     import torch

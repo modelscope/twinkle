@@ -3,9 +3,8 @@ import torch
 from tinker import types
 from typing import List
 
+from twinkle import DeviceMesh
 from twinkle.template import Template
-from twinkle.utils.platform import DeviceMesh
-from twinkle.utils.torch_utils import selective_log_softmax
 
 
 def collect_forward_backward_results(results, device_mesh: DeviceMesh):
@@ -117,6 +116,8 @@ class TwinkleCompatModelBase:
     @staticmethod
     def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor) -> List[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss."""
+        from twinkle.utils.torch_utils import selective_log_softmax
+
         results = []
         for feature, logit in zip(inputs, logits):
             # Ensure 1D shape and correct device to avoid dimension mismatch and device errors

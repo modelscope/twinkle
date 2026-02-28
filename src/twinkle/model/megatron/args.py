@@ -107,6 +107,7 @@ class TwinkleMegatronArgs:
     num_experts: int = 0
     num_experts_per_tok: int = 2
     shared_expert_intermediate_size: int = 0
+    moe_router_enable_expert_bias: bool = False
 
     # =========================================================================
     # Training/inference settings
@@ -137,9 +138,6 @@ class TwinkleMegatronArgs:
     # =========================================================================
     merge_lora: bool = False
     target_modules: List[str] = field(default_factory=list)
-    freeze_llm: bool = False
-    freeze_vit: bool = False
-    freeze_aligner: bool = False
 
     # =========================================================================
     # FP8 quantization settings
@@ -160,7 +158,6 @@ class TwinkleMegatronArgs:
     # =========================================================================
     untie_embeddings_and_output_weights: bool = True
     max_shard_size: str = '5GB'
-    llm_model_type: str = 'gpt'  # For transformers 5.0 compatibility
     use_cpu_initialization: bool = False
 
     def __post_init__(self):
@@ -261,6 +258,10 @@ class TwinkleMegatronArgs:
         return self.ffn_hidden_size
 
     @property
+    def moe_shared_expert_intermediate_size(self) -> int:
+        return self.shared_expert_intermediate_size
+
+    @property
     def num_query_groups(self) -> int:
         """Alias for num_key_value_heads (Megatron naming)."""
         return self.num_key_value_heads
@@ -330,9 +331,12 @@ class TwinkleMegatronArgs:
         # Get rope_scaling
         rope_scaling = getattr(text_config, 'rope_scaling', None)
 
-        # Detect multimodal model
         model_type = getattr(hf_config, 'model_type', 'qwen2')
-        is_multimodal = 'vl' in model_type.lower() or 'vision' in model_type.lower() or 'omni' in model_type.lower()
+
+        # Detect multimodal model from the registered MegatronModelMeta
+        from .model.register import get_megatron_model_meta
+        model_meta = get_megatron_model_meta(model_type)
+        is_multimodal = model_meta.is_multimodal if model_meta is not None else False
 
         # Determine QKV bias
         if hasattr(text_config, 'attention_bias'):
@@ -435,7 +439,6 @@ class TwinkleMegatronArgs:
         if self._model is not None:
             return self._model
         from megatron.core import parallel_state as mpu
-        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
         from megatron.core.transformer import TransformerConfig
         from megatron.core.transformer.enums import AttnBackend
 
@@ -611,24 +614,37 @@ class TwinkleMegatronArgs:
         if exists('megatron_core>=0.13'):
             config.expert_tensor_parallel_size = self.etp_size
 
-        # Save transformer config for later use (e.g., DDP wrapping)
+        if mg_config_dict.get('use_shared_expert_gate'):
+            config.moe_use_shared_expert_gate = True
+        if mg_config_dict.get('rotary_interleaved'):
+            config.rotary_interleaved = True
+        partial_rotary_factor = mg_config_dict.get('partial_rotary_factor')
+        if partial_rotary_factor is not None:
+            config.rotary_percent = partial_rotary_factor
+            config.apply_rope_fusion = False
+        mrope_section = mg_config_dict.get('mrope_section')
+        if mrope_section is not None:
+            config.mrope_section = mrope_section
+        if mg_config_dict.get('mrope_interleaved'):
+            config.mrope_interleaved = True
+
         self.config = config
 
-        # Get layer spec - enable moe_grouped_gemm for MoE models
-        moe_grouped_gemm = num_experts > 0
-        try:
-            layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                num_experts=mg_config_dict.get('num_experts'),
-                moe_grouped_gemm=moe_grouped_gemm,
-                qk_layernorm=mg_config_dict.get('qk_layernorm', False),
-            )
-        except (ImportError, AttributeError):
-            raise RuntimeError(
-                'TransformerEngine is not installed or not compatible with this version of Megatron-Core.')
+        # Delegate model-specific config & layer spec construction to the loader
+        loader = model_meta.loader() if model_meta else None
+        if loader is not None:
+            loader.post_config(config, self, mg_config_dict)
+            layer_spec = loader.get_layer_spec(config, self, mg_config_dict)
+        else:
+            from .model.register import MegatronModelLoader
+            default_loader = MegatronModelLoader()
+            default_loader.post_config(config, self, mg_config_dict)
+            layer_spec = default_loader.get_layer_spec(config, self, mg_config_dict)
 
         # Create model
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)
         rotary_base = mg_config_dict.get('rotary_base', 10000)
+        position_embedding_type = mg_config_dict.get('position_embedding_type', 'rope')
         extra_init_args = {}
         if hasattr(hf_config,
                    'rope_scaling') and hf_config.rope_scaling is not None and 'factor' in hf_config.rope_scaling:
@@ -651,7 +667,7 @@ class TwinkleMegatronArgs:
                     post_process=mpu.is_pipeline_last_stage(**extra_kwargs),
                     parallel_output=True,
                     share_embeddings_and_output_weights=getattr(hf_config, 'tie_word_embeddings', False),
-                    position_embedding_type='rope',
+                    position_embedding_type=position_embedding_type,
                     rotary_base=rotary_base,
                     **extra_init_args)
                 model.append(_model)
@@ -666,7 +682,7 @@ class TwinkleMegatronArgs:
                 post_process=mpu.is_pipeline_last_stage(),
                 parallel_output=True,
                 share_embeddings_and_output_weights=getattr(hf_config, 'tie_word_embeddings', False),
-                position_embedding_type='rope',
+                position_embedding_type=position_embedding_type,
                 rotary_base=rotary_base,
                 **extra_init_args,
             )

@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Type, Union
+from typing import TYPE_CHECKING, List, Union
 
-from twinkle.utils import construct_class
+if TYPE_CHECKING:
+    import torch
 
 
 class Patch:
 
-    def __call__(self, module, *args, **kwargs):
+    def __call__(self, module: Union['torch.nn.Module', List['torch.nn.Module']], *args, **kwargs):
         ...

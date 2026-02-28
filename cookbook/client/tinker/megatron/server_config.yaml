@@ -21,6 +21,8 @@ applications:
     route_prefix: /api/v1          # API endpoint prefix (Tinker-compatible)
     import_path: server            # Python module to import
     args:
+      server_config:
+        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
 
     deployments:
       - name: TinkerCompatServer
@@ -95,7 +97,6 @@ applications:
         rps_limit: 20                               # Max requests per second
         tps_limit: 16000                            # Max tokens per second
       adapter_config:
-        per_token_adapter_limit: 3                # Max concurrent LoRA adapters
         adapter_timeout: 30                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:

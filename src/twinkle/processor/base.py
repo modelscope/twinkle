@@ -105,6 +105,9 @@ class InputProcessor:
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
+        if self.device_mesh is None:
+            return inputs
+
         def _pad_cp(_input: InputFeature) -> InputFeature:
             # Pad sequence for parallel compatibility
             # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
@@ -363,7 +366,7 @@ class InputProcessor:
                    micro_batch_size: Optional[int] = None,
                    variable_seq_lengths=False,
                    **kwargs) -> List[InputFeature]:
-        if len(inputs) == 1:
+        if len(inputs) == 1 and self.framework != 'megatron':
             return inputs
         if micro_batch_size is None:
             # normal collate

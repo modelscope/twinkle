@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from types import MethodType
 from typing import Optional
 
-from .platform import Platform
+from .platforms import Platform
 
 
 # Avoid circular reference

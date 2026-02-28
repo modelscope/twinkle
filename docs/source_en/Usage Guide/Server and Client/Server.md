@@ -210,7 +210,6 @@ CLI supported parameters:
 | `-c, --config` | YAML configuration file path (required) | — |
 | `-t, --server-type` | Server mode: `twinkle` or `tinker` | `twinkle` |
 | `--namespace` | Ray namespace | tinker mode defaults to `twinkle_cluster` |
-| `--no-wait` | Do not block and wait (daemon mode) | `False` |
 | `--log-level` | Log level | `INFO` |
 
 ## YAML Configuration Details
@@ -260,7 +259,6 @@ applications:
       use_megatron: false                              # Use Transformers backend
       model_id: "ms://Qwen/Qwen2.5-7B-Instruct"      # ModelScope model identifier
       adapter_config:                                  # LoRA adapter configuration
-        per_token_adapter_limit: 30   # Maximum number of LoRAs that can be activated simultaneously
         adapter_timeout: 1800         # Idle adapter timeout unload time (seconds)
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group
@@ -355,6 +353,8 @@ applications:
     route_prefix: /api/v1              # Tinker protocol API prefix
     import_path: server
     args:
+      server_config:
+        per_token_model_limit: 30     # Maximum number of models (adapters) per token (server-global)
     deployments:
       - name: TinkerCompatServer
         autoscaling_config:

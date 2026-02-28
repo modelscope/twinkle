@@ -819,6 +819,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
              output_dir: Optional[str] = None,
              interval: int = 1,
              save_optimizer: bool = False,
+             merge_lora: bool = False,
              **kwargs):
         """Save model checkpoint.
 
@@ -832,6 +833,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             interval: Save each *interval* steps.
             save_optimizer: If True, save optimizer + lr_scheduler + RNG state
                 alongside the HF weights for checkpoint resumption.
+            merge_lora: If True, merge LoRA adapters into base weights and save
+                the full merged model instead of PEFT adapter format. The merge
+                is reversed after saving so training can continue.
             **kwargs: Additional arguments forwarded to the underlying save
                 methods (e.g. ``adapter_name``).
         """
@@ -846,8 +850,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
 
-        # Always save HF-format weights (for inference / deployment).
-        self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+        is_lora = (optimizer_config.adapter_name != _default_adapter_name)
+
+        if merge_lora and is_lora:
+            self._merge_lora_adapters(optimizer_config.adapter_name)
+            self._save_hf_format(checkpoint_dir, _default_adapter_name)
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._unmerge_lora_adapters()
+        else:
+            self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Optionally save mcore optimizer state (for training resumption).
         if save_optimizer:
@@ -856,8 +868,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 optimizer_config=optimizer_config,
                 **kwargs,
             )
-
-        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Final synchronization to ensure all ranks complete save.
         if dist.is_initialized():
@@ -1160,6 +1170,24 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             iteration = iters_cuda[0].item()
         return iteration
 
+    def _merge_lora_adapters(self, adapter_name: str = 'default'):
+        """Merge LoRA adapters into base model weights."""
+        from .tuners.lora import LoraParallelLinear
+        with torch.no_grad():
+            for model in self.strategy.unwrap_model(self.model):
+                for module in model.modules():
+                    if isinstance(module, (LoraParallelLinear, LoraLinear)):
+                        module.merge(adapter_names=[adapter_name])
+
+    def _unmerge_lora_adapters(self):
+        """Unmerge LoRA adapters to restore training state."""
+        from .tuners.lora import LoraParallelLinear
+        with torch.no_grad():
+            for model in self.strategy.unwrap_model(self.model):
+                for module in model.modules():
+                    if isinstance(module, (LoraParallelLinear, LoraLinear)):
+                        module.unmerge()
+
     def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in HuggingFace format using bridge adapter.
 
@@ -1213,7 +1241,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         torch.save(cpu_state_dict, checkpoint_path)
 
     def _save_tokenizer(self, output_dir: str, **kwargs):
-        from twinkle.utils.platform import is_last_rank
+        from twinkle.utils import is_last_rank
         if not is_last_rank():
             return
 
@@ -1344,7 +1372,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
-        apply_patch(self, patch_cls, **kwargs)
+        apply_patch(self.model, patch_cls, **kwargs)
 
     @remote_function(dispatch='all')
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
