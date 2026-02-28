@@ -84,7 +84,7 @@ applications:
   #       logprobs_mode: processed_logprobs # Logprobs mode for sampling results
   #     device_group:                   # Logical device group for the sampler
   #       name: sampler
-  #       ranks: [2]                    # GPU rank indices to use
+  #       ranks: 1                    # Number of GPUs to use
   #       device_type: cuda
   #     device_mesh:
   #       device_type: cuda

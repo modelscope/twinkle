@@ -45,7 +45,7 @@ applications:
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
         name: model
-        ranks: [0,1]                  # GPU rank indices to use
+        ranks: 2                      # Number of GPUs to use
         device_type: cuda
       device_mesh:                    # Distributed training mesh configuration
         device_type: cuda
@@ -72,12 +72,11 @@ applications:
       ncpu_proc_per_node: 2           # Number of CPU processes per node
       device_group:
         name: model
-        ranks: 2                      # CPU rank index
+        ranks: 2                      # Number of CPU workers to use
         device_type: CPU
       device_mesh:
         device_type: CPU
-        mesh: [0,1]
-        mesh_dim_names: ['dp']
+        dp_size: 2                    # Data parallel size
     deployments:
       - name: ProcessorManagement
         autoscaling_config:
@@ -106,7 +105,7 @@ applications:
         adapter_timeout: 1800                            # Seconds before idle adapter is unloaded
       device_group:
         name: sampler
-        ranks: [2]                                     # GPU rank indices to use
+        ranks: 1                                     # Number of GPUs to use
         device_type: cuda
       device_mesh:
         device_type: cuda
