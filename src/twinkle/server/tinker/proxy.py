@@ -79,7 +79,7 @@ class ServiceProxy:
         Returns:
             Cleaned headers safe for proxying
         """
-        logger.info('prepare_headers request_headers=%s', request_headers)
+        logger.debug('prepare_headers request_headers=%s', request_headers)
         # Convert to dict while preserving case-insensitive lookups for special headers
         headers = dict(request_headers)
         # Remove headers that should not be forwarded
