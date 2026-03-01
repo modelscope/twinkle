@@ -442,7 +442,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
-                if remote_group is None:
+                if os.environ.get('WORKER_NAME') is None and remote_group is None:
                     logger.info(f'⚠️ Using local initialization of class: {cls}, please make sure the class '
                                 'does not need remote execution.')
                 # If cannot trust_remote_code, no callable and type can be used.

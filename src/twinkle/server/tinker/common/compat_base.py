@@ -117,13 +117,14 @@ class TwinkleCompatModelBase:
     def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor, logps: torch.Tensor) -> List[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss."""
         from twinkle.utils.torch_utils import selective_log_softmax
-
+        device = logits.device if logits is not None else logps.device
         results = []
-        for feature, logit in zip(inputs, logits):
+        if logits is None:
+            logits = [None] * len(inputs)
+        for idx, (feature, logit) in enumerate(zip(inputs, logits)):
             # Ensure 1D shape and correct device to avoid dimension mismatch and device errors
-            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(
-                logit.device)  # shape (seq_len,)
-            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(logit.device)  # shape (seq_len,)
+            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(device)  # shape (seq_len,)
+            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(device)  # shape (seq_len,)
 
             # Slice logits to match the sequence length of labels
             # Labels are assumed to be already shifted/aligned with logits
@@ -138,7 +139,7 @@ class TwinkleCompatModelBase:
                 # Calculate log probs for all labels
                 token_log_probs = selective_log_softmax(feature_logits, labels)
             else:
-                token_log_probs = logps[:seq_len, :]
+                token_log_probs = logps[idx, :seq_len]
 
             # elementwise_loss: positive NLL loss (0.0 where masked)
             elementwise_loss = -token_log_probs * weights
