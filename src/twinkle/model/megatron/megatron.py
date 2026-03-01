@@ -471,7 +471,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             counts = result['num_tokens']
             if not counts:
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.gather_loss_for_cp(losses, counts, output_tensor, logps)
+            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
