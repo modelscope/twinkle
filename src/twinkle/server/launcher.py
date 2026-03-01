@@ -214,6 +214,11 @@ class ServerLauncher:
                 # Copy all deployment options from the config, except 'name'.
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
 
+        # Pass http_options to server apps for internal proxy routing
+        http_options = self.config.get('http_options', {})
+        if http_options:
+            args['http_options'] = http_options
+
         # Build and deploy the application
         app = builder(deploy_options=deploy_options, **{k: v for k, v in args.items()})
 

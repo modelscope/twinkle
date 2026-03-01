@@ -28,7 +28,7 @@ for item in service_client.get_server_capabilities().supported_models:
 When calling `init_tinker_client`, the following operations are automatically executed:
 
 1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
-2. **Set Request Headers**: Inject necessary authentication headers such as `serve_multiplexed_model_id` and `Authorization`
+2. **Set Request Headers**: Inject necessary authentication headers such as `X-Ray-Serve-Request-Id` and `Authorization`
 
 After initialization, simply import `from tinker import ServiceClient` to connect to Twinkle Server, and **all existing Tinker training code can be used directly** without any modifications.
 
