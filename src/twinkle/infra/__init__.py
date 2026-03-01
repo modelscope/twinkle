@@ -280,6 +280,15 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             return np.array(flatten)
         return type(result[0])(flatten)
     elif method in ('avg', 'mean'):
+        if isinstance(result[0], dict):
+            output = {}
+            for key in result[0]:
+                vals = [r[key] for r in result if key in r]
+                try:
+                    output[key] = np.mean(vals)
+                except (TypeError, ValueError):
+                    output[key] = vals
+            return output
         return np.mean(result)
     elif method == 'sum':
         return np.sum(result)

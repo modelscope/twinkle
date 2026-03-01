@@ -290,6 +290,51 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
+    def _postprocess_tensor_cp(self, tensor):
+        """All-gather and reconstruct full sequence from CP-split tensor.
+
+        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
+        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
+
+        Only the current rank's slice retains the original tensor (and its
+        gradient graph); other ranks' slices are plain copies.  This means
+        backward through the reconstructed tensor only produces gradients for
+        the local chunk, naturally distributing the gradient across CP ranks
+        without extra scaling.
+
+        Args:
+            tensor: [batch_size, seq_len/cp_size] CP-split tensor
+
+        Returns:
+            [batch_size, full_seq_len] reconstructed full tensor
+        """
+        from megatron.core import parallel_state as mpu
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size <= 1:
+            return tensor
+
+        cp_rank = mpu.get_context_parallel_rank()
+        cp_group = mpu.get_context_parallel_group()
+
+        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+        gathered[cp_rank] = tensor
+
+        batch_size = tensor.shape[0]
+        seq_len_per_cp = tensor.shape[1]
+        full_seq_len = seq_len_per_cp * cp_size
+        chunk_len = full_seq_len // (2 * cp_size)
+        half_len = seq_len_per_cp // 2
+
+        output = tensor.new_zeros(batch_size, full_seq_len)
+        for j in range(cp_size):
+            o = gathered[j]
+            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
+            reverse_idx = 2 * cp_size - j - 1
+            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
+
+        return output
+
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
@@ -420,13 +465,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
-            outputs = ModelOutput(logits=output_tensor)
+            outputs = ModelOutput(logits=output_tensor, logps=logps)
             result = loss_instance(inputs, outputs, **current_kwargs)
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.gather_loss_for_cp(losses, counts, output_tensor, logps)
+            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -435,11 +480,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             labels = batch.pop('labels', None)
             output_tensor = model(**batch)
             batch['labels'] = labels
+            logps = None
             if labels is not None:
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
                 logps = selective_log_softmax(output_tensor, masked_labels)
+                if cp_size > 1:
+                    logps = self._postprocess_tensor_cp(logps)
+                    batch['labels'] = self._postprocess_tensor_cp(labels)
             return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
 
         # Get Megatron's forward-backward function
@@ -514,7 +563,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         optimizer_config.inputs = inputs
-        if len({_logps.shape[1] for _logps in logps}) == 1:
+        if logps and len({_logps.shape[1] for _logps in logps}) == 1:
             logps = torch.cat(logps, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()

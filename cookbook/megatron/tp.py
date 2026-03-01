@@ -65,8 +65,6 @@ def train():
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
-        _inputs = [input_feature_to_datum(b) for b in batch]
-        _temp = TwinkleCompatModelBase._get_forward_output(_inputs, model.optimizer_group['default'].outputs['logits'])
         # Step
         model.clip_grad_and_step()
         if step % 5 == 0:

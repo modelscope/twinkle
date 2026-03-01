@@ -289,18 +289,18 @@ class GRPOLoss(Loss):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
 
-        logits = outputs.get('logits')
-        if logits.shape[1] != labels.shape[1]:
-            # some mllm return logits with image tokens, exclude here
-            logits = logits[:, -labels.shape[1]:]
+        logps = outputs.get('logps')
+        if logps is None:
+            logits = outputs.get('logits')
+            if logits.shape[1] != labels.shape[1]:
+                # some mllm return logits with image tokens, exclude here
+                logits = logits[:, -labels.shape[1]:]
 
-        # labels = torch.roll(labels, shifts=-1, dims=1)
-        loss_mask = (labels != self.ignore_index).bool()
-        masked_labels = labels.clone()
-        masked_labels[~loss_mask] = 0
-        logps = selective_log_softmax(logits, masked_labels)
-
-        del logits
+            # labels = torch.roll(labels, shifts=-1, dims=1)
+            loss_mask = (labels != self.ignore_index).bool()
+            masked_labels = labels.clone()
+            masked_labels[~loss_mask] = 0
+            logps = selective_log_softmax(logits, masked_labels)
 
         device = logps.device
 
