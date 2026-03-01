@@ -70,22 +70,24 @@ class ServiceProxy:
         base_url = f'http://{host}:{port}'
         return f'{base_url}{prefix}/{service_type}/{base_model}/{endpoint}'
 
-    def _prepare_headers(self, request_headers: dict[str, str]) -> dict[str, str]:
+    def _prepare_headers(self, request_headers) -> dict[str, str]:
         """Prepare headers for proxying by removing problematic headers.
 
         Args:
-            request_headers: Original request headers
+            request_headers: Original request headers (case-insensitive from FastAPI)
 
         Returns:
             Cleaned headers safe for proxying
         """
         logger.info('prepare_headers request_headers=%s', request_headers)
+        # Convert to dict while preserving case-insensitive lookups for special headers
         headers = dict(request_headers)
         # Remove headers that should not be forwarded
         headers.pop('host', None)
         headers.pop('content-length', None)
         # Add serve_multiplexed_model_id for sticky sessions if present
-        request_id = request_headers.get('X-Ray-Serve-Request-Id')
+        # Use case-insensitive lookup from original request_headers
+        request_id = request_headers.get('x-ray-serve-request-id')
         if request_id is not None:
             headers['serve_multiplexed_model_id'] = request_id
         return headers
@@ -112,7 +114,8 @@ class ServiceProxy:
         """
         body_bytes = await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
-        headers = self._prepare_headers(dict(request.headers))
+        # Pass original request.headers (case-insensitive) instead of dict conversion
+        headers = self._prepare_headers(request.headers)
 
         try:
             # Debug logging for troubleshooting proxy issues
@@ -122,7 +125,7 @@ class ServiceProxy:
                     service_type,
                     endpoint,
                     target_url,
-                    headers.get('x-ray-serve-request-id'),
+                    headers.get('serve_multiplexed_model_id'),
                 )
 
             # Forward the request to the target service
