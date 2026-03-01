@@ -18,4 +18,3 @@ class VocabParallelCrossEntropyLoss(Loss):
             loss=(-logps * loss_mask).sum(),
             num_tokens=loss_mask.sum().clamp(min=1),
         )
-
