@@ -284,9 +284,9 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             output = {}
             for key in result[0]:
                 vals = [r[key] for r in result if key in r]
-                if isinstance(vals[0], (int, float, np.integer, np.floating, np.ndarray)):
+                try:
                     output[key] = np.mean(vals)
-                else:
+                except (TypeError, ValueError):
                     output[key] = vals
             return output
         return np.mean(result)
