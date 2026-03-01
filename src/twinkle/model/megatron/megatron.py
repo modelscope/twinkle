@@ -527,17 +527,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
-                        count += 1
                     if 'logits' in loss_dict:
                         logits.append(loss_dict['logits'])
                     if 'logps' in loss_dict:
                         logps.append(loss_dict['logps'])
+                    if 'num_tokens' in loss_dict:
+                        count += loss_dict['num_tokens']
                 elif isinstance(loss_dict, torch.Tensor):
-                    loss += loss_dict
-                    count += 1
+                    raise ValueError('Expected loss dict, got tensor')
 
-        if count > 0:
-            loss /= count
+        loss = loss / (count or 1)
 
         # For PP > 1, broadcast loss from last PP stage to all ranks
         # Note: mpu is imported at module level, no need to reimport

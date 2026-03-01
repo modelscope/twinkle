@@ -134,8 +134,13 @@ class MegatronStrategy:
         return wrapped_models
 
     def reduce_loss(self, local_loss, local_count, logits, logps):
-        loss = local_loss / local_count.clamp(min=1)
-        return loss, {'loss': loss.detach(), 'logits': logits.detach(), 'logps': logps.detach()}
+        count = local_count.clamp(min=1).to(torch.int64)
+        return local_loss, count, {
+            'loss': local_loss.detach(),
+            'logits': logits.detach(),
+            'logps': logps.detach(),
+            'num_tokens': count
+        }
 
     def get_model_config(
         self,
