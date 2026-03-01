@@ -481,7 +481,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             output_tensor = model(**batch)
             batch['labels'] = labels
             logps = None
-            if labels is not None:
+            if labels is not None and mpu.is_pipeline_last_stage():
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
