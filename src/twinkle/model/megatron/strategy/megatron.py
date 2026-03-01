@@ -133,29 +133,13 @@ class MegatronStrategy:
 
         return wrapped_models
 
-    def gather_loss_for_cp(self, local_loss_sum, local_count, logits, logps):
-        import torch
-        from megatron.core import parallel_state as mpu
-        cp_size = mpu.get_context_parallel_world_size()
-
-        # For CP > 1, aggregate loss across CP ranks
-        if cp_size > 1:
-            # All-reduce the count across CP ranks
-            total_count = local_count.clone()
-            torch.distributed.nn.all_reduce(
-                total_count, op=torch.distributed.ReduceOp.SUM, group=mpu.get_context_parallel_group())
-
-            # All-reduce the loss sum
-            total_loss_sum = local_loss_sum.clone()
-            torch.distributed.nn.all_reduce(
-                total_loss_sum, op=torch.distributed.ReduceOp.SUM, group=mpu.get_context_parallel_group())
-
-            # Return global mean, divided by cp_size to counteract Megatron's multiplication
-            loss = (total_loss_sum / total_count.clamp(min=1)) / cp_size
+    def gather_loss_for_cp(self, local_loss, local_count, logits, logps):
+        if local_count.item() > 0:
+            loss = local_loss / local_count.clamp(min=1)
         else:
-            loss = local_loss_sum / local_count.clamp(min=1)
+            loss = local_loss
 
-        return loss, {'loss': loss.detach(), 'logits': logits.detach(), 'logps': logps.detach()}
+        return loss, {'loss': loss.detach().clone(), 'logits': logits.detach(), 'logps': logps.detach()}
 
     def get_model_config(
         self,
