@@ -16,11 +16,13 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
+base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_url = 'http://www.modelscope.cn/twinkle'
+
 # Step 2: Define the base model and connect to the server
-base_model = 'Qwen/Qwen3-4B'
 service_client = ServiceClient(
-    base_url='http://localhost:8000',
-    api_key='EMPTY-TOKEN'
+    base_url=base_url,
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
 )
 
 # Step 3: Create a sampling client by loading weights from a saved checkpoint.
