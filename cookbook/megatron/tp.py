@@ -8,9 +8,6 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.tinker.common import input_feature_to_datum
-from twinkle.server.tinker.common.compat_base import TwinkleCompatModelBase
-
 # Construct a device_mesh, tp=pp=cp=2, dp=1
 device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, cp_size=2)
 # use torchrun mode
@@ -65,8 +62,6 @@ def train():
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
-        _inputs = [input_feature_to_datum(b) for b in batch]
-        _temp = TwinkleCompatModelBase._get_forward_output(_inputs, model.optimizer_group['default'].outputs['logits'])
         # Step
         model.clip_grad_and_step()
         if step % 5 == 0:
