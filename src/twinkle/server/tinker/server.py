@@ -12,8 +12,6 @@ training and inference. It acts as a routing layer that:
 from __future__ import annotations
 
 import asyncio
-import httpx
-import logging
 import os
 from fastapi import FastAPI, HTTPException, Request, Response
 from ray import serve
@@ -24,14 +22,17 @@ from twinkle.hub import HubOperation
 from twinkle.server.utils.state import get_server_state
 from twinkle.server.utils.task_queue import QueueState
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
+from twinkle.utils.logger import get_logger
 from .common.io_utils import create_checkpoint_manager, create_training_run_manager
+from .proxy import ServiceProxy
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def build_server_app(deploy_options: dict[str, Any],
                      supported_models: list[types.SupportedModel] | None = None,
                      server_config: dict[str, Any] = {},
+                     http_options: dict[str, Any] | None = None,
                      **kwargs):
     """Build and configure the Tinker-compatible server application.
 
@@ -69,18 +70,23 @@ def build_server_app(deploy_options: dict[str, Any],
         def __init__(self,
                      supported_models: list[types.SupportedModel] | None = None,
                      server_config: dict[str, Any] = {},
+                     http_options: dict[str, Any] | None = None,
                      **kwargs) -> None:
             """Initialize the Tinker-compatible server.
 
             Args:
                 supported_models: List of supported base models for validation
+                server_config: Server configuration options
+                http_options: HTTP server options (host, port) for internal proxy routing
                 **kwargs: Additional configuration (route_prefix, etc.)
             """
-            # Get per_token_adapter_limit from kwargs or use default
             self.state = get_server_state(**server_config)
-            # Disable proxy for internal requests to avoid routing through external proxies
-            self.client = httpx.AsyncClient(timeout=None, trust_env=False)
             self.route_prefix = kwargs.get('route_prefix', '/api/v1')
+            self.http_options = http_options or {}
+
+            # Initialize service proxy for routing requests to model/sampler services
+            self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
+
             self.supported_models = self.normalize_models(supported_models) or [
                 types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
@@ -134,83 +140,6 @@ def build_server_app(deploy_options: dict[str, Any],
             if metadata and metadata.get('base_model'):
                 return metadata['base_model']
             raise HTTPException(status_code=404, detail=f'Model {model_id} not found')
-
-        async def _proxy_request(self, request: Request, endpoint: str, base_model: str, service_type: str) -> Response:
-            """Generic proxy method to forward requests to model or sampler services.
-
-            This method consolidates the common proxy logic for both model and sampler endpoints.
-
-            Args:
-                request: The incoming FastAPI request
-                endpoint: The target endpoint name (e.g., 'create_model', 'asample')
-                base_model: The base model name for routing
-                service_type: Either 'model' or 'sampler' to determine the target service
-
-            Returns:
-                Proxied response from the target service
-            """
-            body_bytes = await request.body()
-
-            # Construct target URL: /{service_type}/{base_model}/{endpoint}
-            prefix = self.route_prefix.rstrip('/') if self.route_prefix else ''
-            base_url = f'{request.url.scheme}://{request.url.netloc}'
-            target_url = f'{base_url}{prefix}/{service_type}/{base_model}/{endpoint}'
-
-            headers = dict(request.headers)
-            headers.pop('host', None)
-            headers.pop('content-length', None)
-
-            try:
-                if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
-                    logger.info('proxy_to_model endpoint=%s target_url=%s x-ray-serve-request-id=%s', endpoint,
-                                target_url, headers.get('x-ray-serve-request-id'))
-                rp_ = await self.client.request(
-                    method=request.method,
-                    url=target_url,
-                    content=body_bytes,
-                    headers=headers,
-                    params=request.query_params,
-                )
-                if os.environ.get('TWINKLE_DEBUG_PROXY', '0') == '1':
-                    logger.info('proxy_to_model response status=%s body=%s', rp_.status_code, rp_.text[:200])
-                return Response(
-                    content=rp_.content,
-                    status_code=rp_.status_code,
-                    headers=dict(rp_.headers),
-                    media_type=rp_.headers.get('content-type'),
-                )
-            except Exception as e:
-                return Response(content=f'Proxy Error: {str(e)}', status_code=502)
-
-        async def _proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
-            """Proxy request to model endpoint.
-
-            Routes the request to the appropriate model deployment based on base_model.
-
-            Args:
-                request: The incoming FastAPI request
-                endpoint: The target endpoint name (e.g., 'create_model', 'forward')
-                base_model: The base model name for routing
-
-            Returns:
-                Proxied response from the model service
-            """
-            return await self._proxy_request(request, endpoint, base_model, 'model')
-
-        async def _proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
-            """Proxy request to sampler endpoint.
-
-            Routes the request to the appropriate sampler deployment based on base_model.
-
-            Args:
-                request: The incoming FastAPI request
-                endpoint: The target endpoint name (e.g., 'asample')
-                base_model: The base model name for routing
-
-            Returns:
-                Proxied response from the sampler service
-            """
-            return await self._proxy_request(request, endpoint, base_model, 'sampler')
 
         # --- Endpoints ---------------------------------------------------------
 
@@ -553,7 +482,7 @@ def build_server_app(deploy_options: dict[str, Any],
                 Proxied response from model service
             """
             self._validate_base_model(body.base_model)
-            return await self._proxy_to_model(request, 'create_model', body.base_model)
+            return await self.proxy.proxy_to_model(request, 'create_model', body.base_model)
 
         @app.post('/get_info')
         async def get_info(self, request: Request, body: types.GetInfoRequest) -> Any:
@@ -565,7 +494,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'get_info', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'get_info', self._get_base_model(body.model_id))
 
         @app.post('/unload_model')
         async def unload_model(self, request: Request, body: types.UnloadModelRequest) -> Any:
@@ -577,7 +506,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'unload_model', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'unload_model', self._get_base_model(body.model_id))
 
         @app.post('/forward')
         async def forward(self, request: Request, body: types.ForwardRequest) -> Any:
@@ -589,7 +518,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'forward', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'forward', self._get_base_model(body.model_id))
 
         @app.post('/forward_backward')
         async def forward_backward(self, request: Request, body: types.ForwardBackwardRequest) -> Any:
@@ -601,7 +530,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'forward_backward', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'forward_backward', self._get_base_model(body.model_id))
 
         @app.post('/optim_step')
         async def optim_step(self, request: Request, body: types.OptimStepRequest) -> Any:
@@ -613,7 +542,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'optim_step', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'optim_step', self._get_base_model(body.model_id))
 
         @app.post('/save_weights')
         async def save_weights(self, request: Request, body: types.SaveWeightsRequest) -> Any:
@@ -625,7 +554,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'save_weights', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'save_weights', self._get_base_model(body.model_id))
 
         @app.post('/load_weights')
         async def load_weights(self, request: Request, body: types.LoadWeightsRequest) -> Any:
@@ -637,7 +566,7 @@ def build_server_app(deploy_options: dict[str, Any],
             Returns:
                 Proxied response from model service
             """
-            return await self._proxy_to_model(request, 'load_weights', self._get_base_model(body.model_id))
+            return await self.proxy.proxy_to_model(request, 'load_weights', self._get_base_model(body.model_id))
 
     # --- Sampler Proxy Endpoints ----------------------------------------
 
@@ -662,7 +591,7 @@ def build_server_app(deploy_options: dict[str, Any],
                 if session:
                     base_model = session.get('base_model')
 
-            return await self._proxy_to_sampler(request, 'asample', base_model)
+            return await self.proxy.proxy_to_sampler(request, 'asample', base_model)
 
         @app.post('/save_weights_for_sampler')
         async def save_weights_for_sampler(self, request: Request, body: types.SaveWeightsForSamplerRequest) -> Any:
@@ -678,7 +607,7 @@ def build_server_app(deploy_options: dict[str, Any],
             """
             # Proxy to model service for save_weights_for_sampler
             base_model = self._get_base_model(body.model_id)
-            return await self._proxy_to_model(request, 'save_weights_for_sampler', base_model)
+            return await self.proxy.proxy_to_model(request, 'save_weights_for_sampler', base_model)
 
     return TinkerCompatServer.options(**deploy_options).bind(
-        supported_models=supported_models, server_config=server_config, **kwargs)
+        supported_models=supported_models, server_config=server_config, http_options=http_options, **kwargs)

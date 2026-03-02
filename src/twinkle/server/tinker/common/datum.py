@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 from collections import defaultdict
 from tinker import types
-from typing import List, Union
 
 from twinkle.data_format.input_feature import InputFeature
 from twinkle.template import Template
@@ -92,6 +91,8 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
         labels_raw = input_feature['labels']
         if isinstance(labels_raw, np.ndarray):
             labels_arr = labels_raw.astype(np.int64)
+        elif isinstance(labels_raw, list):
+            labels_arr = np.asarray(labels_raw, dtype=np.int64)
         else:
             labels_arr = np.asarray(labels_raw.cpu(), dtype=np.int64)
 

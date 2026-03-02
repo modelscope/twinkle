@@ -127,7 +127,7 @@ def _make_patched_service_client_init(original):
             api_key = get_api_key()
 
         twinkle_headers = {
-            'serve_multiplexed_model_id': get_request_id(),
+            'X-Ray-Serve-Request-Id': get_request_id(),
             'Authorization': 'Bearer ' + api_key,
             'Twinkle-Authorization': 'Bearer ' + api_key,
         }

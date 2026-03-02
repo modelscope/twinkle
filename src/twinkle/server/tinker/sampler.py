@@ -23,6 +23,7 @@ from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
+from ..utils import wrap_builder_with_device_group_env
 from .common.io_utils import create_checkpoint_manager
 
 logger = get_logger()
@@ -245,3 +246,6 @@ def build_sampler_app(model_id: str,
 
     return SamplerManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, sampler_type,
                                                             engine_args, queue_config, **kwargs)
+
+
+build_sampler_app = wrap_builder_with_device_group_env(build_sampler_app)

@@ -7,6 +7,7 @@
 #      that the model has learned the custom identity.
 # The server must be running first (see server.py and server_config.yaml).
 import os
+import numpy as np
 from tqdm import tqdm
 from tinker import types
 from twinkle import init_tinker_client
@@ -76,9 +77,9 @@ def train():
             optim_result = optim_future.result()
 
             # Compute weighted average log-loss per token for monitoring
-            # logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
-            # weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
-            # print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
+            logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
+            weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
+            print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
             print(f'Training Metrics: {optim_result}')
 
         # Save a checkpoint after each epoch

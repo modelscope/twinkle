@@ -101,7 +101,7 @@ class ServerLauncher:
                 'build_sampler_app': build_sampler_app,
             }
         else:  # twinkle
-            from twinkle.server import build_model_app, build_processor_app, build_sampler_app, build_server_app
+            from twinkle.server.twinkle import build_model_app, build_processor_app, build_sampler_app, build_server_app
             self._builders = {
                 'build_server_app': build_server_app,
                 'build_model_app': build_model_app,
@@ -213,6 +213,11 @@ class ServerLauncher:
             if isinstance(deploy_config, dict):
                 # Copy all deployment options from the config, except 'name'.
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
+
+        # Pass http_options to server apps for internal proxy routing
+        http_options = self.config.get('http_options', {})
+        if http_options:
+            args['http_options'] = http_options
 
         # Build and deploy the application
         app = builder(deploy_options=deploy_options, **{k: v for k, v in args.items()})
