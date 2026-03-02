@@ -41,7 +41,7 @@ template = Template(model_id=f'ms://{base_model}')
 trajectory = Trajectory(
     messages=[
         Message(role='system', content='You are a helpful assistant'),
-        Message(role='user', content='你是谁？'),
+        Message(role='user', content='Who are you?'),
     ]
 )
 
