@@ -361,7 +361,7 @@ def _gated_delta_net_forward(self, hidden_states: torch.Tensor, **kwargs):
         res = res[attention_mask][:, None]
         res = torch.concat([res, res.new_zeros(seq_len - res.shape[0], 1, res.shape[2])])
     else:
-        res = res.transpose(0, 1)
+        res = res.transpose(0, 1).contiguous()
     if args.sequence_parallel and args.tensor_model_parallel_size > 1:
         res = reduce_scatter_to_sequence_parallel_region(res) / args.tensor_model_parallel_size
     return res, None
