@@ -7,7 +7,7 @@ authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "datasets>=3.0,<4.0",
-  "numpy>=2.0.0,!=2.4.0,<3.0.0",
+  "numpy>=2.0.0,<2.3.0",
   "omegaconf>=2.3.0,<3.0.0",
   "fastapi",
   "modelscope[framework]>=1.34.0",
@@ -44,10 +44,6 @@ packages = [
   { include = "twinkle", from = "src" },
   { include = "twinkle_client", from = "src" },
 ]
-
-[[tool.poetry.source]]
-name = "aliyun"
-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [build-system]
 requires = ["setuptools", "wheel"]
