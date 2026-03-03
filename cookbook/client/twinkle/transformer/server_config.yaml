@@ -34,7 +34,7 @@ applications:
 
   # 2. Model Service - Hosts the base model for training
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen3-4B
+  - name: models-Qwen3.5-4B
     route_prefix: /models/Qwen/Qwen3.5-4B   # REST path for this model
     import_path: model
     args:
@@ -91,7 +91,7 @@ applications:
 
   # 4. Sampler Service - Handles text generation inference
   #    Uses vLLM for efficient batched generation with optional LoRA adapters.
-  - name: sampler-Qwen3-4B
+  - name: sampler-Qwen3.5-4B
     route_prefix: /samplers/Qwen/Qwen3.5-4B   # REST path for this sampler
     import_path: sampler
     args:

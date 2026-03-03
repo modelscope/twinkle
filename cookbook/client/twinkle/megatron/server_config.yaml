@@ -34,7 +34,7 @@ applications:
 
   # 2. Model Service - Hosts the base model for training (Megatron backend)
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen3-4B
+  - name: models-Qwen3.5-4B
     route_prefix: /models/Qwen/Qwen3.5-4B   # REST path for this model
     import_path: model
     args:

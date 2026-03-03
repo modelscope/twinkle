@@ -36,7 +36,7 @@ applications:
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
-  - name: models-Qwen3-4B
+  - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
@@ -73,7 +73,7 @@ applications:
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
-  - name: sampler-Qwen3-4B
+  - name: sampler-Qwen3.5-4B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
     import_path: sampler
     args:
