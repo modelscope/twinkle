@@ -305,22 +305,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
             raise RuntimeError(f'Metadata bucket mismatch: got {got_bucket_id}, expected {bucket_id}')
         return metadata
 
-    @staticmethod
-    def _view_from_u8_buffer(
-        buffer: torch.Tensor,
-        offset: int,
-        size: int,
-        dtype: torch.dtype,
-        shape: torch.Size,
-    ) -> torch.Tensor:
-        raw = buffer[offset:offset + size]
-        itemsize = int(dtype.itemsize)
-        if itemsize > 1 and offset % itemsize != 0:
-            aligned = torch.empty(size, dtype=torch.uint8, device=buffer.device)
-            aligned.copy_(raw)
-            raw = aligned
-        return raw.view(dtype=dtype).view(shape)
-
     @torch.no_grad()
     async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
         assert self.rank is not None and self.rank <= 0
@@ -450,7 +434,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 total_chunks += 1
 
                 if nbytes == total_nbytes and chunk_offset == 0:
-                    tensor = self._view_from_u8_buffer(recv_buf, offset, nbytes, dtype, shape)
+                    tensor = recv_buf[offset:offset + nbytes].view(dtype=dtype).view(shape)
                     yield name, tensor
                     total_params += 1
                     continue
@@ -485,7 +469,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
                     )
                 if state['received'] == state['total']:
                     full_size = int(dtype.itemsize * shape.numel())
-                    tensor = self._view_from_u8_buffer(state['buffer'], 0, full_size, dtype, shape)
+                    tensor = state['buffer'][:full_size].view(dtype=dtype).view(shape)
                     yield name, tensor
                     total_params += 1
                     del partial_tensors[name]

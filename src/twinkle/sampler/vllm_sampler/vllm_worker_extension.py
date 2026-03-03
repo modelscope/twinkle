@@ -246,8 +246,6 @@ class TwinkleWorkerExtension:
                 if nbytes == total_nbytes and chunk_offset == 0:
                     if use_shm:
                         cpu_u8 = raw_u8.clone()
-                        # Keep SHM tensors on CPU; loading will copy into model params
-                        # without allocating an extra full-size temporary tensor on NPU.
                         tensor = cpu_u8.view(dtype=dtype).view(shape)
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape).clone()
