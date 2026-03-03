@@ -34,13 +34,13 @@ applications:
 
   # 2. Model Service - Hosts the base model for training (Megatron backend)
   #    This is the actual model worker that performs forward/backward passes.
-  - name: models-Qwen3-4B
-    route_prefix: /models/Qwen/Qwen3-4B   # REST path for this model
+  - name: models-Qwen3.5-4B
+    route_prefix: /models/Qwen/Qwen3.5-4B   # REST path for this model
     import_path: model
     args:
       use_megatron: true                               # Use Megatron-LM backend (not HuggingFace)
       mixed_precision: bf16
-      model_id: "ms://Qwen/Qwen3-4B"     # ModelScope model identifier to load
+      model_id: "ms://Qwen/Qwen3.5-4B"     # ModelScope model identifier to load
       nproc_per_node: 2               # Number of GPU processes per node
       device_group:                   # Logical device group for this model
         name: model

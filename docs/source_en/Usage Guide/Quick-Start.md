@@ -46,7 +46,7 @@ def train():
 
     dataset = PackingDataset(dataset_meta)
     dataset.map(SelfCognitionProcessor(model_name='Twinkle Model', model_author='ModelScope Community'))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B', max_length=512)
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
     dataset.encode()
     dataset.pack_dataset()
 
@@ -90,7 +90,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B')
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -98,7 +98,7 @@ def train():
     # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
-    model = TransformersModel(model_id='ms://Qwen/Qwen3-4B')
+    model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
@@ -130,7 +130,7 @@ if __name__ == '__main__':
     train()
 ```
 
-In this training code, we constructed a dataset and loaded the Qwen/Qwen3-4B model, used LoRA with the all-linear approach, and completed one training run. In the logs, you can observe the process of loss gradually converging.
+In this training code, we constructed a dataset and loaded the Qwen/Qwen3.5-4B model, used LoRA with the all-linear approach, and completed one training run. In the logs, you can observe the process of loss gradually converging.
 
 ### torchrun
 
@@ -158,7 +158,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B')
+    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -166,7 +166,7 @@ def train():
     # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
-    model = TransformersModel(model_id='ms://Qwen/Qwen3-4B')
+    model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
@@ -231,7 +231,7 @@ from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS',4))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
@@ -437,7 +437,7 @@ from twinkle_client.sampler import vLLMSampler
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = 'ms://Qwen/Qwen3-4B'
+MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 1e-5
@@ -682,7 +682,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.tinker.common import input_feature_to_datum
 
 # The base model to fine-tune / evaluate
-base_model = 'ms://Qwen/Qwen3-4B'
+base_model = 'ms://Qwen/Qwen3.5-4B'
 
 
 def train():
@@ -747,7 +747,7 @@ This service shares the same code as the Tinker API section described above. The
 Switch the prefix.
 
 ```text
-ms://Qwen/Qwen3-4B -> hf://Qwen/Qwen3-4B
+ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 ```
 
 ## 🛠️ Twinkle✨ Modular Ecosystem
@@ -874,10 +874,10 @@ DeviceGroup: Define how many resource groups are needed for this training sessio
 
 ```python
 from twinkle.model import TransformersModel
-model = TransformersModel(model_id='Qwen/Qwen3-4B', remote_group='default', device_mesh=device_mesh)
+model = TransformersModel(model_id='Qwen/Qwen3.5-4B', remote_group='default', device_mesh=device_mesh)
 # Or
 from twinkle.model import MegatronModel
-model = MegatronModel(model_id='Qwen/Qwen3-4B', remote_group='default', device_mesh=device_mesh)
+model = MegatronModel(model_id='Qwen/Qwen3.5-4B', remote_group='default', device_mesh=device_mesh)
 ```
 
 DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions, such as data acquisition, data consumption, data return, etc.
@@ -903,7 +903,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='Qwen/Qwen3-4B')
+    dataset.set_template('Template', model_id='Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -911,7 +911,7 @@ def train():
     # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=8, min_batch_size=8)
     # Use a TransformersModel
-    model = TransformersModel(model_id='Qwen/Qwen3-4B', remote_group='default')
+    model = TransformersModel(model_id='Qwen/Qwen3.5-4B', remote_group='default')
 
     lora_config = LoraConfig(
         r=8,
@@ -948,29 +948,3 @@ Start training like this:
 ```shell
 python3 train.py
 ```
-
-## Supported Large Language Models List
-
-| Model Type          | Model ID Example                                             |               Model Size                | Requires             | Support Megatron |                         HF Model ID                          |
-| ------------------- | ------------------------------------------------------------ | :-------------------------------------: | -------------------- | :--------------: | :----------------------------------------------------------: |
-| qwen2 series        | [Qwen/Qwen2-0.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-0.5B-Instruct) |            0.5B/1.5B/7B/72B             | transformers>=4.37   |        ✔         | [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) |
-|                     | [Qwen/Qwen2-1.5B](https://modelscope.cn/models/Qwen/Qwen2-1.5B) |            0.5B/1.5B/7B/72B             | transformers>=4.37   |        ✔         |  [Qwen/Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)   |
-|                     | [Qwen/Qwen2.5-1.5B-Instruct](https://modelscope.cn/models/Qwen/Qwen2.5-1.5B-Instruct) |       0.5B/1.5B/3B/7B/14B/32B/72B       | transformers>=4.37   |        ✔         | [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) |
-|                     | [Qwen/Qwen2.5-0.5B](https://modelscope.cn/models/Qwen/Qwen2.5-0.5B) |         0.5B/1.5B/3B/7B/14B/32B         | transformers>=4.37   |        ✔         | [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) |
-| qwen2_moe series    | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://modelscope.cn/models/Qwen/Qwen1.5-MoE-A2.7B-Chat) |                    -                    | transformers>=4.40   |        ✔         | [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat) |
-|                     | [Qwen/Qwen1.5-MoE-A2.7B](https://modelscope.cn/models/Qwen/Qwen1.5-MoE-A2.7B) |                    -                    | transformers>=4.40   |        ✔         | [Qwen/Qwen1.5-MoE-A2.7B](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B) |
-| qwen3 series        | [Qwen/Qwen3-14B-Base](https://modelscope.cn/models/Qwen/Qwen3-14B-Base) |           0.6B/1.7B/4B/8B/14B           | transformers>=4.51   |        ✔         | [Qwen/Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base) |
-|                     | [Qwen/Qwen3-32B](https://modelscope.cn/models/Qwen/Qwen3-32B) |         0.6B/1.7B/4B/8B/14B/32B         | transformers>=4.51   |        ✔         |   [Qwen/Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B)    |
-| qwen3_moe series    | [Qwen/Qwen3-30B-A3B-Base](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Base) |                    -                    | transformers>=4.51   |        ✔         | [Qwen/Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base) |
-|                     | [Qwen/Qwen3-30B-A3B](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B) |                    -                    | transformers>=4.51   |        ✔         | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
-|                     | [Qwen/Qwen3-235B-A22B](https://modelscope.cn/models/Qwen/Qwen3-235B-A22B) |                    -                    | transformers>=4.51   |        ✔         | [Qwen/Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B) |
-| chatglm2 series     | [ZhipuAI/chatglm2-6b](https://modelscope.cn/models/ZhipuAI/chatglm2-6b) |                6b/6b-32k                | transformers<4.42    |        ✘         | [zai-org/chatglm2-6b](https://huggingface.co/zai-org/chatglm2-6b) |
-| chatglm3 series     | [ZhipuAI/chatglm3-6b](https://modelscope.cn/models/ZhipuAI/chatglm3-6b) |        6b/6b-base/6b-32k/6b-128k        | transformers<4.42    |        ✘         | [zai-org/chatglm3-6b](https://huggingface.co/zai-org/chatglm3-6b) |
-| chatglm4 series     | [ZhipuAI/glm-4-9b-chat](https://modelscope.cn/models/ZhipuAI/glm-4-9b-chat) | glm-4-9b/glm-4-9b-chat/glm-4-9b-chat-1m | transformers>=4.42   |        ✘         | [zai-org/glm-4-9b-chat](https://huggingface.co/zai-org/glm-4-9b-chat) |
-|                     | [ZhipuAI/LongWriter-glm4-9b](https://modelscope.cn/models/ZhipuAI/LongWriter-glm4-9b) |                    -                    | transformers>=4.42   |        ✘         | [zai-org/LongWriter-glm4-9b](https://huggingface.co/zai-org/LongWriter-glm4-9b) |
-| glm_edge series     | [ZhipuAI/glm-edge-1.5b-chat](https://modelscope.cn/models/ZhipuAI/glm-edge-1.5b-chat) |            1.5b-chat/4b-chat            | transformers>=4.46   |        ✘         | [zai-org/glm-edge-1.5b-chat](https://huggingface.co/zai-org/glm-edge-1.5b-chat) |
-| internlm2 series    | [Shanghai_AI_Laboratory/internlm2-1_8b](https://modelscope.cn/models/Shanghai_AI_Laboratory/internlm2-1_8b) | 1_8b/chat-1_8b-sft/base-7b/7b/chat-7b/  | transformers>=4.38   |        ✘         | [internlm/internlm2-1_8b](https://huggingface.co/internlm/internlm2-1_8b) |
-| deepseek_v1         | [deepseek-ai/DeepSeek-V2-Lite](https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite) |   V2/V2-Lite/V2-Chat/2-Lite-Chat/V2.5   | transformers>=4.39.3 |        ✔         | [deepseek-ai/DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) |
-|                     | [deepseek-ai/DeepSeek-Prover-V2-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-Prover-V2-7B) |                    -                    | transformers>=4.39.3 |        ✔         | [deepseek-ai/DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B) |
-|                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1) |                    -                    | transformers>=4.39.3 |        ✔         | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) |
-| deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |             1.5B/7B/14B/32B             | transformers>=4.37   |        ✔         | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |
