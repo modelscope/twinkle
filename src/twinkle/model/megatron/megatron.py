@@ -34,7 +34,13 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, exists
 from .strategy import MegatronStrategy
+from transformers.utils import is_torch_npu_available
 
+if is_torch_npu_available():
+    # Enable Megatron on Ascend NPU
+    from mindspeed.megatron_adaptor import repatch
+else:
+    repatch = None
 
 @dataclass
 class MegatronOptimizerGroup:
@@ -71,7 +77,17 @@ class MegatronOptimizerGroup:
 
     def __post_init__(self):
         if self._device_mesh.data_world_size > 1:
-            self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
+            is_npu = is_torch_npu_available()
+            has_fsdp = (getattr(self._device_mesh, 'fsdp_world_size', 0) or 0) > 1
+
+            if is_npu and not has_fsdp:
+                # On NPU/HCCL without FSDP, cached dim-group creation avoids
+                # inconsistent creation order issues.
+                self._dp_group = self._device_mesh.get_dim_group('dp')
+            else:
+                # Keep metrics/data aggregation on the full data axis.
+                # This must include fsdp when fsdp_size > 1.
+                self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
         self.train_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
@@ -223,6 +239,24 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             sequence_parallel=self.strategy.sequence_parallel,
             **ac_kwargs,
         )
+
+        is_npu = is_torch_npu_available()
+
+        if repatch is not None and is_npu:
+            from dataclasses import asdict
+            megatron_args = asdict(args)
+            try:
+                repatch(megatron_args)
+            except NameError as e:
+                # MindSpeed 0.12.1 has a known repatch bug:
+                # mindspeed/patch_utils.py references `inspect` without importing it.
+                # Keep training alive with initial patches already applied at import time.
+                if 'inspect' in str(e):
+                    logging.getLogger(__name__).warning(
+                        'Skip MindSpeed repatch due to upstream bug (%s). Continue with initial patches.', e)
+                else:
+                    raise
+
         set_args(args)
         self._initialized = False
         self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
@@ -433,6 +467,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
+            local_device = Platform.get_local_device()
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor) and value.device != local_device:
+                    batch[key] = value.to(local_device, non_blocking=True)
             labels = batch.pop('labels', None)
             output_tensor = model(**batch)
             batch['labels'] = labels
@@ -726,30 +764,46 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         lr = kwargs.pop('lr', 1e-4)
         use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', False)
 
-        opt_config = OptimizerConfig(
-            optimizer='adam',
-            lr=lr,
-            min_lr=kwargs.get('min_lr', 0.0),
-            weight_decay=kwargs.get('weight_decay', 0.01),
-            adam_beta1=kwargs.get('adam_beta1', 0.9),
-            adam_beta2=kwargs.get('adam_beta2', 0.999),
-            adam_eps=kwargs.get('adam_eps', 1e-8),
-            clip_grad=kwargs.get('clip_grad', 1.0),
-            bf16=kwargs.get('bf16', True),
-            use_distributed_optimizer=use_distributed_optimizer,
-            overlap_param_gather=kwargs.get('overlap_param_gather', False),
-            log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
-            **kwargs,
-        )
+        config_sig = inspect.signature(OptimizerConfig).parameters
+        overlap_param_gather = kwargs.get('overlap_param_gather', False)
+        overlap_param_gather_with_step = kwargs.get('overlap_param_gather_with_optimizer_step', overlap_param_gather)
+
+        config_kwargs = {
+            'optimizer': 'adam',
+            'lr': lr,
+            'min_lr': kwargs.get('min_lr', 0.0),
+            'weight_decay': kwargs.get('weight_decay', 0.01),
+            'adam_beta1': kwargs.get('adam_beta1', 0.9),
+            'adam_beta2': kwargs.get('adam_beta2', 0.999),
+            'adam_eps': kwargs.get('adam_eps', 1e-8),
+            'clip_grad': kwargs.get('clip_grad', 1.0),
+            'bf16': kwargs.get('bf16', True),
+            'use_distributed_optimizer': use_distributed_optimizer,
+            'log_num_zeros_in_grad': kwargs.get('log_num_zeros_in_grad', False),
+        }
+        if 'overlap_param_gather' in config_sig:
+            config_kwargs['overlap_param_gather'] = overlap_param_gather
+        if 'overlap_param_gather_with_optimizer_step' in config_sig:
+            config_kwargs['overlap_param_gather_with_optimizer_step'] = overlap_param_gather_with_step
+
+        # Keep compatibility across Megatron-Core versions by only forwarding supported args.
+        for key, value in kwargs.items():
+            if key in config_sig and key not in config_kwargs:
+                config_kwargs[key] = value
+
+        opt_config = OptimizerConfig(**config_kwargs)
 
         # Ensure each model chunk has ddp_config attached (required by Megatron optimizer)
         from megatron.core.distributed import DistributedDataParallelConfig
+        is_npu = is_torch_npu_available()
+
         model_chunks = self.model
         for model_chunk in model_chunks:
             assert hasattr(model_chunk, 'ddp_config')
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
+            use_gloo_process_groups=False if is_npu else True
         )
         return optimizer
 
@@ -1419,12 +1473,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         from .args import get_args
         self._try_init_process_group()
         args = get_args()
+        is_npu = is_torch_npu_available()
         init_kwargs = {
             'tensor_model_parallel_size': args.tensor_model_parallel_size,
             'pipeline_model_parallel_size': args.pipeline_model_parallel_size,
             'context_parallel_size': args.context_parallel_size,
             'virtual_pipeline_model_parallel_size': args.virtual_pipeline_model_parallel_size,
             'expert_model_parallel_size': args.expert_model_parallel_size,
+            'create_gloo_process_groups': False if is_npu else True,
         }
 
         if args.order:

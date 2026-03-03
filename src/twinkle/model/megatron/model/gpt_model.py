@@ -6,7 +6,6 @@ from copy import deepcopy
 from megatron.core import mpu
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt import GPTModel as McoreGPTModel
@@ -27,6 +26,16 @@ from .rope import dynamic_rope_update, get_rope_inv_freq
 logger = get_logger()
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
+
+try:
+    from megatron.core.extensions.transformer_engine import TELinear
+except ImportError:
+
+    class TELinear(torch.nn.Module):
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            raise RuntimeError('TransformerEngine is required to instantiate OutputLayerLinear.')
 
 
 class OutputLayerLinear(TELinear):

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional
 
+from transformers.utils import is_torch_npu_available
+
 from twinkle import DeviceMesh
 from twinkle.utils import exists
 from .utils import convert_hf_config
@@ -435,7 +437,8 @@ class TwinkleMegatronArgs:
         if self._model is not None:
             return self._model
         from megatron.core import parallel_state as mpu
-        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+        from megatron.core.models.gpt.gpt_layer_specs import (get_gpt_layer_local_spec,
+                                                               get_gpt_layer_with_transformer_engine_spec)
         from megatron.core.transformer import TransformerConfig
         from megatron.core.transformer.enums import AttnBackend
 
@@ -614,17 +617,27 @@ class TwinkleMegatronArgs:
         # Save transformer config for later use (e.g., DDP wrapping)
         self.config = config
 
-        # Get layer spec - enable moe_grouped_gemm for MoE models
+        is_npu = is_torch_npu_available()
+
         moe_grouped_gemm = num_experts > 0
-        try:
-            layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        if is_npu:
+            layer_spec = get_gpt_layer_local_spec(
                 num_experts=mg_config_dict.get('num_experts'),
                 moe_grouped_gemm=moe_grouped_gemm,
                 qk_layernorm=mg_config_dict.get('qk_layernorm', False),
+                normalization='RMSNorm',
             )
-        except (ImportError, AttributeError):
-            raise RuntimeError(
-                'TransformerEngine is not installed or not compatible with this version of Megatron-Core.')
+        else:
+            try:
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=mg_config_dict.get('num_experts'),
+                    moe_grouped_gemm=moe_grouped_gemm,
+                    qk_layernorm=mg_config_dict.get('qk_layernorm', False),
+                )
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError(
+                    'TransformerEngine is not installed or not compatible with this version of Megatron-Core.'
+                ) from e
 
         # Create model
         max_seq_length = getattr(hf_config, 'max_position_embeddings', 4096)

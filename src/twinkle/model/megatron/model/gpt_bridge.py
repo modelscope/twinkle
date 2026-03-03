@@ -1249,8 +1249,12 @@ class GPTBridge:
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 'input_layernorm.weight', to_mcore)
+            # TE spec keeps attention LN under linear_qkv.layer_norm_weight,
+            # while local spec keeps it as input_layernorm.weight.
+            attn_ln_key = 'self_attention.linear_qkv.layer_norm_weight'
+            if deep_getattr(mg_layer, attn_ln_key) is None:
+                attn_ln_key = 'input_layernorm.weight'
+            self._set_state_dict(mg_layer, attn_ln_key, hf_state_dict, 'input_layernorm.weight', to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
@@ -1264,8 +1268,12 @@ class GPTBridge:
                                  to_mcore)
         else:
             hf_state_dict.update(self._set_mlp_state(mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
-                                 'post_attention_layernorm.weight', to_mcore)
+            # TE spec keeps MLP LN under linear_fc1.layer_norm_weight,
+            # while local spec keeps it as pre_mlp_layernorm.weight.
+            mlp_ln_key = 'mlp.linear_fc1.layer_norm_weight'
+            if deep_getattr(mg_layer, mlp_ln_key) is None:
+                mlp_ln_key = 'pre_mlp_layernorm.weight'
+            self._set_state_dict(mg_layer, mlp_ln_key, hf_state_dict, 'post_attention_layernorm.weight', to_mcore)
         return hf_state_dict
 
     def _set_layer_state(self, mg_layer, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):

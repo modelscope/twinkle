@@ -1,6 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import List, Union
 
+import torch.distributed as dist
+
+from transformers.utils import is_torch_npu_available
+
+from twinkle import Platform
 from twinkle.data_format import InputFeature, ModelOutput
 from .base import Metric
 
@@ -46,19 +51,36 @@ class LossMetric(Metric):
         self.num_tokens = 0
 
     def calculate(self):
-        local_results = [{
-            'loss': self.total_loss,
-            'count': self.total_count,
-            'grad_norm': self.grad_norm,
-            'num_tokens': self.num_tokens
-        }]
+        total_loss = float(self.total_loss)
+        total_count = float(self.total_count)
+        grad_norm = float(self.grad_norm)
+        num_tokens = float(self.num_tokens)
 
-        all_results = self.gather_results(local_results)
+        if self.device_mesh is not None and self.process_group is not None and dist.is_initialized():
+            is_npu = is_torch_npu_available()
+            if is_npu:
+                # On NPU/HCCL, tensor all_reduce is more stable than all_gather_object.
+                import torch
+                device = Platform.get_local_device()
+                stats = torch.tensor([total_loss, total_count, num_tokens], dtype=torch.float64, device=device)
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=self.process_group)
+                total_loss, total_count, num_tokens = stats.tolist()
 
-        total_loss = sum(r['loss'] for r in all_results)
-        total_count = sum(r['count'] for r in all_results)
-        grad_norm = max(r['grad_norm'] for r in all_results)
-        num_tokens = sum(r['num_tokens'] for r in all_results)
+                grad_tensor = torch.tensor([grad_norm], dtype=torch.float64, device=device)
+                dist.all_reduce(grad_tensor, op=dist.ReduceOp.MAX, group=self.process_group)
+                grad_norm = grad_tensor.item()
+            else:
+                local_results = [{
+                    'loss': total_loss,
+                    'count': total_count,
+                    'grad_norm': grad_norm,
+                    'num_tokens': num_tokens
+                }]
+                all_results = self.gather_results(local_results)
+                total_loss = sum(r['loss'] for r in all_results)
+                total_count = sum(r['count'] for r in all_results)
+                grad_norm = max(r['grad_norm'] for r in all_results)
+                num_tokens = sum(r['num_tokens'] for r in all_results)
         if num_tokens > 0:
             avg_loss = total_loss / num_tokens
         else:
