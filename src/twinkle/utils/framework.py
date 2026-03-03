@@ -126,10 +126,10 @@ class Torch(Framework):
             local_rank = max(0, Platform.get_local_rank())
         local_rank = str(local_rank)
         if Torch.is_gpu_available():
-            from .platform import GPU
+            from .platforms import GPU
             device = f'{GPU.device_prefix()}:{local_rank}'
         elif Torch.is_npu_available():
-            from .platform import NPU
+            from .platforms import NPU
             device = f'{NPU.device_prefix()}:{local_rank}'
         else:
             device = 'cpu'

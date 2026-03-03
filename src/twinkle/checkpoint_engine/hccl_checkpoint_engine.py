@@ -2,23 +2,23 @@
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/hccl_checkpoint_engine.py
 """HCCL-based checkpoint engine for Ascend NPU.
 
-This engine uses HCCL broadcast for efficient NPU-to-NPU weight transfer
-across different processes/nodes. It supports:
-- Double buffering for pipelined transfer
-- ZMQ for metadata, HCCL for weight data
-- Streaming weight transfer to avoid OOM
+This implementation keeps HCCL for weight payload transfer and uses a
+reliable ZMQ REQ/REP control channel for bucket metadata handshakes.
 """
 
-import asyncio
+from __future__ import annotations
+
+import os
 import time
-import torch
-import zmq
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
+import torch
+import zmq
+
 from twinkle import get_logger
 from twinkle.utils import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
-from .base import CheckpointEngine, TensorMeta
+from .base import CheckpointEngine
 
 logger = get_logger()
 
@@ -26,79 +26,15 @@ logger = get_logger()
 @dataclass
 class MasterMetadata:
     """Metadata from the master for process group initialization."""
+
     zmq_ip: str
     zmq_port: int
     dist_ip: str
     dist_port: int
 
 
-class BroadcastOperation:
-    """Async broadcast operation with HCCL in separate thread.
-
-    Args:
-        rank: The rank of the current process.
-        process_group: The HCCL process group.
-        bucket: The tensor buffer to broadcast.
-        metadata: The metadata of tensors in the bucket.
-        socket: The ZMQ socket for metadata communication.
-        topic: The ZMQ topic for pub/sub.
-    """
-
-    def __init__(
-        self,
-        rank: int,
-        process_group,
-        bucket: torch.Tensor,
-        metadata: dict[str, TensorMeta],
-        socket: zmq.Socket,
-        topic: str,
-    ) -> None:
-        self.rank = rank
-        self.pyhccl = process_group
-        self.bucket = bucket
-        self.metadata = metadata
-        self.socket = socket
-        self.topic = topic
-
-        loop = asyncio.get_running_loop()
-        self._task = loop.run_in_executor(None, self._run)
-
-    def _run(self):
-        """Execute the broadcast operation in a thread."""
-        # Broadcast tensor metadata via ZMQ PUB/SUB
-        if self.rank == 0:
-            self.socket.send_string(self.topic, flags=zmq.SNDMORE)
-            self.socket.send_pyobj(self.metadata)
-        else:
-            self.socket.recv_string()
-            self.metadata = self.socket.recv_pyobj()
-
-        # Broadcast tensor data via HCCL
-        self.pyhccl.broadcast(self.bucket, src=0)
-
-    async def wait_for_complete(self) -> dict[str, TensorMeta]:
-        """Wait for the broadcast operation to complete.
-
-        Returns:
-            The bucket metadata after broadcast.
-        """
-        await self._task
-        return self.metadata
-
-
 class HCCLCheckpointEngine(CheckpointEngine):
-    """HCCL checkpoint engine for Ascend NPU.
-
-    Same lifecycle and semantics as NCCLCheckpointEngine but uses HCCL
-    instead of NCCL and stateless_init_process_group instead of
-    ray.util.collective.
-
-    Args:
-        bucket_size: Bucket size in bytes for weight transfer.
-        group_name: Name of the process group.
-        rebuild_group: Whether to rebuild the group each sync.
-        rollout_dtype: Target dtype for weights.
-    """
+    """HCCL checkpoint engine for Ascend NPU."""
 
     def __init__(
         self,
@@ -108,76 +44,92 @@ class HCCLCheckpointEngine(CheckpointEngine):
         rollout_dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> None:
+        bucket_mb_env = os.environ.get('TWINKLE_CKPT_HCCL_BUCKET_MB')
+        if bucket_mb_env:
+            bucket_size = int(bucket_mb_env) << 20
+
         self.bucket_size = bucket_size
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.pyhccl = None
 
-        # Get current NPU device
+        self.meta_timeout_s = int(os.environ.get('TWINKLE_CKPT_HCCL_META_TIMEOUT_S', '300'))
+        self.meta_timeout_ms = self.meta_timeout_s * 1000
+
         try:
             self.device = torch.npu.current_device()
         except Exception:
             self.device = 0
 
-        # Set by Manager before prepare() via attribute assignment
         self.is_master = False
-        self.topic = 'bucket_metadata'
 
-        # Will be set during prepare / init_process_group
-        self.rank = None
-        self.world_size = None
-        self.send_buf = None
-        self.recv_buf = None
-        self.socket = None
+        self.rank: int | None = None
+        self.world_size: int | None = None
+        self.send_buf: torch.Tensor | None = None
+        self.recv_buf: torch.Tensor | None = None
+        self.socket: zmq.Socket | None = None
+        self._zmq_ctx: zmq.Context | None = None
 
-        # Track whether resources are ready for reuse
         self._prepared = False
         self._group_initialized = False
+        self.ip: str | None = None
+        self.zmq_port: int | None = None
+        self.dist_port: int | None = None
 
-    # ── ZMQ helpers ──────────────────────────────────────────────────────
+    def _new_socket(self, socket_type: int) -> zmq.Socket:
+        assert self._zmq_ctx is not None
+        socket = self._zmq_ctx.socket(socket_type)
+        socket.setsockopt(zmq.RCVTIMEO, self.meta_timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, self.meta_timeout_ms)
+        socket.setsockopt(zmq.LINGER, 0)
+        return socket
+
+    def _recv_pyobj(self, where: str) -> Any:
+        assert self.socket is not None
+        try:
+            return self.socket.recv_pyobj()
+        except zmq.error.Again as e:
+            raise RuntimeError(
+                f'HCCL metadata timeout ({self.meta_timeout_s}s) waiting at {where}.'
+            ) from e
+
+    def _send_pyobj(self, payload: Any, where: str) -> None:
+        assert self.socket is not None
+        try:
+            self.socket.send_pyobj(payload)
+        except zmq.error.Again as e:
+            raise RuntimeError(
+                f'HCCL metadata timeout ({self.meta_timeout_s}s) sending at {where}.'
+            ) from e
 
     def _start_zmq_server(self):
-        """Start ZMQ PUB server for metadata broadcast (master only)."""
         self.ip = find_node_ip()
         self.zmq_port = find_free_port()
         self.dist_port = find_free_port()
 
-        context = zmq.Context()
-        self.socket = context.socket(zmq.PUB)
+        self._zmq_ctx = zmq.Context()
+        self.socket = self._new_socket(zmq.REP)
         if is_valid_ipv6_address(self.ip):
             address = f'tcp://[{self.ip}]:{self.zmq_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
             address = f'tcp://{self.ip}:{self.zmq_port}'
-
         self.socket.bind(address)
-        logger.debug(f'ZMQ PUB server started at {address}')
+        logger.debug(f'ZMQ REP server started at {address}')
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
-        """Connect to the ZMQ PUB server as a subscriber (receiver only)."""
-        context = zmq.Context()
-        self.socket = context.socket(zmq.SUB)
+        self._zmq_ctx = zmq.Context()
+        self.socket = self._new_socket(zmq.REQ)
         if is_valid_ipv6_address(metadata.zmq_ip):
             address = f'tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}'
             self.socket.setsockopt(zmq.IPV6, 1)
         else:
             address = f'tcp://{metadata.zmq_ip}:{metadata.zmq_port}'
-
         self.socket.connect(address)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
-        logger.debug(f'ZMQ SUB client connected to {address}')
-
-    # ── Core lifecycle ───────────────────────────────────────────────────
+        logger.debug(f'ZMQ REQ client connected to {address}')
 
     def prepare(self) -> MasterMetadata | None:
-        """Allocate double buffers and start ZMQ server (master only).
-
-        Idempotent: skips if already prepared.
-
-        Returns:
-            MasterMetadata with ZMQ/dist IP/port if master, else None.
-        """
         if self._prepared:
             if self.is_master:
                 return MasterMetadata(
@@ -200,15 +152,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 dist_ip=self.ip,
                 dist_port=self.dist_port,
             )
+
         self._prepared = True
         return None
 
     def finalize(self):
-        """Clean up resources after a sync.
-
-        When ``rebuild_group=False``: keeps everything alive for reuse.
-        When ``rebuild_group=True``: full teardown.
-        """
         if self.rebuild_group:
             if self.socket is not None:
                 try:
@@ -216,6 +164,13 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 except Exception as e:
                     logger.warning(f'Error closing ZMQ socket: {e}')
                 self.socket = None
+
+            if self._zmq_ctx is not None:
+                try:
+                    self._zmq_ctx.term()
+                except Exception as e:
+                    logger.warning(f'Error terminating ZMQ context: {e}')
+                self._zmq_ctx = None
 
             if self.rank is not None and self.rank >= 0 and self.pyhccl is not None:
                 try:
@@ -238,10 +193,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
         rollout_world_size: int,
         metadata: list[dict],
     ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
-        """Build communication topology for HCCL broadcast.
-
-        Same topology as NCCLCheckpointEngine.
-        """
         master_metadata = None
         for m in metadata:
             if m is not None:
@@ -261,24 +212,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
         return trainer_kwargs, rollout_kwargs
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
-        """Initialize the HCCL process group.
-
-        Idempotent: if already initialized and ``rebuild_group`` is False,
-        this is a fast no-op.
-
-        Args:
-            rank: The rank of this worker (-1 for non-participating trainers).
-            world_size: Total number of workers in the sync group.
-            master_metadata: Metadata from the master.
-        """
-        # Non-participating trainer ranks
         if rank < 0:
             self.rank = rank
             self.world_size = world_size
             self._group_initialized = True
             return
 
-        # Fast path: already initialized
         if self._group_initialized and not self.rebuild_group:
             return
 
@@ -297,143 +236,273 @@ class HCCLCheckpointEngine(CheckpointEngine):
             assert self.rank == rank
             assert self.world_size == world_size
 
-        # Receivers connect to master's ZMQ PUB server
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
-        # Barrier using all_reduce
         signal = torch.tensor([1], dtype=torch.int8, device=torch.npu.current_device())
         self.pyhccl.all_reduce(signal)
 
         self._group_initialized = True
         logger.info(f'init_process_group: rank={self.rank}, world_size={self.world_size}')
 
-    # ── Send / Receive ───────────────────────────────────────────────────
+    def _serve_bucket_requests(self, bucket_id: int, metadata: dict[str, Any]) -> None:
+        assert self.rank == 0
+        assert self.world_size is not None
+
+        if self.world_size <= 1:
+            return
+
+        pending = set(range(1, self.world_size))
+        while pending:
+            req = self._recv_pyobj(f'NEXT request for bucket={bucket_id}')
+
+            if not isinstance(req, dict) or req.get('type') != 'NEXT':
+                self._send_pyobj({'ok': False, 'error': f'unexpected message: {req}'}, 'NEXT reply')
+                continue
+
+            req_rank = int(req.get('rank', -1))
+            req_bucket_id = int(req.get('bucket_id', -1))
+
+            if req_rank not in pending:
+                self._send_pyobj(
+                    {'ok': False, 'error': f'unexpected/duplicate rank={req_rank}'},
+                    'NEXT reply',
+                )
+                continue
+            if req_bucket_id != bucket_id:
+                self._send_pyobj(
+                    {
+                        'ok': False,
+                        'error': f'bucket mismatch rank={req_rank} got={req_bucket_id} expected={bucket_id}',
+                    },
+                    'NEXT reply',
+                )
+                continue
+
+            self._send_pyobj({'ok': True, 'metadata': metadata}, 'NEXT reply')
+            pending.remove(req_rank)
+
+    def _request_bucket(self, bucket_id: int) -> dict[str, Any]:
+        assert self.rank is not None and self.rank > 0
+
+        self._send_pyobj(
+            {'type': 'NEXT', 'rank': self.rank, 'bucket_id': bucket_id},
+            f'NEXT send bucket={bucket_id}',
+        )
+        resp = self._recv_pyobj(f'NEXT recv bucket={bucket_id}')
+
+        if not isinstance(resp, dict):
+            raise RuntimeError(f'Invalid metadata response for bucket {bucket_id}: {resp}')
+        if not resp.get('ok', False):
+            raise RuntimeError(
+                f'Metadata request failed for bucket {bucket_id}: {resp.get("error", "unknown")}'
+            )
+        metadata = resp.get('metadata')
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f'Invalid metadata payload for bucket {bucket_id}: {metadata}')
+        got_bucket_id = int(metadata.get('bucket_id', -1))
+        if got_bucket_id != bucket_id:
+            raise RuntimeError(f'Metadata bucket mismatch: got {got_bucket_id}, expected {bucket_id}')
+        return metadata
+
+    @staticmethod
+    def _view_from_u8_buffer(
+        buffer: torch.Tensor,
+        offset: int,
+        size: int,
+        dtype: torch.dtype,
+        shape: torch.Size,
+    ) -> torch.Tensor:
+        raw = buffer[offset:offset + size]
+        itemsize = int(dtype.itemsize)
+        if itemsize > 1 and offset % itemsize != 0:
+            aligned = torch.empty(size, dtype=torch.uint8, device=buffer.device)
+            aligned.copy_(raw)
+            raw = aligned
+        return raw.view(dtype=dtype).view(shape)
 
     @torch.no_grad()
     async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
-        """Send model weights via HCCL broadcast."""
         assert self.rank is not None and self.rank <= 0
-
         if self.rank < 0:
-            for name, weight in weights:
+            for _name, _weight in weights:
                 pass
             return
 
-        send_buf, recv_buf = self.send_buf, self.recv_buf
-        broadcast_op = None
+        assert self.send_buf is not None
 
+        send_buf = self.send_buf
         start_time = time.time()
-        bucket_meta: dict[str, TensorMeta] = {}
+        bucket_meta: list[dict[str, Any]] = []
         offset = 0
+        bucket_id = 0
+        total_params = 0
+        total_chunks = 0
+
+        def _flush(is_last: bool):
+            nonlocal bucket_meta, offset, bucket_id, total_chunks
+            if not bucket_meta and not is_last:
+                return
+
+            metadata = {
+                'bucket_id': bucket_id,
+                'is_last': is_last,
+                'bucket_meta': bucket_meta,
+                'payload_size': offset,
+            }
+            self._serve_bucket_requests(bucket_id, metadata)
+            self.pyhccl.broadcast(send_buf, src=0)
+            torch.npu.synchronize()
+
+            total_chunks += len(bucket_meta)
+            bucket_id += 1
+            bucket_meta = []
+            offset = 0
 
         for name, weight in weights:
-            if offset + weight.nbytes > self.bucket_size:
-                torch.npu.synchronize()
+            total_params += 1
+            if weight.device.type != 'npu':
+                weight = weight.to('npu')
+            if not weight.is_contiguous():
+                weight = weight.contiguous()
 
-                if broadcast_op is not None:
-                    await broadcast_op.wait_for_complete()
+            weight_u8 = weight.view(-1).view(torch.uint8)
+            nbytes = int(weight_u8.numel())
+            if nbytes == 0:
+                if offset >= self.bucket_size:
+                    _flush(is_last=False)
+                bucket_meta.append({
+                    'name': name,
+                    'shape': weight.shape,
+                    'dtype': weight.dtype,
+                    'offset': offset,
+                    'nbytes': 0,
+                    'chunk_offset': 0,
+                    'total_nbytes': 0,
+                })
+                continue
 
-                broadcast_op = BroadcastOperation(
-                    rank=self.rank,
-                    process_group=self.pyhccl,
-                    bucket=send_buf,
-                    metadata={
-                        'bucket_meta': bucket_meta,
-                        'is_last': False
-                    },
-                    socket=self.socket,
-                    topic=self.topic,
+            chunk_offset = 0
+            while chunk_offset < nbytes:
+                if offset >= self.bucket_size:
+                    _flush(is_last=False)
+
+                chunk_nbytes = min(self.bucket_size - offset, nbytes - chunk_offset)
+                send_buf[offset:offset + chunk_nbytes].copy_(
+                    weight_u8[chunk_offset:chunk_offset + chunk_nbytes]
                 )
+                bucket_meta.append({
+                    'name': name,
+                    'shape': weight.shape,
+                    'dtype': weight.dtype,
+                    'offset': offset,
+                    'nbytes': chunk_nbytes,
+                    'chunk_offset': chunk_offset,
+                    'total_nbytes': nbytes,
+                })
+                offset += chunk_nbytes
+                chunk_offset += chunk_nbytes
 
-                send_buf, recv_buf = recv_buf, send_buf
-                bucket_meta = {}
-                offset = 0
-
-            assert offset + weight.nbytes <= self.bucket_size
-
-            bucket_meta[name] = {
-                'name': name,
-                'shape': weight.shape,
-                'dtype': weight.dtype,
-                'offset': offset,
-            }
-            send_buf[offset:offset + weight.nbytes] = weight.view(-1).view(torch.uint8)
-            offset += weight.nbytes
-
-        torch.npu.synchronize()
-        if broadcast_op is not None:
-            await broadcast_op.wait_for_complete()
-
-        broadcast_op = BroadcastOperation(
-            rank=self.rank,
-            process_group=self.pyhccl,
-            bucket=send_buf,
-            metadata={
-                'bucket_meta': bucket_meta,
-                'is_last': True
-            },
-            socket=self.socket,
-            topic=self.topic,
-        )
-        await broadcast_op.wait_for_complete()
+        _flush(is_last=True)
 
         elapsed = time.time() - start_time
-        logger.info(f'send_weights done: rank={self.rank}, time={elapsed:.2f}s')
+        logger.info(
+            f'send_weights done: rank={self.rank}, params={total_params}, '
+            f'chunks={total_chunks}, time={elapsed:.2f}s'
+        )
 
     @torch.no_grad()
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
-        """Receive model weights via HCCL broadcast."""
         assert self.rank is not None and self.rank > 0
+        assert self.recv_buf is not None
 
-        send_buf, recv_buf = self.send_buf, self.recv_buf
-        total_bytes, total_params = 0, 0
-
+        recv_buf = self.recv_buf
+        bucket_id = 0
+        total_params = 0
+        total_chunks = 0
+        total_bytes = 0
         start_time = time.time()
-        broadcast_op = BroadcastOperation(
-            rank=self.rank,
-            process_group=self.pyhccl,
-            bucket=recv_buf,
-            metadata=None,
-            socket=self.socket,
-            topic=self.topic,
-        )
-        metadata = await broadcast_op.wait_for_complete()
-        total_bytes += self.bucket_size
-        total_params += len(metadata['bucket_meta'])
+        partial_tensors: dict[str, dict[str, Any]] = {}
 
-        send_buf, recv_buf = recv_buf, send_buf
-
-        while not metadata['is_last']:
-            broadcast_op = BroadcastOperation(
-                rank=self.rank,
-                process_group=self.pyhccl,
-                bucket=recv_buf,
-                metadata=None,
-                socket=self.socket,
-                topic=self.topic,
-            )
-
-            for name, meta in metadata['bucket_meta'].items():
-                dtype, shape = meta['dtype'], meta['shape']
-                size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
-                yield name, tensor
-
-            metadata = await broadcast_op.wait_for_complete()
-            total_bytes += self.bucket_size
-            total_params += len(metadata['bucket_meta'])
-
+        while True:
+            metadata = self._request_bucket(bucket_id)
+            self.pyhccl.broadcast(recv_buf, src=0)
             torch.npu.synchronize()
-            send_buf, recv_buf = recv_buf, send_buf
 
-        for name, meta in metadata['bucket_meta'].items():
-            dtype, shape = meta['dtype'], meta['shape']
-            size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
-            yield name, tensor
+            bucket_meta = metadata['bucket_meta']
+            if isinstance(bucket_meta, dict):
+                entries = bucket_meta.values()
+            else:
+                entries = bucket_meta
+
+            payload_size = int(metadata.get('payload_size', self.bucket_size))
+            total_bytes += payload_size
+
+            for meta in entries:
+                name = meta['name']
+                dtype = meta['dtype']
+                shape = meta['shape']
+                shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
+                offset = int(meta['offset'])
+                nbytes = int(meta.get('nbytes', int(dtype.itemsize * shape.numel())))
+                chunk_offset = int(meta.get('chunk_offset', 0))
+                total_nbytes = int(meta.get('total_nbytes', int(dtype.itemsize * shape.numel())))
+                total_chunks += 1
+
+                if nbytes == total_nbytes and chunk_offset == 0:
+                    tensor = self._view_from_u8_buffer(recv_buf, offset, nbytes, dtype, shape)
+                    yield name, tensor
+                    total_params += 1
+                    continue
+
+                state = partial_tensors.get(name)
+                if state is None:
+                    state = {
+                        'buffer': torch.empty(total_nbytes, dtype=torch.uint8, device=recv_buf.device),
+                        'dtype': dtype,
+                        'shape': shape,
+                        'total': total_nbytes,
+                        'received': 0,
+                    }
+                    partial_tensors[name] = state
+                else:
+                    if state['total'] != total_nbytes or state['dtype'] != dtype or state['shape'] != shape:
+                        raise RuntimeError(
+                            f'Inconsistent chunk metadata for weight {name}: '
+                            f'expected total={state["total"]}, dtype={state["dtype"]}, shape={state["shape"]}; '
+                            f'got total={total_nbytes}, dtype={dtype}, shape={shape}.'
+                        )
+
+                if nbytes > 0:
+                    state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(
+                        recv_buf[offset:offset + nbytes]
+                    )
+                state['received'] += nbytes
+
+                if state['received'] > state['total']:
+                    raise RuntimeError(
+                        f'Chunk overrun for weight {name}: received={state["received"]}, total={state["total"]}.'
+                    )
+                if state['received'] == state['total']:
+                    full_size = int(dtype.itemsize * shape.numel())
+                    tensor = self._view_from_u8_buffer(state['buffer'], 0, full_size, dtype, shape)
+                    yield name, tensor
+                    total_params += 1
+                    del partial_tensors[name]
+
+            if bool(metadata['is_last']):
+                if partial_tensors:
+                    pending = ', '.join(sorted(partial_tensors.keys())[:8])
+                    raise RuntimeError(
+                        'Incomplete chunked weights at end of stream. '
+                        f'Pending {len(partial_tensors)} weight(s): {pending}'
+                    )
+                break
+            bucket_id += 1
 
         elapsed = time.time() - start_time
-        bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024)
-        logger.info(f'receive_weights done: rank={self.rank}, params={total_params}, '
-                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+        bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
+        logger.info(
+            f'receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+            f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s'
+        )

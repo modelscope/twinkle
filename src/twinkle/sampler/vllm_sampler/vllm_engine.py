@@ -492,6 +492,10 @@ class VLLMEngine(BaseSamplerEngine):
 
         start_time = time.time()
 
+        bucket_size_mb = int(os.environ.get('TWINKLE_VLLM_IPC_BUCKET_MB', str(bucket_size_mb)))
+        if bucket_size_mb <= 0:
+            raise ValueError(f'Invalid TWINKLE_VLLM_IPC_BUCKET_MB={bucket_size_mb}, must be > 0')
+
         # Normalise *weights* into an async iterator regardless of input type.
         if isinstance(weights, dict):
 
@@ -520,12 +524,11 @@ class VLLMEngine(BaseSamplerEngine):
         use_gpu_ipc = first_tensor.is_cuda
         use_shm = not use_gpu_ipc
 
-        # fix: On NPU, current_platform.get_device_uuid may be unimplemented and break receive_weights flow.
-        # fix: Route through platform-level fallback so IPC socket name remains stable.
-        # Get device UUID for ZMQ handle.
-        # For NPU, this is resolved from `npu-smi info` Bus-Id when needed.
+        # Use a per-sync unique IPC endpoint to avoid cross-actor collisions
+        # when multiple sampler actors share the same device UUID.
         device_uuid = Platform.get_vllm_device_uuid(0)
-        zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}.sock'
+        sync_id = uuid.uuid4().hex
+        zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}-{os.getpid()}-{sync_id}.sock'
 
         bucket_size = bucket_size_mb << 20
 
@@ -546,6 +549,10 @@ class VLLMEngine(BaseSamplerEngine):
         # Setup ZMQ socket FIRST (bind before worker connects)
         zmq_ctx = zmq.Context()
         socket = zmq_ctx.socket(zmq.REQ)
+        zmq_timeout_s = int(os.environ.get('TWINKLE_VLLM_IPC_TIMEOUT_S', '300'))
+        socket.setsockopt(zmq.RCVTIMEO, zmq_timeout_s * 1000)
+        socket.setsockopt(zmq.SNDTIMEO, zmq_timeout_s * 1000)
+        socket.setsockopt(zmq.LINGER, 0)
         socket.bind(zmq_handle)
 
         loop = asyncio.get_running_loop()
@@ -555,9 +562,14 @@ class VLLMEngine(BaseSamplerEngine):
         # critical when TP > 1: collective_rpc is an async task on the
         # same loop, and blocking socket.recv() would prevent it from
         # being scheduled, causing a deadlock.
-        def _zmq_send_recv(payload):
-            socket.send_pyobj(payload)
-            return socket.recv()
+        def _zmq_send_recv(payload, where: str):
+            try:
+                socket.send_pyobj(payload)
+                return socket.recv()
+            except zmq.error.Again as e:
+                raise RuntimeError(
+                    f'IPC timeout ({zmq_timeout_s}s) during {where} on {zmq_handle}'
+                ) from e
 
         # Launch worker side concurrently
         worker_task = asyncio.ensure_future(
@@ -567,12 +579,13 @@ class VLLMEngine(BaseSamplerEngine):
                     'peft_config': peft_config,
                     'base_sync_done': base_sync_done,
                     'use_shm': use_shm,
+                    'zmq_handle': zmq_handle,
                 },
             ))
 
         # Send IPC/SHM handle, wait for worker ready (non-blocking)
         handle_payload = ipc_handle if use_gpu_ipc else {'name': shm_name, 'size': bucket_size}
-        await loop.run_in_executor(None, _zmq_send_recv, handle_payload)
+        await loop.run_in_executor(None, _zmq_send_recv, handle_payload, 'handle handshake')
 
         # Stream weights into buckets and send to worker
         async def _chain_first():
@@ -582,53 +595,60 @@ class VLLMEngine(BaseSamplerEngine):
                 yield item
 
         offset = 0
-        bucket_meta: dict = {}
+        bucket_meta: list[dict] = []
         n_weights = 0
 
+        async def _flush_bucket(is_last: bool) -> None:
+            nonlocal offset, bucket_meta
+            if not bucket_meta and not is_last:
+                return
+            if use_gpu_ipc:
+                torch.cuda.synchronize()
+            await loop.run_in_executor(
+                None,
+                _zmq_send_recv,
+                {
+                    'bucket_meta': bucket_meta,
+                    'is_last': is_last,
+                },
+                'final bucket' if is_last else 'bucket flush',
+            )
+            offset = 0
+            bucket_meta = []
+
         async for name, weight in _chain_first():
-            if use_shm and weight.is_cuda:
+            if use_shm and weight.device.type != 'cpu':
                 weight = weight.cpu()
+            if not weight.is_contiguous():
+                weight = weight.contiguous()
 
-            if weight.nbytes > bucket_size:
-                raise ValueError(f'Weight {name} ({weight.nbytes / (1 << 20):.1f} MB) exceeds '
-                                 f'bucket size ({bucket_size_mb} MB). Increase bucket_size_mb.')
+            weight_u8 = weight.view(-1).view(torch.uint8)
+            total_nbytes = int(weight_u8.numel())
+            chunk_offset = 0
+            while chunk_offset < total_nbytes:
+                if offset >= bucket_size:
+                    await _flush_bucket(is_last=False)
 
-            # Flush current bucket if it would overflow
-            if offset + weight.nbytes > bucket_size:
-                if use_gpu_ipc:
-                    torch.cuda.synchronize()
-                await loop.run_in_executor(
-                    None,
-                    _zmq_send_recv,
-                    {
-                        'bucket_meta': bucket_meta,
-                        'is_last': False
-                    },
+                chunk_nbytes = min(bucket_size - offset, total_nbytes - chunk_offset)
+                buffer[offset:offset + chunk_nbytes].copy_(
+                    weight_u8[chunk_offset:chunk_offset + chunk_nbytes],
+                    non_blocking=True,
                 )
-                bucket_meta = {}
-                offset = 0
-
-            bucket_meta[name] = {
-                'name': name,
-                'shape': weight.shape,
-                'dtype': weight.dtype,
-                'offset': offset,
-            }
-            buffer[offset:offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
-            offset += weight.nbytes
+                bucket_meta.append({
+                    'name': name,
+                    'shape': weight.shape,
+                    'dtype': weight.dtype,
+                    'offset': offset,
+                    'nbytes': chunk_nbytes,
+                    'chunk_offset': chunk_offset,
+                    'total_nbytes': total_nbytes,
+                })
+                offset += chunk_nbytes
+                chunk_offset += chunk_nbytes
             n_weights += 1
 
         # Send last bucket
-        if use_gpu_ipc:
-            torch.cuda.synchronize()
-        await loop.run_in_executor(
-            None,
-            _zmq_send_recv,
-            {
-                'bucket_meta': bucket_meta,
-                'is_last': True
-            },
-        )
+        await _flush_bucket(is_last=True)
 
         # Wait for worker to finish loading
         await worker_task
@@ -636,6 +656,13 @@ class VLLMEngine(BaseSamplerEngine):
         # Clean up
         socket.close()
         zmq_ctx.term()
+        if zmq_handle.startswith('ipc://'):
+            ipc_path = zmq_handle[len('ipc://'):]
+            try:
+                if os.path.exists(ipc_path):
+                    os.remove(ipc_path)
+            except OSError:
+                pass
         del buffer
         if shm is not None:
             shm.close()
