@@ -41,8 +41,8 @@ from twinkle.sampler import vLLMSampler
 from twinkle.reward import MathReward
 
 # 创建组件
-actor = TransformersModel(model_id='ms://Qwen/Qwen3-4B')
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3-4B')
+actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
 reward_fn = MathReward()
 advantage_fn = GRPOAdvantage()
 

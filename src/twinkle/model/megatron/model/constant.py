@@ -32,6 +32,7 @@ class MLLMMegatronModelType:
     qwen2_5_vl = 'qwen2_5_vl'
     qwen3_vl = 'qwen3_vl'
     qwen3_5 = 'qwen3_5'
+    qwen3_5_moe = 'qwen3_5_moe'
 
 
 class MegatronModelType(LLMMegatronModelType, MLLMMegatronModelType):

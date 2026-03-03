@@ -24,7 +24,7 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3-4B'
+base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://localhost:8000'
 api_key = 'EMPTY_API_KEY'
 
