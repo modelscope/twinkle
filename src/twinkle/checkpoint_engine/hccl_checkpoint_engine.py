@@ -44,10 +44,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
         rollout_dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> None:
-        bucket_mb_env = os.environ.get('TWINKLE_CKPT_HCCL_BUCKET_MB')
-        if bucket_mb_env:
-            bucket_size = int(bucket_mb_env) << 20
-
         self.bucket_size = bucket_size
         self.group_name = group_name
         self.rebuild_group = rebuild_group
@@ -321,10 +317,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
         offset = 0
         bucket_id = 0
         total_params = 0
-        total_chunks = 0
 
         def _flush(is_last: bool):
-            nonlocal bucket_meta, offset, bucket_id, total_chunks
+            nonlocal bucket_meta, offset, bucket_id
             if not bucket_meta and not is_last:
                 return
 
@@ -338,7 +333,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
             self.pyhccl.broadcast(send_buf, src=0)
             torch.npu.synchronize()
 
-            total_chunks += len(bucket_meta)
             bucket_id += 1
             bucket_meta = []
             offset = 0
@@ -352,48 +346,27 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
             weight_u8 = weight.view(-1).view(torch.uint8)
             nbytes = int(weight_u8.numel())
-            if nbytes == 0:
-                if offset >= self.bucket_size:
-                    _flush(is_last=False)
-                bucket_meta.append({
-                    'name': name,
-                    'shape': weight.shape,
-                    'dtype': weight.dtype,
-                    'offset': offset,
-                    'nbytes': 0,
-                    'chunk_offset': 0,
-                    'total_nbytes': 0,
-                })
-                continue
-
-            chunk_offset = 0
-            while chunk_offset < nbytes:
-                if offset >= self.bucket_size:
-                    _flush(is_last=False)
-
-                chunk_nbytes = min(self.bucket_size - offset, nbytes - chunk_offset)
-                send_buf[offset:offset + chunk_nbytes].copy_(
-                    weight_u8[chunk_offset:chunk_offset + chunk_nbytes]
+            if nbytes > self.bucket_size:
+                raise ValueError(
+                    f'Weight {name}({tuple(weight.shape)}, {weight.dtype}) is too large '
+                    f'for bucket ({self.bucket_size / (1 << 20):.1f} MB). Increase bucket size.'
                 )
-                bucket_meta.append({
-                    'name': name,
-                    'shape': weight.shape,
-                    'dtype': weight.dtype,
-                    'offset': offset,
-                    'nbytes': chunk_nbytes,
-                    'chunk_offset': chunk_offset,
-                    'total_nbytes': nbytes,
-                })
-                offset += chunk_nbytes
-                chunk_offset += chunk_nbytes
+            if offset + nbytes > self.bucket_size:
+                _flush(is_last=False)
+
+            send_buf[offset:offset + nbytes].copy_(weight_u8)
+            bucket_meta.append({
+                'name': name,
+                'shape': weight.shape,
+                'dtype': weight.dtype,
+                'offset': offset,
+            })
+            offset += nbytes
 
         _flush(is_last=True)
 
         elapsed = time.time() - start_time
-        logger.info(
-            f'send_weights done: rank={self.rank}, params={total_params}, '
-            f'chunks={total_chunks}, time={elapsed:.2f}s'
-        )
+        logger.info(f'send_weights done: rank={self.rank}, params={total_params}, time={elapsed:.2f}s')
 
     @torch.no_grad()
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
