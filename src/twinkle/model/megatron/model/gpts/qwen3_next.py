@@ -361,7 +361,7 @@ def _gated_delta_net_forward(self, hidden_states: torch.Tensor, **kwargs):
         res = res[attention_mask][:, None]
         res = torch.concat([res, res.new_zeros(seq_len - res.shape[0], 1, res.shape[2])])
     else:
-        res = res.transpose(0, 1)
+        res = res.transpose(0, 1).contiguous()
     if args.sequence_parallel and args.tensor_model_parallel_size > 1:
         res = reduce_scatter_to_sequence_parallel_region(res) / args.tensor_model_parallel_size
     return res, None
@@ -458,10 +458,14 @@ def get_qwen3_next_layer_spec(config, args, gated_delta_net_cls):
         elif layer_type == 'full_attention':
             layer_spec.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
             layer_spec.submodules.self_attention.module = Qwen3NextSelfAttention
+        # Replace ALL layernorms with Qwen3NextRMSNorm (Zero-Centered)
         layer_spec.submodules.input_layernorm = layer_norm_impl
-        if hasattr(layer_spec.submodules,
-                   'pre_mlp_layernorm') and layer_spec.submodules.pre_mlp_layernorm is not IdentityOp:
+        if hasattr(layer_spec.submodules, 'pre_mlp_layernorm'):
             layer_spec.submodules.pre_mlp_layernorm = layer_norm_impl
+        # qwen3.5 dense
+        if args.hf_model_type == 'qwen3_5':
+            layer_spec.submodules.mlp.submodules.linear_fc1 = TEColumnParallelLinear
+        # Replace qk_layernorm if present
         if hasattr(layer_spec.submodules.self_attention.submodules, 'q_layernorm'):
             layer_spec.submodules.self_attention.submodules.q_layernorm = layer_norm_impl
         if hasattr(layer_spec.submodules.self_attention.submodules, 'k_layernorm'):

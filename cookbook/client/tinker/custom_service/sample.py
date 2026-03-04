@@ -9,7 +9,7 @@ from tinker import types
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 # Step 1: Initialize Tinker client
 init_tinker_client()
@@ -17,10 +17,10 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # Step 2: Define the base model and connect to the server
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen3.5-4B'
 service_client = ServiceClient(
-    base_url='http://www.modelscope.cn/twinkle',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
+    base_url='http://localhost:8000',
+    api_key='EMPTY-TOKEN'
 )
 
 # Step 3: Create a sampling client by loading weights from a saved checkpoint.
@@ -39,7 +39,7 @@ template = Template(model_id=f'ms://{base_model}')
 trajectory = Trajectory(
     messages=[
         Message(role='system', content='You are a helpful assistant'),
-        Message(role='user', content='你是谁？'),
+        Message(role='user', content='Who are you?'),
     ]
 )
 
@@ -56,7 +56,7 @@ params = types.SamplingParams(
 )
 
 # Step 6: Send the sampling request to the server.
-# num_samples=8 generates 8 independent completions for the same prompt.
+# num_samples=1 generates 1 independent completions for the same prompt.
 print('Sampling...')
 future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
 result = future.result()

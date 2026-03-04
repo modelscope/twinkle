@@ -34,7 +34,7 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, torch_util
+from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
@@ -383,6 +383,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
         optimizer_config.loss_value = outputs.get('aux_loss', 0)
+        if labels is not None:
+            loss_mask = (labels != -100).bool()
+            masked_labels = labels.clone()
+            masked_labels[~loss_mask] = 0
+            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
         return outputs
 
     @remote_function(dispatch='slice_dp', collect='flatten')
@@ -425,6 +430,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.inputs = inputs
         optimizer_config.outputs = outputs
         optimizer_config.loss_value = outputs.get('aux_loss', 0)
+        if labels is not None:
+            loss_mask = (labels != -100).bool()
+            masked_labels = labels.clone()
+            masked_labels[~loss_mask] = 0
+            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
         return outputs
 
     @remote_function(collect='mean')
@@ -446,10 +456,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         outputs = optimizer_config.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
-        if isinstance(result, tuple):
-            loss_value, counts = result
-        else:
-            loss_value = result
+        loss_value = result['loss']
+        counts = result['num_tokens']
+        if not counts:
             counts = torch.tensor(0, device=loss_value.device)
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
@@ -501,10 +510,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             The output of the model forward.
         """
-        self.forward(inputs=inputs, **kwargs)
+        outputs = self.forward(inputs=inputs, **kwargs)
         loss = self.calculate_loss(**kwargs)
+        outputs['loss'] = loss
         self.backward(**kwargs)
-        return loss
+        return outputs
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
@@ -565,11 +575,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
-        grad_norm = self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
-        return grad_norm
 
     def _create_param_group(self,
                             adapter_name: str,
@@ -869,9 +878,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if output_dir is None:
-            # load from hub
-            token = kwargs.pop('token', None)
-            checkpoint_dir = HubOperation.download_model(name, token=token)
+            if os.path.exists(name):
+                checkpoint_dir = name
+            else:
+                # load from hub
+                token = kwargs.pop('token', None)
+                checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             checkpoint_dir = os.path.join(output_dir, name)
         model = self.strategy.unwrap_model(self.model)

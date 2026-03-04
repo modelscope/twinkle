@@ -7,9 +7,10 @@
 #      that the model has learned the custom identity.
 # The server must be running first (see server.py and server_config.yaml).
 import os
+import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 from twinkle.dataloader import DataLoader
@@ -23,9 +24,9 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-# base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
-base_model = 'Qwen/Qwen2.5-7B-Instruct'
+base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
 
 
 def train():
@@ -51,7 +52,7 @@ def train():
 
     service_client = ServiceClient(
         base_url=base_url,
-        api_key=os.environ.get('MODELSCOPE_TOKEN')
+        api_key=api_key
     )
 
     # Create a LoRA training client for the base model (rank=16 for the LoRA adapter)
@@ -76,9 +77,9 @@ def train():
             optim_result = optim_future.result()
 
             # Compute weighted average log-loss per token for monitoring
-            # logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
-            # weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
-            # print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
+            logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
+            weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
+            print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
             print(f'Training Metrics: {optim_result}')
 
         # Save a checkpoint after each epoch

@@ -52,7 +52,10 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         outputs = super().forward_only(inputs=input_features, **kwargs)
         # shape (batch_size, seq_len, vocab_size)
         logits = outputs['logits'].detach().cpu()
-        results = self._get_forward_output(inputs, logits)
+        logps = outputs.get('logps', None)
+        if logps is not None:
+            logps = logps.detach().cpu()
+        results = self._get_forward_output(inputs, logits, logps)
         return results
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
@@ -89,7 +92,10 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
 
         # shape (batch_size, seq_len, vocab_size)
         logits = outputs['logits'].detach()
-        results = self._get_forward_output(inputs, logits)
+        logps = outputs.get('logps', None)
+        if logps is not None:
+            logps = logps.detach().cpu()
+        results = self._get_forward_output(inputs, logits, logps)
         return [results, loss]
 
     @remote_function()

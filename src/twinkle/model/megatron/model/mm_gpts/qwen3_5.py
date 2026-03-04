@@ -139,13 +139,10 @@ try:
 except ImportError:
     Qwen3_5MoeForConditionalGeneration = None
 
-_auto_model_cls = Qwen3_5MoeForConditionalGeneration
-if _auto_model_cls is None:
-    try:
-        from transformers import AutoModel
-        _auto_model_cls = AutoModel
-    except ImportError:
-        _auto_model_cls = None
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+except ImportError:
+    Qwen3_5ForConditionalGeneration = None
 
 
 class Qwen3_5MoeLoader(Qwen3NextLoader):
@@ -154,13 +151,24 @@ class Qwen3_5MoeLoader(Qwen3NextLoader):
 
 register_megatron_model(
     MegatronModelMeta(
-        MegatronModelType.qwen3_5,
+        MegatronModelType.qwen3_5_moe,
         [
-            ModelType.qwen3_5,
             ModelType.qwen3_5_moe,
         ],
         bridge_cls=Qwen3_5Bridge,
         visual_cls=Qwen3_5Vit,
-        auto_model_cls=_auto_model_cls,
+        auto_model_cls=Qwen3_5MoeForConditionalGeneration,
+        loader=Qwen3_5MoeLoader,
+    ))
+
+register_megatron_model(
+    MegatronModelMeta(
+        MegatronModelType.qwen3_5,
+        [
+            ModelType.qwen3_5,
+        ],
+        bridge_cls=Qwen3_5Bridge,
+        visual_cls=Qwen3_5Vit,
+        auto_model_cls=Qwen3_5ForConditionalGeneration,
         loader=Qwen3_5MoeLoader,
     ))

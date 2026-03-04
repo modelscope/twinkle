@@ -23,92 +23,92 @@ class TwinkleModel(ABC):
     _checkpoint_engine = None
 
     @abstractmethod
-    def forward(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
         ...
 
     @abstractmethod
-    def forward_only(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward_only(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
         ...
 
     @abstractmethod
-    def calculate_loss(self, **kwargs):
+    def calculate_loss(self, **kwargs) -> float:
         ...
 
     @abstractmethod
-    def backward(self, **kwargs):
+    def backward(self, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def forward_backward(self, *, inputs: Dict[str, Any], **kwargs):
+    def forward_backward(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
         ...
 
     @abstractmethod
-    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> float:
         ...
 
     @abstractmethod
-    def step(self, **kwargs):
+    def step(self, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def zero_grad(self, **kwargs):
+    def zero_grad(self, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def lr_step(self, **kwargs):
+    def lr_step(self, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> None:
         ...
 
     @abstractmethod
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...],
-                                                                       'torch.Tensor']], **kwargs):
+                                                                       'torch.Tensor']], **kwargs) -> None:
         ...
 
     @abstractmethod
-    def set_optimizer(self, optimizer_cls: Union['Optimizer', Type['Optimizer'], str], **kwargs):
+    def set_optimizer(self, optimizer_cls: Union['Optimizer', Type['Optimizer'], str], **kwargs) -> None:
         ...
 
     @abstractmethod
-    def set_lr_scheduler(self, scheduler_cls: Union['LRScheduler', Type['LRScheduler'], str], **kwargs):
+    def set_lr_scheduler(self, scheduler_cls: Union['LRScheduler', Type['LRScheduler'], str], **kwargs) -> None:
         ...
 
     @abstractmethod
-    def save(self, name: str, output_dir: Optional[str] = None, **kwargs):
+    def save(self, name: str, output_dir: Optional[str] = None, **kwargs) -> str:
         ...
 
     @abstractmethod
-    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def get_state_dict(self, **kwargs):
+    def get_state_dict(self, **kwargs) -> Dict[str, Any]:
         ...
 
     @abstractmethod
-    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         ...
 
     @abstractmethod
-    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def calculate_metric(self, is_training: bool, **kwargs):
+    def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:
         ...
 
     @abstractmethod
-    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs):
+    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
         ...
 
     @abstractmethod
-    def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
+    def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs) -> None:
         ...
 
     @abstractmethod
-    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs):
+    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs) -> None:
         ...
 
     @abstractmethod
@@ -119,7 +119,7 @@ class TwinkleModel(ABC):
                       checkpoint_dir: str,
                       hub_model_id: str,
                       hub_token: Optional[str] = None,
-                      async_upload: bool = True):
+                      async_upload: bool = True) -> None:
         """Upload model checkpoint to hub.
 
         Args:

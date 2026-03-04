@@ -136,8 +136,6 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'config': self.config,
             'is_expert': self.is_expert,
         }
-        if exists('megatron_core>=0.13'):
-            kwargs['tp_group'] = self.base_layer.tp_group
 
         if isinstance(self.base_layer, TopKRouter):
             # Router layer - no parallelism needed

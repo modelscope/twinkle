@@ -608,6 +608,7 @@ class TwinkleMegatronArgs:
             # Critical: Set finalize_model_grads_func for DP gradient synchronization
             # Uses custom wrapper that handles both DDP and PEFT/LoRA models
             finalize_model_grads_func=finalize_model_grads_for_lora,
+            calculate_per_token_loss=True,
             # MoE configuration
             **moe_kwargs,
         )

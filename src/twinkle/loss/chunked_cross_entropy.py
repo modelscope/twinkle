@@ -2,10 +2,12 @@
 import math
 from typing import Any
 
+from ..data_format import LossOutput
 from .base import Loss
 
 
 class ChunkedCrossEntropyLoss(Loss):
+    """TODO untested code"""
 
     def __init__(self, chunk_size):
         self.chunk_size = chunk_size
@@ -58,4 +60,4 @@ class ChunkedCrossEntropyLoss(Loss):
 
         logits = outputs['logits']
         labels = inputs['labels']
-        return ChunkedCrossEntropyLossFunc.apply(logits, labels, self.chunk_size)
+        return LossOutput(loss=ChunkedCrossEntropyLossFunc.apply(logits, labels, self.chunk_size), num_tokens=0)
