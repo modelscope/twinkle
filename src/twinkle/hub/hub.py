@@ -165,7 +165,8 @@ class HubOperation:
                      subset_name: str,
                      split: str,
                      streaming: bool = False,
-                     revision: Optional[str] = None):
+                     revision: Optional[str] = None,
+                     **kwargs):
         """Load a dataset from the repo
 
         Args:
@@ -179,7 +180,7 @@ class HubOperation:
             The Dataset instance
         """
         hub = cls._get_hub_class(dataset_id)
-        return hub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
+        return hub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision, **kwargs)
 
     @classmethod
     def download_model(cls,

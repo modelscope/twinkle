@@ -28,9 +28,9 @@ class TestDataLoaderMultimodal:
         dataset.map(create_multimodal_messages)
 
         try:
-            dataset.set_template('Qwen3VLTemplate', model_id='Qwen/Qwen2-VL-7B-Instruct')
+            dataset.set_template('Qwen3_5Template', model_id='Qwen/Qwen2-VL-7B-Instruct')
         except Exception as e:
-            pytest.skip(f'Failed to load Qwen3VLTemplate (may need network): {e}')
+            pytest.skip(f'Failed to load Qwen3_5Template (may need network): {e}')
 
         dataset.encode()
 

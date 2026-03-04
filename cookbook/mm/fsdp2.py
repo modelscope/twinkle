@@ -1,27 +1,38 @@
-import os
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle.data_format import Trajectory, Message
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataset import LazyDataset, DatasetMeta
 from twinkle.model import TransformersModel
-from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.preprocessor import Preprocessor
 
-# Construct a device_mesh, fsdp=4, dp=2
-device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
+# Construct a device_mesh, fsdp=2
+device_mesh = DeviceMesh.from_sizes(fsdp_size=2)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
 
 
+class LatexOCRProcessor(Preprocessor):
+
+    def __call__(self, row) -> Trajectory:
+        return Trajectory(
+            messages=[
+                Message(role='user', content='<image>Using LaTeX to perform OCR on the image.', images=[row['image']]),
+                Message(role='assistant', content=row['text']),
+            ]
+        )
+
+
 def eval(model):
     # 100 Samples
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B')
-    dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
+    dataset = LazyDataset(dataset_meta=DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(100)))
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.map(LatexOCRProcessor)
     dataset.encode()
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     for step, batch in tqdm(enumerate(dataloader)):
@@ -32,18 +43,20 @@ def eval(model):
 
 
 def train():
-    # 1000 samples
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
+    # 2000 samples
+    dataset = LazyDataset(dataset_meta=DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(2000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=1024)
     # Preprocess the dataset to standard format
-    dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
+    dataset.map(LatexOCRProcessor)
     # Encode dataset
     dataset.encode()
-    # Global batch size = 8, for GPUs, so 1 sample per GPU
-    dataloader = DataLoader(dataset=dataset, batch_size=8)
+    # Global batch size = 4, for GPUs, so 2 sample per GPU
+    dataloader = DataLoader(dataset=dataset, batch_size=4)
     # Use a TransformersModel
-    model = TransformersModel(model_id='ms://Qwen/Qwen3-4B')
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+    model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B', model_cls=Qwen3_5ForConditionalGeneration)
+    model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
 
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
@@ -51,6 +64,7 @@ def train():
     # Comment this to use full-parameter training
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
     # Add Optimizer for lora `default`
+    model.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
     # Add LRScheduler for lora `default`
     model.set_lr_scheduler(
@@ -60,8 +74,6 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # lora: 18G * 4
-    # full: 50G * 4
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)

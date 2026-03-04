@@ -370,7 +370,9 @@ class MultiLora:
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config)
                 else:
-                    _module = get_peft_model(_module, config, lora_tenant.adapter_name)
+                    _peft_model: PeftModel = get_peft_model(_module, config, lora_tenant.adapter_name)
+                    _module.active_adapters = _peft_model.active_adapters
+                    _module = _peft_model
 
                 for name, submodule in _module.named_modules():
                     if isinstance(submodule, LoraLayer):

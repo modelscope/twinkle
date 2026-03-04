@@ -62,6 +62,7 @@ class OptimizerGroup:
     checkpoint_engine: CheckpointEngine = None
     _dp_group = None
     _device_mesh: DeviceMesh = None
+    _handler: Any = None
 
     def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
@@ -284,10 +285,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 assert optimizer is not None
                 self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
                 optimizer_group.optimizer = optimizer
+                self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
                 self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
+
+    def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
+        model = self.strategy.unwrap_model(self.model)
+        template = optimizer_group.template
+        assert template is not None
+        optimizer_group._handler = model.register_forward_pre_hook(template.pre_forward_hook, with_kwargs=True)
+
+    def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
+        if optimizer_group._handler is not None:
+            optimizer_group._handler.remove()
+            optimizer_group._handler = None
 
     @staticmethod
     def _should_enable_expert_parallel(expert_parallel_config: Optional[Dict[str, Any]],

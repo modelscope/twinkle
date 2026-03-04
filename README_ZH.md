@@ -116,8 +116,6 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                 |                    -                    | transformers>=4.39.3 |        ✔         |                 [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                 |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |             1.5B/7B/14B/32B             | transformers>=4.37   |        ✔         | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |
 
-更详细的模型支持列表 👉  [快速开始.md](docs/source_zh/使用指引/快速开始.md)
-
 ## 示例代码
 
 下面列出了示例代码的一部分能力。完整的训练能力介绍请参考[快速开始](docs/source_zh/使用指引/快速开始.md)以及[cookbook](cookbook)。

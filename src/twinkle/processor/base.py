@@ -94,6 +94,10 @@ class InputProcessor:
                     value = torch.from_numpy(value)
                 elif isinstance(value, list) and isinstance(value[0], (int, float, np.number)):
                     value = torch.tensor(value)
+                elif key in self.VLM_CONCAT_FIELDS:
+                    if not isinstance(value[0], torch.Tensor):
+                        value = [torch.tensor(v) for v in value]
+                        value = torch.cat(value, dim=0)
                 if isinstance(value, torch.Tensor):
                     value = value.to(Platform.get_local_device())
                     if value.dim() == 1:
@@ -260,7 +264,8 @@ class InputProcessor:
 
     @staticmethod
     def _get_packed_seq_params(position_ids):
-        assert position_ids.shape[0] == 1
+        if position_ids.shape[0] > 1:
+            position_ids = position_ids[:1]
         position_ids_f = position_ids.flatten()
         indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
 
@@ -305,7 +310,10 @@ class InputProcessor:
         results = []
         for _input in inputs:
             output = {}
-            _keys = ['input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask']
+            _keys = [
+                'input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask',
+                'pixel_values', 'image_grid_thw'
+            ]
             for key in list(_input.keys()):
                 if key in _keys:
                     output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]
@@ -361,6 +369,9 @@ class InputProcessor:
 
         for field, values in vlm_fields.items():
             if values:
+                if values[0].dim() == 1:
+                    # image_thw may be squeezed
+                    values = [value.unsqueeze(0) for value in values]
                 result[field] = torch.cat(values, dim=0)
 
         return result
