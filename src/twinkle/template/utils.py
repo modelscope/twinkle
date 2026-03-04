@@ -1,13 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.utils import to_device
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
+
+_T = TypeVar('_T')
 
 PLACEHOLDER = '<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>'
 

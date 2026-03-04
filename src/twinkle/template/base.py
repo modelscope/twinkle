@@ -11,6 +11,7 @@ from twinkle.data_format import InputFeature, Message, Trajectory
 from twinkle.hub import HubOperation
 from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
 from twinkle.utils import to_device
+from twinkle.utils import load_image
 
 if TYPE_CHECKING:
     import torch
@@ -114,7 +115,7 @@ class Template:
             self._template_support_assistant_tokens_mask = False
 
     def preprocess_image(self, image: ImageInput) -> 'Image.Image':
-        return image
+        return load_image(image)
 
     def preprocess_video(self, video: VideoInput) -> List['Image.Image']:
         return video

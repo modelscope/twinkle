@@ -1,10 +1,11 @@
 import torch
 from PIL import Image
 from typing import Any, Dict, List, Optional, Union
-from twinkle import remote_class
+from twinkle import remote_class, requires
 from twinkle.template import Template
 from twinkle.template.base import ImageInput, VideoInput
 from twinkle.template.utils import get_inputs_embeds_hf
+from twinkle.utils import load_image
 
 
 @remote_class()
@@ -43,7 +44,9 @@ class Qwen3VLTemplate(Template):
 
     def preprocess_image(self, image: ImageInput) -> Image.Image:
         try:
+            requires('qwen_vl_utils')
             from qwen_vl_utils.vision_process import fetch_image
+            image = load_image(image)
             if isinstance(image, str):
                 image_input = {'image': image}
             elif isinstance(image, Image.Image):
