@@ -219,8 +219,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                                                                            self.device_mesh)
         self._expert_parallel_applied = False
         # Store ep_size for later use (EP mesh construction, grad clip, etc.)
-        self._ep_size = (self._expert_parallel_config.get('ep_size')
-                         if self._expert_parallel_config else None)
+        self._ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
         if self._ep_size is None and self.device_mesh is not None:
             self._ep_size = getattr(self.device_mesh, 'ep_size', None)
         if self._ep_size is None:

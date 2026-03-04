@@ -3,14 +3,14 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0
 
-from typing import Optional
-
 import torch
 import torch.distributed as dist
+from typing import Optional
 
 
 # ========================== comm ==========================
 class _AllToAll(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, group, input, output_split_sizes, input_split_sizes):
         ctx.group = group
@@ -48,6 +48,7 @@ class _AllToAll(torch.autograd.Function):
 
 
 class _AllToAll_Async(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, group, input, output_split_sizes, input_split_sizes):
         ctx.group = group
@@ -213,12 +214,10 @@ def preprocess(
 
     # [num_local_expert]
     num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0).to(
-        torch.device("cpu"), non_blocking=True
-    )
+        torch.device('cpu'), non_blocking=True)
 
     num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(-1, num_local_experts).to(
-        torch.device("cpu"), non_blocking=True
-    )
+        torch.device('cpu'), non_blocking=True)
 
     return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
 

@@ -17,7 +17,8 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
-                 enable_ep: bool = True,                 ep_fsdp_device_mesh: Optional[TorchDeviceMesh] = None):
+                 enable_ep: bool = True,
+                 ep_fsdp_device_mesh: Optional[TorchDeviceMesh] = None):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
@@ -60,6 +61,7 @@ class NativeFSDPStrategy:
 
                 if experts_mod is not None and ep_fsdp_mesh_1d is not None:
                     from torch.distributed.tensor import Shard
+
                     # PreMulSum (used by set_gradient_divide_factor) only supports
                     # float16/float32/float64; override reduce_dtype to float32
                     # when the base policy uses bfloat16.
@@ -254,9 +256,7 @@ def _ensure_moe_patched_if_needed(model: nn.Module, ep_fsdp_device_mesh: Optiona
     for module in model.modules():
         experts = getattr(module, 'experts', None)
         is_moe_experts = (
-            isinstance(experts, nn.ModuleList)
-            or (hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'))
-        )
+            isinstance(experts, nn.ModuleList) or (hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj')))
         if is_moe_experts and not getattr(module, '_ep_patched', False):
             raise RuntimeError('Found MoE experts but expert parallel is not applied. '
                                'Call apply_expert_parallel(model, device_mesh, config) before wrapping with FSDP2.')

@@ -8,12 +8,8 @@ from dataclasses import dataclass
 from torch import nn
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
-from twinkle.model.transformers.moe.ep_utils import (
-    preprocess,
-    token_pre_all2all,
-    tokens_post_all2all,
-)
 
 
 @dataclass
@@ -22,7 +18,7 @@ class ExpertParallelConfig:
     router_dtype: str = 'fp32'
     keep_router_logits: bool = True
     ignore_shared_experts: bool = False
-    ep_size: Optional[int] = None  # consumed by TransformersModel, not used in expert_parallel logic
+    ep_size: int | None = None  # consumed by TransformersModel, not used in expert_parallel logic
 
 
 @dataclass
@@ -43,8 +39,8 @@ def apply_expert_parallel(
     model: nn.Module,
     device_mesh: DeviceMesh,
     config: dict[str, Any] | None = None,
-    ep_fsdp_device_mesh: Optional['torch.distributed.DeviceMesh'] = None,
-) -> List[ExpertShardingSpec]:
+    ep_fsdp_device_mesh: torch.distributed.DeviceMesh | None = None,
+) -> list[ExpertShardingSpec]:
     """Apply expert parallelism to all MoE blocks in the model."""
     cfg = _merge_config(config)
 
@@ -229,8 +225,7 @@ def patch_forward(
 
         # Build expert_mask: [num_experts, top_k, num_tokens]
         expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=num_experts
-        ).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
+            selected_experts, num_classes=num_experts).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
 
         # 1. preprocess: compute splits and token counts
         (
@@ -346,9 +341,8 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
                 out = out.to(input_dtype)
             output_chunks.append(out)
 
-        return torch.cat(output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(
-            0, permuted_tokens.size(-1)
-        )
+        return torch.cat(
+            output_chunks, dim=0) if output_chunks else permuted_tokens.new_empty(0, permuted_tokens.size(-1))
 
     import types
     experts_mod.forward = types.MethodType(ep_forward, experts_mod)

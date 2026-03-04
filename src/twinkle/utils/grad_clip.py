@@ -181,7 +181,7 @@ def _ep_aware_clip_grad_norm(
         if math.isinf(norm_type):
             total_norm = torch.maximum(non_ep_val, ep_val)
         else:
-            total_norm = (non_ep_val + ep_val) ** (1.0 / norm_type)
+            total_norm = (non_ep_val + ep_val)**(1.0 / norm_type)
 
     # Clip both groups with the same coefficient via PyTorch builtin (foreach-accelerated)
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm)
@@ -198,11 +198,8 @@ def _local_norm_stat(params, norm_type: float):
     import math
     import torch
     from torch.distributed._tensor import DTensor
-    from torch.utils._foreach_utils import (
-        _device_has_foreach_support,
-        _group_tensors_by_device_and_dtype,
-        _has_foreach_support,
-    )
+    from torch.utils._foreach_utils import (_device_has_foreach_support, _group_tensors_by_device_and_dtype,
+                                            _has_foreach_support)
 
     grads_local = []
     default_device = None
@@ -240,5 +237,5 @@ def _local_norm_stat(params, norm_type: float):
             val += torch.sum(torch.stack(out)).to(default_device)
         else:
             for g in device_grads:
-                val += (torch.norm(g, p=p) ** p).to(default_device)
+                val += (torch.norm(g, p=p)**p).to(default_device)
     return val

@@ -209,13 +209,12 @@ class DeviceMesh:
         if ep_size <= 1:
             return None
         world_size = self.world_size
-        assert world_size % ep_size == 0, (
-            f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
+        assert world_size % ep_size == 0, (f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
         ep_fsdp_size = world_size // ep_size
         with torch.device('cpu'):
-            mesh = (torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int)
-                    .view(ep_fsdp_size, ep_size)
-                    .transpose(0, 1))
+            mesh = (
+                torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int).view(ep_fsdp_size,
+                                                                                       ep_size).transpose(0, 1))
         return torch.distributed.DeviceMesh(self.device_type, mesh, mesh_dim_names=('ep', 'ep_fsdp'))
 
     @property

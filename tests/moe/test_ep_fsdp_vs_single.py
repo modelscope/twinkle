@@ -20,7 +20,6 @@ from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh
 
-
 ABS_TOL = 5e-3
 LOSS_TOL = 1e-4
 REL_TOL = 1e-4
@@ -50,16 +49,18 @@ def _load_model(model_id: str, local_only: bool, device: torch.device, num_layer
         config._experts_implementation = 'eager'
 
     # 关闭 Dropout，确保确定性
-    dropout_attrs = ['attention_dropout', 'hidden_dropout', 'classifier_dropout',
-                     'resid_pdrop', 'embd_pdrop']
+    dropout_attrs = ['attention_dropout', 'hidden_dropout', 'classifier_dropout', 'resid_pdrop', 'embd_pdrop']
     for attr in dropout_attrs:
         if hasattr(config, attr):
             setattr(config, attr, 0.0)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, config=config, torch_dtype=torch.float32,
-        low_cpu_mem_usage=True, trust_remote_code=True, local_files_only=local_only
-    )
+        model_id,
+        config=config,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+        local_files_only=local_only)
     model.to(device)
     return model
 
@@ -94,12 +95,8 @@ def _split_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
     return start, end
 
 
-def _match_single_tensor_for_compare(mapped_name: str,
-                                     multi_tensor: torch.Tensor,
-                                     single_dict: dict,
-                                     ep_rank: int,
-                                     fsdp_rank: int,
-                                     fsdp_world_size: int):
+def _match_single_tensor_for_compare(mapped_name: str, multi_tensor: torch.Tensor, single_dict: dict, ep_rank: int,
+                                     fsdp_rank: int, fsdp_world_size: int):
     """返回和 multi_tensor 对齐后的 single tensor；expert 参数支持 dim0(ep)+dim1(fsdp) 切片。"""
     single_tensor = single_dict.get(mapped_name)
     if single_tensor is None:
@@ -149,8 +146,12 @@ def _match_single_tensor_for_compare(mapped_name: str,
 def _run_single_gpu(rank, world_size, port, model_id, local_only):
     """Single GPU baseline."""
     os.environ.update({
-        'RANK': '0', 'WORLD_SIZE': '1', 'LOCAL_RANK': '0',
-        'LOCAL_WORLD_SIZE': '1', 'MASTER_ADDR': '127.0.0.1', 'MASTER_PORT': str(port)
+        'RANK': '0',
+        'WORLD_SIZE': '1',
+        'LOCAL_RANK': '0',
+        'LOCAL_WORLD_SIZE': '1',
+        'MASTER_ADDR': '127.0.0.1',
+        'MASTER_PORT': str(port)
     })
 
     if not torch.cuda.is_available():
@@ -180,14 +181,15 @@ def _run_single_gpu(rank, world_size, port, model_id, local_only):
     new_weight_dict = {n: p.detach().cpu() for n, p in model.named_parameters()}
 
     # 保存输入数据，确保多卡使用相同输入
-    torch.save({
-        'input_ids': input_ids.cpu(),
-        'position_ids': position_ids.cpu(),
-        'logits': outputs.logits.detach().cpu(),
-        'loss': loss.item(),
-        'grad_dict': grad_dict,
-        'new_weight_dict': new_weight_dict,
-    }, _single_snapshot_path(port))
+    torch.save(
+        {
+            'input_ids': input_ids.cpu(),
+            'position_ids': position_ids.cpu(),
+            'logits': outputs.logits.detach().cpu(),
+            'loss': loss.item(),
+            'grad_dict': grad_dict,
+            'new_weight_dict': new_weight_dict,
+        }, _single_snapshot_path(port))
 
     print(f'[Single] Loss={loss.item():.4f}')
 
@@ -195,9 +197,12 @@ def _run_single_gpu(rank, world_size, port, model_id, local_only):
 def _run_multi_gpu(rank, world_size, port, model_id, local_only):
     """4-GPU EP+FSDP with two independent meshes."""
     os.environ.update({
-        'RANK': str(rank), 'WORLD_SIZE': str(world_size),
-        'LOCAL_RANK': str(rank), 'LOCAL_WORLD_SIZE': str(world_size),
-        'MASTER_ADDR': '127.0.0.1', 'MASTER_PORT': str(port)
+        'RANK': str(rank),
+        'WORLD_SIZE': str(world_size),
+        'LOCAL_RANK': str(rank),
+        'LOCAL_WORLD_SIZE': str(world_size),
+        'MASTER_ADDR': '127.0.0.1',
+        'MASTER_PORT': str(port)
     })
 
     if not torch.cuda.is_available():
@@ -206,9 +211,12 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
     torch.cuda.set_device(device)
 
     dist.init_process_group(
-        backend='nccl', rank=rank, world_size=world_size,
-        init_method=f'tcp://127.0.0.1:{port}', device_id=device, timeout=timedelta(minutes=15)
-    )
+        backend='nccl',
+        rank=rank,
+        world_size=world_size,
+        init_method=f'tcp://127.0.0.1:{port}',
+        device_id=device,
+        timeout=timedelta(minutes=15))
     dist.barrier()
 
     try:
@@ -222,7 +230,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         device_mesh = DeviceMesh(
             device_type='cuda',
             mesh=np.arange(world_size).reshape(world_size),  # 1D mesh: [0, 1, 2, 3]
-            mesh_dim_names=('fsdp',),
+            mesh_dim_names=('fsdp', ),
             ep_size=ep_size,  # ep_size as attribute, not mesh dimension
         )
 
@@ -243,7 +251,11 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         apply_expert_parallel(
             getattr(model, 'model', model),
             device_mesh,
-            config={'enabled': True, 'router_dtype': 'fp32', 'keep_router_logits': False},
+            config={
+                'enabled': True,
+                'router_dtype': 'fp32',
+                'keep_router_logits': False
+            },
             ep_fsdp_device_mesh=ep_fsdp_mesh,
         )
 
@@ -303,8 +315,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             loss_diff = abs(single_data['loss'] - loss.item())
             single_loss_t = torch.tensor(single_data['loss'], dtype=torch.float32)
             multi_loss_t = torch.tensor(loss.item(), dtype=torch.float32)
-            if (not torch.allclose(single_loss_t, multi_loss_t, rtol=REL_TOL, atol=LOSS_TOL)
-                    and forward_err is None):
+            if (not torch.allclose(single_loss_t, multi_loss_t, rtol=REL_TOL, atol=LOSS_TOL) and forward_err is None):
                 forward_err = f'Loss mismatch! Diff: {loss_diff}'
 
         obj = [forward_err]
@@ -372,20 +383,17 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             ratio_list.append(ratio)
             is_close = torch.allclose(s_grad, m_grad, rtol=REL_TOL, atol=ABS_TOL)
             status = 'PASS' if is_close else 'FAIL'
-            print(
-                f'  [{status}] {mapped_n}: max_diff={grad_max_diff:.2e}, mean_diff={grad_mean_diff:.2e}, '
-                f'norm_ratio(ep/single)={ratio:.4f}')
-            assert is_close, (
-                f'Expert grad mismatch for {mapped_n}! '
-                f'Max diff: {grad_max_diff}, Mean diff: {grad_mean_diff}, Ratio: {ratio}')
+            print(f'  [{status}] {mapped_n}: max_diff={grad_max_diff:.2e}, mean_diff={grad_mean_diff:.2e}, '
+                  f'norm_ratio(ep/single)={ratio:.4f}')
+            assert is_close, (f'Expert grad mismatch for {mapped_n}! '
+                              f'Max diff: {grad_max_diff}, Mean diff: {grad_mean_diff}, Ratio: {ratio}')
             verified += 1
         if verified == 0:
             print(f'  [INFO] No expert gradients matched on rank {rank} (EP distribution is expected)')
         else:
             ratio_t = torch.tensor(ratio_list, dtype=torch.float32)
-            print(
-                f'  [INFO] expert grad norm ratio(ep/single): '
-                f'min={ratio_t.min().item():.4f}, max={ratio_t.max().item():.4f}, mean={ratio_t.mean().item():.4f}')
+            print(f'  [INFO] expert grad norm ratio(ep/single): '
+                  f'min={ratio_t.min().item():.4f}, max={ratio_t.max().item():.4f}, mean={ratio_t.mean().item():.4f}')
 
         # 对比更新后的权重
         print(f'\n=== Rank {rank}: Updated Weights ===')
