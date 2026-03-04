@@ -294,7 +294,10 @@ class TestDatasetMapChanges:
         class ModifiedProcessor(CompetitionMathProcessor):
 
             def __call__(self, rows):
-                return [self.preprocess(row) for row in rows]
+                rows = self.map_col_to_row(rows)
+                rows = [self.preprocess(row) for row in rows]
+                rows = self.map_row_to_col(rows)
+                return rows
 
             def preprocess(self, row):
                 traj = super().preprocess(row)
