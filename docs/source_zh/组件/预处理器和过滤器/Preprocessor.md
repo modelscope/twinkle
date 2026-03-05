@@ -7,11 +7,11 @@ Preprocessor 的基类：
 ```python
 class Preprocessor:
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: List[Dict]) -> List[Trajectory]:
         ...
 ```
 
-格式为传入一个原始样本，输出一个`Trajectory`。如果样本无法使用，可以直接返回None。
+格式为传入一系列原始样本，输出对应的`Trajectory`。如果某个样本无法使用，可以直接忽略它。输入条数和输出条数不必相同。
 
 我们提供了一些基本的 Preprocessor，例如 `SelfCognitionProcessor`：
 
@@ -22,7 +22,7 @@ dataset.map('SelfCognitionProcessor', model_name='some-model', model_author='som
 Preprocessor 包含 __call__ 方法，这意味着你可以使用 function 来代替类：
 
 ```python
-def self_cognition_preprocessor(row):
+def self_cognition_preprocessor(rows):
     ...
-    return Trajectory(...)
+    return [Trajectory(...), ...]
 ```
