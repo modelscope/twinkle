@@ -1,6 +1,6 @@
 # Qwen3.5-4B Training Best Practices
 
-Using Qwen3.5-4B as an example, this guide demonstrates the core capability of the Twinkle framework: **one codebase, from local debugging to production deployment**.
+Using Qwen3.5-4B as an example, this guide demonstrates the core capability of the Twinkle framework: **one codebase, from single GPU training to Client-Server mode**.
 
 ---
 
@@ -9,7 +9,8 @@ Using Qwen3.5-4B as an example, this guide demonstrates the core capability of t
 Twinkle is a production-oriented large model training framework. Its core design is straightforward: **training logic is expressed in Python code, and the runtime mode is switched via initialization parameters**.
 
 This means:
-- A training script written in the lab can be deployed to a production cluster by changing a single line
+- A training script written in the lab can be used to ray and server training by changing a single line
+- Open to customize your training algorithm
 - No need to maintain separate codebases to support different modes like torchrun, Ray, or HTTP
 - Algorithm engineers focus on training logic; the framework handles distributed communication automatically
 
