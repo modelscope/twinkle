@@ -18,6 +18,7 @@ class CheckpointEngineMixin:
                 self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
             elif Platform.get_platform().__name__ == 'NPU':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
+
                 # Reusing HCCL communicator across sync steps avoids frequent
                 # stream/channel allocation and reduces resource exhaustion risk.
                 rebuild_group = bool(int(os.environ.get('TWINKLE_CKPT_HCCL_REBUILD_GROUP', '0')))

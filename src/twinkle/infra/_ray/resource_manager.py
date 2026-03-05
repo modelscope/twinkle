@@ -86,11 +86,10 @@ class ResourceManager:
             if device_type == 'GPU' and cluster_resource_totals.get('NPU', 0) > 0 and cluster_resource_totals.get(
                     'GPU', 0) == 0:
                 hint = " Hint: Ray cluster exposes 'NPU' resources but no 'GPU'. Set DeviceGroup.device_type='NPU'."
-            raise AssertionError(
-                f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}. '
-                f"requested device: '{device_type}', cluster total for requested device: "
-                f"{int(cluster_resource_totals.get(device_type, 0))}. "
-                f'cluster resource keys: {sorted(cluster_resource_totals.keys())}.{hint}')
+            raise AssertionError(f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}. '
+                                 f"requested device: '{device_type}', cluster total for requested device: "
+                                 f'{int(cluster_resource_totals.get(device_type, 0))}. '
+                                 f'cluster resource keys: {sorted(cluster_resource_totals.keys())}.{hint}')
 
         bundles = []
         cpu_bundles = []

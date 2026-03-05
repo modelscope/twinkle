@@ -176,9 +176,7 @@ class TwinkleWorkerExtension:
             try:
                 comm_metadata = socket.recv_pyobj()
             except zmq.error.Again as e:
-                raise RuntimeError(
-                    f'IPC timeout ({zmq_timeout_s}s) waiting handle on {endpoint}'
-                ) from e
+                raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting handle on {endpoint}') from e
         else:
             comm_metadata = None
 
@@ -208,9 +206,7 @@ class TwinkleWorkerExtension:
                 try:
                     metadata = socket.recv_pyobj()
                 except zmq.error.Again as e:
-                    raise RuntimeError(
-                        f'IPC timeout ({zmq_timeout_s}s) waiting bucket metadata on {endpoint}'
-                    ) from e
+                    raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting bucket metadata on {endpoint}') from e
             else:
                 metadata = None
 
@@ -267,8 +263,7 @@ class TwinkleWorkerExtension:
                         raise RuntimeError(
                             f'Inconsistent chunk metadata for {name}: '
                             f'expected(total={state["total"]}, dtype={state["dtype"]}, shape={state["shape"]}), '
-                            f'got(total={total_nbytes}, dtype={dtype}, shape={shape})'
-                        )
+                            f'got(total={total_nbytes}, dtype={dtype}, shape={shape})')
 
                 if nbytes > 0:
                     state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(raw_u8)
@@ -276,8 +271,7 @@ class TwinkleWorkerExtension:
 
                 if state['received'] > state['total']:
                     raise RuntimeError(
-                        f'Chunk overrun for {name}: received={state["received"]}, total={state["total"]}'
-                    )
+                        f'Chunk overrun for {name}: received={state["received"]}, total={state["total"]}')
 
                 if state['received'] == state['total']:
                     assembled = state['buffer'].view(dtype=state['dtype']).view(state['shape'])
@@ -305,8 +299,7 @@ class TwinkleWorkerExtension:
                 if partial_tensors:
                     pending = ', '.join(sorted(partial_tensors.keys())[:8])
                     raise RuntimeError(
-                        f'Incomplete chunked weights at stream end: pending {len(partial_tensors)} ({pending})'
-                    )
+                        f'Incomplete chunked weights at stream end: pending {len(partial_tensors)} ({pending})')
                 break
 
         partial_tensors.clear()

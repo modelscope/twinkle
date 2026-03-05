@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Generator
-
 import torch
 import zmq
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
 from twinkle.utils import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
@@ -86,18 +85,14 @@ class HCCLCheckpointEngine(CheckpointEngine):
         try:
             return self.socket.recv_pyobj()
         except zmq.error.Again as e:
-            raise RuntimeError(
-                f'HCCL metadata timeout ({self.meta_timeout_s}s) waiting at {where}.'
-            ) from e
+            raise RuntimeError(f'HCCL metadata timeout ({self.meta_timeout_s}s) waiting at {where}.') from e
 
     def _send_pyobj(self, payload: Any, where: str) -> None:
         assert self.socket is not None
         try:
             self.socket.send_pyobj(payload)
         except zmq.error.Again as e:
-            raise RuntimeError(
-                f'HCCL metadata timeout ({self.meta_timeout_s}s) sending at {where}.'
-            ) from e
+            raise RuntimeError(f'HCCL metadata timeout ({self.meta_timeout_s}s) sending at {where}.') from e
 
     def _start_zmq_server(self):
         self.ip = find_node_ip()
@@ -261,7 +256,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
             if req_rank not in pending:
                 self._send_pyobj(
-                    {'ok': False, 'error': f'unexpected/duplicate rank={req_rank}'},
+                    {
+                        'ok': False,
+                        'error': f'unexpected/duplicate rank={req_rank}'
+                    },
                     'NEXT reply',
                 )
                 continue
@@ -282,7 +280,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
         assert self.rank is not None and self.rank > 0
 
         self._send_pyobj(
-            {'type': 'NEXT', 'rank': self.rank, 'bucket_id': bucket_id},
+            {
+                'type': 'NEXT',
+                'rank': self.rank,
+                'bucket_id': bucket_id
+            },
             f'NEXT send bucket={bucket_id}',
         )
         resp = self._recv_pyobj(f'NEXT recv bucket={bucket_id}')
@@ -290,9 +292,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if not isinstance(resp, dict):
             raise RuntimeError(f'Invalid metadata response for bucket {bucket_id}: {resp}')
         if not resp.get('ok', False):
-            raise RuntimeError(
-                f'Metadata request failed for bucket {bucket_id}: {resp.get("error", "unknown")}'
-            )
+            raise RuntimeError(f'Metadata request failed for bucket {bucket_id}: {resp.get("error", "unknown")}')
         metadata = resp.get('metadata')
         if not isinstance(metadata, dict):
             raise RuntimeError(f'Invalid metadata payload for bucket {bucket_id}: {metadata}')
@@ -302,7 +302,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         return metadata
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor]]):
         assert self.rank is not None and self.rank <= 0
         if self.rank < 0:
             for _name, _weight in weights:
@@ -347,10 +347,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
             weight_u8 = weight.view(-1).view(torch.uint8)
             nbytes = int(weight_u8.numel())
             if nbytes > self.bucket_size:
-                raise ValueError(
-                    f'Weight {name}({tuple(weight.shape)}, {weight.dtype}) is too large '
-                    f'for bucket ({self.bucket_size / (1 << 20):.1f} MB). Increase bucket size.'
-                )
+                raise ValueError(f'Weight {name}({tuple(weight.shape)}, {weight.dtype}) is too large '
+                                 f'for bucket ({self.bucket_size / (1 << 20):.1f} MB). Increase bucket size.')
             if offset + nbytes > self.bucket_size:
                 _flush(is_last=False)
 
@@ -369,7 +367,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         logger.info(f'send_weights done: rank={self.rank}, params={total_params}, time={elapsed:.2f}s')
 
     @torch.no_grad()
-    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor]]:
         assert self.rank is not None and self.rank > 0
         assert self.recv_buf is not None
 
@@ -427,19 +425,15 @@ class HCCLCheckpointEngine(CheckpointEngine):
                         raise RuntimeError(
                             f'Inconsistent chunk metadata for weight {name}: '
                             f'expected total={state["total"]}, dtype={state["dtype"]}, shape={state["shape"]}; '
-                            f'got total={total_nbytes}, dtype={dtype}, shape={shape}.'
-                        )
+                            f'got total={total_nbytes}, dtype={dtype}, shape={shape}.')
 
                 if nbytes > 0:
-                    state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(
-                        recv_buf[offset:offset + nbytes]
-                    )
+                    state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(recv_buf[offset:offset + nbytes])
                 state['received'] += nbytes
 
                 if state['received'] > state['total']:
                     raise RuntimeError(
-                        f'Chunk overrun for weight {name}: received={state["received"]}, total={state["total"]}.'
-                    )
+                        f'Chunk overrun for weight {name}: received={state["received"]}, total={state["total"]}.')
                 if state['received'] == state['total']:
                     full_size = int(dtype.itemsize * shape.numel())
                     tensor = state['buffer'][:full_size].view(dtype=dtype).view(shape)
@@ -450,16 +444,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
             if bool(metadata['is_last']):
                 if partial_tensors:
                     pending = ', '.join(sorted(partial_tensors.keys())[:8])
-                    raise RuntimeError(
-                        'Incomplete chunked weights at end of stream. '
-                        f'Pending {len(partial_tensors)} weight(s): {pending}'
-                    )
+                    raise RuntimeError('Incomplete chunked weights at end of stream. '
+                                       f'Pending {len(partial_tensors)} weight(s): {pending}')
                 break
             bucket_id += 1
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
-        logger.info(
-            f'receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
-            f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s'
-        )
+        logger.info(f'receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
