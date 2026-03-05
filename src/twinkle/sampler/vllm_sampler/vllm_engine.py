@@ -9,6 +9,7 @@ from twinkle import get_logger
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
 from twinkle.sampler.base_engine import BaseSamplerEngine
 from twinkle.utils import Platform
+from twinkle.utils.framework import Torch
 
 logger = get_logger()
 
@@ -492,10 +493,6 @@ class VLLMEngine(BaseSamplerEngine):
 
         start_time = time.time()
 
-        bucket_size_mb = int(os.environ.get('TWINKLE_VLLM_IPC_BUCKET_MB', str(bucket_size_mb)))
-        if bucket_size_mb <= 0:
-            raise ValueError(f'Invalid TWINKLE_VLLM_IPC_BUCKET_MB={bucket_size_mb}, must be > 0')
-
         # Normalise *weights* into an async iterator regardless of input type.
         if isinstance(weights, dict):
 
@@ -600,8 +597,8 @@ class VLLMEngine(BaseSamplerEngine):
             nonlocal offset, bucket_meta
             if not bucket_meta and not is_last:
                 return
-            if use_gpu_ipc:
-                torch.cuda.synchronize()
+            if buffer.device.type != 'cpu':
+                Torch.synchronize()
             await loop.run_in_executor(
                 None,
                 _zmq_send_recv,

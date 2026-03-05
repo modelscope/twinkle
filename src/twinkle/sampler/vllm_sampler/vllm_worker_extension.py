@@ -115,6 +115,7 @@ class TwinkleWorkerExtension:
             peft_config: If provided with base_sync_done, loads as LoRA.
             base_sync_done: If True and peft_config, replaces existing LoRA.
             use_shm: If True, use shared memory instead of CUDA IPC.
+            zmq_handle: Optional ZMQ IPC endpoint for per-bucket handshake/control messages. If None, falls back to _get_zmq_handle().
         """
         import torch.distributed as dist
         import zmq
