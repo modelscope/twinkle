@@ -68,28 +68,17 @@ class ResourceManager:
             self.nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
 
         self.nodes = []
-        cluster_resource_totals = {}
         for node in ray.nodes():
             # get available nodes
             resource = node['Resources']
-            for name, amount in resource.items():
-                if isinstance(amount, (int, float)):
-                    cluster_resource_totals[name] = cluster_resource_totals.get(name, 0.0) + float(amount)
             node_device_num = int(resource.get(device_type, 0))
             if device_type != 'CPU' and node_device_num >= nproc_per_node:
                 self.nodes.append(node)
             if device_type == 'CPU' and int(node['Resources']['CPU']) // 4 >= ncpu_proc_per_node:
                 self.nodes.append(node)
 
-        if self.nnodes > len(self.nodes):
-            hint = ''
-            if device_type == 'GPU' and cluster_resource_totals.get('NPU', 0) > 0 and cluster_resource_totals.get(
-                    'GPU', 0) == 0:
-                hint = " Hint: Ray cluster exposes 'NPU' resources but no 'GPU'. Set DeviceGroup.device_type='NPU'."
-            raise AssertionError(f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}. '
-                                 f"requested device: '{device_type}', cluster total for requested device: "
-                                 f'{int(cluster_resource_totals.get(device_type, 0))}. '
-                                 f'cluster resource keys: {sorted(cluster_resource_totals.keys())}.{hint}')
+        assert self.nnodes <= len(
+            self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
 
         bundles = []
         cpu_bundles = []
