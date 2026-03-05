@@ -69,4 +69,11 @@ sampler = vLLMSampler(
 response = sampler.sample(trajectories, sampling_params=params)
 ```
 
+## Environment Variables
+
+- `TWINKLE_VLLM_IPC_TIMEOUT_S`:
+  Controls the timeout (in seconds) for the IPC channel (ZMQ REQ/REP)
+  between `vLLMSampler` and the vLLM worker extension.
+  Default is `300`. This value must be greater than `0`.
+
 > In RLHF training, vLLMSampler is typically separated from the Actor model, using different hardware resources to avoid interference between inference and training.

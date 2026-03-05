@@ -25,4 +25,10 @@ HCCLCheckpointEngine 专门用于昇腾 NPU 环境:
 - 需要在 NPU 间同步模型权重
 - 大规模 NPU 集群部署
 
+## 环境变量
+
+- `TWINKLE_CKPT_HCCL_META_TIMEOUT_S`:
+  控制 HCCL CheckpointEngine 元数据握手通道（ZMQ REQ/REP）的超时时间（秒）。
+  默认值为 `300`。该值应设置为大于 `0` 的整数。
+
 > 在昇腾 NPU 环境中,HCCLCheckpointEngine 提供了与 NCCL 相当的性能。

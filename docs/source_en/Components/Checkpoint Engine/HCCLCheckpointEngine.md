@@ -25,4 +25,11 @@ HCCLCheckpointEngine is specifically designed for Ascend NPU environments:
 - Synchronizing model weights between NPUs
 - Large-scale NPU cluster deployment
 
+## Environment Variables
+
+- `TWINKLE_CKPT_HCCL_META_TIMEOUT_S`:
+  Controls the timeout (in seconds) for the HCCL CheckpointEngine
+  metadata handshake channel (ZMQ REQ/REP).
+  Default is `300`. This value should be an integer greater than `0`.
+
 > In Ascend NPU environments, HCCLCheckpointEngine provides performance comparable to NCCL.

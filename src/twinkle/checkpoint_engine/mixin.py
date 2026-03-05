@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
+
 from twinkle import Platform, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 
@@ -16,7 +18,13 @@ class CheckpointEngineMixin:
                 self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
             elif Platform.get_platform().__name__ == 'NPU':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
-                self._checkpoint_engine = HCCLCheckpointEngine(self._bucket_size)
+
+                # Reusing HCCL communicator across sync steps avoids frequent
+                # stream/channel allocation and reduces resource exhaustion risk.
+                self._checkpoint_engine = HCCLCheckpointEngine(
+                    self._bucket_size,
+                    rebuild_group=False,
+                )
         return self._checkpoint_engine
 
     @remote_function(collect='first', lazy_collect=False)

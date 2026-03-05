@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from twinkle import get_logger
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
+from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
 
@@ -97,6 +98,7 @@ class TwinkleWorkerExtension:
         peft_config: Optional[Dict] = None,
         base_sync_done: bool = False,
         use_shm: bool = False,
+        zmq_handle: Optional[str] = None,
     ) -> None:
         """Receive and load weights via ZMQ + CUDA IPC/SHM.
 
@@ -114,6 +116,7 @@ class TwinkleWorkerExtension:
             peft_config: If provided with base_sync_done, loads as LoRA.
             base_sync_done: If True and peft_config, replaces existing LoRA.
             use_shm: If True, use shared memory instead of CUDA IPC.
+            zmq_handle: Optional ZMQ IPC endpoint. If None, uses _get_zmq_handle().
         """
         import torch.distributed as dist
         import zmq
@@ -121,8 +124,10 @@ class TwinkleWorkerExtension:
         if self.device is None:
             # fix: In some worker paths, omitting local_rank can pick the wrong device / trigger get_device arg issues.
             # fix: Pass local_rank when available so each worker binds to the expected local device.
-            print(f"VLLM Worker local_rank: {getattr(self, 'local_rank', None)} <<<<<<<<<<<<< {Torch.get_device()}")
-            self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
+            local_rank = getattr(self, 'local_rank', None)
+            device_str = Torch.get_device(local_rank)
+            logger.info(f'vLLM worker bind device: local_rank={local_rank}, device={device_str}')
+            self.device = torch.device(device_str)
 
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
@@ -155,17 +160,23 @@ class TwinkleWorkerExtension:
 
         # ── Step 1: Establish ZMQ connection (driver only) ──
         socket = None
+        zmq_timeout_s = get_timeout_s_from_env('TWINKLE_VLLM_IPC_TIMEOUT_S', 300)
+        endpoint = zmq_handle or self._get_zmq_handle()
         if is_driver:
             if not hasattr(self, '_zmq_ctx') or self._zmq_ctx is None:
                 self._zmq_ctx = zmq.Context()
             socket = self._zmq_ctx.socket(zmq.REP)
-            socket.connect(self._get_zmq_handle())
+            configure_zmq_socket(socket, timeout_ms=zmq_timeout_s * 1000, linger=0)
+            socket.connect(endpoint)
 
         # ── Step 2: Receive and broadcast IPC/SHM handle ──
         buffer, shm = None, None
 
         if is_driver:
-            comm_metadata = socket.recv_pyobj()
+            try:
+                comm_metadata = socket.recv_pyobj()
+            except zmq.error.Again as e:
+                raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting handle on {endpoint}') from e
         else:
             comm_metadata = None
 
@@ -188,10 +199,14 @@ class TwinkleWorkerExtension:
             socket.send(b'')  # Ready
 
         # ── Step 3: Receive and process weight buckets ──
+        partial_tensors: dict = {}
         while True:
             # Only the driver receives bucket metadata from VLLMEngine.
             if is_driver:
-                metadata = socket.recv_pyobj()
+                try:
+                    metadata = socket.recv_pyobj()
+                except zmq.error.Again as e:
+                    raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) waiting bucket metadata on {endpoint}') from e
             else:
                 metadata = None
 
@@ -199,15 +214,73 @@ class TwinkleWorkerExtension:
                 metadata = _broadcast_obj(metadata)
 
             weights = []
-            for name, meta in metadata['bucket_meta'].items():
-                shape, dtype, offset = meta['shape'], meta['dtype'], meta['offset']
-                size = dtype.itemsize * shape.numel()
-                tensor = buffer[offset:offset + size].view(dtype=dtype).view(shape)
-                if not use_shm:
-                    tensor = tensor.clone()
+            bucket_meta = metadata.get('bucket_meta', [])
+            if isinstance(bucket_meta, dict):
+                entries = list(bucket_meta.values())
+            else:
+                entries = list(bucket_meta)
+
+            # Drop old slice refs before creating new views into shared memory.
+            raw_u8 = None
+            cpu_u8 = None
+            tensor = None
+            assembled = None
+            state = None
+            for meta in entries:
+                name = meta['name']
+                dtype = meta['dtype']
+                shape = meta['shape']
+                shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
+                offset = int(meta['offset'])
+                full_size = int(dtype.itemsize * shape.numel())
+                nbytes = int(meta.get('nbytes', full_size))
+                chunk_offset = int(meta.get('chunk_offset', 0))
+                total_nbytes = int(meta.get('total_nbytes', full_size))
+
+                raw_u8 = buffer[offset:offset + nbytes]
+
+                if nbytes == total_nbytes and chunk_offset == 0:
+                    if use_shm:
+                        cpu_u8 = raw_u8.clone()
+                        tensor = cpu_u8.view(dtype=dtype).view(shape)
+                    else:
+                        tensor = raw_u8.view(dtype=dtype).view(shape).clone()
+                    weights.append((name, tensor))
+                    continue
+
+                state = partial_tensors.get(name)
+                if state is None:
+                    state = {
+                        'buffer': torch.empty(total_nbytes, dtype=torch.uint8, device=buffer.device),
+                        'dtype': dtype,
+                        'shape': shape,
+                        'total': total_nbytes,
+                        'received': 0,
+                    }
+                    partial_tensors[name] = state
                 else:
-                    tensor = tensor.to(self.device)
-                weights.append((name, tensor))
+                    if state['total'] != total_nbytes or state['dtype'] != dtype or state['shape'] != shape:
+                        raise RuntimeError(
+                            f'Inconsistent chunk metadata for {name}: '
+                            f'expected(total={state["total"]}, dtype={state["dtype"]}, shape={state["shape"]}), '
+                            f'got(total={total_nbytes}, dtype={dtype}, shape={shape})')
+
+                if nbytes > 0:
+                    state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(raw_u8)
+                state['received'] += nbytes
+
+                if state['received'] > state['total']:
+                    raise RuntimeError(
+                        f'Chunk overrun for {name}: received={state["received"]}, total={state["total"]}')
+
+                if state['received'] == state['total']:
+                    assembled = state['buffer'].view(dtype=state['dtype']).view(state['shape'])
+                    if use_shm:
+                        tensor = assembled
+                    else:
+                        tensor = assembled.clone()
+                    weights.append((name, tensor))
+                    del partial_tensors[name]
 
             Torch.synchronize()
 
@@ -223,15 +296,34 @@ class TwinkleWorkerExtension:
             del weights
 
             if metadata['is_last']:
+                if partial_tensors:
+                    pending = ', '.join(sorted(partial_tensors.keys())[:8])
+                    raise RuntimeError(
+                        f'Incomplete chunked weights at stream end: pending {len(partial_tensors)} ({pending})')
                 break
 
+        partial_tensors.clear()
+        metadata = None
+        raw_u8 = None
+        cpu_u8 = None
+        tensor = None
+        assembled = None
+        state = None
         if is_driver and socket is not None:
             socket.close()
         del buffer
-        if shm is not None:
-            shm.close()
-            del shm
         gc.collect()
+        if shm is not None:
+            try:
+                shm.close()
+            except BufferError:
+                # Best effort: some temporary views may still be held by runtime internals.
+                gc.collect()
+                try:
+                    shm.close()
+                except BufferError as e:
+                    logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
+            del shm
         Torch.ipc_collect()
         Torch.empty_cache()
 
