@@ -226,7 +226,7 @@ class Template:
                 message['images'] = self.preprocess_images(msg_images)
                 assert len(message['images']) == content.count(self.image_placeholder)
             if msg_videos:
-                message['videos'] = self.preprocess_images(msg_videos)
+                message['videos'] = self.preprocess_videos(msg_videos)
                 assert len(message['videos']) == content.count(self.video_placeholder)
             if msg_audios:
                 message['audios'] = self.preprocess_audios(msg_audios)

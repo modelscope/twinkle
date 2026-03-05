@@ -311,9 +311,13 @@ class InputProcessor:
         for _input in inputs:
             output = {}
             _keys = [
-                'input_ids', 'input_embeddings', 'attention_mask', 'position_ids', 'labels', 'completion_mask',
-                'pixel_values', 'image_grid_thw'
-            ]
+                'input_ids',
+                'input_embeddings',
+                'attention_mask',
+                'position_ids',
+                'labels',
+                'completion_mask',
+            ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key in _keys:
                     output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]
