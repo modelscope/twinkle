@@ -1,6 +1,6 @@
-# Qwen3.5-4B Training Best Practices
+# Qwen3.5 Training Best Practices
 
-Using Qwen3.5-4B as an example, this guide demonstrates the core capability of the Twinkle framework: **one codebase, from single GPU training to Client-Server mode**.
+Using Qwen3.5-4B as an example, this guide demonstrates the core capability of the Twinkle framework: **one component-based code, used from single GPU training to Client-Server mode**.
 
 ---
 
@@ -364,7 +364,6 @@ Twinkle Client provides an API nearly identical to local training, ideal for sce
 import dotenv
 dotenv.load_dotenv('.env')
 
-import os
 from peft import LoraConfig
 
 from twinkle import get_logger
@@ -375,9 +374,6 @@ from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
-
-# Whether to use the Megatron backend
-use_megatron = True
 
 # Initialize the Twinkle client
 client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
@@ -410,11 +406,8 @@ def train():
     model.set_template('Template')
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('CrossEntropyLoss')
-    model.set_optimizer('Adam', lr=1e-4)
-
-    # LR scheduler not supported with Megatron backend
-    if not use_megatron:
-        model.set_lr_scheduler('LinearLR')
+    model.set_optimizer('AdamW', lr=1e-4)
+    model.set_lr_scheduler('LinearLR')
 
     # Resume from checkpoint if available
     if resume_path:
@@ -473,7 +466,7 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # Base model
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 
@@ -481,7 +474,7 @@ def train():
     # Prepare dataset
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
     dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
-    dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_cache_file=False)
+    dataset.map(SelfCognitionProcessor('Twinkle Model', 'ModelScope Team'), load_from_cache_file=False)
     dataset.encode(batched=True, load_from_cache_file=False)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
 
