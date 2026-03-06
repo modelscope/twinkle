@@ -58,7 +58,7 @@ dataset = Dataset(DatasetMeta(dataset_id='my/custom/dataset.jsonl', data_slice=r
 If using a local path or a local file, please follow these instructions:
 
 1. If you are using a local dataset file, pass a single file path (better to be an absolute path to avoid relative path errors), list is not supported.
-2. If you are using a local dir, please make sure files in the path share the same data structure, and the file extensions.
+2. If you are using a local dir, please make sure all files in the path have the same data structure and file extension.
 3. We use `datasets` library to do data loading, check the support extensions [here](https://huggingface.co/docs/hub/datasets-libraries).
 
 2. Setting template
