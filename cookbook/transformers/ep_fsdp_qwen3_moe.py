@@ -34,7 +34,7 @@ device_mesh = DeviceMesh(
     device_type=Platform.get_platform().device_prefix(),
     mesh=np.arange(fsdp_size * dp_size).reshape(fsdp_size, dp_size),
     mesh_dim_names=('fsdp', 'dp'),
-    ep_size=ep_size,  # ep_size is stored as attribute, not a mesh dimension
+    ep_size=ep_size,
 )
 
 twinkle.initialize(
@@ -104,13 +104,16 @@ def train():
                 max_grad_norm=MAX_GRAD_NORM,
                 gradient_accumulation_steps=GRAD_ACCUM_STEPS,
             )
-        if step % GRAD_ACCUM_STEPS == 0:
+
+        is_sync_step = ((step + 1) % GRAD_ACCUM_STEPS == 0)
+        if is_sync_step:
+            optimizer_step = (step + 1) // GRAD_ACCUM_STEPS
             metric = model.calculate_metric(is_training=True)
             if callable(metric):
                 metric = metric()
-            logger.info(f'Current is step {step // GRAD_ACCUM_STEPS}, metric: {metric}')
-        if step > 0 and step % 50 == 0:
-            model.save('./output')
+            logger.info(f'Current optimizer_step {optimizer_step}, metric: {metric}')
+            if optimizer_step > 0 and optimizer_step % 50 == 0:
+                model.save(name=f'checkpoint-step-{optimizer_step}', output_dir='./output')
 
 
 if __name__ == '__main__':

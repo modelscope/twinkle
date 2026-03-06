@@ -305,12 +305,12 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             logits_abs_diff = (single_logits - multi_logits).abs()
             logits_max_diff = logits_abs_diff.max().item()
             logits_mean_diff = logits_abs_diff.mean().item()
-            print(f'\n=== Forward: Logits ===')
+            print('\n=== Forward: Logits ===')
             print(f'  Max diff: {logits_max_diff:.2e}, Mean diff: {logits_mean_diff:.2e}')
             if not torch.allclose(single_logits, multi_logits, rtol=REL_TOL, atol=ABS_TOL):
                 forward_err = f'Logits mismatch! Max diff: {logits_max_diff}, Mean diff: {logits_mean_diff}'
 
-            print(f'\n=== Forward: Loss ===')
+            print('\n=== Forward: Loss ===')
             print(f'  Single: {single_data["loss"]:.6f}, Multi: {loss.item():.6f}')
             loss_diff = abs(single_data['loss'] - loss.item())
             single_loss_t = torch.tensor(single_data['loss'], dtype=torch.float32)
