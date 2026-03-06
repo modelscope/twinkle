@@ -55,6 +55,12 @@ from twinkle.dataset import Dataset, DatasetMeta
 dataset = Dataset(DatasetMeta(dataset_id='my/custom/dataset.jsonl', data_slice=range(1500)))
 ```
 
+If using a local path or a local file, please follow these instructions:
+
+1. If you are using a local dataset file, pass a single file path (better to be an absolute path to avoid relative path errors), list is not supported.
+2. If you are using a local dir, please make sure files in the path share the same data structure, and the file extensions.
+3. We use `datasets` library to do data loading, check the support extensions [here](https://huggingface.co/docs/hub/datasets-libraries).
+
 2. Setting template
 
 The Template component is responsible for converting string/image multimodal raw data into model input tokens. The dataset can set a Template to complete the `encode` process.
