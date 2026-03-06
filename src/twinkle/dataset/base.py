@@ -132,15 +132,13 @@ class Dataset(TorchDataset):
                     file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
                     if file_type == 'csv':
                         kwargs['na_filter'] = False
-                    kwargs['path'] = ext
-                    dataset = load_dataset(data_dir=dataset_id, **kwargs)
+                    dataset = load_dataset(file_type, data_dir=dataset_id, **kwargs)
                 else:
                     ext = os.path.splitext(dataset_id)[1].lstrip('.')
                     file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
                     if file_type == 'csv':
                         kwargs['na_filter'] = False
-                    kwargs['path'] = ext
-                    dataset = load_dataset(data_files=dataset_id, **kwargs)
+                    dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
 
