@@ -1,12 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from twinkle.data_format import Message, Trajectory
+from twinkle.utils import to_device
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
+
+_T = TypeVar('_T')
 
 PLACEHOLDER = '<<<ASSISTANT_PLACEHOLDER_7f3d2a1b>>>'
 
@@ -101,14 +104,14 @@ def tokenize_with_assistant_labels(
             assistant_count += 1
         _dummy_messages.append(msg)
 
-    encoded = encode_func(trajectory, )
+    encoded = encode_func(trajectory)
     full_ids = encoded.pop('input_ids')
     if isinstance(full_ids, torch.Tensor):
         full_ids = full_ids.tolist()[0]
 
     _dummy_trajectory = copy(trajectory)
     _dummy_trajectory['messages'] = _dummy_messages
-    template_ids = encode_func(_dummy_trajectory, )
+    template_ids = encode_func(_dummy_trajectory)
     template_ids = template_ids['input_ids']
     if isinstance(template_ids, torch.Tensor):
         template_ids = template_ids.tolist()[0]
@@ -168,50 +171,66 @@ def _load_image(img: Any) -> Optional[Any]:
         return img
 
 
-def _transfer_single_message(content: str, image_placeholder, video_placeholder, images, videos):
-    image_idx = 0
-    video_idx = 0
-    remaining = content
-    # Handle None images/videos
-    images = images or []
-    videos = videos or []
-    has_image = image_placeholder in content
-    has_video = video_placeholder in content
-    new_content = []
-    while remaining:
-        img_pos = remaining.find(image_placeholder) if has_image else -1
-        vid_pos = remaining.find(video_placeholder) if has_video else -1
+def _transfer_single_message(
+    content: str,
+    image_placeholder: str,
+    video_placeholder: str,
+    audio_placeholder: str,
+    images: list | None = None,
+    videos: list | None = None,
+    audios: list | None = None,
+) -> list[dict]:
+    if not content:
+        return []
 
-        # Find next placeholder
-        if img_pos == -1 and vid_pos == -1:
-            if remaining.strip():
-                new_content.append({'type': 'text', 'text': remaining})
-            break
+    media_configs = [
+        (image_placeholder, 'image', images or []),
+        (video_placeholder, 'video', videos or []),
+        (audio_placeholder, 'audio', audios or []),
+    ]
 
-        # Determine which comes first
-        if vid_pos == -1 or (img_pos != -1 and img_pos < vid_pos):
-            # Image placeholder
-            if remaining[:img_pos].strip():
-                new_content.append({'type': 'text', 'text': remaining[:img_pos]})
-            if image_idx < len(images):
-                new_content.append({'type': 'image', 'url': images[image_idx]})
-                image_idx += 1
-            remaining = remaining[img_pos + len(image_placeholder):]
-        else:
-            # Video placeholder
-            if remaining[:vid_pos].strip():
-                new_content.append({'type': 'text', 'text': remaining[:vid_pos]})
-            if video_idx < len(videos):
-                new_content.append({'type': 'video', 'url': videos[video_idx]})
-                video_idx += 1
-            remaining = remaining[vid_pos + len(video_placeholder):]
-    return new_content
+    placeholders = []
+    for placeholder, media_type, media_list in media_configs:
+        if not placeholder:
+            continue
+        start = 0
+        media_idx = 0
+        while (pos := content.find(placeholder, start)) != -1:
+            url = media_list[media_idx] if media_idx < len(media_list) else None
+            placeholders.append((pos, len(placeholder), media_type, url))
+            media_idx += 1
+            start = pos + len(placeholder)
+
+    if not placeholders:
+        return [{'type': 'text', 'text': content}] if content.strip() else []
+
+    placeholders.sort(key=lambda x: x[0])
+
+    result = []
+    cursor = 0
+
+    for pos, length, media_type, url in placeholders:
+        text_segment = content[cursor:pos]
+        if text_segment.strip():
+            result.append({'type': 'text', 'text': text_segment})
+
+        if url is not None:
+            result.append({'type': media_type, 'url': url})
+
+        cursor = pos + length
+
+    trailing_text = content[cursor:]
+    if trailing_text.strip():
+        result.append({'type': 'text', 'text': trailing_text})
+
+    return result
 
 
-def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder, is_mm):
+def transfer_to_standard_message(message: Message, image_placeholder, video_placeholder, audio_placeholder, is_mm):
     if is_mm:
         new_content = _transfer_single_message(message['content'], image_placeholder, video_placeholder,
-                                               message.get('images'), message.get('videos'))
+                                               audio_placeholder, message.get('images'), message.get('videos'),
+                                               message.get('audios'))
     else:
         new_content = message['content']
 
@@ -220,3 +239,61 @@ def transfer_to_standard_message(message: Message, image_placeholder, video_plac
         content=new_content,
         tool_calls=message.get('tool_calls'),
         reasoning_content=message.get('reasoning_content'))
+
+
+def get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config):
+    input_ids = inputs['input_ids']
+    pixel_values = inputs.get('pixel_values')
+    pixel_values_videos = inputs.get('pixel_values_videos')
+    image_grid_thw = inputs.get('image_grid_thw')
+    video_grid_thw = inputs.get('video_grid_thw')
+    dtype = visual.dtype
+    if pixel_values is None and pixel_values_videos is None:
+        from PIL import Image
+        images = [Image.new('RGB', (32, 32), (0, 0, 0))]
+        media_inputs = processor.image_processor(images=images, return_tensors='pt')
+        media_inputs = to_device(media_inputs, input_ids.device)
+        pixel_values = media_inputs['pixel_values'].type(dtype)
+        image_embeds = visual(pixel_values, grid_thw=media_inputs['image_grid_thw'])
+        if hasattr(image_embeds, 'pooler_output'):
+            image_embeds = image_embeds.pooler_output
+        inputs_embeds = inputs_embeds + image_embeds.mean().to(device=inputs_embeds.device) * 0.
+    else:
+        import torch
+        if pixel_values is None:
+            pixel_values_mixed = pixel_values_videos
+            grid_thw = video_grid_thw
+        elif pixel_values_videos is None:
+            pixel_values_mixed = pixel_values
+            grid_thw = image_grid_thw
+        else:
+            pixel_values_mixed = torch.concat([pixel_values, pixel_values_videos], dim=0)
+            grid_thw = torch.concat([image_grid_thw, video_grid_thw], dim=0)
+        pixel_values_mixed = pixel_values_mixed.type(dtype)
+        mixed_embeds = visual(pixel_values_mixed, grid_thw=grid_thw)
+        if hasattr(mixed_embeds, 'pooler_output'):
+            mixed_embeds = mixed_embeds.pooler_output
+        if pixel_values is None:
+            image_embeds = None
+            video_embeds = mixed_embeds
+        elif pixel_values_videos is None:
+            image_embeds = mixed_embeds
+            video_embeds = None
+        else:
+            merge_length = processor.image_processor.merge_size**2
+            image_tokens = (image_grid_thw.prod(dim=-1) // merge_length).sum()
+            image_embeds = mixed_embeds[:image_tokens]
+            video_embeds = mixed_embeds[image_tokens:]
+
+        if image_embeds is not None:
+            image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask = image_mask.to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if video_embeds is not None:
+            video_mask = (input_ids == config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            video_mask = video_mask.to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+    return inputs_embeds

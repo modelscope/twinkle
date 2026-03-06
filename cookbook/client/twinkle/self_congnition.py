@@ -21,8 +21,7 @@ from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
-# Whether to use Megatron for training
-use_megatron = True
+
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
@@ -88,8 +87,7 @@ def train():
     model.set_optimizer('Adam', lr=1e-4)
 
     # Use a linear learning rate scheduler (Do not support LR scheduler if server use megatron)
-    if not use_megatron:
-        model.set_lr_scheduler('LinearLR')
+    model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
     if resume_path:

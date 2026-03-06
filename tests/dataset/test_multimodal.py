@@ -37,15 +37,15 @@ class TestMultimodalDataset:
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_multimodal_dataset_with_qwen3vl_template(self):
-        # Use Qwen3VLTemplate
+        # Use Qwen3_5Template
         csv_path = str(TEST_DATA_DIR / 'test.csv')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
         dataset.map(create_multimodal_messages)
 
         try:
-            dataset.set_template('Qwen3VLTemplate', model_id='Qwen/Qwen3-VL-2B-Instruct')
+            dataset.set_template('Qwen3_5Template', model_id='Qwen/Qwen3-VL-2B-Instruct')
         except Exception as e:
-            pytest.skip(f'Failed to load Qwen3VLTemplate (may need network): {e}')
+            pytest.skip(f'Failed to load Qwen3_5Template (may need network): {e}')
 
         assert dataset.template is not None
         assert hasattr(dataset.template, 'is_mm')
@@ -58,9 +58,9 @@ class TestMultimodalDataset:
         dataset.map(create_multimodal_messages)
 
         try:
-            dataset.set_template('Qwen3VLTemplate', model_id='Qwen/Qwen3-VL-2B-Instruct')
+            dataset.set_template('Qwen3_5Template', model_id='Qwen/Qwen3-VL-2B-Instruct')
         except Exception as e:
-            pytest.skip(f'Failed to load Qwen3VLTemplate (may need network): {e}')
+            pytest.skip(f'Failed to load Qwen3_5Template (may need network): {e}')
 
         try:
             dataset.encode()

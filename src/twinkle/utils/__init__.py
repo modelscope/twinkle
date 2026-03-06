@@ -14,3 +14,4 @@ from .torch_utils import pad_sequence_to_length, selective_log_softmax, stateles
 from .transformers_utils import find_all_linears, find_layers, get_modules_to_not_convert
 from .unsafe import check_unsafe, trust_remote_code
 from .utils import copy_files_by_pattern, deep_getattr
+from .vision_tools import load_image, load_mm_file

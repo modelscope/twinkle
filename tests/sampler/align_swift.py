@@ -17,7 +17,6 @@ Run Ray test alone: python align_swift.py --ray
 
 import gc
 import os
-import sys
 import torch
 from swift.infer_engine import RequestConfig, TransformersEngine, VllmEngine
 from swift.utils import seed_everything
@@ -27,8 +26,7 @@ import twinkle
 from twinkle.data_format import SamplingParams, Trajectory
 from twinkle.sampler.torch_sampler import TorchSampler
 from twinkle.sampler.vllm_sampler import vLLMSampler
-from twinkle.template import Template
-from twinkle.template.qwen3_vl import Qwen3VLTemplate
+from twinkle.template import Qwen3_5Template, Template
 
 # Test models
 LLM_MODEL_ID = 'Qwen/Qwen2.5-7B-Instruct'
@@ -182,7 +180,6 @@ def test_llm_vllm_sampler_ray():
     from peft import LoraConfig
 
     from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
-    from twinkle.checkpoint_engine import CheckpointEngineManager
     from twinkle.model import TransformersModel
     from twinkle.processor import InputProcessor
 
@@ -269,7 +266,7 @@ def test_mllm_torch_sampler():
     seed_everything(42)
     from transformers import Qwen3VLForConditionalGeneration
     sampler = TorchSampler(MLLM_MODEL_ID, model_cls=Qwen3VLForConditionalGeneration)
-    sampler.set_template(Qwen3VLTemplate, model_id=MLLM_MODEL_ID)
+    sampler.set_template(Qwen3_5Template, model_id=MLLM_MODEL_ID)
 
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
@@ -297,7 +294,7 @@ def test_mllm_vllm_sampler():
 
     seed_everything(42)
     sampler = vLLMSampler(MLLM_MODEL_ID, gpu_memory_utilization=VLLM_GPU_MEM, max_model_len=VLLM_MAX_MODEL_LEN)
-    sampler.set_template(Qwen3VLTemplate, model_id=MLLM_MODEL_ID)
+    sampler.set_template(Qwen3_5Template, model_id=MLLM_MODEL_ID)
 
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
     sampling_params = SamplingParams(max_tokens=128, temperature=0)

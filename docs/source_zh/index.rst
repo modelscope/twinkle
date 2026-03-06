@@ -14,6 +14,7 @@ Twinkle DOCUMENTATION
    使用指引/服务端和客户端/index.rst
    使用指引/NPU的支持.md
    使用指引/训练服务.md
+   使用指引/Qwen3.5最佳实践.md
 
 .. toctree::
    :maxdepth: 2
