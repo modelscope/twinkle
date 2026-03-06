@@ -41,6 +41,18 @@ class TestLocalDatasetLoading:
         assert dataset[0]['text'] == 'Hello world'
         assert dataset[0]['label'] == 0
 
+    def test_load_local_lance(self):
+        """Test loading local Lance file"""
+        lance_path = str(TEST_DATA_DIR / '1.lance')
+        dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=lance_path))
+        assert len(dataset) == 2
+
+    def test_load_local_lance_dir(self):
+        """Test loading local Lance dir"""
+        lance_path = str(TEST_DATA_DIR / 'lance')
+        dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=lance_path))
+        assert len(dataset) == 2
+
     def test_load_local_jsonl(self):
         jsonl_path = str(TEST_DATA_DIR / 'test.jsonl')
         dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=jsonl_path))

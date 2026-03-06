@@ -55,6 +55,12 @@ from twinkle.dataset import Dataset, DatasetMeta
 dataset = Dataset(DatasetMeta(dataset_id='my/custom/dataset.jsonl', data_slice=range(1500)))
 ```
 
+如果使用本地路径或本地文件，请遵循以下说明：
+
+1. 如果使用的是本地数据集文件，请传入单个文件路径（最好使用绝对路径以避免相对路径错误），不支持传入列表。
+2. 如果使用的是本地目录，请确保目录中的文件具有相同的数据结构和文件扩展名。
+3. 我们使用 `datasets` 库进行数据加载，支持的扩展名请查看[此处](https://huggingface.co/docs/hub/datasets-libraries)。
+
 2. 设置 template
 
 Template 组件是负责将字符串/图片多模态原始数据转换为模型输入 token 的组件。数据集可以设置一个 Template 来完成 `encode` 过程。

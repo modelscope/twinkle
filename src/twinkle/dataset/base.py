@@ -120,15 +120,25 @@ class Dataset(TorchDataset):
             if os.path.exists(dataset_id):
                 streaming = kwargs.get('streaming', False)
                 num_proc = kwargs.get('num_proc', 1)
-                ext = os.path.splitext(dataset_id)[1].lstrip('.')
-                file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
                 if streaming:
                     kwargs = {'split': 'train', 'streaming': True}
                 else:
                     kwargs = {'split': 'train', 'num_proc': num_proc}
-                if file_type == 'csv':
-                    kwargs['na_filter'] = False
-                dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
+                if os.path.isdir(dataset_id):
+                    folder_path = dataset_id
+                    files = os.listdir(folder_path)
+                    first_file = files[0] if files else None
+                    ext = os.path.splitext(first_file)[1].lstrip('.')
+                    file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
+                    if file_type == 'csv':
+                        kwargs['na_filter'] = False
+                    dataset = load_dataset(file_type, data_dir=dataset_id, **kwargs)
+                else:
+                    ext = os.path.splitext(dataset_id)[1].lstrip('.')
+                    file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
+                    if file_type == 'csv':
+                        kwargs['na_filter'] = False
+                    dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
 
