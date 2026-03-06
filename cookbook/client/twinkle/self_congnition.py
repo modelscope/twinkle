@@ -102,10 +102,11 @@ def train():
         for step, batch in enumerate(dataloader):
             # Forward pass + backward pass (computes gradients)
             output = model.forward_backward(inputs=batch)
+            loss=output.get('loss', 'N/A')
 
             # Log the loss every 2 steps (aligned with gradient accumulation)
             if step % 2 == 0:
-                logger.info(f'Current is step {step // 2}, loss: {output}')
+                logger.info(f'Current is step {step // 2}, loss: {loss}')
 
             # Clip gradients to prevent exploding gradients (max norm = 1.0)
             model.clip_grad_norm(1.0)

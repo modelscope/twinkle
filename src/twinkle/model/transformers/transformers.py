@@ -343,6 +343,31 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             _device_mesh=self.device_mesh,
         )
 
+    @staticmethod
+    def _to_cpu_safe_output(obj: Any) -> Any:
+        """Convert nested outputs into CPU-safe Python objects for HTTP transport."""
+        import numpy as np
+        from collections.abc import Mapping
+
+        if isinstance(obj, torch.Tensor):
+            tensor = torch_util.to_local_tensor(obj).detach().cpu()
+            if tensor.numel() == 1:
+                return tensor.item()
+            return tensor.tolist()
+        if isinstance(obj, np.ndarray):
+            if obj.size == 1:
+                return obj.item()
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, Mapping):
+            return {key: TransformersModel._to_cpu_safe_output(value) for key, value in obj.items()}
+        if isinstance(obj, tuple):
+            return [TransformersModel._to_cpu_safe_output(value) for value in obj]
+        if isinstance(obj, list):
+            return [TransformersModel._to_cpu_safe_output(value) for value in obj]
+        return obj
+
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
@@ -514,6 +539,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         outputs['loss'] = loss
         self.backward(**kwargs)
         return outputs
+
+    @remote_function(dispatch='slice_dp', collect='mean')
+    def forward_backward_http(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                              **kwargs):
+        """HTTP-safe forward/backward that materializes outputs before they leave the worker."""
+        outputs = self.forward_backward(inputs=inputs, **kwargs)
+        return self._to_cpu_safe_output(outputs)
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):

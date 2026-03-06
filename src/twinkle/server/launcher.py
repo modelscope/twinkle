@@ -216,7 +216,7 @@ class ServerLauncher:
 
         # Pass http_options to server apps for internal proxy routing
         http_options = self.config.get('http_options', {})
-        if http_options:
+        if import_path == 'server' and http_options:
             args['http_options'] = http_options
 
         # Build and deploy the application

@@ -295,8 +295,8 @@ def build_model_app(model_id: str,
             else:
                 assert isinstance(inputs, dict)
                 inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
-            ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
-            return {'result': str(ret)}
+            ret = self.model.forward_backward_http(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+            return {'result': ret}
 
         @app.post('/get_train_configs')
         def get_train_configs(self, request: Request, body: AdapterRequest):
