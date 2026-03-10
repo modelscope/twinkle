@@ -182,8 +182,8 @@ def build_model_app(model_id: str,
                     instance_id=replica_id,
                     **kwargs)
             else:
-                from twinkle.model import MultiLoraTransformersModel
-                self.model = MultiLoraTransformersModel(
+                from .common.transformers_model import TwinkleCompatTransformersModel
+                self.model = TwinkleCompatTransformersModel(
                     model_id=model_id,
                     device_mesh=self.device_mesh,
                     remote_group=self.device_group.name,
@@ -296,7 +296,7 @@ def build_model_app(model_id: str,
                 assert isinstance(inputs, dict)
                 inputs = InputFeature(**inputs) if 'input_ids' in inputs else Trajectory(**inputs)
             ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
-            return {'result': str(ret)}
+            return {'result': ret}
 
         @app.post('/get_train_configs')
         def get_train_configs(self, request: Request, body: AdapterRequest):

@@ -1108,7 +1108,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return expr
 
     # =========================================================================
-    # Checkpoint Engine — Weight Sync (from CheckpointEngineMixin)
+    # Checkpoint Engine weight sync (from CheckpointEngineMixin)
     # =========================================================================
     # prepare_checkpoint_engine, init_checkpoint_process_group, and
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
@@ -1145,7 +1145,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
-                # ── LoRA-only mode: send only adapter weights ────────────────
+                # LoRA-only mode: send only adapter weights.
                 # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
                 from peft.utils import get_peft_model_state_dict
                 lora_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
@@ -1156,7 +1156,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         yield name, tensor
 
         else:
-            # ── Full model mode: send all weights (base model sync) ──────
+            # Full model mode: send all weights (base model sync).
             state_dict = model.state_dict()
 
             def weight_generator():
