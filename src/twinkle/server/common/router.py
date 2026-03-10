@@ -1,3 +1,5 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+# Moved from tinker/common/router.py — logic unchanged.
 from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest, ReplicaID, ReplicaResult,
                                       RequestRouter, RunningReplica)
 from typing import Dict, List, Optional

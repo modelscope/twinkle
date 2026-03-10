@@ -1,3 +1,5 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+# Moved from tinker/common/datum.py — logic unchanged.
 from __future__ import annotations
 
 import numpy as np

@@ -1,44 +1,43 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Processor management application (moved from twinkle/processor.py).
+
+Provides a Ray Serve deployment for managing distributed processors
+(datasets, dataloaders, preprocessors, rewards, templates, weight loaders, etc.).
+"""
 import importlib
 import os
 import threading
 import uuid
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
 from ray import serve
 from typing import Any, Dict
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.server.common.serialize import deserialize_object
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
-from .common.serialize import deserialize_object
+from twinkle_client.types.processor import ProcessorCallRequest, ProcessorCreateRequest, ProcessorHeartbeatRequest
 
 logger = get_logger()
 
 
-class CreateRequest(BaseModel):
-    processor_type: str
-    class_type: str
-
-    class Config:
-        extra = 'allow'
-
-
-class HeartbeatRequest(BaseModel):
-    processor_id: str
-
-
-class CallRequest(BaseModel):
-    processor_id: str
-    function: str
-
-    class Config:
-        extra = 'allow'
-
-
 def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_group: Dict[str, Any],
                         device_mesh: Dict[str, Any], deploy_options: Dict[str, Any], **kwargs):
+    """Build the processor management application.
+
+    Args:
+        nproc_per_node: Number of GPU processes per node
+        ncpu_proc_per_node: Number of CPU processes per node
+        device_group: Device group configuration dict
+        device_mesh: Device mesh configuration dict
+        deploy_options: Ray Serve deployment options
+        **kwargs: Additional arguments
+
+    Returns:
+        Ray Serve deployment bound with configuration
+    """
     app = FastAPI()
 
     @app.middleware('http')
@@ -50,6 +49,11 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
     @serve.deployment(name='ProcessorManagement')
     @serve.ingress(app)
     class ProcessorManagement:
+        """Processor management service.
+
+        Manages lifecycle and invocation of distributed processor objects
+        (datasets, dataloaders, rewards, templates, etc.).
+        """
 
         COUNT_DOWN = 60 * 30
 
@@ -105,11 +109,10 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                     self.state.pop_config(user_key)
 
         @app.post('/create')
-        def create(self, request: Request, body: CreateRequest):
-
+        def create(self, request: Request, body: ProcessorCreateRequest):
             processor_type_name = body.processor_type
             class_type = body.class_type
-            kwargs = body.model_extra or {}
+            _kwargs = body.model_extra or {}
 
             assert processor_type_name in processors, f'Invalid processor type: {processor_type_name}'
             processor_module = importlib.import_module(f'twinkle.{processor_type_name}')
@@ -118,26 +121,29 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             processor_id = str(uuid.uuid4().hex)
             self.key_token_dict[processor_id] = request.state.token
 
-            kwargs.pop('remote_group', None)
-            kwargs.pop('device_mesh', None)
+            _kwargs.pop('remote_group', None)
+            _kwargs.pop('device_mesh', None)
 
-            _kwargs = {}
-            for key, value in kwargs.items():
+            resolved_kwargs = {}
+            for key, value in _kwargs.items():
                 if isinstance(value, str) and value.startswith('pid:'):
                     ref_id = value[4:]
-                    _kwargs[key] = self.resource_dict[ref_id]
+                    resolved_kwargs[key] = self.resource_dict[ref_id]
                 else:
                     value = deserialize_object(value)
-                    _kwargs[key] = value
+                    resolved_kwargs[key] = value
 
             processor = getattr(processor_module, class_type)(
-                remote_group=self.device_group.name, device_mesh=self.device_mesh, instance_id=processor_id, **_kwargs)
+                remote_group=self.device_group.name,
+                device_mesh=self.device_mesh,
+                instance_id=processor_id,
+                **resolved_kwargs)
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
             return {'processor_id': 'pid:' + processor_id}
 
         @app.post('/heartbeat')
-        def heartbeat(self, body: HeartbeatRequest):
+        def heartbeat(self, body: ProcessorHeartbeatRequest):
             processor_ids = body.processor_id.split(',')
             for _id in processor_ids:
                 if _id and _id in self.resource_dict:
@@ -145,10 +151,10 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             return {'status': 'ok'}
 
         @app.post('/call')
-        def call(self, body: CallRequest):
+        def call(self, body: ProcessorCallRequest):
             processor_id = body.processor_id
             function_name = body.function
-            kwargs = body.model_extra or {}
+            _kwargs = body.model_extra or {}
             processor_id = processor_id[4:]
             self.assert_processor_exists(processor_id=processor_id)
             processor = self.resource_dict.get(processor_id)
@@ -157,28 +163,25 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             assert function is not None, f'`{function_name}` not found in {processor.__class__}'
             assert hasattr(function, '_execute'), f'Cannot call inner method of {processor.__class__}'
 
-            _kwargs = {}
-            for key, value in kwargs.items():
+            resolved_kwargs = {}
+            for key, value in _kwargs.items():
                 if isinstance(value, str) and value.startswith('pid:'):
                     ref_id = value[4:]
-                    _kwargs[key] = self.resource_dict[ref_id]
+                    resolved_kwargs[key] = self.resource_dict[ref_id]
                 else:
                     value = deserialize_object(value)
-                    _kwargs[key] = value
+                    resolved_kwargs[key] = value
 
             # Special handling for __next__ to catch StopIteration
-            # We convert StopIteration to HTTP 410 (Gone) which semantically means
-            # "the resource (next item) is no longer available"
             if function_name == '__next__':
                 try:
-                    result = function(**_kwargs)
+                    result = function(**resolved_kwargs)
                     return {'result': result}
                 except StopIteration:
-                    # Use HTTP 410 Gone to indicate iterator exhausted
-                    # This is a clean signal that won't be confused with errors
+                    # HTTP 410 Gone signals iterator exhausted
                     raise HTTPException(status_code=410, detail='Iterator exhausted')
 
-            result = function(**_kwargs)
+            result = function(**resolved_kwargs)
             if function_name == '__iter__':
                 return {'result': 'ok'}
             else:

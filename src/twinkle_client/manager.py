@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-# Reuse Pydantic models from server
-from twinkle.server.twinkle.common.io_utils import Checkpoint, Cursor, TrainingRun
+# Shared Pydantic models
+from twinkle_client.types.training import Checkpoint, Cursor, TrainingRun
 from .http.http_utils import http_get, http_post
 
 

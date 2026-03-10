@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+# Moved from twinkle/common/serialize.py — logic unchanged.
 import json
 from numbers import Number
 from peft import LoraConfig

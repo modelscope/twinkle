@@ -544,6 +544,58 @@ class TaskQueueMixin:
         """
         return self._rate_limiter.get_memory_stats()
 
+    async def schedule_task_and_wait(
+        self,
+        coro_factory: Callable[[], Coroutine],
+        model_id: str | None = None,
+        token: str | None = None,
+        input_tokens: int = 0,
+        task_type: str | None = None,
+    ) -> Any:
+        """Schedule an async task and wait for its result synchronously.
+
+        This is the twinkle-side counterpart to :meth:`schedule_task`.
+        It enqueues the task through the same serial worker, then blocks
+        (via async sleep) until the task completes, and returns the result
+        directly instead of a future reference dict.
+
+        Args:
+            coro_factory: Factory that creates the coroutine to execute.
+            model_id: Optional model_id to associate with the result.
+            token: Optional user token for rate limiting.
+            input_tokens: Number of input tokens for tps rate limiting.
+            task_type: Optional task type for logging/observability.
+
+        Returns:
+            The direct return value of the coroutine.
+
+        Raises:
+            RuntimeError: If the task fails.
+        """
+        future_ref = await self.schedule_task(
+            coro_factory,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            task_type=task_type,
+        )
+        request_id = future_ref.get('request_id')
+        if request_id is None:
+            # Pre-flight check failed; surface the error from the stored future
+            raise RuntimeError(f'Task scheduling failed: {future_ref}')
+
+        while True:
+            record = self.state.get_future(request_id)
+            if record and record.get('status') not in ('pending', 'queued', 'running'):
+                break
+            await asyncio.sleep(0.05)
+
+        if record['status'] == 'failed':
+            error = record.get('result', {}).get('error', 'Unknown error')
+            raise RuntimeError(error)
+
+        return record['result']
+
     async def shutdown_task_queue(self) -> None:
         """Gracefully shutdown the task queue and cleanup tasks.
 
