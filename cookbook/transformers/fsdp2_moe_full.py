@@ -22,7 +22,6 @@ NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
 GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '4'))
 LR = float(os.environ.get('LR', '1e-5'))
-DISABLE_CLIP = os.environ.get('DISABLE_CLIP', '1') == '1'
 MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 
 # Pure FSDP topology (no EP): default 4 GPUs -> fsdp=2, dp=2.
@@ -72,7 +71,7 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(
         f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}, '
-        f'lr={LR:.2e}, disable_clip={DISABLE_CLIP}, max_grad_norm={MAX_GRAD_NORM}, '
+        f'lr={LR:.2e}, max_grad_norm={MAX_GRAD_NORM}, '
         f'dp_size={dp_size}, fsdp_size={fsdp_size}')
     if NUM_LAYERS is not None:
         logger.info(f'NUM_LAYERS={NUM_LAYERS}')
@@ -81,15 +80,10 @@ def train():
         if callable(batch):
             batch = batch()
         model.forward_backward(inputs=batch, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-        if DISABLE_CLIP:
-            model.step(gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-            model.zero_grad(gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-            model.lr_step(gradient_accumulation_steps=GRAD_ACCUM_STEPS)
-        else:
-            model.clip_grad_and_step(
-                max_grad_norm=MAX_GRAD_NORM,
-                gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-            )
+        model.clip_grad_and_step(
+            max_grad_norm=MAX_GRAD_NORM,
+            gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+        )
         if step % GRAD_ACCUM_STEPS == 0:
             metric = model.calculate_metric(is_training=True)
             if callable(metric):
