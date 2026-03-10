@@ -192,34 +192,3 @@ def stateless_init_process_group(
 
     communicator = Communicator(pg, device=device)
     return communicator
-
-
-def split_tensor_to_list(data: Union[torch.Tensor, Dict[str, Any]]) -> Union[List[torch.Tensor], List[Dict[str, Any]]]:
-    if isinstance(data, torch.Tensor):
-        return list(data)
-
-    if isinstance(data, dict):
-        if not data:
-            return [{}]
-
-        batch_size = None
-        for v in data.values():
-            if isinstance(v, torch.Tensor):
-                batch_size = v.size(0)
-                break
-
-        if batch_size is None:
-            return [data]
-
-        result = []
-        for i in range(batch_size):
-            item = {}
-            for k, v in data.items():
-                if isinstance(v, torch.Tensor):
-                    item[k] = v[i]
-                else:
-                    item[k] = v
-            result.append(item)
-        return result
-
-    raise TypeError(f"Unsupported type: {type(data)}, expected Tensor or Dict")

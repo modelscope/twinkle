@@ -391,6 +391,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs['past_key_values'] = None
         return outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -441,7 +442,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        outputs.pop('past_key_values', None)
+        outputs['past_key_values'] = None
         return outputs
 
     @remote_function(collect='mean')

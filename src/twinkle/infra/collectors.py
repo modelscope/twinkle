@@ -2,7 +2,7 @@ from typing import List, Dict, Any
 import torch
 
 
-def collect_tensor_dict(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh) -> Dict[str, Any]:
     if not outputs:
         return {}
 
@@ -72,4 +72,4 @@ def _pad_and_stack_tensors(tensors: List[torch.Tensor], pad_value: float = 0) ->
             padded = torch.nn.functional.pad(t, pad_params, value=pad_value)
             padded_tensors.append(padded)
 
-    return torch.stack(padded_tensors, dim=0)
+    return torch.cat(padded_tensors, dim=0)
