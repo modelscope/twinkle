@@ -6,6 +6,7 @@ import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
+from .collectors import collect_tensor_dict
 
 logger = get_logger()
 

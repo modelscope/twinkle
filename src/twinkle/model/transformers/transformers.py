@@ -26,6 +26,7 @@ from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
@@ -343,7 +344,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             _device_mesh=self.device_mesh,
         )
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
@@ -392,7 +393,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
         return outputs
 
-    @remote_function(dispatch='slice_dp')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -502,7 +503,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.cur_step += 1
         optimizer_config.loss_value = None
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Do forward, calculate loss, and backward.
