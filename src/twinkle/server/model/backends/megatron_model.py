@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from twinkle import remote_class, remote_function
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
-from twinkle.server.model.backends.transformers_model import (TwinkleCompatModelBase, clean_metrics,
-                                                              collect_forward_backward_results)
+from twinkle.server.model.backends.common import TwinkleCompatModelBase, clean_metrics, collect_forward_backward_results
 from twinkle.utils import exists, requires
 
 if TYPE_CHECKING:

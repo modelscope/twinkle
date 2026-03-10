@@ -2,11 +2,9 @@
 """
 Backend model implementations for the unified model deployment.
 
-Contains two classes:
-- TwinkleCompatTransformersModel: tinker-compat wrapper (Datum-based I/O),
-  moved from tinker/common/transformers_model.py.
-- TwinkleCompatTransformersModelNative: twinkle-native wrapper
-  (InputFeature/Trajectory-based I/O), moved from twinkle/common/transformers_model.py.
+Contains one unified class:
+- TwinkleCompatTransformersModel: handles both tinker (Datum-based I/O) via /tinker/*
+  endpoints and twinkle-native (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
 import numpy as np
 import torch
@@ -14,147 +12,51 @@ from collections.abc import Mapping
 from tinker import types
 from typing import Any, List, Union
 
-# ---------------------------------------------------------------------------
-# Shared helpers (moved from tinker/common/compat_base.py)
-# ---------------------------------------------------------------------------
-from twinkle import DeviceMesh, remote_class, remote_function
+from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
-from twinkle.template import Template
-
-
-def collect_forward_backward_results(results, device_mesh: DeviceMesh):
-    """Custom collect function for forward_backward that handles list [outputs, loss]."""
-    if not results:
-        return results
-
-    pp_last_ranks = None
-    if device_mesh.pp_world_size > 1:
-        pp_last_ranks = set(device_mesh.get_pp_last_ranks())
-
-    tp_last_ranks = None
-    if device_mesh.tp_world_size > 1:
-        tp_last_ranks = set(device_mesh.get_tp_last_ranks())
-
-    mesh_flat = device_mesh.mesh.flatten()
-
-    all_outputs = []
-    all_losses = []
-    for i, result in enumerate(results):
-        rank = mesh_flat[i] if i < len(mesh_flat) else -1
-
-        if pp_last_ranks is not None:
-            if rank not in pp_last_ranks:
-                continue
-
-        if tp_last_ranks is not None:
-            if rank not in tp_last_ranks:
-                continue
-
-        if result is None:
-            continue
-
-        outputs, loss = result
-        if outputs is None or loss is None:
-            continue
-        all_outputs.extend(outputs)
-        all_losses.append(loss)
-
-    if all_losses:
-        avg_loss = float(np.mean(all_losses))
-    else:
-        avg_loss = 0.0
-
-    return [all_outputs, avg_loss]
-
-
-def clean_metrics(metrics: dict) -> dict:
-    import re
-    from numbers import Number
-
-    def _to_float(v):
-        if isinstance(v, (float, int, Number, np.generic, str)):
-            try:
-                return float(v)
-            except Exception:
-                return None
-        if isinstance(v, torch.Tensor) and v.numel() == 1:
-            try:
-                return float(v.item())
-            except Exception:
-                return None
-        return None
-
-    cleaned = {}
-    for key, value in metrics.items():
-        fv = _to_float(value)
-        if fv is not None:
-            cleaned[key] = fv
-            continue
-
-        if isinstance(value, str):
-            s = value.strip()
-            if s:
-                try:
-                    head, unit = s.split()
-                    cleaned[f'{key}/{unit}'] = float(head)
-                except Exception:
-                    m = re.match(r'^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)', s)
-                    if m:
-                        cleaned[key] = float(m.group(1))
-
-    return cleaned
-
-
-class TwinkleCompatModelBase:
-    """Base class containing common logic for Twinkle compatibility wrappers."""
-
-    def get_template(self, adapter_name: str) -> Template:
-        return self.optimizer_group[adapter_name].template
-
-    @staticmethod
-    def _get_forward_output(inputs: List[types.Datum], logits: torch.Tensor, logps: torch.Tensor) -> List[dict]:
-        """Convert raw logits to the expected output format with logprobs and elementwise_loss."""
-        from twinkle.utils.torch_utils import selective_log_softmax
-        device = logits.device if logits is not None else logps.device
-        results = []
-        if logits is None:
-            logits = [None] * len(inputs)
-        for idx, (feature, logit) in enumerate(zip(inputs, logits)):
-            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(device)
-            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(device)
-
-            seq_len = labels.numel()
-
-            if logps is None:
-                assert logits is not None
-                feature_logits = logit[:seq_len, :]
-                token_log_probs = selective_log_softmax(feature_logits, labels)
-            else:
-                token_log_probs = logps[idx, :seq_len]
-
-            elementwise_loss = -token_log_probs * weights
-
-            results.append({
-                'logprobs': types.TensorData.from_torch(token_log_probs.cpu()),
-                'elementwise_loss': types.TensorData.from_torch(elementwise_loss.cpu())
-            })
-        return results
-
-
-# ---------------------------------------------------------------------------
-# Tinker-compat Transformers model (Datum-based I/O)
-# ---------------------------------------------------------------------------
+from twinkle.server.model.backends.common import TwinkleCompatModelBase, clean_metrics, collect_forward_backward_results
 
 
 @remote_class()
 class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatModelBase):
-    """Tinker-compatible wrapper around MultiLoraTransformersModel.
+    """Unified wrapper around MultiLoraTransformersModel.
 
-    Input/output is in tinker Datum / TensorData format.
-    Moved from tinker/common/transformers_model.py.
+    Handles both:
+    - Tinker-compat I/O (Datum / TensorData) via /tinker/* endpoints.
+    - Twinkle-native I/O (InputFeature / Trajectory) via /twinkle/* endpoints.
     """
+
+    # ------------------------------------------------------------------
+    # Shared helper: CPU-safe serialisation for HTTP transport
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_cpu_safe_output(obj: Any) -> Any:
+        """Convert nested outputs into CPU-safe Python objects for HTTP transport."""
+        from twinkle.utils import torch_util
+
+        if isinstance(obj, torch.Tensor):
+            tensor = torch_util.to_local_tensor(obj).detach().cpu()
+            if tensor.numel() == 1:
+                return tensor.item()
+            return tensor.tolist()
+        if isinstance(obj, np.ndarray):
+            if obj.size == 1:
+                return obj.item()
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, Mapping):
+            return {key: TwinkleCompatTransformersModel._to_cpu_safe_output(value) for key, value in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [TwinkleCompatTransformersModel._to_cpu_safe_output(value) for value in obj]
+        return obj
+
+    # ------------------------------------------------------------------
+    # Tinker-compat methods (Datum-based I/O)
+    # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect='flatten')
     def forward_only(self, *, inputs: List[types.Datum], **kwargs):
@@ -224,44 +126,13 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         else:
             return super().load(name=resolved.checkpoint_name, **kwargs)
 
-
-# ---------------------------------------------------------------------------
-# Twinkle-native Transformers model (InputFeature/Trajectory-based I/O)
-# ---------------------------------------------------------------------------
-
-
-@remote_class()
-class TwinkleCompatTransformersModelNative(MultiLoraTransformersModel):
-    """Twinkle-native wrapper around MultiLoraTransformersModel.
-
-    Input/output is in native InputFeature / Trajectory format.
-    Moved from twinkle/common/transformers_model.py.
-    """
-
-    @staticmethod
-    def _to_cpu_safe_output(obj: Any) -> Any:
-        """Convert nested outputs into CPU-safe Python objects for HTTP transport."""
-        from twinkle.utils import torch_util
-
-        if isinstance(obj, torch.Tensor):
-            tensor = torch_util.to_local_tensor(obj).detach().cpu()
-            if tensor.numel() == 1:
-                return tensor.item()
-            return tensor.tolist()
-        if isinstance(obj, np.ndarray):
-            if obj.size == 1:
-                return obj.item()
-            return obj.tolist()
-        if isinstance(obj, np.generic):
-            return obj.item()
-        if isinstance(obj, Mapping):
-            return {key: TwinkleCompatTransformersModelNative._to_cpu_safe_output(value) for key, value in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [TwinkleCompatTransformersModelNative._to_cpu_safe_output(value) for value in obj]
-        return obj
+    # ------------------------------------------------------------------
+    # Twinkle-native methods (InputFeature/Trajectory-based I/O)
+    # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect='mean')
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         **kwargs):
+    def twinkle_forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                                 **kwargs):
+        """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return self._to_cpu_safe_output(output)

@@ -17,8 +17,8 @@ from twinkle.server.utils.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 from .proxy import ServiceProxy
-from .tinker_router import tinker_router
-from .twinkle_router import twinkle_router
+from .tinker_gateway_handlers import TinkerGatewayHandlers
+from .twinkle_gateway_handlers import TwinkleGatewayHandlers
 
 logger = get_logger()
 
@@ -48,22 +48,9 @@ def build_server_app(deploy_options: dict[str, Any],
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
-    @app.middleware('http')
-    async def inject_dependencies(request: Request, call_next):
-        """Middleware to inject GatewayServer dependencies into request.state.
-
-        This must run after GatewayServer is instantiated. We use a marker
-        set by the first request to initialize the state reference.
-        """
-        # The GatewayServer instance will set itself on the app state
-        server = getattr(app.state, 'gateway_server', None)
-        if server:
-            server._setup_request_state(request)
-        return await call_next(request)
-
     @serve.deployment(name='GatewayServer')
     @serve.ingress(app)
-    class GatewayServer:
+    class GatewayServer(TinkerGatewayHandlers, TwinkleGatewayHandlers):
         """Unified gateway server handling both Tinker and Twinkle API clients."""
 
         def __init__(self,
@@ -79,8 +66,6 @@ def build_server_app(deploy_options: dict[str, Any],
                 tinker_types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
             ]
             self._modelscope_config_lock = asyncio.Lock()
-            # Register self on app state so middleware can access dependencies
-            app.state.gateway_server = self
 
         def _normalize_models(self, supported_models):
             if not supported_models:
@@ -109,18 +94,9 @@ def build_server_app(deploy_options: dict[str, Any],
                 return metadata['base_model']
             raise HTTPException(status_code=404, detail=f'Model {model_id} not found')
 
-        def _setup_request_state(self, request: Request):
-            """Inject dependencies into request.state for router handlers."""
-            request.state.server_state = self.state
-            request.state.proxy = self.proxy
-            request.state.supported_models = self.supported_models
-            request.state.modelscope_config_lock = self._modelscope_config_lock
-            request.state.validate_base_model = self._validate_base_model
-            request.state.get_base_model = self._get_base_model
-
-    # Include routers for Tinker and Twinkle endpoints
-    app.include_router(tinker_router, prefix='/tinker')
-    app.include_router(twinkle_router, prefix='/twinkle')
+    # Register routes from both handler mixins
+    TinkerGatewayHandlers._register_tinker_routes(app)
+    TwinkleGatewayHandlers._register_twinkle_routes(app)
 
     return GatewayServer.options(**deploy_options).bind(
         supported_models=supported_models, server_config=server_config, http_options=http_options, **kwargs)

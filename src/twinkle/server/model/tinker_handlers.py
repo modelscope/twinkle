@@ -27,17 +27,15 @@ class TinkerModelHandlers:
     """
 
     @staticmethod
-    def _register_tinker_routes(app: FastAPI, model_id_ref: list):
+    def _register_tinker_routes(app: FastAPI, model_id: str):
         """Register all tinker routes on the given FastAPI app.
 
         This is called once during build_model_app to wire routes.
-        model_id_ref is a mutable list so we can capture the closure variable.
         """
 
         @app.post('/tinker/create_model')
         async def create_model(self, request: Request, body: types.CreateModelRequest) -> types.UntypedAPIFuture:
             token = await self._on_request_start(request)
-            model_id = model_id_ref[0]
 
             async def _create_adapter():
                 _model_id = None
@@ -70,7 +68,6 @@ class TinkerModelHandlers:
         @app.post('/tinker/get_info')
         async def get_info(self, request: Request, body: types.GetInfoRequest) -> types.GetInfoResponse:
             token = await self._on_request_start(request)
-            model_id = model_id_ref[0]
             training_run_manager = create_training_run_manager(token, client_type='tinker')
             metadata = training_run_manager.get(str(body.model_id))
             model_name = metadata.base_model if metadata else model_id

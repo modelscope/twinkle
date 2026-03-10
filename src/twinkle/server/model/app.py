@@ -53,8 +53,6 @@ def build_model_app(model_id: str,
         Configured Ray Serve deployment bound with parameters
     """
     app = FastAPI()
-    # Mutable list so inner route functions can capture the model_id
-    model_id_ref = [model_id]
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
@@ -149,8 +147,8 @@ def build_model_app(model_id: str,
             self._cleanup_adapter(adapter_name)
 
     # Register routes from both handler mixins
-    TinkerModelHandlers._register_tinker_routes(app, model_id_ref)
-    TwinkleModelHandlers._register_twinkle_routes(app, model_id_ref)
+    TinkerModelHandlers._register_tinker_routes(app, model_id)
+    TwinkleModelHandlers._register_twinkle_routes(app, model_id)
 
     return ModelManagement.options(**deploy_options).bind(nproc_per_node, device_group, device_mesh, use_megatron,
                                                           queue_config, **kwargs)

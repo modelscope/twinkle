@@ -14,3 +14,7 @@ class DeleteCheckpointResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class WeightsInfoRequest(BaseModel):
+    twinkle_path: str

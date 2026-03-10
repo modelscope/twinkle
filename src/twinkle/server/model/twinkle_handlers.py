@@ -49,11 +49,8 @@ class TwinkleModelHandlers:
     """
 
     @staticmethod
-    def _register_twinkle_routes(app: FastAPI, model_id_ref: list):
-        """Register all twinkle routes on the given FastAPI app.
-
-        model_id_ref is a mutable list containing [model_id] for closure capture.
-        """
+    def _register_twinkle_routes(app: FastAPI, model_id: str):
+        """Register all twinkle routes on the given FastAPI app."""
 
         @app.post('/twinkle/create')
         async def create(self, request: Request, body: CreateRequest):
@@ -123,7 +120,7 @@ class TwinkleModelHandlers:
                 self.assert_adapter_exists(adapter_name=adapter_name)
                 extra_kwargs = body.model_extra or {}
                 inputs = _parse_inputs(body.inputs)
-                ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+                ret = self.model.twinkle_forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
                 return {'result': ret}
 
             return await self.schedule_task_and_wait(_task, task_type='forward_backward')
@@ -226,12 +223,12 @@ class TwinkleModelHandlers:
 
         @app.post('/twinkle/save')
         async def save(self, request: Request, body: SaveRequest):
+            token = await self._on_request_start(request)
             adapter_name = self._get_twinkle_adapter_name(request, body.adapter_name)
 
             async def _task():
                 self.assert_adapter_exists(adapter_name=adapter_name)
                 extra_kwargs = body.model_extra or {}
-                token = request.state.token
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
                 save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=False)
@@ -248,12 +245,12 @@ class TwinkleModelHandlers:
 
         @app.post('/twinkle/load')
         async def load(self, request: Request, body: LoadRequest):
+            token = await self._on_request_start(request)
             adapter_name = self._get_twinkle_adapter_name(request, body.adapter_name)
 
             async def _task():
                 self.assert_adapter_exists(adapter_name=adapter_name)
                 extra_kwargs = body.model_extra or {}
-                token = request.state.token
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 resolved = checkpoint_manager.resolve_load_path(body.name)
                 ret = self.model.load(
@@ -269,9 +266,9 @@ class TwinkleModelHandlers:
 
         @app.post('/twinkle/upload_to_hub')
         async def upload_to_hub(self, request: Request, body: UploadToHubRequest):
+            token = await self._on_request_start(request)
 
             async def _task():
-                token = request.state.token
                 if body.checkpoint_dir.startswith('twinkle://'):
                     checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                     parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
@@ -298,13 +295,12 @@ class TwinkleModelHandlers:
         @app.post('/twinkle/add_adapter_to_model')
         async def add_adapter_to_model(self, request: Request, body: AddAdapterRequest):
             assert body.adapter_name, 'You need to specify a valid `adapter_name`'
+            token = await self._on_request_start(request)
             adapter_name = self._get_twinkle_adapter_name(request, body.adapter_name)
-            model_id = model_id_ref[0]
 
             async def _task():
                 config = deserialize_object(body.config)
                 extra_kwargs = body.model_extra or {}
-                token = request.state.token
                 training_run_manager = create_training_run_manager(token, client_type='twinkle')
                 self.register_adapter(adapter_name, token)
                 self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
