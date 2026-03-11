@@ -8,6 +8,7 @@ Note: Class names are prefixed with 'Processor' to avoid name collisions when
 importing from twinkle_client.types alongside model.py classes.
 """
 from pydantic import BaseModel
+from typing import Any
 
 
 class ProcessorCreateRequest(BaseModel):
@@ -28,3 +29,18 @@ class ProcessorCallRequest(BaseModel):
 
     class Config:
         extra = 'allow'
+
+
+class ProcessorCreateResponse(BaseModel):
+    """Response body for the /create endpoint."""
+    processor_id: str
+
+
+class ProcessorHeartbeatResponse(BaseModel):
+    """Response body for the /heartbeat endpoint."""
+    status: str = 'ok'
+
+
+class ProcessorCallResponse(BaseModel):
+    """Response body for the /call endpoint."""
+    result: Any

@@ -239,3 +239,19 @@ class UploadToHubResponse(BaseModel):
 
     class Config:
         extra = 'allow'
+
+
+class CreateResponse(BaseModel):
+    """Response for /create endpoint."""
+    status: str = 'ok'
+
+
+class AddAdapterResponse(BaseModel):
+    """Response for /add_adapter_to_model endpoint."""
+    status: str = 'ok'
+    adapter_name: str
+
+
+class HeartbeatResponse(BaseModel):
+    """Response for /heartbeat endpoint."""
+    status: str = 'ok'

@@ -15,9 +15,7 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.utils.logger import get_logger
-from twinkle_client.types.sampler import (AddAdapterRequest, AddAdapterResponse, CreateResponse, HeartbeatRequest,
-                                          HeartbeatResponse, SampleRequest, SampleResponseModel, SetTemplateRequest,
-                                          SetTemplateResponse)
+import twinkle_client.types as types
 
 logger = get_logger()
 
@@ -36,14 +34,14 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    @app.post('/twinkle/create', response_model=CreateResponse)
-    def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> CreateResponse:
+    @app.post('/twinkle/create', response_model=types.CreateResponse)
+    def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> types.CreateResponse:
         """Health check / session creation endpoint."""
-        return CreateResponse()
+        return types.CreateResponse()
 
-    @app.post('/twinkle/sample', response_model=SampleResponseModel)
-    def sample(request: Request, body: SampleRequest,
-               self: SamplerManagement = Depends(self_fn)) -> SampleResponseModel:
+    @app.post('/twinkle/sample', response_model=types.SampleResponseModel)
+    def sample(request: Request, body: types.SampleRequest,
+               self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModel:
         """Sample completions from the model.
 
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
@@ -99,7 +97,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     'logprobs': list(seq.logprobs) if seq.logprobs is not None else None,
                 })
 
-            return SampleResponseModel(
+            return types.SampleResponseModel(
                 sequences=sequences,
                 prompt_logprobs=response.prompt_logprobs,
                 topk_prompt_logprobs=response.topk_prompt_logprobs,
@@ -108,20 +106,20 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             logger.error(traceback.format_exc())
             raise
 
-    @app.post('/twinkle/set_template', response_model=SetTemplateResponse)
-    def set_template(request: Request, body: SetTemplateRequest,
-                     self: SamplerManagement = Depends(self_fn)) -> SetTemplateResponse:
+    @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
+    def set_template(request: Request, body: types.SetTemplateRequest,
+                     self: SamplerManagement = Depends(self_fn)) -> types.SetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
         extra_kwargs = body.model_extra or {}
         self.sampler.set_template(body.template_cls, **extra_kwargs)
-        return SetTemplateResponse()
+        return types.SetTemplateResponse()
 
-    @app.post('/twinkle/add_adapter_to_sampler', response_model=AddAdapterResponse)
+    @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
     def add_adapter_to_sampler(
             request: Request,
-            body: AddAdapterRequest,
+            body: types.AddAdapterRequest,
             self: SamplerManagement = Depends(self_fn),
-    ) -> AddAdapterResponse:
+    ) -> types.AddAdapterResponse:
         """Add a LoRA adapter to the sampler."""
         assert body.adapter_name, 'You need to specify a valid `adapter_name`'
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
@@ -134,13 +132,13 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         self.register_adapter(full_adapter_name, token)
         self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
-        return AddAdapterResponse(adapter_name=full_adapter_name)
+        return types.AddAdapterResponse(adapter_name=full_adapter_name)
 
-    @app.post('/twinkle/heartbeat', response_model=HeartbeatResponse)
-    def heartbeat(request: Request, body: HeartbeatRequest,
-                  self: SamplerManagement = Depends(self_fn)) -> HeartbeatResponse:
+    @app.post('/twinkle/heartbeat', response_model=types.HeartbeatResponse)
+    def heartbeat(request: Request, body: types.HeartbeatRequest,
+                  self: SamplerManagement = Depends(self_fn)) -> types.HeartbeatResponse:
         """Keep an adapter alive by resetting its inactivity timer."""
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
         self.assert_adapter_exists(adapter_name=full_adapter_name)
         self.touch_adapter(full_adapter_name)
-        return HeartbeatResponse()
+        return types.HeartbeatResponse()

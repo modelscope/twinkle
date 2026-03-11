@@ -18,7 +18,7 @@ from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.server.common.serialize import deserialize_object
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
-from twinkle_client.types.processor import ProcessorCallRequest, ProcessorCreateRequest, ProcessorHeartbeatRequest
+import twinkle_client.types as types
 
 logger = get_logger()
 
@@ -108,8 +108,8 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 if cur_count <= 0:
                     self.state.pop_config(user_key)
 
-        @app.post('/twinkle/create')
-        def create(self, request: Request, body: ProcessorCreateRequest):
+        @app.post('/twinkle/create', response_model=types.ProcessorCreateResponse)
+        def create(self, request: Request, body: types.ProcessorCreateRequest) -> types.ProcessorCreateResponse:
             processor_type_name = body.processor_type
             class_type = body.class_type
             _kwargs = body.model_extra or {}
@@ -140,18 +140,18 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 **resolved_kwargs)
             self.resource_dict[processor_id] = processor
             self.resource_records[processor_id] = 0
-            return {'processor_id': 'pid:' + processor_id}
+            return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
 
-        @app.post('/twinkle/heartbeat')
-        def heartbeat(self, body: ProcessorHeartbeatRequest):
+        @app.post('/twinkle/heartbeat', response_model=types.ProcessorHeartbeatResponse)
+        def heartbeat(self, body: types.ProcessorHeartbeatRequest) -> types.ProcessorHeartbeatResponse:
             processor_ids = body.processor_id.split(',')
             for _id in processor_ids:
                 if _id and _id in self.resource_dict:
                     self.resource_records[_id] = 0
-            return {'status': 'ok'}
+            return types.ProcessorHeartbeatResponse()
 
-        @app.post('/twinkle/call')
-        def call(self, body: ProcessorCallRequest):
+        @app.post('/twinkle/call', response_model=types.ProcessorCallResponse)
+        def call(self, body: types.ProcessorCallRequest) -> types.ProcessorCallResponse:
             processor_id = body.processor_id
             function_name = body.function
             _kwargs = body.model_extra or {}
@@ -176,16 +176,16 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             if function_name == '__next__':
                 try:
                     result = function(**resolved_kwargs)
-                    return {'result': result}
+                    return types.ProcessorCallResponse(result=result)
                 except StopIteration:
                     # HTTP 410 Gone signals iterator exhausted
                     raise HTTPException(status_code=410, detail='Iterator exhausted')
 
             result = function(**resolved_kwargs)
             if function_name == '__iter__':
-                return {'result': 'ok'}
+                return types.ProcessorCallResponse(result='ok')
             else:
-                return {'result': result}
+                return types.ProcessorCallResponse(result=result)
 
     return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, ncpu_proc_per_node, device_group,
                                                               device_mesh)
