@@ -28,6 +28,30 @@ Twinkle and [ms-swift](https://github.com/modelscope/ms-swift) are both model tr
 - If you need other capabilities like inference, deployment, quantization
 - If you are sensitive to new model training support, Swift guarantees day-0 update capability
 
+## Model Training and Twinkle
+
+When you find that general-purpose large models cannot meet your needs, training becomes essential:
+
+- **Make the model know you**: Through self-cognition training, the model can answer questions like "Who are you?" and "Who is your developer?", becoming an AI assistant exclusively yours.
+- **Make the model understand your business**: By fine-tuning with private data, the model can learn your industry terminology, business processes, and internal knowledge base, becoming a domain expert.
+- **Make the model think your way**: Through reinforcement learning (RL), you can define reward rules to guide the model in generating outputs that match your expected format, reasoning style, or values.
+- **Make the model stronger**: Distill capabilities from large models to smaller ones, or inject new knowledge through continued pre-training, enabling the model's capabilities to continuously evolve.
+
+After training is complete, you can deploy the model to your own servers, publish it to ModelScope/Hugging Face to share with the community, or deploy your service using deployment frameworks like vLLM.
+
+Existing training frameworks can be roughly divided into three categories:
+
+- **Low-level frameworks** (e.g., native PyTorch): Highly flexible, but require developers to build infrastructure from scratch including distributed computing, data loading, checkpointing, etc., resulting in high development costs and long cycles.
+- **High-level frameworks** (e.g., ms-swift, transformers Trainer): Ready to use out of the box—just provide the dataset and configuration to complete training—but the training process is a black box, making it difficult to customize algorithm details.
+- **Heavy-duty frameworks** (e.g., Megatron-LM): Designed for ultra-large-scale models with support for complex parallelism strategies, but have a steep learning curve and highly invasive code requirements.
+
+Twinkle's design goal is to find a balance among these three types of frameworks:
+
+1. **Retain control over the training loop**: Developers can clearly see and control every step of forward, backward, and step, making it easy to debug and customize algorithms.
+2. **Provide highly cohesive component abstractions**: Components like Dataset, Model, Sampler, and Loss each have their own responsibilities and can be used independently or in combination, without requiring full integration.
+3. **Hide distributed complexity**: Whether using a single GPU, torchrun, or a Ray cluster, the training code remains almost identical—only the initialization parameters need to be modified.
+4. **Support production-grade deployment**: Built-in capabilities for multi-tenancy, HTTP services, weight synchronization, and more, ready for building enterprise-level training platforms.
+
 ## Usage Patterns
 
 ### Using Only Partial Components
