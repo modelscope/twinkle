@@ -16,8 +16,6 @@ API endpoint: `base_url="https://www.modelscope.cn/twinkle"`
 
 ## Step 2. Review the Cookbook and Customize Development
 
-# Translation
-
 We strongly recommend that developers check out our [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook/client/tinker) and build upon the training code provided there for secondary development.
 
 Sample code:
