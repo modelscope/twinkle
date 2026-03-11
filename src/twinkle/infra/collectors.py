@@ -20,7 +20,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, An
     for key in all_keys:
         values = [d[key] for d in outputs if key in d]
 
-        if not values:
+        if not values or all([v is None for v in values]):
             continue
 
         first_value = values[0]

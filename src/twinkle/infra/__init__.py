@@ -350,6 +350,13 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
                 for i in range(n):
                     _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
                 return _args
+            elif isinstance(arg, dict):
+                _args = [{} for _ in range(n)]
+                for key in arg.keys():
+                    value = arg[key]
+                    for i, v in enumerate(dispatch_func(value, n)):
+                        _args[i][key] = v
+                return _args
             else:
                 return [arg] * n
 

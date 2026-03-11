@@ -105,11 +105,14 @@ class OptimizerGroup:
         self._dp_group = self._device_mesh.create_process_group(dims)
 
     def _get_lr(self):
-        _lrs = []
-        _default_lr = self.optimizer.defaults.get('lr')
-        for param_group in self.optimizer.param_groups:
-            _lrs.append(param_group.get('lr', _default_lr))
-        return _lrs
+        if self.optimizer is not None:
+            _lrs = []
+            _default_lr = self.optimizer.defaults.get('lr')
+            for param_group in self.optimizer.param_groups:
+                _lrs.append(param_group.get('lr', _default_lr))
+            return _lrs
+        else:
+            return []
 
     def accumulate_metrics(self, is_training):
         self._ensure_dp_group()
