@@ -18,12 +18,17 @@ class NativeFSDPStrategy:
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
                  enable_ep: bool = True,
-                 ep_fsdp_device_mesh: Optional[TorchDeviceMesh] = None):
+                 ep_size: Optional[int] = None):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
         self.enable_ep = enable_ep
-        self.ep_fsdp_device_mesh = ep_fsdp_device_mesh
+        self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
+
+    def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
+        if self.device_mesh is None:
+            return None
+        return self.device_mesh.build_ep_fsdp_device_mesh(ep_size=ep_size)
 
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:

@@ -255,7 +255,7 @@ def token_pre_all2all(
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
     routing_weights: torch.Tensor,
-    selected_experts: int,
+    selected_experts: torch.Tensor,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,

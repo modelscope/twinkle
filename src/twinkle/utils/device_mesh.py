@@ -118,7 +118,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep', 'ep_fsdp'}
+        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep'}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(f'The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) '
@@ -180,27 +180,6 @@ class DeviceMesh:
         coord = self._get_coord()
         key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
         return group_map[key]
-
-    def get_ranks_for_dims(self, dims):
-        if self.mesh_dim_names is None:
-            raise ValueError('mesh_dim_names is not set.')
-        if isinstance(dims, str):
-            dims = (dims, )
-        for dim_name in dims:
-            if dim_name not in self.mesh_dim_names:
-                raise ValueError(f"Dimension '{dim_name}' not found in mesh. Available: {self.mesh_dim_names}")
-
-        coord = self._get_coord()
-        if coord is None:
-            raise RuntimeError('Current rank is not found in mesh.')
-
-        slices = []
-        for i, dim_name in enumerate(self.mesh_dim_names):
-            if dim_name in dims:
-                slices.append(slice(None))
-            else:
-                slices.append(coord[i])
-        return sorted(self.mesh[tuple(slices)].flatten().tolist())
 
     def build_ep_fsdp_device_mesh(self, ep_size: int = None):
         import math

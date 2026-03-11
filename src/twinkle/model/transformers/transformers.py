@@ -219,24 +219,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)
         self._expert_parallel_applied = False
-        # Store ep_size for later use (EP mesh construction, grad clip, etc.)
-        self._ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
-        if self._ep_size is None and self.device_mesh is not None:
-            self._ep_size = getattr(self.device_mesh, 'ep_size', None)
-        if self._ep_size is None:
-            self._ep_size = 1
 
         use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
         if use_native_fsdp:
-            ep_fsdp_mesh = None
-            if self._enable_expert_parallel and self.device_mesh is not None:
-                ep_fsdp_mesh = self.device_mesh.build_ep_fsdp_device_mesh(ep_size=self._ep_size)
+            ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
+            if ep_size is None and self.device_mesh is not None:
+                ep_size = getattr(self.device_mesh, 'ep_size', None)
             self.strategy = NativeFSDPStrategy(
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
                 enable_ep=self._enable_expert_parallel,
-                ep_fsdp_device_mesh=ep_fsdp_mesh,
+                ep_size=ep_size,
             )
         else:
             self.strategy = AccelerateStrategy(
