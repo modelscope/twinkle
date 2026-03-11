@@ -68,7 +68,7 @@ If you need to use Twinkle's Client, you can use our one-click installation scri
 ```shell
 # Mac or Linux
 sh INSTALL_CLIENT.sh
-# Windows
+# Windows, Open with powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 .\INSTALL_CLIENT.ps1
 ```

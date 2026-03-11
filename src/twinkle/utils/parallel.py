@@ -8,7 +8,7 @@ os.makedirs('.locks', exist_ok=True)
 
 
 def _sanitize_lock_name(name: str) -> str:
-    """Sanitize lock file name for cross-platform compatibility.
+    r"""Sanitize lock file name for cross-platform compatibility.
 
     Windows does not allow : / \ * ? " < > | in file names.
     """
