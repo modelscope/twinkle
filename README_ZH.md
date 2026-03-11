@@ -53,6 +53,26 @@ cd twinkle
 pip install -e .
 ```
 
+如果你需要使用Twinkle的Client，可以使用我们的一键安装脚本：
+
+```shell
+# Mac or Linux
+sh INSTALL_CLIENT.sh
+# Windows, Open with powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\INSTALL_CLIENT.ps1
+```
+
+这个脚本会下载或利用conda，创建一个叫`twinkle-client`的虚拟环境，这个环境可以直接用于远端训练。
+
+如果你需要安装Megatron相关依赖，可以如下脚本：
+
+```shell
+sh INSTALL_MEGATRON.sh
+```
+
+或者使用魔搭的[官方镜像](https://www.modelscope.cn/docs/intro/environment-setup)。
+
 ## 教程
 
 | 训练类型                     | 模型框架 | Cookbook 路径                                     |

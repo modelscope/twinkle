@@ -63,6 +63,26 @@ cd twinkle
 pip install -e .
 ```
 
+If you need to use Twinkle's Client, you can use our one-click installation script:
+
+```shell
+# Mac or Linux
+sh INSTALL_CLIENT.sh
+# Windows, Open with powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\INSTALL_CLIENT.ps1
+```
+
+This script will download or utilize conda to create a virtual environment called `twinkle-client`, which can be directly used for remote training.
+
+If you need to install Megatron-related dependencies, you can use the following script:
+
+```shell
+sh INSTALL_MEGATRON.sh
+```
+
+Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/environment-setup).
+
 ## Tutorials
 
 | Training Type                     | Model Framework | Cookbook Path                                     |
