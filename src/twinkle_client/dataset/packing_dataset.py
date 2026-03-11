@@ -20,7 +20,7 @@ class PackingDataset(Dataset):
     def __init__(self, dataset_meta: DatasetMeta, packing_num_proc: int = 1, **kwargs):
         from twinkle_client.http import get_base_url
 
-        self.server_url = f'{get_base_url()}/processors/twinkle'
+        self.server_url = f'{get_base_url()}/processor/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
             json_data={

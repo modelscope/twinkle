@@ -55,7 +55,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
-                from twinkle.server.common.io_utils import create_checkpoint_manager
+                from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
                 from twinkle.server.utils.validation import get_token_from_request
                 token = get_token_from_request(request)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')

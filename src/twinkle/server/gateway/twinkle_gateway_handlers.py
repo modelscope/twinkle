@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from .server import GatewayServer
 
-from twinkle.server.common.io_utils import create_checkpoint_manager, create_training_run_manager, validate_user_path
+from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.utils.checkpoint_base import validate_user_path
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.server import DeleteCheckpointResponse, HealthResponse, WeightsInfoRequest

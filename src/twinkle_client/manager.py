@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 # Shared Pydantic models
 from twinkle_client.types.training import Checkpoint, Cursor, TrainingRun
-from .http.http_utils import http_get, http_post
+from .http import http_get, http_post, get_base_url
 
 
 class TwinkleClientError(Exception):
@@ -31,11 +31,11 @@ class TwinkleClient:
         base_url: Base URL of the Twinkle server (e.g., "http://localhost:8000").
         api_key: API key for authentication. If not provided, uses
                  TWINKLE_SERVER_TOKEN environment variable
-        route_prefix: API route prefix (default: "/api/v1/twinkle")
+        route_prefix: API route prefix (default: "/twinkle")
     """
 
-    def __init__(self, base_url: str = None, api_key: str = None, route_prefix: str | None = '/api/v1/twinkle'):
-        self.base_url = base_url
+    def __init__(self, base_url: str = None, api_key: str = None, route_prefix: str | None = '/twinkle'):
+        self.base_url = base_url or get_base_url()
         self.api_key = api_key
         self.route_prefix = route_prefix.rstrip('/') if route_prefix else ''
 

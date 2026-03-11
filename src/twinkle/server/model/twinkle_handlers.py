@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .app import ModelManagement
 
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.server.common.io_utils import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.common.serialize import deserialize_object
 from twinkle.utils.logger import get_logger
 from twinkle_client.types.model import (AdapterRequest, AddAdapterRequest, CalculateMetricRequest, CreateRequest,
@@ -305,8 +305,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
             self.register_adapter(adapter_name, token)
             self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
-            from twinkle.server.common.io_utils import CreateModelRequest
-            from twinkle.server.common.io_utils import LoraConfig as IoLoraConfig
+            from twinkle_client.types.training import CreateModelRequest
+            from twinkle_client.types.training import LoraConfig as IoLoraConfig
             lora_config = None
             if isinstance(config, LoraConfig):
                 lora_config = IoLoraConfig(rank=config.r, train_unembed=False, train_mlp=True, train_attn=True)

@@ -30,7 +30,7 @@ class MultiLoraTransformersModel:
         self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
-        self.server_url = f'{self.server_url}/models/{model_id}/twinkle'
+        self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
             url=f'{self.server_url}/create',

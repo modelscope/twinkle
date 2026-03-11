@@ -1,19 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Twinkle-specific IO managers for training runs and checkpoints.
+Twinkle-specific checkpoint and training-run managers.
 
 Uses ``twinkle_client.types.training`` models for all serialization and response construction.
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.utils.io_utils import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager,
-                                           validate_ownership)
-from twinkle_client.types.training import Checkpoint as TwinkleCheckpoint
-from twinkle_client.types.training import (CheckpointsListResponse, CreateModelRequest, Cursor,
-                                           ParsedCheckpointTwinklePath)
-from twinkle_client.types.training import TrainingRun as TwinkleTrainingRun
-from twinkle_client.types.training import TrainingRunsResponse, WeightsInfoResponse
+from twinkle.server.utils.checkpoint_base import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager,
+                                                  BaseTrainingRunManager, validate_ownership)
+from twinkle_client.types.training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor,
+                                           ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse,
+                                           WeightsInfoResponse)
 
 
 class TwinkleTrainingRunManager(BaseTrainingRunManager):
@@ -25,7 +23,7 @@ class TwinkleTrainingRunManager(BaseTrainingRunManager):
 
     def _create_training_run(self, model_id: str, run_config: CreateModelRequest) -> Dict[str, Any]:
         lora_config = run_config.lora_config
-        train_run_data = TwinkleTrainingRun(
+        train_run_data = TrainingRun(
             training_run_id=model_id,
             base_model=run_config.base_model,
             model_owner=self.token,
@@ -44,14 +42,14 @@ class TwinkleTrainingRunManager(BaseTrainingRunManager):
             new_data['train_attn'] = lora_config.train_attn
         return new_data
 
-    def _parse_training_run(self, data: Dict[str, Any]) -> TwinkleTrainingRun:
-        return TwinkleTrainingRun(**data)
+    def _parse_training_run(self, data: Dict[str, Any]) -> TrainingRun:
+        return TrainingRun(**data)
 
-    def _create_training_runs_response(self, runs: List[TwinkleTrainingRun], limit: int, offset: int,
+    def _create_training_runs_response(self, runs: List[TrainingRun], limit: int, offset: int,
                                        total: int) -> TrainingRunsResponse:
         return TrainingRunsResponse(training_runs=runs, cursor=Cursor(limit=limit, offset=offset, total_count=total))
 
-    def get_with_permission(self, model_id: str) -> Optional[TwinkleTrainingRun]:
+    def get_with_permission(self, model_id: str) -> Optional[TrainingRun]:
         run = self.get(model_id)
         if run and validate_ownership(self.token, run.model_owner):
             return run
@@ -82,7 +80,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
                            train_mlp=None,
                            train_attn=None,
                            user_metadata=None) -> Dict[str, Any]:
-        checkpoint = TwinkleCheckpoint(
+        checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
             time=datetime.now(),
@@ -98,15 +96,15 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
             user_metadata=user_metadata)
         return checkpoint.model_dump(mode='json')
 
-    def _parse_checkpoint(self, data: Dict[str, Any]) -> TwinkleCheckpoint:
+    def _parse_checkpoint(self, data: Dict[str, Any]) -> Checkpoint:
         data = data.copy()
         if 'tinker_path' in data and 'twinkle_path' not in data:
             data['twinkle_path'] = data.pop('tinker_path')
         elif 'twinkle_path' not in data and 'path' in data:
             data['twinkle_path'] = data.pop('path')
-        return TwinkleCheckpoint(**data)
+        return Checkpoint(**data)
 
-    def get(self, model_id: str, checkpoint_id: str) -> Optional[TwinkleCheckpoint]:
+    def get(self, model_id: str, checkpoint_id: str) -> Optional[Checkpoint]:
         data = self._read_ckpt_info(model_id, checkpoint_id)
         if not data:
             return None
@@ -116,7 +114,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
                 data['twinkle_path'] = f"{self.path_prefix}{model_id}/{data['checkpoint_id']}"
         return self._parse_checkpoint(data)
 
-    def _create_checkpoints_response(self, checkpoints: List[TwinkleCheckpoint]) -> CheckpointsListResponse:
+    def _create_checkpoints_response(self, checkpoints: List[Checkpoint]) -> CheckpointsListResponse:
         return CheckpointsListResponse(checkpoints=checkpoints, cursor=None)
 
     def _create_parsed_path(self, path, training_run_id, checkpoint_type, checkpoint_id) -> ParsedCheckpointTwinklePath:

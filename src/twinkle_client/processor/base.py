@@ -20,7 +20,7 @@ class InputProcessor(object):
     def __init__(self, device_mesh: Optional[DeviceMesh] = None, padding_free: bool = False, framework: Literal['transformers', 'megatron'] = 'transformers', **kwargs):
         from twinkle_client.http import get_base_url
 
-        self.server_url = f'{get_base_url()}/processors/twinkle'
+        self.server_url = f'{get_base_url()}/processor/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
             json_data={

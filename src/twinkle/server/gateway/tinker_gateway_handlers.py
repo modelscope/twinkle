@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .server import GatewayServer
 
 from twinkle.hub import HubOperation
-from twinkle.server.common.io_utils import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.utils.task_queue import QueueState
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger

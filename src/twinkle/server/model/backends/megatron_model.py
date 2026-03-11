@@ -118,7 +118,7 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         token = kwargs.pop('token', None)
         if not token:
             raise ValueError('Token is required for loading checkpoints')
-        from twinkle.server.common.io_utils import create_checkpoint_manager
+        from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
         checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
         resolved = checkpoint_manager.resolve_load_path(checkpoint_dir)
         if resolved.is_twinkle_path:

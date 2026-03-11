@@ -100,3 +100,26 @@ applications:
   #         runtime_env:
   #           env_vars:
   #             TWINKLE_TRUST_REMOTE_CODE: "0"
+
+  # 4. Processor Service - Runs inference / sampling using vLLM engine
+  - name: processor
+    route_prefix: /api/v1/processor
+    import_path: processor
+    args:
+      nproc_per_node: 2               # 每节点处理器 worker 数
+      ncpu_proc_per_node: 2           # 每节点 CPU 进程数
+      device_group:
+        name: model
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 2                    # 数据并行大小
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1

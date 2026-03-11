@@ -23,7 +23,11 @@ def set_base_url(url: str):
 
 def get_base_url() -> Optional[str]:
     """Get the current base URL from context or environment variable."""
-    return _base_url_context.get() or TWINKLE_SERVER_URL
+    base_url = _base_url_context.get() or TWINKLE_SERVER_URL
+    # if not ends with '/api/v1' then append it
+    if not base_url.endswith('/api/v1'):
+        base_url += '/api/v1'
+    return base_url
 
 
 def clear_base_url():

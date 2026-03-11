@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from .app import ModelManagement
 
-from twinkle.server.common.io_utils import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

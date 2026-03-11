@@ -347,7 +347,7 @@ class {class_name}({inheritance}):
     def __init__({init_params}):
         from twinkle_client.http import get_base_url
 
-        self.server_url = f'{{get_base_url()}}/processors/twinkle'
+        self.server_url = f'{{get_base_url()}}/processor/twinkle'
         response = http_post(
             url=f'{{self.server_url}}/create',
             json_data={{
@@ -466,7 +466,7 @@ class MultiLoraTransformersModel:
         self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
-        self.server_url = f'{self.server_url}/models/{model_id}/twinkle'
+        self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
             url=f'{self.server_url}/create',
@@ -743,7 +743,7 @@ class vLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
-        self.server_url = f'{self.server_url}/samplers/{model_id}/twinkle'
+        self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
             json_data=kwargs

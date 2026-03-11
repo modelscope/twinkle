@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Tinker-specific IO managers for training runs and checkpoints.
+Tinker-specific checkpoint and training-run managers.
 
 Uses ``tinker.types`` models for all serialization and response construction.
 """
@@ -8,7 +8,7 @@ from datetime import datetime
 from tinker import types as tinker_types
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.utils.io_utils import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
+from twinkle.server.utils.checkpoint_base import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
 
 
 class TinkerTrainingRunManager(BaseTrainingRunManager):

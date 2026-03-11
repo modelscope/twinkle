@@ -1,10 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Base IO utilities for managing training runs and checkpoints.
+Base infrastructure for checkpoint and training-run persistence.
 
-This module provides abstract base classes that encapsulate common logic for
-file-based storage of training run metadata and checkpoint information.
-Both tinker and twinkle servers inherit from these classes.
+Provides:
+- Constants and path-hashing utilities
+- Permission-check helpers (``validate_user_path``, ``validate_ownership``)
+- Internal Pydantic base specs used as type constraints for the generic managers
+- Abstract base managers: ``BaseTrainingRunManager``, ``BaseCheckpointManager``
+
+Concrete implementations live in:
+  - ``twinkle.server.common.tinker_checkpoint``
+  - ``twinkle.server.common.twinkle_checkpoint``
 """
 import hashlib
 import hmac
@@ -20,6 +26,7 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 from twinkle import get_logger
 from twinkle.hub import HubOperation
+from twinkle.server.types.checkpoint import ResolvedLoadPath
 
 logger = get_logger()
 
@@ -41,13 +48,7 @@ def _hash_token(token: str) -> str:
     return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
 
 
-# ----- Common Pydantic Models -----
-
-
-class Cursor(BaseModel):
-    limit: int
-    offset: int
-    total_count: int
+# ----- Internal Pydantic Base Specs -----
 
 
 class BaseCheckpoint(BaseModel):
@@ -102,23 +103,6 @@ class BaseParsedCheckpointPath(BaseModel):
     training_run_id: str
     checkpoint_type: str
     checkpoint_id: str
-
-
-class ResolvedLoadPath(BaseModel):
-    """Result of resolving a load path.
-
-    Attributes:
-        checkpoint_name: The name of the checkpoint (e.g., 'step-8' or hub model id)
-        checkpoint_dir: The directory containing the checkpoint, or None if loading from hub
-        is_twinkle_path: Whether the path was a twinkle:// path
-        training_run_id: The training run ID (only set for twinkle:// paths)
-        checkpoint_id: The checkpoint ID (only set for twinkle:// paths)
-    """
-    checkpoint_name: str
-    checkpoint_dir: Optional[str] = None
-    is_twinkle_path: bool = False
-    training_run_id: Optional[str] = None
-    checkpoint_id: Optional[str] = None
 
 
 class BaseWeightsInfoResponse(BaseModel):
