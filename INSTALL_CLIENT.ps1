@@ -44,7 +44,7 @@ function Test-CondaInstalled {
             return $true
         }
     } catch {}
-    
+
     # Check common installation paths
     $condaPaths = @(
         "$env:USERPROFILE\miniconda3\Scripts\conda.exe",
@@ -52,7 +52,7 @@ function Test-CondaInstalled {
         "C:\ProgramData\miniconda3\Scripts\conda.exe",
         "C:\ProgramData\Anaconda3\Scripts\conda.exe"
     )
-    
+
     foreach ($path in $condaPaths) {
         if (Test-Path $path) {
             $condaDir = Split-Path (Split-Path $path)
@@ -62,7 +62,7 @@ function Test-CondaInstalled {
             return $true
         }
     }
-    
+
     Write-Host "[!] Conda not found" -ForegroundColor Yellow
     return $false
 }
@@ -70,12 +70,12 @@ function Test-CondaInstalled {
 function Install-Miniconda {
     Write-Host ""
     Write-Host "Installing Miniconda..." -ForegroundColor Cyan
-    
+
     $installerPath = "$env:TEMP\Miniconda3-latest-Windows-x86_64.exe"
     $installDir = "$env:USERPROFILE\miniconda3"
-    
+
     Write-Host "Downloading Miniconda from: $MinicondaUrl"
-    
+
     # Download installer
     try {
         Invoke-WebRequest -Uri $MinicondaUrl -OutFile $installerPath -UseBasicParsing
@@ -83,10 +83,10 @@ function Install-Miniconda {
         Write-Host "[ERROR] Failed to download Miniconda: $_" -ForegroundColor Red
         exit 1
     }
-    
+
     Write-Host "Installing Miniconda to: $installDir"
     Write-Host "This may take a few minutes..."
-    
+
     # Run installer silently
     Start-Process -FilePath $installerPath -ArgumentList @(
         "/InstallationType=JustMe",
@@ -95,13 +95,13 @@ function Install-Miniconda {
         "/S",
         "/D=$installDir"
     ) -Wait -NoNewWindow
-    
+
     # Add to PATH for current session
     $env:PATH = "$installDir\Scripts;$installDir;$env:PATH"
-    
+
     # Clean up
     Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-    
+
     Write-Host "[OK] Miniconda installed successfully" -ForegroundColor Green
     Write-Host ""
     Write-Host "[!] IMPORTANT: Restart PowerShell after installation to use conda globally" -ForegroundColor Yellow
@@ -193,7 +193,7 @@ print()
 
 packages = [
     'twinkle',
-    'twinkle_client', 
+    'twinkle_client',
     'tinker',
     'transformers',
     'peft',

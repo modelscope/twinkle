@@ -187,7 +187,7 @@ print()
 
 packages = [
     'twinkle',
-    'twinkle_client', 
+    'twinkle_client',
     'tinker',
     'transformers',
     'peft',
