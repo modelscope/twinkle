@@ -1,9 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import re
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 
 os.makedirs('.locks', exist_ok=True)
+
+
+def _sanitize_lock_name(name: str) -> str:
+    r"""Sanitize lock file name for cross-platform compatibility.
+
+    Windows does not allow : / \ * ? " < > | in file names.
+    """
+    # Replace problematic characters with underscores
+    return re.sub(r'[:/\\*?"<>|]', '_', name)
 
 
 def acquire_lock(lock: FileLock, blocking: bool):
@@ -37,7 +47,8 @@ def processing_lock(lock_file: str):
     Returns:
 
     """
-    lock: FileLock = FileLock(os.path.join('.locks', f'{lock_file}.lock'))  # noqa
+    lock_name = _sanitize_lock_name(lock_file)
+    lock: FileLock = FileLock(os.path.join('.locks', f'{lock_name}.lock'))  # noqa
 
     if acquire_lock(lock, False):
         try:

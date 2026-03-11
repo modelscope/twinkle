@@ -16,7 +16,7 @@ API endpoint: `base_url="https://www.modelscope.cn/twinkle"`
 
 ## Step 2. Review the Cookbook and Customize Development
 
-We strongly recommend that developers review our [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook/client/tinker) and build upon the training code provided there.
+We strongly recommend that developers check out our [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook/client/tinker) and build upon the training code provided there for secondary development.
 
 Sample code:
 
@@ -49,7 +49,7 @@ service_client = ServiceClient(base_url=base_url, api_key=api_key)
 training_client = service_client.create_lora_training_client(base_model=base_model[len('ms://'):], rank=16)
 
 # Training loop: use input_feature_to_datum to transfer the input format
-for epoch in range(3):
+for epoch in range(2):
     for step, batch in tqdm(enumerate(dataloader)):
         input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
 
@@ -58,9 +58,81 @@ for epoch in range(3):
 
         fwdbwd_result = fwdbwd_future.result()
         optim_result = optim_future.result()
+        print(f'Training Metrics: {optim_result}')
 
-    training_client.save_state(f"twinkle-lora-{epoch}").result()
+    result = training_client.save_state(f"twinkle-lora-{epoch}").result()
+    print(f'Saved checkpoint for epoch {epoch} to {result.path}')
 ```
+
+With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3-30B-A3B-Instruct-2507`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
+
+```python
+import os
+from tinker import types
+
+from twinkle.data_format import Message, Trajectory
+from twinkle.template import Template
+from twinkle import init_tinker_client
+
+# Step 1: Initialize Tinker client
+init_tinker_client()
+
+from tinker import ServiceClient
+
+base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_url = 'http://www.modelscope.cn/twinkle'
+
+# Step 2: Define the base model and connect to the server
+service_client = ServiceClient(
+    base_url=base_url,
+    api_key=os.environ.get('MODELSCOPE_TOKEN')
+)
+
+# Step 3: Create a sampling client by loading weights from a saved checkpoint.
+# The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.
+# The server will load the base model and apply the LoRA adapter weights.
+sampling_client = service_client.create_sampling_client(
+    model_path='twinkle://xxx-Qwen_Qwen3-30B-A3B-Instruct-2507-xxx/weights/twinkle-lora-1',
+    base_model=base_model
+)
+
+# Step 4: Load the tokenizer locally to encode the prompt and decode the results
+print(f'Using model {base_model}')
+
+template = Template(model_id=f'ms://{base_model}')
+
+trajectory = Trajectory(
+    messages=[
+        Message(role='system', content='You are a helpful assistant'),
+        Message(role='user', content='Who are you?'),
+    ]
+)
+
+input_feature = template.encode(trajectory, add_generation_prompt=True)
+
+input_ids = input_feature['input_ids'].tolist()
+
+# Step 5: Prepare the prompt and sampling parameters
+prompt = types.ModelInput.from_ints(input_ids)
+params = types.SamplingParams(
+    max_tokens=128,       # Maximum number of tokens to generate
+    temperature=0.7,
+    stop=['\n']          # Stop generation when a newline character is produced
+)
+
+# Step 6: Send the sampling request to the server.
+# num_samples=1 generates 1 independent completions for the same prompt.
+print('Sampling...')
+future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
+result = future.result()
+
+# Step 7: Decode and print the generated responses
+print('Responses:')
+for i, seq in enumerate(result.sequences):
+    print(f'{i}: {repr(template.decode(seq.tokens))}')
+```
+
+Developers can also merge this LoRA with the base model and then deploy it using their own service, calling it through the OpenAI-compatible standard API.
 
 > The ModelScope server is tinker-compatible, so use the tinker cookbooks. In the future version, we will support a server works both for twinkle/tinker clients.
 
