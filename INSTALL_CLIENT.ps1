@@ -131,6 +131,16 @@ try {
 Write-Host ""
 Write-Host "Creating conda environment: $EnvName (Python $PythonVersion)..." -ForegroundColor Cyan
 
+# Accept Conda ToS for default channels (required for conda >= 26.x)
+Write-Host "Accepting Conda Terms of Service for default channels..."
+try {
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>$null
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>$null
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/msys2 2>$null
+} catch {
+    # Older conda versions don't have tos command, ignore
+}
+
 # Check if environment already exists
 $envList = conda env list 2>$null
 if ($envList -match "^$EnvName\s") {
@@ -147,7 +157,21 @@ if ($envList -match "^$EnvName\s") {
 # Create environment if it doesn't exist
 $envList = conda env list 2>$null
 if (-not ($envList -match "^$EnvName\s")) {
+    Write-Host "Running: conda create -n $EnvName python=$PythonVersion -y"
     conda create -n $EnvName python=$PythonVersion -y
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] Failed to create conda environment. Exit code: $LASTEXITCODE" -ForegroundColor Red
+        exit 1
+    }
+}
+
+# Verify environment was created
+$envList = conda env list 2>$null
+if (-not ($envList -match "^$EnvName\s")) {
+    Write-Host "[ERROR] Environment '$EnvName' was not created successfully." -ForegroundColor Red
+    Write-Host "Please run manually:" -ForegroundColor Yellow
+    Write-Host "  conda create -n $EnvName python=$PythonVersion" -ForegroundColor Yellow
+    exit 1
 }
 
 Write-Host "[OK] Environment '$EnvName' is ready" -ForegroundColor Green
@@ -160,10 +184,39 @@ Write-Host ""
 Write-Host "Activating environment and installing dependencies..." -ForegroundColor Cyan
 
 # Activate environment
-conda activate $EnvName
+Write-Host "Activating environment '$EnvName'..."
+try {
+    conda activate $EnvName
+    if ($LASTEXITCODE -ne 0) {
+        throw "conda activate failed"
+    }
+} catch {
+    Write-Host "[!] Standard activation failed, trying alternative method..." -ForegroundColor Yellow
+    # Alternative: run commands in the conda environment directly
+    $condaBase = (conda info --base 2>$null).Trim()
+    $activateScript = Join-Path $condaBase "Scripts\activate.bat"
+    if (Test-Path $activateScript) {
+        cmd /c "call `"$activateScript`" $EnvName && pip --version" 2>$null
+    }
+}
+
+# Verify we're in the correct environment
+$currentPython = python --version 2>&1
+Write-Host "Current Python: $currentPython"
+if ($currentPython -notmatch "3\.11") {
+    Write-Host "[!] Warning: Python version mismatch. Expected 3.11, got: $currentPython" -ForegroundColor Yellow
+    Write-Host "Attempting to use conda run instead..." -ForegroundColor Yellow
+    $UseCondaRun = $true
+} else {
+    $UseCondaRun = $false
+}
 
 # Upgrade pip
-pip install --upgrade pip
+if ($UseCondaRun) {
+    conda run -n $EnvName pip install --upgrade pip
+} else {
+    pip install --upgrade pip
+}
 
 # Check if we're in the twinkle source directory
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -171,11 +224,24 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (Test-Path "$ScriptDir\pyproject.toml") {
     Write-Host ""
     Write-Host "Installing twinkle from source (with tinker support)..." -ForegroundColor Cyan
-    pip install -e "$ScriptDir[tinker]"
+    if ($UseCondaRun) {
+        conda run -n $EnvName pip install -e "$ScriptDir[tinker]"
+    } else {
+        pip install -e "$ScriptDir[tinker]"
+    }
 } else {
     Write-Host ""
     Write-Host "Installing twinkle-kit from PyPI (with tinker support)..." -ForegroundColor Cyan
-    pip install "twinkle-kit[tinker]"
+    if ($UseCondaRun) {
+        conda run -n $EnvName pip install "twinkle-kit[tinker]"
+    } else {
+        pip install "twinkle-kit[tinker]"
+    }
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Failed to install twinkle. Exit code: $LASTEXITCODE" -ForegroundColor Red
+    exit 1
 }
 
 # ==============================================================================
@@ -229,7 +295,11 @@ except ImportError as e:
     print(f'  [FAIL] twinkle core: {e}')
 "@
 
-python -c $verifyScript
+if ($UseCondaRun) {
+    conda run -n $EnvName python -c $verifyScript
+} else {
+    python -c $verifyScript
+}
 
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
