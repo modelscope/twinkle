@@ -89,8 +89,8 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # LoRA 训练：约 18G * 4 显存占用
-    # 全参数训练：约 50G * 4 显存占用
+    # LoRA 训练：约 8G * 8 显存占用
+    # 全参数训练：约 18G * 8 显存占用
     for step, batch in enumerate(dataloader):
         # 前向 + 反向传播
         model.forward_backward(inputs=batch)

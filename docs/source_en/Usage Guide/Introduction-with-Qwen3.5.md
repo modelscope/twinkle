@@ -89,8 +89,8 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # LoRA training: ~18G * 4 GPU memory
-    # Full-parameter training: ~50G * 4 GPU memory
+    # LoRA training: ~8G * 8 GPU memory
+    # Full-parameter training: ~18G * 8 GPU memory
     for step, batch in enumerate(dataloader):
         # Forward + backward pass
         model.forward_backward(inputs=batch)
