@@ -118,7 +118,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep'}
+        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep', 'ep_fsdp'}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(f'The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) '
@@ -182,19 +182,20 @@ class DeviceMesh:
         return group_map[key]
 
     def build_ep_fsdp_device_mesh(self, ep_size: int = None):
-        import math
-        import torch
         ep_size = ep_size or self.ep_size or 1
         if ep_size <= 1:
             return None
         world_size = self.world_size
-        assert world_size % ep_size == 0, (f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
+        assert world_size % ep_size == 0, (
+            f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
         ep_fsdp_size = world_size // ep_size
-        with torch.device('cpu'):
-            mesh = (
-                torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int).view(ep_fsdp_size,
-                                                                                       ep_size).transpose(0, 1))
-        return torch.distributed.DeviceMesh(self.device_type, mesh, mesh_dim_names=('ep', 'ep_fsdp'))
+
+        ep_mesh = DeviceMesh(
+            mesh=np.arange(world_size).reshape(ep_size, ep_fsdp_size),
+            mesh_dim_names=('ep', 'ep_fsdp'),
+            device_type=self.device_type,
+        )
+        return ep_mesh.to_torch_device_mesh()
 
     @property
     def order(self):
