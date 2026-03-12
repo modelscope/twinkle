@@ -7,7 +7,6 @@ Provides a Ray Serve deployment for managing distributed processors
 """
 import importlib
 import os
-import threading
 import uuid
 from fastapi import FastAPI, HTTPException, Request
 from ray import serve
@@ -23,16 +22,20 @@ from twinkle.server.utils.validation import verify_request_token
 logger = get_logger()
 
 
-def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_group: Dict[str, Any],
-                        device_mesh: Dict[str, Any], deploy_options: Dict[str, Any], **kwargs):
+def build_processor_app(ncpu_proc_per_node: int,
+                        device_group: Dict[str, Any],
+                        device_mesh: Dict[str, Any],
+                        deploy_options: Dict[str, Any],
+                        nproc_per_node: int = 1,
+                        **kwargs):
     """Build the processor management application.
 
     Args:
-        nproc_per_node: Number of GPU processes per node
         ncpu_proc_per_node: Number of CPU processes per node
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict
         deploy_options: Ray Serve deployment options
+        nproc_per_node: Number of GPU processes per node (default 1, not used for CPU-only tasks)
         **kwargs: Additional arguments
 
     Returns:
@@ -55,10 +58,11 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
         (datasets, dataloaders, rewards, templates, etc.).
         """
 
-        COUNT_DOWN = 60 * 30
-
-        def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, device_group: Dict[str, Any],
-                     device_mesh: Dict[str, Any]):
+        def __init__(self,
+                     ncpu_proc_per_node: int,
+                     device_group: Dict[str, Any],
+                     device_mesh: Dict[str, Any],
+                     nproc_per_node: int = 1):
             self.device_group = DeviceGroup(**device_group)
             twinkle.initialize(
                 mode='ray',
@@ -71,24 +75,9 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
             self.resource_dict = {}
-            self.resource_records: Dict[str, int] = {}
-            self.hb_thread = threading.Thread(target=self.countdown, daemon=True)
-            self.hb_thread.start()
             self.state: ServerStateProxy = get_server_state()
             self.per_token_processor_limit = int(os.environ.get('TWINKLE_PER_USER_PROCESSOR_LIMIT', 20))
             self.key_token_dict = {}
-
-        def countdown(self):
-            import time
-            while True:
-                time.sleep(1)
-                for key in list(self.resource_records.keys()):
-                    self.resource_records[key] += 1
-                    if self.resource_records[key] > self.COUNT_DOWN:
-                        self.resource_records.pop(key, None)
-                        self.resource_dict.pop(key, None)
-                        if key in self.key_token_dict:
-                            self.handle_processor_count(self.key_token_dict.pop(key), False)
 
         def assert_processor_exists(self, processor_id: str):
             assert processor_id and processor_id in self.resource_dict, f'Processor {processor_id} not found'
@@ -139,16 +128,7 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
                 instance_id=processor_id,
                 **resolved_kwargs)
             self.resource_dict[processor_id] = processor
-            self.resource_records[processor_id] = 0
             return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
-
-        @app.post('/twinkle/heartbeat', response_model=types.ProcessorHeartbeatResponse)
-        def heartbeat(self, body: types.ProcessorHeartbeatRequest) -> types.ProcessorHeartbeatResponse:
-            processor_ids = body.processor_id.split(',')
-            for _id in processor_ids:
-                if _id and _id in self.resource_dict:
-                    self.resource_records[_id] = 0
-            return types.ProcessorHeartbeatResponse()
 
         @app.post('/twinkle/call', response_model=types.ProcessorCallResponse)
         def call(self, body: types.ProcessorCallRequest) -> types.ProcessorCallResponse:
@@ -187,5 +167,5 @@ def build_processor_app(nproc_per_node: int, ncpu_proc_per_node: int, device_gro
             else:
                 return types.ProcessorCallResponse(result=result)
 
-    return ProcessorManagement.options(**deploy_options).bind(nproc_per_node, ncpu_proc_per_node, device_group,
-                                                              device_mesh)
+    return ProcessorManagement.options(**deploy_options).bind(
+        ncpu_proc_per_node, device_group, device_mesh, nproc_per_node=nproc_per_node)

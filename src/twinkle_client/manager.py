@@ -10,7 +10,7 @@ from twinkle_client.types.session import (CreateSessionRequest, CreateSessionRes
                                            SessionHeartbeatResponse)
 from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
                                             TrainingRunsResponse, WeightsInfoResponse)
-from .http import get_api_key, get_base_url, http_delete, http_get, http_post, set_api_key, set_base_url, set_session_id, clear_session_id
+from .http import get_api_key, get_base_url, http_delete, http_get, http_post, set_api_key, set_base_url, set_session_id
 
 
 class TwinkleClientError(Exception):
@@ -46,7 +46,7 @@ class TwinkleClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         route_prefix: Optional[str] = '/twinkle',
-        session_heartbeat_interval: int = 30,
+        session_heartbeat_interval: int = 10,
         session_metadata: Optional[Dict[str, Any]] = None,
     ):
         # Resolve and store config, then propagate to context so all generated
@@ -55,18 +55,13 @@ class TwinkleClient:
             set_base_url(base_url)
         if api_key:
             set_api_key(api_key)
-            
+
         self.base_url = get_base_url()
         self.api_key = get_api_key()
         self.route_prefix = route_prefix.rstrip('/') if route_prefix else ''
 
         # Create a server-side session.
-        resp = http_post(
-            self._get_url('/create_session'),
-            json_data=CreateSessionRequest(metadata=session_metadata).model_dump(),
-        )
-        resp.raise_for_status()
-        self._session_id: str = CreateSessionResponse(**resp.json()).session_id
+        self._session_id: str = self.create_session(session_metadata)
         set_session_id(self._session_id)
 
         # Start background session-touch thread.
@@ -99,6 +94,26 @@ class TwinkleClient:
             raise TwinkleClientError(f'Request failed with status {response.status_code}: {detail}')
         return response.json()
 
+    def create_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Create a server-side session.
+
+        Args:
+            metadata: Optional metadata dict stored with the session on the server.
+
+        Returns:
+            The session ID string.
+
+        Raises:
+            TwinkleClientError: If the session creation request fails.
+        """
+        resp = http_post(
+            self._get_url('/create_session'),
+            json_data=CreateSessionRequest(metadata=metadata).model_dump(),
+        )
+        resp.raise_for_status()
+        return CreateSessionResponse(**resp.json()).session_id
+
     def _touch_session_loop(self) -> None:
         """Background loop: touch the session every N seconds."""
         while not self._stop_event.wait(timeout=self._heartbeat_interval):
@@ -117,7 +132,6 @@ class TwinkleClient:
         self._stop_event.set()
         if self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=2)
-        clear_session_id()
 
     # ------------------------------------------------------------------
     # Health Check
