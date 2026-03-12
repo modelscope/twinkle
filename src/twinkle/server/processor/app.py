@@ -14,11 +14,11 @@ from ray import serve
 from typing import Any, Dict
 
 import twinkle
+import twinkle_client.types as types
 from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.server.common.serialize import deserialize_object
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
-import twinkle_client.types as types
 
 logger = get_logger()
 

@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from .server import GatewayServer
 
+import twinkle_client.types as types
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.utils.checkpoint_base import validate_user_path
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-import twinkle_client.types as types
 
 logger = get_logger()
 
@@ -72,8 +72,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
             raise HTTPException(status_code=404, detail=f'Training run {run_id} not found or access denied')
         return response
 
-    @app.delete('/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id:path}', response_model=types.DeleteCheckpointResponse)
-    async def delete_run_checkpoint(request: Request, run_id: str, checkpoint_id: str) -> types.DeleteCheckpointResponse:
+    @app.delete(
+        '/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id:path}',
+        response_model=types.DeleteCheckpointResponse)
+    async def delete_run_checkpoint(request: Request, run_id: str,
+                                    checkpoint_id: str) -> types.DeleteCheckpointResponse:
         token = get_token_from_request(request)
 
         if not validate_user_path(token, checkpoint_id):

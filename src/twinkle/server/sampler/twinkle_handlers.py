@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 if TYPE_CHECKING:
     from .app import SamplerManagement
 
+import twinkle_client.types as types
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.utils.logger import get_logger
-import twinkle_client.types as types
 
 logger = get_logger()
 
@@ -107,8 +107,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             raise
 
     @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
-    def set_template(request: Request, body: types.SetTemplateRequest,
-                     self: SamplerManagement = Depends(self_fn)) -> types.SetTemplateResponse:
+    def set_template(
+            request: Request,
+            body: types.SetTemplateRequest,
+            self: SamplerManagement = Depends(self_fn),
+    ) -> types.SetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
         extra_kwargs = body.model_extra or {}
         self.sampler.set_template(body.template_cls, **extra_kwargs)
