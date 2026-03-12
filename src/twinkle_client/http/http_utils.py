@@ -64,11 +64,25 @@ def _handle_response(response: requests.Response) -> requests.Response:
 
     Raises:
         StopIteration: When server returns HTTP 410 (iterator exhausted)
+        requests.HTTPError: When server returns a 4xx/5xx error, with the
+            server-side ``detail`` field (full traceback) included in the
+            exception message so callers don't need to inspect the response body.
     """
     # Convert HTTP 410 Gone to StopIteration
     # This indicates an iterator has been exhausted
     if response.status_code == 410:
         raise StopIteration(response.json().get('detail', 'Iterator exhausted'))
+
+    if not response.ok:
+        try:
+            detail = response.json().get('detail', response.text)
+        except Exception:
+            detail = response.text
+        http_error_msg = (
+            f'{response.status_code} Error for url: {response.url}\n'
+            f'Server detail:\n{detail}'
+        )
+        raise requests.HTTPError(http_error_msg, response=response)
 
     return response
 

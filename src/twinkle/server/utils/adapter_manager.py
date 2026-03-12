@@ -239,14 +239,12 @@ class AdapterManagerMixin:
                         info['expiring'] = True
                         info['state'] = {}  # best-effort clear
                         token = info.get('token')
-                        expired_adapters.append((adapter_name, token))
+                        expired_adapters.append((adapter_name, token, session_id))
 
-                for adapter_name, _token in expired_adapters:
+                for adapter_name, _token, session_id in expired_adapters:
                     success = False
                     try:
                         self._on_adapter_expired(adapter_name)
-                        info = self._adapter_records.get(adapter_name, {})
-                        session_id = info.get('session_id')
                         logger.info(f'[AdapterManager] Adapter {adapter_name} expired '
                                     f'(reason=session_expired, session={session_id})')
                         success = True
