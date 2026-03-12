@@ -2,11 +2,17 @@
 from .model import (
     AddAdapterRequest,
     AddAdapterResponse,
+    AddMetricRequest,
+    AddMetricResponse,
     AdapterRequest,
+    ApplyPatchRequest,
+    ApplyPatchResponse,
     BackwardResponse,
     CalculateLossResponse,
     CalculateMetricRequest,
     CalculateMetricResponse,
+    ClipGradAndStepRequest,
+    ClipGradAndStepResponse,
     ClipGradNormResponse,
     CreateRequest,
     CreateResponse,
@@ -23,6 +29,7 @@ from .model import (
     LoadResponse,
     LrStepResponse,
     ModelResult,
+    OkResponse,
     SaveRequest,
     SaveResponse,
     SetLossRequest,
@@ -79,3 +86,5 @@ from .training import (
     TrainingRunsResponse,
     WeightsInfoResponse,
 )
+
+from .checkpoint import ResolvedLoadPath

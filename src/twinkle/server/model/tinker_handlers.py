@@ -112,7 +112,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 self.touch_adapter(adapter_name)
                 datum_list = body.forward_input.data
                 loss_fn_config = body.forward_input.loss_fn_config or {}
-                output = self.model.forward_only(inputs=datum_list, adapter_name=adapter_name)
+                output = self.model.tinker_forward_only(inputs=datum_list, adapter_name=adapter_name)
                 loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type='CrossEntropyLossReturn',
@@ -155,7 +155,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 datum_list = body.forward_backward_input.data
                 loss_fn = body.forward_backward_input.loss_fn
                 loss_fn_config = body.forward_backward_input.loss_fn_config or {}
-                output, loss = self.model.forward_backward(
+                output, loss = self.model.tinker_forward_backward(
                     inputs=datum_list, adapter_name=adapter_name, loss_fn=loss_fn, **loss_fn_config)
                 output_type = ('ImportanceSamplingLossReturn'
                                if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn')
@@ -201,9 +201,9 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                     raise RuntimeError(f'No accumulated gradients for adapter={adapter_name}; '
                                        'call forward_backward before optim_step')
                 self.touch_adapter(adapter_name)
-                self.model.step(adam_params=body.adam_params, adapter_name=adapter_name)
+                self.model.tinker_step(adam_params=body.adam_params, adapter_name=adapter_name)
                 self.set_adapter_state(adapter_name, 'grad_ready', False)
-                metrics = self.model.calculate_metric(is_training=True, adapter_name=adapter_name)
+                metrics = self.model.tinker_calculate_metric(is_training=True, adapter_name=adapter_name)
                 return types.OptimStepResponse(metrics=metrics)
             except Exception:
                 logger.error(traceback.format_exc())
@@ -294,7 +294,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_adapter_exists(adapter_name=adapter_name)
                 self.touch_adapter(adapter_name)
-                self.model.load(
+                self.model.tinker_load(
                     checkpoint_dir=body.path, load_optimizer=body.optimizer, adapter_name=adapter_name, token=token)
                 self.set_adapter_state(adapter_name, 'grad_ready', False)
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')

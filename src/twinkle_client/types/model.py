@@ -132,114 +132,163 @@ class GetStateDictRequest(BaseModel):
         extra = 'allow'
 
 
+class ClipGradAndStepRequest(BaseModel):
+    adapter_name: str
+    max_grad_norm: float = 1.0
+    norm_type: int = 2
+
+    class Config:
+        extra = 'allow'
+
+
+class ApplyPatchRequest(BaseModel):
+    patch_cls: str
+    adapter_name: str
+
+    class Config:
+        extra = 'allow'
+
+
+class AddMetricRequest(BaseModel):
+    metric_cls: str
+    adapter_name: str
+    is_training: Optional[bool] = None
+
+    class Config:
+        extra = 'allow'
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
 
 
+class OkResponse(BaseModel):
+    """Response for endpoints whose underlying method returns None."""
+    status: str = 'ok'
+
+
 class ModelResult(BaseModel):
-    """Generic single-value result wrapper returned by most model endpoints."""
+    """Generic single-value result wrapper returned by result-bearing endpoints."""
     result: Any
 
 
-class ForwardResponse(ModelResult):
-    """Response for /forward and /forward_only endpoints."""
-    pass
+# --- Result-bearing responses ---
+
+class ForwardResponse(BaseModel):
+    """Response for /forward and /forward_only endpoints (returns ModelOutput)."""
+    result: Any
 
 
-class ForwardBackwardResponse(ModelResult):
-    """Response for /forward_backward endpoint."""
-    pass
+class ForwardBackwardResponse(BaseModel):
+    """Response for /forward_backward endpoint (returns ModelOutput)."""
+    result: Any
 
 
-class BackwardResponse(ModelResult):
+class CalculateLossResponse(BaseModel):
+    """Response for /calculate_loss endpoint (returns float)."""
+    result: float
+
+
+class ClipGradNormResponse(BaseModel):
+    """Response for /clip_grad_norm endpoint (returns float as str)."""
+    result: str
+
+
+class GetTrainConfigsResponse(BaseModel):
+    """Response for /get_train_configs endpoint (returns str)."""
+    result: str
+
+
+class GetStateDictResponse(BaseModel):
+    """Response for /get_state_dict endpoint (returns Dict)."""
+    result: Dict[str, Any]
+
+
+class CalculateMetricResponse(BaseModel):
+    """Response for /calculate_metric endpoint (returns Dict)."""
+    result: Dict[str, Any]
+
+
+class SaveResponse(BaseModel):
+    """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
+    result: str
+    checkpoint_dir: Optional[str] = None
+
+
+# --- Void responses (return None → OkResponse) ---
+
+class BackwardResponse(OkResponse):
     """Response for /backward endpoint."""
     pass
 
 
-class StepResponse(ModelResult):
+class StepResponse(OkResponse):
     """Response for /step (optimizer step) endpoint."""
     pass
 
 
-class ZeroGradResponse(ModelResult):
+class ZeroGradResponse(OkResponse):
     """Response for /zero_grad endpoint."""
     pass
 
 
-class LrStepResponse(ModelResult):
+class LrStepResponse(OkResponse):
     """Response for /lr_step endpoint."""
     pass
 
 
-class SetLossResponse(ModelResult):
+class SetLossResponse(OkResponse):
     """Response for /set_loss endpoint."""
     pass
 
 
-class ClipGradNormResponse(ModelResult):
-    """Response for /clip_grad_norm endpoint."""
-    pass
-
-
-class SetOptimizerResponse(ModelResult):
+class SetOptimizerResponse(OkResponse):
     """Response for /set_optimizer endpoint."""
     pass
 
 
-class SetLrSchedulerResponse(ModelResult):
+class SetLrSchedulerResponse(OkResponse):
     """Response for /set_lr_scheduler endpoint."""
     pass
 
 
-class SaveResponse(ModelResult):
-    """Response for /save endpoint."""
-    pass
-
-
-class LoadResponse(ModelResult):
+class LoadResponse(OkResponse):
     """Response for /load endpoint."""
     pass
 
 
-class SetTemplateResponse(ModelResult):
+class SetTemplateResponse(OkResponse):
     """Response for /set_template endpoint."""
     pass
 
 
-class SetProcessorResponse(ModelResult):
+class SetProcessorResponse(OkResponse):
     """Response for /set_processor endpoint."""
     pass
 
 
-class CalculateLossResponse(ModelResult):
-    """Response for /calculate_loss endpoint."""
-    pass
-
-
-class CalculateMetricResponse(ModelResult):
-    """Response for /calculate_metric endpoint."""
-    pass
-
-
-class GetTrainConfigsResponse(ModelResult):
-    """Response for /get_train_configs endpoint."""
-    pass
-
-
-class GetStateDictResponse(ModelResult):
-    """Response for /get_state_dict endpoint."""
-    pass
-
-
-class UploadToHubResponse(BaseModel):
+class UploadToHubResponse(OkResponse):
     """Response for /upload_to_hub endpoint."""
-    status: Optional[str] = None
-    message: Optional[str] = None
+    pass
 
-    class Config:
-        extra = 'allow'
 
+class ClipGradAndStepResponse(OkResponse):
+    """Response for /clip_grad_and_step endpoint."""
+    pass
+
+
+class ApplyPatchResponse(OkResponse):
+    """Response for /apply_patch endpoint."""
+    pass
+
+
+class AddMetricResponse(OkResponse):
+    """Response for /add_metric endpoint."""
+    pass
+
+
+# --- Other responses ---
 
 class CreateResponse(BaseModel):
     """Response for /create endpoint."""

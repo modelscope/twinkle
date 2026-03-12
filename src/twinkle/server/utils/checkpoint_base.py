@@ -26,7 +26,7 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 from twinkle import get_logger
 from twinkle.hub import HubOperation
-from twinkle.server.types.checkpoint import ResolvedLoadPath
+from twinkle_client.types import ResolvedLoadPath
 
 logger = get_logger()
 

@@ -33,37 +33,37 @@ applications:
 
   # 2. Model Service (commented out) - Would host the base model for training.
   #    Uncomment and configure if you need a training model worker.
-  # - name: models-Qwen3.5-4B
-  #   route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
-  #   import_path: model
-  #   args:
-  #     use_megatron: false                          # Use HuggingFace Transformers backend
-  #     model_id: "ms://Qwen/Qwen3.5-4B"    # ModelScope model identifier
-  #     max_length: 10240
-  #     nproc_per_node: 1                            # Number of GPU processes per node
-  #     device_group:
-  #       name: model
-  #       ranks: 1
-  #       device_type: cuda
-  #     device_mesh:
-  #       device_type: cuda
-  #       dp_size: 1
-  #     queue_config:
-  #       rps_limit: 100                              # Max requests per second
-  #       tps_limit: 100000                           # Max tokens per second
-  #     adapter_config:
-  #       adapter_timeout: 30                      # Seconds before idle adapter unload
-  #   deployments:
-  #     - name: ModelManagement
-  #       autoscaling_config:
-  #         min_replicas: 1
-  #         max_replicas: 1
-  #         target_ongoing_requests: 16
-  #       ray_actor_options:
-  #         num_cpus: 0.1
-  #         runtime_env:
-  #           env_vars:
-  #             TWINKLE_TRUST_REMOTE_CODE: "0"
+  - name: models-Qwen3.5-4B
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+    import_path: model
+    args:
+      use_megatron: false                          # Use HuggingFace Transformers backend
+      model_id: "ms://Qwen/Qwen3.5-4B"    # ModelScope model identifier
+      max_length: 10240
+      nproc_per_node: 1                            # Number of GPU processes per node
+      device_group:
+        name: model
+        ranks: 1
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100                              # Max requests per second
+        tps_limit: 100000                           # Max tokens per second
+      adapter_config:
+        adapter_timeout: 30                      # Seconds before idle adapter unload
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).

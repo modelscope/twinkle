@@ -59,7 +59,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect='flatten')
-    def forward_only(self, *, inputs: List[types.Datum], **kwargs):
+    def tinker_forward_only(self, *, inputs: List[types.Datum], **kwargs):
         template = self.get_template(**kwargs)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, **kwargs)
@@ -71,7 +71,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         return results
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+    def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         if loss_fn == 'cross_entropy':
             super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         elif loss_fn == 'importance_sampling':
@@ -94,7 +94,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         return [results, loss]
 
     @remote_function()
-    def step(self, *, adam_params: types.AdamParams, **kwargs):
+    def tinker_step(self, *, adam_params: types.AdamParams, **kwargs):
         grad_clip_norm = adam_params.grad_clip_norm
         if grad_clip_norm > 0.0:
             self.clip_grad_norm(max_grad_norm=grad_clip_norm, norm_type=2, **kwargs)
@@ -108,12 +108,12 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         super().zero_grad(**kwargs)
 
     @remote_function(collect='first', lazy_collect=False)
-    def calculate_metric(self, is_training, **kwargs):
+    def tinker_calculate_metric(self, is_training, **kwargs):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)
 
     @remote_function()
-    def load(self, checkpoint_dir: str, **kwargs):
+    def tinker_load(self, checkpoint_dir: str, **kwargs):
         """Load checkpoint with token-based isolation support."""
         token = kwargs.pop('token', None)
         if not token:
@@ -131,8 +131,8 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect='mean')
-    def twinkle_forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                                 **kwargs):
+    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                         **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return self._to_cpu_safe_output(output)

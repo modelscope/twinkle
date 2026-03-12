@@ -33,7 +33,7 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
     """
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
-    def forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+    def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass."""
         if loss_fn == 'importance_sampling':
             super().set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=0.2, beta=0.0)
@@ -66,7 +66,7 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         return [results, loss]
 
     @remote_function(dispatch='slice_dp', collect='flatten')
-    def forward_only(self, *, inputs: List[types.Datum], **kwargs):
+    def tinker_forward_only(self, *, inputs: List[types.Datum], **kwargs):
         """Forward pass without gradient computation."""
         template = self.get_template(**kwargs)
         input_features = datum_to_input_feature(inputs, template)
@@ -86,7 +86,7 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         return results
 
     @remote_function(dispatch='all')
-    def step(self, *, adam_params: types.AdamParams, **kwargs):
+    def tinker_step(self, *, adam_params: types.AdamParams, **kwargs):
         """Optimizer step with AdamParams configuration."""
         adapter_name = kwargs.get('adapter_name')
         optimizer_config = self.optimizer_group.get(adapter_name)
@@ -108,12 +108,12 @@ class TwinkleCompatMegatronModel(_MegatronBase, TwinkleCompatModelBase):
         super().zero_grad(**kwargs)
 
     @remote_function(collect='first', lazy_collect=False)
-    def calculate_metric(self, is_training, **kwargs):
+    def tinker_calculate_metric(self, is_training, **kwargs):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)
 
     @remote_function(dispatch='all', sync=True)
-    def load(self, checkpoint_dir: str, **kwargs):
+    def tinker_load(self, checkpoint_dir: str, **kwargs):
         """Load checkpoint with token-based isolation support."""
         token = kwargs.pop('token', None)
         if not token:

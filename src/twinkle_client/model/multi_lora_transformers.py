@@ -11,7 +11,6 @@
 from typing import Any, Dict, Optional
 from twinkle_client.http import http_post
 from twinkle_client.types.model import (
-    BackwardResponse,
     CalculateLossResponse,
     CalculateMetricResponse,
     ClipGradNormResponse,
@@ -19,17 +18,7 @@ from twinkle_client.types.model import (
     ForwardResponse,
     GetStateDictResponse,
     GetTrainConfigsResponse,
-    LoadResponse,
-    LrStepResponse,
     SaveResponse,
-    SetLossResponse,
-    SetLrSchedulerResponse,
-    SetOptimizerResponse,
-    SetProcessorResponse,
-    SetTemplateResponse,
-    StepResponse,
-    UploadToHubResponse,
-    ZeroGradResponse,
 )
 
 
@@ -100,14 +89,13 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         return GetTrainConfigsResponse(**response.json())
 
-    def backward(self, **kwargs) -> BackwardResponse:
+    def backward(self, **kwargs) -> None:
         """Execute backward pass."""
         response = http_post(
             url=f'{self.server_url}/backward',
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return BackwardResponse(**response.json())
 
     def forward_backward(self, inputs: Any, **kwargs) -> ForwardBackwardResponse:
         """Execute combined forward and backward pass."""
@@ -118,41 +106,29 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         return ForwardBackwardResponse(**response.json())
 
-    def step(self, **kwargs) -> StepResponse:
+    def step(self, **kwargs) -> None:
         """Execute optimizer step."""
         response = http_post(
             url=f'{self.server_url}/step',
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return StepResponse(**response.json())
 
-    def zero_grad(self, **kwargs) -> ZeroGradResponse:
+    def zero_grad(self, **kwargs) -> None:
         """Zero out gradients."""
         response = http_post(
             url=f'{self.server_url}/zero_grad',
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return ZeroGradResponse(**response.json())
 
-    def lr_step(self, **kwargs) -> LrStepResponse:
+    def lr_step(self, **kwargs) -> None:
         """Execute learning rate scheduler step."""
         response = http_post(
             url=f'{self.server_url}/lr_step',
             json_data={'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return LrStepResponse(**response.json())
-
-    def set_loss(self, loss_cls: str, **kwargs) -> SetLossResponse:
-        """Set the loss function."""
-        response = http_post(
-            url=f'{self.server_url}/set_loss',
-            json_data={'loss_cls': loss_cls, 'adapter_name': self.adapter_name, **kwargs}
-        )
-        response.raise_for_status()
-        return SetLossResponse(**response.json())
 
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs) -> ClipGradNormResponse:
         """Clip gradient norm."""
@@ -163,23 +139,37 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         return ClipGradNormResponse(**response.json())
 
-    def set_optimizer(self, optimizer_cls: str, **kwargs) -> SetOptimizerResponse:
+    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs) -> None:
+        """Clip gradient norm and execute optimizer step in one call."""
+        response = http_post(
+            url=f'{self.server_url}/clip_grad_and_step',
+            json_data={'max_grad_norm': max_grad_norm, 'norm_type': norm_type, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+
+    def set_loss(self, loss_cls: str, **kwargs) -> None:
+        """Set the loss function."""
+        response = http_post(
+            url=f'{self.server_url}/set_loss',
+            json_data={'loss_cls': loss_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+
+    def set_optimizer(self, optimizer_cls: str, **kwargs) -> None:
         """Set the optimizer."""
         response = http_post(
             url=f'{self.server_url}/set_optimizer',
             json_data={'optimizer_cls': optimizer_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return SetOptimizerResponse(**response.json())
 
-    def set_lr_scheduler(self, scheduler_cls: str, **kwargs) -> SetLrSchedulerResponse:
+    def set_lr_scheduler(self, scheduler_cls: str, **kwargs) -> None:
         """Set the learning rate scheduler."""
         response = http_post(
             url=f'{self.server_url}/set_lr_scheduler',
             json_data={'scheduler_cls': scheduler_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return SetLrSchedulerResponse(**response.json())
 
     def save(self, name: str, **kwargs) -> SaveResponse:
         """Save model checkpoint."""
@@ -190,32 +180,45 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         return SaveResponse(**response.json())
 
-    def load(self, name: str, **kwargs) -> LoadResponse:
+    def load(self, name: str, **kwargs) -> None:
         """Load model checkpoint."""
         response = http_post(
             url=f'{self.server_url}/load',
             json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return LoadResponse(**response.json())
 
-    def set_template(self, template_cls: str, **kwargs) -> SetTemplateResponse:
+    def apply_patch(self, patch_cls: str, **kwargs) -> None:
+        """Apply a patch to the model."""
+        response = http_post(
+            url=f'{self.server_url}/apply_patch',
+            json_data={'patch_cls': patch_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+
+    def add_metric(self, metric_cls: str, is_training: Optional[bool] = None, **kwargs) -> None:
+        """Add a metric to the model."""
+        response = http_post(
+            url=f'{self.server_url}/add_metric',
+            json_data={'metric_cls': metric_cls, 'is_training': is_training, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
+
+    def set_template(self, template_cls: str, **kwargs) -> None:
         """Set the template for data processing."""
         response = http_post(
             url=f'{self.server_url}/set_template',
             json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': self.model_id, **kwargs}
         )
         response.raise_for_status()
-        return SetTemplateResponse(**response.json())
 
-    def set_processor(self, processor_cls: str, **kwargs) -> SetProcessorResponse:
+    def set_processor(self, processor_cls: str, **kwargs) -> None:
         """Set the input processor."""
         response = http_post(
             url=f'{self.server_url}/set_processor',
             json_data={'processor_cls': processor_cls, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return SetProcessorResponse(**response.json())
 
     def calculate_metric(self, is_training: bool = True, **kwargs) -> CalculateMetricResponse:
         """Calculate metrics from model outputs."""
@@ -241,7 +244,7 @@ class MultiLoraTransformersModel:
         hub_model_id: str,
         hub_token: Optional[str] = None,
         async_upload: bool = True,
-    ) -> UploadToHubResponse:
+    ) -> None:
         """Upload model checkpoint to hub.
 
         Args:
@@ -260,4 +263,3 @@ class MultiLoraTransformersModel:
             }
         )
         response.raise_for_status()
-        return UploadToHubResponse(**response.json())

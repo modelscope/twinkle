@@ -101,24 +101,25 @@ def train():
         logger.info(f'Starting epoch {epoch}')
         for step, batch in enumerate(dataloader):
             # Forward pass + backward pass (computes gradients)
-            output = model.forward_backward(inputs=batch)
-            loss=output.get('loss', 'N/A')
+            model.forward_backward(inputs=batch)
+
+            # Step
+            model.clip_grad_and_step()
+            # Equal to the following steps:
+            # # Clip gradients to prevent exploding gradients (max norm = 1.0)
+            # model.clip_grad_norm(1.0)
+            # # Perform one optimizer step (update model weights)
+            # model.step()
+            # # Reset gradients to zero for the next iteration
+            # model.zero_grad()
+            # # Advance the learning rate scheduler by one step
+            # model.lr_step()
 
             # Log the loss every 2 steps (aligned with gradient accumulation)
             if step % 2 == 0:
-                logger.info(f'Current is step {step // 2}, loss: {loss}')
-
-            # Clip gradients to prevent exploding gradients (max norm = 1.0)
-            model.clip_grad_norm(1.0)
-
-            # Perform one optimizer step (update model weights)
-            model.step()
-
-            # Reset gradients to zero for the next iteration
-            model.zero_grad()
-
-            # Advance the learning rate scheduler by one step
-            model.lr_step()
+                # Print metric
+                metric = model.calculate_metric(is_training=True)
+                logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric.model_dump()}')
 
         # Step 8: Save the trained checkpoint
         twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
