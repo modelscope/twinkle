@@ -53,16 +53,6 @@ class AddAdapterResponse(BaseModel):
     adapter_name: str
 
 
-class HeartbeatRequest(BaseModel):
-    """Request body for the /heartbeat endpoint."""
-    adapter_name: str = Field(..., description='Adapter name to keep alive')
-
-
-class HeartbeatResponse(BaseModel):
-    """Response body for the /heartbeat endpoint."""
-    status: str = 'ok'
-
-
 class CreateResponse(BaseModel):
     """Response body for the /create endpoint."""
     status: str = 'ok'

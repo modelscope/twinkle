@@ -136,12 +136,3 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)
-
-    @app.post('/twinkle/heartbeat', response_model=types.HeartbeatResponse)
-    def heartbeat(request: Request, body: types.HeartbeatRequest,
-                  self: SamplerManagement = Depends(self_fn)) -> types.HeartbeatResponse:
-        """Keep an adapter alive by resetting its inactivity timer."""
-        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
-        self.assert_adapter_exists(adapter_name=full_adapter_name)
-        self.touch_adapter(full_adapter_name)
-        return types.HeartbeatResponse()

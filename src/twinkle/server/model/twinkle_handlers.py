@@ -19,6 +19,7 @@ import twinkle_client.types as types
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.common.serialize import deserialize_object
+from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -343,12 +344,13 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         assert body.adapter_name, 'You need to specify a valid `adapter_name`'
         token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+        session_id = get_session_id_from_request(request)
 
         async def _task():
             config = deserialize_object(body.config)
             extra_kwargs = body.model_extra or {}
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
-            self.register_adapter(adapter_name, token)
+            self.register_adapter(adapter_name, token, session_id=session_id)
             self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
 
             lora_config = None
@@ -422,17 +424,6 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             self.model.set_processor(body.processor_cls, adapter_name=adapter_name, **extra_kwargs)
 
         await self.schedule_task_and_wait(_task, task_type='set_processor')
-
-    @app.post('/twinkle/heartbeat', response_model=types.HeartbeatResponse)
-    async def heartbeat(
-            request: Request,
-            body: types.HeartbeatRequest,
-            self: ModelManagement = Depends(self_fn),
-    ) -> types.HeartbeatResponse:
-        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
-        self.assert_adapter_exists(adapter_name=adapter_name)
-        self.touch_adapter(adapter_name)
-        return types.HeartbeatResponse()
 
     @app.post('/twinkle/calculate_metric', response_model=types.CalculateMetricResponse)
     async def calculate_metric(

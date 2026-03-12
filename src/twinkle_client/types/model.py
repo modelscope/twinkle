@@ -113,10 +113,6 @@ class SetProcessorRequest(BaseModel):
         extra = 'allow'
 
 
-class HeartbeatRequest(BaseModel):
-    adapter_name: str
-
-
 class CalculateMetricRequest(BaseModel):
     adapter_name: str
     is_training: bool = True
@@ -299,8 +295,3 @@ class AddAdapterResponse(BaseModel):
     """Response for /add_adapter_to_model endpoint."""
     status: str = 'ok'
     adapter_name: str
-
-
-class HeartbeatResponse(BaseModel):
-    """Response for /heartbeat endpoint."""
-    status: str = 'ok'
