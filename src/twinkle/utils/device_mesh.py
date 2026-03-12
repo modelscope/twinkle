@@ -186,8 +186,7 @@ class DeviceMesh:
         if ep_size <= 1:
             return None
         world_size = self.world_size
-        assert world_size % ep_size == 0, (
-            f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
+        assert world_size % ep_size == 0, (f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
         ep_fsdp_size = world_size // ep_size
 
         ep_mesh = DeviceMesh(
