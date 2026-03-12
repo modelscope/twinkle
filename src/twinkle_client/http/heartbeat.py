@@ -4,7 +4,7 @@ from threading import Lock
 from typing import Callable, Dict, Optional, Set
 
 from .http_utils import http_post
-from .utils import TWINKLE_SERVER_URL
+from .utils import get_base_url
 
 
 class HeartbeatManager:
@@ -33,7 +33,6 @@ class HeartbeatManager:
             return
 
         self._initialized = True
-        self.server_url = TWINKLE_SERVER_URL
 
         # Processor heartbeat management
         self.processor_ids: Set[str] = set()
@@ -52,7 +51,7 @@ class HeartbeatManager:
 
     def processor_heartbeat_func(self, processor_id_list: str):
         response = http_post(
-            url=f'{self.server_url}/processors/heartbeat', json_data={'processor_id': processor_id_list})
+            url=f'{get_base_url()}/processors/heartbeat', json_data={'processor_id': processor_id_list})
         response.raise_for_status()
 
     def register_processor(self, processor_id: str):
