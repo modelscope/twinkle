@@ -43,7 +43,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
             body: types.SessionHeartbeatRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.SessionHeartbeatResponse:
-        alive = self.state.touch_session(body.session_id)
+        alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise HTTPException(status_code=404, detail='Unknown session')
         return types.SessionHeartbeatResponse()

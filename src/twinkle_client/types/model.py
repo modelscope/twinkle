@@ -74,7 +74,7 @@ class UploadToHubRequest(BaseModel):
     checkpoint_dir: str
     hub_model_id: str
     hub_token: Optional[str] = None
-    async_upload: bool = True
+    async_upload: bool = False
 
     class Config:
         extra = 'allow'

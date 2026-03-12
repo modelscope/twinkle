@@ -61,7 +61,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     async def session_heartbeat(
         request: Request, body: types.SessionHeartbeatRequest, self: GatewayServer = Depends(self_fn)
     ) -> types.SessionHeartbeatResponse:  # noqa: E125
-        alive = self.state.touch_session(body.session_id)
+        alive = await self.state.touch_session(body.session_id)
         if not alive:
             raise HTTPException(status_code=404, detail='Unknown session')
         return types.SessionHeartbeatResponse()
@@ -84,7 +84,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         start = asyncio.get_event_loop().time()
 
         while True:
-            record = self.state.get_future(request_id)
+            record = await self.state.get_future(request_id)
 
             if record is None:
                 return {'type': 'try_again'}
@@ -103,7 +103,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
             await asyncio.sleep(poll_interval)
 
-        record = self.state.get_future(request_id)
+        record = await self.state.get_future(request_id)
         if not record:
             return {'type': 'try_again'}
 
@@ -207,7 +207,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
         checkpoint_name = checkpoint_id.split('/')[-1]
         hub_model_id = f'{username}/{run_id}_{checkpoint_name}'
-        HubOperation.async_push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=token, private=True)
+        HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=token, private=True)
 
         return Response(status_code=204)
 

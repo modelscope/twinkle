@@ -11,6 +11,8 @@ to handle expired adapters without using callbacks or polling.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -63,6 +65,9 @@ class AdapterManagerMixin:
         self._adapter_countdown_thread: threading.Thread | None = None
         self._adapter_countdown_running = False
 
+        # Event loop reference used to bridge sync thread → async state calls
+        self._adapter_event_loop: asyncio.AbstractEventLoop | None = None
+
     def register_adapter(self, adapter_name: str, token: str, session_id: str) -> None:
         """Register a new adapter for lifecycle tracking.
 
@@ -89,7 +94,7 @@ class AdapterManagerMixin:
         logger.debug(
             f'[AdapterManager] Registered adapter {adapter_name} for token {token[:8]}... (session: {session_id})')
 
-    def _is_session_alive(self, session_id: str) -> bool:
+    async def _is_session_alive(self, session_id: str) -> bool:
         """Check if a session is still alive via state proxy.
 
         Args:
@@ -102,7 +107,7 @@ class AdapterManagerMixin:
             return True  # No session association means always alive
 
         # Get session last heartbeat through proxy
-        last_heartbeat = self.state.get_session_last_heartbeat(session_id)
+        last_heartbeat = await self.state.get_session_last_heartbeat(session_id)
         if last_heartbeat is None:
             return False  # Session doesn't exist
 
@@ -231,7 +236,19 @@ class AdapterManagerMixin:
                         continue
 
                     session_id = info.get('session_id')
-                    session_expired = not self._is_session_alive(session_id)
+                    if self._adapter_event_loop is not None and self._adapter_event_loop.is_running():
+                        future: concurrent.futures.Future = asyncio.run_coroutine_threadsafe(
+                            self._is_session_alive(session_id), self._adapter_event_loop)
+                        try:
+                            session_alive = future.result(timeout=5.0)
+                        except Exception as e:
+                            logger.warning(f'[AdapterManager] Failed to check session liveness for {adapter_name}: {e}')
+                            continue
+                    else:
+                        logger.warning(
+                            f'[AdapterManager] No event loop available to check session {session_id}, skipping')
+                        continue
+                    session_expired = not session_alive
                     logger.debug(f'[AdapterManager] Adapter {adapter_name} session check '
                                  f'(session_id={session_id}, session_alive={not session_expired})')
 
@@ -272,6 +289,10 @@ class AdapterManagerMixin:
         """
         if not self._adapter_countdown_running:
             self._adapter_countdown_running = True
+            try:
+                self._adapter_event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._adapter_event_loop = None
             self._adapter_countdown_thread = threading.Thread(target=self._adapter_countdown_loop, daemon=True)
             self._adapter_countdown_thread.start()
             logger.debug('[AdapterManager] Countdown thread started')

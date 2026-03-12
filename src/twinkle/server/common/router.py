@@ -56,7 +56,7 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
 
         # Filter out replicas that exceed max lora count (query from server state)
         candidate_ids = [r.replica_id.unique_id for r in top_ranked_replicas.values()]
-        available_ids = set(self.state.get_available_replica_ids(candidate_ids))
+        available_ids = set(await self.state.get_available_replica_ids(candidate_ids))
         if available_ids:
             top_ranked_replicas = {
                 rid: r

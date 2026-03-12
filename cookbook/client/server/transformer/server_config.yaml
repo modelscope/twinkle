@@ -24,7 +24,7 @@ applications:
         - Qwen/Qwen3.5-4B
     deployments:
       - name: TinkerCompatServer
-        max_ongoing_requests: 10
+        max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1                # Minimum number of replicas
           max_replicas: 1                # Maximum number of replicas
@@ -107,14 +107,14 @@ applications:
     route_prefix: /api/v1/processor
     import_path: processor
     args:
-      ncpu_proc_per_node: 1           # 每节点 CPU 进程数
+      ncpu_proc_per_node: 2           # 每节点 CPU 进程数
       device_group:
         name: model
-        ranks: 1
+        ranks: 2
         device_type: CPU
       device_mesh:
         device_type: CPU
-        dp_size: 1                    # 数据并行大小
+        dp_size: 2                    # 数据并行大小
     deployments:
       - name: ProcessorManagement
         autoscaling_config:

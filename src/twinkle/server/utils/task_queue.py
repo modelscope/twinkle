@@ -255,7 +255,7 @@ class TaskQueueMixin:
                             'error': f'Queue timeout exceeded: waited {now - task.created_at:.2f}s',
                             'category': 'Server'
                         }
-                        self.state.store_future_status(
+                        await self.state.store_future_status(
                             task.request_id,
                             TaskStatus.FAILED.value,
                             task.model_id,
@@ -270,13 +270,13 @@ class TaskQueueMixin:
 
                     # Execute
                     executed_any = True
-                    self.state.store_future_status(
+                    await self.state.store_future_status(
                         task.request_id, TaskStatus.RUNNING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
 
                     try:
                         coro = task.coro_factory()
                         result = await coro
-                        self.state.store_future_status(
+                        await self.state.store_future_status(
                             task.request_id,
                             TaskStatus.COMPLETED.value,
                             task.model_id,
@@ -284,7 +284,7 @@ class TaskQueueMixin:
                             queue_state=QueueState.ACTIVE.value)
                     except Exception:
                         error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
-                        self.state.store_future_status(
+                        await self.state.store_future_status(
                             task.request_id,
                             TaskStatus.FAILED.value,
                             task.model_id,
@@ -321,7 +321,7 @@ class TaskQueueMixin:
 
         for task in drained:
             error_payload = {'error': reason, 'category': 'Server'}
-            self.state.store_future_status(
+            await self.state.store_future_status(
                 task.request_id,
                 TaskStatus.FAILED.value,
                 task.model_id,
@@ -381,7 +381,7 @@ class TaskQueueMixin:
         if input_tokens > self._task_queue_config.max_input_tokens:
             error_msg = f'Input tokens ({input_tokens}) exceed maximum allowed ({self._task_queue_config.max_input_tokens})'  # noqa: E501
             error_payload = {'error': error_msg, 'category': 'User'}
-            self.state.store_future_status(
+            await self.state.store_future_status(
                 request_id,
                 TaskStatus.FAILED.value,
                 model_id,
@@ -396,7 +396,7 @@ class TaskQueueMixin:
             if batch_size < data_world_size:
                 error_msg = f'Batch size {batch_size} must be greater than or equal to data world size {data_world_size}'  # noqa: E501
                 error_payload = {'error': error_msg, 'category': 'User'}
-                self.state.store_future_status(
+                await self.state.store_future_status(
                     request_id,
                     TaskStatus.FAILED.value,
                     model_id,
@@ -411,7 +411,7 @@ class TaskQueueMixin:
         if not allowed:
             error_msg = f'Rate limit exceeded: {reason}'
             error_payload = {'error': error_msg, 'category': 'User'}
-            self.state.store_future_status(
+            await self.state.store_future_status(
                 request_id,
                 TaskStatus.FAILED.value,
                 model_id,
@@ -475,7 +475,7 @@ class TaskQueueMixin:
         )
 
         # 2. Register PENDING status FIRST
-        self.state.store_future_status(
+        await self.state.store_future_status(
             request_id, TaskStatus.PENDING.value, model_id, queue_state=QueueState.ACTIVE.value)
 
         # 3. Route to per-model/per-token queue
@@ -500,7 +500,7 @@ class TaskQueueMixin:
                 task_type=task_type,
                 created_at=time.monotonic(),
             ))
-        self.state.store_future_status(
+        await self.state.store_future_status(
             request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
         logger.debug(f'[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}')
 
@@ -585,7 +585,7 @@ class TaskQueueMixin:
             raise RuntimeError(f'Task scheduling failed: {future_ref}')
 
         while True:
-            record = self.state.get_future(request_id)
+            record = await self.state.get_future(request_id)
             if record and record.get('status') not in ('pending', 'queued', 'running'):
                 break
             await asyncio.sleep(0.05)
