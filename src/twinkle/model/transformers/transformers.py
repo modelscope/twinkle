@@ -1243,17 +1243,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         else:
             # Full model mode: send all weights (base model sync).
-            # Use EP-aware collection to reconstruct full expert tensors.
-            full_sd = self._get_full_state_dict()
+            state_dict = model.state_dict()
 
             def weight_generator():
-                for name, tensor in full_sd.items():
+                for name, tensor in state_dict.items():
                     # Skip LoRA-specific weights for base model sync
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
-                    # tensor is already a local CPU tensor from _get_full_state_dict;
-                    # move to CUDA for NCCL broadcast.
-                    yield name, tensor.cuda()
+                    tensor = Torch.to_local_tensor(tensor)
+                    yield name, tensor
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
