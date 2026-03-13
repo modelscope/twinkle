@@ -823,14 +823,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
-        state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
-        processed_state_dict = {}
-
-        save_kwargs = {}
-
-        for key, value in state_dict.items():
-            key = key.replace(f'.{adapter_name}.', '.')
-            processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
+        if adapter_name == _default_adapter_name:
+            # Full model save — use EP-aware collection to reconstruct expert weights
+            full_sd = self._get_full_state_dict()
+            processed_state_dict = {}
+            save_kwargs = {}
+            for key, value in full_sd.items():
+                processed_state_dict[key] = value
+        else:
+            # LoRA adapter save — no EP experts involved
+            state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
+            processed_state_dict = {}
+            save_kwargs = {}
+            for key, value in state_dict.items():
+                key = key.replace(f'.{adapter_name}.', '.')
+                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
@@ -941,6 +948,65 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
+
+    def _get_full_state_dict(self) -> dict:
+        """Collect full state dict with EP-aware all-gather for expert parameters.
+
+        For non-EP models or non-expert parameters, this is equivalent to
+        calling to_local_tensor(param).cpu() for each parameter.
+
+        For EP-sharded expert parameters, this additionally all-gathers
+        the local expert shards across the EP group to reconstruct the
+        full expert tensor (all num_experts on dim-0).
+        """
+        import torch
+        import torch.distributed as dist
+
+        model = self.strategy.unwrap_model(self.model)
+        state_dict = {}
+
+        # Detect EP configuration
+        ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
+        ep_group = None
+        ep_world_size = 1
+        if ep_fsdp_mesh is not None:
+            try:
+                ep_group = ep_fsdp_mesh['ep'].get_group()
+                ep_world_size = ep_fsdp_mesh['ep'].size()
+            except Exception:
+                pass
+
+        # Build set of EP expert parameter names for fast lookup
+        ep_expert_names = set()
+        if ep_world_size > 1:
+            for fqn, module in model.named_modules():
+                if not getattr(module, '_ep_patched', False):
+                    continue
+                experts = getattr(module, 'experts', None)
+                if experts is None:
+                    continue
+                experts_prefix = fqn + '.experts.' if fqn else 'experts.'
+                for pname, _ in experts.named_parameters():
+                    ep_expert_names.add(experts_prefix + pname)
+
+        for name, param in model.named_parameters():
+            # full_tensor() all-gathers within the DTensor's own mesh.
+            # For non-expert params (on fsdp_mesh): reconstructs full param ✓
+            # For expert params (on ep_fsdp_mesh): reconstructs FSDP shard only,
+            #   dim-0 still has local_experts = num_experts / ep_size
+            local_full = torch_util.to_local_tensor(param)
+
+            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+                # All-gather expert shards across EP group on dim-0
+                # local_full shape: [local_experts, ...], need [num_experts, ...]
+                local_full = local_full.contiguous().cuda()
+                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
+                dist.all_gather(gathered, local_full, group=ep_group)
+                local_full = torch.cat(gathered, dim=0)
+
+            state_dict[name] = local_full.cpu()
+
+        return state_dict
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
@@ -1177,18 +1243,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         else:
             # Full model mode: send all weights (base model sync).
-            state_dict = model.state_dict()
+            # Use EP-aware collection to reconstruct full expert tensors.
+            full_sd = self._get_full_state_dict()
 
             def weight_generator():
-                for name, tensor in state_dict.items():
+                for name, tensor in full_sd.items():
                     # Skip LoRA-specific weights for base model sync
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
-                    tensor = Torch.to_local_tensor(tensor)
-                    # Keep original names (including .base_layer for PEFT models).
-                    # The sampler side will strip .base_layer based on whether
-                    # vLLM has enable_lora=True/False.
-                    yield name, tensor
+                    # tensor is already a local CPU tensor from _get_full_state_dict;
+                    # move to CUDA for NCCL broadcast.
+                    yield name, tensor.cuda()
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
