@@ -199,7 +199,7 @@ def main():
 
     sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0)
     # For teacher: only need prompt logprobs, no generation
-    teacher_sampling_params = SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=10)
+    teacher_sampling_params = SamplingParams(max_tokens=1, temperature=1.0)
 
     logger.info(f'GKD On-Policy | student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}')
     logger.info(f'  beta={GKD_BETA}  T={GKD_TEMPERATURE}  topk={GKD_TOPK}')
@@ -217,6 +217,7 @@ def main():
         teacher_response = teacher_sampler.sample(
             input_data,
             teacher_sampling_params,
+            prompt_logprobs=10,
         )
 
         # 3. Convert teacher logprobs to tensor format for GKDLoss
