@@ -219,13 +219,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)
         self._expert_parallel_applied = False
+
         use_native_fsdp = self._enable_expert_parallel or strategy == 'native_fsdp'
         if use_native_fsdp:
+            ep_size = (self._expert_parallel_config.get('ep_size') if self._expert_parallel_config else None)
+            if ep_size is None and self.device_mesh is not None:
+                ep_size = getattr(self.device_mesh, 'ep_size', None)
             self.strategy = NativeFSDPStrategy(
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
                 enable_ep=self._enable_expert_parallel,
+                ep_size=ep_size,
             )
         else:
             self.strategy = AccelerateStrategy(
@@ -307,10 +312,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                                        device_mesh: Optional[DeviceMesh]) -> bool:
         if expert_parallel_config is None or device_mesh is None:
             return False
-        if not device_mesh.has_dim('ep'):
-            return False
-        ep_world_size = device_mesh.ep_world_size or 1
-        if ep_world_size <= 1:
+        # Check ep_size from config first, then from device_mesh.ep_size attribute
+        ep_size = expert_parallel_config.get('ep_size') or getattr(device_mesh, 'ep_size', None) or 1
+        if ep_size <= 1:
             return False
         return expert_parallel_config.get('enabled', True)
 
@@ -319,10 +323,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
+        # Get the ep_fsdp_device_mesh from the strategy (NativeFSDPStrategy stores it)
+        ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
         apply_expert_parallel(
             model,
             self.device_mesh,
             config=self._expert_parallel_config,
+            ep_fsdp_device_mesh=ep_fsdp_mesh,
         )
         self._expert_parallel_applied = True
 
@@ -548,12 +555,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             num_tokens = torch_util.gather_object([num_tokens], self.device_mesh, optimizer_config._dp_group)
             num_tokens = sum(num_tokens)
             parameters = list(self._get_trainable_parameters(adapter_name).values())
+
+            # EP-aware grad clip kwargs
+            ep_clip_kwargs = {}
+            model = self.strategy.unwrap_model(self.model)
+            if hasattr(model, '_ep_param_groups'):
+                ep_clip_kwargs['ep_param_groups'] = model._ep_param_groups
+                # Get EP groups from ep_fsdp_device_mesh, not from main mesh
+                ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
+                if ep_fsdp_mesh is not None:
+                    ep_clip_kwargs['ep_group'] = ep_fsdp_mesh['ep'].get_group()
+                    ep_clip_kwargs['ep_fsdp_group'] = ep_fsdp_mesh['ep_fsdp'].get_group()
+
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,
                 num_tokens=num_tokens,
                 max_grad_norm=max_grad_norm,
                 norm_type=norm_type,
                 group=optimizer_config._dp_group,
+                **ep_clip_kwargs,
             )
             optimizer_config._last_grad_norm = grad_norm
             optimizer_config.num_tokens = 0
