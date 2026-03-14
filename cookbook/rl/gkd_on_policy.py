@@ -197,10 +197,6 @@ def main():
         remote_group='student_model',
     )
 
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0)
-    # For teacher: only need prompt logprobs, no generation
-    teacher_sampling_params = SamplingParams(max_tokens=1, temperature=1.0)
-
     logger.info(f'GKD On-Policy | student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}')
     logger.info(f'  beta={GKD_BETA}  T={GKD_TEMPERATURE}  topk={GKD_TOPK}')
 
@@ -210,14 +206,15 @@ def main():
             break
 
         # 1. Student vLLM generates completions
-        sample_response = student_sampler.sample(batch, sampling_params, num_samples=1)
+        sample_response = student_sampler.sample(batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0), num_samples=1)
         input_data = [seq.new_input_feature for seq in sample_response.sequences]
-
+        for data in input_data:
+            data.pop('input_ids', None)
+            
         # 2. Teacher vLLM computes top-k prompt logprobs on generated sequences
         teacher_response = teacher_sampler.sample(
             input_data,
-            teacher_sampling_params,
-            prompt_logprobs=10,
+            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=10),
         )
 
         # 3. Convert teacher logprobs to tensor format for GKDLoss

@@ -275,8 +275,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         adapter_name: str = '',
         adapter_path: Optional[str] = None,
         *,
-        logprobs: bool = True,
-        num_samples: int = 1,
         return_encoded: bool = False,
     ) -> SampleResponse:
         """Sample responses for given inputs.
@@ -337,8 +335,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     feat,
                     sampling_params,
                     lora_request=lora_request,
-                    logprobs=logprobs,
-                    num_samples=num_samples,
                 ) for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)
