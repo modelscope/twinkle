@@ -142,6 +142,7 @@ class TwinkleCompatModelBase:
                 token_log_probs = logps[idx, :seq_len]
 
             # elementwise_loss: positive NLL loss (0.0 where masked)
+            token_log_probs = token_log_probs.to(weights.device)
             elementwise_loss = -token_log_probs * weights
 
             results.append({
