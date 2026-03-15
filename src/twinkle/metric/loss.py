@@ -13,19 +13,19 @@ class LossMetric(Metric):
         process_group: The process group to collect data from
     """
 
-    def __init__(self, device_mesh, process_group, loss_reduction='mean', **kwargs):
+    def __init__(self, device_mesh, process_group, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)
         self.total_loss = 0
         self.total_count = 0
         self.grad_norm = 0
         self.num_tokens = 0
-        self.loss_reduction = loss_reduction
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         if 'loss' not in outputs:
             return
         loss = outputs['loss']
-        if self.loss_reduction == 'sum':
+        loss_reduction = kwargs.get('loss_reduction', 'mean')
+        if loss_reduction == 'sum':
             if not isinstance(inputs, list):
                 inputs = [inputs]
             for input in inputs:

@@ -89,15 +89,12 @@ class GKDLoss(Loss):
             teacher_topk_logprobs = teacher_topk_logprobs[:, :student_logits.shape[1]]
             teacher_topk_indices = teacher_topk_indices[:, :student_logits.shape[1]]
 
-        # Shift labels: label[i] = next token predicted by logits[i]
-        # The last position wraps to label[0] via roll; since label[0] is -100 (prompt),
-        # it will be correctly excluded by the mask in _generalized_jsd_loss.
-        shifted_labels = labels.roll(shifts=-1, dims=1)
+        shifted_labels = labels
 
         loss = self._generalized_jsd_loss(
             student_logits=student_logits,
             teacher_logits=teacher_logits,
-            labels=shifted_labels,
+            labels=labels,
             beta=self.beta,
             temperature=self.temperature,
             chunk_size=self.chunk_size,
@@ -178,8 +175,6 @@ class GKDLoss(Loss):
             elif stu_dim > tea_dim:
                 teacher_logits = F.pad(teacher_logits, (0, stu_dim - tea_dim))
                 teacher_logits[..., tea_dim:] = student_logits[..., tea_dim:]
-            if student_logits.shape[1] != mask.shape[1]:
-                breakpoint()
             student_logits = student_logits[mask]   # [num_valid, vocab/topk]
             teacher_logits = teacher_logits[mask]
             num_valid = mask.sum()

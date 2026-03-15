@@ -128,7 +128,9 @@ class OptimizerGroup:
                     lr=self._get_lr(),
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm)
+                    grad_norm=self._last_grad_norm,
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean')
+                    )
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)

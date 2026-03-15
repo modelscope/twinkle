@@ -70,7 +70,7 @@ LEARNING_RATE = float(os.environ.get('LR', 1e-4))
 
 GKD_BETA = float(os.environ.get('GKD_BETA', 0.5))
 GKD_TEMPERATURE = float(os.environ.get('GKD_TEMPERATURE', 1.0))
-GKD_TOPK = int(os.environ.get('GKD_TOPK', 10))
+GKD_TOPK = int(os.environ.get('GKD_TOPK', 20))
 
 ADAPTER_NAME = 'default'
 
@@ -208,14 +208,16 @@ def main():
         # 1. Student vLLM generates completions
         sample_response = student_sampler.sample(batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=1))
         input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
+        input_ids_list = []
         for data in input_data:
-            data.pop('input_ids', None)
+            input_ids_list.append(data.pop('input_ids', None))
             
         # 2. Teacher vLLM computes top-k prompt logprobs on generated sequences
         teacher_response = teacher_sampler.sample(
             input_data,
-            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=10),
+            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=GKD_TOPK),
         )
+        teacher_input_ids = teacher_response[0].sequences[0].new_input_feature['input_ids']
 
         # 3. Convert teacher logprobs to tensor format for GKDLoss
         # teacher_response is List[SampleResponse], extract topk_prompt_logprobs from each
