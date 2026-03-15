@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, 
 from twinkle.data_format import InputFeature, Message, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
-from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
+from .utils import tokenize_with_assistant_labels, transfer_to_standard_message, TokenizeByRound
 
 if TYPE_CHECKING:
     import torch
@@ -298,8 +298,9 @@ class Template:
                 assistant_masks = encoded.pop('assistant_masks')
                 labels = np.where(assistant_masks, input_ids, -100)
             else:
-                input_ids, labels, encoded = tokenize_with_assistant_labels(self.tokenizer, self._apply_chat_template,
-                                                                            trajectory)
+                input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(self.tokenizer,
+                                                                                            self._apply_chat_template,
+                                                                                            trajectory)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']
