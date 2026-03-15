@@ -52,6 +52,7 @@ class Template:
         self._test_support_assistant_tokens_mask()
         self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
             self._add_default_system,  # Add a default system field
+            self._to_standard_reasoning_content, # Convert thinking to standard field
             self._build_mm_messages,  # turn to standard mm messages
         ]
         self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
@@ -181,6 +182,36 @@ class Template:
             for (_, messages) in trajectory.get('extend_message', []):
                 if messages and messages[0]['role'] == 'user':
                     messages.insert(0, Message(role='system', content=self.default_system))
+        return [trajectory]
+
+    def _to_standard_reasoning_content(self, trajectory: Trajectory) -> List[Trajectory]:
+
+        def _extract_reasoning_content(messages: list[Message]) -> List[Message]:
+            result = []
+            for message in messages:
+                message = message.copy()
+                if message.get("role") == "assistant":
+                    content = message.get("content", "")
+                    if "reasoning_content" not in message and isinstance(content, str):
+                        if "</think>" in content:
+                            reasoning_content = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip(
+                                "\n")
+                            new_content = content.split("</think>")[-1].lstrip("\n")
+
+                            message["reasoning_content"] = reasoning_content
+                            message["content"] = new_content
+
+                result.append(message)
+
+            return result
+
+        trajectory['messages'] = _extract_reasoning_content(trajectory['messages'])
+        extra_messages = trajectory.get('extend_message', [])
+        if extra_messages:
+            result = []
+            for key, extra_message in trajectory.get('extend_message', []):
+                result.append((key, _extract_reasoning_content(extra_message)))
+            trajectory['extend_message'] = result
         return [trajectory]
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
