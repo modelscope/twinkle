@@ -217,6 +217,7 @@ class VLLMEngine(BaseSamplerEngine):
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0
+        logprobs = sampling_params.logprobs or 0
         vllm_params = sampling_params.to_vllm(**kwargs)
 
         # Build request
@@ -276,8 +277,11 @@ class VLLMEngine(BaseSamplerEngine):
             if output.logprobs is not None:
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
-                    if i < len(token_ids) and token_ids[i] in lp:
-                        seq_logprobs.append(lp[token_ids[i]].logprob)
+                    if i < len(token_ids):
+                        sorted_items = sorted(
+                            lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
+                        seq_logprobs.append([(tid, lp_obj.logprob)
+                                                            for tid, lp_obj in sorted_items])
 
             # Map finish_reason to StopReason
             stop_reason: StopReason = 'length'
@@ -299,8 +303,7 @@ class VLLMEngine(BaseSamplerEngine):
 
             for i, lp_dict in enumerate(result.prompt_logprobs):
                 if lp_dict is None:
-                    result_prompt_logprobs.append(None)
-                    result_topk_prompt_logprobs.append(None)
+                    assert i == 0, 'Postion > 0 should not has None lobprobs!'
                     continue
 
                 # Get logprob for the actual token
@@ -308,7 +311,7 @@ class VLLMEngine(BaseSamplerEngine):
                     token_id = prompt_token_ids[i]
                     if token_id in lp_dict:
                         lp_obj = lp_dict[token_id]
-                        result_prompt_logprobs.append(lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
+                        result_prompt_logprobs.append(lp_obj.logprob)
                     else:
                         result_prompt_logprobs.append(None)
                 else:
@@ -316,9 +319,8 @@ class VLLMEngine(BaseSamplerEngine):
 
                 # Get top-k logprobs
                 sorted_items = sorted(
-                    lp_dict.items(), key=lambda x: -(x[1].logprob
-                                                     if hasattr(x[1], 'logprob') else x[1]))[:prompt_logprobs_k]
-                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
+                    lp_dict.items(), key=lambda x: -(x[1].logprob))[:prompt_logprobs_k]
+                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob)
                                                     for tid, lp_obj in sorted_items])
 
         return SampleResponse(

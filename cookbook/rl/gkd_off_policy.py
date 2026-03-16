@@ -70,6 +70,7 @@ LEARNING_RATE = float(os.environ.get('LR', 1e-4))
 GKD_BETA = float(os.environ.get('GKD_BETA', 0.5))
 GKD_TEMPERATURE = float(os.environ.get('GKD_TEMPERATURE', 1.0))
 GKD_TOPK = int(os.environ.get('GKD_TOPK', 20))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
 
 ADAPTER_NAME = 'default'
 
@@ -81,7 +82,6 @@ def create_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
     dataset.set_template('Template', model_id=STUDENT_MODEL_ID, max_length=1024)
     dataset.map(GSM8KFullProcessor())
-    dataset.encode()
     return dataset
 
 
@@ -181,21 +181,20 @@ def main():
         if optim_step >= MAX_STEPS:
             break
 
-        input_data = batch if isinstance(batch, list) else [batch]
-
-        # Remove input_ids so teacher re-encodes with its own tokenizer
-        for data in input_data:
-            data.pop('input_ids', None)
-
         # Teacher vLLM computes top-k prompt logprobs on the reference sequences
         teacher_response = teacher_sampler.sample(
-            input_data,
-            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=GKD_TOPK),
+            batch,
+            SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, prompt_logprobs=1, logprobs=GKD_TOPK),
         )
+        input_data = [seq.new_input_feature for response in teacher_response for seq in response.sequences]
+        input_ids_list = []
+        for data in input_data:
+            input_ids_list.append(data.pop('input_ids', None))
 
         # Convert teacher logprobs to tensor format for GKDLoss
         teacher_output = convert_topk_prompt_logprobs(
-            [resp.topk_prompt_logprobs for resp in teacher_response],
+            [resp.prompt_logprobs for resp in teacher_response],
+            [[sequence.logprobs for sequence in resp.sequences] for resp in teacher_response],
         )
 
         # Student forward + GKD backward
