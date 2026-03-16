@@ -1,15 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Test EP+FSDP checkpoint save/load round-trip:
-1. Load model on single GPU, record full state dict as reference
-2. Load same model with EP+FSDP (4 GPUs, ep_size=2), save checkpoint
-3. Load saved checkpoint on single GPU, compare against reference
+1. Load model on single device, record full state dict as reference
+2. Load same model with EP+FSDP (4 devices, ep_size=2), save checkpoint
+3. Load saved checkpoint on single device, compare against reference
 
 Requirements:
-  - 4 CUDA GPUs
+  - 4 CUDA GPUs or 4 Ascend NPUs
   - Model weights accessible via QWEN3_MOE_MODEL_ID (default: Qwen/Qwen3-30B-A3B-Instruct-2507)
 
-Launch (requires 4 CUDA GPUs; skipped automatically if fewer GPUs are available):
+Launch (requires 4 accelerators; skipped automatically if fewer are available):
 
     pytest tests/moe/test_ep_fsdp_checkpoint.py -v -s
 
@@ -17,7 +17,7 @@ Launch (requires 4 CUDA GPUs; skipped automatically if fewer GPUs are available)
     QWEN3_MOE_MODEL_ID=/path/to/model pytest tests/moe/test_ep_fsdp_checkpoint.py -v -s
 
 Note: nproc_per_node=1 is intentional — the test internally spawns worker processes via
-mp.spawn (1 for the single-GPU baseline and 4 for the EP+FSDP run).
+mp.spawn (1 for the single-device baseline and 4 for the EP+FSDP run).
 """
 
 import numpy as np
@@ -39,6 +39,27 @@ from twinkle.utils.platforms import Platform
 
 ABS_TOL = 1e-5
 REL_TOL = 1e-5
+
+
+def _get_device_info():
+    """Return (device_type, backend, device_count) based on available platform."""
+    platform = Platform.get_platform()
+    device_type = platform.device_prefix()  # 'cuda' or 'npu'
+    backend = platform.device_backend()     # 'nccl' or 'hccl'
+    if device_type == 'npu':
+        import torch_npu  # noqa: F401
+        device_count = torch.npu.device_count()
+    else:
+        device_count = torch.cuda.device_count()
+    return device_type, backend, device_count
+
+
+def _set_device(device_type, idx):
+    """Set current device for the given device type."""
+    if device_type == 'npu':
+        torch.npu.set_device(idx)
+    else:
+        torch.cuda.set_device(idx)
 
 
 def _find_free_port():
@@ -115,7 +136,7 @@ def _gather_full_state_dict(model, ep_fsdp_mesh):
     for name, param in model.named_parameters():
         local_full = torch_util.to_local_tensor(param)
         if name in ep_expert_names and ep_ws > 1 and ep_group is not None:
-            local_full = local_full.contiguous().to(Platform.get_local_device())
+            local_full = local_full.contiguous().to(param.device)
             gathered = [torch.empty_like(local_full) for _ in range(ep_ws)]
             dist.all_gather(gathered, local_full, group=ep_group)
             local_full = torch.cat(gathered, dim=0)
@@ -131,7 +152,7 @@ def _clean_name(name: str) -> str:
 
 
 def _run_save_reference(rank, world_size, port, model_id, local_only):
-    """Save full state dict from single-GPU model as reference."""
+    """Save full state dict from single-device model as reference."""
     os.environ.update({
         'RANK': '0',
         'WORLD_SIZE': '1',
@@ -140,8 +161,9 @@ def _run_save_reference(rank, world_size, port, model_id, local_only):
         'MASTER_ADDR': '127.0.0.1',
         'MASTER_PORT': str(port),
     })
-    device = torch.device('cuda:0')
-    torch.cuda.set_device(device)
+    device_type, _, _ = _get_device_info()
+    device = torch.device(f'{device_type}:0')
+    _set_device(device_type, 0)
 
     model = _load_model(model_id, local_only, device)
     ref_sd = {n: p.detach().cpu() for n, p in model.named_parameters()}
@@ -159,11 +181,16 @@ def _run_ep_fsdp_save(rank, world_size, port, model_id, local_only):
         'MASTER_ADDR': '127.0.0.1',
         'MASTER_PORT': str(port),
     })
-    device = torch.device(f'cuda:{rank}')
-    torch.cuda.set_device(device)
+    device_type, backend, _ = _get_device_info()
+    device = torch.device(f'{device_type}:{rank}')
+    _set_device(device_type, rank)
+
+    if device_type == 'npu':
+        from twinkle.utils.platforms.npu import ensure_hccl_socket_env
+        ensure_hccl_socket_env(port)
 
     dist.init_process_group(
-        backend='nccl',
+        backend=backend,
         rank=rank,
         world_size=world_size,
         init_method=f'tcp://127.0.0.1:{port}',
@@ -174,7 +201,7 @@ def _run_ep_fsdp_save(rank, world_size, port, model_id, local_only):
     try:
         ep_size = 2
         device_mesh = DeviceMesh(
-            device_type='cuda',
+            device_type=device_type,
             mesh=np.arange(world_size).reshape(world_size),
             mesh_dim_names=('fsdp',),
             ep_size=ep_size,
@@ -229,15 +256,17 @@ def _run_ep_fsdp_save(rank, world_size, port, model_id, local_only):
 class TestEPFSDPCheckpointSave(unittest.TestCase):
 
     def test_checkpoint_round_trip(self):
-        """Verify EP+FSDP save produces state dict matching single-GPU reference.
+        """Verify EP+FSDP save produces state dict matching single-device reference.
 
         This test catches the bug where only local expert shards (num_experts/ep_size)
         were saved instead of the full expert tensor (num_experts).
         """
-        if not dist.is_available() or not torch.cuda.is_available():
-            self.skipTest('Need distributed + CUDA')
-        if torch.cuda.device_count() < 4:
-            self.skipTest('Need 4 GPUs')
+        if not dist.is_available():
+            self.skipTest('Need distributed')
+
+        device_type, _, device_count = _get_device_info()
+        if device_count < 4:
+            self.skipTest(f'Need 4 {device_type} devices, found {device_count}')
 
         model_id = os.environ.get('QWEN3_MOE_MODEL_ID', 'Qwen/Qwen3-30B-A3B-Instruct-2507')
         local_only = os.environ.get('QWEN3_MOE_LOCAL_ONLY', '1') != '0'
@@ -297,7 +326,7 @@ class TestEPFSDPCheckpointSave(unittest.TestCase):
                 'Value mismatches:\n' + '\n'.join(mismatched_value))
 
             print(f'[PASS] All {len(ref_sd)} parameters match between '
-                  f'single-GPU reference and EP+FSDP checkpoint')
+                  f'single-device reference and EP+FSDP checkpoint')
 
         finally:
             if os.path.exists(ref_path):
