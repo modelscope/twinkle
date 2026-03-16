@@ -100,8 +100,15 @@ def _load_model(model_id, local_only, device, num_layers=1):
 
 
 def _collect_ep_expert_names(model):
-    """Collect FQNs of expert parameters from EP-patched modules."""
-    names = set()
+    """Collect FQNs of expert parameters from EP-patched modules.
+
+    Matches against model.named_parameters() output by building the same
+    FQN prefix that named_parameters() would produce, then cross-checking
+    against the actual parameter names to avoid silent mismatches after
+    FSDP wrapping.
+    """
+    # First pass: build candidate names from module tree
+    candidate_names = set()
     for fqn, module in model.named_modules():
         if not getattr(module, '_ep_patched', False):
             continue
@@ -110,8 +117,18 @@ def _collect_ep_expert_names(model):
             continue
         experts_prefix = fqn + '.experts.' if fqn else 'experts.'
         for pname, _ in experts.named_parameters():
-            names.add(experts_prefix + pname)
-    return names
+            candidate_names.add(experts_prefix + pname)
+
+    # Second pass: cross-check against actual named_parameters() to catch
+    # any FSDP-induced name changes (e.g. _fsdp_wrapped_module. prefixes)
+    actual_param_names = {n for n, _ in model.named_parameters()}
+    matched = candidate_names & actual_param_names
+    unmatched = candidate_names - actual_param_names
+    if unmatched:
+        print(f'[WARNING] _collect_ep_expert_names: {len(unmatched)} candidate '
+              f'expert param names not found in model.named_parameters() — '
+              f'they will NOT be all-gathered. Examples: {list(unmatched)[:3]}')
+    return matched
 
 
 def _gather_full_state_dict(model, ep_fsdp_mesh):
@@ -120,18 +137,33 @@ def _gather_full_state_dict(model, ep_fsdp_mesh):
     For non-expert params, uses to_local_tensor() (DTensor.full_tensor()).
     For expert params, additionally all-gathers across the EP group on dim-0
     to reconstruct the full [num_experts, ...] tensor.
+
+    Raises RuntimeError if EP is expected but the EP group cannot be obtained,
+    to prevent silent fallback to saving only local expert shards.
     """
     ep_group = None
     ep_ws = 1
     if ep_fsdp_mesh is not None:
-        try:
-            ep_group = ep_fsdp_mesh['ep'].get_group()
-            ep_ws = ep_fsdp_mesh['ep'].size()
-        except Exception:
-            pass
+        # Let errors propagate — a silent fallback here would save only local
+        # expert shards and produce a checkpoint that looks correct but isn't.
+        ep_group = ep_fsdp_mesh['ep'].get_group()
+        ep_ws = ep_fsdp_mesh['ep'].size()
 
-    ep_expert_names = _collect_ep_expert_names(model) if ep_ws > 1 else set()
+    ep_expert_names = set()
+    if ep_ws > 1:
+        ep_expert_names = _collect_ep_expert_names(model)
+        if not ep_expert_names:
+            raise RuntimeError(
+                '_gather_full_state_dict: EP is enabled (ep_ws=%d) but no expert '
+                'parameter names were found via _collect_ep_expert_names(). '
+                'Expert params will NOT be all-gathered — checkpoint would be wrong. '
+                'Check that apply_expert_parallel() was called before wrap_model() '
+                'and that _ep_patched is set on MoE blocks.' % ep_ws)
+        print(f'[gather_full_state_dict] EP all-gather enabled: ep_ws={ep_ws}, '
+              f'expert params to gather={len(ep_expert_names)}')
 
+    gathered_count = 0
+    direct_count = 0
     full_sd = {}
     for name, param in model.named_parameters():
         local_full = torch_util.to_local_tensor(param)
@@ -140,12 +172,30 @@ def _gather_full_state_dict(model, ep_fsdp_mesh):
             gathered = [torch.empty_like(local_full) for _ in range(ep_ws)]
             dist.all_gather(gathered, local_full, group=ep_group)
             local_full = torch.cat(gathered, dim=0)
+            # Sanity-check: dim-0 of the gathered tensor must equal num_experts,
+            # not num_experts // ep_size (which would indicate a missing all-gather).
+            expected_full_dim0 = local_full.shape[0]
+            shard_dim0 = gathered[0].shape[0]
+            assert expected_full_dim0 == shard_dim0 * ep_ws, (
+                f'Expert param {name}: gathered dim-0={expected_full_dim0} != '
+                f'shard_dim0={shard_dim0} * ep_ws={ep_ws}. All-gather may be wrong.')
+            gathered_count += 1
+        else:
+            direct_count += 1
         full_sd[name] = local_full.cpu()
+
+    print(f'[gather_full_state_dict] params via EP all-gather={gathered_count}, '
+          f'params via direct={direct_count}, total={len(full_sd)}')
     return full_sd
 
 
 def _clean_name(name: str) -> str:
-    """Strip FSDP wrapper prefixes from parameter names."""
+    """Strip FSDP1 wrapper prefixes from parameter names.
+
+    Note: FSDP2 (fully_shard) preserves original parameter names and does NOT
+    add these prefixes. This function is kept for compatibility but is effectively
+    a no-op for FSDP2-wrapped models.
+    """
     name = name.replace('_fsdp_wrapped_module.', '')
     name = name.replace('module.', '')
     return name
@@ -302,6 +352,12 @@ class TestEPFSDPCheckpointSave(unittest.TestCase):
             self.assertEqual(
                 len(missing), 0,
                 f'Missing params in saved checkpoint: {missing}')
+
+            # Saved checkpoint must not contain extra params not in reference
+            extra = set(saved_sd.keys()) - set(ref_sd.keys())
+            self.assertEqual(
+                len(extra), 0,
+                f'Extra params in saved checkpoint (not in reference): {extra}')
 
             # Shapes and values must match
             mismatched_shape = []
