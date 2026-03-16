@@ -171,18 +171,20 @@ def _gather_full_state_dict(model, ep_fsdp_mesh):
             local_full = local_full.contiguous().to(param.device)
             gathered = [torch.empty_like(local_full) for _ in range(ep_ws)]
             dist.all_gather(gathered, local_full, group=ep_group)
-            local_full = torch.cat(gathered, dim=0)
-            # Sanity-check: dim-0 of the gathered tensor must equal num_experts,
-            # not num_experts // ep_size (which would indicate a missing all-gather).
-            expected_full_dim0 = local_full.shape[0]
+            # Sanity-check before cat: dim-0 of each shard * ep_ws = full dim-0
             shard_dim0 = gathered[0].shape[0]
-            assert expected_full_dim0 == shard_dim0 * ep_ws, (
-                f'Expert param {name}: gathered dim-0={expected_full_dim0} != '
+            local_full = torch.cat(gathered, dim=0)
+            assert local_full.shape[0] == shard_dim0 * ep_ws, (
+                f'Expert param {name}: gathered dim-0={local_full.shape[0]} != '
                 f'shard_dim0={shard_dim0} * ep_ws={ep_ws}. All-gather may be wrong.')
+            # Move to CPU and release GPU tensors immediately
+            full_sd[name] = local_full.cpu()
+            del gathered, local_full
             gathered_count += 1
         else:
+            full_sd[name] = local_full.cpu()
+            del local_full
             direct_count += 1
-        full_sd[name] = local_full.cpu()
 
     print(f'[gather_full_state_dict] params via EP all-gather={gathered_count}, '
           f'params via direct={direct_count}, total={len(full_sd)}')

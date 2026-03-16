@@ -970,15 +970,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         ep_group = None
         ep_world_size = 1
         if ep_fsdp_mesh is not None:
-            try:
-                ep_group = ep_fsdp_mesh['ep'].get_group()
-                ep_world_size = ep_fsdp_mesh['ep'].size()
-            except Exception:
-                pass
+            ep_group = ep_fsdp_mesh['ep'].get_group()
+            ep_world_size = ep_fsdp_mesh['ep'].size()
 
-        # Build set of EP expert parameter names for fast lookup
         ep_expert_names = set()
         if ep_world_size > 1:
+            candidate_names = set()
             for fqn, module in model.named_modules():
                 if not getattr(module, '_ep_patched', False):
                     continue
@@ -987,7 +984,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     continue
                 experts_prefix = fqn + '.experts.' if fqn else 'experts.'
                 for pname, _ in experts.named_parameters():
-                    ep_expert_names.add(experts_prefix + pname)
+                    candidate_names.add(experts_prefix + pname)
+            actual_param_names = {n for n, _ in model.named_parameters()}
+            ep_expert_names = candidate_names & actual_param_names
 
         for name, param in model.named_parameters():
             # full_tensor() all-gathers within the DTensor's own mesh.
@@ -1003,8 +1002,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
                 local_full = torch.cat(gathered, dim=0)
-
-            state_dict[name] = local_full.cpu()
+                # Move to CPU and release GPU tensors immediately
+                state_dict[name] = local_full.cpu()
+                del gathered, local_full
+            else:
+                state_dict[name] = local_full.cpu()
+                del local_full
 
         return state_dict
 
