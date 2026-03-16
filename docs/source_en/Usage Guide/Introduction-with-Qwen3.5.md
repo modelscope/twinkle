@@ -458,7 +458,7 @@ from twinkle import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.tinker.common import input_feature_to_datum
+from twinkle.server.common import input_feature_to_datum
 
 # Initialize Tinker client (must be called before importing ServiceClient)
 init_tinker_client()

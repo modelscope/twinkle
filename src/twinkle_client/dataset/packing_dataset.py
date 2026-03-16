@@ -9,7 +9,7 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
-from twinkle_client.http import http_post, heartbeat_manager
+from twinkle_client.http import http_post
 from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta
 from .base import Dataset
@@ -19,10 +19,10 @@ class PackingDataset(Dataset):
 
     def __init__(self, dataset_meta: DatasetMeta, packing_num_proc: int = 1, **kwargs):
         from twinkle_client.http import get_base_url
-        self.server_url = get_base_url()
 
+        self.server_url = f'{get_base_url()}/processor/twinkle'
         response = http_post(
-            url=f'{self.server_url}/processors/create',
+            url=f'{self.server_url}/create',
             json_data={
                 'processor_type': 'dataset',
                 'class_type': 'PackingDataset',
@@ -31,18 +31,11 @@ class PackingDataset(Dataset):
         )
         response.raise_for_status()
         self.processor_id = response.json()['processor_id']
-        heartbeat_manager.register_processor(self.processor_id)
-
-    def __del__(self):
-        try:
-            heartbeat_manager.unregister_processor(self.processor_id)
-        except:
-            pass
 
     
     def pack_dataset(self):
         response = http_post(
-            url=f'{self.server_url}/processors/call',
+            url=f'{self.server_url}/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'pack_dataset',
@@ -55,7 +48,7 @@ class PackingDataset(Dataset):
 
     def __getitem__(self, index):
         response = http_post(
-            url=f'{self.server_url}/processors/call',
+            url=f'{self.server_url}/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__getitem__',
@@ -68,7 +61,7 @@ class PackingDataset(Dataset):
 
     def __len__(self):
         response = http_post(
-            url=f'{self.server_url}/processors/call',
+            url=f'{self.server_url}/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': '__len__',

@@ -53,10 +53,10 @@ def _patched_async_tinker_init(
 
     # Get api_key from environment if not provided
     if api_key is None:
-        api_key = os.environ.get('TINKER_API_KEY')
+        api_key = os.environ.get('TWINKLE_SERVER_TOKEN')
     if api_key is None:
         raise TinkerError(
-            'The api_key client option must be set either by passing api_key to the client or by setting the TINKER_API_KEY environment variable'
+            'The api_key client option must be set either by passing api_key to the client or by setting the TWINKLE_SERVER_TOKEN environment variable'
         )
     # REMOVED: api_key 'tml-' prefix validation
     # Original code:

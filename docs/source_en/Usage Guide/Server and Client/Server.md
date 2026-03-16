@@ -139,11 +139,7 @@ launch_server(config_path=config_path)
 ### Method 2: Command Line Startup
 
 ```bash
-# Start Twinkle native Server
 python -m twinkle.server --config server_config.yaml
-
-# Start Tinker compatible Server
-python -m twinkle.server --config server_config.yaml --server-type tinker
 ```
 
 CLI supported parameters:
@@ -151,22 +147,16 @@ CLI supported parameters:
 | Parameter | Description | Default Value |
 |------|------|-------|
 | `-c, --config` | YAML configuration file path (required) | — |
-| `-t, --server-type` | Server mode: `twinkle` or `tinker` | `twinkle` |
-| `--namespace` | Ray namespace | tinker mode defaults to `twinkle_cluster` |
+| `--namespace` | Ray namespace | `twinkle_cluster` |
 | `--log-level` | Log level | `INFO` |
 
 ## YAML Configuration Details
 
-The configuration file defines the complete deployment plan for the Server, including HTTP listening, application components, and resource allocation.
+The configuration file defines the complete deployment plan for the Server, including HTTP listening, application components, and resource allocation. The Server simultaneously supports both Twinkle and Tinker clients through a unified configuration file.
 
-### Twinkle Server + Transformers Backend
+### Complete Configuration Example (Megatron Backend)
 
 ```yaml
-# server_config.yaml — Twinkle native protocol + Transformers backend
-
-# Protocol type: twinkle native protocol
-server_type: twinkle
-
 # HTTP proxy location: EveryNode means running one proxy per Ray node (recommended for multi-node scenarios)
 proxy_location: EveryNode
 
@@ -178,41 +168,52 @@ http_options:
 # Application list: Each entry defines a service component deployed on the Server
 applications:
 
-  # 1. TwinkleServer: Central management service
-  # Responsible for handling client connections, training run tracking, checkpoint management, etc.
+  # 1. TinkerCompatServer: Central API service
+  # Handles client connections, training run tracking, checkpoint management, etc.
+  # route_prefix uses /api/v1, compatible with both Tinker and Twinkle clients
   - name: server
-    route_prefix: /server          # API path prefix
-    import_path: server            # Built-in component identifier
-    args:                          # No additional parameters
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
+      supported_models:
+        - Qwen/Qwen3.5-4B
     deployments:
-      - name: TwinkleServer
+      - name: TinkerCompatServer
+        max_ongoing_requests: 50
         autoscaling_config:
-          min_replicas: 1                # Minimum number of replicas
-          max_replicas: 1                # Maximum number of replicas
-          target_ongoing_requests: 128   # Target concurrent requests per replica
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
         ray_actor_options:
-          num_cpus: 0.1                  # CPU resources allocated to this Actor
+          num_cpus: 0.1
 
   # 2. Model service: Hosts the base model
   # Executes forward propagation, backward propagation and other training computations
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct   # REST path for the model
+  - name: models-Qwen3.5-4B
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      use_megatron: false                              # Use Transformers backend
-      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"      # ModelScope model identifier
-      adapter_config:                                  # LoRA adapter configuration
-        adapter_timeout: 1800         # Idle adapter timeout unload time (seconds)
-      nproc_per_node: 2               # Number of GPU processes per node
-      device_group:                   # Logical device group
+      use_megatron: true                               # Use Megatron-LM backend
+      model_id: "ms://Qwen/Qwen3.5-4B"               # ModelScope model identifier
+      max_length: 10240
+      nproc_per_node: 2                                # Number of GPU processes per node
+      device_group:                                    # Logical device group
         name: model
-        ranks: 2                    # Number of GPUs to use
+        ranks: 2                                       # Number of GPUs to use
         device_type: cuda
-      device_mesh:                    # Distributed training mesh
+      device_mesh:                                     # Distributed training mesh
         device_type: cuda
-        dp_size: 2                    # Data parallel size
-        # tp_size: 1                  # Tensor parallel size (optional)
-        # pp_size: 1                  # Pipeline parallel size (optional)
+        dp_size: 2                                     # Data parallel size
+      queue_config:
+        rps_limit: 100                                 # Max requests per second
+        tps_limit: 10000                               # Max tokens per second per user
+        max_input_tokens: 10000                        # Maximum input tokens per request
+      adapter_config:
+        adapter_timeout: 30                            # Idle adapter timeout unload time (seconds)
+        adapter_max_lifetime: 36000                    # Maximum adapter lifetime (seconds)
+      max_loras: 1                                     # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -221,22 +222,60 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
 
-  # 3. Processor service: Data preprocessing
-  # Executes preprocessing tasks such as tokenization, template conversion, etc. on CPU
+  # 3. Sampler service: Inference sampling
+  # Uses vLLM engine for inference, supports LoRA adapters
+  - name: sampler-Qwen3.5-4B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+    import_path: sampler
+    args:
+      model_id: "ms://Qwen/Qwen3.5-4B"               # ModelScope model identifier
+      nproc_per_node: 2                                # Number of GPU processes per node
+      sampler_type: vllm                               # Inference engine: vllm (high performance) or torch
+      engine_args:                                     # vLLM engine parameters
+        max_model_len: 4096                            # Maximum sequence length
+        gpu_memory_utilization: 0.5                    # GPU memory usage ratio (0.0-1.0)
+        enable_lora: true                              # Support loading LoRA during inference
+        logprobs_mode: processed_logprobs              # Logprobs output mode
+      device_group:                                    # Logical device group
+        name: sampler
+        ranks: 1                                       # Number of GPUs to use
+        device_type: cuda
+      device_mesh:
+        device_type: cuda
+        dp_size: 1
+      queue_config:
+        rps_limit: 100                                 # Max requests per second
+        tps_limit: 100000                              # Max tokens per second
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "0"
+
+  # 4. Processor service: Data preprocessing
+  # Executes tokenization, template conversion, and other preprocessing tasks on CPU
   - name: processor
-    route_prefix: /processors
+    route_prefix: /api/v1/processor
     import_path: processor
     args:
-      nproc_per_node: 2               # Number of processor workers per node
-      ncpu_proc_per_node: 2           # Number of CPU processes per node
+      ncpu_proc_per_node: 2
       device_group:
         name: model
         ranks: 2
         device_type: CPU
       device_mesh:
         device_type: CPU
-        dp_size: 2                    # Data parallel size
+        dp_size: 2
     deployments:
       - name: ProcessorManagement
         autoscaling_config:
@@ -247,17 +286,16 @@ applications:
           num_cpus: 0.1
 ```
 
-### Twinkle Server + Megatron Backend
+### Transformers Backend
 
-The difference from the Transformers backend is only in the `use_megatron` parameter of the Model service:
+The difference from the Megatron backend is only in the `use_megatron` parameter of the Model service:
 
 ```yaml
-  # Model service — Megatron backend
   - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
     import_path: model
     args:
-      use_megatron: true                               # Use Megatron-LM backend
+      use_megatron: false                              # Use Transformers backend
       model_id: "ms://Qwen/Qwen2.5-7B-Instruct"
       nproc_per_node: 2
       device_group:
@@ -266,62 +304,10 @@ The difference from the Transformers backend is only in the `use_megatron` param
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2                    # Data parallel size
-```
-
-> **Note**: The Megatron backend does not need `adapter_config` (LoRA adapter management is handled internally by Megatron).
-
-### Tinker Compatible Server Configuration
-
-Main differences in Tinker compatible mode:
-- `server_type` set to `tinker`
-- `route_prefix` uses `/api/v1` prefix (Tinker protocol specification)
-- Can additionally configure Sampler service (for inference sampling)
-
-```yaml
-# server_config.yaml — Tinker compatible protocol
-
-server_type: tinker
-
-proxy_location: EveryNode
-
-http_options:
-  host: 0.0.0.0
-  port: 8000
-
-applications:
-
-  # 1. TinkerCompatServer: Central API service
-  - name: server
-    route_prefix: /api/v1              # Tinker protocol API prefix
-    import_path: server
-    args:
-      server_config:
-        per_token_model_limit: 30     # Maximum number of models (adapters) per token (server-global)
-    deployments:
-      - name: TinkerCompatServer
-        autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
-          target_ongoing_requests: 128
-        ray_actor_options:
-          num_cpus: 0.1
-
-  # 2. Model service (Megatron backend example)
-  - name: models-Qwen2.5-0.5B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-0.5B-Instruct
-    import_path: model
-    args:
-      use_megatron: true
-      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
-      nproc_per_node: 2
-      device_group:
-        name: model
-        ranks: 2
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        dp_size: 2                    # Data parallel size
+        dp_size: 2
+      adapter_config:
+        adapter_timeout: 1800                          # Idle adapter timeout unload time (seconds)
+        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -330,51 +316,18 @@ applications:
           target_ongoing_requests: 16
         ray_actor_options:
           num_cpus: 0.1
-          runtime_env:
-            env_vars:
-
-  # 3. Sampler service (optional, for inference sampling)
-  - name: sampler-Qwen2.5-0.5B-Instruct
-    route_prefix: /api/v1/sampler/Qwen/Qwen2.5-0.5B-Instruct
-    import_path: sampler
-    args:
-      model_id: "ms://Qwen/Qwen2.5-0.5B-Instruct"
-      nproc_per_node: 1
-      sampler_type: vllm              # Inference engine: vllm (high performance) or torch
-      engine_args:                    # vLLM engine parameters
-        max_model_len: 4096           # Maximum sequence length
-        gpu_memory_utilization: 0.5   # GPU memory usage ratio
-        enable_lora: true             # Support loading LoRA during inference
-      device_group:
-        name: sampler
-        ranks: 1
-        device_type: cuda
-      device_mesh:
-        device_type: cuda
-        dp_size: 1                    # Data parallel size
-    deployments:
-      - name: SamplerManagement
-        autoscaling_config:
-          min_replicas: 1
-          max_replicas: 1
-          target_ongoing_requests: 16
-        ray_actor_options:
-          num_cpus: 0.1
-          num_gpus: 1                 # Sampler needs independent GPU
-          runtime_env:
-            env_vars:
 ```
 
 ## Configuration Item Description
 
 ### Application Components (import_path)
 
-| import_path | Twinkle Mode | Tinker Mode | Description |
-|-------------|-------------|------------|------|
-| `server` | ✅ | ✅ | Central management service, handles training runs and checkpoints |
-| `model` | ✅ | ✅ | Model service, hosts base model for training |
-| `processor` | ✅ | ❌ | Data preprocessing service (Twinkle mode only, Tinker mode needs local processing) |
-| `sampler` | ✅ | ✅ | Inference sampling service |
+| import_path | Description |
+|-------------|------|
+| `server` | Central management service, handles training runs and checkpoints |
+| `model` | Model service, hosts base model for training |
+| `processor` | Data preprocessing service, executes tokenization and template conversion on CPU |
+| `sampler` | Inference sampling service |
 
 ### device_group and device_mesh
 

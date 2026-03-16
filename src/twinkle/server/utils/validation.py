@@ -32,6 +32,7 @@ async def verify_request_token(request: Request, call_next):
             status_code=400, content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
     request.state.request_id = request_id
     request.state.token = token
+    request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
     response = await call_next(request)
     return response
 
@@ -63,3 +64,16 @@ def get_token_from_request(request: Request) -> str:
         The extracted token or empty string if not found
     """
     return getattr(request.state, 'token', '') or ''
+
+
+def get_session_id_from_request(request: Request) -> str:
+    """
+    Extract session ID from request.
+
+    Args:
+        request: The FastAPI Request object
+
+    Returns:
+        The extracted session ID or empty string if not found
+    """
+    return getattr(request.state, 'session_id', '') or ''

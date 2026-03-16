@@ -1,8 +1,7 @@
 import requests
-from numbers import Number
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from .utils import get_api_key, get_base_url, get_request_id
+from .utils import get_api_key, get_base_url, get_request_id, get_session_id
 
 
 def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -17,9 +16,13 @@ def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[
     """
     headers = {
         'X-Ray-Serve-Request-Id': get_request_id(),
+        'serve_multiplexed_model_id': get_request_id(),  # For model multiplexing
         'Authorization': 'Bearer ' + get_api_key(),
         'Twinkle-Authorization': 'Bearer ' + get_api_key(),  # For server compatibility
     }
+
+    if session_id := get_session_id():
+        headers['X-Twinkle-Session-Id'] = session_id
 
     if additional_headers:
         headers.update(additional_headers)
@@ -42,7 +45,7 @@ def _serialize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         if hasattr(value, 'processor_id'):
             serialized[key] = value.processor_id
         elif hasattr(value, '__dict__'):
-            from twinkle.server.twinkle.common.serialize import serialize_object
+            from twinkle.server.common.serialize import serialize_object
             serialized[key] = serialize_object(value)
         else:
             serialized[key] = value
@@ -61,11 +64,25 @@ def _handle_response(response: requests.Response) -> requests.Response:
 
     Raises:
         StopIteration: When server returns HTTP 410 (iterator exhausted)
+        requests.HTTPError: When server returns a 4xx/5xx error, with the
+            server-side ``detail`` field (full traceback) included in the
+            exception message so callers don't need to inspect the response body.
     """
     # Convert HTTP 410 Gone to StopIteration
     # This indicates an iterator has been exhausted
     if response.status_code == 410:
         raise StopIteration(response.json().get('detail', 'Iterator exhausted'))
+
+    if not response.ok:
+        try:
+            detail = response.json().get('detail', response.text)
+        except Exception:
+            detail = response.text
+        http_error_msg = (
+            f'{response.status_code} Error for url: {response.url}\n'
+            f'Server detail:\n{detail}'
+        )
+        raise requests.HTTPError(http_error_msg, response=response)
 
     return response
 
