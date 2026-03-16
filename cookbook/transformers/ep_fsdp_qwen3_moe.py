@@ -103,6 +103,9 @@ def train():
             if optimizer_step > 0 and optimizer_step % 50 == 0:
                 model.save(name=f'checkpoint-step-{optimizer_step}', output_dir='./output')
 
+    model.save(name='checkpoint-final', output_dir='./output')
+    logger.info('Saved final checkpoint to ./output/checkpoint-final')
+
 
 if __name__ == '__main__':
     train()
