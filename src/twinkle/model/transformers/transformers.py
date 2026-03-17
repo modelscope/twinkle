@@ -1254,6 +1254,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
                     tensor = Torch.to_local_tensor(tensor)
+                    # Keep original names (including .base_layer for PEFT models).
+                    # The sampler side will strip .base_layer based on whether
+                    # vLLM has enable_lora=True/False.
                     yield name, tensor
 
         # Run async send_weights in a dedicated event loop thread.
