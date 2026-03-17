@@ -323,7 +323,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
-        # Get the ep_fsdp_device_mesh from the strategy (NativeFSDPStrategy stores it)
         ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
         apply_expert_parallel(
             model,
@@ -556,16 +555,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             num_tokens = sum(num_tokens)
             parameters = list(self._get_trainable_parameters(adapter_name).values())
 
-            # EP-aware grad clip kwargs
-            ep_clip_kwargs = {}
-            model = self.strategy.unwrap_model(self.model)
-            if hasattr(model, '_ep_param_groups'):
-                ep_clip_kwargs['ep_param_groups'] = model._ep_param_groups
-                # Get EP groups from ep_fsdp_device_mesh, not from main mesh
-                ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
-                if ep_fsdp_mesh is not None:
-                    ep_clip_kwargs['ep_group'] = ep_fsdp_mesh['ep'].get_group()
-                    ep_clip_kwargs['ep_fsdp_group'] = ep_fsdp_mesh['ep_fsdp'].get_group()
+            ep_clip_kwargs = self.strategy.get_ep_clip_kwargs(self.model) if hasattr(self.strategy, 'get_ep_clip_kwargs') else {}
 
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,

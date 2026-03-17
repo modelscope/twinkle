@@ -125,6 +125,17 @@ class NativeFSDPStrategy:
 
         return model, optimizer
 
+    def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
+        """Return EP-aware kwargs for normalize_and_clip_grad_norm."""
+        model = self.unwrap_model(model)
+        ep_clip_kwargs = {}
+        if hasattr(model, '_ep_param_groups'):
+            ep_clip_kwargs['ep_param_groups'] = model._ep_param_groups
+            if self.ep_fsdp_device_mesh is not None:
+                ep_clip_kwargs['ep_group'] = self.ep_fsdp_device_mesh['ep'].get_group()
+                ep_clip_kwargs['ep_fsdp_group'] = self.ep_fsdp_device_mesh['ep_fsdp'].get_group()
+        return ep_clip_kwargs
+
     def unwrap_model(self, model):
         return model
 
