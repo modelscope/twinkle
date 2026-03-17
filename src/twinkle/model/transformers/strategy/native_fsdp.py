@@ -136,6 +136,18 @@ class NativeFSDPStrategy:
                 ep_clip_kwargs['ep_fsdp_group'] = self.ep_fsdp_device_mesh['ep_fsdp'].get_group()
         return ep_clip_kwargs
 
+    def adjust_optimizer_kwargs(self, optimizer_cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Adjust optimizer kwargs for EP compatibility (e.g. disable foreach for Adam)."""
+        if not self.enable_ep or 'foreach' in kwargs:
+            return kwargs
+        from torch.optim import Adam, AdamW
+        is_adam_family = (
+            optimizer_cls in ('AdamW', 'Adam')
+            or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
+        if is_adam_family:
+            kwargs['foreach'] = False
+        return kwargs
+
     def unwrap_model(self, model):
         return model
 

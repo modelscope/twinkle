@@ -741,12 +741,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lr = kwargs.get('lr', DEFAULT_LEARNING_RATE)
             weight_decay = kwargs.get('weight_decay', DEFAULT_WEIGHT_DECAY)
             params = self._create_param_group(adapter_name, lr=lr, weight_decay=weight_decay)
-        if self._enable_expert_parallel and 'foreach' not in kwargs:
-            is_adam_family = (
-                optimizer_cls in ('AdamW', 'Adam')
-                or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
-            if is_adam_family:
-                kwargs['foreach'] = False
+        if hasattr(self.strategy, 'adjust_optimizer_kwargs'):
+            kwargs = self.strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs)
         optimizer_config.optimizer = construct_class(
             optimizer_cls,
             Optimizer,
