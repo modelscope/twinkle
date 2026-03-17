@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
-from twinkle.utils import DeviceMesh, Platform
+from twinkle.utils import DeviceMesh, Platform, torch_util
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -124,8 +125,84 @@ class NativeFSDPStrategy:
 
         return model, optimizer
 
+    def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
+        """Return EP-aware kwargs for normalize_and_clip_grad_norm."""
+        model = self.unwrap_model(model)
+        ep_clip_kwargs = {}
+        if hasattr(model, '_ep_param_groups'):
+            ep_clip_kwargs['ep_param_groups'] = model._ep_param_groups
+            if self.ep_fsdp_device_mesh is not None:
+                ep_clip_kwargs['ep_group'] = self.ep_fsdp_device_mesh['ep'].get_group()
+                ep_clip_kwargs['ep_fsdp_group'] = self.ep_fsdp_device_mesh['ep_fsdp'].get_group()
+        return ep_clip_kwargs
+
+    def adjust_optimizer_kwargs(self, optimizer_cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Adjust optimizer kwargs for EP compatibility (e.g. disable foreach for Adam)."""
+        if not self.enable_ep or 'foreach' in kwargs:
+            return kwargs
+        from torch.optim import Adam, AdamW
+        is_adam_family = (
+            optimizer_cls in ('AdamW', 'Adam')
+            or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
+        if is_adam_family:
+            kwargs['foreach'] = False
+        return kwargs
+
     def unwrap_model(self, model):
         return model
+
+    def get_full_state_dict(self, model) -> dict:
+        """Collect full state dict with EP-aware all-gather for expert parameters.
+
+        For non-EP models or non-expert parameters, this is equivalent to
+        calling to_local_tensor(param).cpu() for each parameter.
+
+        For EP-sharded expert parameters, this additionally all-gathers
+        the local expert shards across the EP group to reconstruct the
+        full expert tensor (all num_experts on dim-0).
+        """
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+
+        ep_fsdp_mesh = self.ep_fsdp_device_mesh
+        ep_group = None
+        ep_world_size = 1
+        if ep_fsdp_mesh is not None:
+            ep_group = ep_fsdp_mesh['ep'].get_group()
+            ep_world_size = ep_fsdp_mesh['ep'].size()
+
+        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+
+        for name, param in unwrapped.named_parameters():
+            local_full = torch_util.to_local_tensor(param)
+
+            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+                local_full = local_full.contiguous().to(Platform.get_local_device())
+                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
+                dist.all_gather(gathered, local_full, group=ep_group)
+                local_full = torch.cat(gathered, dim=0)
+                state_dict[name] = local_full.cpu()
+                del gathered, local_full
+            else:
+                state_dict[name] = local_full.cpu()
+                del local_full
+
+        return state_dict
+
+
+def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
+    candidate_names = set()
+    for fqn, module in model.named_modules():
+        if not getattr(module, '_ep_patched', False):
+            continue
+        experts = getattr(module, 'experts', None)
+        if experts is None:
+            continue
+        experts_prefix = fqn + '.experts.' if fqn else 'experts.'
+        for pname, _ in experts.named_parameters():
+            candidate_names.add(experts_prefix + pname)
+    actual_param_names = {n for n, _ in model.named_parameters()}
+    return candidate_names & actual_param_names
 
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':

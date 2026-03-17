@@ -323,7 +323,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
-        # Get the ep_fsdp_device_mesh from the strategy (NativeFSDPStrategy stores it)
         ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
         apply_expert_parallel(
             model,
@@ -556,16 +555,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             num_tokens = sum(num_tokens)
             parameters = list(self._get_trainable_parameters(adapter_name).values())
 
-            # EP-aware grad clip kwargs
-            ep_clip_kwargs = {}
-            model = self.strategy.unwrap_model(self.model)
-            if hasattr(model, '_ep_param_groups'):
-                ep_clip_kwargs['ep_param_groups'] = model._ep_param_groups
-                # Get EP groups from ep_fsdp_device_mesh, not from main mesh
-                ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
-                if ep_fsdp_mesh is not None:
-                    ep_clip_kwargs['ep_group'] = ep_fsdp_mesh['ep'].get_group()
-                    ep_clip_kwargs['ep_fsdp_group'] = ep_fsdp_mesh['ep_fsdp'].get_group()
+            ep_clip_kwargs = self.strategy.get_ep_clip_kwargs(self.model) if hasattr(
+                self.strategy, 'get_ep_clip_kwargs') else {}
 
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,
@@ -751,12 +742,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lr = kwargs.get('lr', DEFAULT_LEARNING_RATE)
             weight_decay = kwargs.get('weight_decay', DEFAULT_WEIGHT_DECAY)
             params = self._create_param_group(adapter_name, lr=lr, weight_decay=weight_decay)
-        if self._enable_expert_parallel and 'foreach' not in kwargs:
-            is_adam_family = (
-                optimizer_cls in ('AdamW', 'Adam')
-                or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
-            if is_adam_family:
-                kwargs['foreach'] = False
+        if hasattr(self.strategy, 'adjust_optimizer_kwargs'):
+            kwargs = self.strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs)
         optimizer_config.optimizer = construct_class(
             optimizer_cls,
             Optimizer,
@@ -823,14 +810,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
-        state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
         processed_state_dict = {}
-
         save_kwargs = {}
-
-        for key, value in state_dict.items():
-            key = key.replace(f'.{adapter_name}.', '.')
-            processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
+        if adapter_name == _default_adapter_name:
+            # Full model save
+            processed_state_dict = self.strategy.get_full_state_dict(self.model)
+        else:
+            # LoRA adapter save
+            state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
+            for key, value in state_dict.items():
+                key = key.replace(f'.{adapter_name}.', '.')
+                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
