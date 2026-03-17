@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import re
+import inspect
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 
@@ -18,7 +19,7 @@ def _sanitize_lock_name(name: str) -> str:
 
 def acquire_lock(lock: FileLock, blocking: bool):
     try:
-        if 'blocking' in inspect.signature(AsyncEngineArgs).parameters:
+        if 'blocking' in inspect.signature(lock.acquire).parameters:
             lock.acquire(blocking=blocking)
         else:
             lock.acquire(timeout=(0 if not blocking else None))
