@@ -827,7 +827,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         save_kwargs = {}
         if adapter_name == _default_adapter_name:
             # Full model save — use EP-aware collection to reconstruct expert weights
-            processed_state_dict = self._get_full_state_dict()
+            processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
             # LoRA adapter save — no EP experts involved
             state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
@@ -944,65 +944,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
-
-    def _get_full_state_dict(self) -> dict:
-        """Collect full state dict with EP-aware all-gather for expert parameters.
-
-        For non-EP models or non-expert parameters, this is equivalent to
-        calling to_local_tensor(param).cpu() for each parameter.
-
-        For EP-sharded expert parameters, this additionally all-gathers
-        the local expert shards across the EP group to reconstruct the
-        full expert tensor (all num_experts on dim-0).
-        """
-        model = self.strategy.unwrap_model(self.model)
-        state_dict = {}
-
-        # Detect EP configuration
-        ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
-        ep_group = None
-        ep_world_size = 1
-        if ep_fsdp_mesh is not None:
-            ep_group = ep_fsdp_mesh['ep'].get_group()
-            ep_world_size = ep_fsdp_mesh['ep'].size()
-
-        ep_expert_names = set()
-        if ep_world_size > 1:
-            candidate_names = set()
-            for fqn, module in model.named_modules():
-                if not getattr(module, '_ep_patched', False):
-                    continue
-                experts = getattr(module, 'experts', None)
-                if experts is None:
-                    continue
-                experts_prefix = fqn + '.experts.' if fqn else 'experts.'
-                for pname, _ in experts.named_parameters():
-                    candidate_names.add(experts_prefix + pname)
-            actual_param_names = {n for n, _ in model.named_parameters()}
-            ep_expert_names = candidate_names & actual_param_names
-
-        for name, param in model.named_parameters():
-            # full_tensor() all-gathers within the DTensor's own mesh.
-            # For non-expert params (on fsdp_mesh): reconstructs full param ✓
-            # For expert params (on ep_fsdp_mesh): reconstructs FSDP shard only,
-            #   dim-0 still has local_experts = num_experts / ep_size
-            local_full = torch_util.to_local_tensor(param)
-
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
-                # All-gather expert shards across EP group on dim-0
-                # local_full shape: [local_experts, ...], need [num_experts, ...]
-                local_full = local_full.contiguous().to(Platform.get_local_device())
-                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
-                dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=0)
-                # Move to CPU and release GPU tensors immediately
-                state_dict[name] = local_full.cpu()
-                del gathered, local_full
-            else:
-                state_dict[name] = local_full.cpu()
-                del local_full
-
-        return state_dict
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
