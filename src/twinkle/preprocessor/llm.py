@@ -153,4 +153,3 @@ class GSM8KProcessor(Preprocessor):
             messages=messages,
             user_data=[('ground_truth', ground_truth)],
         )
-

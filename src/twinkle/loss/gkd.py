@@ -72,11 +72,8 @@ class GKDLoss(Loss):
         Returns:
             LossOutput with scalar 'loss' averaged over valid (non-ignored) response tokens.
         """
-        assert teacher_logits is not None or (
-            teacher_topk_logprobs is not None and teacher_topk_indices is not None
-        ), (
-            'Either logits or both topk_logprobs and topk_indices must be provided.'
-        )
+        assert teacher_logits is not None or (teacher_topk_logprobs is not None and teacher_topk_indices is not None), (
+            'Either logits or both topk_logprobs and topk_indices must be provided.')
 
         labels = inputs['labels']
         student_logits = outputs['logits']
@@ -88,8 +85,6 @@ class GKDLoss(Loss):
         if teacher_topk_logprobs is not None and teacher_topk_logprobs.shape[1] > student_logits.shape[1]:
             teacher_topk_logprobs = teacher_topk_logprobs[:, :student_logits.shape[1]]
             teacher_topk_indices = teacher_topk_indices[:, :student_logits.shape[1]]
-
-        shifted_labels = labels
 
         loss = self._generalized_jsd_loss(
             student_logits=student_logits,
@@ -175,7 +170,7 @@ class GKDLoss(Loss):
             elif stu_dim > tea_dim:
                 teacher_logits = F.pad(teacher_logits, (0, stu_dim - tea_dim))
                 teacher_logits[..., tea_dim:] = student_logits[..., tea_dim:]
-            student_logits = student_logits[mask]   # [num_valid, vocab/topk]
+            student_logits = student_logits[mask]  # [num_valid, vocab/topk]
             teacher_logits = teacher_logits[mask]
             num_valid = mask.sum()
         else:

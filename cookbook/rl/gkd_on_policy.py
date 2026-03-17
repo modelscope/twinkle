@@ -206,7 +206,7 @@ def main():
         # 1. Student vLLM generates completions
         sample_response = student_sampler.sample(batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=N_SAMPLES))
         input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
-            
+
         # 2. Teacher vLLM computes top-k prompt logprobs on generated sequences
         teacher_response = teacher_sampler.sample(
             input_data,

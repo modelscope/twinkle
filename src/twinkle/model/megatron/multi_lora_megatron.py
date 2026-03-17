@@ -15,6 +15,7 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
+from ...infra import collect_tensor_dict
 from ..multi_lora import MultiLora
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
@@ -111,7 +112,7 @@ class MultiLoraMegatronModel(MegatronModel):
     def _lazy_wrap_model(self):
         pass
 
-    @remote_function(dispatch='slice_dp', collect='last_pp', sync=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Forward pass without gradient computation.
 

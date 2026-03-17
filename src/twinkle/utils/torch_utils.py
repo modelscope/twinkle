@@ -1,6 +1,6 @@
 import socket
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Mapping, Union, List, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Union
 
 from .network import is_valid_ipv6_address
 

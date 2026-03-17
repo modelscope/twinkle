@@ -5,7 +5,6 @@ from .cross_entropy import CrossEntropyLoss
 from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .mse import MSELoss
-from .cross_entropy import CrossEntropyLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,

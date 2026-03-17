@@ -1,11 +1,14 @@
-from typing import List, Dict, Any, TYPE_CHECKING
 import numpy as np
+from typing import TYPE_CHECKING, Any, Dict, List
+
+from twinkle import DeviceMesh
 
 if TYPE_CHECKING:
     import torch
 
 
-def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[str, Any]:
+    import torch
     if not outputs:
         return {}
 
@@ -16,7 +19,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, An
     for d in outputs:
         all_keys.update(d.keys())
 
-    import torch
+    outputs = [r for i, r in enumerate(outputs) if i in device_mesh.get_pp_last_ranks()]
     result = {}
     for key in all_keys:
         values = [d[key] for d in outputs if key in d]
@@ -42,7 +45,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, An
             result[key] = collect_tensor_dict(values)
 
         elif isinstance(first_value, np.ndarray):
-            raise NotImplementedError(f'Numpy array not supported for now.')
+            raise NotImplementedError('Numpy array not supported for now.')
 
         else:
             result[key] = values
@@ -53,7 +56,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, An
 def _pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = 0) -> 'torch.Tensor':
     import torch
     if not tensors:
-        raise ValueError("Empty tensor list")
+        raise ValueError('Empty tensor list')
 
     if len(tensors) == 1:
         return tensors[0].unsqueeze(0)

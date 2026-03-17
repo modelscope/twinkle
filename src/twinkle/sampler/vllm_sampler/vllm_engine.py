@@ -176,18 +176,16 @@ class VLLMEngine(BaseSamplerEngine):
     # Core Sampling API
     # =========================================================================
 
-    async def sample(
-        self,
-        prompt_token_ids: List[int],
-        sampling_params: Union[SamplingParams, Dict[str, Any]],
-        lora_request: Optional[Any] = None,
-        request_id: Optional[str] = None,
-        priority: int = 0,
-        *,
-        images: Optional[List[Any]] = None,
-        videos: Optional[List[Any]] = None,
-        **kwargs
-    ) -> SampleResponse:
+    async def sample(self,
+                     prompt_token_ids: List[int],
+                     sampling_params: Union[SamplingParams, Dict[str, Any]],
+                     lora_request: Optional[Any] = None,
+                     request_id: Optional[str] = None,
+                     priority: int = 0,
+                     *,
+                     images: Optional[List[Any]] = None,
+                     videos: Optional[List[Any]] = None,
+                     **kwargs) -> SampleResponse:
         """
         Sample completions from the model.
 
@@ -278,10 +276,8 @@ class VLLMEngine(BaseSamplerEngine):
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids):
-                        sorted_items = sorted(
-                            lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
-                        seq_logprobs.append([(tid, lp_obj.logprob)
-                                                            for tid, lp_obj in sorted_items])
+                        sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
+                        seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
 
             # Map finish_reason to StopReason
             stop_reason: StopReason = 'length'
@@ -319,10 +315,8 @@ class VLLMEngine(BaseSamplerEngine):
                     result_prompt_logprobs.append(None)
 
                 # Get top-k logprobs
-                sorted_items = sorted(
-                    lp_dict.items(), key=lambda x: -(x[1].logprob))[:prompt_logprobs_k]
-                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob)
-                                                    for tid, lp_obj in sorted_items])
+                sorted_items = sorted(lp_dict.items(), key=lambda x: -(x[1].logprob))[:prompt_logprobs_k]
+                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
         return SampleResponse(
             sequences=sequences,
             prompt_logprobs=result_prompt_logprobs,

@@ -229,15 +229,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         )
 
         # response.sequences contains num_samples sequences for this prompt
-        return SampleResponse(sequences=[
-            SampledSequence(
-                stop_reason=seq.stop_reason,
-                tokens=seq.tokens,
-                logprobs=seq.logprobs,
-                decoded=self.template.decode(seq.tokens),
-                new_input_feature=self.template.concat_input_feature(feat, seq.tokens),
-            ) for seq in response.sequences
-        ], prompt_logprobs=response.prompt_logprobs, topk_prompt_logprobs=response.topk_prompt_logprobs)
+        return SampleResponse(
+            sequences=[
+                SampledSequence(
+                    stop_reason=seq.stop_reason,
+                    tokens=seq.tokens,
+                    logprobs=seq.logprobs,
+                    decoded=self.template.decode(seq.tokens),
+                    new_input_feature=self.template.concat_input_feature(feat, seq.tokens),
+                ) for seq in response.sequences
+            ],
+            prompt_logprobs=response.prompt_logprobs,
+            topk_prompt_logprobs=response.topk_prompt_logprobs)
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
     def sample(

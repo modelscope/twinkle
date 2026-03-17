@@ -26,7 +26,8 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss, CrossEntropyLoss
+from twinkle.infra import collect_tensor_dict
+from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.patch import Patch, apply_patch
@@ -339,7 +340,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='last_pp')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -364,7 +365,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def backward(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='last_pp', sync=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],

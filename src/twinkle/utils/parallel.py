@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import os
 import re
-import inspect
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 
