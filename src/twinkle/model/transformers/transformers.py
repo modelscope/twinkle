@@ -823,18 +823,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
+        processed_state_dict = {}
+        save_kwargs = {}
         if adapter_name == _default_adapter_name:
             # Full model save — use EP-aware collection to reconstruct expert weights
-            full_sd = self._get_full_state_dict()
-            processed_state_dict = {}
-            save_kwargs = {}
-            for key, value in full_sd.items():
-                processed_state_dict[key] = value
+            processed_state_dict = self._get_full_state_dict()
         else:
             # LoRA adapter save — no EP experts involved
             state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
-            processed_state_dict = {}
-            save_kwargs = {}
             for key, value in state_dict.items():
                 key = key.replace(f'.{adapter_name}.', '.')
                 processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
