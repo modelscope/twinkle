@@ -826,10 +826,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         processed_state_dict = {}
         save_kwargs = {}
         if adapter_name == _default_adapter_name:
-            # Full model save — use EP-aware collection to reconstruct expert weights
+            # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save — no EP experts involved
+            # LoRA adapter save
             state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
             for key, value in state_dict.items():
                 key = key.replace(f'.{adapter_name}.', '.')

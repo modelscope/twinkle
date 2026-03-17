@@ -121,7 +121,7 @@ class AccelerateStrategy:
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
 
     def get_full_state_dict(self, model) -> dict:
-        """Collect full state dict (no EP support in accelerate strategy)."""
+        """Collect full state dict."""
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
         state_dict = {}
