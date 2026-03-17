@@ -50,7 +50,7 @@ def train():
 
     # Add a lora to model, with name `default`
     # Comment this to use full-parameter training
-    # model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
     # Add Optimizer for lora `default`
     model.set_optimizer(optimizer_cls='AdamW', lr=1e-4)
     # Add LRScheduler for lora `default`

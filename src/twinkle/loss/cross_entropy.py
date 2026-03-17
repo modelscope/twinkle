@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from ..data_format import LossOutput
+from twinkle.data_format import LossOutput
 from .base import Loss
 
 
