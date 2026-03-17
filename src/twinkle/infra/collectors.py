@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, TYPE_CHECKING
+import numpy as np
 
 if TYPE_CHECKING:
     import torch
@@ -39,6 +40,9 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], **kwargs) -> Dict[str, An
 
         elif isinstance(first_value, dict):
             result[key] = collect_tensor_dict(values)
+
+        elif isinstance(first_value, np.ndarray):
+            raise NotImplementedError(f'Numpy array not supported for now.')
 
         else:
             result[key] = values
