@@ -955,9 +955,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         the local expert shards across the EP group to reconstruct the
         full expert tensor (all num_experts on dim-0).
         """
-        import torch
-        import torch.distributed as dist
-
         model = self.strategy.unwrap_model(self.model)
         state_dict = {}
 
