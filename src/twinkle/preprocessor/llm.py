@@ -116,10 +116,11 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
 
 
 class GSM8KProcessor(Preprocessor):
-    """Preprocessor for GSM8K dataset.
+    """Preprocessor for GSM8K dataset (prompt-only, for on-policy generation).
 
     GSM8K fields: question (str), answer (str ending with '#### <number>')
     Extracts the ground truth number and stores it in user_data for reward.
+    Only includes system + user messages; assistant response is generated on-policy.
     """
 
     system_prompt = ('You are a helpful math assistant. Solve the problem step by step and put your final answer within \\boxed{}.')
@@ -145,6 +146,29 @@ class GSM8KProcessor(Preprocessor):
         messages = [
             Message(role='system', content=self.system_prompt),
             Message(role='user', content=question),
+        ]
+        return Trajectory(
+            messages=messages,
+            user_data=[('ground_truth', ground_truth)],
+        )
+
+
+class GSM8KFullProcessor(GSM8KProcessor):
+    """Preprocessor for GSM8K dataset (full trajectory, for off-policy distillation).
+
+    Includes system + user + assistant messages with the reference answer.
+    Used when training on existing responses (off-policy) rather than generating new ones.
+    """
+
+    def preprocess(self, row) -> Trajectory:
+        question = row['question']
+        answer = row.get('answer', '')
+        ground_truth = self.extract_ground_truth(answer)
+
+        messages = [
+            Message(role='system', content=self.system_prompt),
+            Message(role='user', content=question),
+            Message(role='assistant', content=answer),
         ]
         return Trajectory(
             messages=messages,

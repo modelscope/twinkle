@@ -49,7 +49,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import GKDLoss
 from twinkle.model import MegatronModel
-from twinkle.preprocessor import GSM8KProcessor
+from twinkle.preprocessor import GSM8KFullProcessor
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
 
@@ -70,8 +70,6 @@ LEARNING_RATE = float(os.environ.get('LR', 5e-5))
 GKD_BETA = float(os.environ.get('GKD_BETA', 0.5))
 GKD_TEMPERATURE = float(os.environ.get('GKD_TEMPERATURE', 1.0))
 GKD_TOPK = int(os.environ.get('GKD_TOPK', 64))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
-N_SAMPLES = int(os.environ.get('N_SAMPLES', 1))
 ADAPTER_NAME = 'default'
 
 
@@ -81,72 +79,52 @@ def create_dataset():
     """Full-text dataset with prompt + reference answer for off-policy distillation."""
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
     dataset.set_template('Template', model_id=STUDENT_MODEL_ID, max_length=1024)
-    dataset.map(GSM8KProcessor())
+    dataset.map(GSM8KFullProcessor())
     return dataset
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def convert_topk_prompt_logprobs(
-    prompt_logprobs_batch: List[Optional[List[List[tuple]]]],
-    sequences_logprobs_batch: List[List[Optional[List[List[tuple]]]]],
+    topk_prompt_logprobs_batch: List[Optional[List[List[tuple]]]],
 ) -> dict:
     """Convert vLLM topk_prompt_logprobs to GKDLoss teacher_output format.
 
     Args:
-        prompt_logprobs_batch: [batch] each is topk_prompt_logprobs for one request.
-            Shape: [prompt_seq_len, topk] per request.
-        sequences_logprobs_batch: [batch][n_samples] each is generated logprobs.
-            Shape: [generated_len, topk] per sequence.
+        topk_prompt_logprobs_batch: [batch] each is topk_prompt_logprobs for one request.
+            Shape: [seq_len, topk] per request, where each position is List[(token_id, logprob)].
 
     Returns:
-        Dict with expanded teacher logprobs/indices tensors.
-        Each prompt is expanded N times (one per generated sequence).
+        Dict with teacher logprobs/indices tensors.
     """
     batch_logprobs = []
     batch_indices = []
 
-    for prompt_logprobs, sequences_logprobs in zip(prompt_logprobs_batch, sequences_logprobs_batch):
-        n_samples = len(sequences_logprobs)
-
-        # Parse prompt logprobs (shared across all sequences)
-        # prompt_logprobs is List[float], expand to [seq_len, topk] with padding
-        prompt_lps = []
-        prompt_ids = []
-        if prompt_logprobs is not None:
-            for lp in prompt_logprobs:
-                if lp is None:
-                    lp = -1
-                # Expand single logprob to topk slots: [lp, 0, 0, ...]
-                prompt_lps.append([lp] + [0.0] * (GKD_TOPK - 1))
-                prompt_ids.append([0] * GKD_TOPK)
-
-        # Expand prompt and concat with each sequence's generated logprobs
-        for seq_logprobs in sequences_logprobs:
-            # Start with prompt logprobs (copy for each sequence)
-            seq_lps = list(prompt_lps)
-            seq_ids = list(prompt_ids)
-
-            # Append generated token logprobs
-            if seq_logprobs is not None:
-                for pos_topk in seq_logprobs:
-                    seq_lps.append([lp for _, lp in pos_topk])
-                    seq_ids.append([tid for tid, _ in pos_topk])
-
-            batch_logprobs.append(seq_lps)
-            batch_indices.append(seq_ids)
+    for seq_topk in topk_prompt_logprobs_batch:
+        seq_logprobs = []
+        seq_indices = []
+        if seq_topk is not None:
+            for pos_topk in seq_topk:
+                if pos_topk is None:
+                    # First position is None, fill with placeholder
+                    seq_logprobs.append([0.0] * GKD_TOPK)
+                    seq_indices.append([0] * GKD_TOPK)
+                else:
+                    seq_logprobs.append([lp for _, lp in pos_topk])
+                    seq_indices.append([tid for tid, _ in pos_topk])
+        batch_logprobs.append(seq_logprobs)
+        batch_indices.append(seq_indices)
 
     # Pad to same seq_len within batch
     max_len = max(len(seq) for seq in batch_logprobs) if batch_logprobs else 1
-    topk = len(batch_logprobs[0][0]) if batch_logprobs and batch_logprobs[0] else GKD_TOPK
 
     for i in range(len(batch_logprobs)):
         pad_len = max_len - len(batch_logprobs[i])
         if pad_len > 0:
-            batch_logprobs[i].extend([[0.0] * topk] * pad_len)
-            batch_indices[i].extend([[0] * topk] * pad_len)
+            batch_logprobs[i].extend([[0.0] * GKD_TOPK] * pad_len)
+            batch_indices[i].extend([[0] * GKD_TOPK] * pad_len)
 
-    # In vllm output, the first position is None, we returns an invalid value(-10000), so roll it to match the labels
+    # Roll to align with labels (first position has no valid logprobs)
     return {
         'teacher_topk_logprobs': torch.roll(torch.tensor(batch_logprobs, dtype=torch.float32), shifts=-1, dims=1),
         'teacher_topk_indices': torch.roll(torch.tensor(batch_indices, dtype=torch.long), shifts=-1, dims=1),
@@ -211,16 +189,18 @@ def main():
             break
 
         # Teacher vLLM computes top-k prompt logprobs on the reference sequences
+        # max_tokens=1: don't generate new content, just compute logprobs on input
         teacher_response = teacher_sampler.sample(
             batch,
-            SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, prompt_logprobs=1, logprobs=GKD_TOPK, num_samples=N_SAMPLES),
+            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=GKD_TOPK, num_samples=1),
         )
-        input_data = [seq.new_input_feature for response in teacher_response for seq in response.sequences]
+
+        # Use original batch as input_data (dataset reference responses)
+        input_data = batch if isinstance(batch, list) else [batch]
 
         # Convert teacher logprobs to tensor format for GKDLoss
         teacher_output = convert_topk_prompt_logprobs(
-            [resp.prompt_logprobs for resp in teacher_response],
-            [[sequence.logprobs for sequence in resp.sequences] for resp in teacher_response],
+            [resp.topk_prompt_logprobs for resp in teacher_response],
         )
 
         # Student forward + GKD backward
