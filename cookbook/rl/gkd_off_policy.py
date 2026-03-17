@@ -48,7 +48,7 @@ from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import GKDLoss
-from twinkle.model import TransformersModel
+from twinkle.model import MegatronModel
 from twinkle.preprocessor import GSM8KProcessor
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
@@ -56,8 +56,8 @@ from twinkle.template import Template
 logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', 'ms://Qwen/Qwen3.5-2B')
-TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen/Qwen3.5-9B')
+STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
+TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen/Qwen3-8B')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 8))
@@ -171,7 +171,7 @@ def main():
     logger.info(get_device_placement())
 
     # ── Student model (trainable) ──────────────────────────────────────────────
-    student_model = TransformersModel(
+    student_model = MegatronModel(
         model_id=STUDENT_MODEL_ID,
         device_mesh=model_mesh,
         remote_group='student_model',
@@ -181,8 +181,8 @@ def main():
         LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules='all-linear'),
         gradient_accumulation_steps=1,
     )
-    student_model.set_optimizer('AdamW', lr=LEARNING_RATE)
-    student_model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
+    student_model.set_optimizer('default', lr=LEARNING_RATE)
+    student_model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS)
     student_model.set_loss(GKDLoss(beta=GKD_BETA, temperature=GKD_TEMPERATURE))
     student_model.set_template('Template', model_id=STUDENT_MODEL_ID)
 
@@ -228,14 +228,14 @@ def main():
         # Student forward + GKD backward
         student_model.forward_backward(inputs=input_data, **teacher_output)
         student_model.clip_grad_and_step()
-        optim_step += 1
 
-        if optim_step % 10 == 0:
-            metric = student_model.calculate_metric(is_training=True)
-            logger.info(f'[Step {optim_step}/{MAX_STEPS}] {metric}')
+        metric = student_model.calculate_metric(is_training=True)
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {metric}')
 
         if optim_step % 50 == 0:
             student_model.save(f'gkd-offpolicy-ckpt-{optim_step}')
+        
+        optim_step += 1
 
     student_model.save('gkd-offpolicy-final')
     logger.info('GKD off-policy training completed.')

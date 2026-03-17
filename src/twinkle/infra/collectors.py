@@ -44,12 +44,14 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
         elif isinstance(first_value, dict):
             result[key] = collect_tensor_dict(values)
 
-        elif isinstance(first_value, np.ndarray):
+        elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')
 
         else:
             result[key] = values
 
+    if 'loss' in result and len(result['loss']) > 1:
+        result['loss'] = np.mean(result['loss'])
     return result
 
 
