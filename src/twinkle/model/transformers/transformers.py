@@ -801,7 +801,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def __del__(self):
         HubOperation.wait_for()
 
-    @remote_function()
+    @remote_function(collect='first')
     def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 

@@ -157,7 +157,7 @@ class RayHelper:
         def get_node_address():
             return find_node_ip(), find_free_port()
 
-        ip, port = ray.get(get_node_address.options(placement_group=placement_group).remote())
+        ip, port = ray.get(get_node_address.options(placement_group=placement_group, num_cpus=0.01).remote())
         return ip, port
 
     @staticmethod

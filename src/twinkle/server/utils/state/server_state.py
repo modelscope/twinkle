@@ -71,7 +71,7 @@ class ServerState:
         self._session_mgr.add(session_id, record)
         return session_id
 
-    def touch_session(self, session_id: str) -> bool:
+    async def touch_session(self, session_id: str) -> bool:
         """Update session heartbeat timestamp.
 
         Returns:
@@ -154,7 +154,7 @@ class ServerState:
         """
         self._model_mgr.unregister_replica(replica_id)
 
-    def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
+    async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
         """Return candidate replica IDs that have not reached their max_loras limit.
 
         Args:
@@ -195,12 +195,12 @@ class ServerState:
 
     # ----- Future Management -----
 
-    def get_future(self, request_id: str) -> dict[str, Any] | None:
+    async def get_future(self, request_id: str) -> dict[str, Any] | None:
         """Retrieve a stored future result as a plain dict."""
         record = self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
-    def store_future_status(
+    async def store_future_status(
         self,
         request_id: str,
         status: str,
@@ -238,28 +238,6 @@ class ServerState:
             queue_state=queue_state,
             queue_state_reason=queue_state_reason,
         )
-
-    # ----- Config Management -----
-
-    def add_config(self, key: str, value: Any) -> None:
-        """Add or update a configuration value."""
-        self._config_mgr.add(key, value)
-
-    def add_or_get(self, key: str, value: Any) -> Any:
-        """Add a config value if the key does not exist; otherwise return the existing value."""
-        return self._config_mgr.add_or_get(key, value)
-
-    def get_config(self, key: str) -> Any | None:
-        """Get a configuration value by key."""
-        return self._config_mgr.get(key)
-
-    def pop_config(self, key: str) -> Any | None:
-        """Remove and return a configuration value."""
-        return self._config_mgr.pop(key)
-
-    def clear_config(self) -> None:
-        """Clear all configuration values."""
-        self._config_mgr.clear()
 
     # ----- Resource Cleanup -----
 
@@ -372,8 +350,8 @@ class ServerStateProxy:
     def create_session(self, payload: dict[str, Any]) -> str:
         return ray.get(self._actor.create_session.remote(payload))
 
-    def touch_session(self, session_id: str) -> bool:
-        return ray.get(self._actor.touch_session.remote(session_id))
+    async def touch_session(self, session_id: str) -> bool:
+        return await self._actor.touch_session.remote(session_id)
 
     def get_session_last_heartbeat(self, session_id: str) -> float | None:
         return ray.get(self._actor.get_session_last_heartbeat.remote(session_id))
@@ -401,8 +379,8 @@ class ServerStateProxy:
     def unregister_replica(self, replica_id: str) -> None:
         ray.get(self._actor.unregister_replica.remote(replica_id))
 
-    def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
-        return ray.get(self._actor.get_available_replica_ids.remote(candidate_ids))
+    async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
+        return await self._actor.get_available_replica_ids.remote(candidate_ids)
 
     # ----- Sampling Session Management -----
 
@@ -414,10 +392,10 @@ class ServerStateProxy:
 
     # ----- Future Management -----
 
-    def get_future(self, request_id: str) -> dict[str, Any] | None:
-        return ray.get(self._actor.get_future.remote(request_id))
+    async def get_future(self, request_id: str) -> dict[str, Any] | None:
+        return await self._actor.get_future.remote(request_id)
 
-    def store_future_status(
+    async def store_future_status(
         self,
         request_id: str,
         status: str,
@@ -428,26 +406,8 @@ class ServerStateProxy:
         queue_state_reason: str | None = None,
     ) -> None:
         """Store task status with optional result (synchronous)."""
-        ray.get(
-            self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
-                                                   queue_state_reason))
-
-    # ----- Config Management -----
-
-    def add_config(self, key: str, value: Any):
-        return ray.get(self._actor.add_config.remote(key, value))
-
-    def add_or_get(self, key: str, value: Any) -> Any:
-        return ray.get(self._actor.add_or_get.remote(key, value))
-
-    def get_config(self, key: str) -> Any | None:
-        return ray.get(self._actor.get_config.remote(key))
-
-    def pop_config(self, key: str) -> Any | None:
-        return ray.get(self._actor.pop_config.remote(key))
-
-    def clear_config(self):
-        return ray.get(self._actor.clear_config.remote())
+        await self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
+                                                     queue_state_reason)
 
     # ----- Resource Cleanup -----
 
