@@ -555,7 +555,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             num_tokens = sum(num_tokens)
             parameters = list(self._get_trainable_parameters(adapter_name).values())
 
-            ep_clip_kwargs = self.strategy.get_ep_clip_kwargs(self.model) if hasattr(self.strategy, 'get_ep_clip_kwargs') else {}
+            ep_clip_kwargs = self.strategy.get_ep_clip_kwargs(self.model) if hasattr(
+                self.strategy, 'get_ep_clip_kwargs') else {}
 
             grad_norm = normalize_and_clip_grad_norm(
                 parameters,
