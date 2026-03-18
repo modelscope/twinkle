@@ -119,3 +119,14 @@ class AccelerateStrategy:
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
+
+    def get_full_state_dict(self, model) -> dict:
+        """Collect full state dict."""
+        from twinkle.utils import torch_util
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+        for name, param in unwrapped.named_parameters():
+            local = torch_util.to_local_tensor(param)
+            state_dict[name] = local.cpu()
+            del local
+        return state_dict

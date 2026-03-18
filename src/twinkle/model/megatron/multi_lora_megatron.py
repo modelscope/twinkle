@@ -170,7 +170,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return super().set_lr_scheduler(scheduler_cls, **kwargs)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         optimizer_config = self.optimizer_group[kwargs.get('adapter_name')]

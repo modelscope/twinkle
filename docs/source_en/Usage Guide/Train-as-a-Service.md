@@ -28,7 +28,7 @@ from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.tinker.common import input_feature_to_datum
+from twinkle.server.common import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507'
 base_url='http://www.modelscope.cn/twinkle'
