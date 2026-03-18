@@ -416,13 +416,23 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
     Non-persistent buffers are not included in ``state_dict()`` and will be
     lost when the model is moved to ``meta`` device.  We need to save them
     before the move and re-register them after broadcast.
+
+    Uses ``module._non_persistent_buffers_set`` (the same approach as
+    accelerate's ``get_non_persistent_buffers``) for precision — directly
+    reads PyTorch's internal tracking set rather than diffing against
+    ``state_dict()`` keys.
     """
-    sd_keys = set(model.state_dict().keys())
-    result = {}
-    for fqn, buf in model.named_buffers():
-        if fqn not in sd_keys:
-            result[fqn] = buf.clone()
-    return result
+    import copy
+
+    non_persistent_fqns: Set[str] = set()
+    for fqn, module in model.named_modules():
+        for buf_name in getattr(module, '_non_persistent_buffers_set', set()):
+            full_fqn = f'{fqn}.{buf_name}' if fqn else buf_name
+            non_persistent_fqns.add(full_fqn)
+
+    return copy.deepcopy({
+        k: v for k, v in model.named_buffers() if k in non_persistent_fqns
+    })
 
 
 def _restore_non_persistent_buffers(
