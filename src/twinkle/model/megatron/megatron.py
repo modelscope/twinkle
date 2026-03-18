@@ -365,10 +365,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def backward(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(collect='first', lazy_collect=False)
-    def get_lr(self):
-        return self.optimizer_group['default']._get_lr()
-
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_backward(self,
                          *,
