@@ -349,7 +349,7 @@ def main():
 
         for sequence in sample_response.sequences:
             all_input_data.append(sequence.new_input_feature)
-            all_old_logps.append(sequence.logprobs)
+            all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
             all_completion_lengths.append(len(sequence.tokens))
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             all_input_data

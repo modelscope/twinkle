@@ -20,7 +20,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '0')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
@@ -113,7 +113,7 @@ def main():
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
 
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
 
     optim_step = 0
     logger.info(get_device_placement())
@@ -137,7 +137,7 @@ def main():
         for sample_response in sample_responses:
             for sequence in sample_response.sequences:
                 all_input_data.append(sequence.new_input_feature)
-                all_old_logps.append(sequence.logprobs)
+                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
                 all_completion_lengths.append(len(sequence.tokens))
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             all_input_data

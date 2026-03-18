@@ -405,6 +405,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -571,11 +572,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer_config.inputs = inputs
         if logps and len({_logps.shape[1] for _logps in logps}) == 1:
             logps = torch.cat(logps, dim=0)
+        if logits and len({_logits.shape[1] for _logits in logits}) == 1:
+            logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()
+        if not return_logits:
+            logits = None
         if not forward_only:
-            optimizer_config.outputs = ModelOutput(logits=None, loss=loss, logps=logps)
-        return ModelOutput(logits=None, loss=loss, logps=logps)
+            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+        return ModelOutput(logits=logits, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):

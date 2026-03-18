@@ -8,6 +8,7 @@ import threading
 import torch
 import torch.distributed as dist
 import transformers
+from copy import copy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
 from peft.utils import load_peft_weights, set_peft_model_state_dict
@@ -367,6 +368,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -401,7 +403,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
         outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -417,6 +422,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -452,7 +458,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
         outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
     @remote_function(collect='mean')

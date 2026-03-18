@@ -166,7 +166,7 @@ def train():
         for sample_response in sample_responses:
             for sequence in sample_response.sequences:
                 all_input_data.append(sequence.new_input_feature)
-                all_old_logps.append(sequence.logprobs)
+                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
                 all_completion_lengths.append(len(sequence.tokens))
 
         # ========== 3. Compute rewards ==========
