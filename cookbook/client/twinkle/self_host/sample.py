@@ -73,7 +73,7 @@ def sample():
     # - sampling_params: controls generation behavior
     # - adapter_uri: optional LoRA adapter path for fine-tuned inference
     # - num_samples: number of completions per prompt
-    response = sampler.sample(
+    responses = sampler.sample(
         inputs=[trajectory] * num_prompts,
         sampling_params=sampling_params,
         adapter_uri=ADAPTER_URI,
@@ -83,12 +83,13 @@ def sample():
     # Step 8: Decode and print the results
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    logger.info(f'Generated {len(response.sequences)} sequences '
-                f'({num_prompts} prompts x {num_samples} samples)')
+    for response in responses:
+        logger.info(f'Generated {len(response.sequences)} sequences '
+                    f'({num_prompts} prompts x {num_samples} samples)')
 
-    for i, seq in enumerate(response.sequences):
-        text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
-        logger.info(f'Sequence {i}:\n  {text}\n')
+        for i, seq in enumerate(response.sequences):
+            text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
+            logger.info(f'Sequence {i}:\n  {text}\n')
 
 
 if __name__ == '__main__':

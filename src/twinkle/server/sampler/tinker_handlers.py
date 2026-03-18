@@ -79,31 +79,32 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         stop=body.sampling_params.stop,
                     )
 
-                response = self.sampler.sample(
+                responses = self.sampler.sample(
                     inputs=[prompt_inputs] * body.num_samples,
                     sampling_params=sampling_params,
                     adapter_path=adapter_uri,
                 )
 
-                # Convert twinkle SampleResponse to tinker types
                 tinker_sequences = []
-                for seq in response.sequences:
-                    logprobs = None
-                    if seq.logprobs is not None:
-                        if any(lp is None for lp in seq.logprobs):
-                            logprobs = None
-                        else:
-                            logprobs = list(seq.logprobs)
-                    tinker_sequences.append(
-                        types.SampledSequence(
-                            stop_reason=seq.stop_reason,
-                            tokens=list(seq.tokens),
-                            logprobs=logprobs,
-                        ))
+                for response in responses:
+                    # Convert twinkle SampleResponse to tinker types
+                    for seq in response.sequences:
+                        logprobs = None
+                        if seq.logprobs is not None:
+                            if any(lp is None for lp in seq.logprobs):
+                                logprobs = None
+                            else:
+                                logprobs = list(seq.logprobs)
+                        tinker_sequences.append(
+                            types.SampledSequence(
+                                stop_reason=seq.stop_reason,
+                                tokens=list(seq.tokens),
+                                logprobs=logprobs,
+                            ))
                 return types.SampleResponse(
                     sequences=tinker_sequences,
-                    prompt_logprobs=response.prompt_logprobs,
-                    topk_prompt_logprobs=response.topk_prompt_logprobs,
+                    prompt_logprobs=responses[0].prompt_logprobs,
+                    topk_prompt_logprobs=responses[0].topk_prompt_logprobs,
                 )
             except Exception:
                 logger.error(traceback.format_exc())

@@ -219,7 +219,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         lora_request: Optional[Any] = None,
         *,
         logprobs_only: bool = False,
-    ) -> List[SampledSequence]:
+    ) -> SampleResponse:
         """Sample a single input asynchronously.
 
         Args:
@@ -231,7 +231,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             logprobs_only: Only return logprobs (no generated tokens).
 
         Returns:
-            List of num_samples SampledSequence objects.
+            A SampleResponse object
         """
         input_ids = feat['input_ids']
         if hasattr(input_ids, 'tolist'):

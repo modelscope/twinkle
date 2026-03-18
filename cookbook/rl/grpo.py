@@ -125,7 +125,7 @@ def main():
         global_prompts = batch if isinstance(batch, list) else [batch]
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
-        sample_response = sampler.sample(
+        sample_responses = sampler.sample(
             global_prompts*NUM_GENERATIONS,
             sampling_params,
             num_samples=1,
@@ -135,10 +135,11 @@ def main():
         all_old_logps: List[List[float]] = []
         all_completion_lengths: List[int] = []
 
-        for sequence in sample_response.sequences:
-            all_input_data.append(sequence.new_input_feature)
-            all_old_logps.append(sequence.logprobs)
-            all_completion_lengths.append(len(sequence.tokens))
+        for sample_response in sample_responses:
+            for sequence in sample_response.sequences:
+                all_input_data.append(sequence.new_input_feature)
+                all_old_logps.append(sequence.logprobs)
+                all_completion_lengths.append(len(sequence.tokens))
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             all_input_data
         )

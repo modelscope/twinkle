@@ -101,9 +101,8 @@ Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/enviro
 
 ## Changelog
 
+- 🎉2026-03-19 Support GKD training ，please refer to this [cookbook](cookbook/rl/gkd_on_policy.py).
 - 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models.
-We also made available serverless training capabilities on [ModelScope](https://modelscope.cn) via
-Tinker-compatible APIs.
 
 ## Training as a Service on ModelScope
 

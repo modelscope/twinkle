@@ -91,6 +91,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 
 ## 更新日志
 
+🎉2026-03-19 支持GKD蒸馏能力，参考[cookbook](cookbook/rl/gkd_on_policy.py)。
 🎉2026-02-13 Twinkle✨ 初始版本发布，支持文本模型的SFT/PT/RL训练。我们还通过兼容Tinker的API，在魔搭社区上提供了无服务器训练功能。
 
 ## ModelScope 的训练服务

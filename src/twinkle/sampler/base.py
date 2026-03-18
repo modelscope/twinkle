@@ -24,7 +24,7 @@ class Sampler(ABC):
         adapter_name: str = '',
         *,
         num_samples: int = 1,
-    ) -> SampleResponse:
+    ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
         Args:
