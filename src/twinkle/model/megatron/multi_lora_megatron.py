@@ -12,10 +12,10 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 from twinkle import DeviceMesh, remote_class, remote_function, requires, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.infra import collect_tensor_dict
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
-from ...infra import collect_tensor_dict
 from ..multi_lora import MultiLora
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
