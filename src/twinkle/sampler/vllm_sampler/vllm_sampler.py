@@ -25,6 +25,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
+
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
@@ -33,6 +35,17 @@ from twinkle.sampler.base import Sampler
 from twinkle.utils import Platform
 
 logger = get_logger()
+
+
+def _convert_ndarray_to_list(obj: Any) -> Any:
+    """Recursively convert numpy arrays to lists in a dict/list structure."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: _convert_ndarray_to_list(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_ndarray_to_list(item) for item in obj]
+    return obj
 
 
 @remote_class()
@@ -236,7 +249,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                         tokens=seq.tokens,
                         logprobs=seq.logprobs,
                         decoded=self.template.decode(seq.tokens),
-                        new_input_feature=self.template.concat_input_feature(feat, seq.tokens),
+                        new_input_feature=_convert_ndarray_to_list(
+                            self.template.concat_input_feature(feat, seq.tokens)
+                        ),
                     ) for seq in response.sequences
                 ],
                 prompt_logprobs=response.prompt_logprobs,
@@ -247,7 +262,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     SampledSequence(
                         tokens=[],
                         stop_reason=seq.stop_reason,
-                        new_input_feature=feat,
+                        new_input_feature=_convert_ndarray_to_list(feat),
                     ) for seq in response.sequences
                 ],
                 prompt_logprobs=response.prompt_logprobs,
