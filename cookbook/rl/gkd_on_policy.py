@@ -37,8 +37,6 @@ Environment variables (all optional):
 """
 
 import os
-import threading
-from queue import Queue
 from typing import List, Optional
 
 import torch
@@ -200,72 +198,38 @@ def main():
     logger.info(f'GKD On-Policy | student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}')
     logger.info(f'  beta={GKD_BETA}  T={GKD_TEMPERATURE}  topk={GKD_TOPK}')
 
-    # ── Async sampling with queue ───────────────────────────────────────────────
-    sample_queue: Queue = Queue(maxsize=2)  # Prefetch up to 2 batches
-    stop_event = threading.Event()
-
-    def sample_producer():
-        """Background thread: sample from student/teacher and put results in queue."""
-        for batch in dataloader:
-            if stop_event.is_set():
-                break
-
-            # 1. Student vLLM generates completions
-            sample_response = student_sampler.sample(
-                batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=N_SAMPLES)
-            )
-            input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
-
-            # 2. Teacher vLLM computes top-k prompt logprobs on generated sequences
-            teacher_response = teacher_sampler.sample(
-                input_data,
-                SamplingParams(max_tokens=0, temperature=1.0, prompt_logprobs=GKD_TOPK),
-            )
-
-            # 3. Convert teacher logprobs to tensor format for GKDLoss
-            teacher_output = convert_topk_prompt_logprobs(
-                [resp.topk_prompt_logprobs for resp in teacher_response],
-            )
-
-            # Put (input_data, teacher_output) into queue
-            sample_queue.put((input_data, teacher_output))
-
-        # Signal end of data
-        sample_queue.put(None)
-
-    # Start sampling thread
-    producer_thread = threading.Thread(target=sample_producer, daemon=True)
-    producer_thread.start()
-
-    # ── Training loop (consume from queue) ──────────────────────────────────────
     optim_step = 0
-    while True:
+    for batch in dataloader:
         if optim_step >= MAX_STEPS:
-            stop_event.set()
             break
 
-        # Get data from queue (blocking)
-        item = sample_queue.get()
-        if item is None:  # End of data
-            break
+        # 1. Student vLLM generates completions
+        sample_response = student_sampler.sample(batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=N_SAMPLES))
+        input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
 
-        input_data, teacher_output = item
+        # 2. Teacher vLLM computes top-k prompt logprobs on generated sequences
+        teacher_response = teacher_sampler.sample(
+            input_data,
+            SamplingParams(max_tokens=1, temperature=1.0, prompt_logprobs=GKD_TOPK),
+        )
 
-        # Student forward + GKD backward
+        # 3. Convert teacher logprobs to tensor format for GKDLoss
+        # teacher_response is List[SampleResponse], extract topk_prompt_logprobs from each
+        teacher_output = convert_topk_prompt_logprobs(
+            [resp.topk_prompt_logprobs for resp in teacher_response],
+        )
+
+        # 4. Student forward + GKD backward
         student_model.forward_backward(inputs=input_data, **teacher_output)
         student_model.clip_grad_and_step()
         optim_step += 1
 
-        if optim_step > 0 and optim_step % 10 == 0:
+        if optim_step % 10 == 0:
             metric = student_model.calculate_metric(is_training=True)
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {metric}')
 
-        if optim_step > 0 and optim_step % 50 == 0:
+        if optim_step % 50 == 0:
             student_model.save(f'gkd-onpolicy-ckpt-{optim_step}')
-
-    # Wait for producer to finish
-    stop_event.set()
-    producer_thread.join(timeout=5)
 
     student_model.save('gkd-onpolicy-final')
     logger.info('GKD on-policy training completed.')
