@@ -107,11 +107,13 @@ class AccelerateStrategy:
             activation_checkpointing=fsdp_config.pop('activation_checkpointing', False),
             auto_wrap_policy=fsdp_config.pop('auto_wrap_policy', 'transformer_based_wrap'),  # noqa
             reshard_after_forward=fsdp_config.pop('reshard_after_forward', True),
+            cpu_ram_efficient_loading=fsdp_config.pop('cpu_ram_efficient_loading', True),
             **fsdp_config,
         )
-        # Enable memory efficient model loading in transformers(see `is_fsdp_enabled` in transformers)
-        # os.environ['ACCELERATE_USE_FSDP'] = '1'
-        # os.environ['FSDP_CPU_RAM_EFFICIENT_LOADING'] = '1'
+        # The env vars (ACCELERATE_USE_FSDP, FSDP_CPU_RAM_EFFICIENT_LOADING) are set
+        # in TransformersModel.__init__ before from_pretrained, and the plugin's
+        # __post_init__ also sets FSDP_CPU_RAM_EFFICIENT_LOADING when
+        # cpu_ram_efficient_loading=True.
         return fsdp_plugin
 
     def wrap_model(self, model, *args):

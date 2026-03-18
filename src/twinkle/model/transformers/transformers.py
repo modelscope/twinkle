@@ -183,6 +183,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
+            memory_efficient_init: bool = True,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -196,6 +197,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
         self._decide_strategy(strategy)
+        self._memory_efficient_init = memory_efficient_init
         self.grad_scaler_config = grad_scaler_config
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
@@ -203,8 +205,39 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.model = model_cls.from_config(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
-            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
-        # Construct sequence-parallel strategy lazily during wrapping to reduce init-time side effects.
+            # Memory-efficient init: set env vars so transformers' from_pretrained
+            # uses its built-in FSDP-aware loading path.
+            # When is_fsdp_enabled() returns True inside transformers:
+            #   - All ranks: model created on meta device
+            #   - Rank 0: loads real weights from disk
+            #   - Non-rank-0: replaces params with torch.empty_like (no disk I/O)
+            # This works for BOTH strategies:
+            #   - NativeFSDPStrategy: wrap_model does meta → broadcast (Task 4)
+            #   - AccelerateStrategy: accelerator.prepare() → fsdp2_prepare_model()
+            #     does its own meta → broadcast (accelerate built-in)
+            use_efficient_loading = (
+                memory_efficient_init
+                and self.device_mesh is not None
+            )
+            _saved_env = {}
+            if use_efficient_loading:
+                _saved_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
+                _saved_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
+                os.environ['ACCELERATE_USE_FSDP'] = 'true'
+                os.environ['FSDP_CPU_RAM_EFFICIENT_LOADING'] = 'true'
+            try:
+                self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
+            finally:
+                # Restore original env vars to avoid polluting other code paths.
+                # For AccelerateStrategy, Accelerator.__init__ already sets
+                # ACCELERATE_USE_FSDP=true when fsdp_plugin is provided, so
+                # restoring here is safe — accelerate will re-set it as needed.
+                if use_efficient_loading:
+                    for key, old_val in _saved_env.items():
+                        if old_val is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = old_val
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -284,16 +317,25 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
+
+            extra_kwargs = {}
+            if isinstance(self.strategy, NativeFSDPStrategy):
+                extra_kwargs['memory_efficient'] = getattr(self, '_memory_efficient_init', True)
+
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
                 assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
+                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer, **extra_kwargs)
                 optimizer_group.optimizer = optimizer
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                self.model = self.strategy.wrap_model(self.model)
+                result = self.strategy.wrap_model(self.model, **extra_kwargs)
+                if isinstance(result, tuple):
+                    self.model = result[0]
+                else:
+                    self.model = result
             self._model_wrapped = True
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
