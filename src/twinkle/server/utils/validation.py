@@ -11,7 +11,7 @@ async def verify_request_token(request: Request, call_next):
     This middleware:
     1. Extracts the Bearer token from Authorization header
     2. Validates the token
-    3. Extracts serve_multiplexed_model_id for sticky sessions
+    3. Extracts X-Ray-Serve-Request-Id for sticky sessions
     4. Stores token and request_id in request.state for later use
 
     Args:
@@ -26,13 +26,13 @@ async def verify_request_token(request: Request, call_next):
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
-    request_id = request.headers.get('serve_multiplexed_model_id')
+    request_id = request.headers.get('X-Ray-Serve-Request-Id')
     if not request_id:
         return JSONResponse(
-            status_code=400,
-            content={'detail': 'Missing serve_multiplexed_model_id header, required for sticky session'})
+            status_code=400, content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
     request.state.request_id = request_id
     request.state.token = token
+    request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
     response = await call_next(request)
     return response
 
@@ -64,3 +64,16 @@ def get_token_from_request(request: Request) -> str:
         The extracted token or empty string if not found
     """
     return getattr(request.state, 'token', '') or ''
+
+
+def get_session_id_from_request(request: Request) -> str:
+    """
+    Extract session ID from request.
+
+    Args:
+        request: The FastAPI Request object
+
+    Returns:
+        The extracted session ID or empty string if not found
+    """
+    return getattr(request.state, 'session_id', '') or ''

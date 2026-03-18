@@ -6,7 +6,7 @@ The Tinker Client is suitable for scenarios with existing Tinker training code. 
 
 ```python
 # Initialize Tinker client before importing ServiceClient
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 init_tinker_client()
 
@@ -28,7 +28,7 @@ for item in service_client.get_server_capabilities().supported_models:
 When calling `init_tinker_client`, the following operations are automatically executed:
 
 1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
-2. **Set Request Headers**: Inject necessary authentication headers such as `serve_multiplexed_model_id` and `Authorization`
+2. **Set Request Headers**: Inject necessary authentication headers such as `X-Ray-Serve-Request-Id` and `Authorization`
 
 After initialization, simply import `from tinker import ServiceClient` to connect to Twinkle Server, and **all existing Tinker training code can be used directly** without any modifications.
 
@@ -41,7 +41,7 @@ import dotenv
 dotenv.load_dotenv('.env')
 
 # Step 1: Initialize Tinker client before importing ServiceClient
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 init_tinker_client()
 
 from tinker import types, ServiceClient
@@ -139,11 +139,11 @@ Tinker compatible mode can also leverage Twinkle's dataset components to simplif
 ```python
 from tqdm import tqdm
 from tinker import types
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.tinker.common import input_feature_to_datum
+from twinkle.server.common import input_feature_to_datum
 
 # Initialize Tinker client before importing ServiceClient
 init_tinker_client()
@@ -155,7 +155,7 @@ base_model = "Qwen/Qwen2.5-0.5B-Instruct"
 # Use Twinkle's Dataset component to load and preprocess data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
-dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_cache_file=False)
+dataset.map(SelfCognitionProcessor('twinkle model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
@@ -216,7 +216,7 @@ You can also load saved checkpoints for inference:
 import os
 from tinker import types
 from modelscope import AutoTokenizer
-from twinkle_client import init_tinker_client
+from twinkle import init_tinker_client
 
 # Initialize Tinker client before importing ServiceClient
 init_tinker_client()

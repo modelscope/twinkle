@@ -32,6 +32,7 @@ class DeviceMesh:
     mesh_dim_names: Optional[tuple[str, ...]]
     ep_size: Optional[int] = None
     etp_size: Optional[int] = None
+    ep_fsdp_size: Optional[int] = None
     # megatron only
     vpp_size: Optional[int] = None
     # transformers only
@@ -51,6 +52,7 @@ class DeviceMesh:
                    cp_size: int = None,
                    ep_size: int = None,
                    etp_size: int = 1,
+                   ep_fsdp_size: int = None,
                    vpp_size: int = None,
                    device_type: str = 'cuda',
                    sequence_parallel: bool = False) -> 'DeviceMesh':
@@ -66,6 +68,7 @@ class DeviceMesh:
             cp_size: The context parallel size
             ep_size: The expert parallel size
             etp_size: The expert tensor parallel size
+            ep_fsdp_size: The expert FSDP parallel size, auto-computed as world_size // ep_size if not provided
             vpp_size: The virtual pipeline parallel size
             device_type: The device type
             sequence_parallel: Use sequence parallel or not, default false
@@ -103,6 +106,8 @@ class DeviceMesh:
             mesh_dim_names.append('tp')
             if origin_world_size == 1:
                 world_size *= tp_size
+        if ep_size is not None and ep_size > 1 and ep_fsdp_size is None:
+            ep_fsdp_size = world_size // ep_size
         return DeviceMesh(
             device_type=device_type,
             mesh=np.arange(world_size).reshape(mesh_dim_sizes),
@@ -110,6 +115,7 @@ class DeviceMesh:
             vpp_size=vpp_size,
             ep_size=ep_size,
             etp_size=etp_size,
+            ep_fsdp_size=ep_fsdp_size,
             ulysses_size=ulysses_size,
             sequence_parallel=sequence_parallel,
         )
@@ -118,7 +124,7 @@ class DeviceMesh:
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
-        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep'}
+        valid_dim_names = {'dp', 'fsdp', 'tp', 'pp', 'cp', 'ep', 'ep_fsdp'}
         if self.mesh_dim_names is not None:
             if len(self.mesh_dim_names) != len(self.mesh.shape):
                 raise ValueError(f'The shape of `mesh_dim_names`:({len(self.mesh_dim_names)}) '

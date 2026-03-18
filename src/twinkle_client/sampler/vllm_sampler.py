@@ -8,9 +8,10 @@
 #   1. Modify the source files in src/twinkle/
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
-from typing import Any, Optional, List, Dict, Union
-from twinkle_client.http import http_post, heartbeat_manager
+from typing import Any, Dict, List, Optional, Union
+from twinkle_client.http import http_post
 from twinkle.sampler.base import Sampler
+from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 
@@ -19,7 +20,7 @@ class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
 
     This client manages sampling operations and adapter synchronization with the sampler server.
-    Each adapter has its own lifecycle managed through automatic heartbeats.
+    The server-side session (managed by TwinkleClient) keeps the sampler alive.
     """
 
     def __init__(self, model_id: str, **kwargs):
@@ -30,25 +31,15 @@ class vLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
-        self.server_url = f'{self.server_url}/samplers/{model_id}'
+        self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
             json_data=kwargs
         )
         response.raise_for_status()
 
-    def _send_adapter_heartbeat(self):
-        """Internal method to send adapter heartbeat."""
-        if not self.adapter_name:
-            return
-        response = http_post(
-            url=f'{self.server_url}/heartbeat',
-            json_data={'adapter_name': self.adapter_name}
-        )
-        response.raise_for_status()
-
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs):
-        """Add a new adapter to the sampler and start automatic heartbeat."""
+    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> AddAdapterResponse:
+        """Add a new adapter to the sampler."""
         if isinstance(config, PeftConfig):
             config = config.__dict__
         response = http_post(
@@ -56,23 +47,8 @@ class vLLMSampler(Sampler):
             json_data={'adapter_name': adapter_name, 'config': config, **kwargs}
         )
         response.raise_for_status()
-
-        # Register adapter for automatic heartbeat after successful creation
         self.adapter_name = adapter_name
-        heartbeat_manager.register_adapter(
-            self.adapter_name,
-            self._send_adapter_heartbeat
-        )
-
-        return response.json()
-
-    def __del__(self):
-        """Cleanup: unregister adapter from heartbeat manager."""
-        try:
-            if self.adapter_name:
-                heartbeat_manager.unregister_adapter(self.adapter_name)
-        except:
-            pass
+        return AddAdapterResponse(**response.json())
 
     def sample(
         self,
@@ -81,7 +57,7 @@ class vLLMSampler(Sampler):
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
-    ) -> Dict[str, Any]:
+    ) -> SampleResponseModel:
         """Sample from the model.
 
         Args:
@@ -92,7 +68,7 @@ class vLLMSampler(Sampler):
             num_samples: Number of completions to generate per prompt.
 
         Returns:
-            Dict with 'sequences' list, each containing tokens, logprobs, stop_reason.
+            SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
         json_data = {
             'inputs': inputs,
@@ -108,13 +84,13 @@ class vLLMSampler(Sampler):
             json_data=json_data
         )
         response.raise_for_status()
-        return response.json()
+        return SampleResponseModel(**response.json())
 
-    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs):
+    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
         response = http_post(
             url=f'{self.server_url}/set_template',
             json_data={'template_cls': template_cls, 'adapter_name': adapter_name, **kwargs}
         )
         response.raise_for_status()
-        return response.json()
+        return SetTemplateResponse(**response.json())

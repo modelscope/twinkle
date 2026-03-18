@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
+from typing import Any, Dict, List
 
 from twinkle.data_format import Message, Trajectory
 from .base import Preprocessor
@@ -7,7 +8,13 @@ from .base import Preprocessor
 
 class CompetitionMathProcessor(Preprocessor):
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Dict[str, Any]:
         problem = row['problem']
         solution = row['solution']
         messages = [
@@ -19,7 +26,13 @@ class CompetitionMathProcessor(Preprocessor):
 
 class CompetitionMathGRPOProcessor(Preprocessor):
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
         problem = row['problem']
         solution = row['solution']
         messages = [
@@ -39,7 +52,13 @@ class SelfCognitionProcessor(Preprocessor):
         self.model_name = model_name
         self.model_author = model_author
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
         problem = row['query'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
         solution = row['response'].replace('{{NAME}}', self.model_name).replace('{{AUTHOR}}', self.model_author)
         messages = [
@@ -52,7 +71,13 @@ class SelfCognitionProcessor(Preprocessor):
 
 class AlpacaProcessor(Preprocessor):
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
         instruction = row.get('instruction') or ''
         input_text = row.get('input') or ''
         output_text = row.get('output') or ''
@@ -68,7 +93,13 @@ class CountdownProcessor(Preprocessor):
     system_prompt = ('You are a helpful assistant. You first thinks about the reasoning process '
                      'in the mind and then provides the user with the answer.')
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
         nums = row.get('nums', [])
         target = row.get('response', row.get('target', 0))
 
@@ -103,7 +134,13 @@ class GSM8KProcessor(Preprocessor):
             return match.group(1).replace(',', '').strip()
         return ''
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
         question = row['question']
         answer = row.get('answer', '')
         ground_truth = self.extract_ground_truth(answer)

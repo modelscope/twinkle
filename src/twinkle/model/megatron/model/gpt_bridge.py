@@ -3,6 +3,8 @@
 
 import math
 import os
+import re
+import shutil
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -18,7 +20,7 @@ from typing import Callable, List, Optional, Union
 from twinkle.hub import HubOperation
 from twinkle.model.megatron.args import get_args  # Use twinkle's get_args
 from twinkle.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr, get_logger,
-                           get_modules_to_not_convert, get_multimodal_target_regex, is_last_rank, requires)
+                           get_modules_to_not_convert, is_last_rank, requires)
 
 logger = get_logger()
 
@@ -108,6 +110,12 @@ class GPTBridge:
 
     def _get_hf_mlp(self, layer_idx):
         return getattr(self.hf_layers[layer_idx], self.get_hf_mlp_prefix(layer_idx))
+
+    def _get_transpose(self):
+        if self.args.hf_model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
+            return True
+        else:
+            return False
 
     def _init_meta_hf_model(self):
         import copy
@@ -298,6 +306,9 @@ class GPTBridge:
                     if self._is_peft_format:
                         if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k:
                             k = k.replace(f'{self._adapter_name}.', '')
+                            if '.lora_A.' in k:
+                                module_name = k.split('.lora_A.')[0].rsplit('.', 1)[-1]
+                                self._peft_target_modules.add(module_name)
                             new_state_dict[k] = v
                     else:
                         if '.lora_A.' in k or '.lora_B.' in k or 'original_module.' in k:
@@ -733,6 +744,15 @@ class GPTBridge:
             hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
         return hf_state_dict
 
+    def _get_hf_grouped(self):
+        if self.args.hf_model_type in {
+                'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'dots1', 'ernie4_5_moe', 'glm4_moe',
+                'glm4_moe_lite', 'glm4v_moe', 'minimax_m2', 'olmoe', 'qwen3_next', 'kimi_vl', 'qwen3_omni_moe',
+                'qwen3_5_moe'
+        }:
+            return False, False
+        return None, None
+
     def _set_mlp_state(self,
                        mg_mlp,
                        hf_state_dict,
@@ -741,6 +761,8 @@ class GPTBridge:
                        to_mcore: bool,
                        ep_rank: Optional[int] = None,
                        hf_mlp=None):
+        if to_mcore:
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         if hf_mlp is None:
             hf_mlp = self._get_hf_mlp(layer_idx)
         is_expert = ep_rank is not None
@@ -748,18 +770,38 @@ class GPTBridge:
         hf_grouped = False
         args = self.args
         if is_expert:
-            hf_grouped = not hasattr(hf_mlp.experts, '__len__')
-            hf_mlp = hf_mlp.experts if hf_grouped else hf_mlp.experts[0]
+            hf_mlp = hf_mlp.experts
+            # When converting to_mcore, hf_grouped is determined by default from the hf_state_dict condition.
+            # When converting to_hf, it is determined by default from the hf_mlp condition.
+            if to_mcore:
+                pattern = r'\d+\.down_proj'
+                hf_grouped = not any(re.match(pattern, k) is not None for k in hf_state_dict.keys())
+            else:
+                hf_grouped = not hasattr(hf_mlp, '__len__')
+            if hasattr(hf_mlp, '__len__'):
+                hf_mlp = hf_mlp[0]
             num_local_experts = args.num_experts // self.ep_size
-        # TODO: Temporary modification for transformers 5.0 compatibility with GLM4.6v, to be fixed later
-        is_gate_up = hasattr(hf_mlp, 'gate_up_proj')
-        if self.is_transformers_5 and self.args.hf_model_type in {'glm4v_moe', 'glm4_moe_lite'}:
-            hf_grouped = False
-            is_gate_up = False
-        if to_mcore or hf_grouped:
-            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+        if to_mcore:
+            is_gate_up = any('gate_up_proj' in k for k in hf_state_dict.keys())
         else:
+            is_gate_up = hasattr(hf_mlp, 'gate_up_proj')
+        # transformers 5.0 compatibility
+        if self.is_transformers_5 and not to_mcore and is_expert:
+            _hf_grouped, _is_gate_up = self._get_hf_grouped()
+            if _hf_grouped is not None:
+                hf_grouped = _hf_grouped
+            if _is_gate_up is not None:
+                is_gate_up = _is_gate_up
+
+        need_transpose = True
+        if self.is_transformers_5 and hf_grouped:
+            need_transpose = self._get_transpose()
+
+        if hf_grouped and not to_mcore:
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+        elif not to_mcore:
             hf_state_dict = {}
+
         # linear_fc1
         if to_mcore:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())
@@ -829,18 +871,22 @@ class GPTBridge:
                                 gate_up_proj_weight = self.mxfp4_quantizer.convert(blocks, scales)
                             else:
                                 gate_up_proj_weight = hf_state_dict['gate_up_proj'].load()
-                            gate_up_proj_weight = gate_up_proj_weight.transpose(1, 2)
+                            if need_transpose:
+                                gate_up_proj_weight = gate_up_proj_weight.transpose(1, 2)
+
                             gate_up_proj_weight = gate_up_proj_weight[ep_rank * num_local_experts:(ep_rank + 1)
                                                                       * num_local_experts]
                             if has_scale_inv:
-                                gate_up_scale_inv = hf_state_dict['gate_up_proj_scale_inv'].load().transpose(1, 2)
+                                gate_up_scale_inv = hf_state_dict['gate_up_proj_scale_inv'].load()
+                                if need_transpose:
+                                    gate_up_scale_inv = gate_up_scale_inv.transpose(1, 2)
                                 gate_up_scale_inv = gate_up_scale_inv[ep_rank * num_local_experts:(ep_rank + 1)
                                                                       * num_local_experts]
                             if fc1_bias is not None:
                                 gate_up_proj_bias = hf_state_dict['gate_up_proj_bias'].load()
                                 gate_up_proj_bias = gate_up_proj_bias[ep_rank * num_local_experts:(ep_rank + 1)
                                                                       * num_local_experts]
-                            if args.llm_model_type == 'gpt_oss':
+                            if args.hf_model_type == 'gpt_oss':
                                 gate_proj_weight = gate_up_proj_weight[:, ::2]
                                 up_proj_weight = gate_up_proj_weight[:, 1::2]
                                 gate_proj_bias, up_proj_bias = gate_up_proj_bias[:, ::2], gate_up_proj_bias[:, 1::2]
@@ -989,12 +1035,13 @@ class GPTBridge:
                     if is_gate_up:
                         if is_expert:
                             if hf_grouped:
-                                gate_up_proj_weight = gate_up_proj_weight.transpose(1, 2)
+                                if need_transpose:
+                                    gate_up_proj_weight = gate_up_proj_weight.transpose(1, 2)
                                 if 'gate_up_proj' in hf_state_dict:
                                     gate_up_proj_weight = torch.concat(
                                         [hf_state_dict['gate_up_proj'], gate_up_proj_weight], dim=0)
                                 is_last_ckpt = gate_up_proj_weight.shape[0] == args.num_experts
-                                if args.llm_model_type == 'gpt_oss' and is_last_ckpt:
+                                if args.hf_model_type == 'gpt_oss' and is_last_ckpt:
                                     gate_proj_weight, up_proj_weight = gate_up_proj_weight.chunk(2, dim=2)
                                     new_gate_up_proj_weight = torch.empty_like(gate_up_proj_weight)
                                     new_gate_up_proj_weight[..., ::2] = gate_proj_weight
@@ -1003,7 +1050,8 @@ class GPTBridge:
                                     del new_gate_up_proj_weight, gate_proj_weight, up_proj_weight
                                 hf_state_dict['gate_up_proj'] = gate_up_proj_weight.clone()
                                 if scale_inv is not None:
-                                    scale_inv = scale_inv.transpose(1, 2)
+                                    if need_transpose:
+                                        scale_inv = scale_inv.transpose(1, 2)
                                     if 'gate_up_proj_scale_inv' in hf_state_dict:
                                         scale_inv = torch.concat([hf_state_dict['gate_up_proj_scale_inv'], scale_inv],
                                                                  dim=0)
@@ -1013,7 +1061,7 @@ class GPTBridge:
                                     if 'gate_up_proj_bias' in hf_state_dict:
                                         gate_up_proj_bias = torch.concat(
                                             [hf_state_dict['gate_up_proj_bias'], gate_up_proj_bias], dim=0)
-                                    if args.llm_model_type == 'gpt_oss' and is_last_ckpt:
+                                    if args.hf_model_type == 'gpt_oss' and is_last_ckpt:
                                         gate_proj_bias, up_proj_bias = gate_up_proj_bias.chunk(2, dim=1)
                                         new_gate_up_proj_bias = torch.empty_like(gate_up_proj_bias)
                                         new_gate_up_proj_bias[:, ::2] = gate_proj_bias
@@ -1095,12 +1143,15 @@ class GPTBridge:
                             down_proj_weight = self.mxfp4_quantizer.convert(blocks, scales)
                         else:
                             down_proj_weight = hf_state_dict['down_proj'].load()
-                        down_proj_weight = down_proj_weight.transpose(1, 2)
+                        if need_transpose:
+                            down_proj_weight = down_proj_weight.transpose(1, 2)
                         down_proj_weight = down_proj_weight[ep_rank * num_local_experts:(ep_rank + 1)
                                                             * num_local_experts].reshape(
                                                                 -1, down_proj_weight.shape[-1])
                         if has_scale_inv:
-                            down_scale_inv = hf_state_dict['down_proj_scale_inv'].load().transpose(1, 2)
+                            down_scale_inv = hf_state_dict['down_proj_scale_inv'].load()
+                            if need_transpose:
+                                down_scale_inv = down_scale_inv.transpose(1, 2)
                             down_scale_inv = down_scale_inv[ep_rank * num_local_experts:(ep_rank + 1)
                                                             * num_local_experts].reshape(-1, down_scale_inv.shape[-1])
                         if fc2_bias is not None:
@@ -1180,12 +1231,14 @@ class GPTBridge:
                     del fc2_weight, fc2_bias
                     if down_proj_weight is not None:
                         if hf_grouped:
-                            down_proj_weight = down_proj_weight.transpose(1, 2)
+                            if need_transpose:
+                                down_proj_weight = down_proj_weight.transpose(1, 2)
                             if 'down_proj' in hf_state_dict:
                                 down_proj_weight = torch.concat([hf_state_dict['down_proj'], down_proj_weight], dim=0)
                             hf_state_dict['down_proj'] = down_proj_weight.clone()
                             if scale_inv is not None:
-                                scale_inv = scale_inv.transpose(1, 2)
+                                if need_transpose:
+                                    scale_inv = scale_inv.transpose(1, 2)
                                 if 'down_proj_scale_inv' in hf_state_dict:
                                     scale_inv = torch.concat([hf_state_dict['down_proj_scale_inv'], scale_inv], dim=0)
                                 hf_state_dict['down_proj_scale_inv'] = scale_inv.clone()
@@ -1446,7 +1499,7 @@ class GPTBridge:
             hf_state_dict = {}
         self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
         transformer_layer = None if mtp_layer is None else mtp_layer.transformer_layer
-        if not to_mcore and not self.args.hf_model_type.startswith('qwen3_next'):
+        if not to_mcore and not self.args.hf_model_type.startswith(('qwen3_next', 'qwen3_5')):
             self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, 'embed_tokens.weight',
                                  to_mcore)
             if self.args.untie_embeddings_and_output_weights:
@@ -1526,16 +1579,7 @@ class GPTBridge:
                 peft_config = copy(mg_models[0].peft_config[self._adapter_name])
                 if args.task_type == 'seq_cls':
                     peft_config.task_type = 'SEQ_CLS'
-                if args.is_multimodal and 'all-linear' in args.target_modules:
-                    peft_config.target_modules = get_multimodal_target_regex(
-                        self.hf_model,
-                        freeze_llm=args.freeze_llm,
-                        freeze_vit=args.freeze_vit,
-                        freeze_aligner=args.freeze_aligner,
-                        include_embedding='all-embedding' in args.target_modules,
-                        exclude_router='all-router' not in args.target_modules)
-                else:
-                    peft_config.target_modules = self._peft_target_modules
+                peft_config.target_modules = self._peft_target_modules
                 peft_config.modules_to_save = self._peft_modules_to_save
                 peft_config.save_pretrained(output_dir)
             else:

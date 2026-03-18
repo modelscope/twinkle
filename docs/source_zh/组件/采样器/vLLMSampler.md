@@ -11,7 +11,7 @@ from twinkle import DeviceMesh
 
 # 创建采样器
 sampler = vLLMSampler(
-    model_id='ms://Qwen/Qwen2.5-7B-Instruct',
+    model_id='ms://Qwen/Qwen3.5-4B',
     device_mesh=DeviceMesh.from_sizes(dp_size=2, tp_size=2),
     remote_group='sampler_group'
 )
@@ -60,7 +60,7 @@ twinkle.initialize('ray', groups=device_groups)
 
 # 创建远程采样器
 sampler = vLLMSampler(
-    model_id='ms://Qwen/Qwen2.5-7B-Instruct',
+    model_id='ms://Qwen/Qwen3.5-4B',
     device_mesh=DeviceMesh.from_sizes(dp_size=4),
     remote_group='sampler'
 )
@@ -68,5 +68,11 @@ sampler = vLLMSampler(
 # sample 方法会在 remote worker 中执行
 response = sampler.sample(trajectories, sampling_params=params)
 ```
+
+## 环境变量
+
+- `TWINKLE_VLLM_IPC_TIMEOUT_S`:
+  控制 `vLLMSampler` 与 vLLM worker extension 之间 IPC 通道（ZMQ REQ/REP）的超时时间（秒）。
+  默认值为 `300`。该值必须大于 `0`。
 
 > vLLMSampler 在 RLHF 训练中通常与 Actor 模型分离,使用不同的硬件资源,避免推理和训练相互干扰。

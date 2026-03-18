@@ -115,7 +115,7 @@ class MultiLora:
             raise ValueError(f'Lora {tenant_adapter_name} already exists')
         _available_lora = self._get_available_lora()
         if _available_lora is None:
-            raise RuntimeError(f'No lora available for tenant {tenant_adapter_name}')
+            raise RuntimeError(f'No lora available for tenant {tenant_adapter_name}. Max loras: {self.max_loras}')
         if config.r > self.max_r:
             raise RuntimeError(f'Too big rank for lora: {config.r}')
         _available_lora.tenant_config = config
@@ -370,7 +370,9 @@ class MultiLora:
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config)
                 else:
-                    _module = get_peft_model(_module, config, lora_tenant.adapter_name)
+                    _peft_model: PeftModel = get_peft_model(_module, config, lora_tenant.adapter_name)
+                    _module.active_adapters = _peft_model.active_adapters
+                    _module = _peft_model
 
                 for name, submodule in _module.named_modules():
                     if isinstance(submodule, LoraLayer):

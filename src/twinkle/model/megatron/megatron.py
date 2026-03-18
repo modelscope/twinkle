@@ -32,7 +32,7 @@ from twinkle.model.base import TwinkleModel
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, exists
+from twinkle.utils import construct_class, exists, selective_log_softmax
 from .strategy import MegatronStrategy
 from transformers.utils import is_torch_npu_available
 
@@ -211,7 +211,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
 
         self.strategy = MegatronStrategy(self.device_mesh, mixed_precision=mixed_precision, **kwargs)
@@ -323,6 +323,51 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
+
+    def _postprocess_tensor_cp(self, tensor):
+        """All-gather and reconstruct full sequence from CP-split tensor.
+
+        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
+        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
+
+        Only the current rank's slice retains the original tensor (and its
+        gradient graph); other ranks' slices are plain copies.  This means
+        backward through the reconstructed tensor only produces gradients for
+        the local chunk, naturally distributing the gradient across CP ranks
+        without extra scaling.
+
+        Args:
+            tensor: [batch_size, seq_len/cp_size] CP-split tensor
+
+        Returns:
+            [batch_size, full_seq_len] reconstructed full tensor
+        """
+        from megatron.core import parallel_state as mpu
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size <= 1:
+            return tensor
+
+        cp_rank = mpu.get_context_parallel_rank()
+        cp_group = mpu.get_context_parallel_group()
+
+        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+        gathered[cp_rank] = tensor
+
+        batch_size = tensor.shape[0]
+        seq_len_per_cp = tensor.shape[1]
+        full_seq_len = seq_len_per_cp * cp_size
+        chunk_len = full_seq_len // (2 * cp_size)
+        half_len = seq_len_per_cp // 2
+
+        output = tensor.new_zeros(batch_size, full_seq_len)
+        for j in range(cp_size):
+            o = gathered[j]
+            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
+            reverse_idx = 2 * cp_size - j - 1
+            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
+
+        return output
 
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -450,18 +495,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs):
+        def post_loss_function(output_tensor, inputs, logps):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
-            outputs = ModelOutput(logits=output_tensor)
+            outputs = ModelOutput(logits=output_tensor, logps=logps)
             result = loss_instance(inputs, outputs, **current_kwargs)
-            if isinstance(result, tuple):
-                losses, counts = result
-            else:
-                losses = result
+            losses = result['loss']
+            counts = result['num_tokens']
+            if not counts:
                 counts = torch.tensor(1, device=losses.device)
-            return self.strategy.gather_loss_for_cp(losses, counts, output_tensor)
+            return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
         # Define forward step function for Megatron
         # forward_step_func(data_iterator, model) -> (output_tensor, partial(loss_func))
@@ -474,7 +518,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             labels = batch.pop('labels', None)
             output_tensor = model(**batch)
             batch['labels'] = labels
-            return output_tensor, partial(post_loss_function, inputs=batch)
+            logps = None
+            if labels is not None and mpu.is_pipeline_last_stage():
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.clone()
+                masked_labels[~loss_mask] = 0
+                logps = selective_log_softmax(output_tensor, masked_labels)
+                if cp_size > 1:
+                    logps = self._postprocess_tensor_cp(logps)
+                    batch['labels'] = self._postprocess_tensor_cp(labels)
+            return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -505,21 +558,23 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
         logits = []
+        logps = []
         count = 0
         if losses:
             for loss_dict in losses:
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
-                        count += 1
                     if 'logits' in loss_dict:
                         logits.append(loss_dict['logits'])
+                    if 'logps' in loss_dict:
+                        logps.append(loss_dict['logps'])
+                    if 'num_tokens' in loss_dict:
+                        count += loss_dict['num_tokens']
                 elif isinstance(loss_dict, torch.Tensor):
-                    loss += loss_dict
-                    count += 1
+                    raise ValueError('Expected loss dict, got tensor')
 
-        if count > 0:
-            loss /= count
+        loss = loss / (count or 1)
 
         # For PP > 1, broadcast loss from last PP stage to all ranks
         # Note: mpu is imported at module level, no need to reimport
@@ -545,23 +600,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         optimizer_config.inputs = inputs
-        if forward_only:
-            if len({logit.shape[0] for logit in logits}) == 1:
-                logits = torch.cat(logits, dim=0)
-            return {
-                'loss': loss,
-                'logits': logits,
-            }
-        else:
-            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss)
-            if isinstance(loss, torch.Tensor):
-                return loss.detach().cpu().float().numpy()
-            return float(loss)
+        if logps and len({_logps.shape[1] for _logps in logps}) == 1:
+            logps = torch.cat(logps, dim=0)
+        if isinstance(loss, torch.Tensor):
+            loss = loss.detach().cpu().float().numpy()
+        if not forward_only:
+            optimizer_config.outputs = ModelOutput(logits=None, loss=loss, logps=logps)
+        return ModelOutput(logits=None, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):
         # Megatron optimizer will cover this function.
-        pass
+        return 0
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):
@@ -873,6 +923,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
              output_dir: Optional[str] = None,
              interval: int = 1,
              save_optimizer: bool = False,
+             merge_lora: bool = False,
              **kwargs):
         """Save model checkpoint.
 
@@ -886,6 +937,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             interval: Save each *interval* steps.
             save_optimizer: If True, save optimizer + lr_scheduler + RNG state
                 alongside the HF weights for checkpoint resumption.
+            merge_lora: If True, merge LoRA adapters into base weights and save
+                the full merged model instead of PEFT adapter format. The merge
+                is reversed after saving so training can continue.
             **kwargs: Additional arguments forwarded to the underlying save
                 methods (e.g. ``adapter_name``).
         """
@@ -900,8 +954,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
 
-        # Always save HF-format weights (for inference / deployment).
-        self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+        is_lora = (optimizer_config.adapter_name != _default_adapter_name)
+
+        if merge_lora and is_lora:
+            self._merge_lora_adapters(optimizer_config.adapter_name)
+            self._save_hf_format(checkpoint_dir, _default_adapter_name)
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            self._unmerge_lora_adapters()
+        else:
+            self._save_hf_format(checkpoint_dir, optimizer_config.adapter_name)
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Optionally save mcore optimizer state (for training resumption).
         if save_optimizer:
@@ -910,8 +972,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 optimizer_config=optimizer_config,
                 **kwargs,
             )
-
-        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Final synchronization to ensure all ranks complete save.
         if dist.is_initialized():
@@ -934,9 +994,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         """
         resume = kwargs.pop('load_optimizer', False)
         if output_dir is None and not resume:
-            # Load from hub
-            token = kwargs.pop('token', None)
-            checkpoint_dir = HubOperation.download_model(name, token=token)
+            if os.path.exists(name):
+                checkpoint_dir = name
+            else:
+                # load from hub
+                token = kwargs.pop('token', None)
+                checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             if output_dir is None:
                 output_dir = 'output'
@@ -1213,6 +1276,24 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             )
             iteration = iters_cuda[0].item()
         return iteration
+
+    def _merge_lora_adapters(self, adapter_name: str = 'default'):
+        """Merge LoRA adapters into base model weights."""
+        from .tuners.lora import LoraParallelLinear
+        with torch.no_grad():
+            for model in self.strategy.unwrap_model(self.model):
+                for module in model.modules():
+                    if isinstance(module, (LoraParallelLinear, LoraLinear)):
+                        module.merge(adapter_names=[adapter_name])
+
+    def _unmerge_lora_adapters(self):
+        """Unmerge LoRA adapters to restore training state."""
+        from .tuners.lora import LoraParallelLinear
+        with torch.no_grad():
+            for model in self.strategy.unwrap_model(self.model):
+                for module in model.modules():
+                    if isinstance(module, (LoraParallelLinear, LoraLinear)):
+                        module.unmerge()
 
     def _save_hf_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in HuggingFace format using bridge adapter.

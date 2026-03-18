@@ -5,7 +5,9 @@ import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
-from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, requires
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
+
+logger = get_logger()
 
 T1 = TypeVar('T1', bound=object)
 
@@ -100,6 +102,9 @@ def get_device_placement(device_group=None) -> str:
     """
     if device_group is None:
         device_group = _device_group
+
+    if device_group is None:
+        return 'No device group provided.'
 
     WIDTH = 80
 
@@ -275,6 +280,15 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             return np.array(flatten)
         return type(result[0])(flatten)
     elif method in ('avg', 'mean'):
+        if isinstance(result[0], dict):
+            output = {}
+            for key in result[0]:
+                vals = [r[key] for r in result if key in r]
+                try:
+                    output[key] = np.mean(vals)
+                except (TypeError, ValueError):
+                    output[key] = vals
+            return output
         return np.mean(result)
     elif method == 'sum':
         return np.sum(result)
@@ -437,6 +451,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
+                if os.environ.get('WORKER_NAME') is None and remote_group is None:
+                    logger.info(f'⚠️ Using local initialization of class: {cls}, please make sure the class '
+                                'does not need remote execution.')
                 # If cannot trust_remote_code, no callable and type can be used.
                 check_unsafe(*args, **kwargs)
 

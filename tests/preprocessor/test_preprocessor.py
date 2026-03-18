@@ -293,8 +293,14 @@ class TestDatasetMapChanges:
         # Modify processor, process again
         class ModifiedProcessor(CompetitionMathProcessor):
 
-            def __call__(self, row):
-                traj = super().__call__(row)
+            def __call__(self, rows):
+                rows = self.map_col_to_row(rows)
+                rows = [self.preprocess(row) for row in rows]
+                rows = self.map_row_to_col(rows)
+                return rows
+
+            def preprocess(self, row):
+                traj = super().preprocess(row)
                 traj['messages'][0]['content'] = 'Modified: ' + traj['messages'][0]['content']
                 return traj
 

@@ -165,7 +165,8 @@ class HubOperation:
                      subset_name: str,
                      split: str,
                      streaming: bool = False,
-                     revision: Optional[str] = None):
+                     revision: Optional[str] = None,
+                     **kwargs):
         """Load a dataset from the repo
 
         Args:
@@ -179,7 +180,7 @@ class HubOperation:
             The Dataset instance
         """
         hub = cls._get_hub_class(dataset_id)
-        return hub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision)
+        return hub.load_dataset(cls.remove_source_type(dataset_id), subset_name, split, streaming, revision, **kwargs)
 
     @classmethod
     def download_model(cls,
@@ -373,7 +374,7 @@ class MSHub(HubOperation):
             ignore_patterns = []
         if revision is None or revision == 'main':
             revision = 'master'
-        return push_to_hub(
+        result = push_to_hub(
             repo_id,
             folder_path,
             token or cls.ms_token,
@@ -382,6 +383,8 @@ class MSHub(HubOperation):
             ignore_file_pattern=ignore_patterns,
             revision=revision,
             tag=path_in_repo)
+        if not result:
+            raise Exception('Failed to push to hub')
 
     @classmethod
     def load_dataset(cls,

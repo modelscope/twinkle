@@ -97,7 +97,7 @@ dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_l
 
 # Data preprocessing: Replace placeholders with custom names
 dataset.map('SelfCognitionProcessor',
-            init_args={'model_name': 'twinkle model', 'model_author': 'twinkle team'})
+            init_args={'model_name': 'twinkle model', 'model_author': 'ModelScope Team'})
 
 # Encode dataset into tokens usable by the model
 dataset.encode(batched=True)

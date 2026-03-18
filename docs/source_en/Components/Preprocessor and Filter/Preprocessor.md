@@ -7,11 +7,11 @@ The base class of Preprocessor:
 ```python
 class Preprocessor:
 
-    def __call__(self, row) -> Trajectory:
+    def __call__(self, rows: List[Dict]) -> List[Trajectory]:
         ...
 ```
 
-The format is to pass in a raw sample and output a `Trajectory`. If the sample cannot be used, you can directly return None.
+The format is to pass in a list of samples and output a list of `Trajectory`. If a sample cannot be used, you can directly ignore it.
 
 We provide some basic Preprocessors, such as `SelfCognitionProcessor`:
 
@@ -22,7 +22,7 @@ dataset.map('SelfCognitionProcessor', model_name='some-model', model_author='som
 Preprocessor contains the __call__ method, which means you can use a function to replace the class:
 
 ```python
-def self_cognition_preprocessor(row):
+def self_cognition_preprocessor(rows):
     ...
-    return Trajectory(...)
+    return [Trajectory(...), ...]
 ```

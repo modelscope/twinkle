@@ -14,6 +14,7 @@ Twinkle DOCUMENTATION
    Usage Guide/Server and Client/index.rst
    Usage Guide/NPU-Support.md
    Usage Guide/Train-as-a-Service.md
+   Usage Guide/Introduction-with-Qwen3.5.md
 
 .. toctree::
    :maxdepth: 2

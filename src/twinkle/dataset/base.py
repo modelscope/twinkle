@@ -120,15 +120,26 @@ class Dataset(TorchDataset):
             if os.path.exists(dataset_id):
                 streaming = kwargs.get('streaming', False)
                 num_proc = kwargs.get('num_proc', 1)
-                ext = os.path.splitext(dataset_id)[1].lstrip('.')
-                file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
+                kwargs['split'] = 'train'
                 if streaming:
-                    kwargs = {'split': 'train', 'streaming': True}
+                    kwargs['streaming'] = True
                 else:
-                    kwargs = {'split': 'train', 'num_proc': num_proc}
+                    kwargs['num_proc'] = num_proc
+                load_kwargs = {}
+                if os.path.isdir(dataset_id):
+                    files = os.listdir(dataset_id)
+                    if not files:
+                        raise ValueError(f'Cannot load dataset from empty directory: {dataset_id}')
+                    filename_for_ext = files[0]
+                    load_kwargs['data_dir'] = dataset_id
+                else:
+                    filename_for_ext = dataset_id
+                    load_kwargs['data_files'] = dataset_id
+                ext = os.path.splitext(filename_for_ext)[1].lstrip('.')
+                file_type = {'jsonl': 'json', 'txt': 'text'}.get(ext) or ext
                 if file_type == 'csv':
                     kwargs['na_filter'] = False
-                dataset = load_dataset(file_type, data_files=dataset_id, **kwargs)
+                dataset = load_dataset(file_type, **load_kwargs, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
 
@@ -183,7 +194,7 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
-        kwargs['batched'] = False  # TODO temporary change to False, because the interface does not support batched
+        kwargs['batched'] = True
         with processing_lock(key):
             self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
         if len(self.datasets) == 1:
@@ -210,7 +221,7 @@ class Dataset(TorchDataset):
             key = next(iter(self.datasets.keys()))
         else:
             key = dataset_meta.get_id()
-        kwargs['batched'] = False  # TODO temporary change to False, because the interface does not support batched
+        kwargs['batched'] = False
         with processing_lock(key):
             self.datasets[key] = self.datasets[key].filter(filter_func, **kwargs)
         if len(self.datasets) == 1:

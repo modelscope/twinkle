@@ -53,19 +53,19 @@
 
 ### 基础能力
 
-- [ ] 支持多模态模型
+- [x] 支持多模态模型
 - [ ] 支持megatron VPP
 - [ ] 支持liger kernel
 - [ ] 支持transformers模型的ulysses/ring-attention
 - [ ] 兼容transformers v5的tp、pp
 - [ ] 支持多轮RL
 - [ ] 支持gym训练
-- [ ] 支持GAPO、GSPO算法
+- [x] 支持GAPO、GSPO算法
 - [ ] 支持GKD、on-policy-distill等蒸馏算法
 - [ ] 支持DPO对齐训练
 - [ ] 支持colocate RL训练
-- [ ] Preprocess支持batched
-- [ ] 对多replica的支持和粘滞路由
+- [x] Preprocess支持batched
+- [x] 对多replica的支持和粘滞路由
 
 ### 网络能力
 
@@ -73,18 +73,18 @@
 
 ### Core Capabilities
 
-- [ ] Support for multimodal models
+- [x] Support for multimodal models
 - [ ] Support for Megatron VPP
 - [ ] Support for Liger kernel
 - [ ] Support for Ulysses/Ring-Attention for Transformers models
 - [ ] Compatibility with Transformers v5 TP and PP
 - [ ] Support for multi-turn RL
 - [ ] Support for Gym training
-- [ ] Support for GAPO and GSPO algorithms
+- [x] Support for GAPO and GSPO algorithms
 - [ ] Support for distillation algorithms such as GKD and on-policy distillation
 - [ ] Support for DPO alignment training
 - [ ] Support for colocate RL training
-- [ ] Support for batched preprocessing
-- [ ] Support for multiple replicas and sticky routing
+- [x] Support for batched preprocessing
+- [x] Support for multiple replicas and sticky routing
 
 ### Networking Capabilities
