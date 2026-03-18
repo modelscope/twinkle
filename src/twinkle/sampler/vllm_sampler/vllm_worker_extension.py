@@ -135,7 +135,7 @@ class TwinkleWorkerExtension:
             try:
                 self.monkey_patch_model()
             except Exception as e:
-                logger.warning(f"Failed to apply MoE weight_loader patch before load_weights: {e}")
+                logger.warning(f'Failed to apply MoE weight_loader patch before load_weights: {e}')
 
         # Detect TP rank — vLLM sets self.rank on each worker.
         tp_rank = getattr(self, 'rank', 0)
@@ -362,7 +362,7 @@ class TwinkleWorkerExtension:
             try:
                 self.monkey_patch_model()
             except Exception as e:
-                logger.warning(f"Failed to apply MoE weight_loader patch before load_weights: {e}")
+                logger.warning(f'Failed to apply MoE weight_loader patch before load_weights: {e}')
 
         weight_list = list(weights.items())
         self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
