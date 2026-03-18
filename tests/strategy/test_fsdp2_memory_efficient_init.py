@@ -328,10 +328,12 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
 
     # Create a dummy batch — inputs must be a list of dicts (List[InputFeature]).
     # The processor's to_tensor() handles device placement internally.
+    seq_len = 16
     batch = [{
-        'input_ids': torch.randint(0, 1000, (16,)),
-        'labels': torch.randint(0, 1000, (16,)),
-        'attention_mask': torch.ones(16, dtype=torch.long),
+        'input_ids': torch.randint(0, 1000, (seq_len,)),
+        'labels': torch.randint(0, 1000, (seq_len,)),
+        'attention_mask': torch.ones(seq_len, dtype=torch.long),
+        'position_ids': torch.arange(seq_len, dtype=torch.long),
     }]
 
     # This triggers _lazy_wrap_model → wrap_model(memory_efficient=True)
