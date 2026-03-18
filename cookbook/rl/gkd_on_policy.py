@@ -60,19 +60,19 @@ logger = get_logger()
 STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
 TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen/Qwen3-8B')
 
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + 2*SAMPLER_GPUS
 
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 512))
+MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 1024))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-LEARNING_RATE = float(os.environ.get('LR', 1e-4))
-N_SAMPLES = int(os.environ.get('N_SAMPLES', 8))
+MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
+LEARNING_RATE = float(os.environ.get('LR', 5e-5))
+N_SAMPLES = int(os.environ.get('N_SAMPLES', 1))
 
 GKD_BETA = float(os.environ.get('GKD_BETA', 0.5))
 GKD_TEMPERATURE = float(os.environ.get('GKD_TEMPERATURE', 1.0))
-GKD_TOPK = int(os.environ.get('GKD_TOPK', 20))
+GKD_TOPK = int(os.environ.get('GKD_TOPK', 64))
 
 ADAPTER_NAME = 'default'
 
@@ -151,7 +151,6 @@ def main():
         nproc_per_node=NUM_GPUS,
         groups=device_groups,
     )
-    logger.info(get_device_placement())
 
     # ── Student model (trainable) ──────────────────────────────────────────────
     student_model = TransformersModel(
@@ -181,7 +180,7 @@ def main():
     # ── Teacher vLLM sampler (for prompt logprobs) ───────────────────────────────
     teacher_sampler = vLLMSampler(
         model_id=TEACHER_MODEL_ID,
-        engine_args={'gpu_memory_utilization': 0.85, 'max_model_len': 2048, 'logprobs_mode': 'raw_logprobs'},
+        engine_args={'gpu_memory_utilization': 0.85, 'max_model_len': 2048, 'logprobs_mode': 'raw_logprobs', 'max_logprobs': 64},
         device_mesh=sampler_mesh,
         remote_group='teacher_sampler',
     )
@@ -199,6 +198,7 @@ def main():
     # ── Checkpoint manager for weight sync ──────────────────────────────────────
     ckpt_manager = CheckpointEngineManager(model=student_model, sampler=student_sampler)
 
+    logger.info(get_device_placement())
     logger.info(f'GKD On-Policy | student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}')
     logger.info(f'  beta={GKD_BETA}  T={GKD_TEMPERATURE}  topk={GKD_TOPK}')
 
