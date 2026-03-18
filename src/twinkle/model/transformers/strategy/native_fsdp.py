@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set, Tuple
 
 from twinkle.utils import DeviceMesh, Platform
 
@@ -41,12 +41,27 @@ class NativeFSDPStrategy:
         )
         return ep_mesh.to_torch_device_mesh()
 
-    def wrap_model(self, model, optimizer=None):
+    def wrap_model(self, model, optimizer=None, memory_efficient=True):
         if self.device_mesh is None:
             return model, optimizer
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
+
+            # EP path is not yet compatible with meta-device flow because
+            # _place_ep_experts_on_local_device requires experts on a real device.
+            use_meta = memory_efficient and not ep_enabled
+
+            # --- Phase 1: save state before meta move ---
+            original_sd = None
+            saved_buffers = None
+            if use_meta:
+                original_sd = model.state_dict()
+                saved_buffers = _get_non_persistent_buffers(model)
+                model = model.to(torch.device('meta'))
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights()
+
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
                 _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
@@ -110,6 +125,21 @@ class NativeFSDPStrategy:
                 mp_policy=mp_policy,
                 ignored_params=expert_params,
             )
+
+            # --- Phase 2: broadcast and restore ---
+            if use_meta:
+                import torch.distributed as dist
+                device_type = self.device_mesh.device_type or 'cuda'
+                is_rank0 = (dist.get_rank() == 0)
+                _broadcast_sharded_state_dict(
+                    model,
+                    original_sd if is_rank0 else {},
+                    device_type=device_type,
+                )
+                target_device = torch.device(device_type)
+                _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights()
 
             # Manual prefetch
             if ep_enabled and layer_pairs:
@@ -321,3 +351,98 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
         return optimizer
     optimizer.param_groups[0]['params'] = list(model.parameters())
     return optimizer
+
+
+def _broadcast_sharded_state_dict(
+    model: nn.Module,
+    full_sd: dict,
+    device_type: str = 'cuda',
+) -> None:
+    """Broadcast full state dict from rank 0 and load as sharded parameters.
+
+    After ``fully_shard`` on a meta-device model, every rank has DTensor
+    parameters whose ``device_mesh`` and ``placements`` describe the desired
+    sharding but whose storage is still on ``meta``.  This function:
+
+    1. Rank 0 broadcasts each full parameter tensor.
+    2. Every rank calls ``distribute_tensor`` to materialise only its local
+       shard, then collects the results into a new state dict.
+    3. ``model.load_state_dict(..., assign=True)`` replaces the meta tensors
+       with the real sharded ones.
+
+    This is the twinkle equivalent of accelerate's
+    ``fsdp2_load_full_state_dict``.
+
+    Args:
+        model: The model whose parameters are on ``meta`` after ``fully_shard``.
+        full_sd: The full (unsharded) state dict.  Must be populated on rank 0;
+            may be empty (``{}``) on other ranks.
+        device_type: The device type string (e.g. ``'cuda'``, ``'npu'``).
+    """
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    meta_sharded_sd = model.state_dict()
+    sharded_sd = {}
+    is_rank0 = (dist.get_rank() == 0)
+
+    if is_rank0:
+        full_items = iter(full_sd.items())
+
+    for param_name, sharded_param in meta_sharded_sd.items():
+        device_mesh = sharded_param.device_mesh
+        placements = sharded_param.placements
+        shape = sharded_param.size()
+        dtype = sharded_param.dtype
+
+        if is_rank0:
+            _, full_param = next(full_items)
+            full_tensor = full_param.detach().to(device_type)
+            if isinstance(full_tensor, DTensor):
+                full_tensor = full_tensor.to_local()
+        else:
+            full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
+
+        dist.broadcast(full_tensor, src=0)
+        sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+        sharded_sd[param_name] = sharded_tensor
+
+    model.load_state_dict(sharded_sd, assign=True)
+
+
+def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Return {fqn: tensor} for all non-persistent buffers in the model.
+
+    Non-persistent buffers are not included in ``state_dict()`` and will be
+    lost when the model is moved to ``meta`` device.  We need to save them
+    before the move and re-register them after broadcast.
+    """
+    sd_keys = set(model.state_dict().keys())
+    result = {}
+    for fqn, buf in model.named_buffers():
+        if fqn not in sd_keys:
+            result[fqn] = buf.clone()
+    return result
+
+
+def _restore_non_persistent_buffers(
+    model: nn.Module,
+    saved_buffers: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Re-register non-persistent buffers that were saved before ``to(meta)``.
+
+    Args:
+        model: The model (may have meta-device buffers after sharding).
+        saved_buffers: ``{fqn: tensor}`` from ``_get_non_persistent_buffers``.
+        device: Target device for the restored buffers.
+    """
+    for fqn, buf_tensor in saved_buffers.items():
+        buf_tensor = buf_tensor.to(device)
+        if '.' in fqn:
+            parent_fqn, local_name = fqn.rsplit('.', 1)
+            parent = model.get_submodule(parent_fqn)
+        else:
+            local_name = fqn
+            parent = model
+        parent.register_buffer(local_name, buf_tensor, persistent=False)
