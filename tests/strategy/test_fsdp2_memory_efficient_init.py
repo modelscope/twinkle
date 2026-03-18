@@ -7,6 +7,18 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import unittest
 from torch.distributed.fsdp import fully_shard
+from twinkle.utils import Platform
+
+_PLATFORM = Platform.get_platform()
+_DEVICE_TYPE = _PLATFORM.device_prefix()   # 'cuda' or 'npu'
+_DIST_BACKEND = _PLATFORM.device_backend()  # 'nccl' or 'hccl'
+
+
+def _device_count() -> int:
+    if _DEVICE_TYPE == 'npu':
+        import torch_npu  # noqa: F401
+        return torch.npu.device_count()
+    return torch.cuda.device_count()
 
 
 def _find_free_port() -> int:
@@ -20,8 +32,17 @@ def _init_dist(rank, world_size, port):
     os.environ['MASTER_PORT'] = str(port)
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
-    dist.init_process_group('nccl', rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    if _DEVICE_TYPE == 'npu':
+        from twinkle.utils.platforms.npu import ensure_hccl_socket_env
+        ensure_hccl_socket_env(port)
+    dist.init_process_group(_DIST_BACKEND, rank=rank, world_size=world_size)
+    device = torch.device(_PLATFORM.get_local_device(rank))
+    torch.device(device)  # set current device
+    if _DEVICE_TYPE == 'npu':
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(device)
+    else:
+        torch.cuda.set_device(rank)
 
 
 class TinyModel(nn.Module):
@@ -60,7 +81,7 @@ def _worker_broadcast_sharded(rank, world_size, port, ref_sd):
     fully_shard(model)
 
     # Broadcast
-    _broadcast_sharded_state_dict(model, full_sd, device_type='cuda')
+    _broadcast_sharded_state_dict(model, full_sd, device_type=_DEVICE_TYPE)
 
     # Verify: gather full state dict back and compare to original
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
@@ -76,7 +97,7 @@ def _worker_broadcast_sharded(rank, world_size, port, ref_sd):
     dist.destroy_process_group()
 
 
-@unittest.skipIf(torch.cuda.device_count() < 2, 'Need >= 2 GPUs')
+@unittest.skipIf(_device_count() < 2, f'Need >= 2 {_DEVICE_TYPE.upper()}s')
 class TestBroadcastShardedStateDict(unittest.TestCase):
 
     def test_broadcast_restores_weights(self):
@@ -162,19 +183,19 @@ def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
         mesh_dim_names=('fsdp',),
-        device_type='cuda',
+        device_type=_DEVICE_TYPE,
     )
     strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
 
-    model = TinyModel(dim=32).cuda()
+    model = TinyModel(dim=32).to(_DEVICE_TYPE)
     if rank == 0:
         model.load_state_dict(ref_sd)
 
     model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=True)
 
-    # Verify: model should be on cuda, not meta
+    # Verify: model should be on device, not meta
     for name, param in model.named_parameters():
-        assert param.device.type == 'cuda', f"{name} still on {param.device}"
+        assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
 
     # Verify: gathered full state dict matches original
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
@@ -190,7 +211,7 @@ def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
     dist.destroy_process_group()
 
 
-@unittest.skipIf(torch.cuda.device_count() < 2, 'Need >= 2 GPUs')
+@unittest.skipIf(_device_count() < 2, f'Need >= 2 {_DEVICE_TYPE.upper()}s')
 class TestWrapModelMemoryEfficient(unittest.TestCase):
 
     def test_wrap_model_memory_efficient(self):
@@ -219,17 +240,17 @@ def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
         mesh_dim_names=('fsdp',),
-        device_type='cuda',
+        device_type=_DEVICE_TYPE,
     )
     strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
 
-    model = TinyModel(dim=32).cuda()
+    model = TinyModel(dim=32).to(_DEVICE_TYPE)
     model.load_state_dict(ref_sd)
 
     model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=False)
 
     for name, param in model.named_parameters():
-        assert param.device.type == 'cuda', f"{name} still on {param.device}"
+        assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
 
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
     gathered = get_model_state_dict(
@@ -244,7 +265,7 @@ def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
     dist.destroy_process_group()
 
 
-@unittest.skipIf(torch.cuda.device_count() < 2, 'Need >= 2 GPUs')
+@unittest.skipIf(_device_count() < 2, f'Need >= 2 {_DEVICE_TYPE.upper()}s')
 class TestWrapModelLegacy(unittest.TestCase):
 
     def test_wrap_model_legacy_path(self):
@@ -293,7 +314,7 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
         mesh_dim_names=('fsdp',),
-        device_type='cuda',
+        device_type=_DEVICE_TYPE,
     )
 
     model = TransformersModel(
@@ -307,9 +328,9 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
 
     # Create a dummy batch
     batch = {
-        'input_ids': torch.randint(0, 1000, (1, 16)).cuda(),
-        'labels': torch.randint(0, 1000, (1, 16)).cuda(),
-        'attention_mask': torch.ones(1, 16, dtype=torch.long).cuda(),
+        'input_ids': torch.randint(0, 1000, (1, 16)).to(_DEVICE_TYPE),
+        'labels': torch.randint(0, 1000, (1, 16)).to(_DEVICE_TYPE),
+        'attention_mask': torch.ones(1, 16, dtype=torch.long).to(_DEVICE_TYPE),
     }
 
     # This triggers _lazy_wrap_model → wrap_model(memory_efficient=True)
@@ -320,7 +341,7 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
         dist.destroy_process_group()
 
 
-@unittest.skipIf(torch.cuda.device_count() < 2, 'Need >= 2 GPUs')
+@unittest.skipIf(_device_count() < 2, f'Need >= 2 {_DEVICE_TYPE.upper()}s')
 class TestE2EMemoryEfficientInit(unittest.TestCase):
 
     def test_e2e_forward_backward(self):
