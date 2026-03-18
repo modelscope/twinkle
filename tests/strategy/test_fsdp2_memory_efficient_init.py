@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import copy
 import os
 import socket
 import torch
@@ -263,9 +262,6 @@ class TestWrapModelLegacy(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Task 6: env var / memory_efficient_init parameter in TransformersModel
 # ---------------------------------------------------------------------------
-from unittest.mock import patch, MagicMock
-
-
 class TestEnvVarRamEfficientLoading(unittest.TestCase):
     """Test that __init__ sets FSDP env vars for both strategies."""
 
