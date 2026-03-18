@@ -6,10 +6,11 @@ token distribution on pre-existing reference responses from the dataset.
 Pipeline:
     1. DataLoader supplies full-text batches (prompt + reference answer).
     2. Teacher vLLM sampler computes top-k prompt logprobs on the sequences.
-    3. Student TransformersModel runs forward_backward() with GKDLoss.
+    3. Student MegatronModel runs forward_backward() with GKDLoss.
 
 Key difference from on-policy:
     - No student sampler needed (responses already in the dataset).
+    - No weight sync needed (student doesn't sample).
     - Faster per-step (no generation latency), but less exploration.
 
 Architecture (Ray):
@@ -20,20 +21,20 @@ Architecture (Ray):
     │  student_model.forward_backward(teacher_output=...) ──► GKD    │
     └─────────────────────────────────────────────────────────────────┘
                         │
-         vLLMSampler + TransformersModel
+         vLLMSampler + MegatronModel
           (teacher)       (student)
 
 Environment variables (all optional):
     STUDENT_MODEL_ID  – (default: ms://Qwen/Qwen3-0.6B)
     TEACHER_MODEL_ID  – (default: ms://Qwen/Qwen3-8B)
-    MODEL_GPUS        – GPUs for student model        (default: 4)
-    SAMPLER_GPUS      – GPUs for teacher vLLM sampler (default: 2)
-    BATCH_SIZE        – global batch size             (default: 8)
-    MAX_STEPS         – total optimisation steps      (default: 200)
-    LR                – learning rate                 (default: 1e-4)
+    MODEL_GPUS        – GPUs for student model        (default: 8)
+    SAMPLER_GPUS      – GPUs for teacher vLLM sampler (default: 8)
+    BATCH_SIZE        – global batch size             (default: 16)
+    MAX_STEPS         – total optimisation steps      (default: 1000)
+    LR                – learning rate                 (default: 5e-5)
     GKD_BETA          – JSD beta (0=fwd KL, 1=rev KL) (default: 0.5)
     GKD_TEMPERATURE   – distillation temperature      (default: 1.0)
-    GKD_TOPK          – top-k vocab for teacher logprobs (default: 20)
+    GKD_TOPK          – top-k vocab for teacher logprobs (default: 64)
 """
 
 import os

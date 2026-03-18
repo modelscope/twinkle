@@ -5,7 +5,7 @@ teacher vLLM provides top-k prompt logprobs, then student model learns
 to match the teacher's token distribution.
 
 Pipeline:
-    1. DataLoader supplies prompt-only batches.
+    1. Sync student model weights to student vLLM sampler.
     2. Student vLLM sampler generates completions on-the-fly.
     3. Teacher vLLM sampler computes top-k prompt logprobs on generated sequences.
     4. Student TransformersModel runs forward_backward() with GKDLoss.
@@ -13,27 +13,28 @@ Pipeline:
 Architecture (Ray):
     ┌─────────────────────────────────────────────────────────────────┐
     │ Driver (CPU)                                                    │
-    │  dataloader ──► prompt-only batch                              │
+    │  ckpt_manager.sync_weights() ──► sync LoRA to student sampler  │
     │  student_sampler.sample() ──► on-policy completions            │
-    │  teacher_sampler.sample(topk_prompt_logprobs=k) ──► teacher lps│
+    │  teacher_sampler.sample(prompt_logprobs=k) ──► teacher lps     │
     │  student_model.forward_backward(teacher_output=...) ──► GKD    │
     └─────────────────────────────────────────────────────────────────┘
          │               │                    │
     DataLoader      vLLMSampler ×2     TransformersModel
-    (model GPUs)  student + teacher      (model GPUs)
+                  student + teacher      (model GPUs)
 
 Environment variables (all optional):
-    STUDENT_MODEL_ID  – (default: ms://Qwen/Qwen2.5-1.5B-Instruct)
-    TEACHER_MODEL_ID  – (default: ms://Qwen/Qwen3-4B)
+    STUDENT_MODEL_ID  – (default: ms://Qwen/Qwen3-0.6B)
+    TEACHER_MODEL_ID  – (default: ms://Qwen/Qwen3-8B)
     MODEL_GPUS        – GPUs for student model               (default: 4)
-    SAMPLER_GPUS      – GPUs for each vLLM sampler           (default: 2)
-    MAX_NEW_TOKENS    – max completion tokens                (default: 512)
-    BATCH_SIZE        – global prompt-level batch size       (default: 8)
-    MAX_STEPS         – total optimisation steps             (default: 200)
-    LR                – learning rate                        (default: 1e-4)
+    SAMPLER_GPUS      – GPUs for each vLLM sampler           (default: 4)
+    MAX_NEW_TOKENS    – max completion tokens                (default: 2048)
+    BATCH_SIZE        – global prompt-level batch size       (default: 16)
+    MAX_STEPS         – total optimisation steps             (default: 1000)
+    LR                – learning rate                        (default: 5e-5)
+    N_SAMPLES         – samples per prompt                   (default: 1)
     GKD_BETA          – JSD beta (0=fwd KL, 1=rev KL)        (default: 0.5)
     GKD_TEMPERATURE   – distillation temperature             (default: 1.0)
-    GKD_TOPK          – top-k vocab for teacher logprobs     (default: 10)
+    GKD_TOPK          – top-k vocab for teacher logprobs     (default: 64)
 """
 
 import os
