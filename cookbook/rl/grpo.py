@@ -113,7 +113,7 @@ def main():
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
 
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1)
 
     optim_step = 0
     logger.info(get_device_placement())
@@ -128,7 +128,6 @@ def main():
         sample_responses = sampler.sample(
             global_prompts*NUM_GENERATIONS,
             sampling_params,
-            num_samples=1,
         )
 
         all_input_data: List[Dict[str, Any]] = []

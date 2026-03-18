@@ -126,6 +126,7 @@ def train():
         'max_tokens': MAX_NEW_TOKENS,
         'temperature': TEMPERATURE,
         'top_p': 0.95,
+        'num_samples': NUM_GENERATIONS,
     }
 
     # Track the current adapter path for sampling
@@ -156,7 +157,6 @@ def train():
             inputs=prompts,
             sampling_params=sampling_params,
             adapter_uri=current_adapter_uri,
-            num_samples=NUM_GENERATIONS,
         )
 
         all_input_data: List[Dict[str, Any]] = []

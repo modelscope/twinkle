@@ -14,11 +14,10 @@ class SampleRequest(BaseModel):
     """Request body for the /sample endpoint."""
     inputs: Any = Field(..., description='List of Trajectory or InputFeature dicts')
     sampling_params: Optional[Dict[str, Any]] = Field(
-        None, description='Sampling parameters (max_tokens, temperature, etc.)')
+        None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: Optional[str] = Field(
         None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
-    num_samples: int = Field(1, description='Number of completions to generate per prompt')
 
 
 class SampledSequenceModel(BaseModel):

@@ -98,6 +98,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             params = None
             if body.sampling_params:
                 params = SamplingParams.from_dict(body.sampling_params)
+            params.num_samples = body.num_samples
 
             # Call sampler
             responses = self.sampler.sample(
@@ -105,7 +106,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params,
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
-                num_samples=body.num_samples,
             )
             if callable(responses):
                 responses = responses()

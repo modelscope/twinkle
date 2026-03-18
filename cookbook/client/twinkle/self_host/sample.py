@@ -66,6 +66,7 @@ def sample():
     sampling_params = {
         'max_tokens': 128,
         'temperature': 1.0,
+        'num_samples': num_samples,
     }
 
     # Step 7: Call the sampler
@@ -77,7 +78,6 @@ def sample():
         inputs=[trajectory] * num_prompts,
         sampling_params=sampling_params,
         adapter_uri=ADAPTER_URI,
-        num_samples=num_samples,
     )
 
     # Step 8: Decode and print the results
