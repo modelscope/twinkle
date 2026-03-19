@@ -478,6 +478,11 @@ def _broadcast_sharded_state_dict(
 
         dist.broadcast(full_tensor, src=0)
 
+        # Ensure the async broadcast completes before we consume the tensor.
+        # Without this, NPU (and potentially other async backends) may not
+        # have finished writing full_tensor when distribute_tensor reads it.
+        torch_util.synchronize()
+
         # Handle both DTensor (FSDP-sharded) and regular tensor (e.g. tied weights)
         if isinstance(sharded_param, DTensor):
             device_mesh = sharded_param.device_mesh
