@@ -60,9 +60,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         return types.CreateResponse()
 
     @app.post('/twinkle/sample', response_model=types.SampleResponseModelList)
-    def sample(
-        request: Request, body: types.SampleRequest,
-        self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
+    def sample(request: Request, body: types.SampleRequest,
+               self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
         """Sample completions from the model.
 
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
