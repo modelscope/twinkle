@@ -8,13 +8,13 @@
 #   1. Modify the source files in src/twinkle/
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Type
 from twinkle_client.http import http_post
 from twinkle.sampler.base import Sampler
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
-
+from twinkle.patch import Patch, apply_patch
 
 class vLLMSampler(Sampler):
     """Client wrapper for Sampler that calls server HTTP endpoints.
@@ -94,3 +94,6 @@ class vLLMSampler(Sampler):
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())
+
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
+        apply_patch(self, patch_cls, **kwargs)
