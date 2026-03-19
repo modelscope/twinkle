@@ -324,12 +324,40 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
         mixed_precision='bf16',
         memory_efficient_init=True,
     )
+
+    # Debug: check model state before set_optimizer
+    if rank == 0:
+        print(f"\n=== DEBUG rank {rank}: After TransformersModel init ===")
+        print(f"model._model_wrapped = {model._model_wrapped}")
+        print(f"model._memory_efficient_init = {getattr(model, '_memory_efficient_init', 'NOT SET')}")
+        for name, param in list(model.model.named_parameters())[:5]:
+            print(f"  {name}: device={param.device}, shape={param.shape}")
+
     model.set_optimizer('AdamW', lr=1e-4)
 
+    # Debug: check before _lazy_wrap_model
+    if rank == 0:
+        print(f"\n=== DEBUG rank {rank}: Before _lazy_wrap_model ===")
+        print(f"model._model_wrapped = {model._model_wrapped}")
+        print(f"strategy type = {type(model.strategy).__name__}")
+
     # Trigger _lazy_wrap_model by calling the internal method directly.
-    # This exercises the memory-efficient init path without needing a full
-    # forward pass (which has unrelated device placement issues in processor).
     model._lazy_wrap_model()
+
+    # Debug: check after _lazy_wrap_model
+    if rank == 0:
+        print(f"\n=== DEBUG rank {rank}: After _lazy_wrap_model ===")
+        print(f"model._model_wrapped = {model._model_wrapped}")
+        cpu_params = []
+        for name, param in model.model.named_parameters():
+            if param.device.type in ('cpu', 'meta'):
+                cpu_params.append((name, param.device))
+        if cpu_params:
+            print(f"Parameters still on CPU/meta:")
+            for name, device in cpu_params[:10]:
+                print(f"  {name}: {device}")
+        else:
+            print("All parameters on device!")
 
     # Verify: model should be wrapped and parameters on device
     assert model._model_wrapped, "Model should be wrapped after _lazy_wrap_model"
