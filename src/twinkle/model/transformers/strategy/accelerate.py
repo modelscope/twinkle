@@ -21,13 +21,14 @@ class AccelerateStrategy:
         mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
         ddp_config: Dict[str, Any] = None,
         fsdp_config: Dict[str, Any] = None,
+        memory_efficient: bool = True,
     ):
         from accelerate import Accelerator
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
-        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config)
+        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient)
 
         kwargs_handlers = []
         if ddp_config is not None:
@@ -69,7 +70,7 @@ class AccelerateStrategy:
 
         return parallelism_config
 
-    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any]):
+    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any], memory_efficient: bool):
         from accelerate import FullyShardedDataParallelPlugin
         from torch.distributed.fsdp import BackwardPrefetch
         from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
@@ -107,7 +108,7 @@ class AccelerateStrategy:
             activation_checkpointing=fsdp_config.pop('activation_checkpointing', False),
             auto_wrap_policy=fsdp_config.pop('auto_wrap_policy', 'transformer_based_wrap'),  # noqa
             reshard_after_forward=fsdp_config.pop('reshard_after_forward', True),
-            cpu_ram_efficient_loading=fsdp_config.pop('cpu_ram_efficient_loading', True),
+            cpu_ram_efficient_loading=fsdp_config.pop('cpu_ram_efficient_loading', memory_efficient),
             **fsdp_config,
         )
         # The env vars (ACCELERATE_USE_FSDP, FSDP_CPU_RAM_EFFICIENT_LOADING) are set

@@ -59,6 +59,12 @@ class NativeFSDPStrategy:
             if use_meta:
                 original_sd = model.state_dict()
                 saved_buffers = _get_non_persistent_buffers(model)
+                # Drop optimizer references so old params can be freed on to('meta').
+                # Without this, the optimizer holds strong refs to the full-size
+                # parameter tensors, preventing GC even after the model moves to meta.
+                # _rebind_optimizer will re-attach the new sharded params later.
+                if optimizer is not None:
+                    _unbind_optimizer_params(optimizer)
                 model = model.to(torch.device('meta'))
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
@@ -504,6 +510,25 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
             non_persistent_fqns.add(full_fqn)
 
     return {k: v.clone() for k, v in model.named_buffers() if k in non_persistent_fqns}
+
+
+def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
+    """Replace optimizer param references with ``torch.empty(1)`` placeholders.
+
+    This drops the optimizer's strong references to the full model parameters,
+    allowing them to be freed when the model is moved to ``meta`` device.
+    Without this, ``model.to('meta')`` cannot free the old parameter tensors
+    because the optimizer still holds references to them.
+
+    Must be called BEFORE ``model.to('meta')``.  After ``fully_shard`` and
+    ``_broadcast_sharded_state_dict``, call ``_rebind_optimizer`` to point
+    the optimizer at the new sharded parameters.
+
+    This mirrors accelerate's approach in ``Accelerator._prepare_fsdp2``.
+    """
+    for group in optimizer.param_groups:
+        for i in range(len(group['params'])):
+            group['params'][i] = torch.empty(1)
 
 
 def _restore_non_persistent_buffers(
