@@ -69,11 +69,13 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     @app.post('/twinkle/create', response_model=types.CreateResponse)
     async def create(request: Request, body: types.CreateRequest,
                      self: ModelManagement = Depends(self_fn)) -> types.CreateResponse:
+        await self._on_request_start(request)
         return types.CreateResponse()
 
     @app.post('/twinkle/forward', response_model=types.ForwardResponse)
     async def forward(request: Request, body: types.ForwardRequest,
                       self: ModelManagement = Depends(self_fn)) -> types.ForwardResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -91,6 +93,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ForwardOnlyRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ForwardResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -108,6 +111,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.CalculateLossResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -120,6 +124,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/backward')
     async def backward(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -135,6 +140,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ForwardRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ForwardBackwardResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -152,6 +158,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ClipGradNormResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -164,6 +171,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/step')
     async def step(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -175,6 +183,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/zero_grad')
     async def zero_grad(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -186,6 +195,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/lr_step')
     async def lr_step(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -201,6 +211,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ClipGradAndStepRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -221,6 +232,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.GetTrainConfigsResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -233,6 +245,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
     @app.post('/twinkle/set_loss')
     async def set_loss(request: Request, body: types.SetLossRequest, self: ModelManagement = Depends(self_fn)) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -248,6 +261,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetOptimizerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -263,6 +277,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetLrSchedulerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -380,6 +395,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ApplyPatchRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -396,6 +412,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AddMetricRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -412,6 +429,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetTemplateRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -427,6 +445,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetProcessorRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -442,6 +461,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.CalculateMetricRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.CalculateMetricResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -458,6 +478,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.GetStateDictRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.GetStateDictResponse:
+        await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
