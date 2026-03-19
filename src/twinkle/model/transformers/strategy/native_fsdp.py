@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
 
@@ -125,7 +125,6 @@ class NativeFSDPStrategy:
 
             # --- Phase 2: broadcast and restore ---
             if use_meta:
-                import torch.distributed as dist
                 device_type = self.device_mesh.device_type or 'cuda'
                 is_rank0 = (dist.get_rank() == 0)
                 _broadcast_sharded_state_dict(
@@ -452,22 +451,18 @@ def _broadcast_sharded_state_dict(
             may be empty (``{}``) on other ranks.
         device_type: The device type string (e.g. ``'cuda'``, ``'npu'``).
     """
-    import torch.distributed as dist
     from torch.distributed.tensor import DTensor, distribute_tensor
 
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
     is_rank0 = (dist.get_rank() == 0)
 
-    if is_rank0:
-        full_items = iter(full_sd.items())
-
     for param_name, sharded_param in meta_sharded_sd.items():
         shape = sharded_param.size()
         dtype = sharded_param.dtype
 
         if is_rank0:
-            _, full_param = next(full_items)
+            full_param = full_sd[param_name]
             full_tensor = full_param.detach().to(device_type)
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
@@ -502,15 +497,13 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
     reads PyTorch's internal tracking set rather than diffing against
     ``state_dict()`` keys.
     """
-    import copy
-
     non_persistent_fqns: Set[str] = set()
     for fqn, module in model.named_modules():
         for buf_name in getattr(module, '_non_persistent_buffers_set', set()):
             full_fqn = f'{fqn}.{buf_name}' if fqn else buf_name
             non_persistent_fqns.add(full_fqn)
 
-    return copy.deepcopy({k: v for k, v in model.named_buffers() if k in non_persistent_fqns})
+    return {k: v.clone() for k, v in model.named_buffers() if k in non_persistent_fqns}
 
 
 def _restore_non_persistent_buffers(
