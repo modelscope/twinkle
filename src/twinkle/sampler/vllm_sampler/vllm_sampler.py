@@ -24,11 +24,12 @@ import atexit
 import numpy as np
 import os
 import threading
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
 from twinkle.utils import Platform
@@ -211,6 +212,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if videos:
             result['videos'] = videos
         return result
+
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
+        apply_patch(self, patch_cls, **kwargs)
 
     async def _sample_single(
         self,

@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Type, Union
 import twinkle
 from twinkle import remote_function
 from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
+from twinkle.patch import Patch
 from twinkle.template import Template
 from twinkle.utils import construct_class
 
@@ -41,6 +42,10 @@ class Sampler(ABC):
             Total sequences = len(inputs) * num_samples.
         """
         pass
+
+    @abstractmethod
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
+        ...
 
     @staticmethod
     def _not_encoded(inputs: Any) -> bool:
