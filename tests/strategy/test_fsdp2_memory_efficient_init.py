@@ -392,17 +392,19 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
         # Verify env vars are actually set during from_pretrained call
         captured_env = {}
 
-        original_from_pretrained = None
+        # Build a fake model_cls whose from_pretrained captures env vars.
+        # We pass it explicitly as model_cls to avoid default-argument binding issues.
+        fake_model_cls = MagicMock()
 
-        def fake_from_pretrained(cls_or_self, *args, **kwargs):
-            """Capture env vars at the moment from_pretrained is called."""
+        def fake_from_pretrained(*args, **kwargs):
             captured_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
             captured_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
-            # Return a minimal mock model
             mock_model = MagicMock()
             mock_model.gradient_checkpointing_enable = MagicMock()
             mock_model.named_parameters = MagicMock(return_value=iter([]))
             return mock_model
+
+        fake_model_cls.from_pretrained = fake_from_pretrained
 
         from twinkle.utils import DeviceMesh as TwinkleMesh
 
@@ -419,16 +421,15 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
 
         try:
             with patch('twinkle.model.transformers.transformers.HubOperation') as mock_hub, \
-                 patch('twinkle.model.transformers.transformers.AutoModelForCausalLM') as mock_auto, \
                  patch.object(TransformersModel, '_try_init_process_group'), \
                  patch.object(TransformersModel, '_decide_strategy'), \
                  patch.object(TransformersModel, '_construct_default_optimizer_group', return_value=MagicMock()):
                 mock_hub.download_model.return_value = '/fake/path'
-                mock_auto.from_pretrained = classmethod(fake_from_pretrained)
 
                 # memory_efficient_init=True with device_mesh → env vars should be set
                 try:
                     TransformersModel(
+                        model_cls=fake_model_cls,
                         model_id='/fake/model',
                         device_mesh=mesh,
                         memory_efficient_init=True,
@@ -463,13 +464,17 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
 
         captured_env = {}
 
-        def fake_from_pretrained(cls_or_self, *args, **kwargs):
+        fake_model_cls = MagicMock()
+
+        def fake_from_pretrained(*args, **kwargs):
             captured_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
             captured_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
             mock_model = MagicMock()
             mock_model.gradient_checkpointing_enable = MagicMock()
             mock_model.named_parameters = MagicMock(return_value=iter([]))
             return mock_model
+
+        fake_model_cls.from_pretrained = fake_from_pretrained
 
         mesh = TwinkleMesh(
             mesh=np.arange(1),
@@ -483,15 +488,14 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
 
         try:
             with patch('twinkle.model.transformers.transformers.HubOperation') as mock_hub, \
-                 patch('twinkle.model.transformers.transformers.AutoModelForCausalLM') as mock_auto, \
                  patch.object(TransformersModel, '_try_init_process_group'), \
                  patch.object(TransformersModel, '_decide_strategy'), \
                  patch.object(TransformersModel, '_construct_default_optimizer_group', return_value=MagicMock()):
                 mock_hub.download_model.return_value = '/fake/path'
-                mock_auto.from_pretrained = classmethod(fake_from_pretrained)
 
                 try:
                     TransformersModel(
+                        model_cls=fake_model_cls,
                         model_id='/fake/model',
                         device_mesh=mesh,
                         memory_efficient_init=False,
