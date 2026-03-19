@@ -58,6 +58,33 @@ class TinyModel(nn.Module):
         return self.layer2(self.layer1(x))
 
 
+class TinyDecoderLayer(nn.Module):
+    """Minimal decoder layer for per-layer sharding tests."""
+
+    def __init__(self, dim=32):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim, bias=False)
+        self.fc2 = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        return self.fc2(self.fc1(x))
+
+
+class TinyTransformerModel(nn.Module):
+    """Model with model.model.layers structure matching _get_decoder_layers expectations."""
+
+    def __init__(self, dim=32, num_layers=2):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([TinyDecoderLayer(dim) for _ in range(num_layers)])
+        self.lm_head = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        for layer in self.model.layers:
+            x = layer(x)
+        return self.lm_head(x)
+
+
 def _worker_broadcast_sharded(rank, world_size, port, ref_sd):
     """Worker function: shard on meta, broadcast, verify values."""
     _init_dist(rank, world_size, port)
@@ -282,20 +309,206 @@ class TestWrapModelLegacy(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Task 5b: wrap_model memory_efficient with per-layer sharding
+# ---------------------------------------------------------------------------
+
+
+def _worker_wrap_model_per_layer(rank, world_size, port, ref_sd):
+    """Test that wrap_model with memory_efficient=True correctly shards per decoder layer."""
+    _init_dist(rank, world_size, port)
+    from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy, _get_decoder_layers
+    from twinkle.utils import DeviceMesh as TwinkleMesh
+
+    mesh = TwinkleMesh(
+        mesh=np.arange(world_size),
+        mesh_dim_names=('fsdp', ),
+        device_type=_DEVICE_TYPE,
+    )
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
+
+    model = TinyTransformerModel(dim=32, num_layers=2).to(_DEVICE_TYPE)
+    if rank == 0:
+        model.load_state_dict(ref_sd)
+
+    # Verify the model has the expected structure before wrapping
+    assert _get_decoder_layers(model) is not None, \
+        "TinyTransformerModel should have model.model.layers"
+
+    model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=True)
+
+    # Verify: all parameters on device, not meta
+    for name, param in model.named_parameters():
+        assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
+
+    # Verify: gathered full state dict matches original
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    gathered = get_model_state_dict(
+        model,
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+    )
+    if rank == 0:
+        for key in ref_sd:
+            assert torch.allclose(gathered[key], ref_sd[key], atol=1e-6), \
+                f"Mismatch on {key}"
+
+    dist.destroy_process_group()
+
+
+@unittest.skipIf(_device_count() < 2, f'Need >= 2 {_DEVICE_TYPE.upper()}s')
+class TestWrapModelPerLayerSharding(unittest.TestCase):
+
+    def test_wrap_model_per_layer_memory_efficient(self):
+        """Verify per-layer fully_shard works with the meta→broadcast path."""
+        port = _find_free_port()
+        world_size = 2
+        ref_model = TinyTransformerModel(dim=32, num_layers=2)
+        ref_sd = {k: v.clone() for k, v in ref_model.state_dict().items()}
+        mp.spawn(
+            _worker_wrap_model_per_layer,
+            args=(world_size, port, ref_sd),
+            nprocs=world_size,
+            join=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 6: env var / memory_efficient_init parameter in TransformersModel
 # ---------------------------------------------------------------------------
 class TestEnvVarRamEfficientLoading(unittest.TestCase):
-    """Test that __init__ sets FSDP env vars for both strategies."""
+    """Test that __init__ sets FSDP env vars during from_pretrained."""
 
     def test_env_vars_set_during_from_pretrained(self):
-        """Verify env vars are set when memory_efficient_init=True, regardless of strategy."""
-        # Verify the new parameter exists in __init__ signature
+        """Verify env vars are set when memory_efficient_init=True and restored after."""
         import inspect
+        from unittest.mock import MagicMock, patch
 
         from twinkle.model.transformers.transformers import TransformersModel
+
+        # Verify the parameter exists in __init__ signature
         sig = inspect.signature(TransformersModel.__init__)
         assert 'memory_efficient_init' in sig.parameters, \
             'memory_efficient_init parameter should exist in __init__'
+
+        # Verify env vars are actually set during from_pretrained call
+        captured_env = {}
+
+        original_from_pretrained = None
+
+        def fake_from_pretrained(cls_or_self, *args, **kwargs):
+            """Capture env vars at the moment from_pretrained is called."""
+            captured_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
+            captured_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
+            # Return a minimal mock model
+            mock_model = MagicMock()
+            mock_model.gradient_checkpointing_enable = MagicMock()
+            mock_model.named_parameters = MagicMock(return_value=iter([]))
+            return mock_model
+
+        from twinkle.utils import DeviceMesh as TwinkleMesh
+
+        mesh = TwinkleMesh(
+            mesh=np.arange(1),
+            mesh_dim_names=('fsdp', ),
+            device_type='cpu',
+        )
+
+        # Clean env before test
+        saved = {}
+        for key in ('ACCELERATE_USE_FSDP', 'FSDP_CPU_RAM_EFFICIENT_LOADING'):
+            saved[key] = os.environ.pop(key, None)
+
+        try:
+            with patch('twinkle.model.transformers.transformers.HubOperation') as mock_hub, \
+                 patch('twinkle.model.transformers.transformers.AutoModelForCausalLM') as mock_auto, \
+                 patch.object(TransformersModel, '_try_init_process_group'), \
+                 patch.object(TransformersModel, '_decide_strategy'), \
+                 patch.object(TransformersModel, '_construct_default_optimizer_group', return_value=MagicMock()):
+                mock_hub.download_model.return_value = '/fake/path'
+                mock_auto.from_pretrained = classmethod(fake_from_pretrained)
+
+                # memory_efficient_init=True with device_mesh → env vars should be set
+                try:
+                    TransformersModel(
+                        model_id='/fake/model',
+                        device_mesh=mesh,
+                        memory_efficient_init=True,
+                    )
+                except Exception:
+                    pass  # We only care about the env var capture
+
+            assert captured_env.get('ACCELERATE_USE_FSDP') == 'true', \
+                f"ACCELERATE_USE_FSDP should be 'true' during from_pretrained, got {captured_env.get('ACCELERATE_USE_FSDP')}"
+            assert captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING') == 'true', \
+                f"FSDP_CPU_RAM_EFFICIENT_LOADING should be 'true' during from_pretrained, got {captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING')}"
+
+            # Verify env vars are restored after __init__
+            assert os.environ.get('ACCELERATE_USE_FSDP') is None, \
+                'ACCELERATE_USE_FSDP should be restored (removed) after __init__'
+            assert os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING') is None, \
+                'FSDP_CPU_RAM_EFFICIENT_LOADING should be restored (removed) after __init__'
+        finally:
+            # Restore original env
+            for key, val in saved.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+    def test_env_vars_not_set_when_disabled(self):
+        """Verify env vars are NOT set when memory_efficient_init=False."""
+        from unittest.mock import MagicMock, patch
+
+        from twinkle.model.transformers.transformers import TransformersModel
+        from twinkle.utils import DeviceMesh as TwinkleMesh
+
+        captured_env = {}
+
+        def fake_from_pretrained(cls_or_self, *args, **kwargs):
+            captured_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
+            captured_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
+            mock_model = MagicMock()
+            mock_model.gradient_checkpointing_enable = MagicMock()
+            mock_model.named_parameters = MagicMock(return_value=iter([]))
+            return mock_model
+
+        mesh = TwinkleMesh(
+            mesh=np.arange(1),
+            mesh_dim_names=('fsdp', ),
+            device_type='cpu',
+        )
+
+        saved = {}
+        for key in ('ACCELERATE_USE_FSDP', 'FSDP_CPU_RAM_EFFICIENT_LOADING'):
+            saved[key] = os.environ.pop(key, None)
+
+        try:
+            with patch('twinkle.model.transformers.transformers.HubOperation') as mock_hub, \
+                 patch('twinkle.model.transformers.transformers.AutoModelForCausalLM') as mock_auto, \
+                 patch.object(TransformersModel, '_try_init_process_group'), \
+                 patch.object(TransformersModel, '_decide_strategy'), \
+                 patch.object(TransformersModel, '_construct_default_optimizer_group', return_value=MagicMock()):
+                mock_hub.download_model.return_value = '/fake/path'
+                mock_auto.from_pretrained = classmethod(fake_from_pretrained)
+
+                try:
+                    TransformersModel(
+                        model_id='/fake/model',
+                        device_mesh=mesh,
+                        memory_efficient_init=False,
+                    )
+                except Exception:
+                    pass
+
+            assert captured_env.get('ACCELERATE_USE_FSDP') is None, \
+                'ACCELERATE_USE_FSDP should NOT be set when memory_efficient_init=False'
+            assert captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING') is None, \
+                'FSDP_CPU_RAM_EFFICIENT_LOADING should NOT be set when memory_efficient_init=False'
+        finally:
+            for key, val in saved.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
 
 
 # ---------------------------------------------------------------------------
