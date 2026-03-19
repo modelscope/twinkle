@@ -317,6 +317,12 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
         device_type=_DEVICE_TYPE,
     )
 
+    # Debug: check mesh before passing to TransformersModel
+    if rank == 0:
+        print(f"\n=== DEBUG rank {rank}: mesh before TransformersModel ===")
+        print(f"mesh = {mesh}")
+        print(f"mesh type = {type(mesh)}")
+
     model = TransformersModel(
         model_id=model_path,
         device_mesh=mesh,
