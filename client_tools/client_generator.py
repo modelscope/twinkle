@@ -805,6 +805,14 @@ class vLLMSampler(Sampler):
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())
+    
+    def apply_patch(self, patch_cls: str, **kwargs) -> None:
+        """Apply a patch to the model."""
+        response = http_post(
+            url=f'{self.server_url}/apply_patch',
+            json_data={'patch_cls': patch_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
 '''
 
     # Write the sampler client file

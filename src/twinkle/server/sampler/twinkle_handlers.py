@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable
+
+from twinkle.server.common.serialize import deserialize_object
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -162,3 +164,13 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)
+
+    @app.post('/twinkle/apply_patch')
+    async def apply_patch(
+            request: Request,
+            body: types.ApplyPatchRequest,
+            self: SamplerManagement = Depends(self_fn),
+    ) -> None:
+        extra_kwargs = body.model_extra or {}
+        patch_cls = deserialize_object(body.patch_cls)
+        self.sampler.apply_patch(patch_cls, **extra_kwargs)
