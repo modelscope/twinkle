@@ -38,28 +38,27 @@ GRPO 将样本分组(每组对应一个 prompt 的多个生成),然后在组内:
 from twinkle.advantage import GRPOAdvantage
 from twinkle.model import TransformersModel
 from twinkle.sampler import vLLMSampler
-from twinkle.reward import MathReward
 
-# 创建组件
+# Create components
 actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = MathReward()
+reward_fn = ...
 advantage_fn = GRPOAdvantage()
 
-# 训练循环
+# Training loop
 for batch in dataloader:
-    # 1. 采样生成
-    response = sampler.sample(batch, num_samples=4)
+    # Sample generation
+    sample_response = sampler.sample(batch, num_samples=4)
+    input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
+    ...
+    rewards = reward_fn(...)
 
-    # 2. 计算奖励
-    rewards = reward_fn(response.trajectories, batch.ground_truths)
-
-    # 3. 计算优势
+    # Calculate advantages
     advantages = advantage_fn(rewards, num_generations=4)
 
-    # 4. 策略优化
+    # 4. Policy optimization
     loss = actor.forward_backward(
-        inputs=response.inputs,
+        inputs=input_data,
         advantages=advantages
     )
     actor.clip_grad_and_step()

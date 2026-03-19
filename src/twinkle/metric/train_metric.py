@@ -22,14 +22,16 @@ class TrainMetric(Metric):
         self.gradient_accumulation_steps = 1
         self.start_time = time.time()
         self.time = time.time()
+        self.lrs = []
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         lr = kwargs.get('lr')
         if isinstance(lr, list):
-            lr = [f'{x:.2e}' for x in lr]
+            lr = [f'{x:.6e}' for x in lr]
         else:
-            lr = f'{lr:.2e}'
+            lr = f'{lr:.6e}'
         self.lr = lr
+        self.lrs.append(lr)
         self.step = kwargs.get('step')
         self.gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', self.gradient_accumulation_steps)
 

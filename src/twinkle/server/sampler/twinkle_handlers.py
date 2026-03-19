@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -59,9 +59,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """Health check / session creation endpoint."""
         return types.CreateResponse()
 
-    @app.post('/twinkle/sample', response_model=types.SampleResponseModel)
+    @app.post('/twinkle/sample', response_model=types.SampleResponseModelList)
     def sample(request: Request, body: types.SampleRequest,
-               self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModel:
+               self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
         """Sample completions from the model.
 
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
@@ -99,32 +99,35 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params = SamplingParams.from_dict(body.sampling_params)
 
             # Call sampler
-            response = self.sampler.sample(
+            responses = self.sampler.sample(
                 inputs,
                 params,
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
-                num_samples=body.num_samples,
             )
-            if callable(response):
-                response = response()
+            if callable(responses):
+                responses = responses()
 
-            sequences = [
-                types.SampledSequenceModel(
-                    stop_reason=seq.stop_reason,
-                    tokens=list(seq.tokens),
-                    logprobs=list(seq.logprobs) if seq.logprobs is not None else None,
-                    decoded=seq.decoded,
-                    new_input_feature=_serialize_input_feature(seq.new_input_feature)
-                    if seq.new_input_feature is not None else None,
-                ) for seq in response.sequences
-            ]
+            sample_models = []
+            for response in responses:
+                sequences = [
+                    types.SampledSequenceModel(
+                        stop_reason=seq.stop_reason,
+                        tokens=list(seq.tokens),
+                        logprobs=list(seq.logprobs) if seq.logprobs is not None else None,
+                        decoded=seq.decoded,
+                        new_input_feature=_serialize_input_feature(seq.new_input_feature)
+                        if seq.new_input_feature is not None else None,
+                    ) for seq in response.sequences
+                ]
 
-            return types.SampleResponseModel(
-                sequences=sequences,
-                prompt_logprobs=response.prompt_logprobs,
-                topk_prompt_logprobs=response.topk_prompt_logprobs,
-            )
+                sample_models.append(
+                    types.SampleResponseModel(
+                        sequences=sequences,
+                        prompt_logprobs=response.prompt_logprobs,
+                        topk_prompt_logprobs=response.topk_prompt_logprobs,
+                    ))
+            return types.SampleResponseModelList(samples=sample_models)
         except Exception:
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=traceback.format_exc())

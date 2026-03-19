@@ -2,15 +2,16 @@
 from .base import Loss
 from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
+from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .mse import MSELoss
-from .vocab_parallel_cross_entropy import VocabParallelCrossEntropyLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
-    'cross_entropy': CrossEntropyLoss,
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
-    'vocab_parallel_cross_entropy': VocabParallelCrossEntropyLoss,
+    'cross_entropy': CrossEntropyLoss,
+    # KD losses
+    'gkd': GKDLoss,
     # RL losses
     'grpo': GRPOLoss,
     'gspo': GSPOLoss,

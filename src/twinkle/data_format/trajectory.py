@@ -15,5 +15,4 @@ class Trajectory(TypedDict, total=False):
     messages: List[Message]
     extend_message: List[Tuple[str, List[Message]]]
     tools: List[Tool]
-    advantages: float
     user_data: List[Tuple[str, Any]]

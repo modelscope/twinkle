@@ -26,7 +26,8 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
+from twinkle.infra import collect_tensor_dict
+from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.patch import Patch, apply_patch
@@ -238,7 +239,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
-            loss_instance=VocabParallelCrossEntropyLoss(),
+            loss_instance=CrossEntropyLoss(),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,
@@ -339,7 +340,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='last_pp')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -364,7 +365,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def backward(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='mean', sync=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -398,7 +399,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -485,6 +488,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
+                output_tensor.div_(temperature)
                 logps = selective_log_softmax(output_tensor, masked_labels)
                 if cp_size > 1:
                     logps = self._postprocess_tensor_cp(logps)
@@ -564,11 +568,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer_config.inputs = inputs
         if logps and len({_logps.shape[1] for _logps in logps}) == 1:
             logps = torch.cat(logps, dim=0)
+        if logits and len({_logits.shape[1] for _logits in logits}) == 1:
+            logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()
+        if not return_logits:
+            logits = None
         if not forward_only:
-            optimizer_config.outputs = ModelOutput(logits=None, loss=loss, logps=logps)
-        return ModelOutput(logits=None, loss=loss, logps=logps)
+            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+        return ModelOutput(logits=logits, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):

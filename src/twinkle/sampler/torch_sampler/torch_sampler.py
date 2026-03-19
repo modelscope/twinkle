@@ -55,7 +55,7 @@ class TorchSampler(Sampler):
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
-    ) -> SampleResponse:
+    ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
         Args:
@@ -154,4 +154,4 @@ class TorchSampler(Sampler):
                 logprobs=seq_logprobs,
             ))
 
-        return SampleResponse(sequences=all_sequences)
+        return [SampleResponse(sequences=all_sequences)]

@@ -28,7 +28,7 @@ params = SamplingParams(
 )
 
 # 进行采样
-response = sampler.sample(
+responses = sampler.sample(
     trajectories,
     sampling_params=params,
     adapter_name='my_lora',
@@ -66,7 +66,7 @@ sampler = vLLMSampler(
 )
 
 # sample 方法会在 remote worker 中执行
-response = sampler.sample(trajectories, sampling_params=params)
+responses = sampler.sample(trajectories, sampling_params=params)
 ```
 
 ## 环境变量

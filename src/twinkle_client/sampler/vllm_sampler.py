@@ -57,7 +57,7 @@ class vLLMSampler(Sampler):
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
-    ) -> SampleResponseModel:
+    ) -> List[SampleResponseModel]:
         """Sample from the model.
 
         Args:
@@ -68,7 +68,7 @@ class vLLMSampler(Sampler):
             num_samples: Number of completions to generate per prompt.
 
         Returns:
-            SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
+            A list of sampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
         json_data = {
             'inputs': inputs,
@@ -84,7 +84,7 @@ class vLLMSampler(Sampler):
             json_data=json_data
         )
         response.raise_for_status()
-        return SampleResponseModel(**response.json())
+        return [SampleResponseModel(**r) for r in response.json()['samples']]
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""

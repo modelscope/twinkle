@@ -161,17 +161,18 @@ def test_weight_sync(model_gpus: int = 2, sampler_gpus: int = 1, vllm_tp: int = 
     # Quick sample to verify model works
     log('\n--- Sampling after sync ---')
     traj = Trajectory(messages=[{'role': 'user', 'content': 'What is 2+2?'}])
-    response = sampler.sample(traj, SamplingParams(max_tokens=32, temperature=0.0))
-    if callable(response):
-        response = response()
-    if response and response.sequences:
-        tokens = response.sequences[0].tokens
-        if hasattr(tokens, 'tolist'):
-            tokens = tokens.tolist()
-        from modelscope import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        text = tok.decode(tokens, skip_special_tokens=True)
-        log(f"  Output: '{text[:200]}'")
+    responses = sampler.sample(traj, SamplingParams(max_tokens=32, temperature=0.0))
+    if callable(responses):
+        responses = responses()
+    for response in responses:
+        if response and response.sequences:
+            tokens = response.sequences[0].tokens
+            if hasattr(tokens, 'tolist'):
+                tokens = tokens.tolist()
+            from modelscope import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            text = tok.decode(tokens, skip_special_tokens=True)
+            log(f"  Output: '{text[:200]}'")
 
     log('\n--- PASS: Weight sync completed without OOM or hang ---')
     log(f'  Base sync: {base_time:.2f}s, LoRA sync: {lora_time:.2f}s')

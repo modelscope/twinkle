@@ -8,6 +8,7 @@ import threading
 import torch
 import torch.distributed as dist
 import transformers
+from copy import copy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
 from peft.utils import load_peft_weights, set_peft_model_state_dict
@@ -26,6 +27,7 @@ from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
@@ -104,11 +106,14 @@ class OptimizerGroup:
         self._dp_group = self._device_mesh.create_process_group(dims)
 
     def _get_lr(self):
-        _lrs = []
-        _default_lr = self.optimizer.defaults.get('lr')
-        for param_group in self.optimizer.param_groups:
-            _lrs.append(param_group.get('lr', _default_lr))
-        return _lrs
+        if self.optimizer is not None:
+            _lrs = []
+            _default_lr = self.optimizer.defaults.get('lr')
+            for param_group in self.optimizer.param_groups:
+                _lrs.append(param_group.get('lr', _default_lr))
+            return _lrs
+        else:
+            return []
 
     def accumulate_metrics(self, is_training):
         self._ensure_dp_group()
@@ -124,7 +129,8 @@ class OptimizerGroup:
                     lr=self._get_lr(),
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm)
+                    grad_norm=self._last_grad_norm,
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'))
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -349,7 +355,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             _device_mesh=self.device_mesh,
         )
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
@@ -361,6 +367,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -392,10 +400,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
-            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
+            logits = outputs['logits']
+            logits.div_(temperature)
+            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
+        outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -407,6 +421,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -439,7 +455,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
-            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
+            logits = outputs['logits']
+            logits.div_(temperature)
+            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
+        outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
     @remote_function(collect='mean')
@@ -501,7 +523,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.cur_step += 1
         optimizer_config.loss_value = None
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Do forward, calculate loss, and backward.

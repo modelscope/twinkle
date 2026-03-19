@@ -116,20 +116,26 @@ for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
 
 
 class GSM8KProcessor(Preprocessor):
-    """Preprocessor for GSM8K dataset.
+    """Preprocessor for GSM8K dataset (prompt-only, for on-policy generation).
 
     GSM8K fields: question (str), answer (str ending with '#### <number>')
     Extracts the ground truth number and stores it in user_data for reward.
+    Only includes system + user messages; assistant response is generated on-policy.
     """
-
     system_prompt = ('You are a helpful math assistant. Solve the problem step by step. '
                      'Show your reasoning in <think> </think> tags, then give the final '
                      'numerical answer after ####.\n'
                      'For example:\n<think> ... reasoning ... </think>\n#### 42')
 
+    def __init__(self, system=None, add_assistant=False):
+        self.system = system
+        if self.system is None:
+            self.system = self.system_prompt
+        self.add_assistant = add_assistant
+
     def extract_ground_truth(self, answer_str: str) -> str:
         """Extract the number after '####' from GSM8K answer."""
-        match = re.search(r'####\s*([\-\d,\.]+)', answer_str)
+        match = re.search(r'####\s*([\-\d,.]+)', answer_str)
         if match:
             return match.group(1).replace(',', '').strip()
         return ''
@@ -146,9 +152,11 @@ class GSM8KProcessor(Preprocessor):
         ground_truth = self.extract_ground_truth(answer)
 
         messages = [
-            Message(role='system', content=self.system_prompt),
+            Message(role='system', content=self.system),
             Message(role='user', content=question),
         ]
+        if self.add_assistant:
+            messages.append(Message(role='assistant', content=answer))
         return Trajectory(
             messages=messages,
             user_data=[('ground_truth', ground_truth)],

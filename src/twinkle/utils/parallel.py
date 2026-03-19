@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import os
 import re
 from contextlib import contextmanager
@@ -18,7 +19,10 @@ def _sanitize_lock_name(name: str) -> str:
 
 def acquire_lock(lock: FileLock, blocking: bool):
     try:
-        lock.acquire(blocking=blocking)
+        if 'blocking' in inspect.signature(lock.acquire).parameters:
+            lock.acquire(blocking=blocking)
+        else:
+            lock.acquire(timeout=(0 if not blocking else None))
         return True
     except TimeoutError:
         return False

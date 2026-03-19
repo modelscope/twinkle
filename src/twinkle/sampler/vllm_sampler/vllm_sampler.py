@@ -21,6 +21,7 @@ Data Flow:
 """
 import asyncio
 import atexit
+import numpy as np
 import os
 import threading
 from typing import Any, Dict, List, Optional, Union
@@ -35,27 +36,21 @@ from twinkle.utils import Platform
 logger = get_logger()
 
 
-def _collect_sample_responses(results: List[SampleResponse], **kwargs) -> SampleResponse:
-    """Custom collect function to merge multiple SampleResponse objects.
-
-    Args:
-        results: List of SampleResponse from each DP worker.
-
-    Returns:
-        Merged SampleResponse with all sequences combined.
-    """
-    if not results:
-        return SampleResponse(sequences=[])
-
-    if len(results) == 1:
-        return results[0]
-
-    all_sequences = []
-    for resp in results:
-        if resp is not None and hasattr(resp, 'sequences'):
-            all_sequences.extend(resp.sequences)
-
-    return SampleResponse(sequences=all_sequences)
+def _convert_ndarray_to_list(obj: Any) -> Any:
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_ndarray_to_list(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        converted = [_convert_ndarray_to_list(item) for item in obj]
+        return type(obj)(converted) if isinstance(obj, tuple) else converted
+    return obj
 
 
 @remote_class()
@@ -148,7 +143,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         """Create engine in async context to ensure output_handler starts correctly."""
         return engine_cls(model_id=model_id, **engine_kwargs)
 
-    def encode_trajectory_for_vllm(self, trajectory: Trajectory, adapter_name: str = '') -> InputFeature:
+    def encode_trajectory_for_vllm(self,
+                                   trajectory: Trajectory,
+                                   adapter_name: str = '',
+                                   add_generation_prompt=True) -> InputFeature:
         """Encode trajectory for vLLM - does not expand image tokens.
 
         Args:
@@ -193,28 +191,25 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                             new_content.append({'type': 'text', 'text': part})
                     msg['content'] = new_content if new_content else [{'type': 'text', 'text': ''}]
 
-        encoded = template.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            add_generation_prompt=True,
-            return_tensors='pt',
-        )
+        encoded = template.batch_encode(
+            [Trajectory(messages=messages)],
+            add_generation_prompt=add_generation_prompt,
+        )[0]
 
         input_ids = encoded['input_ids']
         if hasattr(input_ids, 'squeeze'):
-            input_ids = input_ids.squeeze(0)
+            input_ids = input_ids.squeeze()
         if hasattr(input_ids, 'tolist'):
             input_ids = input_ids.tolist()
 
-        result = InputFeature(input_ids=input_ids)
+        result = trajectory
+        result.update(encoded)
 
         # Attach preprocessed images/videos for vLLM
         if images:
             result['images'] = images
         if videos:
             result['videos'] = videos
-
         return result
 
     async def _sample_single(
@@ -223,9 +218,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         sampling_params: SamplingParams,
         lora_request: Optional[Any] = None,
         *,
-        logprobs: bool = True,
-        num_samples: int = 1,
-    ) -> List[SampledSequence]:
+        logprobs_only: bool = False,
+    ) -> SampleResponse:
         """Sample a single input asynchronously.
 
         Args:
@@ -234,10 +228,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             adapter_path: Optional LoRA adapter path (legacy, prefer lora_request).
             lora_request: Pre-built LoRARequest to attach to the sampling request.
                 Avoids repeated ``_get_or_load_lora`` calls per input.
-            num_samples: Number of completions to generate for this prompt.
+            logprobs_only: Only return logprobs (no generated tokens).
 
         Returns:
-            List of num_samples SampledSequence objects.
+            A SampleResponse object
         """
         input_ids = feat['input_ids']
         if hasattr(input_ids, 'tolist'):
@@ -249,25 +243,39 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         response = await self.engine.sample(
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
-            logprobs=logprobs,
-            num_samples=num_samples,
             lora_request=lora_request,
             images=images,
             videos=videos,
         )
 
-        # response.sequences contains num_samples sequences for this prompt
-        return [
-            SampledSequence(
-                stop_reason=seq.stop_reason,
-                tokens=seq.tokens,
-                logprobs=seq.logprobs,
-                decoded=self.template.decode(seq.tokens),
-                new_input_feature=self.template.concat_input_feature(feat, seq.tokens),
-            ) for seq in response.sequences
-        ]
+        if not logprobs_only:
+            # response.sequences contains num_samples sequences for this prompt
+            return SampleResponse(
+                sequences=[
+                    SampledSequence(
+                        stop_reason=seq.stop_reason,
+                        tokens=seq.tokens,
+                        logprobs=seq.logprobs,
+                        decoded=self.template.decode(seq.tokens),
+                        new_input_feature=_convert_ndarray_to_list(
+                            self.template.concat_input_feature(feat, seq.tokens)),
+                    ) for seq in response.sequences
+                ],
+                prompt_logprobs=response.prompt_logprobs,
+                topk_prompt_logprobs=response.topk_prompt_logprobs)
+        else:
+            return SampleResponse(
+                sequences=[
+                    SampledSequence(
+                        tokens=[],
+                        stop_reason=seq.stop_reason,
+                        new_input_feature=_convert_ndarray_to_list(feat),
+                    ) for seq in response.sequences
+                ],
+                prompt_logprobs=response.prompt_logprobs,
+                topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect=_collect_sample_responses, lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -275,10 +283,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         adapter_name: str = '',
         adapter_path: Optional[str] = None,
         *,
-        logprobs: bool = True,
-        num_samples: int = 1,
         return_encoded: bool = False,
-    ) -> SampleResponse:
+    ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
         Args:
@@ -302,7 +308,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         Note:
             In Ray mode with multiple workers (DP > 1):
             - Data is automatically sliced by DP rank (dispatch='slice_dp')
-            - Results are merged using _collect_sample_responses
             - Each worker receives already-sliced inputs (e.g., DP4 with 8 inputs -> 2 per worker)
         """
         if sampling_params is None:
@@ -314,12 +319,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = self._is_trajectory(inputs)
+        logprobs_only = False
+        if sampling_params.max_tokens == 0:
+            sampling_params.max_tokens = 1
+            logprobs_only = True
 
         if is_trajectory:
             template = self.template
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
-            encoded_inputs = [self.encode_trajectory_for_vllm(traj, adapter_name) for traj in inputs_list]
+            encoded_inputs = [
+                self.encode_trajectory_for_vllm(traj, adapter_name, not logprobs_only) for traj in inputs_list
+            ]
         else:
             encoded_inputs = inputs_list
 
@@ -337,18 +348,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     feat,
                     sampling_params,
                     lora_request=lora_request,
-                    logprobs=logprobs,
-                    num_samples=num_samples,
+                    logprobs_only=logprobs_only,
                 ) for feat in encoded_inputs
             ]
             return await asyncio.gather(*tasks)
 
-        results = self._run_in_loop(_sample_all())
-        # Flatten results (each result contains num_samples sequences)
-        all_sequences = []
-        for seqs in results:
-            all_sequences.extend(seqs)
-        return SampleResponse(sequences=all_sequences)
+        sample_results = self._run_in_loop(_sample_all())
+        return sample_results
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:

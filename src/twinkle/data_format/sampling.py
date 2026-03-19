@@ -17,21 +17,20 @@ class SamplingParams:
     top_k: int = -1
     top_p: float = 1.0
     repetition_penalty: float = 1.0
+    logprobs: int = None
+    prompt_logprobs: int = None
+    num_samples: int = 1
 
-    def to_vllm(self, *, num_samples: int = 1, logprobs: bool = True, prompt_logprobs: int = 0):
+    def to_vllm(self, **kwargs):
         """Convert to vLLM SamplingParams.
-
-        Args:
-            num_samples: Number of completions per prompt (vLLM's 'n' parameter).
-            logprobs: Whether to return logprobs for generated tokens.
-            prompt_logprobs: Number of prompt token logprobs to return.
         """
         from vllm import SamplingParams as VLLMSamplingParams
 
         kwargs = {
             'temperature': self.temperature,
             'top_p': self.top_p,
-            'n': num_samples,
+            'n': self.num_samples,
+            **kwargs,
         }
 
         if self.max_tokens is not None:
@@ -54,14 +53,14 @@ class SamplingParams:
             else:
                 kwargs['stop'] = list(self.stop)
 
-        if logprobs:
-            kwargs['logprobs'] = 0
+        if self.logprobs is not None:
+            kwargs['logprobs'] = self.logprobs
 
-        if prompt_logprobs > 0:
-            kwargs['prompt_logprobs'] = prompt_logprobs
+        if self.prompt_logprobs is not None:
+            kwargs['prompt_logprobs'] = self.prompt_logprobs
 
         vllm_params = VLLMSamplingParams(**kwargs)
-        if num_samples > 1:
+        if self.num_samples > 1:
             from vllm.sampling_params import RequestOutputKind
             vllm_params.output_kind = RequestOutputKind.FINAL_ONLY
         return vllm_params

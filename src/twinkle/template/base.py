@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, 
 from twinkle.data_format import InputFeature, Message, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
-from .utils import tokenize_with_assistant_labels, transfer_to_standard_message
+from .utils import TokenizeByRound, transfer_to_standard_message
 
 if TYPE_CHECKING:
     import torch
@@ -52,6 +52,7 @@ class Template:
         self._test_support_assistant_tokens_mask()
         self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
             self._add_default_system,  # Add a default system field
+            self._to_standard_reasoning_content,  # Convert thinking to standard field
             self._build_mm_messages,  # turn to standard mm messages
         ]
         self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
@@ -183,6 +184,36 @@ class Template:
                     messages.insert(0, Message(role='system', content=self.default_system))
         return [trajectory]
 
+    def _to_standard_reasoning_content(self, trajectory: Trajectory) -> List[Trajectory]:
+
+        def _extract_reasoning_content(messages: list[Message]) -> List[Message]:
+            result = []
+            for message in messages:
+                message = message.copy()
+                if message.get('role') == 'assistant':
+                    content = message.get('content', '')
+                    if 'reasoning_content' not in message and isinstance(content, str):
+                        if '</think>' in content:
+                            reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip(
+                                '\n')
+                            new_content = content.split('</think>')[-1].lstrip('\n')
+
+                            message['reasoning_content'] = reasoning_content
+                            message['content'] = new_content
+
+                result.append(message)
+
+            return result
+
+        trajectory['messages'] = _extract_reasoning_content(trajectory['messages'])
+        extra_messages = trajectory.get('extend_message', [])
+        if extra_messages:
+            result = []
+            for key, extra_message in trajectory.get('extend_message', []):
+                result.append((key, _extract_reasoning_content(extra_message)))
+            trajectory['extend_message'] = result
+        return [trajectory]
+
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
         if self.max_length and len(input_feature['input_ids']) > self.max_length:
             if self.truncation_strategy == 'raise':
@@ -267,8 +298,8 @@ class Template:
                 assistant_masks = encoded.pop('assistant_masks')
                 labels = np.where(assistant_masks, input_ids, -100)
             else:
-                input_ids, labels, encoded = tokenize_with_assistant_labels(self.tokenizer, self._apply_chat_template,
-                                                                            trajectory)
+                input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(
+                    self.tokenizer, self._apply_chat_template, trajectory)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']

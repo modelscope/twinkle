@@ -80,7 +80,7 @@ class AccelerateStrategy:
         fsdp_size = device_mesh.get_dim_size('fsdp') if device_mesh.has_dim('fsdp') else 1
         dp_size = device_mesh.get_dim_size('dp') if device_mesh.has_dim('dp') else 1
 
-        if fsdp_size == 1 and dp_size == 1:
+        if fsdp_size == 1:
             return None
 
         fsdp_config = fsdp_config or {}

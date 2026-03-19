@@ -38,7 +38,6 @@ from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.sampler import vLLMSampler
-from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
 
@@ -127,6 +126,8 @@ def train():
         'max_tokens': MAX_NEW_TOKENS,
         'temperature': TEMPERATURE,
         'top_p': 0.95,
+        'num_samples': NUM_GENERATIONS,
+        'logprobs': 1,
     }
 
     # Track the current adapter path for sampling
@@ -153,21 +154,21 @@ def train():
             logger.info(f'Step {step}: Saved weights to {current_adapter_uri}')
 
         # ========== 2. Sample completions ==========
-        sample_response = sampler.sample(
+        sample_responses = sampler.sample(
             inputs=prompts,
             sampling_params=sampling_params,
             adapter_uri=current_adapter_uri,
-            num_samples=NUM_GENERATIONS,
         )
 
         all_input_data: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
         all_completion_lengths: List[int] = []
 
-        for sequence in sample_response.sequences:
-            all_input_data.append(sequence.new_input_feature)
-            all_old_logps.append(sequence.logprobs)
-            all_completion_lengths.append(len(sequence.tokens))
+        for sample_response in sample_responses:
+            for sequence in sample_response.sequences:
+                all_input_data.append(sequence.new_input_feature)
+                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                all_completion_lengths.append(len(sequence.tokens))
 
         # ========== 3. Compute rewards ==========
 

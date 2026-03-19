@@ -6,6 +6,7 @@ import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
+from .collectors import collect_tensor_dict
 
 logger = get_logger()
 
@@ -343,10 +344,18 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         length = len(workers)
 
         def dispatch_func(arg, n):
-            if isinstance(arg, list):
+            import torch
+            if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
                 for i in range(n):
                     _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
+                return _args
+            elif isinstance(arg, dict):
+                _args = [{} for _ in range(n)]
+                for key in arg.keys():
+                    value = arg[key]
+                    for i, v in enumerate(dispatch_func(value, n)):
+                        _args[i][key] = v
                 return _args
             else:
                 return [arg] * n

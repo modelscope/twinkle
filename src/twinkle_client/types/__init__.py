@@ -60,6 +60,7 @@ from .sampler import (
     SampledSequenceModel,
     SampleRequest,
     SampleResponseModel,
+    SampleResponseModelList,
     SetTemplateRequest as SamplerSetTemplateRequest,
     SetTemplateResponse as SamplerSetTemplateResponse,
 )

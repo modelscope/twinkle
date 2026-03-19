@@ -89,8 +89,8 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # LoRA 训练：约 18G * 4 显存占用
-    # 全参数训练：约 50G * 4 显存占用
+    # LoRA 训练：约 8G * 8 显存占用
+    # 全参数训练：约 18G * 8 显存占用
     for step, batch in enumerate(dataloader):
         # 前向 + 反向传播
         model.forward_backward(inputs=batch)
@@ -250,7 +250,7 @@ def main():
 
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
 
     optim_step = 0
     logger.info(get_device_placement())
@@ -266,20 +266,20 @@ def main():
         sampler.reset_prefix_cache()
 
         # 组采样：每个 prompt 采样 NUM_GENERATIONS 个结果
-        sample_response = sampler.sample(
+        sample_responses = sampler.sample(
             global_prompts * NUM_GENERATIONS,
             sampling_params,
-            num_samples=1,
         )
 
         all_input_data = []
         all_old_logps = []
         all_completion_lengths = []
 
-        for sequence in sample_response.sequences:
-            all_input_data.append(sequence.new_input_feature)
-            all_old_logps.append(sequence.logprobs)
-            all_completion_lengths.append(len(sequence.tokens))
+        for sample_response in sample_responses:
+            for sequence in sample_response.sequences:
+                all_input_data.append(sequence.new_input_feature)
+                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                all_completion_lengths.append(len(sequence.tokens))
 
         # 计算奖励
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(all_input_data)

@@ -178,12 +178,13 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     # ── Helper: sample one prompt ─────────────────────────────────────
     def do_sample(prompt: str, max_tokens: int = 32) -> str:
         traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
-        response = wait_result(sampler.sample(traj, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
-        if response and response.sequences:
-            tokens = response.sequences[0].tokens
-            if hasattr(tokens, 'tolist'):
-                tokens = tokens.tolist()
-            return tokenizer.decode(tokens, skip_special_tokens=True)
+        responses = wait_result(sampler.sample(traj, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
+        for response in responses:
+            if response and response.sequences:
+                tokens = response.sequences[0].tokens
+                if hasattr(tokens, 'tolist'):
+                    tokens = tokens.tolist()
+                return tokenizer.decode(tokens, skip_special_tokens=True)
         return ''
 
     # ── Sample BEFORE sync (dummy weights → garbage) ──────────────────
