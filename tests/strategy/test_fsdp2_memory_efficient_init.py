@@ -330,6 +330,8 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
         print(f"\n=== DEBUG rank {rank}: After TransformersModel init ===")
         print(f"model._model_wrapped = {model._model_wrapped}")
         print(f"model._memory_efficient_init = {getattr(model, '_memory_efficient_init', 'NOT SET')}")
+        print(f"model.device_mesh = {model.device_mesh}")
+        print(f"model.strategy.device_mesh = {model.strategy.device_mesh}")
         for name, param in list(model.model.named_parameters())[:5]:
             print(f"  {name}: device={param.device}, shape={param.shape}")
 
