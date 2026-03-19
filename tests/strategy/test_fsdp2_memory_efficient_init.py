@@ -346,8 +346,9 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
         model.model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
     )
-    # Just check we can gather without error — values correctness is tested in unit tests
-    assert len(gathered) > 0, "Should have gathered state dict"
+    # full_state_dict=True gathers shards to rank 0 only; other ranks get {}.
+    if rank == 0:
+        assert len(gathered) > 0, "Should have gathered state dict"
 
     if dist.is_initialized():
         dist.destroy_process_group()
