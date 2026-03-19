@@ -70,7 +70,8 @@ class AccelerateStrategy:
 
         return parallelism_config
 
-    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any], memory_efficient: bool):
+    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any],
+                                      memory_efficient: bool):
         from accelerate import FullyShardedDataParallelPlugin
         from torch.distributed.fsdp import BackwardPrefetch
         from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
@@ -111,10 +112,6 @@ class AccelerateStrategy:
             cpu_ram_efficient_loading=fsdp_config.pop('cpu_ram_efficient_loading', memory_efficient),
             **fsdp_config,
         )
-        # The env vars (ACCELERATE_USE_FSDP, FSDP_CPU_RAM_EFFICIENT_LOADING) are set
-        # in TransformersModel.__init__ before from_pretrained, and the plugin's
-        # __post_init__ also sets FSDP_CPU_RAM_EFFICIENT_LOADING when
-        # cpu_ram_efficient_loading=True.
         return fsdp_plugin
 
     def wrap_model(self, model, *args):

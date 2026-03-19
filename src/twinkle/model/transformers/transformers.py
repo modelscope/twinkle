@@ -205,16 +205,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.model = model_cls.from_config(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
-            # Memory-efficient init: set env vars so transformers' from_pretrained
-            # uses its built-in FSDP-aware loading path.
-            # When is_fsdp_enabled() returns True inside transformers:
-            #   - All ranks: model created on meta device
-            #   - Rank 0: loads real weights from disk
-            #   - Non-rank-0: replaces params with torch.empty_like (no disk I/O)
-            # This works for BOTH strategies:
-            #   - NativeFSDPStrategy: wrap_model does meta → broadcast (Task 4)
-            #   - AccelerateStrategy: accelerator.prepare() → fsdp2_prepare_model()
-            #     does its own meta → broadcast (accelerate built-in)
+            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             use_efficient_loading = (memory_efficient_init and self.device_mesh is not None)
             _saved_env = {}
             if use_efficient_loading:
@@ -225,10 +216,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             try:
                 self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
             finally:
-                # Restore original env vars to avoid polluting other code paths.
-                # For AccelerateStrategy, Accelerator.__init__ already sets
-                # ACCELERATE_USE_FSDP=true when fsdp_plugin is provided, so
-                # restoring here is safe — accelerate will re-set it as needed.
                 if use_efficient_loading:
                     for key, old_val in _saved_env.items():
                         if old_val is None:

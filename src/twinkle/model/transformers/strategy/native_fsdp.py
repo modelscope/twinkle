@@ -49,20 +49,14 @@ class NativeFSDPStrategy:
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
-            # EP path is not yet compatible with meta-device flow because
-            # _place_ep_experts_on_local_device requires experts on a real device.
+            # EP path requires experts on a real device, incompatible with meta-device flow.
             use_meta = memory_efficient and not ep_enabled
 
-            # --- Phase 1: save state before meta move ---
             original_sd = None
             saved_buffers = None
             if use_meta:
                 original_sd = model.state_dict()
                 saved_buffers = _get_non_persistent_buffers(model)
-                # Drop optimizer references so old params can be freed on to('meta').
-                # Without this, the optimizer holds strong refs to the full-size
-                # parameter tensors, preventing GC even after the model moves to meta.
-                # _rebind_optimizer will re-attach the new sharded params later.
                 if optimizer is not None:
                     _unbind_optimizer_params(optimizer)
                 model = model.to(torch.device('meta'))
@@ -78,11 +72,9 @@ class NativeFSDPStrategy:
             if ep_enabled:
                 _ensure_ep_fsdp_supported(model)
 
-            # Collect experts map and expert params
             experts_map = _collect_ep_experts_map(model) if ep_enabled else {}
             expert_params = _collect_expert_params(model) if self.enable_ep else None
 
-            # Build layer_pairs: [(layer_mod, experts_mod_or_None)]
             layers = _get_decoder_layers(model)
             layer_pairs = []
             if layers is not None:
@@ -90,7 +82,6 @@ class NativeFSDPStrategy:
                     experts_mod = _find_experts_in_layer(layer_mod, experts_map)
                     layer_pairs.append((layer_mod, experts_mod))
 
-            # FSDP2 wrapping per layer
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
@@ -120,7 +111,6 @@ class NativeFSDPStrategy:
                 )
                 layer_mod._fsdp_modules.append(layer_mod)
 
-            # Root model
             fully_shard(
                 model,
                 mesh=fsdp_mesh,
@@ -129,7 +119,6 @@ class NativeFSDPStrategy:
                 ignored_params=expert_params,
             )
 
-            # --- Phase 2: broadcast and restore ---
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
                 is_rank0 = (dist.get_rank() == 0)
@@ -143,11 +132,9 @@ class NativeFSDPStrategy:
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
-            # Manual prefetch
             if ep_enabled and layer_pairs:
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
-            # Rebuild groups after wrapping so grad clip sees the live Parameter objects.
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
 
@@ -436,27 +423,7 @@ def _broadcast_sharded_state_dict(
     full_sd: dict,
     device_type: str = 'cuda',
 ) -> None:
-    """Broadcast full state dict from rank 0 and load as sharded parameters.
-
-    After ``fully_shard`` on a meta-device model, every rank has DTensor
-    parameters whose ``device_mesh`` and ``placements`` describe the desired
-    sharding but whose storage is still on ``meta``.  This function:
-
-    1. Rank 0 broadcasts each full parameter tensor.
-    2. Every rank calls ``distribute_tensor`` to materialise only its local
-       shard, then collects the results into a new state dict.
-    3. ``model.load_state_dict(..., assign=True)`` replaces the meta tensors
-       with the real sharded ones.
-
-    This is the twinkle equivalent of accelerate's
-    ``fsdp2_load_full_state_dict``.
-
-    Args:
-        model: The model whose parameters are on ``meta`` after ``fully_shard``.
-        full_sd: The full (unsharded) state dict.  Must be populated on rank 0;
-            may be empty (``{}``) on other ranks.
-        device_type: The device type string (e.g. ``'cuda'``, ``'npu'``).
-    """
+    """Broadcast full state dict from rank 0 and materialise local shards via distribute_tensor."""
     from torch.distributed.tensor import DTensor, distribute_tensor
 
     meta_sharded_sd = model.state_dict()
@@ -476,10 +443,6 @@ def _broadcast_sharded_state_dict(
             full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
 
         dist.broadcast(full_tensor, src=0)
-
-        # Ensure the async broadcast completes before we consume the tensor.
-        # Without this, NPU (and potentially other async backends) may not
-        # have finished writing full_tensor when distribute_tensor reads it.
         torch_util.synchronize()
 
         device_mesh = sharded_param.device_mesh
@@ -492,17 +455,7 @@ def _broadcast_sharded_state_dict(
 
 
 def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return {fqn: tensor} for all non-persistent buffers in the model.
-
-    Non-persistent buffers are not included in ``state_dict()`` and will be
-    lost when the model is moved to ``meta`` device.  We need to save them
-    before the move and re-register them after broadcast.
-
-    Uses ``module._non_persistent_buffers_set`` (the same approach as
-    accelerate's ``get_non_persistent_buffers``) for precision — directly
-    reads PyTorch's internal tracking set rather than diffing against
-    ``state_dict()`` keys.
-    """
+    """Return {fqn: tensor} for non-persistent buffers (lost on to('meta'))."""
     non_persistent_fqns: Set[str] = set()
     for fqn, module in model.named_modules():
         for buf_name in getattr(module, '_non_persistent_buffers_set', set()):
@@ -513,19 +466,7 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
-    """Replace optimizer param references with ``torch.empty(1)`` placeholders.
-
-    This drops the optimizer's strong references to the full model parameters,
-    allowing them to be freed when the model is moved to ``meta`` device.
-    Without this, ``model.to('meta')`` cannot free the old parameter tensors
-    because the optimizer still holds references to them.
-
-    Must be called BEFORE ``model.to('meta')``.  After ``fully_shard`` and
-    ``_broadcast_sharded_state_dict``, call ``_rebind_optimizer`` to point
-    the optimizer at the new sharded parameters.
-
-    This mirrors accelerate's approach in ``Accelerator._prepare_fsdp2``.
-    """
+    """Drop optimizer param refs so model.to('meta') can free memory."""
     for group in optimizer.param_groups:
         for i in range(len(group['params'])):
             group['params'][i] = torch.empty(1)
@@ -536,13 +477,7 @@ def _restore_non_persistent_buffers(
     saved_buffers: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> None:
-    """Re-register non-persistent buffers that were saved before ``to(meta)``.
-
-    Args:
-        model: The model (may have meta-device buffers after sharding).
-        saved_buffers: ``{fqn: tensor}`` from ``_get_non_persistent_buffers``.
-        device: Target device for the restored buffers.
-    """
+    """Re-register non-persistent buffers saved before to('meta')."""
     for fqn, buf_tensor in saved_buffers.items():
         buf_tensor = buf_tensor.to(device)
         if '.' in fqn:
