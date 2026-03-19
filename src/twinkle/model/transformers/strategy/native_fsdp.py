@@ -141,6 +141,9 @@ class NativeFSDPStrategy:
                 _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
+                # After tie_weights, some tied parameters may still reference CPU tensors.
+                # Move any remaining CPU/meta parameters to the target device.
+                _move_remaining_params_to_device(model, target_device)
 
             # Manual prefetch
             if ep_enabled and layer_pairs:
@@ -540,3 +543,28 @@ def _restore_non_persistent_buffers(
             local_name = fqn
             parent = model
         parent.register_buffer(local_name, buf_tensor, persistent=False)
+
+
+def _move_remaining_params_to_device(model: nn.Module, device: torch.device) -> None:
+    """Move any parameters still on CPU or meta device to the target device.
+
+    After ``_broadcast_sharded_state_dict`` and ``tie_weights()``, some parameters
+    (especially tied weights like ``embed_tokens.weight``) may still be on CPU or
+    meta device. This function moves them to the target device in-place.
+
+    For DTensor parameters, we skip them as they are already properly sharded.
+    """
+    from torch.distributed.tensor import DTensor
+
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor):
+            continue
+        if param.device.type in ('cpu', 'meta'):
+            # Create new tensor on device and assign it
+            new_param = nn.Parameter(param.data.to(device), requires_grad=param.requires_grad)
+            # Navigate to parent module and set the parameter
+            parts = name.split('.')
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], new_param)
