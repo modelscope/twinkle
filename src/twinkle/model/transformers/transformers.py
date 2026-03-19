@@ -215,10 +215,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             #   - NativeFSDPStrategy: wrap_model does meta → broadcast (Task 4)
             #   - AccelerateStrategy: accelerator.prepare() → fsdp2_prepare_model()
             #     does its own meta → broadcast (accelerate built-in)
-            use_efficient_loading = (
-                memory_efficient_init
-                and self.device_mesh is not None
-            )
+            use_efficient_loading = (memory_efficient_init and self.device_mesh is not None)
             _saved_env = {}
             if use_efficient_loading:
                 _saved_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')

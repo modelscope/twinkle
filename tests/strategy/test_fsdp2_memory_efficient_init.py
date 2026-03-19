@@ -7,10 +7,11 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import unittest
 from torch.distributed.fsdp import fully_shard
+
 from twinkle.utils import Platform
 
 _PLATFORM = Platform.get_platform()
-_DEVICE_TYPE = _PLATFORM.device_prefix()   # 'cuda' or 'npu'
+_DEVICE_TYPE = _PLATFORM.device_prefix()  # 'cuda' or 'npu'
 _DIST_BACKEND = _PLATFORM.device_backend()  # 'nccl' or 'hccl'
 
 
@@ -47,6 +48,7 @@ def _init_dist(rank, world_size, port):
 
 class TinyModel(nn.Module):
     """2-layer MLP for testing. Small enough to fit on any GPU."""
+
     def __init__(self, dim=32):
         super().__init__()
         self.layer1 = nn.Linear(dim, dim, bias=False)
@@ -59,9 +61,7 @@ class TinyModel(nn.Module):
 def _worker_broadcast_sharded(rank, world_size, port, ref_sd):
     """Worker function: shard on meta, broadcast, verify values."""
     _init_dist(rank, world_size, port)
-    from twinkle.model.transformers.strategy.native_fsdp import (
-        _broadcast_sharded_state_dict,
-    )
+    from twinkle.model.transformers.strategy.native_fsdp import _broadcast_sharded_state_dict
 
     model = TinyModel(dim=32)
 
@@ -84,7 +84,7 @@ def _worker_broadcast_sharded(rank, world_size, port, ref_sd):
     _broadcast_sharded_state_dict(model, full_sd, device_type=_DEVICE_TYPE)
 
     # Verify: gather full state dict back and compare to original
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
     gathered = get_model_state_dict(
         model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
@@ -113,11 +113,14 @@ class TestBroadcastShardedStateDict(unittest.TestCase):
             join=True,
         )
 
+
 # ---------------------------------------------------------------------------
 # Task 2: _get_non_persistent_buffers
 # ---------------------------------------------------------------------------
 
+
 class ModelWithNonPersistentBuffer(nn.Module):
+
     def __init__(self, dim=32):
         super().__init__()
         self.linear = nn.Linear(dim, dim)
@@ -128,9 +131,7 @@ class ModelWithNonPersistentBuffer(nn.Module):
 class TestGetNonPersistentBuffers(unittest.TestCase):
 
     def test_finds_non_persistent_buffers(self):
-        from twinkle.model.transformers.strategy.native_fsdp import (
-            _get_non_persistent_buffers,
-        )
+        from twinkle.model.transformers.strategy.native_fsdp import _get_non_persistent_buffers
         model = ModelWithNonPersistentBuffer()
         result = _get_non_persistent_buffers(model)
         assert 'mask' in result
@@ -139,9 +140,7 @@ class TestGetNonPersistentBuffers(unittest.TestCase):
         assert 'linear.weight' not in result
 
     def test_empty_when_no_non_persistent(self):
-        from twinkle.model.transformers.strategy.native_fsdp import (
-            _get_non_persistent_buffers,
-        )
+        from twinkle.model.transformers.strategy.native_fsdp import _get_non_persistent_buffers
         model = TinyModel()
         result = _get_non_persistent_buffers(model)
         assert len(result) == 0
@@ -151,13 +150,12 @@ class TestGetNonPersistentBuffers(unittest.TestCase):
 # Task 3: _restore_non_persistent_buffers
 # ---------------------------------------------------------------------------
 
+
 class TestRestoreNonPersistentBuffers(unittest.TestCase):
 
     def test_restores_buffers_after_meta(self):
-        from twinkle.model.transformers.strategy.native_fsdp import (
-            _get_non_persistent_buffers,
-            _restore_non_persistent_buffers,
-        )
+        from twinkle.model.transformers.strategy.native_fsdp import (_get_non_persistent_buffers,
+                                                                     _restore_non_persistent_buffers)
         model = ModelWithNonPersistentBuffer()
         saved = _get_non_persistent_buffers(model)
         # Move to meta — buffer becomes meta tensor
@@ -168,6 +166,7 @@ class TestRestoreNonPersistentBuffers(unittest.TestCase):
         assert model.mask.device.type == 'cpu'
         assert torch.equal(model.mask, torch.ones(32))
 
+
 # ---------------------------------------------------------------------------
 # Task 4: wrap_model with memory_efficient=True
 # ---------------------------------------------------------------------------
@@ -177,12 +176,12 @@ import numpy as np
 def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
     """Test that wrap_model with memory_efficient=True produces correct sharded model."""
     _init_dist(rank, world_size, port)
-    from twinkle.utils import DeviceMesh as TwinkleMesh
     from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
+    from twinkle.utils import DeviceMesh as TwinkleMesh
 
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
-        mesh_dim_names=('fsdp',),
+        mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
     strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
@@ -198,7 +197,7 @@ def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
         assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
 
     # Verify: gathered full state dict matches original
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
     gathered = get_model_state_dict(
         model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
@@ -231,15 +230,16 @@ class TestWrapModelMemoryEfficient(unittest.TestCase):
 # Task 5: wrap_model with memory_efficient=False (legacy path)
 # ---------------------------------------------------------------------------
 
+
 def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
     """Test that wrap_model with memory_efficient=False still works (old path)."""
     _init_dist(rank, world_size, port)
-    from twinkle.utils import DeviceMesh as TwinkleMesh
     from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
+    from twinkle.utils import DeviceMesh as TwinkleMesh
 
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
-        mesh_dim_names=('fsdp',),
+        mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
     strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
@@ -252,7 +252,7 @@ def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
     for name, param in model.named_parameters():
         assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
 
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
     gathered = get_model_state_dict(
         model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
@@ -280,6 +280,7 @@ class TestWrapModelLegacy(unittest.TestCase):
             join=True,
         )
 
+
 # ---------------------------------------------------------------------------
 # Task 6: env var / memory_efficient_init parameter in TransformersModel
 # ---------------------------------------------------------------------------
@@ -288,17 +289,19 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
 
     def test_env_vars_set_during_from_pretrained(self):
         """Verify env vars are set when memory_efficient_init=True, regardless of strategy."""
-        from twinkle.model.transformers.transformers import TransformersModel
         # Verify the new parameter exists in __init__ signature
         import inspect
+
+        from twinkle.model.transformers.transformers import TransformersModel
         sig = inspect.signature(TransformersModel.__init__)
         assert 'memory_efficient_init' in sig.parameters, \
-            "memory_efficient_init parameter should exist in __init__"
+            'memory_efficient_init parameter should exist in __init__'
 
 
 # ---------------------------------------------------------------------------
 # Task 8: End-to-end integration test
 # ---------------------------------------------------------------------------
+
 
 def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
     """End-to-end: init → set_optimizer → trigger _lazy_wrap_model with memory_efficient."""
@@ -309,12 +312,12 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
     os.environ['WORLD_SIZE'] = str(world_size)
 
     import twinkle
-    from twinkle.utils import DeviceMesh as TwinkleMesh
     from twinkle.model import TransformersModel
+    from twinkle.utils import DeviceMesh as TwinkleMesh
 
     mesh = TwinkleMesh(
         mesh=np.arange(world_size),
-        mesh_dim_names=('fsdp',),
+        mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
 
@@ -336,19 +339,19 @@ def _worker_e2e_memory_efficient(rank, world_size, port, model_path):
     model._lazy_wrap_model()
 
     # Verify: model should be wrapped and parameters on device
-    assert model._model_wrapped, "Model should be wrapped after _lazy_wrap_model"
+    assert model._model_wrapped, 'Model should be wrapped after _lazy_wrap_model'
     for name, param in model.model.named_parameters():
         assert param.device.type == _DEVICE_TYPE, f"{name} on {param.device}, expected {_DEVICE_TYPE}"
 
     # Verify: gathered full state dict matches (weights were broadcast correctly)
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
     gathered = get_model_state_dict(
         model.model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
     )
     # full_state_dict=True gathers shards to rank 0 only; other ranks get {}.
     if rank == 0:
-        assert len(gathered) > 0, "Should have gathered state dict"
+        assert len(gathered) > 0, 'Should have gathered state dict'
 
     if dist.is_initialized():
         dist.destroy_process_group()

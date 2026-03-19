@@ -512,9 +512,7 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
             full_fqn = f'{fqn}.{buf_name}' if fqn else buf_name
             non_persistent_fqns.add(full_fqn)
 
-    return copy.deepcopy({
-        k: v for k, v in model.named_buffers() if k in non_persistent_fqns
-    })
+    return copy.deepcopy({k: v for k, v in model.named_buffers() if k in non_persistent_fqns})
 
 
 def _restore_non_persistent_buffers(
