@@ -44,24 +44,30 @@ class NativeFSDPStrategy:
 
     def wrap_model(self, model, optimizer=None, memory_efficient=True):
         if self.device_mesh is None:
+            print(f"[wrap_model DEBUG] device_mesh is None, returning early")
             return model, optimizer
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
+        print(f"[wrap_model DEBUG] fsdp_mesh={fsdp_mesh}, memory_efficient={memory_efficient}")
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
             # EP path is not yet compatible with meta-device flow because
             # _place_ep_experts_on_local_device requires experts on a real device.
             use_meta = memory_efficient and not ep_enabled
+            print(f"[wrap_model DEBUG] ep_enabled={ep_enabled}, use_meta={use_meta}")
 
             # --- Phase 1: save state before meta move ---
             original_sd = None
             saved_buffers = None
             if use_meta:
+                print(f"[wrap_model DEBUG] Phase 1: saving state_dict, len={len(model.state_dict())}")
                 original_sd = model.state_dict()
                 saved_buffers = _get_non_persistent_buffers(model)
+                print(f"[wrap_model DEBUG] Moving model to meta device")
                 model = model.to(torch.device('meta'))
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
+                print(f"[wrap_model DEBUG] Model on meta, first param device: {next(model.parameters()).device}")
 
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
@@ -132,18 +138,23 @@ class NativeFSDPStrategy:
                 import torch.distributed as dist
                 device_type = self.device_mesh.device_type or 'cuda'
                 is_rank0 = (dist.get_rank() == 0)
+                print(f"[wrap_model DEBUG] Phase 2: broadcast, device_type={device_type}, is_rank0={is_rank0}")
+                print(f"[wrap_model DEBUG] Before broadcast, first param: {next(model.parameters()).device}")
                 _broadcast_sharded_state_dict(
                     model,
                     original_sd if is_rank0 else {},
                     device_type=device_type,
                 )
+                print(f"[wrap_model DEBUG] After broadcast, first param: {next(model.parameters()).device}")
                 target_device = torch.device(device_type)
                 _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
+                print(f"[wrap_model DEBUG] After tie_weights, first param: {next(model.parameters()).device}")
                 # After tie_weights, some tied parameters may still reference CPU tensors.
                 # Move any remaining CPU/meta parameters to the target device.
                 _move_remaining_params_to_device(model, target_device)
+                print(f"[wrap_model DEBUG] After _move_remaining, first param: {next(model.parameters()).device}")
 
             # Manual prefetch
             if ep_enabled and layer_pairs:
