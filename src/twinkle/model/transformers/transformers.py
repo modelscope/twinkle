@@ -312,7 +312,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            print(f"[_lazy_wrap_model DEBUG] Starting, strategy type = {type(self.strategy).__name__}")
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
@@ -322,29 +321,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             extra_kwargs = {}
             if isinstance(self.strategy, NativeFSDPStrategy):
                 extra_kwargs['memory_efficient'] = getattr(self, '_memory_efficient_init', True)
-                print(f"[_lazy_wrap_model DEBUG] NativeFSDPStrategy detected, extra_kwargs={extra_kwargs}")
-            else:
-                print(f"[_lazy_wrap_model DEBUG] NOT NativeFSDPStrategy, extra_kwargs={extra_kwargs}")
 
-            print(f"[_lazy_wrap_model DEBUG] optimizer_groups count = {len(optimizer_groups)}")
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
                 assert optimizer is not None
-                print(f"[_lazy_wrap_model DEBUG] Calling wrap_model with optimizer")
                 self.model, optimizer = self.strategy.wrap_model(self.model, optimizer, **extra_kwargs)
                 optimizer_group.optimizer = optimizer
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                print(f"[_lazy_wrap_model DEBUG] Calling wrap_model without optimizer")
                 result = self.strategy.wrap_model(self.model, **extra_kwargs)
                 if isinstance(result, tuple):
                     self.model = result[0]
                 else:
                     self.model = result
             self._model_wrapped = True
-            print(f"[_lazy_wrap_model DEBUG] Done, _model_wrapped = {self._model_wrapped}")
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
