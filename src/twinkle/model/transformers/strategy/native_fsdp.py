@@ -467,8 +467,6 @@ def _broadcast_sharded_state_dict(
         full_items = iter(full_sd.items())
 
     for param_name, sharded_param in meta_sharded_sd.items():
-        device_mesh = sharded_param.device_mesh
-        placements = sharded_param.placements
         shape = sharded_param.size()
         dtype = sharded_param.dtype
 
@@ -481,7 +479,16 @@ def _broadcast_sharded_state_dict(
             full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
 
         dist.broadcast(full_tensor, src=0)
-        sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+
+        # Handle both DTensor (FSDP-sharded) and regular tensor (e.g. tied weights)
+        if isinstance(sharded_param, DTensor):
+            device_mesh = sharded_param.device_mesh
+            placements = sharded_param.placements
+            sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+        else:
+            # Regular tensor (not sharded by FSDP) — just use the broadcast result
+            sharded_tensor = full_tensor
+
         sharded_sd[param_name] = sharded_tensor
 
     model.load_state_dict(sharded_sd, assign=True)
