@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import numpy as np
 import os
 import socket
 import torch
@@ -197,7 +198,6 @@ class TestRestoreNonPersistentBuffers(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Task 4: wrap_model with memory_efficient=True
 # ---------------------------------------------------------------------------
-import numpy as np
 
 
 def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
@@ -438,9 +438,11 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
                     pass  # We only care about the env var capture
 
             assert captured_env.get('ACCELERATE_USE_FSDP') == 'true', \
-                f"ACCELERATE_USE_FSDP should be 'true' during from_pretrained, got {captured_env.get('ACCELERATE_USE_FSDP')}"
+                f"ACCELERATE_USE_FSDP should be 'true' during from_pretrained, got " \
+                f"{captured_env.get('ACCELERATE_USE_FSDP')}"
             assert captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING') == 'true', \
-                f"FSDP_CPU_RAM_EFFICIENT_LOADING should be 'true' during from_pretrained, got {captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING')}"
+                f"FSDP_CPU_RAM_EFFICIENT_LOADING should be 'true' during " \
+                f"from_pretrained, got {captured_env.get('FSDP_CPU_RAM_EFFICIENT_LOADING')}"
 
             # Verify env vars are restored after __init__
             assert os.environ.get('ACCELERATE_USE_FSDP') is None, \
