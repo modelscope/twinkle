@@ -332,7 +332,7 @@ def _worker_wrap_model_per_layer(rank, world_size, port, ref_sd):
 
     # Verify the model has the expected structure before wrapping
     assert _get_decoder_layers(model) is not None, \
-        "TinyTransformerModel should have model.model.layers"
+        'TinyTransformerModel should have model.model.layers'
 
     model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=True)
 

@@ -527,5 +527,3 @@ def _restore_non_persistent_buffers(
             local_name = fqn
             parent = model
         parent.register_buffer(local_name, buf_tensor, persistent=False)
-
-
