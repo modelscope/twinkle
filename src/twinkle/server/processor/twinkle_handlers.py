@@ -18,9 +18,9 @@ if TYPE_CHECKING:
     from .app import ProcessorManagement
 
 import twinkle_client.types as types
-from twinkle.server.common.serialize import deserialize_object
 from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
+from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 

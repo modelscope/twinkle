@@ -10,7 +10,7 @@ import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
 from typing import TYPE_CHECKING, Callable
 
-from twinkle.server.common.serialize import deserialize_object
+from twinkle_client.common.serialize import deserialize_object
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
