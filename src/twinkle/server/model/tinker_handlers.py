@@ -40,7 +40,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _create_adapter():
             _model_id = None
             try:
-                _model_id = self.state.register_model(body.model_dump(), token=token, replica_id=self.replica_id)
+                _model_id = await self.state.register_model(body.model_dump(), token=token, replica_id=self.replica_id)
                 if body.lora_config:
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
@@ -56,7 +56,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             except Exception:
                 if _model_id:
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
-                    self._cleanup_adapter(adapter_name)
+                    await self._cleanup_adapter(adapter_name)
                 logger.error(traceback.format_exc())
                 return types.RequestFailedResponse(
                     error=traceback.format_exc(),
@@ -95,7 +95,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
 
         async def _do_unload():
             adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-            self._cleanup_adapter(adapter_name)
+            await self._cleanup_adapter(adapter_name)
             return types.UnloadModelResponse(model_id=body.model_id)
 
         return await self.schedule_task(_do_unload, model_id=body.model_id, token=token, task_type='unload_model')
@@ -260,10 +260,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                     name=checkpoint_name, output_dir=save_dir, adapter_name=adapter_name, save_optimizer=False)
                 payload = body.model_dump()
                 payload['model_path'] = tinker_path
-                metadata = self.state.get_model_metadata(body.model_id) or {}
+                metadata = await self.state.get_model_metadata(body.model_id) or {}
                 if metadata.get('base_model'):
                     payload['base_model'] = metadata['base_model']
-                sampling_session_id = self.state.create_sampling_session(payload)
+                sampling_session_id = await self.state.create_sampling_session(payload)
                 return types.SaveWeightsForSamplerResponseInternal(path=None, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())

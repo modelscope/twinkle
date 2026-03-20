@@ -61,8 +61,8 @@ class GatewayServer:
                 detail=f"Base model '{base_model}' is not supported. "
                 f"Supported models: {', '.join(supported_model_names)}")
 
-    def _get_base_model(self, model_id: str) -> str:
-        metadata = self.state.get_model_metadata(model_id)
+    async def _get_base_model(self, model_id: str) -> str:
+        metadata = await self.state.get_model_metadata(model_id)
         if metadata and metadata.get('base_model'):
             return metadata['base_model']
         raise HTTPException(status_code=404, detail=f'Model {model_id} not found')

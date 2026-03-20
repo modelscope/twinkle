@@ -125,7 +125,18 @@ class ProcessorManagerMixin:
         """Check if a session is still alive via state proxy."""
         if not session_id:
             return True
-        last_heartbeat = self.state.get_session_last_heartbeat(session_id)
+        # Get session last heartbeat through proxy (async method called from sync thread)
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(self.state.get_session_last_heartbeat(session_id), loop)
+                last_heartbeat = future.result(timeout=5.0)
+            else:
+                last_heartbeat = asyncio.run(self.state.get_session_last_heartbeat(session_id))
+        except Exception as e:
+            logger.warning(f'[ProcessorManager] Failed to check session liveness: {e}')
+            return True  # Assume alive on error
         if last_heartbeat is None:
             return False
         return (time.time() - last_heartbeat) < self._processor_timeout

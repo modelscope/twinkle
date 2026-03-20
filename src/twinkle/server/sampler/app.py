@@ -101,7 +101,7 @@ class SamplerManagement(TaskQueueMixin, AdapterManagerMixin):
         token = get_token_from_request(request)
         return token
 
-    def _on_adapter_expired(self, adapter_name: str, token: str = None) -> None:
+    async def _on_adapter_expired(self, adapter_name: str, token: str = None) -> None:
         """Handle expired adapters by removing them from the sampler."""
         try:
             self.sampler.remove_adapter(adapter_name)

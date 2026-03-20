@@ -41,7 +41,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
             body: types.CreateSessionRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
-        session_id = self.state.create_session(body.model_dump())
+        session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post('/twinkle/session_heartbeat', response_model=types.SessionHeartbeatResponse)

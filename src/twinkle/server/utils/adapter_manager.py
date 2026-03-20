@@ -107,8 +107,21 @@ class AdapterManagerMixin:
         if not session_id:
             return True  # No session association means always alive
 
-        # Get session last heartbeat through proxy
-        last_heartbeat = self.state.get_session_last_heartbeat(session_id)
+        # Get session last heartbeat through proxy (async method called from sync thread)
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is running, we can't use asyncio.run()
+                # Use run_coroutine_threadsafe instead
+                future = asyncio.run_coroutine_threadsafe(self.state.get_session_last_heartbeat(session_id), loop)
+                last_heartbeat = future.result(timeout=5.0)
+            else:
+                last_heartbeat = asyncio.run(self.state.get_session_last_heartbeat(session_id))
+        except Exception as e:
+            logger.warning(f'[AdapterManager] Failed to check session liveness: {e}')
+            return True  # Assume alive on error
+
         if last_heartbeat is None:
             return False  # Session doesn't exist
 
@@ -182,7 +195,7 @@ class AdapterManagerMixin:
         """
         return self._adapter_records.get(adapter_name)
 
-    def _on_adapter_expired(self, adapter_name: str) -> None:
+    async def _on_adapter_expired(self, adapter_name: str) -> None:
         """Hook method called when an adapter expires.
 
         This method must be overridden by inheriting classes to handle
@@ -277,7 +290,18 @@ class AdapterManagerMixin:
                 for adapter_name, _token, session_id in expired_adapters:
                     success = False
                     try:
-                        self._on_adapter_expired(adapter_name)
+                        # Call async _on_adapter_expired from sync thread
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                future = asyncio.run_coroutine_threadsafe(self._on_adapter_expired(adapter_name), loop)
+                                future.result(timeout=10.0)
+                            else:
+                                asyncio.run(self._on_adapter_expired(adapter_name))
+                        except Exception as async_e:
+                            logger.warning(f'[AdapterManager] Async call failed for {adapter_name}: {async_e}')
+                            raise
                         logger.info(f'[AdapterManager] Adapter {adapter_name} expired '
                                     f'(reason=session_expired, session={session_id})')
                         success = True

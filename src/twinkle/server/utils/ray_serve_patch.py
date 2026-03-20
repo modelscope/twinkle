@@ -63,7 +63,7 @@ def _patched_setup_request_context_and_handle(
             multiplexed_model_id = value.decode()
             handle = handle.options(multiplexed_model_id=multiplexed_model_id)
             request_context_info['multiplexed_model_id'] = multiplexed_model_id
-            logger.info(f'[Ray Serve Patch] Matched multiplexed_model_id: {multiplexed_model_id}')
+            logger.debug(f'[Ray Serve Patch] Matched multiplexed_model_id: {multiplexed_model_id}')
 
         # Original logic for other headers (unchanged)
         if decoded_key == 'x-request-id':
@@ -91,8 +91,8 @@ def _apply_patch_in_worker_process():
         HTTPProxy.setup_request_context_and_handle = _patched_setup_request_context_and_handle
         _patch_applied = True
 
-        logger.info('[Ray Serve Patch] Applied in worker process: '
-                    'HTTPProxy.setup_request_context_and_handle patched')
+        logger.debug('[Ray Serve Patch] Applied in worker process: '
+                     'HTTPProxy.setup_request_context_and_handle patched')
     except ImportError:
         # Ray Serve not available in this worker
         pass
