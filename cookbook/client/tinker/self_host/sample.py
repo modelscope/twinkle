@@ -52,7 +52,6 @@ prompt = types.ModelInput.from_ints(input_ids)
 params = types.SamplingParams(
     max_tokens=128,       # Maximum number of tokens to generate
     temperature=0.7,
-    stop=['\n']          # Stop generation when a newline character is produced
 )
 
 # Step 6: Send the sampling request to the server.

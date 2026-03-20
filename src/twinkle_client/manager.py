@@ -5,7 +5,7 @@ import atexit
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from twinkle import get_logger
-from twinkle_client.types.server import (DeleteCheckpointResponse, GetServerCapabilitiesResponse, SupportedModel)
+from twinkle_client.types.server import (DeleteCheckpointResponse, GetServerCapabilitiesResponse)
 from twinkle_client.types.session import (CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest,
                                            SessionHeartbeatResponse)
 from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,

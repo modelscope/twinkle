@@ -31,6 +31,11 @@ api_key = 'EMPTY_API_KEY'
 # - api_key: authentication token (loaded from environment variable)
 client = init_twinkle_client(base_url=base_url, api_key=api_key)
 
+# List available models of the server
+print('Available models:')
+for item in client.get_server_capabilities().supported_models:
+    print('- ' + item.model_name)
+
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.
 runs = client.list_training_runs()
