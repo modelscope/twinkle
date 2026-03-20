@@ -349,24 +349,35 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str):
             ulysses_size=1,
             device_type='cuda',
         )
+        baseline_model = _build_tiny_llama(case, device)
+        baseline_strategy = _make_strategy(baseline_model, baseline_device_mesh, 1)
+
+        baseline_peaks = {}
+        for batch_size in case['batch_sizes']:
+            for seq_len in case['seq_lens']:
+                baseline_peak = _measure_peak_memory(
+                    baseline_model, baseline_strategy, batch_size=batch_size, seq_len=seq_len, device=device)
+                baseline_peaks[(int(batch_size), int(seq_len))] = int(baseline_peak)
+
+        del baseline_model
+        del baseline_strategy
+        torch.cuda.empty_cache()
+
         device_mesh = DeviceMesh.from_sizes(
             fsdp_size=world_size,
             dp_size=1,
             ulysses_size=int(case['ulysses_size']),
             device_type='cuda',
         )
-        baseline_model = _build_tiny_llama(case, device)
-        baseline_strategy = _make_strategy(baseline_model, baseline_device_mesh, 1)
         model = _build_tiny_llama(case, device)
         strategy = _make_strategy(model, device_mesh, int(case['ulysses_size']))
 
         peaks = []
         for batch_size in case['batch_sizes']:
             for seq_len in case['seq_lens']:
-                baseline_peak = _measure_peak_memory(
-                    baseline_model, baseline_strategy, batch_size=batch_size, seq_len=seq_len, device=device)
                 peak = _measure_peak_memory(model, strategy, batch_size=batch_size, seq_len=seq_len, device=device)
                 if rank == 0:
+                    baseline_peak = baseline_peaks[(int(batch_size), int(seq_len))]
                     delta_bytes = int(peak) - int(baseline_peak)
                     saving_ratio_pct = 0.0
                     if baseline_peak > 0:
