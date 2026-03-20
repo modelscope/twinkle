@@ -38,18 +38,21 @@ def _make_labels(input_ids: torch.Tensor) -> torch.Tensor:
 def _make_case(case_name: str) -> dict:
     cases = {
         'cp_only': {
-            'ulysses_size': 4,
+            'world_size': 2,
+            'ulysses_size': 2,
             'num_attention_heads': 1,
             'hidden_size': 64,
             'seq_len': 769,
         },
         'cp_sp': {
+            'world_size': 4,
             'ulysses_size': 4,
             'num_attention_heads': 6,
             'hidden_size': 96,
             'seq_len': 769,
         },
         'sp_only_memory': {
+            'world_size': 4,
             'ulysses_size': 2,
             'num_attention_heads': 8,
             'hidden_size': 128,
@@ -57,13 +60,15 @@ def _make_case(case_name: str) -> dict:
             'batch_sizes': [1, 2, 4],
         },
         'cp_only_memory': {
-            'ulysses_size': 4,
+            'world_size': 2,
+            'ulysses_size': 2,
             'num_attention_heads': 1,
             'hidden_size': 64,
             'seq_lens': [511, 1023, 2047],
             'batch_sizes': [1],
         },
         'cp_sp_memory': {
+            'world_size': 4,
             'ulysses_size': 4,
             'num_attention_heads': 6,
             'hidden_size': 96,
@@ -217,14 +222,27 @@ def _measure_peak_memory(
 
 def _format_memory_table(case_name: str, peaks: list[dict]) -> str:
     header = f'[{case_name}] peak memory'
-    columns = ('batch_size', 'seq_len', 'peak_bytes', 'peak_mib')
+    columns = (
+        'batch_size',
+        'seq_len',
+        'baseline_bytes',
+        'baseline_mib',
+        'peak_bytes',
+        'peak_mib',
+        'delta_bytes',
+        'saving_ratio_pct',
+    )
     rows = []
     for row in peaks:
         rows.append((
             str(row['batch_size']),
             str(row['seq_len']),
+            str(row['baseline_bytes']),
+            f"{row['baseline_mib']:.2f}",
             str(row['peak_bytes']),
             f"{row['peak_mib']:.2f}",
+            str(row['delta_bytes']),
+            f"{row['saving_ratio_pct']:.2f}",
         ))
 
     widths = [len(col) for col in columns]
@@ -325,47 +343,66 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str):
         torch.manual_seed(1234)
         torch.cuda.manual_seed_all(1234)
         case = _make_case(case_name)
+        baseline_device_mesh = DeviceMesh.from_sizes(
+            fsdp_size=world_size,
+            dp_size=1,
+            ulysses_size=1,
+            device_type='cuda',
+        )
         device_mesh = DeviceMesh.from_sizes(
             fsdp_size=world_size,
             dp_size=1,
             ulysses_size=int(case['ulysses_size']),
             device_type='cuda',
         )
+        baseline_model = _build_tiny_llama(case, device)
+        baseline_strategy = _make_strategy(baseline_model, baseline_device_mesh, 1)
         model = _build_tiny_llama(case, device)
         strategy = _make_strategy(model, device_mesh, int(case['ulysses_size']))
 
         peaks = []
         for batch_size in case['batch_sizes']:
             for seq_len in case['seq_lens']:
+                baseline_peak = _measure_peak_memory(
+                    baseline_model, baseline_strategy, batch_size=batch_size, seq_len=seq_len, device=device)
                 peak = _measure_peak_memory(model, strategy, batch_size=batch_size, seq_len=seq_len, device=device)
                 if rank == 0:
+                    delta_bytes = int(peak) - int(baseline_peak)
+                    saving_ratio_pct = 0.0
+                    if baseline_peak > 0:
+                        saving_ratio_pct = (float(baseline_peak) - float(peak)) / float(baseline_peak) * 100.0
                     peaks.append({
                         'batch_size': int(batch_size),
                         'seq_len': int(seq_len),
+                        'baseline_bytes': int(baseline_peak),
+                        'baseline_mib': float(baseline_peak) / (1024**2),
                         'peak_bytes': int(peak),
                         'peak_mib': float(peak) / (1024**2),
+                        'delta_bytes': delta_bytes,
+                        'saving_ratio_pct': saving_ratio_pct,
                     })
 
         if rank == 0:
-            by_batch = {}
-            for row in peaks:
-                by_batch.setdefault(row['batch_size'], []).append(row)
-            for rows in by_batch.values():
-                rows.sort(key=lambda item: item['seq_len'])
-                for prev, cur in zip(rows, rows[1:]):
-                    if cur['peak_bytes'] < prev['peak_bytes']:
-                        raise AssertionError(
-                            f'{case_name} memory should be non-decreasing with seq_len, got {prev} then {cur}')
+            for key in ('peak_bytes', 'baseline_bytes'):
+                by_batch = {}
+                for row in peaks:
+                    by_batch.setdefault(row['batch_size'], []).append(row)
+                for rows in by_batch.values():
+                    rows.sort(key=lambda item: item['seq_len'])
+                    for prev, cur in zip(rows, rows[1:]):
+                        if cur[key] < prev[key]:
+                            raise AssertionError(
+                                f'{case_name} {key} should be non-decreasing with seq_len, got {prev} then {cur}')
 
-            by_seq = {}
-            for row in peaks:
-                by_seq.setdefault(row['seq_len'], []).append(row)
-            for rows in by_seq.values():
-                rows.sort(key=lambda item: item['batch_size'])
-                for prev, cur in zip(rows, rows[1:]):
-                    if cur['peak_bytes'] < prev['peak_bytes']:
-                        raise AssertionError(
-                            f'{case_name} memory should be non-decreasing with batch_size, got {prev} then {cur}')
+                by_seq = {}
+                for row in peaks:
+                    by_seq.setdefault(row['seq_len'], []).append(row)
+                for rows in by_seq.values():
+                    rows.sort(key=lambda item: item['batch_size'])
+                    for prev, cur in zip(rows, rows[1:]):
+                        if cur[key] < prev[key]:
+                            raise AssertionError(
+                                f'{case_name} {key} should be non-decreasing with batch_size, got {prev} then {cur}')
 
             print(_format_memory_table(case_name, peaks))
         dist.barrier()
@@ -384,14 +421,18 @@ class TestDerivedRingPrecision(unittest.TestCase):
             self.skipTest('flash_attention_2 is required for derived ring precision tests.')
 
     def test_cp_only_precision_alignment(self):
-        self._skip_if_unavailable()
+        case = _make_case('cp_only')
+        world_size = int(case['world_size'])
+        self._skip_if_unavailable(world_size)
         port = _find_free_port()
-        mp.spawn(_run_precision_worker, args=(4, port, 'cp_only'), nprocs=4, join=True)
+        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_only'), nprocs=world_size, join=True)
 
     def test_cp_sp_precision_alignment(self):
-        self._skip_if_unavailable()
+        case = _make_case('cp_sp')
+        world_size = int(case['world_size'])
+        self._skip_if_unavailable(world_size)
         port = _find_free_port()
-        mp.spawn(_run_precision_worker, args=(4, port, 'cp_sp'), nprocs=4, join=True)
+        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_sp'), nprocs=world_size, join=True)
 
 
 class TestDerivedRingMemoryProfile(unittest.TestCase):
@@ -407,16 +448,22 @@ class TestDerivedRingMemoryProfile(unittest.TestCase):
             self.skipTest('flash_attention_2 is required for derived ring memory tests.')
 
     def test_sp_only_memory_profile_grid(self):
-        self._skip_if_unavailable()
+        case = _make_case('sp_only_memory')
+        world_size = int(case['world_size'])
+        self._skip_if_unavailable(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(4, port, 'sp_only_memory'), nprocs=4, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'sp_only_memory'), nprocs=world_size, join=True)
 
     def test_cp_only_memory_profile_grid(self):
-        self._skip_if_unavailable()
+        case = _make_case('cp_only_memory')
+        world_size = int(case['world_size'])
+        self._skip_if_unavailable(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(4, port, 'cp_only_memory'), nprocs=4, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_only_memory'), nprocs=world_size, join=True)
 
     def test_cp_sp_memory_profile_grid(self):
-        self._skip_if_unavailable()
+        case = _make_case('cp_sp_memory')
+        world_size = int(case['world_size'])
+        self._skip_if_unavailable(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(4, port, 'cp_sp_memory'), nprocs=4, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_sp_memory'), nprocs=world_size, join=True)
