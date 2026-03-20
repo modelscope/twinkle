@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from fastapi import HTTPException
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -210,10 +211,17 @@ class AdapterManagerMixin:
         return adapter_name
 
     def assert_adapter_exists(self, adapter_name: str) -> None:
-        """Validate that an adapter exists and is not expiring."""
+        """Validate that an adapter exists and is not expiring.
+
+        Raises:
+            HTTPException: 400 if adapter not found or expiring, with clear error message.
+        """
         info = self._adapter_records.get(adapter_name)
-        assert adapter_name and info is not None and not info.get('expiring'), \
-            f'Adapter {adapter_name} not found'
+        if not adapter_name or info is None or info.get('expiring'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Adapter '{adapter_name}' not found. "
+                f'Please call add_adapter_to_model() first to create an adapter.')
 
     def _adapter_countdown_loop(self) -> None:
         """Background thread that monitors and handles adapters whose session has expired or exceeded max lifetime.

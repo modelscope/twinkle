@@ -59,9 +59,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     async def run_task(coro):
         """Await a schedule_task_and_wait coroutine and surface any exception as a
         structured HTTP 500 response so the client receives the full traceback instead
-        of an opaque connection-level error."""
+        of an opaque connection-level error.
+
+        Note: HTTPException is re-raised directly to preserve its status code and detail.
+        """
         try:
             return await coro
+        except HTTPException:
+            raise  # Re-raise HTTPException directly to preserve status code
         except Exception:
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=traceback.format_exc())

@@ -68,7 +68,9 @@ from .server import (
     CheckpointPathResponse,
     DeleteCheckpointResponse,
     ErrorResponse,
+    GetServerCapabilitiesResponse,
     HealthResponse,
+    SupportedModel,
     WeightsInfoRequest,
     WeightsInfoResponse as ServerWeightsInfoResponse,
 )

@@ -1,7 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared Pydantic response models for the twinkle server health/error endpoints."""
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, List, Optional
+
+
+class SupportedModel(BaseModel):
+    """Information about a supported model."""
+    model_name: str
+
+
+class GetServerCapabilitiesResponse(BaseModel):
+    """Response body for the /get_server_capabilities endpoint."""
+    supported_models: List[SupportedModel]
 
 
 class HealthResponse(BaseModel):

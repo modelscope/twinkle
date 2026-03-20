@@ -42,7 +42,9 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             request: Request,
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
-        return types.GetServerCapabilitiesResponse(supported_models=self.supported_models)
+        # Convert twinkle_client.types.SupportedModel to tinker.types.SupportedModel
+        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
+        return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 
     @app.post('/telemetry')
     async def telemetry(request: Request, body: types.TelemetrySendRequest) -> types.TelemetryResponse:
