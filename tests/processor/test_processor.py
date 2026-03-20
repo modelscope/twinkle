@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import twinkle
+from twinkle import DeviceMesh
 from twinkle.processor import GRPOLossProcessor, InputProcessor
 
 twinkle.initialize(mode='local')

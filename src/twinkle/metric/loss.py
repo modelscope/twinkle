@@ -25,6 +25,7 @@ class LossMetric(Metric):
             return
         loss = outputs['loss']
         loss_reduction = kwargs.get('loss_reduction', 'mean')
+        ulysses_size = getattr(self.device_mesh, 'ulysses_size', None) or 1
         if loss_reduction == 'sum':
             if not isinstance(inputs, list):
                 inputs = [inputs]
@@ -32,6 +33,11 @@ class LossMetric(Metric):
                 # `Transformers` models may use reduction=sum, to average grads before step
                 labels = input['labels']
                 self.num_tokens += (labels >= 0).sum().item()
+            # Sequence-parallel gathered loss is replicated on each ulysses rank, while
+            # local labels still count only the shard-local tokens. Normalize the loss
+            # contribution here so metric-side averaging matches the non-SP path.
+            if ulysses_size > 1:
+                loss = loss / float(ulysses_size)
         grad_norm = kwargs.get('grad_norm')
         if grad_norm is not None:
             self.grad_norm = grad_norm

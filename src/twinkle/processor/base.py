@@ -23,6 +23,7 @@ class PackedSeqParams:
 class InputProcessor:
     padding_map = {
         'input_ids': 0,
+        'mm_token_type_ids': 0,
         'inputs_embeds': 0.0,
         'attention_mask': 0,
         'labels': -100,
@@ -66,6 +67,7 @@ class InputProcessor:
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
             self.split_cp,
+            self.apply_transformers_sp,
             self.prepare_outputs,
         ]
 
@@ -108,9 +110,17 @@ class InputProcessor:
 
         return [to_tensor(_input) for _input in inputs]
 
+    def apply_transformers_sp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        sp_strategy = kwargs.get('sp_strategy')
+        if self.framework != 'transformers' or sp_strategy is None:
+            return inputs
+        return [InputFeature(**sp_strategy.preprocess_inputs(dict(_input))) for _input in inputs]
+
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
         if self.device_mesh is None:
+            return inputs
+        if self.framework == 'transformers':
             return inputs
 
         def _pad_cp(_input: InputFeature) -> InputFeature:
@@ -171,6 +181,8 @@ class InputProcessor:
     def split_cp(self, inputs: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
 
         if self.device_mesh is None:
+            return inputs
+        if self.framework == 'transformers':
             return inputs
 
         def _split_cp(inputs: Dict[str, Any]) -> Dict[str, Any]:

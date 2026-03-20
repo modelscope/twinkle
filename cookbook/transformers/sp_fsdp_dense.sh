@@ -1,5 +1,6 @@
 #!/bin/bash
-# To enabele sequence parallelism, please set ulysses_size > 1
+# To enable Transformers sequence parallelism, please set ulysses_size > 1.
+# ulysses_size is interpreted as the total sequence-parallel degree.
 # device_mesh = DeviceMesh(
 #     device_type="cuda",
 #     mesh=np.arange(4).reshape(2, 2),
