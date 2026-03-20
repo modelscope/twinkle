@@ -45,7 +45,7 @@ def _serialize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         if hasattr(value, 'processor_id'):
             serialized[key] = value.processor_id
         elif hasattr(value, '__dict__'):
-            from twinkle.server.common.serialize import serialize_object
+            from twinkle_client.common.serialize import serialize_object
             serialized[key] = serialize_object(value)
         else:
             serialized[key] = value
