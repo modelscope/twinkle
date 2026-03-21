@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import List, Optional, Type
@@ -6,6 +7,7 @@ from typing import List, Optional, Type
 from .constant import MLLMMegatronModelType
 
 MEGATRON_MODEL_MAPPING = {}
+_MODELS_REGISTERED = False
 
 
 @dataclass
@@ -86,8 +88,18 @@ def register_megatron_model(megatron_model_meta: MegatronModelMeta, *, exist_ok:
 _MODEL_META_MAPPING = None
 
 
+def ensure_megatron_model_registry() -> None:
+    global _MODELS_REGISTERED
+    if _MODELS_REGISTERED:
+        return
+    importlib.import_module(f'{__package__}.gpts')
+    importlib.import_module(f'{__package__}.mm_gpts')
+    _MODELS_REGISTERED = True
+
+
 def get_megatron_model_meta(model_type: str) -> Optional[MegatronModelMeta]:
     global _MODEL_META_MAPPING
+    ensure_megatron_model_registry()
     if _MODEL_META_MAPPING is None:
         _MODEL_META_MAPPING = {}
         for k, megatron_model_meta in MEGATRON_MODEL_MAPPING.items():

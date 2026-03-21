@@ -6,12 +6,101 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional
 
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.utils import exists
 from .utils import convert_hf_config
 
 # Global args storage
 _GLOBAL_ARGS: Optional['TwinkleMegatronArgs'] = None
+logger = get_logger()
+
+
+def _normalize_word_embedding_allreduce_call(*call_args, **call_kwargs):
+    """Normalize Megatron's private word-embedding helper call.
+
+    Megatron Core has changed the helper signature across releases:
+    - 0.12.1: (model, config)
+    - 0.16.1: (model, config, embd_group, pp_group)
+    - future releases may add more positional/keyword args.
+
+    We keep the semantics stable and only normalize the known pieces.
+    """
+    model = call_kwargs.pop('model', call_args[0] if call_args else None)
+    config = call_kwargs.pop('config', call_args[1] if len(call_args) > 1 else None)
+    if model is None or config is None:
+        raise TypeError('word-embedding finalize helper requires at least model and config arguments.')
+
+    embd_group = call_kwargs.pop('embd_group', call_args[2] if len(call_args) > 2 else None)
+    pp_group = call_kwargs.pop('pp_group', call_args[3] if len(call_args) > 3 else None)
+    return model, config, embd_group, pp_group, call_kwargs
+
+
+def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
+    """None-safe drop-in for Megatron's private embedding all-reduce helper.
+
+    This wrapper intentionally accepts arbitrary positional/keyword arguments so
+    it can survive Megatron helper signature drift across versions.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.distributed.finalize_model_grads import (
+        _get_main_grad_attr,
+        _reshard_if_dtensor,
+        _unshard_if_dtensor,
+        get_attr_wrapped_model,
+    )
+
+    model, config, embd_group, pp_group, _ = _normalize_word_embedding_allreduce_call(*call_args, **call_kwargs)
+    if embd_group is None:
+        embd_group = parallel_state.get_embedding_group()
+    if pp_group is None:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+    def _get_main_grad_attr_compat(weight, ddp_config):
+        try:
+            helper_params = inspect.signature(_get_main_grad_attr).parameters
+        except (TypeError, ValueError):
+            helper_params = None
+
+        if helper_params is not None and len(helper_params) <= 1:
+            return _get_main_grad_attr(weight)
+        return _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+
+    if parallel_state.is_rank_in_embedding_group(ignore_virtual=True) and torch.distributed.get_world_size(
+            embd_group) > 1:
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            model_module = model[0]
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            model_module = model[-1]
+        else:
+            model_module = model[0]
+
+        ddp_config = model_module.ddp_config
+        model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
+
+        if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
+            weight = model_module.shared_embedding_or_output_weight()
+            if weight is None:
+                logger.warning_once(
+                    'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                    'because the tied weight is missing on this pipeline stage.',
+                    hash_id='megatron_lora_skip_embedding_allreduce_missing_weight',
+                )
+                return
+
+            grad_attr = _get_main_grad_attr_compat(weight, ddp_config)
+            orig_grad = getattr(weight, grad_attr, None)
+            grad = _unshard_if_dtensor(orig_grad)
+            if grad is None:
+                logger.warning_once(
+                    'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                    'because the tied weight has no grad. This is expected when LoRA freezes '
+                    'the base embedding/output weight.',
+                    hash_id='megatron_lora_skip_embedding_allreduce_none_grad',
+                )
+                return
+
+            torch.distributed.all_reduce(grad, group=embd_group)
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def get_args() -> 'TwinkleMegatronArgs':
@@ -231,6 +320,18 @@ class TwinkleMegatronArgs:
 
     @property
     def expert_tensor_parallel_size(self) -> int:
+        if not exists('megatron_core>=0.13'):
+            # megatron_core<0.13 does not have a separate ETP config. For expert ColumnParallelLinear,
+            # the internal path still uses the dense TP group, and parameter sharding is determined by tp_size.
+            # etp_size has no practical effect here.
+            # Force alignment here to avoid a mismatch where GPTBridge shards by etp_size while
+            # the parameters were built according to tp_size.
+            tp = self.device_mesh.tp_world_size or 1
+            if self.device_mesh.etp_size is not None and self.device_mesh.etp_world_size != tp:
+                logger.warning(
+                    f'etp_size={self.device_mesh.etp_world_size} is ignored on '
+                    f'megatron_core<0.13; expert TP is tied to tp_size={tp}')
+            return tp
         return self.device_mesh.etp_world_size
 
     @property
@@ -333,10 +434,13 @@ class TwinkleMegatronArgs:
 
         model_type = getattr(hf_config, 'model_type', 'qwen2')
 
-        # Detect multimodal model from the registered MegatronModelMeta
-        from .model.register import get_megatron_model_meta
-        model_meta = get_megatron_model_meta(model_type)
-        is_multimodal = model_meta.is_multimodal if model_meta is not None else False
+        # Detect multimodal models without importing the Megatron registry.
+        # The registry import chain can pull in megatron.core, which must stay
+        # behind the MindSpeed bootstrap on NPU.
+        from .model.constant import MLLMModelType
+        is_multimodal = model_type in {
+            value for key, value in vars(MLLMModelType).items() if not key.startswith('_')
+        }
 
         # Determine QKV bias
         if hasattr(text_config, 'attention_bias'):
@@ -470,27 +574,53 @@ class TwinkleMegatronArgs:
                 # Recompute all layers for maximum memory savings
                 recompute_num_layers = num_layers // self.pp_size
 
-        # Create finalize_model_grads function for DP gradient synchronization
-        # Megatron's native finalize_model_grads requires DDP-wrapped models with ddp_config.
-        # For PEFT/LoRA models, we use a custom implementation that handles non-DDP models.
+        # Custom finalize_model_grads for LoRA, registered via TransformerConfig.
+        # Fixes two issues with Megatron's native finalize_model_grads:
+        #
+        # 1. Bare models (single-rank / no-op wrap) only carry ddp_config but lack
+        #    finish_grad_sync(), so we gate on real DDP capability instead.
+        #
+        # 2. In multi-rank LoRA + PP, native _allreduce_word_embedding_grads assumes
+        #    shared embedding/output weight always has a grad. LoRA freezes the base
+        #    weight so grad is None -> all_reduce(None) crashes. We monkey-patch that
+        #    one helper to skip None grads, reusing the rest of native finalize via
+        #    try/finally to avoid forking the entire module.
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
 
         def finalize_model_grads_for_lora(model, *args, **kwargs):
+            import importlib
+
             from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+            from megatron.core.distributed.finalize_model_grads import (
+                _get_main_grad_attr,
+                _reshard_if_dtensor,
+                _unshard_if_dtensor,
+                get_attr_wrapped_model,
+            )
+            from megatron.core import parallel_state
             from peft import PeftModel as _PeftModel
 
-            # Check if model is DDP-wrapped (has ddp_config)
-            # Need to unwrap PeftModel to check the underlying model
+            # Unwrap PeftModel -> LoraModel -> real model to check DDP capability.
             def _get_base_model(m):
                 if isinstance(m, _PeftModel):
                     return _get_base_model(m.base_model.model)
                 return m
 
+            # Fix 1: check real DDP capability, not just ddp_config presence.
             base_model = _get_base_model(model[0])
-            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'ddp_config'):
-                # Use native implementation for DDP models
-                return _native_finalize_model_grads(model, *args, **kwargs)
+            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
+                # Fix 2: temporarily swap in the None-safe embedding allreduce.
+                finalize_model_grads_mod = importlib.import_module(
+                    'megatron.core.distributed.finalize_model_grads'
+                )
+                orig_allreduce_word_embedding_grads = finalize_model_grads_mod._allreduce_word_embedding_grads
+                finalize_model_grads_mod._allreduce_word_embedding_grads = _allreduce_word_embedding_grads_allow_none
+                try:
+                    return _native_finalize_model_grads(model, *args, **kwargs)
+                finally:
+                    finalize_model_grads_mod._allreduce_word_embedding_grads = orig_allreduce_word_embedding_grads
 
+            # Bare model (single-rank / no-op wrap): no DDP sync, skip.
             return
 
         # MoE configuration
@@ -565,6 +695,7 @@ class TwinkleMegatronArgs:
         bias_activation_fusion = use_swiglu and not has_bias
         if 'moe_token_dispatcher_type' not in moe_kwargs:
             moe_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
+        is_npu = Platform.device_prefix() == 'npu'
         config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=mg_config_dict['hidden_size'],
@@ -595,11 +726,15 @@ class TwinkleMegatronArgs:
             hidden_dropout=0.0,
             attention_dropout=0.0,
             # Performance optimizations
-            masked_softmax_fusion=True,  # Fused attention softmax
+            # NPU fallback: the current environment does not provide the TBE-backed
+            # fused softmax kernel that MindSpeed's NPU path selects by default.
+            # Keep the GPU fast path unchanged, but fall back to unfused softmax on NPU
+            # so attention can run without a hard dependency on `tbe`.
+            masked_softmax_fusion=not is_npu,
             bias_dropout_fusion=True,  # Fused bias + dropout
             apply_rope_fusion=True,  # Fused RoPE application
             attention_softmax_in_fp32=True,  # Numerical stability
-            attention_backend=AttnBackend.flash,  # FlashAttention for speed
+            attention_backend=AttnBackend.flash,
             # Activation recomputation for memory efficiency
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,

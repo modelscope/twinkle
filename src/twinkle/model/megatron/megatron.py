@@ -250,7 +250,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ) -> List[nn.Module]:
         from .args import get_args
+        from .mindspeed_bootstrap import bootstrap_mindspeed_for_npu
         args = get_args()
+        # Convert the args into a MindSpeed-compatible form so Megatron and
+        # MindSpeed can share the same runtime arguments.
+        bootstrap_mindspeed_for_npu(args)
         self.initialize(**kwargs)
 
         model = args.create_model()
@@ -258,7 +262,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             bridge = self._bridge
             for _model in model:
                 bridge.load_weights(_model, args.model_dir)
-
         if dist.is_initialized():
             dist.barrier()
 
@@ -483,8 +486,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             logps = None
             if labels is not None and mpu.is_pipeline_last_stage():
                 loss_mask = (labels != -100).bool()
-                masked_labels = labels.clone()
-                masked_labels[~loss_mask] = 0
+                # Avoid bool advanced indexing here. On NPU this lowers to
+                # aclnnNonzeroV2 inside AdvancedIndex and can crash during
+                # end-to-end training; torch.where preserves the same masking
+                # semantics without going through that path.
+                masked_labels = torch.where(loss_mask, labels, torch.zeros_like(labels))
                 logps = selective_log_softmax(output_tensor, masked_labels)
                 if cp_size > 1:
                     logps = self._postprocess_tensor_cp(logps)
@@ -774,23 +780,39 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
+        use_gloo_process_groups = kwargs.pop('use_gloo_process_groups', True)
         use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', False)
+        # Some Megatron-LM versions (e.g. 0.12.1) only accept
+        # overlap_param_gather_with_optimizer_step here.
+        # overlap_param_gather still exists on ddp_config / distributed
+        # optimizer paths, but passing it directly into OptimizerConfig
+        # raises TypeError on this branch.
+        config_sig = inspect.signature(OptimizerConfig).parameters
+        config_kwargs = {
+            'optimizer': 'adam',
+            'lr': lr,
+            'min_lr': kwargs.get('min_lr', 0.0),
+            'weight_decay': kwargs.get('weight_decay', 0.01),
+            'adam_beta1': kwargs.get('adam_beta1', 0.9),
+            'adam_beta2': kwargs.get('adam_beta2', 0.999),
+            'adam_eps': kwargs.get('adam_eps', 1e-8),
+            'clip_grad': kwargs.get('clip_grad', 1.0),
+            'bf16': kwargs.get('bf16', True),
+            'use_distributed_optimizer': use_distributed_optimizer,
+            'log_num_zeros_in_grad': kwargs.get('log_num_zeros_in_grad', False),
+        }
+        # Keep the old knob only if this Megatron version still exposes it.
+        # Some branches wire it through ddp_config instead of OptimizerConfig.
+        if 'overlap_param_gather' in config_sig:
+            config_kwargs['overlap_param_gather'] = kwargs.get('overlap_param_gather', False)
+        if 'overlap_param_gather_with_optimizer_step' in config_sig:
+            config_kwargs['overlap_param_gather_with_optimizer_step'] = kwargs.get(
+                'overlap_param_gather_with_optimizer_step', kwargs.get('overlap_param_gather', False))
+        for key, value in kwargs.items():
+            if key in config_sig and key not in config_kwargs:
+                config_kwargs[key] = value
 
-        opt_config = OptimizerConfig(
-            optimizer='adam',
-            lr=lr,
-            min_lr=kwargs.get('min_lr', 0.0),
-            weight_decay=kwargs.get('weight_decay', 0.01),
-            adam_beta1=kwargs.get('adam_beta1', 0.9),
-            adam_beta2=kwargs.get('adam_beta2', 0.999),
-            adam_eps=kwargs.get('adam_eps', 1e-8),
-            clip_grad=kwargs.get('clip_grad', 1.0),
-            bf16=kwargs.get('bf16', True),
-            use_distributed_optimizer=use_distributed_optimizer,
-            overlap_param_gather=kwargs.get('overlap_param_gather', False),
-            log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
-            **kwargs,
-        )
+        opt_config = OptimizerConfig(**config_kwargs)
 
         # Ensure each model chunk has ddp_config attached (required by Megatron optimizer)
         from megatron.core.distributed import DistributedDataParallelConfig
@@ -800,6 +822,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer = get_megatron_optimizer(
             config=opt_config,
             model_chunks=model_chunks,
+            use_gloo_process_groups=use_gloo_process_groups,
         )
         return optimizer
 
@@ -1494,11 +1517,39 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if self._initialized:
             return
 
+        import torch.distributed as dist
         from megatron.core import parallel_state
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
         from .args import get_args
         self._try_init_process_group()
+        # `self._try_init_process_group()` only initializes torch.distributed when
+        # Platform.get_world_size() > 1. In single-card local runs that means no
+        # default process group exists yet, but Megatron still expects one before
+        # parallel_state.initialize_model_parallel(). Keep a rank=0/world_size=1
+        # local PG here so single-card smoke and local training can reach the same
+        # Megatron initialization path as multi-card jobs.
+        if Platform.device_prefix() == 'npu' and dist.is_initialized():
+            # The default NPU process group carries a `device_id` binding.
+            # Clear it first so Gloo subgroups do not inherit it and fail.
+            default_pg = dist.distributed_c10d._get_default_group()
+            if getattr(default_pg, 'bound_device_id', None) is not None:
+                default_pg.bound_device_id = None
+        if not dist.is_initialized():
+            from twinkle import find_free_port
+
+            backend = Platform.device_backend()
+            init_kwargs = {
+                'backend': backend,
+                'init_method': f'tcp://127.0.0.1:{find_free_port()}',
+                'rank': 0,
+                'world_size': 1,
+            }
+            if backend == 'nccl':
+                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+            # Do not bind `device_id` on the default NPU process group,
+            # otherwise later Gloo subgroups will inherit it.
+            dist.init_process_group(**init_kwargs)
         args = get_args()
         init_kwargs = {
             'tensor_model_parallel_size': args.tensor_model_parallel_size,
@@ -1507,6 +1558,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'virtual_pipeline_model_parallel_size': args.virtual_pipeline_model_parallel_size,
             'expert_model_parallel_size': args.expert_model_parallel_size,
         }
+        if Platform.device_prefix() == 'npu':
+            # Enable auxiliary Gloo groups on NPU and keep them separate from
+            # the main HCCL groups.
+            init_kwargs['create_gloo_process_groups'] = True
 
         if args.order:
             init_kwargs['order'] = args.order

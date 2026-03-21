@@ -6,7 +6,13 @@
 # Follow the same LazyModule approach as `twinkle.model`: only import when those symbols are actually accessed.
 from typing import TYPE_CHECKING
 
+from twinkle import Platform
 from twinkle.utils.import_utils import _LazyModule
+
+if Platform.device_prefix() == 'npu':
+    # MindSpeed needs to patch `torch.compile`/TE symbols before any `megatron.core`
+    # module binds them by value. Keeping this import early is the smallest reliable hook.
+    import mindspeed.megatron_adaptor  # noqa: F401
 
 if TYPE_CHECKING:
     from .megatron import MegatronModel, MegatronStrategy

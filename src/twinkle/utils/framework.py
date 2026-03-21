@@ -42,6 +42,26 @@ class Framework(ABC):
         import torch.distributed as dist
         output_objects = [object]
         if device_mesh is not None and device_mesh.data_world_size > 1:
+            # 1. NPU/HCCL object collectives are brittle here. Megatron already creates
+            # an equivalent Gloo DP group on NPU, so use that backend for Python
+            # object gather to keep the metric path identical to GPU's semantics
+            # without relying on HCCL object support.
+            # 2. We previously left this path on the default backend and saw metric
+            # gathering hang in `dist.all_gather_object(...)` on 8-card NPU smoke,
+            # with pystack pointing at the object-collective call chain. Switching
+            # to the Megatron-created Gloo DP group is what unblocked the metric path.
+            # 3. If CP is enabled, Megatron builds a separate DP-Gloo group that includes
+            # the context-parallel dimension; using the plain DP group would pick the
+            # wrong rank set for metric aggregation.
+            if Platform.device_prefix() == 'npu':
+                try:
+                    from megatron.core import parallel_state as mpu
+
+                    process_group = mpu.get_data_parallel_group_gloo(
+                        with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1
+                    )
+                except Exception:
+                    pass
             group_size = dist.get_world_size(group=process_group)
             output_objects = [None for _ in range(group_size)]
             dist.all_gather_object(output_objects, object, group=process_group)
