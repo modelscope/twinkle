@@ -1159,21 +1159,28 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 
+        def _normalize(name: str, keep_base_layer: bool) -> str:
+            name = name.replace('base_model.model.', '')
+            if not keep_base_layer:
+                name = name.replace('.base_layer', '')
+            return name
+
+        def _is_lora_key(name: str) -> bool:
+            return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+
         if base_sync_done and adapter_name:
             if merge_and_sync:
-
+                # LoRA Training and sync full model(merge_adapter)
+                # merge and skip lora weigts(already merged)
+                # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
                     if isinstance(model, PeftModel):
                         model.merge_adapter()
                     for name, tensor in model.state_dict().items():
-                        # Skip LoRA-specific weights for base model sync
-                        if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                        if _is_lora_key(name):
                             continue
                         tensor = Torch.to_local_tensor(tensor)
-                        # Keep original names (including .base_layer for PEFT models).
-                        # The sampler side will strip .base_layer based on whether
-                        # vLLM has enable_lora=True/False.
-                        yield name, tensor
+                        yield _normalize(name, keep_base_layer=False), tensor
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -1188,19 +1195,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         yield name, tensor
 
         else:
-            # Full model mode: send all weights (base model sync).
+            # First full base-model sync.  Whether to keep ``.base_layer.``
+            # depends on whether the sampler uses ``enable_lora``:
+            #   merge_and_sync=True  → enable_lora=False → strip .base_layer
+            #   merge_and_sync=False → enable_lora=True  → keep .base_layer
+            keep_base_layer = not merge_and_sync
             state_dict = model.state_dict()
 
             def weight_generator():
                 for name, tensor in state_dict.items():
-                    # Skip LoRA-specific weights for base model sync
-                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                    if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    # Keep original names (including .base_layer for PEFT models).
-                    # The sampler side will strip .base_layer based on whether
-                    # vLLM has enable_lora=True/False.
-                    yield name, tensor
+                    yield _normalize(name, keep_base_layer=keep_base_layer), tensor
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
