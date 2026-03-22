@@ -7,15 +7,17 @@ from twinkle.reward.base import Reward
 class GSM8KAccuracyReward(Reward):
     """Accuracy reward for GSM8K: checks if the model's answer matches ground truth.
 
-    Extracts the last '#### <number>' from model output and compares with ground truth.
+    Extracts the answer from \\boxed{} (preferred) or #### format.
     Returns 1.0 for correct, 0.0 for incorrect.
     """
 
     @staticmethod
     def extract_answer(completion: str) -> str:
-        """Extract the last #### answer from model completion."""
-        # Only check last 500 chars for efficiency
+        """Extract the answer from model completion, preferring \\boxed{} over ####."""
         text = completion[-500:] if len(completion) > 500 else completion
+        boxed = re.findall(r'\\boxed\{([^}]+)\}', text)
+        if boxed:
+            return boxed[-1].replace(',', '').replace(' ', '').strip()
         matches = re.findall(r'####\s*([\-\d,\.\s]+)', text)
         if matches:
             return matches[-1].replace(',', '').replace(' ', '').strip()
@@ -54,9 +56,9 @@ class GSM8KAccuracyReward(Reward):
 
 
 class GSM8KFormatReward(Reward):
-    """Format reward: checks if output contains <think>...</think> tag.
+    """Format reward: checks if output contains \\boxed{} or #### answer format.
 
-    Returns 1.0 if format is correct, 0.0 otherwise.
+    Returns 1.0 if a valid answer format is present, 0.0 otherwise.
     """
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
@@ -68,7 +70,6 @@ class GSM8KFormatReward(Reward):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_think = bool(re.search(r'<think>.*?</think>', completion, re.DOTALL))
-            has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
-            rewards.append(1.0 if (has_think and has_answer) else 0.0)
+            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
+            rewards.append(1.0 if has_answer else 0.0)
         return rewards

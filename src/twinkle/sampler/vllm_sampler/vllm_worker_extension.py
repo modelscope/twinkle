@@ -390,11 +390,17 @@ class TwinkleWorkerExtension:
         """Load a batch of weights into vLLM.
 
         Two modes:
-        - LoRA mode (``peft_config`` and ``base_sync_done``): Loads weights as
-          a tensor-based LoRA adapter via ``add_lora()``.
-        - Base model mode: Strips PEFT prefixes, merges split weights
-          (q/k/v_proj -> qkv_proj, gate/up_proj -> gate_up_proj) into vLLM's
-          stacked format, normalizes prefixes, then loads via direct param copy.
+
+        * **LoRA mode** (``peft_config`` set and ``base_sync_done=True``):
+          loads weights as a tensor-based LoRA adapter via ``add_lora()``.
+        * **Base model mode** (all other cases): delegates to
+          ``model.load_weights()`` which handles stacked-parameter merging
+          (q/k/v → qkv, gate/up → gate_up) and prefix mapping internally.
+
+        Weight names are expected to arrive **already normalised** by the
+        sender (``TransformersModel.send_weights`` /
+        ``MegatronModel.send_weights``), so no name transformation is done
+        here.
         """
         if peft_config and base_sync_done:
             # Remove existing LoRA before replacing
@@ -412,51 +418,9 @@ class TwinkleWorkerExtension:
             )
             self.add_lora(lora_request)
         else:
-            # Base model mode — strip PEFT prefixes and delegate to
-            # vLLM's model.load_weights() which handles stacked params,
-            # prefix normalization, and weight_loader internally.
-            vllm_has_lora = getattr(
-                getattr(self, 'vllm_config', None),
-                'lora_config',
-                None,
-            ) is not None
-
-            # When vLLM LoRA is enabled, some LinearBase modules are
-            # replaced by *WithLoRA wrappers.  Their parameters shift
-            # from e.g. ``gate.weight`` to ``gate.base_layer.weight``.
-            # HF checkpoint names do NOT contain ``.base_layer.``, so
-            # vLLM's own ``load_weights`` will KeyError on them.
-            #
-            # Build a set of base-layer prefixes that need rewriting.
-            lora_base_prefixes: set = set()
-            if vllm_has_lora:
-                from vllm.lora.layers import BaseLayerWithLoRA
-                for mod_name, mod in self.model_runner.model.named_modules():
-                    if isinstance(mod, BaseLayerWithLoRA):
-                        # mod_name is e.g. "model.layers.0.mlp.gate"
-                        lora_base_prefixes.add(mod_name + '.')
-
-            converted = []
-            for name, tensor in weights:
-                if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
-                    continue
-                name = name.removeprefix('model.base_model.model.')
-                name = name.removeprefix('base_model.model.')
-                if not vllm_has_lora:
-                    name = name.replace('.base_layer.', '.')
-                else:
-                    # Insert ``.base_layer.`` for weights whose module
-                    # has been wrapped by LoRA and whose name does NOT
-                    # already contain it.
-                    if '.base_layer.' not in name:
-                        for pfx in lora_base_prefixes:
-                            if name.startswith(pfx):
-                                # e.g. "model.layers.0.mlp.gate.weight"
-                                # →    "model.layers.0.mlp.gate.base_layer.weight"
-                                suffix = name[len(pfx):]
-                                name = pfx + 'base_layer.' + suffix
-                                break
-                converted.append((name, tensor))
+            # Base model mode — weights arrive in canonical HF format
+            converted = [(n, t) for n, t in weights
+                         if 'lora_A' not in n and 'lora_B' not in n and 'lora_embedding' not in n]
 
             if not converted:
                 return
