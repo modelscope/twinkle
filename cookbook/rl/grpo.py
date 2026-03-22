@@ -69,13 +69,21 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
-    lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
-
+    # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
+    lora_config = LoraConfig(
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+        ],
+        r=32, lora_alpha=64, lora_dropout=0.05,
+    )
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
         model = MegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
     else:
-        model = TransformersModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model')
+        from transformers import Qwen3_5ForConditionalGeneration
+        model = TransformersModel(model_id=MODEL_ID, model_cls=Qwen3_5ForConditionalGeneration, device_mesh=model_mesh, remote_group='model')
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     if USE_MEGATRON:
@@ -94,7 +102,7 @@ def main():
             'gpu_memory_utilization': 0.8,
             'max_model_len': 4496,
             'max_lora_rank': 32, # save as lora_config
-            # NOTE: To use enable_lora, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976 or later
+            # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
