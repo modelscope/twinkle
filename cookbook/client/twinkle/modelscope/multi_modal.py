@@ -6,7 +6,7 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
-
+import os
 from twinkle.data_format import Trajectory, Message
 from twinkle.preprocessor import Preprocessor
 
