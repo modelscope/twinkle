@@ -35,6 +35,7 @@ class InputProcessor:
         'video_grid_thw': 0,
         'input_features': 0.0,
         'feature_attention_mask': 0,
+        'mm_token_type_ids': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch

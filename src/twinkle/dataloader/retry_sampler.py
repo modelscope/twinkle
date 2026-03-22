@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
 from torch.utils.data import IterableDataset, Sampler
-
 from twinkle.dataset import Dataset
 
 
@@ -32,7 +31,9 @@ class RetrySampler(Sampler):
                     yield idx
                     total += 1
                     break
-                except Exception:  # noqa
+                except Exception as e:  # noqa
+                    import traceback
+                    traceback.print_exc()
                     continue
             else:
                 raise StopIteration(f'Max retries exceeded: {self.max_retries}, no valid data found.')
