@@ -1,9 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import transformers
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-import transformers
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
