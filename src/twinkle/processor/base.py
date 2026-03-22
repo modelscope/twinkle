@@ -371,7 +371,6 @@ class InputProcessor:
                 else:
                     result[key] = values
             result = InputFeature(**result)
-
         for field, values in vlm_fields.items():
             if values:
                 if values[0].dim() == 1:

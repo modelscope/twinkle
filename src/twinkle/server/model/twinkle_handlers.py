@@ -140,8 +140,13 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         async def _task():
             self.assert_adapter_exists(adapter_name=adapter_name)
             extra_kwargs = body.model_extra or {}
-            inputs = _parse_inputs(body.inputs)
-            ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
+            import torch
+            all_inputs = _parse_inputs(body.inputs)
+            for inputs in all_inputs:
+                for key in inputs:
+                    if isinstance(inputs[key], list):
+                        inputs[key] = torch.tensor(inputs[key])
+            ret = self.model.forward_backward(inputs=all_inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
         return await run_task(self.schedule_task_and_wait(_task, task_type='forward_backward'))
