@@ -12,7 +12,7 @@ import torch
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
 from peft import LoraConfig
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .app import ModelManagement
