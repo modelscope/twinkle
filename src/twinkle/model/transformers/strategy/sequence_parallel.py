@@ -23,6 +23,16 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
+@dataclass(frozen=True)
+class SequenceParallelContext:
+    sp_group: Optional[dist.ProcessGroup]
+    sp_world_size: int
+    rank: int
+    world_size: int
+    real_position_ids: Optional[torch.Tensor]
+    is_packed: bool
+
+
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
     dp_world_size = device_mesh.dp_world_size or 1
     fsdp_world_size = device_mesh.fsdp_world_size or 1
@@ -344,11 +354,24 @@ class SequenceParallel:
         self.num_heads = None
         self.causal_mask_func = None
         self.extra_kwargs = {}
+        self.requires_cu_seq_lens_q = False
+        self._bound_llm_model = None
 
     @property
     def real_position_ids(self) -> torch.Tensor:
         """The real position ids, this is different from the position_ids in mrope"""
         return self.extra_kwargs.get('position_ids')
+
+    def _build_context(self) -> SequenceParallelContext:
+        rank = dist.get_rank(self._sp_group) if self._sp_group is not None and dist.is_initialized() else 0
+        return SequenceParallelContext(
+            sp_group=self._sp_group,
+            sp_world_size=int(self.sp_world_size or 1),
+            rank=rank,
+            world_size=int(self.world_size or 1),
+            real_position_ids=self.real_position_ids,
+            is_packed=bool(self.extra_kwargs.get('is_packed', False)),
+        )
 
     def _prepare_flash_attn(self, base_model: torch.nn.Module):
         try:
@@ -637,6 +660,10 @@ class SequenceParallel:
             SequenceParallel._global_inited = True
 
         self._prepare_forward_hook(llm_model)
+        self.requires_cu_seq_lens_q = bool(getattr(llm_model, 'requires_cu_seq_lens_q', False))
+        self._bound_llm_model = llm_model
+        if hasattr(llm_model, 'set_sequence_parallel_context'):
+            llm_model.set_sequence_parallel_context(self._build_context())
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
             self._prepare_moe_aux_loss(llm_model)
@@ -854,6 +881,13 @@ class SequenceParallel:
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
+        if self._bound_llm_model is not None and hasattr(self._bound_llm_model, 'set_sequence_parallel_context'):
+            self._bound_llm_model.set_sequence_parallel_context(self._build_context())
+        if self.requires_cu_seq_lens_q and position_ids is not None:
+            padded_position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids, dim=-1)
+            padded_position_ids = padded_position_ids.clone()
+            padded_position_ids[padded_position_ids < 0] = 0
+            inputs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(padded_position_ids).to(torch.int32)
         if 'labels' in inputs:
             labels = inputs['labels']
             _, _, labels, _, _, _, _ = self.pad_and_split_inputs(

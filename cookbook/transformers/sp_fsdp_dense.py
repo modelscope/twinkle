@@ -7,6 +7,7 @@ from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
+from twinkle.model.transformers.models.qwen3_5 import TwinkleQwen3_5ForCausalLM
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
@@ -64,6 +65,7 @@ def train():
 
     model = TransformersModel(
         model_id=MODEL_ID,
+        model_cls=TwinkleQwen3_5ForCausalLM,
         device_mesh=device_mesh,
         strategy='native_fsdp',
     )
