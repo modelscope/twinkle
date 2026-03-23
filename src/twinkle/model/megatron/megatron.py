@@ -139,6 +139,7 @@ _BASE_LAYER_SUFFIXES = [
     '.in_proj_a.weight',
     '.in_proj_b.weight',
     '.out_proj.weight',
+    '.conv1d.weight',
 ]
 
 
