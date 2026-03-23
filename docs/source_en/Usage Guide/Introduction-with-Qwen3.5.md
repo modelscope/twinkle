@@ -530,7 +530,7 @@ Alongside the open-source release of Twinkle, ModelScope provides a hosted model
 
 ```python
 base_url = 'https://www.modelscope.cn/twinkle'
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'  # Model currently deployed in the official environment
+base_model = 'Qwen/Qwen3.5-4B'  # Model currently deployed in the official environment
 ```
 
 ---

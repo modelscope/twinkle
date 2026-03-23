@@ -530,7 +530,7 @@ Twinkle 框架开源的同时，魔搭社区依托自身算力基础设施，提
 
 ```python
 base_url = 'https://www.modelscope.cn/twinkle'
-base_model = 'Qwen/Qwen3-30B-A3B-Instruct-2507'  # 官方环境当前部署的模型
+base_model = 'Qwen/Qwen3.5-4B'  # 官方环境当前部署的模型
 ```
 
 ---

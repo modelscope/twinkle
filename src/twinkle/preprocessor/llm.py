@@ -122,10 +122,8 @@ class GSM8KProcessor(Preprocessor):
     Extracts the ground truth number and stores it in user_data for reward.
     Only includes system + user messages; assistant response is generated on-policy.
     """
-    system_prompt = ('You are a helpful math assistant. Solve the problem step by step. '
-                     'Show your reasoning in <think> </think> tags, then give the final '
-                     'numerical answer after ####.\n'
-                     'For example:\n<think> ... reasoning ... </think>\n#### 42')
+    system_prompt = ('You are a helpful math assistant. Solve the problem step by step '
+                     'and put your final answer within \\boxed{}.')
 
     def __init__(self, system=None, add_assistant=False):
         self.system = system
