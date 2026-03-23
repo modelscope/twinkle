@@ -151,6 +151,13 @@ DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
 
 
+def _default_gradient_accumulation_steps_for_device_mesh(device_mesh: Optional[DeviceMesh]) -> int:
+    if device_mesh is None:
+        return 1
+    ulysses_size = getattr(device_mesh, 'ulysses_size', None) or 1
+    return ulysses_size if ulysses_size > 1 else 1
+
+
 @remote_class()
 class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
@@ -352,6 +359,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_instance=CrossEntropyLoss(reduction='sum'),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh),
+            gradient_accumulation_steps=_default_gradient_accumulation_steps_for_device_mesh(self.device_mesh),
             _device_mesh=self.device_mesh,
         )
 
@@ -1010,7 +1018,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                                                                       self._construct_default_optimizer_group())
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
-        _gas_default = kwargs.get('gradient_accumulation_steps', 1)
+        _gas_default = kwargs.get('gradient_accumulation_steps')
+        if _gas_default is None:
+            _gas_default = _default_gradient_accumulation_steps_for_device_mesh(self.device_mesh)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name

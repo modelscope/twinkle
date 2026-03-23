@@ -23,6 +23,29 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
+def get_flattened_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if position_ids.dim() != 2:
+        raise ValueError(f'Expected 1D or 2D position_ids, got shape={tuple(position_ids.shape)}')
+
+    device = position_ids.device
+    cu_seqlens = [0]
+    total = 0
+    for row in position_ids:
+        row = row.clone()
+        row[row < 0] = 0
+        seq_start_indices = torch.where(row == 0)[0]
+        if seq_start_indices.numel() == 0 or seq_start_indices[0].item() != 0:
+            seq_start_indices = torch.cat([torch.tensor([0], device=device, dtype=seq_start_indices.dtype), seq_start_indices])
+        seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(row)], device=device)])
+        seq_lengths = (seq_end_indices - seq_start_indices).tolist()
+        for seq_length in seq_lengths:
+            total += int(seq_length)
+            cu_seqlens.append(total)
+    return torch.tensor(cu_seqlens, device=device, dtype=torch.long)
+
+
 @dataclass(frozen=True)
 class SequenceParallelContext:
     sp_group: Optional[dist.ProcessGroup]
@@ -317,14 +340,17 @@ class DistributedAttention(torch.nn.Module):
         else:
             query_layer, key_layer, value_layer = query, key, value
 
-        position_ids = kwargs.pop('position_ids')
+        position_ids = kwargs.pop('position_ids', None)
         if position_ids is not None:
-            shape0 = position_ids.shape[0]
-            position_ids_output = torch.empty((shape0 * self.sequence_parallel.sp_world_size, position_ids.shape[1]),
-                                              dtype=position_ids.dtype,
-                                              device=position_ids.device)
+            position_ids = position_ids.contiguous()
+            gathered_shape = (self.sequence_parallel.sp_world_size, *position_ids.shape)
+            position_ids_output = torch.empty(
+                gathered_shape,
+                dtype=position_ids.dtype,
+                device=position_ids.device,
+            )
             dist.all_gather_into_tensor(position_ids_output, position_ids, group=self.sequence_parallel._sp_group)
-            position_ids = torch.cat(position_ids_output.split(shape0, dim=0), dim=1)
+            position_ids = torch.cat(tuple(position_ids_output.unbind(dim=0)), dim=-1).contiguous()
 
         context_layer = self.local_attn(
             query_layer, key_layer, value_layer, attention_mask, *args, position_ids=position_ids, **kwargs)
@@ -353,6 +379,7 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
+        self.attn_implementation = None
         self.extra_kwargs = {}
         self.requires_cu_seq_lens_q = False
         self._bound_llm_model = None
@@ -514,6 +541,12 @@ class SequenceParallel:
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
+                    else:
+                        # Dense, non-packed SP path should not forward position_ids into FA2.
+                        # Qwen3.5 has already applied RoPE before entering the attention interface, and keeping
+                        # position_ids here can make HF's FA2 helper mis-detect packed/varlen mode, especially when
+                        # batch_size == 1 and position_ids carries mRoPE-style leading dimensions.
+                        kwargs.pop('position_ids', None)
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
 
@@ -652,6 +685,10 @@ class SequenceParallel:
         else:
             if hasattr(llm_model, '_update_causal_mask'):
                 self.causal_mask_func = llm_model._update_causal_mask
+        self.attn_implementation = (
+            get_config_attr(model.config, '_attn_implementation')
+            or get_config_attr(model.config, '_attn_implementation_internal')
+        )
 
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
@@ -775,26 +812,28 @@ class SequenceParallel:
             loss_scale = self.pad(loss_scale, padding_value=0., position_ids=real_position_ids)
         if real_position_ids is not None:
             real_position_ids = self.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
-        # Build a 2D attention_mask whenever we padded for SP alignment so FlashAttention2 can unpad correctly.
-        # For packed batches (batch_size==1 with multiple position_id resets), relying on position_ids alone is
-        # unsafe if we also appended SP-alignment padding (position_ids=-1), because HF's FA2 varlen path will
-        # include the padded tail in the last segment when attention_mask is None.
-        if (input_ids is not None or input_embeds is not None) and batch_size > 1:
-            # not padding_free, so not ring-attention
+        # Preserve a 2D attention mask only when there is real padding to describe.
+        # For dense batches, FA2/FA3 should keep `attention_mask=None`; otherwise HF routes the kernel through
+        # its varlen/unpadding path and can introduce unnecessary overhead or invalid accesses in SP mode.
+        if input_ids is not None or input_embeds is not None:
             inputs = input_ids if input_ids is not None else input_embeds
-            attn_shape = inputs.shape[1]  # The sequence length
+            attn_shape = inputs.shape[1]
             if attention_mask is None:
-                # Mask out padded positions introduced by sequence-parallel padding.
-                # `real_position_ids` is padded with `-1` (see above), so use it to build a valid-token mask.
-                attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
-            # no need position_ids here, because padding_free does not need attention_mask,
-            # so this is not ring-attention
-            attention_mask = self.pad(attention_mask, padding_value=0)
-            cache_position = torch.arange(0, attn_shape, device=inputs.device)
-            # pad attention mask to 4d to avoid calculation errors
-            if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
-                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
-                                                       None, None)
+                has_padding = bool(real_position_ids is not None and torch.any(real_position_ids == -1))
+                if has_padding:
+                    attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
+            else:
+                has_padding = not bool(torch.all(attention_mask != 0))
+                if not has_padding:
+                    attention_mask = None
+            if attention_mask is not None:
+                attention_mask = self.pad(attention_mask, padding_value=0)
+                if self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+                    cache_position = torch.arange(0, attn_shape, device=inputs.device)
+                    # SDPA/eager-style paths still expect a fully materialized causal mask here.
+                    if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
+                        attention_mask = self.causal_mask_func(
+                            attention_mask, inputs.to(self.model_dtype), cache_position, None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
                 extra_values.append(
@@ -875,8 +914,10 @@ class SequenceParallel:
         """
         position_ids = None
         input_ids = inputs.get('input_ids')
+        inputs_embeds = inputs.get('inputs_embeds')
         position_ids = inputs.get('position_ids')
-        if position_ids is not None and input_ids is not None and position_ids.shape[0] == input_ids.shape[0]:
+        batch_source = input_ids if input_ids is not None else inputs_embeds
+        if position_ids is not None and batch_source is not None and position_ids.shape[0] == batch_source.shape[0]:
             self.extra_kwargs['position_ids'] = position_ids.clone()
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
         if input_ids is not None:
@@ -885,9 +926,7 @@ class SequenceParallel:
             self._bound_llm_model.set_sequence_parallel_context(self._build_context())
         if self.requires_cu_seq_lens_q and position_ids is not None:
             padded_position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids, dim=-1)
-            padded_position_ids = padded_position_ids.clone()
-            padded_position_ids[padded_position_ids < 0] = 0
-            inputs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(padded_position_ids).to(torch.int32)
+            inputs['cu_seq_lens_q'] = get_flattened_cu_seqlens_from_position_ids(padded_position_ids).to(torch.int32)
         if 'labels' in inputs:
             labels = inputs['labels']
             _, _, labels, _, _, _, _ = self.pad_and_split_inputs(

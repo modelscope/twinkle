@@ -135,6 +135,21 @@ class TestDeviceMeshSampler:
         assert 'input_ids' in batch
         assert batch['input_ids'].shape[0] == 2
 
+    def test_device_mesh_sampler_auto_adjusts_batch_for_ulysses(self):
+        csv_path = str(TEST_DATA_DIR / 'test.csv')
+        dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=csv_path))
+
+        device_mesh = DeviceMesh(
+            device_type='cpu',
+            mesh=np.arange(4).reshape(2, 2),
+            mesh_dim_names=('dp', 'fsdp'),
+            ulysses_size=2,
+        )
+
+        dataloader = DataLoader(dataset=dataset, batch_size=8, device_mesh=device_mesh)
+
+        assert dataloader.batch_size == 4
+
 
 class TestRetrySampler:
 

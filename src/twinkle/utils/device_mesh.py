@@ -352,17 +352,21 @@ class DeviceMesh:
     @property
     def data_world_size(self) -> int:
         """Consider all dp/fsdp ranks, uses to determine how to distribute the data"""
-        dp_world_size = self.dp_world_size
-        fsdp_world_size = self.fsdp_world_size
+        data_world_size = self.raw_data_world_size
         ulysses_size = self.ulysses_size or 1
-        if fsdp_world_size is not None and fsdp_world_size > 1:
-            data_world_size = dp_world_size * fsdp_world_size if dp_world_size is not None else fsdp_world_size
-        else:
-            data_world_size = dp_world_size if dp_world_size is not None else 1
 
         assert data_world_size % ulysses_size == 0, (
             f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.')
         return data_world_size // ulysses_size
+
+    @property
+    def raw_data_world_size(self) -> int:
+        """The data world size before applying ulysses sequence parallel grouping."""
+        dp_world_size = self.dp_world_size or 1
+        fsdp_world_size = self.fsdp_world_size
+        if fsdp_world_size is not None and fsdp_world_size > 1:
+            return dp_world_size * fsdp_world_size
+        return dp_world_size
 
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size

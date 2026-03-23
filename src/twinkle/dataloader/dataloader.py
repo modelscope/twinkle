@@ -45,13 +45,30 @@ class DataLoader:
         self.max_retries = kwargs.pop('max_retries', 20)
         self.min_batch_size = min_batch_size
         if device_mesh is not None:
-            assert batch_size >= device_mesh.data_world_size and batch_size % device_mesh.data_world_size == 0
-        self.batch_size = batch_size
+            required_world_size = self._required_data_world_size(device_mesh)
+            assert batch_size >= required_world_size and batch_size % required_world_size == 0
+        self.batch_size = self._resolve_runtime_batch_size(batch_size, device_mesh)
         self.dataloader_params = kwargs
-        self.dataloader_params['batch_size'] = batch_size
+        self.dataloader_params['batch_size'] = self.batch_size
         self.device_mesh = device_mesh
         self.processor: Optional[InputProcessor] = None
         self._set_work_init_fn()
+
+    @staticmethod
+    def _required_data_world_size(device_mesh: Optional[DeviceMesh]) -> int:
+        if device_mesh is None:
+            return 1
+        if (device_mesh.ulysses_size or 1) > 1:
+            return device_mesh.raw_data_world_size
+        return device_mesh.data_world_size
+
+    def _resolve_runtime_batch_size(self, batch_size: int, device_mesh: Optional[DeviceMesh]) -> int:
+        if device_mesh is None:
+            return batch_size
+        ulysses_size = device_mesh.ulysses_size or 1
+        if ulysses_size <= 1:
+            return batch_size
+        return batch_size // ulysses_size
 
     def _set_work_init_fn(self):
         num_workers = self.dataloader_params.get('num_workers', 2)

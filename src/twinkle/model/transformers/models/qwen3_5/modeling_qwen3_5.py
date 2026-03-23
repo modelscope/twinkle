@@ -75,6 +75,9 @@ def _sp_is_enabled(sequence_parallel_context: Any | None) -> bool:
 def _get_sp_rank(sequence_parallel_context: Any | None) -> int:
     if not _sp_is_enabled(sequence_parallel_context):
         return 0
+    rank = getattr(sequence_parallel_context, 'rank', None)
+    if rank is not None:
+        return int(rank)
     import torch.distributed as dist
 
     return dist.get_rank(sequence_parallel_context.sp_group)
@@ -98,6 +101,107 @@ def _head_to_seq_shard(tensor: torch.Tensor, sequence_parallel_context: Any | No
     if tensor.dim() == 3:
         return _SeqAllToAll.apply(sequence_parallel_context.sp_group, tensor.unsqueeze(-1), 1, 2).squeeze(-1)
     return _SeqAllToAll.apply(sequence_parallel_context.sp_group, tensor, 1, 2)
+
+
+def _resolve_local_padding_mask(
+    attention_mask: torch.Tensor | None,
+    seq_len: int,
+    sequence_parallel_context: Any | None = None,
+) -> torch.Tensor | None:
+    if attention_mask is None or attention_mask.dim() != 2:
+        return attention_mask
+    if attention_mask.shape[-1] == seq_len:
+        return attention_mask
+    if _sp_is_enabled(sequence_parallel_context):
+        sp_world_size = int(sequence_parallel_context.sp_world_size)
+        full_seq_len = attention_mask.shape[-1]
+        if full_seq_len % sp_world_size == 0:
+            local_seq_len = full_seq_len // sp_world_size
+            if local_seq_len == seq_len:
+                sp_rank = _get_sp_rank(sequence_parallel_context)
+                start = sp_rank * local_seq_len
+                end = start + local_seq_len
+                return attention_mask[:, start:end].contiguous()
+    if attention_mask.shape[-1] >= seq_len:
+        return attention_mask[:, :seq_len].contiguous()
+    return attention_mask
+
+
+def _flatten_varlen_batch(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(1, tensor.shape[0] * tensor.shape[1], *tensor.shape[2:])
+
+
+def _pad_or_trim_2d_tensor(tensor: torch.Tensor | None, target_len: int, pad_value: int) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.dim() == 3:
+        tensor = tensor[0]
+    if tensor.shape[-1] == target_len:
+        return tensor
+    if tensor.shape[-1] > target_len:
+        return tensor[..., :target_len].contiguous()
+    pad_shape = (*tensor.shape[:-1], target_len - tensor.shape[-1])
+    pad_tensor = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((tensor, pad_tensor), dim=-1)
+
+
+def _build_varlen_metadata(
+    *,
+    position_ids: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+    full_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    position_ids = _pad_or_trim_2d_tensor(position_ids, full_seq_len, pad_value=-1)
+
+    if position_ids is not None:
+        valid_mask = position_ids != -1
+    elif attention_mask is not None:
+        attention_mask = _pad_or_trim_2d_tensor(attention_mask, full_seq_len, pad_value=0)
+        valid_mask = attention_mask != 0
+    else:
+        raise ValueError('Varlen metadata requires at least one of position_ids or attention_mask.')
+
+    cu_seqlens = [0]
+    total = 0
+    for row_idx in range(valid_mask.shape[0]):
+        if position_ids is not None:
+            valid_positions = position_ids[row_idx][valid_mask[row_idx]]
+            if valid_positions.numel() == 0:
+                continue
+            seq_start_indices = torch.where(valid_positions == 0)[0]
+            if seq_start_indices.numel() == 0 or seq_start_indices[0].item() != 0:
+                seq_start_indices = torch.cat([
+                    torch.tensor([0], device=valid_positions.device, dtype=seq_start_indices.dtype),
+                    seq_start_indices,
+                ])
+            seq_end_indices = torch.cat([
+                seq_start_indices[1:],
+                torch.tensor([valid_positions.numel()], device=valid_positions.device, dtype=seq_start_indices.dtype),
+            ])
+            seq_lengths = (seq_end_indices - seq_start_indices).tolist()
+        else:
+            seq_lengths = [int(valid_mask[row_idx].sum().item())]
+        for seq_length in seq_lengths:
+            if seq_length <= 0:
+                continue
+            total += int(seq_length)
+            cu_seqlens.append(total)
+    return valid_mask, torch.tensor(cu_seqlens, device=valid_mask.device, dtype=torch.int32)
+
+
+def _pack_varlen_tensor(tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    return tensor[valid_mask].unsqueeze(0)
+
+
+def _unpack_varlen_tensor(
+    packed_tensor: torch.Tensor,
+    valid_mask: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    output = packed_tensor.new_zeros((batch_size, seq_len, *packed_tensor.shape[2:]))
+    output[valid_mask] = packed_tensor.squeeze(0)
+    return output
 
 
 class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
@@ -183,6 +287,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_parallel_context: Any | None = None,
     ):
+        attention_mask = _resolve_local_padding_mask(attention_mask, hidden_states.shape[1], sequence_parallel_context)
         hidden_states = hf_qwen35.apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (
@@ -203,6 +308,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
+        full_attention_mask = attention_mask
 
         sp_enabled = _sp_is_enabled(sequence_parallel_context)
         if sp_enabled:
@@ -245,6 +351,21 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
             conv_weight = self.conv1d.weight.squeeze(1)
 
+        packed_valid_mask = None
+        packed_cu_seqlens = cu_seq_lens_q
+        packed_seq_len = mixed_qkv.shape[1]
+        use_varlen_pack = cu_seq_lens_q is not None and not use_precomputed_states
+        if use_varlen_pack:
+            full_position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
+            packed_valid_mask, packed_cu_seqlens = _build_varlen_metadata(
+                position_ids=full_position_ids,
+                attention_mask=full_attention_mask,
+                full_seq_len=packed_seq_len,
+            )
+            mixed_qkv = _pack_varlen_tensor(mixed_qkv, packed_valid_mask)
+            b = _pack_varlen_tensor(b, packed_valid_mask)
+            a = _pack_varlen_tensor(a, packed_valid_mask)
+
         if use_precomputed_states:
             if conv_state is None:
                 raise RuntimeError('Qwen3.5 decode requires initialized convolution state.')
@@ -255,12 +376,13 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
                     mixed_qkv.transpose(1, 2).contiguous(),
                     (self.conv_kernel_size - mixed_qkv.shape[1], 0),
                 )
-            mixed_qkv = self._apply_varlen_conv(mixed_qkv, conv_weight, cu_seq_lens_q)
+            mixed_qkv = self._apply_varlen_conv(mixed_qkv, conv_weight, packed_cu_seqlens)
 
         query, key, value = torch.split(mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1)
-        query = query.reshape(batch_size, query.shape[1], local_num_k_heads, self.head_k_dim)
-        key = key.reshape(batch_size, key.shape[1], local_num_k_heads, self.head_k_dim)
-        value = value.reshape(batch_size, value.shape[1], local_num_v_heads, self.head_v_dim)
+        qkv_batch_size = 1 if use_varlen_pack else batch_size
+        query = query.reshape(qkv_batch_size, query.shape[1], local_num_k_heads, self.head_k_dim)
+        key = key.reshape(qkv_batch_size, key.shape[1], local_num_k_heads, self.head_k_dim)
+        value = value.reshape(qkv_batch_size, value.shape[1], local_num_v_heads, self.head_v_dim)
 
         beta = b.sigmoid()
         if sp_enabled:
@@ -296,12 +418,14 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seq_lens_q,
+                cu_seqlens=packed_cu_seqlens,
             )
 
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
+        if use_varlen_pack:
+            core_attn_out = _unpack_varlen_tensor(core_attn_out, packed_valid_mask, batch_size, packed_seq_len)
         core_attn_out = _head_to_seq_shard(core_attn_out, sequence_parallel_context)
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, self.value_dim)
@@ -406,6 +530,19 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
             linear_attn_mask = None
         return linear_attn_mask
 
+    def _resolve_linear_attn_mask(
+        self,
+        attention_mask: torch.Tensor | None,
+        text_position_ids: torch.LongTensor | None,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        if attention_mask is not None and attention_mask.dim() == 2 and attention_mask.shape[-1] == seq_len:
+            return attention_mask
+        if text_position_ids is None:
+            return attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
+        dtype = attention_mask.dtype if attention_mask is not None else torch.int64
+        return (text_position_ids != -1).to(dtype=dtype)
+
     @merge_with_config_defaults
     @capture_outputs
     def forward(
@@ -454,10 +591,13 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         sp_context = self._sequence_parallel_context
+        linear_attn_mask = self._update_linear_attn_mask(
+            self._resolve_linear_attn_mask(attention_mask, text_position_ids, hidden_states.shape[1]),
+            cache_position,
+        )
         if _sp_is_enabled(sp_context) and self.requires_cu_seq_lens_q and cu_seq_lens_q is None:
             raise ValueError('TwinkleQwen3_5TextModel requires cu_seq_lens_q when sequence parallel is enabled.')
 

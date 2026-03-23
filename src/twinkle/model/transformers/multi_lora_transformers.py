@@ -14,7 +14,7 @@ from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
 from .strategy import AccelerateStrategy
-from .transformers import OptimizerGroup, TransformersModel
+from .transformers import OptimizerGroup, TransformersModel, _default_gradient_accumulation_steps_for_device_mesh
 
 
 @remote_class()
@@ -184,7 +184,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config_or_dir
-        _gas_default = kwargs.get('gradient_accumulation_steps', 1)
+        _gas_default = kwargs.get('gradient_accumulation_steps')
+        if _gas_default is None:
+            _gas_default = _default_gradient_accumulation_steps_for_device_mesh(self.device_mesh)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
