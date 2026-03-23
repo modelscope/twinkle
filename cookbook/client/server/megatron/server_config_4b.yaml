@@ -39,6 +39,7 @@ applications:
     import_path: model
     args:
       use_megatron: true
+      model_cls: Qwen3_5ForConditionalGeneration
       model_id: "ms://Qwen/Qwen3.5-4B" # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node

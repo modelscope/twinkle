@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import transformers
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -36,6 +37,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
+        if isinstance(model_cls, str):
+            model_cls = getattr(transformers, model_cls)
         self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)

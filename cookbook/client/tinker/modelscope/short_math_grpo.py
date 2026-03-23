@@ -38,7 +38,7 @@ from twinkle.template import Template
 logger = get_logger()
 
 # ========== Configuration ==========
-BASE_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+BASE_MODEL = 'Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 8
 MAX_NEW_TOKENS = 4096
 LEARNING_RATE = 1e-4
