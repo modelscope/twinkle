@@ -1,6 +1,6 @@
 import socket
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Mapping, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Union
 
 from .network import is_valid_ipv6_address
 
@@ -72,16 +72,6 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
     import torch
     import torch.nn.functional as F
 
-    try:
-        from megatron.core import parallel_state as mpu
-        if mpu.get_tensor_model_parallel_world_size() >= 1:
-            try:
-                return _vocab_parallel_selective_log_softmax(logits, index)
-            except Exception:  # noqa
-                import traceback
-                print(traceback.format_exc())
-    except Exception:  # noqa
-        pass
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption

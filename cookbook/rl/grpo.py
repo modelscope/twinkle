@@ -21,7 +21,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
-USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '0')))
+USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS',4))
@@ -31,15 +31,16 @@ NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 16)) # global prompt-level, global completion-level batch size = BATCH_SIZE * num_generations * dp_size
-MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 16)) # global completion-level mini-batch-size
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8)) # global prompt-level, global completion-level batch size = BATCH_SIZE * num_generations * dp_size
+MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8)) # global completion-level mini-batch-size
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2)) # per-device-micro-batch-size (completion-level), batch_size in forward_backward
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
+SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Template', model_id=MODEL_ID, max_length=400)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -68,13 +69,21 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
-    lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
-
+    # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
+    lora_config = LoraConfig(
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+        ],
+        r=32, lora_alpha=64, lora_dropout=0.05,
+    )
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
         model = MegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
     else:
-        model = TransformersModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model')
+        from transformers import Qwen3_5ForConditionalGeneration
+        model = TransformersModel(model_id=MODEL_ID, model_cls=Qwen3_5ForConditionalGeneration, device_mesh=model_mesh, remote_group='model')
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     if USE_MEGATRON:
@@ -91,8 +100,9 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.8,
-            'max_model_len': 4096,
+            'max_model_len': 4496,
             'max_lora_rank': 32, # save as lora_config
+            # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
@@ -113,7 +123,7 @@ def main():
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
 
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
 
     optim_step = 0
     logger.info(get_device_placement())
@@ -125,20 +135,20 @@ def main():
         global_prompts = batch if isinstance(batch, list) else [batch]
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
-        sample_response = sampler.sample(
+        sample_responses = sampler.sample(
             global_prompts*NUM_GENERATIONS,
             sampling_params,
-            num_samples=1,
         )
 
         all_input_data: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
         all_completion_lengths: List[int] = []
 
-        for sequence in sample_response.sequences:
-            all_input_data.append(sequence.new_input_feature)
-            all_old_logps.append(sequence.logprobs)
-            all_completion_lengths.append(len(sequence.tokens))
+        for sample_response in sample_responses:
+            for sequence in sample_response.sequences:
+                all_input_data.append(sequence.new_input_feature)
+                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                all_completion_lengths.append(len(sequence.tokens))
         total_rewards, format_rewards, accuracy_rewards = compute_rewards(
             all_input_data
         )
@@ -172,6 +182,8 @@ def main():
 
             if optim_step >= MAX_STEPS:
                 break
+            if optim_step % SAVE_STEPS == 0:
+                model.save(f'grpo-gsm8k-checkpoint-{optim_step}')
             log_dict = metrics.calculate()
             log_dict.update(model.calculate_metric(is_training=True))
             metrics.reset()

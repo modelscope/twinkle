@@ -15,7 +15,7 @@ class Sampler(ABC):
         adapter_name: str = '',
         *,
         num_samples: int = 1,
-    ) -> SampleResponse:
+    ) -> List[SampleResponse]:
         """对给定输入进行采样"""
         ...
 

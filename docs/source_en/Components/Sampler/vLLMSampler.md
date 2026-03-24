@@ -28,7 +28,7 @@ params = SamplingParams(
 )
 
 # Perform sampling
-response = sampler.sample(
+responses = sampler.sample(
     trajectories,
     sampling_params=params,
     adapter_name='my_lora',
@@ -66,7 +66,7 @@ sampler = vLLMSampler(
 )
 
 # sample method executes in remote worker
-response = sampler.sample(trajectories, sampling_params=params)
+responses = sampler.sample(trajectories, sampling_params=params)
 ```
 
 ## Environment Variables

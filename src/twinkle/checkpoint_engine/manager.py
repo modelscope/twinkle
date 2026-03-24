@@ -96,7 +96,6 @@ class CheckpointEngineManager:
         Returns:
             None
         """
-        start_time = time.time()
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))
         self.sampler.prepare_checkpoint_engine(False)
@@ -130,6 +129,3 @@ class CheckpointEngineManager:
         if not self.base_sync_done:
             self.base_sync_done = True
             logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
-
-        elapsed = time.time() - start_time
-        logger.info(f'Weight sync completed in {elapsed:.2f}s')

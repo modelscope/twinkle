@@ -7,7 +7,7 @@ Test EP+FSDP vs single-GPU precision:
 
 Requirements:
   - 4 CUDA GPUs
-  - Model weights accessible via QWEN3_MOE_MODEL_ID (default: Qwen/Qwen3-30B-A3B-Instruct-2507)
+  - Model weights accessible via QWEN3_MOE_MODEL_ID (default: Qwen/Qwen3.5-4B)
 
 Launch (requires 4 CUDA GPUs; skipped automatically if fewer GPUs are available):
 
@@ -456,7 +456,7 @@ class TestEPFSDPvsSingle(unittest.TestCase):
         if torch.cuda.device_count() < 4:
             self.skipTest('Need 4 GPUs')
 
-        model_id = os.environ.get('QWEN3_MOE_MODEL_ID', 'Qwen/Qwen3-30B-A3B-Instruct-2507')
+        model_id = os.environ.get('QWEN3_MOE_MODEL_ID', 'Qwen/Qwen3.5-4B')
         local_only = os.environ.get('QWEN3_MOE_LOCAL_ONLY', '1') != '0'
 
         try:
