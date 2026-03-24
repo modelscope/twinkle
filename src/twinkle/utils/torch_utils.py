@@ -72,6 +72,14 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
     import torch
     import torch.nn.functional as F
 
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            # clone to avoid modifying the original logits
+            return _vocab_parallel_selective_log_softmax(logits.clone(), index)
+    except Exception:
+        pass
+
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption

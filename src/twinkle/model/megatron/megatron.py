@@ -134,6 +134,12 @@ _BASE_LAYER_SUFFIXES = [
     '.mlp.gate.weight',
     '.mlp.gate.bias',
     '.mlp.gate.e_score_correction_bias',
+    '.in_proj_qkv.weight',
+    '.in_proj_z.weight',
+    '.in_proj_a.weight',
+    '.in_proj_b.weight',
+    '.out_proj.weight',
+    '.conv1d.weight',
 ]
 
 
