@@ -252,6 +252,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
+                memory_efficient=self._memory_efficient_init,
                 enable_ep=self._enable_expert_parallel,
                 ep_size=ep_size,
             )
@@ -309,20 +310,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
 
-            extra_kwargs = {}
-            if isinstance(self.strategy, NativeFSDPStrategy):
-                extra_kwargs['memory_efficient'] = getattr(self, '_memory_efficient_init', True)
-
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
                 assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer, **extra_kwargs)
+                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
                 optimizer_group.optimizer = optimizer
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                result = self.strategy.wrap_model(self.model, **extra_kwargs)
+                result = self.strategy.wrap_model(self.model)
                 if isinstance(result, tuple):
                     self.model = result[0]
                 else:

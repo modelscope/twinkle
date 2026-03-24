@@ -211,13 +211,13 @@ def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=True)
 
     model = TinyModel(dim=32).to(_DEVICE_TYPE)
     if rank == 0:
         model.load_state_dict(ref_sd)
 
-    model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=True)
+    model, _ = strategy.wrap_model(model, optimizer=None)
 
     # Verify: model should be on device, not meta
     for name, param in model.named_parameters():
@@ -269,12 +269,12 @@ def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=False)
 
     model = TinyModel(dim=32).to(_DEVICE_TYPE)
     model.load_state_dict(ref_sd)
 
-    model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=False)
+    model, _ = strategy.wrap_model(model, optimizer=None)
 
     for name, param in model.named_parameters():
         assert param.device.type == _DEVICE_TYPE, f"{name} still on {param.device}"
@@ -324,7 +324,7 @@ def _worker_wrap_model_per_layer(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no')
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=True)
 
     model = TinyTransformerModel(dim=32, num_layers=2).to(_DEVICE_TYPE)
     if rank == 0:
@@ -334,7 +334,7 @@ def _worker_wrap_model_per_layer(rank, world_size, port, ref_sd):
     assert _get_decoder_layers(model) is not None, \
         'TinyTransformerModel should have model.model.layers'
 
-    model, _ = strategy.wrap_model(model, optimizer=None, memory_efficient=True)
+    model, _ = strategy.wrap_model(model, optimizer=None)
 
     # Verify: all parameters on device, not meta
     for name, param in model.named_parameters():
@@ -456,6 +456,43 @@ class TestEnvVarRamEfficientLoading(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = val
+
+
+class TestNativeFSDPStrategyMemoryEfficientConfig(unittest.TestCase):
+
+    def test_transformers_model_passes_memory_efficient_to_native_fsdp_strategy(self):
+        from unittest.mock import MagicMock, patch
+
+        from twinkle.model.transformers.transformers import TransformersModel
+        from twinkle.utils import DeviceMesh as TwinkleMesh
+
+        fake_model = MagicMock()
+        fake_model.gradient_checkpointing_enable = MagicMock()
+        fake_model.named_parameters = MagicMock(return_value=iter([]))
+
+        mesh = TwinkleMesh(
+            mesh=np.arange(1),
+            mesh_dim_names=('fsdp', ),
+            device_type='cpu',
+        )
+
+        with patch('twinkle.model.transformers.transformers.HubOperation') as mock_hub, \
+             patch.object(TransformersModel, '_try_init_process_group'), \
+             patch.object(TransformersModel, '_construct_default_optimizer_group', return_value=MagicMock()), \
+             patch('twinkle.model.transformers.transformers.NativeFSDPStrategy') as mock_native_fsdp:
+            mock_hub.download_model.return_value = '/fake/path'
+            fake_model_cls = MagicMock()
+            fake_model_cls.from_pretrained.return_value = fake_model
+
+            TransformersModel(
+                model_cls=fake_model_cls,
+                model_id='/fake/model',
+                device_mesh=mesh,
+                strategy='native_fsdp',
+                memory_efficient_init=False,
+            )
+
+        assert mock_native_fsdp.call_args.kwargs['memory_efficient'] is False
 
     def test_env_vars_not_set_when_disabled(self):
         """Verify env vars are NOT set when memory_efficient_init=False."""

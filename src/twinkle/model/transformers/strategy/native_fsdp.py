@@ -18,11 +18,13 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
+                 memory_efficient: bool = True,
                  enable_ep: bool = True,
                  ep_size: Optional[int] = None):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
+        self.memory_efficient = memory_efficient
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
 
@@ -42,7 +44,7 @@ class NativeFSDPStrategy:
         )
         return ep_mesh.to_torch_device_mesh()
 
-    def wrap_model(self, model, optimizer=None, memory_efficient=True):
+    def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:
             return model, optimizer
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
@@ -50,7 +52,7 @@ class NativeFSDPStrategy:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
             # EP path requires experts on a real device, incompatible with meta-device flow.
-            use_meta = memory_efficient and not ep_enabled
+            use_meta = self.memory_efficient and not ep_enabled
 
             original_sd = None
             saved_buffers = None
@@ -448,6 +450,7 @@ def _broadcast_sharded_state_dict(
         device_mesh = sharded_param.device_mesh
         placements = sharded_param.placements
         sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+        del full_tensor
 
         sharded_sd[param_name] = sharded_tensor
 
