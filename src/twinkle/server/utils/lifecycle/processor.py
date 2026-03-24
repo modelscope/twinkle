@@ -92,7 +92,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
 
     async def _on_resource_expired(self, resource_id: str) -> None:
         """Internal hook called by base class. Delegates to _on_processor_expired."""
-        await self._on_processor_expired(resource_id)
+        self._on_processor_expired(resource_id)
 
     def _on_processor_expired(self, processor_id: str) -> None:
         """Hook called when a processor's session expires.

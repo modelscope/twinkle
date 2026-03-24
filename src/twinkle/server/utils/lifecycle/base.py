@@ -247,7 +247,7 @@ class SessionResourceMixin:
             try:
                 await asyncio.sleep(10)
 
-                expired_resources: list[tuple[str, str | None]] = []
+                expired_resources: list[tuple[str, str | None, str | None]] = []
                 # Create snapshot to avoid modification during iteration
                 resource_snapshot = list(self._resource_records.items())
                 for resource_id, info in resource_snapshot:
