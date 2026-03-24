@@ -133,20 +133,13 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
 
     # 3. Optionally pack multimodal tensors into loss_fn_inputs so that
     #    the server-side ``datum_to_input_feature`` can restore them.
-    if 'pixel_values' in input_feature and input_feature['pixel_values'] is not None:
-        pixel_values = input_feature['pixel_values']
-        if hasattr(pixel_values, 'detach'):
-            pixel_values = pixel_values.detach().cpu().numpy()
-        elif not isinstance(pixel_values, np.ndarray):
-            pixel_values = np.asarray(pixel_values)
-        loss_fn_inputs['pixel_values'] = types.TensorData.from_numpy(pixel_values)
-
-    if 'image_grid_thw' in input_feature and input_feature['image_grid_thw'] is not None:
-        image_grid_thw = input_feature['image_grid_thw']
-        if hasattr(image_grid_thw, 'detach'):
-            image_grid_thw = image_grid_thw.detach().cpu().numpy()
-        elif not isinstance(image_grid_thw, np.ndarray):
-            image_grid_thw = np.asarray(image_grid_thw)
-        loss_fn_inputs['image_grid_thw'] = types.TensorData.from_numpy(image_grid_thw)
+    for key in ('pixel_values', 'image_grid_thw'):
+        if key in input_feature and input_feature[key] is not None:
+            value = input_feature[key]
+            if hasattr(value, 'detach'):
+                value = value.detach().cpu().numpy()
+            elif not isinstance(value, np.ndarray):
+                value = np.asarray(value)
+            loss_fn_inputs[key] = types.TensorData.from_numpy(value)
 
     return types.Datum(loss_fn_inputs=loss_fn_inputs, model_input=model_input)
