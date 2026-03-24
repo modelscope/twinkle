@@ -5,7 +5,7 @@ import numpy as np
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle import DeviceGroup, DeviceMesh, get_logger,Platform
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -19,6 +19,7 @@ DATASETS = 'ms://swift/self-cognition'
 device_group = [DeviceGroup(
     name='default',
     ranks=[0, 1, 2, 3],
+    device_type=Platform.get_platform().device_prefix(),
 )]
 
 # FSDP + SP validation over 4 GPUs: dp=2, fsdp=2 (SP only affects input slicing)
@@ -69,6 +70,7 @@ def train():
         model_cls=TwinkleQwen3_5ForCausalLM,
         device_mesh=device_mesh,
         strategy='native_fsdp',
+        attn_implementation="flash_attention_2"
     )
 
     lora_config = LoraConfig(target_modules='all-linear', lora_dropout=0.0)
