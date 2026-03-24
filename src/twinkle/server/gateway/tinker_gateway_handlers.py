@@ -42,7 +42,9 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             request: Request,
             self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
-        return types.GetServerCapabilitiesResponse(supported_models=self.supported_models)
+        # Convert twinkle_client.types.SupportedModel to tinker.types.SupportedModel
+        tinker_supported_models = [types.SupportedModel(model_name=m.model_name) for m in self.supported_models]
+        return types.GetServerCapabilitiesResponse(supported_models=tinker_supported_models)
 
     @app.post('/telemetry')
     async def telemetry(request: Request, body: types.TelemetrySendRequest) -> types.TelemetryResponse:
@@ -54,7 +56,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             body: types.CreateSessionRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
-        session_id = self.state.create_session(body.model_dump())
+        session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post('/session_heartbeat')
@@ -70,7 +72,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     async def create_sampling_session(
         request: Request, body: types.CreateSamplingSessionRequest, self: GatewayServer = Depends(self_fn)
     ) -> types.CreateSamplingSessionResponse:  # noqa: E125
-        sampling_session_id = self.state.create_sampling_session(body.model_dump())
+        sampling_session_id = await self.state.create_sampling_session(body.model_dump())
         return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
     @app.post('/retrieve_future')
@@ -221,36 +223,36 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
     @app.post('/get_info')
     async def get_info(request: Request, body: types.GetInfoRequest, self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'get_info', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'get_info', await self._get_base_model(body.model_id))
 
     @app.post('/unload_model')
     async def unload_model(request: Request, body: types.UnloadModelRequest,
                            self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'unload_model', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'unload_model', await self._get_base_model(body.model_id))
 
     @app.post('/forward')
     async def forward(request: Request, body: types.ForwardRequest, self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'forward', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'forward', await self._get_base_model(body.model_id))
 
     @app.post('/forward_backward')
     async def forward_backward(request: Request,
                                body: types.ForwardBackwardRequest,
                                self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'forward_backward', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'forward_backward', await self._get_base_model(body.model_id))
 
     @app.post('/optim_step')
     async def optim_step(request: Request, body: types.OptimStepRequest, self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'optim_step', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'optim_step', await self._get_base_model(body.model_id))
 
     @app.post('/save_weights')
     async def save_weights(request: Request, body: types.SaveWeightsRequest,
                            self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'save_weights', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'save_weights', await self._get_base_model(body.model_id))
 
     @app.post('/load_weights')
     async def load_weights(request: Request, body: types.LoadWeightsRequest,
                            self: GatewayServer = Depends(self_fn)) -> Any:
-        return await self.proxy.proxy_to_model(request, 'load_weights', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'load_weights', await self._get_base_model(body.model_id))
 
     # --- Sampler Proxy Endpoints ---
 
@@ -258,7 +260,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     async def asample(request: Request, body: types.SampleRequest, self: GatewayServer = Depends(self_fn)) -> Any:
         base_model = body.base_model
         if not base_model and body.sampling_session_id:
-            session = self.state.get_sampling_session(body.sampling_session_id)
+            session = await self.state.get_sampling_session(body.sampling_session_id)
             if session:
                 base_model = session.get('base_model')
         return await self.proxy.proxy_to_sampler(request, 'asample', base_model)
@@ -269,4 +271,5 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             body: types.SaveWeightsForSamplerRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> Any:
-        return await self.proxy.proxy_to_model(request, 'save_weights_for_sampler', self._get_base_model(body.model_id))
+        return await self.proxy.proxy_to_model(request, 'save_weights_for_sampler', await
+                                               self._get_base_model(body.model_id))

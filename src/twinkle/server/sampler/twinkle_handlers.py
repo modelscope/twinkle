@@ -10,7 +10,7 @@ import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
 from typing import TYPE_CHECKING, Callable
 
-from twinkle.server.common.serialize import deserialize_object
+from twinkle_client.common.serialize import deserialize_object
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -154,13 +154,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """Add a LoRA adapter to the sampler."""
         assert body.adapter_name, 'You need to specify a valid `adapter_name`'
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name)
-        from twinkle.server.utils.validation import get_token_from_request
-        token = get_token_from_request(request)
 
         from peft import LoraConfig
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
-        self.register_adapter(full_adapter_name, token)
         self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)

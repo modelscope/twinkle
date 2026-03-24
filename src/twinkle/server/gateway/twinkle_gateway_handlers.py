@@ -28,13 +28,20 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
     async def healthz(request: Request) -> types.HealthResponse:
         return types.HealthResponse(status='ok')
 
+    @app.get('/twinkle/get_server_capabilities', response_model=types.GetServerCapabilitiesResponse)
+    async def get_server_capabilities(
+            request: Request,
+            self: GatewayServer = Depends(self_fn),
+    ) -> types.GetServerCapabilitiesResponse:
+        return types.GetServerCapabilitiesResponse(supported_models=self.supported_models)
+
     @app.post('/twinkle/create_session', response_model=types.CreateSessionResponse)
     async def create_session(
             request: Request,
             body: types.CreateSessionRequest,
             self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
-        session_id = self.state.create_session(body.model_dump())
+        session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
     @app.post('/twinkle/session_heartbeat', response_model=types.SessionHeartbeatResponse)

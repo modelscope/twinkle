@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.utils.adapter_manager import AdapterManagerMixin
+from twinkle.server.utils.lifecycle import AdapterManagerMixin
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
@@ -78,12 +78,18 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                 **kwargs)
 
         self.state: ServerStateProxy = get_server_state()
-        self.state.register_replica(self.replica_id, self.max_loras)
+        self._replica_registered = False
 
         # Initialize mixins
         self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
         self._init_adapter_manager(**adapter_config)
-        self.start_adapter_countdown()
+        # Note: countdown task is started lazily in _ensure_sticky()
+
+    async def _ensure_replica_registered(self):
+        """Lazily register replica on first async request."""
+        if not self._replica_registered:
+            await self.state.register_replica(self.replica_id, self.max_loras)
+            self._replica_registered = True
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -92,25 +98,35 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
     async def _ensure_sticky(self):
         sticky_key = serve.get_multiplexed_model_id()
         await self._sticky_entry(sticky_key)
+        # Lazy-start countdown task on first request (requires running event loop)
+        self._ensure_countdown_started()
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self._ensure_replica_registered()
         token = get_token_from_request(request)
         return token
 
     def __del__(self):
-        self.state.unregister_replica(self.replica_id)
+        try:
+            # Best-effort cleanup; event loop may already be closed
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.state.unregister_replica(self.replica_id))
+        except Exception:
+            pass
 
-    def _cleanup_adapter(self, adapter_name: str) -> None:
-        if self.get_adapter_info(adapter_name):
-            self.clear_adapter_state(adapter_name)
+    async def _cleanup_adapter(self, adapter_name: str) -> None:
+        if self.get_resource_info(adapter_name):
+            self.clear_resource_state(adapter_name)
             self.model.remove_adapter(adapter_name)
-            self.unregister_adapter(adapter_name)
-            self.state.unload_model(adapter_name)
+            self.unregister_resource(adapter_name)
+            await self.state.unload_model(adapter_name)
 
-    def _on_adapter_expired(self, adapter_name: str) -> None:
+    async def _on_adapter_expired(self, adapter_name: str) -> None:
         self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
-        self._cleanup_adapter(adapter_name)
+        await self._cleanup_adapter(adapter_name)
 
 
 def build_model_app(model_id: str,

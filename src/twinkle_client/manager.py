@@ -5,7 +5,7 @@ import atexit
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from twinkle import get_logger
-from twinkle_client.types.server import DeleteCheckpointResponse
+from twinkle_client.types.server import (DeleteCheckpointResponse, GetServerCapabilitiesResponse)
 from twinkle_client.types.session import (CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest,
                                            SessionHeartbeatResponse)
 from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
@@ -166,6 +166,21 @@ class TwinkleClient:
             return response.status_code == 200
         except Exception:
             return False
+
+    def get_server_capabilities(self) -> GetServerCapabilitiesResponse:
+        """
+        Get the server's supported models and capabilities.
+
+        Returns:
+            :class:`~twinkle_client.types.server.GetServerCapabilitiesResponse` with
+            ``supported_models`` field containing a list of supported model names.
+
+        Raises:
+            TwinkleClientError: If the request fails.
+        """
+        response = http_get(self._get_url('/get_server_capabilities'))
+        data = self._handle_response(response)
+        return GetServerCapabilitiesResponse(**data)
 
     # ------------------------------------------------------------------
     # Training Runs

@@ -6,35 +6,31 @@
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv
+import os
+from twinkle.data_format import Trajectory, Message
+from twinkle.preprocessor import Preprocessor
 
 dotenv.load_dotenv('.env')
-
-import os
+import numpy as np
+import torch
 from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
 from twinkle_client import init_twinkle_client
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import LazyDataset
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
 base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://localhost:8000'
-api_key = 'EMPTY_API_KEY'
-
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(base_url=base_url, api_key=api_key)
-
-# List available models of the server
-print('Available models:')
-for item in client.get_server_capabilities().supported_models:
-    print('- ' + item.model_name)
+client = init_twinkle_client(base_url=base_url, api_key=os.environ.get('MODELSCOPE_TOKEN'))
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.
@@ -52,17 +48,34 @@ for run in runs:
         # resume_path = checkpoint.twinkle_path
 
 
+class LatexOCRProcessor(Preprocessor):
+
+    def __call__(self, rows):
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def preprocess(self, row) -> Trajectory:
+        return Trajectory(
+            messages=[
+                Message(role='user', content='<image>Using LaTeX to perform OCR on the image.', images=[row['image']]),
+                Message(role='assistant', content=row['text']),
+            ]
+        )
+
+
 def train():
     # Step 4: Prepare the dataset
 
-    # Load the self-cognition dataset from ModelScope
-    dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
+    # Load the latex dataset from ModelScope
+    dataset = LazyDataset(dataset_meta=DatasetMeta('ms://AI-ModelScope/LaTeX_OCR', data_slice=range(500)))
 
     # Apply a chat template so the data matches the model's expected input format
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=512)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
-    dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
+    dataset.map(LatexOCRProcessor)
 
     # Tokenize and encode the dataset into model-ready input features
     dataset.encode(batched=True)
@@ -84,7 +97,7 @@ def train():
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
     # Set the same chat template used during data preprocessing
-    model.set_template('Template')
+    model.set_template('Qwen3_5Template')
 
     # Set the input processor (pads sequences on the right side)
     model.set_processor('InputProcessor', padding_side='right')
@@ -109,6 +122,12 @@ def train():
     for epoch in range(3):
         logger.info(f'Starting epoch {epoch}')
         for step, batch in enumerate(dataloader):
+            for sample in batch:
+                for key in sample:
+                    if isinstance(sample[key], np.ndarray):
+                        sample[key] = sample[key].tolist()
+                    elif isinstance(sample[key], torch.Tensor):
+                        sample[key] = sample[key].cpu().numpy().tolist()
             # Forward pass + backward pass (computes gradients)
             model.forward_backward(inputs=batch)
 
@@ -136,7 +155,7 @@ def train():
 
     # Step 9: Upload the checkpoint to ModelScope Hub
     # YOUR_USER_NAME = "your_username"
-    # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
+    # hub_model_id = f'{YOUR_USER_NAME}/twinkle-multi-modal'
     # model.upload_to_hub(
     #     checkpoint_dir=twinkle_path,
     #     hub_model_id=hub_model_id,

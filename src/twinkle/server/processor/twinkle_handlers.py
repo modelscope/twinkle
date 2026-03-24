@@ -18,9 +18,9 @@ if TYPE_CHECKING:
     from .app import ProcessorManagement
 
 import twinkle_client.types as types
-from twinkle.server.common.serialize import deserialize_object
 from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
+from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
 
@@ -53,7 +53,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         processor_id = str(uuid.uuid4().hex)
 
         # Register for lifecycle tracking (enforces per-user limit)
-        self.register_processor(processor_id, token, session_id)
+        self.register_resource(processor_id, token, session_id)
 
         _kwargs.pop('remote_group', None)
         _kwargs.pop('device_mesh', None)
@@ -91,7 +91,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         function_name = body.function
         _kwargs = body.model_extra or {}
         processor_id = processor_id[4:]
-        self.assert_processor_exists(processor_id=processor_id)
+        self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)
         function = getattr(processor, function_name, None)
 

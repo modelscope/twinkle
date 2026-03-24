@@ -35,7 +35,9 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         template = self.get_template(**kwargs)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, **kwargs)
-        logits = outputs['logits'].detach().cpu()
+        logits = outputs.get('logits')
+        if logits is not None:
+            logits = logits.detach().cpu()
         logps = outputs.get('logps', None)
         if logps is not None:
             logps = logps.detach().cpu()
@@ -58,7 +60,9 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         loss_kwargs.update(loss_values)
         loss = super().calculate_loss(adapter_name=adapter_name, **loss_kwargs)
         super().backward(adapter_name=adapter_name, **kwargs)
-        logits = outputs['logits'].detach()
+        logits = outputs.get('logits')
+        if logits is not None:
+            logits = logits.detach()
         logps = outputs.get('logps', None)
         if logps is not None:
             logps = logps.detach().cpu()

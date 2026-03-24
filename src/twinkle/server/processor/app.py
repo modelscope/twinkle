@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
-from twinkle.server.utils.processor_manager import ProcessorManagerMixin
+from twinkle.server.utils.lifecycle import ProcessorManagerMixin
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from .twinkle_handlers import _register_processor_routes
@@ -69,7 +69,7 @@ class ProcessorManagement(ProcessorManagerMixin):
             processor_timeout=float(_cfg.get('processor_timeout', 1800.0)),
             per_token_processor_limit=int(_cfg.get('per_token_processor_limit', _env_limit)),
         )
-        self.start_processor_countdown()
+        # Note: countdown task is started lazily in _ensure_sticky()
 
     @serve.multiplexed(max_num_models_per_replica=100)
     async def _sticky_entry(self, sticky_key: str):
@@ -78,11 +78,13 @@ class ProcessorManagement(ProcessorManagerMixin):
     async def _ensure_sticky(self):
         sticky_key = serve.get_multiplexed_model_id()
         await self._sticky_entry(sticky_key)
+        # Lazy-start countdown task on first request (requires running event loop)
+        self._ensure_countdown_started()
 
     def _on_processor_expired(self, processor_id: str) -> None:
         """Called by the countdown thread when a processor's session expires."""
         self.resource_dict.pop(processor_id, None)
-        self.unregister_processor(processor_id)
+        self.unregister_resource(processor_id)
 
 
 def build_processor_app(ncpu_proc_per_node: int,

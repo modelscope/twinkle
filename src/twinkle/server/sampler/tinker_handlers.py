@@ -51,7 +51,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 # Get model_path from body or sampling session
                 model_path = body.model_path
                 if not model_path and body.sampling_session_id:
-                    session = self.state.get_sampling_session(body.sampling_session_id)
+                    session = await self.state.get_sampling_session(body.sampling_session_id)
                     if session:
                         model_path = session.get('model_path')
 

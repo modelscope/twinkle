@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
 from twinkle import get_logger
+from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 
 logger = get_logger()
 
@@ -124,7 +125,10 @@ class ServerLauncher:
         namespace = self.ray_namespace or self.config.get('ray_namespace') or 'twinkle_cluster'
 
         if not ray.is_initialized():
-            ray.init(namespace=namespace)
+            # Use runtime_env to apply patches in worker processes
+            # This is required because Ray Serve's ProxyActor runs in separate processes
+            runtime_env = get_runtime_env_for_patches()
+            ray.init(namespace=namespace, runtime_env=runtime_env)
             logger.info(f'Ray initialized with namespace={namespace}')
 
         self._ray_initialized = True
@@ -189,6 +193,9 @@ class ServerLauncher:
 
     def launch(self) -> None:
         """Launch the server with all configured applications."""
+        # Apply Ray Serve patches before initializing Ray
+        apply_ray_serve_patches()
+
         self._init_ray()
         self._start_serve()
 

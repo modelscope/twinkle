@@ -67,8 +67,8 @@ class ServiceProxy:
         headers.pop('host', None)
         headers.pop('content-length', None)
         request_id = request_headers.get('X-Ray-Serve-Request-Id')
-        if request_id is not None and not request_headers.get('serve_multiplexed_model_id'):
-            headers['serve_multiplexed_model_id'] = request_id
+        if request_id is not None and not request_headers.get('Serve-Multiplexed-Model-Id'):
+            headers['Serve-Multiplexed-Model-Id'] = request_id
         return headers
 
     async def proxy_request(
@@ -99,7 +99,7 @@ class ServiceProxy:
                 service_type,
                 endpoint,
                 target_url,
-                headers.get('serve_multiplexed_model_id'),
+                headers.get('Serve-Multiplexed-Model-Id'),
             )
 
             response = await self.client.request(
