@@ -51,6 +51,10 @@ class NativeFSDPStrategy:
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
+            # Drop optimizer references to pre-shard params before fully_shard to reduce peak memory.
+            if optimizer is not None:
+                _unbind_optimizer_params(optimizer)
+
             # EP path requires experts on a real device, incompatible with meta-device flow.
             use_meta = self.memory_efficient and not ep_enabled
 
@@ -59,8 +63,6 @@ class NativeFSDPStrategy:
             if use_meta:
                 original_sd = model.state_dict()
                 saved_buffers = _get_non_persistent_buffers(model)
-                if optimizer is not None:
-                    _unbind_optimizer_params(optimizer)
                 model = model.to(torch.device('meta'))
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
@@ -469,10 +471,11 @@ def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
-    """Drop optimizer param refs so model.to('meta') can free memory."""
+    """Drop optimizer refs to pre-shard params before fully_shard to lower peak memory."""
     for group in optimizer.param_groups:
         for i in range(len(group['params'])):
-            group['params'][i] = torch.empty(1)
+            param = group['params'][i]
+            group['params'][i] = torch.empty(1, dtype=param.dtype, device=param.device)
 
 
 def _restore_non_persistent_buffers(
