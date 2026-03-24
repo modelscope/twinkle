@@ -44,12 +44,12 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if body.lora_config:
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
-                    self.register_adapter(adapter_name, token, session_id=body.session_id)
+                    self.register_resource(adapter_name, token, session_id=body.session_id)
                     self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
                     self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
                     self.model.set_processor('InputProcessor', adapter_name=adapter_name)
                     self.model.set_optimizer('Adam', adapter_name=adapter_name)
-                    self.set_adapter_state(adapter_name, 'grad_ready', False)
+                    self.set_resource_state(adapter_name, 'grad_ready', False)
                 training_run_manager = create_training_run_manager(token, client_type='tinker')
                 training_run_manager.save(_model_id, body)
                 return types.CreateModelResponse(model_id=_model_id)
@@ -108,7 +108,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _do_forward():
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
+                self.assert_resource_exists(adapter_name)
                 datum_list = body.forward_input.data
                 loss_fn_config = body.forward_input.loss_fn_config or {}
                 output = self.model.tinker_forward_only(inputs=datum_list, adapter_name=adapter_name)
@@ -149,7 +149,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _do_forward_backward():
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
+                self.assert_resource_exists(adapter_name)
                 datum_list = body.forward_backward_input.data
                 loss_fn = body.forward_backward_input.loss_fn
                 loss_fn_config = body.forward_backward_input.loss_fn_config or {}
@@ -157,7 +157,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                     inputs=datum_list, adapter_name=adapter_name, loss_fn=loss_fn, **loss_fn_config)
                 output_type = ('ImportanceSamplingLossReturn'
                                if loss_fn == 'importance_sampling' else 'CrossEntropyLossReturn')
-                self.set_adapter_state(adapter_name, 'grad_ready', True)
+                self.set_resource_state(adapter_name, 'grad_ready', True)
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type=output_type,
                     loss_fn_outputs=output,
@@ -194,12 +194,12 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _do_optim():
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
-                if not self.get_adapter_state(adapter_name, 'grad_ready', False):
+                self.assert_resource_exists(adapter_name)
+                if not self.get_resource_state(adapter_name, 'grad_ready', False):
                     raise RuntimeError(f'No accumulated gradients for adapter={adapter_name}; '
                                        'call forward_backward before optim_step')
                 self.model.tinker_step(adam_params=body.adam_params, adapter_name=adapter_name)
-                self.set_adapter_state(adapter_name, 'grad_ready', False)
+                self.set_resource_state(adapter_name, 'grad_ready', False)
                 metrics = self.model.tinker_calculate_metric(is_training=True, adapter_name=adapter_name)
                 return types.OptimStepResponse(metrics=metrics)
             except Exception:
@@ -222,7 +222,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _do_save():
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
+                self.assert_resource_exists(adapter_name)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
                 checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
                 save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=False)
@@ -250,7 +250,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _do_save_for_sampler():
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
+                self.assert_resource_exists(adapter_name)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
                 checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
                 save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=True)
@@ -287,10 +287,10 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             try:
                 assert self.model is not None, 'Model not loaded, please load model first'
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
-                self.assert_adapter_exists(adapter_name=adapter_name)
+                self.assert_resource_exists(adapter_name)
                 self.model.tinker_load(
                     checkpoint_dir=body.path, load_optimizer=body.optimizer, adapter_name=adapter_name, token=token)
-                self.set_adapter_state(adapter_name, 'grad_ready', False)
+                self.set_resource_state(adapter_name, 'grad_ready', False)
                 return types.LoadWeightsResponse(path=body.path, type='load_weights')
             except Exception:
                 logger.error(traceback.format_exc())

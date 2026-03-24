@@ -84,7 +84,7 @@ class ProcessorManagement(ProcessorManagerMixin):
     def _on_processor_expired(self, processor_id: str) -> None:
         """Called by the countdown thread when a processor's session expires."""
         self.resource_dict.pop(processor_id, None)
-        self.unregister_processor(processor_id)
+        self.unregister_resource(processor_id)
 
 
 def build_processor_app(ncpu_proc_per_node: int,

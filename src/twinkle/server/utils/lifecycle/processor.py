@@ -90,36 +90,6 @@ class ProcessorManagerMixin(SessionResourceMixin):
             'expiring': False,
         }
 
-    def register_processor(self, processor_id: str, token: str, session_id: str) -> None:
-        """Register a new processor for lifecycle tracking.
-
-        Args:
-            processor_id: Unique identifier of the processor.
-            token: User token that owns this processor.
-            session_id: Session ID to associate with this processor. Must be non-empty.
-
-        Raises:
-            ValueError: If session_id is None or empty.
-            RuntimeError: If the per-token processor limit has been reached.
-        """
-        self.register_resource(processor_id, token, session_id)
-
-    def unregister_processor(self, processor_id: str) -> bool:
-        """Unregister a processor from lifecycle tracking.
-
-        Returns:
-            True if found and removed, False otherwise.
-        """
-        return self.unregister_resource(processor_id)
-
-    def get_processor_info(self, processor_id: str) -> dict[str, Any] | None:
-        """Get tracking info for a registered processor, or None if not found."""
-        return self.get_resource_info(processor_id)
-
-    def assert_processor_exists(self, processor_id: str) -> None:
-        """Assert a processor exists and is not expiring."""
-        self.assert_resource_exists(processor_id)
-
     async def _on_resource_expired(self, resource_id: str) -> None:
         """Internal hook called by base class. Delegates to _on_processor_expired."""
         await self._on_processor_expired(resource_id)
@@ -133,10 +103,6 @@ class ProcessorManagerMixin(SessionResourceMixin):
             NotImplementedError: If not overridden.
         """
         raise NotImplementedError(f'_on_processor_expired must be implemented by {self.__class__.__name__}')
-
-    def _ensure_countdown_started(self) -> None:
-        """Ensure the countdown task is started. Call from async context."""
-        super()._ensure_countdown_started()
 
     def stop_processor_countdown(self) -> None:
         """Stop the background countdown task."""

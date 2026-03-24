@@ -11,7 +11,6 @@ to handle expired adapters without using callbacks or polling.
 """
 from __future__ import annotations
 
-from fastapi import HTTPException
 from typing import Any
 
 from twinkle.utils.logger import get_logger
@@ -73,64 +72,6 @@ class AdapterManagerMixin(SessionResourceMixin):
         """Adapter records for backward compatibility."""
         return self._resource_records
 
-    def register_adapter(self, adapter_name: str, token: str, session_id: str) -> None:
-        """Register a new adapter for lifecycle tracking.
-
-        The adapter will expire when its associated session expires.
-
-        Args:
-            adapter_name: Name of the adapter to register.
-            token: User token that owns this adapter.
-            session_id: Session ID to associate with this adapter. Must be a non-empty string.
-
-        Raises:
-            ValueError: If session_id is None or empty.
-        """
-        self.register_resource(adapter_name, token, session_id)
-
-    def unregister_adapter(self, adapter_name: str) -> bool:
-        """Unregister an adapter from lifecycle tracking.
-
-        Args:
-            adapter_name: Name of the adapter to unregister.
-
-        Returns:
-            True if adapter was found and removed, False otherwise.
-        """
-        return self.unregister_resource(adapter_name)
-
-    def set_adapter_state(self, adapter_name: str, key: str, value: Any) -> None:
-        """Set a per-adapter state value.
-
-        This is intentionally generic so higher-level services can store
-        adapter-scoped state (e.g., training readiness) without maintaining
-        separate side maps.
-        """
-        self.set_resource_state(adapter_name, key, value)
-
-    def get_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
-        """Get a per-adapter state value."""
-        return self.get_resource_state(adapter_name, key, default)
-
-    def pop_adapter_state(self, adapter_name: str, key: str, default: Any = None) -> Any:
-        """Pop a per-adapter state value."""
-        return self.pop_resource_state(adapter_name, key, default)
-
-    def clear_adapter_state(self, adapter_name: str) -> None:
-        """Clear all per-adapter state values."""
-        self.clear_resource_state(adapter_name)
-
-    def get_adapter_info(self, adapter_name: str) -> dict[str, Any] | None:
-        """Get information about a registered adapter.
-
-        Args:
-            adapter_name: Name of the adapter to query.
-
-        Returns:
-            Dict with adapter information or None if not found.
-        """
-        return self.get_resource_info(adapter_name)
-
     async def _on_resource_expired(self, resource_id: str) -> None:
         """Internal hook called by base class. Delegates to _on_adapter_expired."""
         await self._on_adapter_expired(resource_id)
@@ -162,23 +103,6 @@ class AdapterManagerMixin(SessionResourceMixin):
             The adapter name to use
         """
         return adapter_name
-
-    def assert_adapter_exists(self, adapter_name: str) -> None:
-        """Validate that an adapter exists and is not expiring.
-
-        Raises:
-            HTTPException: 400 if adapter not found or expiring, with clear error message.
-        """
-        info = self._resource_records.get(adapter_name)
-        if not adapter_name or info is None or info.get('expiring'):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Adapter '{adapter_name}' not found. "
-                f'Please call add_adapter_to_model() first to create an adapter.')
-
-    def _ensure_countdown_started(self) -> None:
-        """Ensure the countdown task is started. Call from async context."""
-        super()._ensure_countdown_started()
 
     def stop_adapter_countdown(self) -> None:
         """Stop the background countdown task."""

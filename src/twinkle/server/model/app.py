@@ -118,10 +118,10 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
             pass
 
     async def _cleanup_adapter(self, adapter_name: str) -> None:
-        if self.get_adapter_info(adapter_name):
-            self.clear_adapter_state(adapter_name)
+        if self.get_resource_info(adapter_name):
+            self.clear_resource_state(adapter_name)
             self.model.remove_adapter(adapter_name)
-            self.unregister_adapter(adapter_name)
+            self.unregister_resource(adapter_name)
             await self.state.unload_model(adapter_name)
 
     async def _on_adapter_expired(self, adapter_name: str) -> None:
