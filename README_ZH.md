@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">英文文档</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
+        <a href="https://twinkle-kit.readthedocs.io/en/latest/">英文文档</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle 站点</a> &nbsp
 </p>
 
 ## ✨ Twinkle 是什么？
@@ -91,6 +91,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 
 ## 更新日志
 
+🎉2026-03-24 Twinkle 站点上线，访问地址 https://modelscope.github.io/twinkle-web/
 🎉2026-03-19 支持GKD蒸馏能力，参考[cookbook](cookbook/rl/gkd_on_policy.py)。
 🎉2026-02-13 Twinkle✨ 初始版本发布，支持文本模型的SFT/PT/RL训练。我们还通过兼容Tinker的API，在魔搭社区上提供了无服务器训练功能。
 

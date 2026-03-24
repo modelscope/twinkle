@@ -19,7 +19,7 @@ by <a href="https://modelscope.cn/home">ModelScope</a>
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
+        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
 </p>
 
 ## ✨ What is Twinkle?
@@ -101,6 +101,7 @@ Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/enviro
 
 ## Changelog
 
+- 🎉2026-03-24 Twinkle Web site is now live at https://modelscope.github.io/twinkle-web/
 - 🎉2026-03-19 Support GKD training ，please refer to this [cookbook](cookbook/rl/gkd_on_policy.py).
 - 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models.
 
