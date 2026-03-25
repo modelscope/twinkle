@@ -211,7 +211,7 @@ def _worker_wrap_model_memory_efficient(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=True)
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient_init=True)
 
     model = TinyModel(dim=32).to(_DEVICE_TYPE)
     if rank == 0:
@@ -269,7 +269,7 @@ def _worker_wrap_model_legacy(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=False)
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient_init=False)
 
     model = TinyModel(dim=32).to(_DEVICE_TYPE)
     model.load_state_dict(ref_sd)
@@ -324,7 +324,7 @@ def _worker_wrap_model_per_layer(rank, world_size, port, ref_sd):
         mesh_dim_names=('fsdp', ),
         device_type=_DEVICE_TYPE,
     )
-    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient=True)
+    strategy = NativeFSDPStrategy(device_mesh=mesh, mixed_precision='no', memory_efficient_init=True)
 
     model = TinyTransformerModel(dim=32, num_layers=2).to(_DEVICE_TYPE)
     if rank == 0:

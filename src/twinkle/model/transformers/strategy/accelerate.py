@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 from typing import Any, Dict, Literal, Optional
 
 from twinkle import DeviceMesh
+from .load_context import fsdp_pretrained_load_context
 
 
 class AccelerateStrategy:
@@ -27,6 +27,7 @@ class AccelerateStrategy:
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
+        self._memory_efficient_init = memory_efficient_init
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
         fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
@@ -42,6 +43,9 @@ class AccelerateStrategy:
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
         )
+
+    def pretrained_load_context(self):
+        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
 
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):

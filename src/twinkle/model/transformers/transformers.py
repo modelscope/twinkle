@@ -212,22 +212,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         else:
             model_id = HubOperation.download_model(model_id)
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
-            use_efficient_loading = (memory_efficient_init and self.device_mesh is not None)
-            _saved_env = {}
-            if use_efficient_loading:
-                _saved_env['ACCELERATE_USE_FSDP'] = os.environ.get('ACCELERATE_USE_FSDP')
-                _saved_env['FSDP_CPU_RAM_EFFICIENT_LOADING'] = os.environ.get('FSDP_CPU_RAM_EFFICIENT_LOADING')
-                os.environ['ACCELERATE_USE_FSDP'] = 'true'
-                os.environ['FSDP_CPU_RAM_EFFICIENT_LOADING'] = 'true'
-            try:
+            with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
-            finally:
-                if use_efficient_loading:
-                    for key, old_val in _saved_env.items():
-                        if old_val is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = old_val
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False

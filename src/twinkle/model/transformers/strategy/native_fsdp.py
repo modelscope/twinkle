@@ -7,6 +7,7 @@ from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
+from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -27,6 +28,9 @@ class NativeFSDPStrategy:
         self._memory_efficient_init = memory_efficient_init
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
+
+    def pretrained_load_context(self):
+        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
