@@ -4,13 +4,8 @@ from typing import TYPE_CHECKING
 from twinkle.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .models import (
-        TwinkleQwen3_5DecoderLayer,
-        TwinkleQwen3_5ForCausalLM,
-        TwinkleQwen3_5GatedDeltaNet,
-        TwinkleQwen3_5PreTrainedModel,
-        TwinkleQwen3_5TextModel,
-    )
+    from .models import (TwinkleQwen3_5DecoderLayer, TwinkleQwen3_5ForCausalLM, TwinkleQwen3_5GatedDeltaNet,
+                         TwinkleQwen3_5PreTrainedModel, TwinkleQwen3_5TextModel)
     from .multi_lora_transformers import MultiLoraTransformersModel
     from .transformers import TransformersModel
 else:

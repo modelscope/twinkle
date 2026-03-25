@@ -70,7 +70,7 @@ def train():
         model_cls=TwinkleQwen3_5ForCausalLM,
         device_mesh=device_mesh,
         strategy='native_fsdp',
-        attn_implementation="flash_attention_2"
+        attn_implementation='flash_attention_2'
     )
 
     lora_config = LoraConfig(target_modules='all-linear', lora_dropout=0.0)

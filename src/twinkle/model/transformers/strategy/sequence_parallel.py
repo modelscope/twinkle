@@ -37,7 +37,8 @@ def get_flattened_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
         row[row < 0] = 0
         seq_start_indices = torch.where(row == 0)[0]
         if seq_start_indices.numel() == 0 or seq_start_indices[0].item() != 0:
-            seq_start_indices = torch.cat([torch.tensor([0], device=device, dtype=seq_start_indices.dtype), seq_start_indices])
+            seq_start_indices = torch.cat(
+                [torch.tensor([0], device=device, dtype=seq_start_indices.dtype), seq_start_indices])
         seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(row)], device=device)])
         seq_lengths = (seq_end_indices - seq_start_indices).tolist()
         for seq_length in seq_lengths:
@@ -687,8 +688,7 @@ class SequenceParallel:
                 self.causal_mask_func = llm_model._update_causal_mask
         self.attn_implementation = (
             get_config_attr(model.config, '_attn_implementation')
-            or get_config_attr(model.config, '_attn_implementation_internal')
-        )
+            or get_config_attr(model.config, '_attn_implementation_internal'))
 
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
@@ -832,8 +832,8 @@ class SequenceParallel:
                     cache_position = torch.arange(0, attn_shape, device=inputs.device)
                     # SDPA/eager-style paths still expect a fully materialized causal mask here.
                     if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
-                        attention_mask = self.causal_mask_func(
-                            attention_mask, inputs.to(self.model_dtype), cache_position, None, None)
+                        attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype),
+                                                               cache_position, None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
                 extra_values.append(

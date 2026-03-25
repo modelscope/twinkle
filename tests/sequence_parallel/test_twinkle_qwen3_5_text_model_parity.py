@@ -3,16 +3,15 @@ import copy
 import os
 import socket
 import tempfile
-import traceback
-import unittest
-from datetime import timedelta
-from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import traceback
+import unittest
+from datetime import timedelta
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.utils.import_utils import is_flash_attn_2_available
+from types import SimpleNamespace
 
 from twinkle.model.transformers.models.qwen3_5 import modeling_qwen3_5 as tw_qwen35
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, SequenceParallelContext
@@ -81,13 +80,9 @@ def _build_mixed_parity_config() -> Qwen3_5TextConfig:
 
 
 def _linear_attention_runtime_available() -> bool:
-    return bool(
-        torch.cuda.is_available()
-        and tw_qwen35._FLA_CAUSAL_CONV1D_FN is not None
-        and tw_qwen35._FLA_CHUNK_GATED_DELTA_RULE is not None
-        and tw_qwen35._FLA_FUSED_RECURRENT_GATED_DELTA_RULE is not None
-        and tw_qwen35._HAS_CAUSAL_CONV1D
-    )
+    return bool(torch.cuda.is_available() and tw_qwen35._FLA_CAUSAL_CONV1D_FN is not None
+                and tw_qwen35._FLA_CHUNK_GATED_DELTA_RULE is not None
+                and tw_qwen35._FLA_FUSED_RECURRENT_GATED_DELTA_RULE is not None and tw_qwen35._HAS_CAUSAL_CONV1D)
 
 
 def _find_free_port() -> int:
@@ -154,7 +149,9 @@ def _run_linear_attention_parity_worker(rank: int, world_size: int, port: int, e
 
         _seed_everything(seed)
         config = _build_linear_parity_config()
-        baseline_module = tw_qwen35.TwinkleQwen3_5GatedDeltaNet(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+        baseline_module = tw_qwen35.TwinkleQwen3_5GatedDeltaNet(
+            config, layer_idx=0).to(
+                device=device, dtype=dtype).eval()
         sp_module = copy.deepcopy(baseline_module).to(device=device, dtype=dtype).eval()
 
         full_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=dtype)
@@ -174,8 +171,7 @@ def _run_linear_attention_parity_worker(rank: int, world_size: int, port: int, e
         baseline_input_grad = baseline_hidden_states.grad.detach()
         baseline_param_grads = {
             name: param.grad.detach().clone()
-            for name, param in baseline_module.named_parameters()
-            if param.grad is not None
+            for name, param in baseline_module.named_parameters() if param.grad is not None
         }
 
         sp_hidden_states = full_hidden_states[:, start:end].detach().clone().requires_grad_(True)
@@ -208,9 +204,9 @@ def _run_linear_attention_parity_worker(rank: int, world_size: int, port: int, e
         _assert_relative_error(sp_input_grad_full, baseline_input_grad, 1e-2, 'linear_attention.input_grad')
 
         for name in (
-            'in_proj_qkv.weight',
-            'in_proj_z.weight',
-            'out_proj.weight',
+                'in_proj_qkv.weight',
+                'in_proj_z.weight',
+                'out_proj.weight',
         ):
             _assert_relative_error(
                 sp_module.get_parameter(name).grad,
@@ -270,8 +266,7 @@ def _run_mixed_text_model_parity_worker(rank: int, world_size: int, port: int, e
         baseline_input_grad = baseline_inputs_embeds.grad.detach()
         baseline_param_grads = {
             name: param.grad.detach().clone()
-            for name, param in baseline_model.named_parameters()
-            if param.grad is not None
+            for name, param in baseline_model.named_parameters() if param.grad is not None
         }
 
         device_mesh = DeviceMesh.from_sizes(
@@ -306,9 +301,9 @@ def _run_mixed_text_model_parity_worker(rank: int, world_size: int, port: int, e
         _assert_relative_error(sp_inputs_embeds.grad, baseline_input_grad, 1e-2, 'mixed_text_model.input_grad')
 
         for name in (
-            'layers.0.self_attn.q_proj.weight',
-            'layers.1.linear_attn.in_proj_qkv.weight',
-            'layers.1.mlp.gate_proj.weight',
+                'layers.0.self_attn.q_proj.weight',
+                'layers.1.linear_attn.in_proj_qkv.weight',
+                'layers.1.mlp.gate_proj.weight',
         ):
             _assert_relative_error(
                 sp_model.get_parameter(name).grad,
@@ -344,7 +339,7 @@ class TestTwinkleQwen35TextModelParity(unittest.TestCase):
                 for rank in range(self.WORLD_SIZE):
                     error_path = f'{error_prefix}.rank{rank}.err'
                     if os.path.exists(error_path):
-                        with open(error_path, 'r', encoding='utf-8') as f:
+                        with open(error_path, encoding='utf-8') as f:
                             error_logs.append(f'Rank {rank}:\n{f.read()}')
                 if error_logs:
                     self.fail('\n\n'.join(error_logs))

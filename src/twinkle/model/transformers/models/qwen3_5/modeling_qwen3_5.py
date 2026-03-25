@@ -2,21 +2,19 @@
 from __future__ import annotations
 
 import importlib.util
-from typing import Any, Callable, Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5 import modeling_qwen3_5 as hf_qwen35
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-
+from typing import Any, Callable, Optional
 
 try:
     from fla.modules import FusedRMSNormGated as _FLA_FUSED_RMS_NORM_GATED
@@ -37,10 +35,8 @@ _HAS_CAUSAL_CONV1D = importlib.util.find_spec('causal_conv1d') is not None
 def _ensure_text_config(config: Qwen3_5TextConfig) -> Qwen3_5TextConfig:
     if isinstance(config, Qwen3_5TextConfig):
         return config
-    raise TypeError(
-        'TwinkleQwen3_5 text-only models require transformers.models.qwen3_5.Qwen3_5TextConfig. '
-        f'Got {type(config).__name__}.'
-    )
+    raise TypeError('TwinkleQwen3_5 text-only models require transformers.models.qwen3_5.Qwen3_5TextConfig. '
+                    f'Got {type(config).__name__}.')
 
 
 def _ensure_linear_attention_fast_path() -> None:
@@ -52,10 +48,8 @@ def _ensure_linear_attention_fast_path() -> None:
     if not _HAS_CAUSAL_CONV1D:
         missing.append('causal-conv1d')
     if missing:
-        raise ImportError(
-            'TwinkleQwen3_5 linear attention requires flash-linear-attention and causal-conv1d. '
-            f'Missing: {", ".join(missing)}'
-        )
+        raise ImportError('TwinkleQwen3_5 linear attention requires flash-linear-attention and causal-conv1d. '
+                          f'Missing: {", ".join(missing)}')
 
 
 def _maybe_slice_tensor_output(output: Any) -> torch.Tensor:
@@ -66,10 +60,8 @@ def _maybe_slice_tensor_output(output: Any) -> torch.Tensor:
 
 def _sp_is_enabled(sequence_parallel_context: Any | None) -> bool:
     return bool(
-        sequence_parallel_context is not None
-        and getattr(sequence_parallel_context, 'sp_world_size', 1) > 1
-        and getattr(sequence_parallel_context, 'sp_group', None) is not None
-    )
+        sequence_parallel_context is not None and getattr(sequence_parallel_context, 'sp_world_size', 1) > 1
+        and getattr(sequence_parallel_context, 'sp_group', None) is not None)
 
 
 def _get_sp_rank(sequence_parallel_context: Any | None) -> int:
@@ -239,8 +231,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
     ) -> torch.Tensor:
         if self.causal_conv1d_fn is None:
             raise ImportError(
-                'TwinkleQwen3_5 linear attention requires fla.modules.convolution.causal_conv1d for prefill/train.'
-            )
+                'TwinkleQwen3_5 linear attention requires fla.modules.convolution.causal_conv1d for prefill/train.')
         output = self.causal_conv1d_fn(
             x=mixed_qkv,
             weight=conv_weight,
@@ -261,8 +252,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
         if self.causal_conv1d_update is None:
             raise ImportError(
                 'TwinkleQwen3_5 decode requires a causal_conv1d_update implementation from flash-linear-attention '
-                'or causal-conv1d.'
-            )
+                'or causal-conv1d.')
         mixed_qkv_t = mixed_qkv.transpose(1, 2).contiguous()
         output = self.causal_conv1d_update(
             mixed_qkv_t,
@@ -291,11 +281,8 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
         hidden_states = hf_qwen35.apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (
-            cache_params is not None
-            and cache_params.has_previous_state
-            and seq_len == 1
-            and cache_position is not None
-        )
+            cache_params is not None and cache_params.has_previous_state and seq_len == 1
+            and cache_position is not None)
 
         if cache_params is not None:
             conv_state = cache_params.conv_states[self.layer_idx]
@@ -316,8 +303,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             if self.num_k_heads % sp_world_size != 0 or self.num_v_heads % sp_world_size != 0:
                 raise RuntimeError(
                     'TwinkleQwen3_5 linear attention requires sp_world_size to divide both '
-                    f'linear_num_key_heads ({self.num_k_heads}) and linear_num_value_heads ({self.num_v_heads}).'
-                )
+                    f'linear_num_key_heads ({self.num_k_heads}) and linear_num_value_heads ({self.num_v_heads}).')
             local_num_k_heads = self.num_k_heads // sp_world_size
             local_num_v_heads = self.num_v_heads // sp_world_size
             local_key_dim = local_num_k_heads * self.head_k_dim
@@ -341,7 +327,8 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
                 ),
                 dim=-1,
             )
-            conv_weight = self._get_local_conv1d_weight(_get_sp_rank(sequence_parallel_context), local_key_dim, local_value_dim)
+            conv_weight = self._get_local_conv1d_weight(
+                _get_sp_rank(sequence_parallel_context), local_key_dim, local_value_dim)
         else:
             local_num_k_heads = self.num_k_heads
             local_num_v_heads = self.num_v_heads
@@ -506,8 +493,7 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
-            [TwinkleQwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+            [TwinkleQwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = hf_qwen35.Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = hf_qwen35.Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -569,8 +555,7 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
 
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)

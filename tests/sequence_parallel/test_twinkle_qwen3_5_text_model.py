@@ -1,13 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import tempfile
+import torch
 import unittest
 from contextlib import ExitStack
-from types import SimpleNamespace
-from unittest.mock import patch
-
-import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from twinkle.model.transformers.models.qwen3_5 import modeling_qwen3_5 as tw_qwen35
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, SequenceParallelContext
@@ -40,13 +39,9 @@ def _build_text_config(layer_types=None) -> Qwen3_5TextConfig:
 
 
 def _linear_attention_runtime_available() -> bool:
-    return bool(
-        torch.cuda.is_available()
-        and tw_qwen35._FLA_CAUSAL_CONV1D_FN is not None
-        and tw_qwen35._FLA_CHUNK_GATED_DELTA_RULE is not None
-        and tw_qwen35._FLA_FUSED_RECURRENT_GATED_DELTA_RULE is not None
-        and tw_qwen35._HAS_CAUSAL_CONV1D
-    )
+    return bool(torch.cuda.is_available() and tw_qwen35._FLA_CAUSAL_CONV1D_FN is not None
+                and tw_qwen35._FLA_CHUNK_GATED_DELTA_RULE is not None
+                and tw_qwen35._FLA_FUSED_RECURRENT_GATED_DELTA_RULE is not None and tw_qwen35._HAS_CAUSAL_CONV1D)
 
 
 class _ContextReceiver:
@@ -233,13 +228,26 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
             return x
 
-        def fake_chunk_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
-                            use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+        def fake_chunk_rule(query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            initial_state=None,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=False,
+                            cu_seqlens=None):
             del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
             return value, None
 
-        def fake_recurrent_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+        def fake_recurrent_rule(query,
+                                key,
+                                value,
+                                g,
+                                beta,
+                                initial_state=None,
+                                output_final_state=False,
                                 use_qk_l2norm_in_kernel=False):
             del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             return value, None
@@ -321,14 +329,27 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
             return x
 
-        def fake_chunk_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
-                            use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+        def fake_chunk_rule(query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            initial_state=None,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=False,
+                            cu_seqlens=None):
             del key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             captured['query_shape'] = tuple(query.shape)
             captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
             return query.new_zeros(query.shape[0], query.shape[1], 4, 4), None
 
-        def fake_recurrent_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+        def fake_recurrent_rule(query,
+                                key,
+                                value,
+                                g,
+                                beta,
+                                initial_state=None,
+                                output_final_state=False,
                                 use_qk_l2norm_in_kernel=False):
             del query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             raise AssertionError('recurrent path should not be used')
@@ -368,12 +389,25 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             del weight, bias, activation, seq_idx, backend, cu_seqlens
             return x
 
-        def fake_chunk_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
-                            use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+        def fake_chunk_rule(query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            initial_state=None,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=False,
+                            cu_seqlens=None):
             del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens
             return value, None
 
-        def fake_recurrent_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+        def fake_recurrent_rule(query,
+                                key,
+                                value,
+                                g,
+                                beta,
+                                initial_state=None,
+                                output_final_state=False,
                                 use_qk_l2norm_in_kernel=False):
             del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             return value, None
@@ -395,8 +429,12 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
                     is_packed=False,
                 ))
 
-            def fake_linear_forward(hidden_states, cache_params=None, cache_position=None, attention_mask=None,
-                                    cu_seq_lens_q=None, sequence_parallel_context=None):
+            def fake_linear_forward(hidden_states,
+                                    cache_params=None,
+                                    cache_position=None,
+                                    attention_mask=None,
+                                    cu_seq_lens_q=None,
+                                    sequence_parallel_context=None):
                 del hidden_states, cache_params, cache_position, cu_seq_lens_q, sequence_parallel_context
                 captured['mask'] = attention_mask.clone() if attention_mask is not None else None
                 return torch.zeros(1, 2, config.hidden_size)
@@ -421,8 +459,7 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         sp.tokenizer = SimpleNamespace(pad_token_id=0)
         sp.model_dtype = torch.bfloat16
         sp.attn_implementation = 'flash_attention_2'
-        sp.causal_mask_func = lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError('should not build 4d mask'))
+        sp.causal_mask_func = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not build 4d mask'))
 
         input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
         position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long)
