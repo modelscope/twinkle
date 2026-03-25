@@ -189,6 +189,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
+            memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -201,6 +202,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
+        self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         if isinstance(model_cls, str):
@@ -209,8 +211,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.model = model_cls.from_config(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
-            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
-        # Construct sequence-parallel strategy lazily during wrapping to reduce init-time side effects.
+            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
+            with self.strategy.pretrained_load_context():
+                self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -235,6 +238,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
+                memory_efficient_init=self._memory_efficient_init,
                 enable_ep=self._enable_expert_parallel,
                 ep_size=ep_size,
             )
@@ -243,7 +247,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 ddp_config=self._ddp_config,
                 fsdp_config=self._fsdp_config,
-                device_mesh=self.device_mesh)
+                device_mesh=self.device_mesh,
+                memory_efficient_init=self._memory_efficient_init)
 
         # Sequence parallel ("ulysses") is derived from dp/fsdp ranks; it does not change world size.
         # We construct `sp_strategy` after the underlying HF model is initialized (see __init__).
@@ -290,6 +295,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
+
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
@@ -299,7 +305,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                self.model = self.strategy.wrap_model(self.model)
+                result = self.strategy.wrap_model(self.model)
+                if isinstance(result, tuple):
+                    self.model = result[0]
+                else:
+                    self.model = result
             self._model_wrapped = True
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):

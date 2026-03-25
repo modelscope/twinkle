@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 from typing import Any, Dict, Literal, Optional
 
 from twinkle import DeviceMesh
+from .load_context import fsdp_pretrained_load_context
 
 
 class AccelerateStrategy:
@@ -21,13 +21,15 @@ class AccelerateStrategy:
         mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
         ddp_config: Dict[str, Any] = None,
         fsdp_config: Dict[str, Any] = None,
+        memory_efficient_init: bool = False,
     ):
         from accelerate import Accelerator
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
+        self._memory_efficient_init = memory_efficient_init
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
-        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config)
+        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
         kwargs_handlers = []
         if ddp_config is not None:
@@ -41,6 +43,9 @@ class AccelerateStrategy:
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
         )
+
+    def pretrained_load_context(self):
+        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
 
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):
@@ -69,7 +74,8 @@ class AccelerateStrategy:
 
         return parallelism_config
 
-    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any]):
+    def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any],
+                                      memory_efficient: bool):
         from accelerate import FullyShardedDataParallelPlugin
         from torch.distributed.fsdp import BackwardPrefetch
         from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
@@ -107,11 +113,9 @@ class AccelerateStrategy:
             activation_checkpointing=fsdp_config.pop('activation_checkpointing', False),
             auto_wrap_policy=fsdp_config.pop('auto_wrap_policy', 'transformer_based_wrap'),  # noqa
             reshard_after_forward=fsdp_config.pop('reshard_after_forward', True),
+            cpu_ram_efficient_loading=fsdp_config.pop('cpu_ram_efficient_loading', memory_efficient),
             **fsdp_config,
         )
-        # Enable memory efficient model loading in transformers(see `is_fsdp_enabled` in transformers)
-        # os.environ['ACCELERATE_USE_FSDP'] = '1'
-        # os.environ['FSDP_CPU_RAM_EFFICIENT_LOADING'] = '1'
         return fsdp_plugin
 
     def wrap_model(self, model, *args):
