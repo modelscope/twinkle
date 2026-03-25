@@ -21,7 +21,7 @@ class AccelerateStrategy:
         mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
         ddp_config: Dict[str, Any] = None,
         fsdp_config: Dict[str, Any] = None,
-        memory_efficient_init: bool = True,
+        memory_efficient_init: bool = False,
     ):
         from accelerate import Accelerator
 

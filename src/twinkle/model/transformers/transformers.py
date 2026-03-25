@@ -189,7 +189,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
-            memory_efficient_init: bool = True,
+            memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()

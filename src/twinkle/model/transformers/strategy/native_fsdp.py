@@ -19,7 +19,7 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
-                 memory_efficient_init: bool = True,
+                 memory_efficient_init: bool = False,
                  enable_ep: bool = True,
                  ep_size: Optional[int] = None):
         self.device_mesh = device_mesh
