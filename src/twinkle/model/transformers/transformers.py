@@ -252,7 +252,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
-                memory_efficient=self._memory_efficient_init,
+                memory_efficient_init=self._memory_efficient_init,
                 enable_ep=self._enable_expert_parallel,
                 ep_size=ep_size,
             )
@@ -262,7 +262,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 ddp_config=self._ddp_config,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
-                memory_efficient=self._memory_efficient_init)
+                memory_efficient_init=self._memory_efficient_init)
 
         # Sequence parallel ("ulysses") is derived from dp/fsdp ranks; it does not change world size.
         # We construct `sp_strategy` after the underlying HF model is initialized (see __init__).

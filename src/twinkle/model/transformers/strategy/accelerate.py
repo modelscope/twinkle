@@ -21,14 +21,14 @@ class AccelerateStrategy:
         mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
         ddp_config: Dict[str, Any] = None,
         fsdp_config: Dict[str, Any] = None,
-        memory_efficient: bool = True,
+        memory_efficient_init: bool = True,
     ):
         from accelerate import Accelerator
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         parallelism_config = self._parallelism_config_from_device_mesh(device_mesh)
-        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient)
+        fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
         kwargs_handlers = []
         if ddp_config is not None:

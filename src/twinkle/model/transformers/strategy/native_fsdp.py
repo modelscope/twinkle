@@ -18,13 +18,13 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
-                 memory_efficient: bool = True,
+                 memory_efficient_init: bool = True,
                  enable_ep: bool = True,
                  ep_size: Optional[int] = None):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
-        self.memory_efficient = memory_efficient
+        self._memory_efficient_init = memory_efficient_init
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
 
@@ -56,7 +56,7 @@ class NativeFSDPStrategy:
                 _unbind_optimizer_params(optimizer)
 
             # EP path requires experts on a real device, incompatible with meta-device flow.
-            use_meta = self.memory_efficient and not ep_enabled
+            use_meta = self._memory_efficient_init and not ep_enabled
 
             original_sd = None
             saved_buffers = None
