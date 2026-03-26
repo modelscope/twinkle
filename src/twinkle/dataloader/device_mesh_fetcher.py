@@ -61,6 +61,8 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                         except StopIteration as e:
                             raise e
                         except Exception:  # noqa
+                            import traceback
+                            traceback.print_exc()
                             continue
                         else:
                             break

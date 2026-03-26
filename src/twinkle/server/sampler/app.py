@@ -13,7 +13,6 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.utils.adapter_manager import AdapterManagerMixin
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
@@ -25,14 +24,13 @@ from .twinkle_handlers import _register_twinkle_sampler_routes
 logger = get_logger()
 
 
-class SamplerManagement(TaskQueueMixin, AdapterManagerMixin):
+class SamplerManagement(TaskQueueMixin):
     """Unified sampler management service.
 
     Manages:
     - vLLM or Torch sampler initialization and lifecycle
     - Tinker inference requests (/tinker/asample) with rate limiting via TaskQueueMixin
     - Twinkle inference requests (/twinkle/*) calling sampler directly
-    - Adapter lifecycle via AdapterManagerMixin
     - Template configuration for trajectory encoding
     """
 
@@ -43,7 +41,6 @@ class SamplerManagement(TaskQueueMixin, AdapterManagerMixin):
                  device_mesh: dict[str, Any],
                  sampler_type: str = 'vllm',
                  engine_args: dict[str, Any] | None = None,
-                 adapter_config: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
                  **kwargs):
         self.device_group = DeviceGroup(**device_group)
@@ -82,11 +79,8 @@ class SamplerManagement(TaskQueueMixin, AdapterManagerMixin):
         self.sampler.set_template('Template', model_id=model_id)
         self.state: ServerStateProxy = get_server_state()
 
-        # Initialize both mixins
+        # Initialize task queue mixin
         self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
-        _adapter_config = adapter_config or {}
-        self._init_adapter_manager(**_adapter_config)
-        self.start_adapter_countdown()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -101,14 +95,6 @@ class SamplerManagement(TaskQueueMixin, AdapterManagerMixin):
         token = get_token_from_request(request)
         return token
 
-    def _on_adapter_expired(self, adapter_name: str, token: str = None) -> None:
-        """Handle expired adapters by removing them from the sampler."""
-        try:
-            self.sampler.remove_adapter(adapter_name)
-            logger.info(f'Removed expired adapter {adapter_name}')
-        except Exception as e:
-            logger.warning(f'Failed to remove expired adapter {adapter_name}: {e}')
-
 
 def build_sampler_app(model_id: str,
                       nproc_per_node: int,
@@ -117,7 +103,6 @@ def build_sampler_app(model_id: str,
                       deploy_options: dict[str, Any],
                       sampler_type: str = 'vllm',
                       engine_args: dict[str, Any] | None = None,
-                      adapter_config: dict[str, Any] | None = None,
                       queue_config: dict[str, Any] | None = None,
                       **kwargs):
     """Build a unified sampler application for text generation inference.
@@ -133,7 +118,6 @@ def build_sampler_app(model_id: str,
         deploy_options: Ray Serve deployment options
         sampler_type: Type of sampler to use ('vllm' or 'torch')
         engine_args: Additional engine arguments for the sampler
-        adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration dict (rps_limit, tps_limit, etc.)
         **kwargs: Additional arguments passed to the sampler
 
@@ -161,8 +145,7 @@ def build_sampler_app(model_id: str,
     SamplerManagementWithIngress = serve.ingress(app)(SamplerManagement)
     DeploymentClass = serve.deployment(name='SamplerManagement')(SamplerManagementWithIngress)
     return DeploymentClass.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh,
-                                                          sampler_type, engine_args, adapter_config, queue_config,
-                                                          **kwargs)
+                                                          sampler_type, engine_args, queue_config, **kwargs)
 
 
 build_sampler_app = wrap_builder_with_device_group_env(build_sampler_app)

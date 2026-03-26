@@ -121,7 +121,7 @@ def test_llm_torch_sampler():
     trajectory = Trajectory(messages=LLM_MESSAGES)
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
     resp = sampler.sample([trajectory], sampling_params=sampling_params)
-    tokens = resp.sequences[0].tokens
+    tokens = resp[0].sequences[0].tokens
     twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
     del sampler
     clean_cache()
@@ -157,7 +157,7 @@ def test_llm_vllm_sampler():
     resp = sampler.sample([trajectory] * 16, sampling_params=sampling_params)
     end_time = time.time()
     print(f'Twinkle inference time: {end_time - st_time} seconds')
-    tokens = resp.sequences[0].tokens
+    tokens = resp[0].sequences[0].tokens
     twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
     del sampler
     clean_cache()
@@ -271,7 +271,7 @@ def test_mllm_torch_sampler():
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
     resp = sampler.sample([trajectory], sampling_params=sampling_params)
-    tokens = resp.sequences[0].tokens
+    tokens = resp[0].sequences[0].tokens
     twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
     del sampler
     clean_cache()
@@ -299,7 +299,7 @@ def test_mllm_vllm_sampler():
     trajectory = Trajectory(messages=MLLM_MESSAGES, images=MLLM_IMAGES)
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
     resp = sampler.sample([trajectory], sampling_params=sampling_params)
-    tokens = resp.sequences[0].tokens
+    tokens = resp[0].sequences[0].tokens
     twinkle_response = sampler.template.decode(tokens, skip_special_tokens=True)
     del sampler
     clean_cache()

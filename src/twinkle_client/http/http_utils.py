@@ -16,7 +16,7 @@ def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[
     """
     headers = {
         'X-Ray-Serve-Request-Id': get_request_id(),
-        'serve_multiplexed_model_id': get_request_id(),  # For model multiplexing
+        'Serve-Multiplexed-Model-Id': get_request_id(),  # For model multiplexing
         'Authorization': 'Bearer ' + get_api_key(),
         'Twinkle-Authorization': 'Bearer ' + get_api_key(),  # For server compatibility
     }
@@ -45,7 +45,7 @@ def _serialize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         if hasattr(value, 'processor_id'):
             serialized[key] = value.processor_id
         elif hasattr(value, '__dict__'):
-            from twinkle.server.common.serialize import serialize_object
+            from twinkle_client.common.serialize import serialize_object
             serialized[key] = serialize_object(value)
         else:
             serialized[key] = value

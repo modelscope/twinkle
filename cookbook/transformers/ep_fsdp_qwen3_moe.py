@@ -11,7 +11,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507')
+MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'Template')
 _num_layers_env = os.environ.get('NUM_LAYERS')

@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 from fastapi import FastAPI, HTTPException, Request
 from ray import serve
-from tinker import types as tinker_types
 from typing import Any
 
+import twinkle_client.types as types
 from twinkle.server.utils.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
@@ -36,7 +36,7 @@ class GatewayServer:
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models) or [
-            tinker_types.SupportedModel(model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'),
+            types.SupportedModel(model_name='Qwen/Qwen3.5-4B'),
         ]
         self._modelscope_config_lock = asyncio.Lock()
 
@@ -45,12 +45,12 @@ class GatewayServer:
             return []
         normalized = []
         for item in supported_models:
-            if isinstance(item, tinker_types.SupportedModel):
+            if isinstance(item, types.SupportedModel):
                 normalized.append(item)
             elif isinstance(item, dict):
-                normalized.append(tinker_types.SupportedModel(**item))
+                normalized.append(types.SupportedModel(**item))
             elif isinstance(item, str):
-                normalized.append(tinker_types.SupportedModel(model_name=item))
+                normalized.append(types.SupportedModel(model_name=item))
         return normalized
 
     def _validate_base_model(self, base_model: str) -> None:
@@ -61,8 +61,8 @@ class GatewayServer:
                 detail=f"Base model '{base_model}' is not supported. "
                 f"Supported models: {', '.join(supported_model_names)}")
 
-    def _get_base_model(self, model_id: str) -> str:
-        metadata = self.state.get_model_metadata(model_id)
+    async def _get_base_model(self, model_id: str) -> str:
+        metadata = await self.state.get_model_metadata(model_id)
         if metadata and metadata.get('base_model'):
             return metadata['base_model']
         raise HTTPException(status_code=404, detail=f'Model {model_id} not found')

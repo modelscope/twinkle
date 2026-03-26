@@ -9,8 +9,8 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-# Construct a device_mesh, fsdp=4, dp=2
-device_mesh = DeviceMesh.from_sizes(fsdp_size=4, dp_size=2)
+# Construct a device_mesh, dp=2
+device_mesh = DeviceMesh.from_sizes(dp_size=2)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
@@ -44,6 +44,7 @@ def train():
     dataloader = DataLoader(dataset=dataset, batch_size=8)
     # Use a TransformersModel
     model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+    model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
 
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
@@ -60,8 +61,8 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
-    # lora: 18G * 4
-    # full: 50G * 4
+    # lora: 8G * 8
+    # full: 18G * 8
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
