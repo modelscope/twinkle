@@ -132,8 +132,8 @@ def prepare_dpo_batch(
         List organized as [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
         where each item is an encoded InputFeature dict.
     """
-    chosen_samples = []
-    rejected_samples = []
+    chosen_trajectories = []
+    rejected_trajectories = []
 
     for item in batch:
         # Build messages from raw data
@@ -147,17 +147,20 @@ def prepare_dpo_batch(
             prompt_messages.append(Message(role='system', content=SYSTEM_PROMPT))
         prompt_messages.append(Message(role='user', content=prompt))
 
-        # Build chosen trajectory and encode
+        # Build chosen and rejected trajectories
         chosen_messages = prompt_messages + [Message(role='assistant', content=chosen_response)]
-        chosen_trajectory = Trajectory(messages=chosen_messages)
-        chosen_encoded = template.encode(chosen_trajectory)
-        chosen_samples.append(dict(chosen_encoded))
-
-        # Build rejected trajectory and encode
         rejected_messages = prompt_messages + [Message(role='assistant', content=rejected_response)]
-        rejected_trajectory = Trajectory(messages=rejected_messages)
-        rejected_encoded = template.encode(rejected_trajectory)
-        rejected_samples.append(dict(rejected_encoded))
+
+        chosen_trajectories.append(Trajectory(messages=chosen_messages))
+        rejected_trajectories.append(Trajectory(messages=rejected_messages))
+
+    # Batch encode all trajectories (properly handles multimodal preprocessing)
+    chosen_encoded = template.batch_encode(chosen_trajectories)
+    rejected_encoded = template.batch_encode(rejected_trajectories)
+
+    # Convert to list of dicts
+    chosen_samples = [dict(enc) for enc in chosen_encoded]
+    rejected_samples = [dict(enc) for enc in rejected_encoded]
 
     # Return [chosen..., rejected...]
     return chosen_samples + rejected_samples
