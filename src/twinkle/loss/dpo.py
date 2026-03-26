@@ -16,7 +16,84 @@ if TYPE_CHECKING:
     import torch
 
 
-class DPOLoss(Loss):
+class PreferenceLossBase(Loss):
+    """Base class for preference optimization losses with shared utilities."""
+
+    def __init__(self, ignore_index: int = -100):
+        self.ignore_index = ignore_index
+
+    def _compute_logps_from_logits(
+        self,
+        logits: 'torch.Tensor',
+        labels: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Compute per-token log probabilities from logits.
+
+        Args:
+            logits: [batch, seq_len, vocab_size] model logits
+            labels: [batch, seq_len] target token ids
+
+        Returns:
+            logps: [batch, seq_len] per-token log probabilities
+        """
+        loss_mask = (labels != self.ignore_index).bool()
+        masked_labels = labels.clone()
+        masked_labels[~loss_mask] = 0
+        return selective_log_softmax(logits, masked_labels)
+
+    def _compute_sequence_logps(
+        self,
+        per_token_logps: 'torch.Tensor',
+        labels: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Compute sequence-level log probabilities by summing valid token logps."""
+        loss_mask = (labels != self.ignore_index).float()
+        return (per_token_logps * loss_mask).sum(dim=-1)
+
+    def _compute_avg_logps(
+        self,
+        per_token_logps: 'torch.Tensor',
+        labels: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Compute length-normalized (average) log probabilities."""
+        loss_mask = (labels != self.ignore_index).float()
+        seq_lengths = loss_mask.sum(dim=-1).clamp(min=1)
+        return (per_token_logps * loss_mask).sum(dim=-1) / seq_lengths
+
+    def _compute_nll_loss(
+        self,
+        per_token_logps: 'torch.Tensor',
+        labels: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Compute negative log likelihood loss."""
+        loss_mask = (labels != self.ignore_index).float()
+        return -(per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+
+    def _get_logps_from_outputs(
+        self,
+        outputs: Dict,
+        labels: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Extract or compute log probabilities from model outputs."""
+        logps = outputs.get('logps')
+        if logps is None:
+            logits = outputs.get('logits')
+            assert logits is not None, "outputs must contain 'logps' or 'logits'"
+            if logits.shape[1] != labels.shape[1]:
+                logits = logits[:, -labels.shape[1]:]
+            logps = self._compute_logps_from_logits(logits, labels)
+        return logps
+
+    def _split_chosen_rejected(
+        self,
+        tensor: 'torch.Tensor',
+    ) -> tuple:
+        """Split tensor into chosen (first half) and rejected (second half)."""
+        half = tensor.shape[0] // 2
+        return tensor[:half], tensor[half:]
+
+
+class DPOLoss(PreferenceLossBase):
     """Direct Preference Optimization (DPO) Loss.
 
     DPO directly optimizes the policy using preference data without explicit reward modeling.
@@ -48,48 +125,11 @@ class DPOLoss(Loss):
         reference_free: bool = False,
         **kwargs,
     ):
+        super().__init__(ignore_index=ignore_index)
         self.beta = beta
         self.label_smoothing = label_smoothing
-        self.ignore_index = ignore_index
         self.loss_type = loss_type
         self.reference_free = reference_free
-
-    def _compute_logps_from_logits(
-        self,
-        logits: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute per-token log probabilities from logits.
-
-        Args:
-            logits: [batch, seq_len, vocab_size] model logits
-            labels: [batch, seq_len] target token ids
-
-        Returns:
-            logps: [batch, seq_len] per-token log probabilities
-        """
-        loss_mask = (labels != self.ignore_index).bool()
-        masked_labels = labels.clone()
-        masked_labels[~loss_mask] = 0
-        logps = selective_log_softmax(logits, masked_labels)
-        return logps
-
-    def _compute_sequence_logps(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute sequence-level log probabilities by summing valid token logps.
-
-        Args:
-            per_token_logps: [batch, seq_len] per-token log probabilities
-            labels: [batch, seq_len] labels for computing mask
-
-        Returns:
-            seq_logps: [batch] sequence-level log probabilities
-        """
-        loss_mask = (labels != self.ignore_index).float()
-        return (per_token_logps * loss_mask).sum(dim=-1)
 
     def _pad_and_align_logps(
         self,
@@ -240,25 +280,15 @@ class DPOLoss(Loss):
 
         batch_size = labels.shape[0]
         assert batch_size % 2 == 0, "Batch size must be even (chosen + rejected pairs)"
-        half_batch = batch_size // 2
 
         # Get log probabilities from outputs
-        logps = outputs.get('logps')
-        if logps is None:
-            logits = outputs.get('logits')
-            assert logits is not None, "outputs must contain 'logps' or 'logits'"
-            if logits.shape[1] != labels.shape[1]:
-                logits = logits[:, -labels.shape[1]:]
-            logps = self._compute_logps_from_logits(logits, labels)
-
+        logps = self._get_logps_from_outputs(outputs, labels)
         device = logps.device
         dtype = logps.dtype
 
         # Split into chosen and rejected
-        chosen_labels = labels[:half_batch]
-        rejected_labels = labels[half_batch:]
-        chosen_logps = logps[:half_batch]
-        rejected_logps = logps[half_batch:]
+        chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
+        chosen_logps, rejected_logps = self._split_chosen_rejected(logps)
 
         # Compute sequence-level log probs for policy
         policy_chosen_logps = self._compute_sequence_logps(chosen_logps, chosen_labels)
@@ -275,8 +305,7 @@ class DPOLoss(Loss):
             ref_logps_aligned = self._pad_and_align_logps(
                 ref_logps, labels.shape, loss_mask, device, dtype
             )
-            ref_chosen = ref_logps_aligned[:half_batch]
-            ref_rejected = ref_logps_aligned[half_batch:]
+            ref_chosen, ref_rejected = self._split_chosen_rejected(ref_logps_aligned)
             reference_chosen_logps = self._compute_sequence_logps(ref_chosen, chosen_labels)
             reference_rejected_logps = self._compute_sequence_logps(ref_rejected, rejected_labels)
         elif self.reference_free:
@@ -300,7 +329,7 @@ class DPOLoss(Loss):
         return LossOutput(loss=loss, num_tokens=0)
 
 
-class SimPOLoss(Loss):
+class SimPOLoss(PreferenceLossBase):
     """SimPO (Simple Preference Optimization) Loss.
 
     SimPO is a simpler variant of DPO that doesn't require a reference model.
@@ -323,40 +352,9 @@ class SimPOLoss(Loss):
         ignore_index: int = -100,
         **kwargs,
     ):
+        super().__init__(ignore_index=ignore_index)
         self.beta = beta
         self.gamma = gamma
-        self.ignore_index = ignore_index
-
-    def _compute_logps_from_logits(
-        self,
-        logits: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute per-token log probabilities from logits."""
-        loss_mask = (labels != self.ignore_index).bool()
-        masked_labels = labels.clone()
-        masked_labels[~loss_mask] = 0
-        logps = selective_log_softmax(logits, masked_labels)
-        return logps
-
-    def _compute_length_normalized_logps(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute length-normalized sequence log probabilities.
-
-        Args:
-            per_token_logps: [batch, seq_len] per-token log probabilities
-            labels: [batch, seq_len] labels for computing mask
-
-        Returns:
-            normalized_logps: [batch] length-normalized log probabilities
-        """
-        loss_mask = (labels != self.ignore_index).float()
-        seq_lengths = loss_mask.sum(dim=-1).clamp(min=1)
-        seq_logps = (per_token_logps * loss_mask).sum(dim=-1)
-        return seq_logps / seq_lengths
 
     def __call__(
         self,
@@ -364,16 +362,7 @@ class SimPOLoss(Loss):
         outputs: Dict,
         **kwargs,
     ) -> LossOutput:
-        """Compute SimPO loss.
-
-        Args:
-            inputs: Dict containing 'input_ids' and 'labels' [batch, seq_len].
-                   Batch: [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
-            outputs: Dict containing 'logps' or 'logits'.
-
-        Returns:
-            LossOutput with SimPO loss.
-        """
+        """Compute SimPO loss."""
         import torch
         import torch.nn.functional as F
 
@@ -384,28 +373,18 @@ class SimPOLoss(Loss):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
 
-        batch_size = labels.shape[0]
-        assert batch_size % 2 == 0, "Batch size must be even (chosen + rejected pairs)"
-        half_batch = batch_size // 2
+        assert labels.shape[0] % 2 == 0, "Batch size must be even (chosen + rejected pairs)"
 
         # Get log probabilities
-        logps = outputs.get('logps')
-        if logps is None:
-            logits = outputs.get('logits')
-            assert logits is not None, "outputs must contain 'logps' or 'logits'"
-            if logits.shape[1] != labels.shape[1]:
-                logits = logits[:, -labels.shape[1]:]
-            logps = self._compute_logps_from_logits(logits, labels)
+        logps = self._get_logps_from_outputs(outputs, labels)
 
         # Split into chosen and rejected
-        chosen_labels = labels[:half_batch]
-        rejected_labels = labels[half_batch:]
-        chosen_logps = logps[:half_batch]
-        rejected_logps = logps[half_batch:]
+        chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
+        chosen_logps, rejected_logps = self._split_chosen_rejected(logps)
 
         # Compute length-normalized log probs
-        chosen_rewards = self._compute_length_normalized_logps(chosen_logps, chosen_labels)
-        rejected_rewards = self._compute_length_normalized_logps(rejected_logps, rejected_labels)
+        chosen_rewards = self._compute_avg_logps(chosen_logps, chosen_labels)
+        rejected_rewards = self._compute_avg_logps(rejected_logps, rejected_labels)
 
         # SimPO loss: -log(sigmoid(beta * (r_w - r_l) - gamma))
         logits = self.beta * (chosen_rewards - rejected_rewards) - self.gamma
@@ -414,7 +393,7 @@ class SimPOLoss(Loss):
         return LossOutput(loss=loss, num_tokens=0)
 
 
-class CPOLoss(Loss):
+class CPOLoss(PreferenceLossBase):
     """CPO (Contrastive Preference Optimization) Loss.
 
     CPO adds a behavior cloning term to preference optimization.
@@ -436,40 +415,9 @@ class CPOLoss(Loss):
         ignore_index: int = -100,
         **kwargs,
     ):
+        super().__init__(ignore_index=ignore_index)
         self.beta = beta
         self.bc_coef = bc_coef
-        self.ignore_index = ignore_index
-
-    def _compute_logps_from_logits(
-        self,
-        logits: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute per-token log probabilities from logits."""
-        loss_mask = (labels != self.ignore_index).bool()
-        masked_labels = labels.clone()
-        masked_labels[~loss_mask] = 0
-        logps = selective_log_softmax(logits, masked_labels)
-        return logps
-
-    def _compute_sequence_logps(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute sequence-level log probabilities."""
-        loss_mask = (labels != self.ignore_index).float()
-        return (per_token_logps * loss_mask).sum(dim=-1)
-
-    def _compute_nll_loss(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute negative log likelihood loss for chosen responses."""
-        loss_mask = (labels != self.ignore_index).float()
-        nll = -(per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
-        return nll
 
     def __call__(
         self,
@@ -477,15 +425,7 @@ class CPOLoss(Loss):
         outputs: Dict,
         **kwargs,
     ) -> LossOutput:
-        """Compute CPO loss.
-
-        Args:
-            inputs: Dict containing 'labels' [batch, seq_len].
-            outputs: Dict containing 'logps' or 'logits'.
-
-        Returns:
-            LossOutput with CPO loss.
-        """
+        """Compute CPO loss."""
         import torch
         import torch.nn.functional as F
 
@@ -496,24 +436,14 @@ class CPOLoss(Loss):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
 
-        batch_size = labels.shape[0]
-        assert batch_size % 2 == 0, "Batch size must be even"
-        half_batch = batch_size // 2
+        assert labels.shape[0] % 2 == 0, "Batch size must be even"
 
         # Get log probabilities
-        logps = outputs.get('logps')
-        if logps is None:
-            logits = outputs.get('logits')
-            assert logits is not None, "outputs must contain 'logps' or 'logits'"
-            if logits.shape[1] != labels.shape[1]:
-                logits = logits[:, -labels.shape[1]:]
-            logps = self._compute_logps_from_logits(logits, labels)
+        logps = self._get_logps_from_outputs(outputs, labels)
 
         # Split into chosen and rejected
-        chosen_labels = labels[:half_batch]
-        rejected_labels = labels[half_batch:]
-        chosen_logps = logps[:half_batch]
-        rejected_logps = logps[half_batch:]
+        chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
+        chosen_logps, rejected_logps = self._split_chosen_rejected(logps)
 
         # Compute sequence-level log probs
         chosen_seq_logps = self._compute_sequence_logps(chosen_logps, chosen_labels)
@@ -532,7 +462,7 @@ class CPOLoss(Loss):
         return LossOutput(loss=loss, num_tokens=0)
 
 
-class ORPOLoss(Loss):
+class ORPOLoss(PreferenceLossBase):
     """ORPO (Odds Ratio Preference Optimization) Loss.
 
     ORPO combines SFT and preference alignment in a single objective using odds ratios.
@@ -552,39 +482,8 @@ class ORPOLoss(Loss):
         ignore_index: int = -100,
         **kwargs,
     ):
+        super().__init__(ignore_index=ignore_index)
         self.lambda_orpo = lambda_orpo
-        self.ignore_index = ignore_index
-
-    def _compute_logps_from_logits(
-        self,
-        logits: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute per-token log probabilities from logits."""
-        loss_mask = (labels != self.ignore_index).bool()
-        masked_labels = labels.clone()
-        masked_labels[~loss_mask] = 0
-        logps = selective_log_softmax(logits, masked_labels)
-        return logps
-
-    def _compute_avg_logps(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute average log probabilities over valid tokens."""
-        loss_mask = (labels != self.ignore_index).float()
-        seq_lengths = loss_mask.sum(dim=-1).clamp(min=1)
-        return (per_token_logps * loss_mask).sum(dim=-1) / seq_lengths
-
-    def _compute_nll_loss(
-        self,
-        per_token_logps: 'torch.Tensor',
-        labels: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Compute negative log likelihood loss."""
-        loss_mask = (labels != self.ignore_index).float()
-        return -(per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
 
     def __call__(
         self,
@@ -592,15 +491,7 @@ class ORPOLoss(Loss):
         outputs: Dict,
         **kwargs,
     ) -> LossOutput:
-        """Compute ORPO loss.
-
-        Args:
-            inputs: Dict containing 'labels' [batch, seq_len].
-            outputs: Dict containing 'logps' or 'logits'.
-
-        Returns:
-            LossOutput with ORPO loss.
-        """
+        """Compute ORPO loss."""
         import torch
         import torch.nn.functional as F
 
@@ -611,24 +502,14 @@ class ORPOLoss(Loss):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
 
-        batch_size = labels.shape[0]
-        assert batch_size % 2 == 0, "Batch size must be even"
-        half_batch = batch_size // 2
+        assert labels.shape[0] % 2 == 0, "Batch size must be even"
 
         # Get log probabilities
-        logps = outputs.get('logps')
-        if logps is None:
-            logits = outputs.get('logits')
-            assert logits is not None, "outputs must contain 'logps' or 'logits'"
-            if logits.shape[1] != labels.shape[1]:
-                logits = logits[:, -labels.shape[1]:]
-            logps = self._compute_logps_from_logits(logits, labels)
+        logps = self._get_logps_from_outputs(outputs, labels)
 
         # Split into chosen and rejected
-        chosen_labels = labels[:half_batch]
-        rejected_labels = labels[half_batch:]
-        chosen_logps = logps[:half_batch]
-        rejected_logps = logps[half_batch:]
+        chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
+        chosen_logps, rejected_logps = self._split_chosen_rejected(logps)
 
         # SFT loss on chosen
         sft_loss = self._compute_nll_loss(chosen_logps, chosen_labels)

@@ -5,8 +5,9 @@ over rejected responses using preference data, without explicit reward modeling.
 
 Pipeline:
     1. Load preference dataset with chosen/rejected pairs.
-    2. Compute reference model log probabilities (frozen).
-    3. Train policy model using DPO loss.
+    2. Encode chosen and rejected separately.
+    3. Compute reference model log probabilities (frozen).
+    4. Train policy model using DPO loss.
 
 Architecture (Ray):
     ┌─────────────────────────────────────────────────────────────────┐
@@ -19,16 +20,20 @@ Architecture (Ray):
     DataLoader      RefModel (frozen)   PolicyModel (trainable)
                      (ref GPUs)          (policy GPUs)
 
+DPO Trajectory format:
+    - messages: List[Message] - chosen response
+    - extend_message: [('rejected_messages', List[Message])] - rejected response
+
 For SimPO/ORPO variants that don't require a reference model,
 set USE_REFERENCE_MODEL=0 to skip reference model computation.
 
 Environment variables (all optional):
     MODEL_ID          – (default: ms://Qwen/Qwen3.5-4B)
-    DATASET_ID        – (default: ms://argilla/ultrafeedback-binarized-preferences-cleaned)
+    DATASET_ID        – (default: ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji)
     MODEL_GPUS        – GPUs for policy model                 (default: 4)
     REF_MODEL_GPUS    – GPUs for reference model              (default: 4, 0 to disable)
     USE_REFERENCE_MODEL – Whether to use reference model      (default: 1)
-    BATCH_SIZE        – global batch size (pairs)             (default: 8)
+    BATCH_SIZE        – global batch size (preference pairs)  (default: 8)
     MICRO_BATCH_SIZE  – per-device micro batch size           (default: 2)
     MAX_STEPS         – total optimization steps              (default: 1000)
     LR                – learning rate                         (default: 5e-6)
@@ -46,11 +51,12 @@ from peft import LoraConfig
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle.data_format import Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from twinkle.model import TransformersModel
-from twinkle.preprocessor import DPOProcessor
+from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 
@@ -58,7 +64,7 @@ logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
-DATASET_ID = os.environ.get('DATASET_ID', 'ms://argilla/ultrafeedback-binarized-preferences-cleaned')
+DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 REF_MODEL_GPUS = int(os.environ.get('REF_MODEL_GPUS', 4))
@@ -72,7 +78,7 @@ else:
     USE_REFERENCE_MODEL = False
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))  # Must be even (chosen + rejected)
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
 LEARNING_RATE = float(os.environ.get('LR', 5e-6))
@@ -88,51 +94,75 @@ ADAPTER_NAME = 'default'
 def create_dpo_dataset():
     """Create preference dataset for DPO training.
 
-    The dataset will contain interleaved chosen/rejected pairs after preprocessing:
-    [chosen_1, rejected_1, chosen_2, rejected_2, ...]
+    Uses shareAI/DPO-zh-en-emoji dataset:
+    - answer_zh: chosen response (Chinese)
+    - answer_en: rejected response (English)
 
-    The collate function will reorder to: [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
+    Output Trajectory format:
+    - messages: chosen response
+    - extend_message: [('rejected_messages', rejected response)]
+
+    Note: We do NOT call dataset.encode() here. Encoding is done in
+    prepare_dpo_batch() to properly handle both chosen and rejected.
     """
     dataset = Dataset(DatasetMeta(DATASET_ID, split='train'))
     dataset.set_template('Template', model_id=MODEL_ID, max_length=MAX_LENGTH)
 
-    # Use DPOProcessor with interleaved output format
-    # This creates alternating chosen/rejected pairs that can be properly encoded
-    dataset.map(DPOProcessor(
-        system='You are a helpful, harmless, and honest assistant.',
-        chosen_key='chosen',
-        rejected_key='rejected',
+    # Use EmojiDPOProcessor for shareAI/DPO-zh-en-emoji dataset
+    # answer_zh -> chosen (messages), answer_en -> rejected (extend_message)
+    dataset.map(EmojiDPOProcessor(
+        system='You are a helpful assistant.',
+        chosen_key='answer_zh',
+        rejected_key='answer_en',
         prompt_key='prompt',
-        output_format='interleaved',  # Output: [chosen_1, rejected_1, chosen_2, ...]
     ))
 
-    # Encode the interleaved trajectories
-    dataset.encode()
+    # Do NOT encode here - encoding is done in prepare_dpo_batch
+    # to preserve extend_message for rejected encoding
     return dataset
 
 
-def collate_preference_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Collate interleaved preference pairs into DPO batch format.
+def prepare_dpo_batch(
+    batch: List[Dict[str, Any]],
+    template: Template,
+) -> List[Dict[str, Any]]:
+    """Prepare DPO batch: encode both chosen and rejected.
 
-    Input: [chosen_1, rejected_1, chosen_2, rejected_2, ...] (interleaved)
-    Output: [chosen_1, chosen_2, ..., rejected_1, rejected_2, ...] (grouped)
+    Args:
+        batch: List of raw Trajectory dicts with messages (chosen) and
+               extend_message containing ('rejected_messages', rejected)
 
-    DPO loss expects: first half chosen, second half rejected.
+    Returns:
+        List organized as [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
+        where each item is an encoded InputFeature dict.
     """
-    if not batch:
-        return batch
-
-    # Extract alternating chosen/rejected
     chosen_samples = []
     rejected_samples = []
 
-    for i, item in enumerate(batch):
-        if i % 2 == 0:  # Even indices are chosen
-            chosen_samples.append(item)
-        else:  # Odd indices are rejected
-            rejected_samples.append(item)
+    for item in batch:
+        # Get messages (chosen) and encode
+        messages = item.get('messages', [])
+        chosen_trajectory = Trajectory(messages=messages)
+        chosen_encoded = template.encode(chosen_trajectory)
+        chosen_samples.append(dict(chosen_encoded))
 
-    # Concatenate: all chosen first, then all rejected
+        # Get rejected from extend_message and encode
+        extend_message = item.get('extend_message', [])
+        rejected_messages = None
+        for key, msgs in extend_message:
+            if key == 'rejected_messages':
+                rejected_messages = msgs
+                break
+
+        if rejected_messages:
+            rejected_trajectory = Trajectory(messages=rejected_messages)
+            rejected_encoded = template.encode(rejected_trajectory)
+            rejected_samples.append(dict(rejected_encoded))
+        else:
+            # Fallback: use chosen (should not happen with proper preprocessing)
+            rejected_samples.append(dict(chosen_encoded))
+
+    # Return [chosen..., rejected...]
     return chosen_samples + rejected_samples
 
 
@@ -201,6 +231,9 @@ def main():
     policy_model.set_processor(InputProcessor)
     policy_model.set_template('Template', model_id=MODEL_ID)
 
+    # Get template for encoding rejected messages
+    template = Template(model_id=MODEL_ID, max_length=MAX_LENGTH)
+
     # ── Reference Model Setup (if needed) ─────────────────────────────────────
     ref_model = None
     if USE_REFERENCE_MODEL and not reference_free:
@@ -217,9 +250,7 @@ def main():
         logger.info(f'Training without reference model (loss_type={LOSS_TYPE})')
 
     # ── DataLoader Setup ──────────────────────────────────────────────────────
-    # Since dataset is interleaved (chosen, rejected, chosen, rejected, ...),
-    # we need batch_size * 2 samples to get BATCH_SIZE preference pairs
-    GLOBAL_BATCH_SIZE = BATCH_SIZE * 2 * GRADIENT_ACCUMULATION_STEPS
+    GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     dataloader = DataLoader(
         dataset=create_dpo_dataset,
         batch_size=GLOBAL_BATCH_SIZE,
@@ -238,21 +269,22 @@ def main():
         if optim_step >= MAX_STEPS:
             break
 
-        # Collate preference pairs: [chosen..., rejected...]
-        preference_batch = collate_preference_batch(batch if isinstance(batch, list) else [batch])
+        # Prepare DPO batch: [chosen..., rejected...]
+        batch_list = batch if isinstance(batch, list) else [batch]
+        dpo_batch = prepare_dpo_batch(batch_list, template)
 
         # Compute reference log probabilities if using reference model
         ref_logps = None
         if ref_model is not None:
             with torch.no_grad():
-                ref_outputs = ref_model.forward_only(inputs=preference_batch)
+                ref_outputs = ref_model.forward_only(inputs=dpo_batch)
                 ref_logps = ref_outputs.get('logps')
 
         # Forward-backward pass with DPO loss
-        # micro_batch_size must be even to maintain chosen/rejected pairing
-        actual_micro_batch = MICRO_BATCH_SIZE * 2  # Convert pairs to samples
+        # micro_batch_size should be even to maintain chosen/rejected pairing
+        actual_micro_batch = MICRO_BATCH_SIZE * 2
         policy_model.forward_backward(
-            inputs=preference_batch,
+            inputs=dpo_batch,
             ref_logps=ref_logps,
             micro_batch_size=actual_micro_batch,
         )
