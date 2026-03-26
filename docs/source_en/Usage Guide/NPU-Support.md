@@ -18,6 +18,7 @@ Before getting started, please ensure your system meets the following requiremen
 - torch and torch_npu versions **must be exactly the same** (e.g., both 2.7.1)
 - Python 3.11 is recommended for best compatibility
 - CANN toolkit requires approximately 10GB+ disk space
+- If you need to use the **Megatron backend** (TP/PP/EP parallelism), you also need to install MindSpeed and prepare Megatron-LM source code. See the "[Megatron Training Environment Setup](#4-megatron-training-environment-setup-optional)" section below
 
 ## Supported Hardware
 
@@ -75,7 +76,37 @@ pip install vllm-ascend==0.11.0rc3
 - Ensure CANN environment is activated before installation: `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
 - Recommended versions are vLLM 0.11.0 and vLLM-Ascend 0.11.0rc3
 
-### 4. Verify Installation
+### 4. Megatron Training Environment Setup (Optional)
+
+If you need to use the Megatron backend for advanced parallel training such as TP/PP/EP, the following additional environment setup is required. This step is not needed if you only use DP/FSDP parallelism.
+
+#### Install MindSpeed
+
+MindSpeed is a required acceleration library for running Megatron on Ascend NPU, providing operator adaptation and distributed communication optimization.
+
+**Installation**: Refer to the [MindSpeed Official Repository](https://gitcode.com/Ascend/MindSpeed) for installation instructions.
+
+#### Clone Megatron-LM Source Code
+
+Megatron training requires Megatron-LM source code:
+
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.12.0
+```
+
+#### Configure PYTHONPATH
+
+Before running Megatron training scripts, you need to add both Twinkle source code and Megatron-LM source code to `PYTHONPATH`:
+
+```bash
+export TWINKLE_SRC_PATH=/path/to/twinkle/src
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${TWINKLE_SRC_PATH}:${MEGATRON_LM_PATH}:${PYTHONPATH}
+```
+
+> **Tip**: `cookbook/megatron/tp.sh` and `cookbook/megatron/tp_moe.sh` already include automatic PYTHONPATH configuration. You can use these scripts directly to launch training without manual setup. Default paths can be overridden via the `TWINKLE_SRC_PATH` and `MEGATRON_LM_PATH` environment variables.
+
+### 5. Verify Installation
 
 Create test script `verify_npu.py`:
 
@@ -155,6 +186,54 @@ python cookbook/grpo/lora_npu.py
 - ✅ Optional TorchSampler or vLLMSampler
 - ✅ Complete RL training workflow
 
+### Megatron MoE LoRA Fine-tuning
+
+Verified 8-card TP+EP LoRA training example:
+
+**Example Path**: [cookbook/megatron/npu/tp_moe_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_moe_lora_npu.py)
+
+**Run Method**:
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${MEGATRON_LM_PATH}:${PYTHONPATH}
+
+torchrun --nproc_per_node=8 cookbook/megatron/npu/tp_moe_lora_npu.py
+```
+
+**Notes**:
+- Current expert LoRA only supports `ETP=1`
+- This example uses the verified topology: `DP=8, TP=1, EP=2, PP=1, CP=1`
+- If you raise `TP` to `2` together with `EP=2`, the framework will reject it explicitly
+
+**Example Features**:
+- ✅ MoE + LoRA fine-tuning
+- ✅ Megatron backend (DP=8, TP=1, EP=2)
+- ✅ 10-step continuous loss printing + checkpoint saving
+
+### Megatron LoRA Fine-tuning
+
+Verified 8-card TP+PP LoRA fine-tuning example:
+
+**Example Path**: [cookbook/megatron/npu/tp_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_lora_npu.py)
+
+**Run Method**:
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TWINKLE_SRC_PATH=/path/to/twinkle/src
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${TWINKLE_SRC_PATH}:${MEGATRON_LM_PATH}:${PYTHONPATH}
+
+torchrun --nproc_per_node=8 cookbook/megatron/npu/tp_lora_npu.py
+```
+
+**Example Features**:
+- ✅ LoRA fine-tuning (r=8, target_modules=all-linear)
+- ✅ Megatron backend (DP=2, TP=2, PP=2)
+- ✅ 10-step continuous metric printing + checkpoint saving
+
+**Note**: MoE models do not currently support LoRA fine-tuning (Expert LoRA is not available when ETP>1).
+
 ### More Examples
 
 Check the `cookbook/remote/tinker/ascend/` directory for remote training server-side configuration.
@@ -167,15 +246,15 @@ Twinkle currently supports the following **verified** parallelization strategies
 |---------|------|---------|---------|
 | DP (Data Parallel) | Data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
 | FSDP (Fully Sharded Data Parallel) | Fully sharded data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
-| TP (Tensor Parallel) | Tensor parallelism (Megatron) | 🚧 | To be verified |
-| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | 🚧 | To be verified |
-| CP (Context Parallel) | Context parallelism | 🚧 | To be verified |
-| EP (Expert Parallel) | Expert parallelism (MoE) | 🚧 | To be verified |
+| TP (Tensor Parallel) | Tensor parallelism (Megatron) | ✅ | Verified (see cookbook/megatron/npu/) |
+| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | ✅ | Verified (see cookbook/megatron/npu/) |
+| CP (Context Parallel) | Context parallelism | ❌ | Not supported for now |
+| EP (Expert Parallel) | Expert parallelism (MoE) | ✅ | Verified (see cookbook/megatron/npu/tp_moe_lora_npu.py) |
 
 **Legend**:
 - ✅ Verified: Has actual running example code
 - 🚧 To be verified: Theoretically supported but no NPU verification example yet
-- ❌ Not supported: Not available in current version
+- ❌ Not supported for now: the current implementation path does not support it, so keep it disabled on NPU Megatron
 
 ### DP + FSDP Example
 
@@ -193,7 +272,29 @@ device_mesh = DeviceMesh(
 )
 ```
 
-**Note**: Megatron backend (TP/PP/EP) support on NPU is under development, with no available examples yet. If you need these advanced parallelization strategies, please verify in GPU environment first or follow project updates.
+### Megatron TP + PP Example
+
+The following configuration is from `cookbook/megatron/npu/tp_lora_npu.py`, verified in an actual 8-card NPU environment:
+
+```python
+from twinkle import DeviceMesh
+
+# 8 cards: dp=2, tp=2, pp=2
+device_mesh = DeviceMesh.from_sizes(dp_size=2, tp_size=2, pp_size=2)
+```
+
+### Megatron TP + EP Example (MoE Model)
+
+The following configuration is from `cookbook/megatron/npu/tp_moe_lora_npu.py`, verified in an actual 8-card NPU environment:
+
+```python
+from twinkle import DeviceMesh
+
+# 8 cards: dp=8, tp=1, ep=2, pp=1, cp=1
+device_mesh = DeviceMesh.from_sizes(dp_size=8, tp_size=1, pp_size=1, cp_size=1, ep_size=2)
+```
+
+**Note**: Context Parallel (CP) is not supported yet on NPU Megatron. Please keep `cp_size=1`.
 
 ## Common Issues
 
@@ -223,6 +324,54 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 - Refer to [Ascend Community Version Compatibility Table](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC1alpha002/softwareinstall/instg/atlasdeploy_03_0015.html)
 - Install corresponding CANN toolkit version
 
+### 3. Megatron Training Reports ModuleNotFoundError: No module named 'megatron'
+
+**Problem**: Running Megatron training scripts reports that the `megatron` module cannot be found.
+
+**Solution**:
+- Confirm that Megatron-LM source code has been cloned and its path is added to `PYTHONPATH`
+- Confirm that `TWINKLE_SRC_PATH` points to Twinkle's `src` directory
+- Refer to the PYTHONPATH configuration in `cookbook/megatron/tp.sh`
+
+```bash
+export PYTHONPATH=/path/to/twinkle/src:/path/to/Megatron-LM:${PYTHONPATH}
+```
+
+### 4. NPU Cards Occupied Causing Training Failure
+
+**Problem**: Training fails with HCCL communication timeout or device unavailable errors after launch.
+
+**Solution**:
+- First use `npu-smi info` to check which cards are occupied by other processes
+- Set `ASCEND_RT_VISIBLE_DEVICES` to specify only available cards
+- Ensure `torchrun --nproc_per_node` count matches the number of cards in `ASCEND_RT_VISIBLE_DEVICES`
+
+```bash
+# Check card usage
+npu-smi info
+
+# Assuming cards 0,1,2,3 are free and 4,5,6,7 are occupied
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+torchrun --nproc_per_node=4 your_script.py
+```
+
+### 5. torchrun Using Wrong Python Environment
+
+**Problem**: Multi-card training reports many missing package errors (e.g., `ModuleNotFoundError: No module named 'datasets'`), but `pip list` locally shows these packages.
+
+**Solution**:
+- Check if `which torchrun` points to the current Conda environment
+- If it points to the system Python, activate the correct environment first
+
+```bash
+# Check torchrun source
+which torchrun
+
+# Ensure it comes from the current Conda environment
+conda activate your_env
+which torchrun  # Should point to a path within the conda environment
+```
+
 ## Feature Support Status
 
 Feature support matrix based on actual code verification:
@@ -236,10 +385,13 @@ Feature support matrix based on actual code verification:
 | Ray Distributed | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified available |
 | TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified available |
 | vLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified available |
-| Full Fine-tuning | ✅ | 🚧 | - | Theoretically supported, to be verified |
 | QLoRA | ✅ | ❌ | - | Quantization operators not yet supported |
 | DPO | ✅ | 🚧 | - | Theoretically supported, to be verified |
-| Megatron TP/PP | ✅ | 🚧 | - | To be adapted and verified |
+| Megatron TP/PP | ✅ | ✅ | cookbook/megatron/npu/tp_lora_npu.py | Verified (dp=2, tp=2, pp=2) |
+| Megatron EP (MoE) | ✅ | ✅ | cookbook/megatron/npu/tp_moe_lora_npu.py | Verified (dp=8, tp=1, ep=2) |
+| Megatron MoE LoRA (ETP=1) | ✅ | ✅ | cookbook/megatron/npu/tp_moe_lora_npu.py | Verified (dp=8, tp=1, ep=2) |
+| Megatron LoRA | ✅ | ✅ | cookbook/megatron/npu/tp_lora_npu.py | Verified (dp=2, tp=2, pp=2) |
+| MoE + LoRA + ETP > 1 | ✅ | ❌ | - | Expert LoRA not supported when ETP>1 |
 | Flash Attention | ✅ | ⚠️ | - | Some operators not supported |
 
 **Legend**:
@@ -269,6 +421,14 @@ Twinkle provides the following verified NPU training examples:
   - Supports Reference Model
   - Optional TorchSampler or vLLMSampler
 
+### Megatron Training
+- **8-card LoRA Fine-tuning**: [cookbook/megatron/npu/tp_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_lora_npu.py)
+  - LoRA fine-tuning, DP=2, TP=2, PP=2
+  - Supports all-linear target modules
+- **8-card MoE LoRA Fine-tuning**: [cookbook/megatron/npu/tp_moe_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_moe_lora_npu.py)
+  - MoE LoRA fine-tuning, DP=8, TP=1, EP=2
+  - Expert LoRA currently requires ETP=1
+
 ### Remote Training (Tinker Protocol)
 - **Server Configuration**: [cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
   - Provides HTTP API interface
@@ -284,6 +444,14 @@ python cookbook/sft/lora_npu.py
 # GRPO training
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 python cookbook/grpo/lora_npu.py
+
+# Megatron LoRA training (use sh script directly)
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+bash cookbook/megatron/npu/tp_lora_npu.sh
+
+# Megatron MoE LoRA training
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+bash cookbook/megatron/npu/tp_moe_lora_npu.sh
 ```
 
 ## Reference Resources

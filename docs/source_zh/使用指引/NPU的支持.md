@@ -18,6 +18,7 @@
 - torch 和 torch_npu 版本**必须完全一致**（例如都为 2.7.1）
 - 推荐使用 Python 3.11 以获得最佳兼容性
 - CANN 工具包需要约 10GB+ 磁盘空间
+- 如果需要使用 **Megatron 后端**（TP/PP/EP 并行），还需额外安装 MindSpeed 并准备 Megatron-LM 源码，详见下方「[Megatron 训练环境准备](#4-megatron-训练环境准备可选)」章节
 
 ## 支持的硬件
 
@@ -75,7 +76,34 @@ pip install vllm-ascend==0.11.0rc3
 - 安装前确保已激活 CANN 环境：`source /usr/local/Ascend/ascend-toolkit/set_env.sh`
 - 推荐使用的版本为 vLLM 0.11.0 和 vLLM-Ascend 0.11.0rc3
 
-### 4. 验证安装
+### 4. Megatron 训练环境准备（可选）
+
+如果需要使用 Megatron 后端进行 TP/PP/EP 等高级并行训练，需要额外准备以下环境。仅使用 DP/FSDP 并行时无需此步骤。
+
+#### 安装 MindSpeed
+
+MindSpeed 是昇腾 NPU 上运行 Megatron 的必要加速库，提供算子适配和分布式通信优化。
+
+**安装方式**：参考 [MindSpeed 官方仓库](https://gitcode.com/Ascend/MindSpeed) 的安装说明。
+
+#### 克隆 Megatron-LM 源码
+
+Megatron 训练需要 Megatron-LM 源码：
+
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.12.0
+```
+
+#### 配置 PYTHONPATH
+
+运行 Megatron 训练脚本前，需要将 Twinkle 源码和 Megatron-LM 源码同时加入 `PYTHONPATH`：
+
+```bash
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${MEGATRON_LM_PATH}:${PYTHONPATH}
+```
+
+### 5. 验证安装
 
 创建测试脚本 `verify_npu.py`：
 
@@ -155,6 +183,53 @@ python cookbook/grpo/lora_npu.py
 - ✅ 可选 TorchSampler 或 vLLMSampler
 - ✅ 完整的 RL 训练流程
 
+### Megatron MoE LoRA 微调
+
+已验证的 8 卡 TP+EP LoRA 训练示例：
+
+**示例路径**：[cookbook/megatron/npu/tp_moe_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_moe_lora_npu.py)
+
+**运行方式**：
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${MEGATRON_LM_PATH}:${PYTHONPATH}
+
+torchrun --nproc_per_node=8 cookbook/megatron/npu/tp_moe_lora_npu.py
+```
+
+**说明**：
+- 当前 expert LoRA 仅支持 `ETP=1`
+- 这份示例使用已验证拓扑：`DP=8, TP=1, EP=2, PP=1, CP=1`
+- 如果把 `TP` 提到 `2` 再配 `EP=2`，框架会明确拒绝
+
+**示例特性**：
+- ✅ MoE + LoRA 微调
+- ✅ Megatron 后端（DP=8, TP=1, EP=2）
+- ✅ 10 步 loss 连续打印 + checkpoint 保存
+
+### Megatron LoRA 微调
+
+已验证的 8 卡 TP+PP LoRA 微调示例：
+
+**示例路径**：[cookbook/megatron/npu/tp_lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/megatron/npu/tp_lora_npu.py)
+
+**运行方式**：
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export MEGATRON_LM_PATH=/path/to/Megatron-LM
+export PYTHONPATH=${MEGATRON_LM_PATH}:${PYTHONPATH}
+
+# 运行训练
+torchrun --nproc_per_node=8 cookbook/megatron/npu/tp_lora_npu.py
+```
+
+**示例特性**：
+- ✅ LoRA 微调（r=8, target_modules=all-linear）
+- ✅ Megatron 后端（DP=2, TP=2, PP=2）
+- ✅ 10 步 metric 连续打印 + checkpoint 保存
+
+
 ### 更多示例
 
 查看 `cookbook/remote/tinker/ascend/` 目录了解远程训练服务端配置。
@@ -167,15 +242,15 @@ Twinkle 在 NPU 上目前支持以下**经过验证**的并行策略：
 |---------|------|---------|---------|
 | DP (Data Parallel) | 数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
 | FSDP (Fully Sharded Data Parallel) | 完全分片数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
-| TP (Tensor Parallel) | 张量并行（Megatron） | 🚧 | 待验证 |
-| PP (Pipeline Parallel) | 流水线并行（Megatron） | 🚧 | 待验证 |
-| CP (Context Parallel) | 上下文并行 | 🚧 | 待验证 |
-| EP (Expert Parallel) | 专家并行（MoE） | 🚧 | 待验证 |
+| TP (Tensor Parallel) | 张量并行（Megatron） | ✅ | 已验证（见 cookbook/megatron/npu/） |
+| PP (Pipeline Parallel) | 流水线并行（Megatron） | ✅ | 已验证（见 cookbook/megatron/npu/） |
+| CP (Context Parallel) | 上下文并行 | ❌ | 暂不支持 |
+| EP (Expert Parallel) | 专家并行（MoE） | ✅ | 已验证（见 cookbook/megatron/npu/tp_moe_lora_npu.py） |
 
 **图例说明**：
 - ✅ 已验证：有实际运行示例代码
 - 🚧 待验证：理论上支持但暂无 NPU 验证示例
-- ❌ 不支持：当前版本不可用
+- ❌ 暂不支持：当前实现路径明确不支持，NPU Megatron 不要开启
 
 ### DP + FSDP 示例
 
@@ -193,7 +268,29 @@ device_mesh = DeviceMesh(
 )
 ```
 
-**注意**：Megatron 后端（TP/PP/EP）在 NPU 上的支持正在开发中，暂无可用示例。如需使用这些高级并行策略，请先在 GPU 环境下验证，或关注项目更新。
+### Megatron TP + PP 示例（Dense LoRA）
+
+以下配置来自 `cookbook/megatron/npu/tp_lora_npu.py`，在实际 8 卡 NPU 环境中验证通过：
+
+```python
+from twinkle import DeviceMesh
+
+# 8 卡：dp=2, tp=2, pp=2
+device_mesh = DeviceMesh.from_sizes(dp_size=2, tp_size=2, pp_size=2)
+```
+
+### Megatron TP + EP 示例（MoE LoRA）
+
+以下配置来自 `cookbook/megatron/npu/tp_moe_lora_npu.py`，在实际 8 卡 NPU 环境中验证通过：
+
+```python
+from twinkle import DeviceMesh
+
+# 8 卡：dp=8, tp=1, ep=2, pp=1, cp=1
+device_mesh = DeviceMesh.from_sizes(dp_size=8, tp_size=1, pp_size=1, cp_size=1, ep_size=2)
+```
+
+**注意**：Context Parallel（CP）在 NPU Megatron 上暂不支持，建议保持 `cp_size=1`。
 
 ## 常见问题
 
@@ -223,6 +320,18 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 - 参考[昇腾社区版本配套表](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC1alpha002/softwareinstall/instg/atlasdeploy_03_0015.html)
 - 安装对应版本的 CANN 工具包
 
+### 3. Megatron 训练报 ModuleNotFoundError: No module named 'megatron'
+
+**问题**：运行 Megatron 训练脚本时报找不到 `megatron` 模块。
+
+**解决方案**：
+- 确认已克隆 Megatron-LM 源码，并将其路径加入 `PYTHONPATH`
+- 参考 `cookbook/megatron/tp.sh` 中的 PYTHONPATH 配置
+
+```bash
+export PYTHONPATH=/path/to/Megatron-LM:${PYTHONPATH}
+```
+
 ## 功能支持情况
 
 基于实际代码验证的功能支持矩阵：
@@ -236,10 +345,13 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 | Ray 分布式 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
 | TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
 | vLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
-| 全量微调 | ✅ | 🚧 | - | 理论支持，待验证 |
 | QLoRA | ✅ | ❌ | - | 量化算子暂不支持 |
 | DPO | ✅ | 🚧 | - | 理论支持，待验证 |
-| Megatron TP/PP | ✅ | 🚧 | - | 待适配和验证 |
+| Megatron TP/PP | ✅ | ✅ | cookbook/megatron/npu/tp_lora_npu.py | 已验证（dp=2, tp=2, pp=2） |
+| Megatron EP（MoE） | ✅ | ✅ | cookbook/megatron/npu/tp_moe_lora_npu.py | 已验证（dp=8, tp=1, ep=2） |
+| Megatron LoRA | ✅ | ✅ | cookbook/megatron/npu/tp_lora_npu.py | 已验证（dp=2, tp=2, pp=2） |
+| Megatron MoE LoRA（ETP=1） | ✅ | ✅ | cookbook/megatron/npu/tp_moe_lora_npu.py | 已验证（dp=8, tp=1, ep=2） |
+| MoE + LoRA + ETP>1 | ✅ | ❌ | - | Expert LoRA 在 ETP>1 时不支持 |
 | Flash Attention | ✅ | ⚠️ | - | 部分算子不支持 |
 
 **图例说明**：
