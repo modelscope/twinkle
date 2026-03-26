@@ -41,6 +41,12 @@ Environment variables (all optional):
     LOSS_TYPE         – DPO variant (sigmoid/hinge/ipo/simpo/orpo/cpo) (default: sigmoid)
     SAVE_STEPS        – checkpoint save interval              (default: 100)
     MAX_LENGTH        – max sequence length                   (default: 2048)
+
+    Dataset field mapping (for custom datasets):
+    PROMPT_KEY        – key for prompt field                  (default: 'prompt')
+    CHOSEN_KEY        – key for chosen response               (default: 'answer_zh')
+    REJECTED_KEY      – key for rejected response             (default: 'answer_en')
+    SYSTEM_PROMPT     – system prompt to prepend              (default: 'You are a helpful assistant.')
 """
 
 import os
@@ -51,12 +57,11 @@ from peft import LoraConfig
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
 from twinkle.model import TransformersModel
-from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 
@@ -91,6 +96,13 @@ ADAPTER_NAME = 'default'
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
+# Dataset field configuration for shareAI/DPO-zh-en-emoji
+PROMPT_KEY = os.environ.get('PROMPT_KEY', 'prompt')
+CHOSEN_KEY = os.environ.get('CHOSEN_KEY', 'answer_zh')
+REJECTED_KEY = os.environ.get('REJECTED_KEY', 'answer_en')
+SYSTEM_PROMPT = os.environ.get('SYSTEM_PROMPT', 'You are a helpful assistant.')
+
+
 def create_dpo_dataset():
     """Create preference dataset for DPO training.
 
@@ -98,27 +110,12 @@ def create_dpo_dataset():
     - answer_zh: chosen response (Chinese)
     - answer_en: rejected response (English)
 
-    Output Trajectory format:
-    - messages: chosen response
-    - extend_message: [('rejected_messages', rejected response)]
-
-    Note: We do NOT call dataset.encode() here. Encoding is done in
-    prepare_dpo_batch() to properly handle both chosen and rejected.
+    Returns raw dataset without preprocessing - preprocessing is done
+    in prepare_dpo_batch() to avoid PyArrow serialization issues.
     """
     dataset = Dataset(DatasetMeta(DATASET_ID, split='train'))
     dataset.set_template('Template', model_id=MODEL_ID, max_length=MAX_LENGTH)
-
-    # Use EmojiDPOProcessor for shareAI/DPO-zh-en-emoji dataset
-    # answer_zh -> chosen (messages), answer_en -> rejected (extend_message)
-    dataset.map(EmojiDPOProcessor(
-        system='You are a helpful assistant.',
-        chosen_key='answer_zh',
-        rejected_key='answer_en',
-        prompt_key='prompt',
-    ))
-
-    # Do NOT encode here - encoding is done in prepare_dpo_batch
-    # to preserve extend_message for rejected encoding
+    # Do NOT apply preprocessor here - raw data will be processed in prepare_dpo_batch
     return dataset
 
 
@@ -126,11 +123,10 @@ def prepare_dpo_batch(
     batch: List[Dict[str, Any]],
     template: Template,
 ) -> List[Dict[str, Any]]:
-    """Prepare DPO batch: encode both chosen and rejected.
+    """Prepare DPO batch: build trajectories and encode both chosen and rejected.
 
     Args:
-        batch: List of raw Trajectory dicts with messages (chosen) and
-               extend_message containing ('rejected_messages', rejected)
+        batch: List of raw data dicts from dataset (e.g., {prompt, answer_zh, answer_en})
 
     Returns:
         List organized as [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
@@ -140,27 +136,28 @@ def prepare_dpo_batch(
     rejected_samples = []
 
     for item in batch:
-        # Get messages (chosen) and encode
-        messages = item.get('messages', [])
-        chosen_trajectory = Trajectory(messages=messages)
+        # Build messages from raw data
+        prompt = item.get(PROMPT_KEY, '')
+        chosen_response = item.get(CHOSEN_KEY, '')
+        rejected_response = item.get(REJECTED_KEY, '')
+
+        # Build prompt messages
+        prompt_messages = []
+        if SYSTEM_PROMPT:
+            prompt_messages.append(Message(role='system', content=SYSTEM_PROMPT))
+        prompt_messages.append(Message(role='user', content=prompt))
+
+        # Build chosen trajectory and encode
+        chosen_messages = prompt_messages + [Message(role='assistant', content=chosen_response)]
+        chosen_trajectory = Trajectory(messages=chosen_messages)
         chosen_encoded = template.encode(chosen_trajectory)
         chosen_samples.append(dict(chosen_encoded))
 
-        # Get rejected from extend_message and encode
-        extend_message = item.get('extend_message', [])
-        rejected_messages = None
-        for key, msgs in extend_message:
-            if key == 'rejected_messages':
-                rejected_messages = msgs
-                break
-
-        if rejected_messages:
-            rejected_trajectory = Trajectory(messages=rejected_messages)
-            rejected_encoded = template.encode(rejected_trajectory)
-            rejected_samples.append(dict(rejected_encoded))
-        else:
-            # Fallback: use chosen (should not happen with proper preprocessing)
-            rejected_samples.append(dict(chosen_encoded))
+        # Build rejected trajectory and encode
+        rejected_messages = prompt_messages + [Message(role='assistant', content=rejected_response)]
+        rejected_trajectory = Trajectory(messages=rejected_messages)
+        rejected_encoded = template.encode(rejected_trajectory)
+        rejected_samples.append(dict(rejected_encoded))
 
     # Return [chosen..., rejected...]
     return chosen_samples + rejected_samples
