@@ -4,22 +4,23 @@
 
 This design adds real checkpoint resumption support for `TransformersModel` without introducing a new trainer class.
 
-The implementation aligns the resume semantics of `TransformersModel` with the existing `MegatronModel` behavior:
+The design supports both full-parameter training and LoRA training:
 
-- normal weight loading remains available
-- strict resume restores model weights and training state together
-- strict resume does not silently fall back to weight-only loading when required state is missing
+- full-parameter training restores weights during model initialization
+- LoRA training restores adapter weights through the existing load path
+- both modes share the same training-state resume contract
+- strict model-state resume does not silently fall back to weight-only loading when required state is missing
 
 Because Twinkle keeps the training loop explicit in user code, the design extends existing model, dataloader, server, and client interfaces rather than adding a central trainer abstraction.
 
 ## Goals
 
 - Support true checkpoint resume for `TransformersModel`
-- Restore model weights, optimizer state, scheduler state, RNG state, and step counters
+- Support both full-parameter and LoRA training resume
+- Restore optimizer state, scheduler state, scaler state, RNG state, and step counters
 - Support dataset progress skipping for map-style datasets
 - Expose Swift-like resume controls without adding a new trainer class
 - Preserve existing weight-only loading and saving behavior
-- Keep backward compatibility for existing checkpoints where possible
 
 ## Non-Goals
 
@@ -54,7 +55,7 @@ Resume behavior is controlled by existing training entrypoints through three new
 
 - Only meaningful when `resume_from_checkpoint` is set and `resume_only_model=True`
 - Defaults to `False`
-- When `False`, the system still restores training progress metadata needed for data skipping and step/epoch continuation, but does not restore optimizer, scheduler, or RNG
+- When `False`, the system still restores training progress metadata needed for data skipping and step/epoch continuation, but does not restore optimizer, scheduler, scaler, or RNG
 - When `True`, the system restores only model weights and does not restore training progress or skip consumed data
 
 ### Effective behavior matrix
@@ -68,6 +69,7 @@ Resume behavior is controlled by existing training entrypoints through three new
 - Restore model weights
 - Restore optimizer state
 - Restore scheduler state
+- Restore scaler state
 - Restore RNG state
 - Restore step counters
 - Attempt to skip already consumed training data
@@ -76,101 +78,140 @@ Resume behavior is controlled by existing training entrypoints through three new
 #### Case 3: `resume_from_checkpoint is not None` and `resume_only_model=True` and `ignore_data_skip=False`
 
 - Restore model weights only
-- Do not restore optimizer, scheduler, or RNG
+- Do not restore optimizer, scheduler, scaler, or RNG
 - Restore step/progress metadata needed for data skipping
 - Attempt to skip already consumed training data
 
 #### Case 4: `resume_from_checkpoint is not None` and `resume_only_model=True` and `ignore_data_skip=True`
 
 - Restore model weights only
-- Do not restore optimizer, scheduler, RNG, step counters, or data progress
+- Do not restore optimizer, scheduler, scaler, RNG, step counters, or data progress
 - Restart the training loop from step 0 with no skipping
 
 ## Checkpoint Layout
 
-Existing checkpoint layout remains valid. New resume metadata is added alongside current files.
+Existing weight layouts remain valid. New training-state files are added alongside current checkpoint contents.
 
 ### Existing files preserved
 
-- model weights saved by `save_pretrained`
+- full-model weights saved by `save_pretrained`
 - LoRA weights saved as `adapter_model.safetensors`
 - tokenizer artifacts
 - `optimizer.pt`
 - `scheduler.pt`
 
-### New file
+### New training-state files
 
-- `training_state.pt`
+- `scaler.pt`
+- `trainer_state.json`
+- `rng_state.pt`
 
-### `training_state.pt` contents
+### `trainer_state.json` contents
 
-`training_state.pt` stores a small dictionary with the following fields:
+`trainer_state.json` stores lightweight training metadata:
 
 - `checkpoint_version`
 - `cur_step`
 - `gradient_accumulation_steps`
-- `scaler_state_dict`
-- `scaler_has_nan`
-- `rng_state`
-- `data_progress`
+- `consumed_train_samples`
+- optionally `consumed_batches`
 
-### `rng_state` contents
+The design prefers storing `consumed_train_samples` as the canonical progress value and deriving batch skipping from it where needed.
+
+### `scaler.pt` contents
+
+- AMP scaler state dict
+- optional scaler-related flags such as `scaler_has_nan`
+
+### `rng_state.pt` contents
 
 - Python `random` state
 - NumPy RNG state
 - PyTorch CPU RNG state
 - CUDA RNG state
 
-### `data_progress` contents
+## Restore Paths
 
-First version stores progress in a compact form:
+## Full-Parameter Training
 
-- `consumed_train_samples`
-- optionally `consumed_batches` when this is easier to compute reliably in a given entrypoint
+For full-parameter training, model weights are restored during initialization.
 
-The design prefers storing `consumed_train_samples` as the canonical progress value and deriving batch skipping from it where needed.
+### Full-parameter restore flow
+
+1. Construct `TransformersModel(model_id=ckpt_dir, ...)`
+2. `__init__` uses `from_pretrained(ckpt_dir, ...)` to restore weights
+3. Create optimizer, scheduler, and scaler objects
+4. Call `load_training_state(ckpt_dir)` to restore training state
+5. If data skipping is enabled, rebuild dataloader with skip arguments derived from `trainer_state.json`
+
+This means full-parameter resume does not need a separate model-weight loading method after initialization. It only needs explicit training-state restoration.
+
+## LoRA Training
+
+For LoRA training, the existing adapter-weight load path remains in place.
+
+### LoRA restore flow
+
+1. Construct the model and adapter objects as today
+2. Restore adapter weights through the existing `load()` path
+3. Create optimizer, scheduler, and scaler objects
+4. Call the same `load_training_state(ckpt_dir)` method to restore training state
+5. If data skipping is enabled, rebuild dataloader with skip arguments derived from `trainer_state.json`
+
+## Unified training-state method
+
+The model layer gains a shared helper such as `load_training_state(ckpt_dir)`.
+
+This method restores:
+
+- `optimizer.pt`
+- `scheduler.pt`
+- `scaler.pt`
+- `trainer_state.json`
+- `rng_state.pt`
+
+It assumes the corresponding optimizer, scheduler, and scaler objects have already been created before invocation.
 
 ## Model Save and Load Semantics
 
-## `TransformersModel.save`
+## Save behavior
 
-`TransformersModel.save(..., save_optimizer=True)` is extended to:
+When saving with optimizer state enabled, the checkpoint includes:
 
-1. Save weights exactly as today
-2. Save tokenizer exactly as today
-3. Save `optimizer.pt` and `scheduler.pt` exactly as today
-4. Save `training_state.pt`
+- weights in the existing full-model or LoRA format
+- tokenizer artifacts
+- `optimizer.pt`
+- `scheduler.pt`
+- `scaler.pt`
+- `trainer_state.json`
+- `rng_state.pt`
 
-When `save_optimizer=False`, save remains weight-only and does not produce strict resume metadata.
+When optimizer save is disabled, save remains weight-only and does not produce strict resume metadata.
 
-## `TransformersModel.load`
+## Strict training-state restore
 
-`TransformersModel.load(..., load_optimizer=False)` keeps current behavior:
+Strict model-state resume restores:
 
-- load model weights only
-
-`TransformersModel.load(..., load_optimizer=True)` becomes strict model-state resume:
-
-1. Resolve checkpoint directory
-2. Load model weights
-3. Load optimizer and scheduler state
-4. Load `training_state.pt`
-5. Restore scaler state
-6. Restore RNG state
-7. Restore `cur_step` and `gradient_accumulation_steps`
+- optimizer state
+- scheduler state
+- scaler state
+- RNG state
+- `cur_step`
+- `gradient_accumulation_steps`
+- data-progress metadata
 
 ### Failure behavior
 
-When `load_optimizer=True`, missing required model training state is an error:
+When strict training-state restore is requested, missing required model training state is an error:
 
-- missing `training_state.pt` -> fail
+- missing `trainer_state.json` -> fail
 - missing `optimizer.pt` when optimizer restore is required -> fail
 - missing `scheduler.pt` when scheduler restore is required -> fail
-- malformed required fields in `training_state.pt` -> fail
+- missing `scaler.pt` when scaler restore is required -> fail
+- missing `rng_state.pt` when RNG restore is required -> fail
+- malformed required fields -> fail
 
 This intentionally does not fall back to weight-only loading, to avoid falsely signaling successful strict resume.
-
-This matches the `MegatronModel` contract more closely than the current `TransformersModel` behavior.
 
 ## Training Progress and Data Skipping
 
@@ -226,10 +267,12 @@ The practical integration model is:
 
 1. Parse or receive the three resume parameters
 2. If `resume_from_checkpoint` is unset, construct dataloader normally
-3. If `resume_only_model=False`, call existing model load with strict restore semantics
-4. If `resume_only_model=True`, call weight-only model load
-5. If data skipping is enabled, read progress metadata from `training_state.pt`
-6. Recreate the dataloader with skip arguments applied
+3. Construct model weights through the appropriate path
+   - full-parameter: restore through `__init__`
+   - LoRA: restore through existing adapter load logic
+4. If `resume_only_model=False`, call `load_training_state(ckpt_dir)`
+5. If `resume_only_model=True` and `ignore_data_skip=False`, read `trainer_state.json` for progress only
+6. Recreate the dataloader with skip arguments applied when skipping is enabled
 
 This keeps the training loop explicit and compatible with current Twinkle examples.
 
@@ -242,17 +285,17 @@ Server-side checkpoint save/load behavior should preserve current APIs while add
 When server-side save endpoints request optimizer save:
 
 - save the model checkpoint as today
-- save `optimizer.pt`, `scheduler.pt`, and `training_state.pt`
+- save `optimizer.pt`, `scheduler.pt`, `scaler.pt`, `trainer_state.json`, and `rng_state.pt`
 - persist checkpoint metadata through the existing checkpoint manager
 
 ### Load path
 
-Current `load_optimizer=True` behavior is retained as the trigger for strict model-state restore.
+Current model load APIs remain the weight-loading trigger.
 
 The new resume parameters are primarily a training-entrypoint concern. They orchestrate whether to:
 
-- call strict resume
-- call weight-only resume
+- restore full training state
+- restore weight only
 - request data skipping
 
 The underlying server model APIs do not need a new trainer object to support this.
@@ -265,12 +308,13 @@ Existing checkpoints remain loadable in weight-only mode.
 
 Examples:
 
-- `model.load(path, load_optimizer=False)` continues to work
+- weight-only initialization for full-parameter checkpoints continues to work
+- existing LoRA weight loading continues to work
 - inference-only consumers remain unaffected
 
 ### Old checkpoints under strict resume
 
-Old checkpoints that lack `training_state.pt` are not valid for strict `TransformersModel` resume.
+Old checkpoints that lack the new training-state files are not valid for strict resume.
 
 Expected behavior:
 
@@ -310,16 +354,25 @@ Skip logic must be compatible with current device-mesh sharding. The implementat
 
 Tests should cover:
 
-### Model-state save/load
+### Full-parameter training resume
 
-- `training_state.pt` is written when optimizer save is enabled
-- scaler, RNG, `cur_step`, and accumulation settings are restored
+- initializing with `model_id=ckpt_dir` restores weights
+- `load_training_state(ckpt_dir)` restores optimizer, scheduler, scaler, RNG, and step metadata
+
+### LoRA training resume
+
+- adapter-weight restore continues to work
+- `load_training_state(ckpt_dir)` restores shared training state correctly
+
+### Strict restore failures
+
 - strict resume fails when required files are missing
+- malformed state files fail clearly
 
 ### Weight-only compatibility
 
 - legacy checkpoints still load in weight-only mode
-- `resume_only_model=True` restores weights without optimizer and RNG
+- `resume_only_model=True` restores weights without optimizer, scheduler, scaler, or RNG
 
 ### Data progress skipping
 
@@ -327,20 +380,16 @@ Tests should cover:
 - skip behavior remains correct with device-mesh sharding
 - iterable and streaming datasets emit warnings and continue without skipping
 
-### Failure cases
-
-- missing progress metadata when data skipping is requested
-- malformed `training_state.pt`
-- mismatch between requested strict resume and available checkpoint contents
-
 ## Implementation Outline
 
-1. Extend `TransformersModel.save/load` to persist and restore `training_state.pt`
-2. Add helper methods for RNG save/load and training-state serialization
-3. Extend dataloader and sampler stack to support skip arguments for map-style datasets
-4. Thread `resume_from_checkpoint`, `resume_only_model`, and `ignore_data_skip` through existing training entrypoints
-5. Add warnings for unsupported iterable/streaming data skipping
-6. Update docs and examples to prefer trainer-level resume parameters over ad hoc `model.load(..., load_optimizer=True)` logic
+1. Add model helpers for saving and loading split training-state files
+2. Implement `load_training_state(ckpt_dir)` with shared behavior for full-parameter and LoRA training
+3. Keep full-parameter weight restore in `__init__`
+4. Keep LoRA weight restore in the existing adapter load path
+5. Extend dataloader and sampler stack to support skip arguments for map-style datasets
+6. Thread `resume_from_checkpoint`, `resume_only_model`, and `ignore_data_skip` through existing training entrypoints
+7. Add warnings for unsupported iterable and streaming data skipping
+8. Update docs and examples to show the new resume contract
 
 ## User Guidance
 
@@ -350,4 +399,5 @@ Recommended guidance text:
 - `resume_only_model=False` performs full resume
 - `resume_only_model=True` restores only model weights
 - `ignore_data_skip=True` disables progress restore and starts from step 0
+- Full-parameter checkpoints restore weights during model initialization and restore training state afterward
 - Iterable and streaming datasets do not support consumed-data skipping and will resume without skipping data
