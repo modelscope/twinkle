@@ -99,9 +99,8 @@ git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.12.0
 Before running Megatron training scripts, you need to add both Twinkle source code and Megatron-LM source code to `PYTHONPATH`:
 
 ```bash
-export TWINKLE_SRC_PATH=/path/to/twinkle/src
 export MEGATRON_LM_PATH=/path/to/Megatron-LM
-export PYTHONPATH=${TWINKLE_SRC_PATH}:${MEGATRON_LM_PATH}:${PYTHONPATH}
+export PYTHONPATH=${MEGATRON_LM_PATH}:${PYTHONPATH}
 ```
 
 > **Tip**: `cookbook/megatron/tp.sh` and `cookbook/megatron/tp_moe.sh` already include automatic PYTHONPATH configuration. You can use these scripts directly to launch training without manual setup. Default paths can be overridden via the `TWINKLE_SRC_PATH` and `MEGATRON_LM_PATH` environment variables.
