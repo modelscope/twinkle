@@ -42,12 +42,8 @@ def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
     it can survive Megatron helper signature drift across versions.
     """
     from megatron.core import parallel_state
-    from megatron.core.distributed.finalize_model_grads import (
-        _get_main_grad_attr,
-        _reshard_if_dtensor,
-        _unshard_if_dtensor,
-        get_attr_wrapped_model,
-    )
+    from megatron.core.distributed.finalize_model_grads import (_get_main_grad_attr, _reshard_if_dtensor,
+                                                                _unshard_if_dtensor, get_attr_wrapped_model)
 
     model, config, embd_group, pp_group, _ = _normalize_word_embedding_allreduce_call(*call_args, **call_kwargs)
     if embd_group is None:
@@ -65,8 +61,8 @@ def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
             return _get_main_grad_attr(weight)
         return _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
 
-    if parallel_state.is_rank_in_embedding_group(ignore_virtual=True) and torch.distributed.get_world_size(
-            embd_group) > 1:
+    if parallel_state.is_rank_in_embedding_group(
+            ignore_virtual=True) and torch.distributed.get_world_size(embd_group) > 1:
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
         elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -328,9 +324,8 @@ class TwinkleMegatronArgs:
             # the parameters were built according to tp_size.
             tp = self.device_mesh.tp_world_size or 1
             if self.device_mesh.etp_size is not None and self.device_mesh.etp_world_size != tp:
-                logger.warning(
-                    f'etp_size={self.device_mesh.etp_world_size} is ignored on '
-                    f'megatron_core<0.13; expert TP is tied to tp_size={tp}')
+                logger.warning(f'etp_size={self.device_mesh.etp_world_size} is ignored on '
+                               f'megatron_core<0.13; expert TP is tied to tp_size={tp}')
             return tp
         return self.device_mesh.etp_world_size
 
@@ -438,9 +433,7 @@ class TwinkleMegatronArgs:
         # The registry import chain can pull in megatron.core, which must stay
         # behind the MindSpeed bootstrap on NPU.
         from .model.constant import MLLMModelType
-        is_multimodal = model_type in {
-            value for key, value in vars(MLLMModelType).items() if not key.startswith('_')
-        }
+        is_multimodal = model_type in {value for key, value in vars(MLLMModelType).items() if not key.startswith('_')}
 
         # Determine QKV bias
         if hasattr(text_config, 'attention_bias'):
@@ -589,15 +582,10 @@ class TwinkleMegatronArgs:
 
         def finalize_model_grads_for_lora(model, *args, **kwargs):
             import importlib
-
-            from megatron.core.distributed import DistributedDataParallel as MegatronDDP
-            from megatron.core.distributed.finalize_model_grads import (
-                _get_main_grad_attr,
-                _reshard_if_dtensor,
-                _unshard_if_dtensor,
-                get_attr_wrapped_model,
-            )
             from megatron.core import parallel_state
+            from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+            from megatron.core.distributed.finalize_model_grads import (_get_main_grad_attr, _reshard_if_dtensor,
+                                                                        _unshard_if_dtensor, get_attr_wrapped_model)
             from peft import PeftModel as _PeftModel
 
             # Unwrap PeftModel -> LoraModel -> real model to check DDP capability.
@@ -610,9 +598,7 @@ class TwinkleMegatronArgs:
             base_model = _get_base_model(model[0])
             if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
                 # Fix 2: temporarily swap in the None-safe embedding allreduce.
-                finalize_model_grads_mod = importlib.import_module(
-                    'megatron.core.distributed.finalize_model_grads'
-                )
+                finalize_model_grads_mod = importlib.import_module('megatron.core.distributed.finalize_model_grads')
                 orig_allreduce_word_embedding_grads = finalize_model_grads_mod._allreduce_word_embedding_grads
                 finalize_model_grads_mod._allreduce_word_embedding_grads = _allreduce_word_embedding_grads_allow_none
                 try:

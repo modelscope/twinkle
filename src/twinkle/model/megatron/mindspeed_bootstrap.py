@@ -7,7 +7,6 @@ from argparse import Namespace
 from typing import Any, Dict, Optional
 
 from twinkle import Platform
-
 from ._mindspeed_args import build_mindspeed_namespace, get_mindspeed_signature, sanitize_mindspeed_values
 
 _DEFAULT_MINDSPEED_VALUES: Optional[Dict[str, Any]] = None
@@ -60,10 +59,8 @@ def bootstrap_mindspeed_for_npu(args: Any) -> Optional[Dict[str, Any]]:
     try:
         args_utils = importlib.import_module('mindspeed.args_utils')
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            'MindSpeed is required for Twinkle NPU Megatron runs. '
-            'Please install MindSpeed in the current environment.'
-        ) from exc
+        raise RuntimeError('MindSpeed is required for Twinkle NPU Megatron runs. '
+                           'Please install MindSpeed in the current environment.') from exc
     # Fetch MindSpeed defaults here, then merge them with Twinkle args to
     # build the final MindSpeed runtime args.
     runtime_args = build_mindspeed_namespace(args, _get_mindspeed_defaults(args_utils))

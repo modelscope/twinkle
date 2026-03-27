@@ -58,8 +58,7 @@ class Framework(ABC):
                     from megatron.core import parallel_state as mpu
 
                     process_group = mpu.get_data_parallel_group_gloo(
-                        with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1
-                    )
+                        with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
                 except Exception:
                     pass
             group_size = dist.get_world_size(group=process_group)

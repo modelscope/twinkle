@@ -502,7 +502,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 masked_labels = torch.where(loss_mask, labels, torch.zeros_like(labels))
 
                 output_tensor.div_(temperature)
-                
+
                 logps = selective_log_softmax(output_tensor, masked_labels)
                 if cp_size > 1:
                     logps = self._postprocess_tensor_cp(logps)
