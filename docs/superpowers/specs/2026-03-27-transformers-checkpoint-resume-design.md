@@ -20,6 +20,7 @@ Because Twinkle keeps the training loop explicit in user code, the design extend
 - Restore optimizer state, scheduler state, scaler state, RNG state, and step counters
 - Support dataset progress skipping for map-style datasets
 - Expose Swift-like resume controls without adding a new trainer class
+- Keep training-state save and load compatible with NPU (Ascend) environments
 - Preserve existing weight-only loading and saving behavior
 
 ## Non-Goals
@@ -129,6 +130,35 @@ The design prefers storing `consumed_train_samples` as the canonical progress va
 - PyTorch CPU RNG state
 - CUDA RNG state
 
+## Accelerator Compatibility
+
+Training-state save and load must be accelerator-compatible, including Ascend NPU environments already supported by Twinkle.
+
+### Device-agnostic serialization
+
+Training-state files must use device-agnostic serialization:
+
+- optimizer, scheduler, scaler, and RNG payloads should be serialized in CPU-safe form
+- JSON metadata stays in plain text files
+- loading should first read state from CPU-safe files and then apply it to objects created on the current runtime device
+
+This avoids tying resume files to a specific device object layout during save.
+
+### RNG compatibility requirements
+
+RNG save and restore must branch by current accelerator backend:
+
+- CUDA runtime uses `torch.cuda` RNG APIs
+- NPU runtime uses `torch.npu` RNG APIs
+- CPU RNG and Python/NumPy RNG are always restored
+
+The implementation must not assume CUDA-only RNG helpers when saving or restoring training state.
+
+### Scope of compatibility
+
+The design requires resume support to work correctly in NPU environments.
+
+The design does not require cross-accelerator resume guarantees such as saving on GPU and resuming on NPU, or saving on NPU and resuming on GPU. The compatibility target is correct save and restore within the active supported accelerator backend.
 ## Restore Paths
 
 ## Full-Parameter Training
@@ -400,3 +430,4 @@ Recommended guidance text:
 - `ignore_data_skip=True` disables progress restore and starts from step 0
 - Full-parameter checkpoints restore weights during model initialization and restore training state afterward
 - Iterable and streaming datasets do not support consumed-data skipping and will resume without skipping data
+
