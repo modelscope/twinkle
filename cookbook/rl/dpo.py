@@ -76,11 +76,10 @@ NUM_GPUS = MODEL_GPUS + REF_MODEL_GPUS
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))  # Number of preference pairs
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 4))
-GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 8))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
-LEARNING_RATE = float(os.environ.get('LR', 5e-5))
+GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 4))
+LEARNING_RATE = float(os.environ.get('LR', 5e-6))  # TRL default for DPO is 5e-7 to 5e-6
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
-SFT_WEIGHT = float(os.environ.get('SFT_WEIGHT', 0.1))  # SFT loss weight for regularization
+SFT_WEIGHT = float(os.environ.get('SFT_WEIGHT', 1.0))  # SFT loss weight for regularization
 LOSS_TYPE = os.environ.get('LOSS_TYPE', 'sigmoid')  # sigmoid, hinge, ipo, simpo, orpo, cpo
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 200))
 MAX_LENGTH = int(os.environ.get('MAX_LENGTH', 2048))
@@ -90,7 +89,7 @@ SYSTEM_PROMPT = os.environ.get('SYSTEM_PROMPT', 'You are a helpful assistant.')
 
 def create_dpo_dataset():
     """Create DPO dataset with positive/negative format."""
-    dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(15000)))
+    dataset = Dataset(DatasetMeta(DATASET_ID))
     dataset.set_template('Template', model_id=MODEL_ID, max_length=MAX_LENGTH)
     dataset.map(
         EmojiDPOProcessor,
@@ -188,6 +187,7 @@ def main():
         device_mesh=policy_mesh,
         remote_group='policy',
     )
+    MAX_STEPS = len(dataloader)
     policy_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     policy_model.set_optimizer('AdamW', lr=LEARNING_RATE, weight_decay=0.01)
     policy_model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=LEARNING_RATE * 0.1)

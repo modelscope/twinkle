@@ -346,12 +346,10 @@ class DPOLoss(PreferenceLossBase):
         else:
             loss = dpo_loss
 
-        # Return sample count for gradient normalization (not token count)
-        # DPO loss is already per-sample mean, so we just count samples for accumulation
-        import torch
-        num_samples = torch.tensor(chosen_labels.shape[0], device=loss.device)
-
-        return LossOutput(loss=loss, num_tokens=num_samples)
+        # Return 0 to skip gradient normalization by num_tokens
+        # DPO loss is already per-sample mean, unlike SFT which sums per-token loss
+        # When num_tokens=0, normalize_and_clip_grad_norm defaults to 1 (no division)
+        return LossOutput(loss=loss, num_tokens=0)
 
 
 class SimPOLoss(PreferenceLossBase):
