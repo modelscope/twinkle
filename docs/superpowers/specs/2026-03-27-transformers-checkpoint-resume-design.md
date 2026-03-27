@@ -114,7 +114,6 @@ Existing weight layouts remain valid. New training-state files are added alongsi
 - `cur_step`
 - `gradient_accumulation_steps`
 - `consumed_train_samples`
-- optionally `consumed_batches`
 
 The design prefers storing `consumed_train_samples` as the canonical progress value and deriving batch skipping from it where needed.
 
