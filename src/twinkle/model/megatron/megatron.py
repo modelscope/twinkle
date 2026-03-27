@@ -245,7 +245,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
-            loss_instance=CrossEntropyLoss(),
+            loss_instance=CrossEntropyLoss(reduction='sum'),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,

@@ -10,7 +10,7 @@ from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
 # Construct a device_mesh, dp=2
-device_mesh = DeviceMesh.from_sizes(dp_size=2)
+device_mesh = DeviceMesh.from_sizes(dp_size=8)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
