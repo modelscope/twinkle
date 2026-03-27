@@ -179,9 +179,6 @@ class Template:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':
                 trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
-            for messages in trajectory.get('extend_message', []):
-                if messages and messages[0]['role'] == 'user':
-                    messages.insert(0, Message(role='system', content=self.default_system))
         return [trajectory]
 
     def _to_standard_reasoning_content(self, trajectory: Trajectory) -> List[Trajectory]:
@@ -206,12 +203,6 @@ class Template:
             return result
 
         trajectory['messages'] = _extract_reasoning_content(trajectory['messages'])
-        extra_messages = trajectory.get('extend_message', [])
-        if extra_messages:
-            result = []
-            for extra_message in trajectory.get('extend_message', []):
-                result.append(_extract_reasoning_content(extra_message))
-            trajectory['extend_message'] = result
         return [trajectory]
 
     def _truncate_feature(self, feature: InputFeature, strategy: str) -> InputFeature:
@@ -238,10 +229,8 @@ class Template:
 
         strategy = self.truncation_strategy
 
-        # Split strategy: doesn't support extend_message
+        # Split strategy
         if strategy == 'split':
-            if input_feature.get('extend_message'):
-                raise ValueError('Split strategy does not support extend_message.')
             results = []
             for start in range(0, len(input_feature['input_ids']), self.max_length):
                 end = min(start + self.max_length, len(input_feature['input_ids']))
@@ -252,32 +241,18 @@ class Template:
                 results.append(InputFeature(**feat))
             return results
 
-        # left/right/raise: apply to main and extend_message
-        result = self._truncate_feature(input_feature, strategy)
-        if input_feature.get('extend_message'):
-            result['extend_message'] = [self._truncate_feature(f, strategy) for f in input_feature['extend_message']]
-        return [result]
-
-    def _add_attention_to_feature(self, feature: InputFeature) -> InputFeature:
-        """Add attention fields to a single InputFeature."""
-        input_ids = feature['input_ids']
-        feature['attention_mask'] = np.ones_like(input_ids)
-        feature['position_ids'] = np.arange(len(input_ids))
-        feature['length'] = len(input_ids)
-        return feature
+        # left/right/raise
+        return [self._truncate_feature(input_feature, strategy)]
 
     def _add_attention_fields(self, input_feature: InputFeature) -> List[InputFeature]:
-        self._add_attention_to_feature(input_feature)
-        if input_feature.get('extend_message'):
-            for f in input_feature['extend_message']:
-                self._add_attention_to_feature(f)
+        input_ids = input_feature['input_ids']
+        input_feature['attention_mask'] = np.ones_like(input_ids)
+        input_feature['position_ids'] = np.arange(len(input_ids))
+        input_feature['length'] = len(input_ids)
         return [input_feature]
 
     def _roll_labels(self, input_feature: InputFeature) -> List[InputFeature]:
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
-        if input_feature.get('extend_message'):
-            for f in input_feature['extend_message']:
-                f['labels'] = np.roll(f['labels'], -1, axis=-1)
         return [input_feature]
 
     def _process_mm_messages(self, messages: List) -> List:
@@ -305,12 +280,6 @@ class Template:
 
     def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
         trajectory['messages'] = self._process_mm_messages(trajectory['messages'])
-        if trajectory.get('extend_message'):
-            new_extend_message = []
-            for msgs in trajectory['extend_message']:
-                new_extend_message.append(self._process_mm_messages(msgs))
-            trajectory['extend_message'] = new_extend_message
-
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -361,20 +330,7 @@ class Template:
         return trajectory
 
     def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        # Encode main messages
-        result = self._encode_messages(trajectory, add_generation_prompt)
-
-        # Encode extend_message (e.g., rejected messages in DPO)
-        if trajectory.get('extend_message'):
-            encoded_extend = []
-            for msgs in trajectory['extend_message']:
-                # Create a temporary trajectory with the extended messages
-                ext_trajectory = Trajectory(messages=msgs)
-                ext_feature = self._encode_messages(ext_trajectory, add_generation_prompt)
-                encoded_extend.append(ext_feature)
-            result['extend_message'] = encoded_extend
-
-        return result
+        return self._encode_messages(trajectory, add_generation_prompt)
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
@@ -402,21 +358,90 @@ class Template:
 
         return columns
 
-    def batch_encode(self,
-                     trajectories: Union[Dict[str, Any], List[Trajectory]],
-                     add_generation_prompt: bool = False) -> List[InputFeature]:
-        output = []
-        _transfer = False
+    def _is_trajectory(self, obj: Any) -> bool:
+        """Check if an object is a Trajectory (has 'messages' key)."""
+        return isinstance(obj, Mapping) and 'messages' in obj
+
+    def _is_trajectory_dict(self, obj: Any) -> bool:
+        """Check if obj is Dict[str, Trajectory] - all values are Trajectories."""
+        if not isinstance(obj, Mapping) or not obj:
+            return False
+        return all(self._is_trajectory(v) for v in obj.values())
+
+    def _get_trajectory_keys(self, obj: Mapping) -> List[str]:
+        """Get keys in a dict whose values are Trajectories."""
+        return [k for k, v in obj.items() if self._is_trajectory(v)]
+
+    def _is_columnar_format(self, obj: Any) -> bool:
+        """Check if obj is columnar format: Dict[str, List[Any]] but NOT a Trajectory."""
+        if not isinstance(obj, Mapping) or not obj:
+            return False
+        # Trajectory has 'messages' key with list of Message dicts - not columnar
+        if self._is_trajectory(obj):
+            return False
+        # Dict[str, Trajectory] - not columnar
+        if self._is_trajectory_dict(obj):
+            return False
+        # Check if all values are non-empty lists of same length
+        first_val = next(iter(obj.values()))
+        if not isinstance(first_val, list) or len(first_val) == 0:
+            return False
+        length = len(first_val)
+        return all(isinstance(v, list) and len(v) == length for v in obj.values())
+
+    def batch_encode(
+        self,
+        trajectories: Union[Dict[str, Any], List[Trajectory], Trajectory],
+        add_generation_prompt: bool = False,
+    ) -> Union[Dict[str, Any], List[InputFeature], InputFeature]:
+        """Encode trajectories into InputFeatures.
+
+        Supports three input formats:
+            1. Trajectory -> InputFeature
+            2. List[Trajectory] -> List[InputFeature]
+            3. Dict containing Trajectories -> Dict with Trajectories encoded
+
+        Also handles columnar format (Dict[str, List]) by converting to rows first.
+        """
+        # Handle columnar format: convert to rows first
+        if self._is_columnar_format(trajectories):
+            rows = self.map_col_to_row(trajectories)
+            encoded = self.batch_encode(rows, add_generation_prompt=add_generation_prompt)
+            if isinstance(encoded, list) and encoded:
+                return self.map_row_to_col(encoded)
+            return encoded
+
+        # Case 1: Single Trajectory
+        if self._is_trajectory(trajectories) and not self._is_trajectory_dict(trajectories):
+            processed = self._invoke_pre_pipeline([trajectories])
+            output = [self.encode(t, add_generation_prompt=add_generation_prompt) for t in processed]
+            output = self._invoke_post_pipeline(output)
+            return output[0] if len(output) == 1 else output
+
+        # Case 2: List (Trajectory or Dict containing Trajectories)
+        if isinstance(trajectories, list):
+            if not trajectories:
+                return []
+            first = trajectories[0]
+            if isinstance(first, Mapping) and self._get_trajectory_keys(first):
+                # List of dicts containing Trajectories
+                return [self.batch_encode(row, add_generation_prompt=add_generation_prompt) for row in trajectories]
+            else:
+                # List[Trajectory]
+                processed = self._invoke_pre_pipeline(trajectories)
+                output = [self.encode(t, add_generation_prompt=add_generation_prompt) for t in processed]
+                return self._invoke_post_pipeline(output)
+
+        # Case 3: Dict containing Trajectories (encode only Trajectory values)
         if isinstance(trajectories, Mapping):
-            _transfer = True
-            trajectories = self.map_col_to_row(trajectories)
-        trajectories = self._invoke_pre_pipeline(trajectories)
-        for trajectory in trajectories:
-            output.append(self.encode(trajectory, add_generation_prompt=add_generation_prompt))
-        output = self._invoke_post_pipeline(output)
-        if _transfer:
-            output = self.map_row_to_col(output)
-        return output
+            traj_keys = self._get_trajectory_keys(trajectories)
+            if traj_keys:
+                result = dict(trajectories)  # Copy non-trajectory keys
+                for key in traj_keys:
+                    result[key] = self.batch_encode(trajectories[key], add_generation_prompt=add_generation_prompt)
+                return result
+
+        raise ValueError(f'Unsupported input type: {type(trajectories)}')
 
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None

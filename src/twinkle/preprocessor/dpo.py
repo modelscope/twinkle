@@ -3,11 +3,11 @@
 DPO (Direct Preference Optimization) Data Preprocessors.
 
 These preprocessors convert various preference dataset formats into the standard
-Trajectory format required by Twinkle for DPO training.
+format required by Twinkle for DPO training.
 
-DPO Trajectory format:
-    - messages: List[Message] - chosen response messages
-    - extend_message: [('rejected_messages', List[Message])] - rejected response messages
+DPO output format:
+    - positive: Trajectory - chosen response trajectory
+    - negative: Trajectory - rejected response trajectory
 """
 from typing import Any, Dict, List, Optional, Union
 
@@ -18,7 +18,7 @@ from .base import Preprocessor
 class DPOProcessor(Preprocessor):
     """Generic DPO preference data preprocessor.
 
-    Converts preference data with chosen/rejected pairs into Trajectory format.
+    Converts preference data with chosen/rejected pairs into positive/negative Trajectories.
     Supports multiple common dataset formats.
 
     Expected input format (one of):
@@ -27,9 +27,9 @@ class DPOProcessor(Preprocessor):
         3. {'messages': List[Message], 'chosen': str, 'rejected': str}
         4. {'chosen': List[Message], 'rejected': List[Message]} (full conversations)
 
-    Output Trajectory format:
-        - messages: chosen response (prompt + chosen assistant message)
-        - extend_message: [('rejected_messages', rejected_messages)]
+    Output format:
+        - positive: Trajectory with chosen response
+        - negative: Trajectory with rejected response
 
     Args:
         system: Optional system prompt to prepend.
@@ -99,11 +99,11 @@ class DPOProcessor(Preprocessor):
 
         return messages
 
-    def preprocess(self, row: Dict[str, Any]) -> Trajectory:
-        """Process a single row into a DPO Trajectory.
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Trajectory]:
+        """Process a single row into positive/negative Trajectories.
 
         Returns:
-            Trajectory with chosen in messages and rejected in extend_message.
+            Dict with 'positive' and 'negative' Trajectory.
         """
         # Build prompt messages
         prompt_messages = self._build_prompt_messages(row)
@@ -120,18 +120,22 @@ class DPOProcessor(Preprocessor):
         chosen_messages = prompt_messages + chosen_response
         rejected_messages = prompt_messages + rejected_response
 
-        # Return Trajectory with rejected in extend_message
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        """Process batched data into DPO trajectories."""
+        """Process batched data into DPO format."""
         rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
+        results = [self.preprocess(row) for row in rows]
+        # Collect all positive and negative trajectories
+        positive_list = [r['positive'] for r in results]
+        negative_list = [r['negative'] for r in results]
+        return {
+            'positive': positive_list,
+            'negative': negative_list,
+        }
 
 
 class HHRLHFProcessor(Preprocessor):
@@ -173,7 +177,7 @@ class HHRLHFProcessor(Preprocessor):
 
         return messages
 
-    def preprocess(self, row: Dict[str, Any]) -> Trajectory:
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Trajectory]:
         """Process HH-RLHF format row."""
         chosen_text = row.get('chosen', '')
         rejected_text = row.get('rejected', '')
@@ -181,16 +185,18 @@ class HHRLHFProcessor(Preprocessor):
         chosen_messages = self._parse_hh_conversation(chosen_text)
         rejected_messages = self._parse_hh_conversation(rejected_text)
 
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
+        results = [self.preprocess(row) for row in rows]
+        return {
+            'positive': [r['positive'] for r in results],
+            'negative': [r['negative'] for r in results],
+        }
 
 
 class UltraFeedbackProcessor(Preprocessor):
@@ -222,7 +228,7 @@ class UltraFeedbackProcessor(Preprocessor):
         self.response_key = response_key
         self.score_key = score_key
 
-    def preprocess(self, row: Dict[str, Any]) -> Optional[Trajectory]:
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Trajectory]]:
         """Process UltraFeedback format row."""
         instruction = row.get(self.instruction_key, '')
         completions = row.get(self.completions_key, [])
@@ -253,22 +259,21 @@ class UltraFeedbackProcessor(Preprocessor):
         chosen_messages = prompt_messages + [Message(role='assistant', content=chosen_response)]
         rejected_messages = prompt_messages + [Message(role='assistant', content=rejected_response)]
 
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
-        trajectories = []
-        for row in rows:
-            result = self.preprocess(row)
-            if result is not None:
-                trajectories.append(result)
-        if not trajectories:
+        results = [self.preprocess(row) for row in rows]
+        results = [r for r in results if r is not None]
+        if not results:
             return {}
-        rows = self.map_row_to_col(trajectories)
-        return rows
+        return {
+            'positive': [r['positive'] for r in results],
+            'negative': [r['negative'] for r in results],
+        }
 
 
 class ShareGPTDPOProcessor(Preprocessor):
@@ -303,7 +308,7 @@ class ShareGPTDPOProcessor(Preprocessor):
         content = msg.get('value', '') or msg.get('content', '')
         return Message(role=role, content=content)
 
-    def preprocess(self, row: Dict[str, Any]) -> Trajectory:
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Trajectory]:
         """Process ShareGPT DPO format row."""
         conversations = row.get('conversations', [])
 
@@ -336,16 +341,18 @@ class ShareGPTDPOProcessor(Preprocessor):
         chosen_messages = prompt_messages + [Message(role='assistant', content=chosen_content)]
         rejected_messages = prompt_messages + [Message(role='assistant', content=rejected_content)]
 
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
+        results = [self.preprocess(row) for row in rows]
+        return {
+            'positive': [r['positive'] for r in results],
+            'negative': [r['negative'] for r in results],
+        }
 
 
 class IntelOrcaDPOProcessor(Preprocessor):
@@ -363,7 +370,7 @@ class IntelOrcaDPOProcessor(Preprocessor):
     def __init__(self, default_system: Optional[str] = None):
         self.default_system = default_system
 
-    def preprocess(self, row: Dict[str, Any]) -> Trajectory:
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Trajectory]:
         """Process Intel ORCA DPO format row."""
         system = row.get('system', self.default_system)
         question = row.get('question', '')
@@ -378,16 +385,18 @@ class IntelOrcaDPOProcessor(Preprocessor):
         chosen_messages = prompt_messages + [Message(role='assistant', content=chosen)]
         rejected_messages = prompt_messages + [Message(role='assistant', content=rejected)]
 
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
+        results = [self.preprocess(row) for row in rows]
+        return {
+            'positive': [r['positive'] for r in results],
+            'negative': [r['negative'] for r in results],
+        }
 
 
 class EmojiDPOProcessor(Preprocessor):
@@ -400,9 +409,9 @@ class EmojiDPOProcessor(Preprocessor):
             'answer_en': str,  # rejected response (English)
         }
 
-    Output Trajectory format:
-        - messages: prompt + chosen (answer_zh)
-        - extend_message: [('rejected_messages', prompt + rejected (answer_en))]
+    Output format:
+        - positive: Trajectory with chosen (answer_zh)
+        - negative: Trajectory with rejected (answer_en)
 
     Args:
         system: Optional system prompt.
@@ -423,7 +432,7 @@ class EmojiDPOProcessor(Preprocessor):
         self.rejected_key = rejected_key
         self.prompt_key = prompt_key
 
-    def preprocess(self, row: Dict[str, Any]) -> Trajectory:
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Trajectory]:
         """Process a single row."""
         prompt = row.get(self.prompt_key, '')
         chosen = row.get(self.chosen_key, '')
@@ -437,16 +446,18 @@ class EmojiDPOProcessor(Preprocessor):
         chosen_messages = prompt_messages + [Message(role='assistant', content=chosen)]
         rejected_messages = prompt_messages + [Message(role='assistant', content=rejected)]
 
-        return Trajectory(
-            messages=chosen_messages,
-            extend_message=[rejected_messages]
-        )
+        return {
+            'positive': Trajectory(messages=chosen_messages),
+            'negative': Trajectory(messages=rejected_messages),
+        }
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
+        results = [self.preprocess(row) for row in rows]
+        return {
+            'positive': [r['positive'] for r in results],
+            'negative': [r['negative'] for r in results],
+        }
 
 
 class UltraFeedbackKTOProcessor(Preprocessor):

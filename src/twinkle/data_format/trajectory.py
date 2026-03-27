@@ -13,6 +13,5 @@ else:
 
 class Trajectory(TypedDict, total=False):
     messages: List[Message]
-    extend_message: List[List[Message]]
     tools: List[Tool]
     user_data: List[Tuple[str, Any]]

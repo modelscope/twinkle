@@ -87,7 +87,7 @@ class Dataset(TorchDataset):
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
             self.dataset = self.dataset.map(encode_fn,
-                                            **kwargs).filter(lambda batch: [len(x) > 0 for x in batch['input_ids']],
+                                            **kwargs).filter(lambda batch: [True] * len(next(iter(batch.values()))) if 'input_ids' not in batch else [len(x) > 0 for x in batch['input_ids']],
                                                              **kwargs)
 
     @remote_function()

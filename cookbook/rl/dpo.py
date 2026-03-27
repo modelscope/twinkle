@@ -5,7 +5,7 @@ over rejected responses using preference data, without explicit reward modeling.
 
 Pipeline:
     1. Load preference dataset with chosen/rejected pairs.
-    2. Encode chosen and rejected separately.
+    2. Encode positive and negative separately.
     3. Compute reference model log probabilities (frozen).
     4. Train policy model using DPO loss.
 
@@ -20,9 +20,9 @@ Architecture (Ray):
     DataLoader      RefModel (frozen)   PolicyModel (trainable)
                      (ref GPUs)          (policy GPUs)
 
-DPO Trajectory format:
-    - messages: List[Message] - chosen response
-    - extend_message: [('rejected_messages', List[Message])] - rejected response
+DPO data format (after preprocessing):
+    - positive: List[Trajectory] - chosen responses
+    - negative: List[Trajectory] - rejected responses
 
 For SimPO/ORPO variants that don't require a reference model,
 set REF_MODEL_GPUS=0 to skip reference model computation.
@@ -89,6 +89,7 @@ SYSTEM_PROMPT = os.environ.get('SYSTEM_PROMPT', 'You are a helpful assistant.')
 
 
 def create_dpo_dataset():
+    """Create DPO dataset with positive/negative format."""
     dataset = Dataset(DatasetMeta(DATASET_ID))
     dataset.set_template('Template', model_id=MODEL_ID, max_length=MAX_LENGTH)
     dataset.map(
@@ -97,41 +98,33 @@ def create_dpo_dataset():
             'system': SYSTEM_PROMPT,
         }
     )
+    # DPO preprocessor returns {'positive': [...], 'negative': [...]}
+    # batch_encode handles this format automatically
+    dataset.encode()
     return dataset
 
 
 def prepare_dpo_batch(
-    batch: List[Trajectory],
+    batch: Dict[str, List[Any]],
     template: Template,
 ) -> List[Dict[str, Any]]:
-    """Prepare DPO batch: encode both chosen and rejected from preprocessed Trajectories.
+    """Prepare DPO batch: convert encoded batch to list format for training.
 
     Args:
-        batch: List of Trajectory objects with:
-            - messages: chosen response messages
-            - extend_message: [('rejected_messages', rejected_messages)]
+        batch: Dict with 'positive' and 'negative' keys, each containing List[InputFeature]
 
     Returns:
-        List organized as [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
+        List organized as [positive_1, ..., positive_n, negative_1, ..., negative_n]
     """
-    chosen_trajectories = []
-    rejected_trajectories = []
-
-    for traj in batch:
-        chosen_trajectories.append(Trajectory(messages=traj.messages))
-        rejected_messages = [m[1] for m in traj['extend_messages'] if m[0] == 'rejected_messages'][0]
-        rejected_trajectories.append(Trajectory(messages=rejected_messages))
-
-    # Batch encode all trajectories
-    chosen_encoded = template.batch_encode(chosen_trajectories)
-    rejected_encoded = template.batch_encode(rejected_trajectories)
+    positive_features = batch.get('positive', [])
+    negative_features = batch.get('negative', [])
 
     # Convert to list of dicts
-    chosen_samples = [dict(enc) for enc in chosen_encoded]
-    rejected_samples = [dict(enc) for enc in rejected_encoded]
+    positive_samples = [dict(f) for f in positive_features]
+    negative_samples = [dict(f) for f in negative_features]
 
-    # Return [chosen..., rejected...]
-    return chosen_samples + rejected_samples
+    # Return [positive..., negative...]
+    return positive_samples + negative_samples
 
 
 # ── Loss Factory ──────────────────────────────────────────────────────────────
@@ -230,9 +223,8 @@ def main():
         if optim_step >= MAX_STEPS:
             break
 
-        # Prepare DPO batch: [chosen..., rejected...]
-        batch_list = batch if isinstance(batch, list) else [batch]
-        dpo_batch = prepare_dpo_batch(batch_list, template)
+        # batch is Dict[str, List[Trajectory]] with 'positive' and 'negative' keys
+        dpo_batch = prepare_dpo_batch(batch, template)
 
         # Compute reference log probabilities if using reference model
         # We compute sequence-level logps here to avoid alignment issues with micro-batching
