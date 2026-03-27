@@ -500,7 +500,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_value = result['loss']
         counts = result['num_tokens']
         if not counts:
-            counts = torch.tensor(0, device=loss_value.device)
+            counts = torch.tensor(1, device=loss_value.device)
+        # Later will gather this value, so it becomes:
+        # 1. SUM loss: gather_sum(local_num_tokens / dp_world_size) = global_num_tokens / dp_world_size
+        # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps / dp_world_size ) = gradient_accumulation_steps
+        # Then, grad will divided by this value:
+        # 1. SUM loss: gather_mean(local_sum_grad) / (global_num_tokens / dp_world_size)
+        #              = (global_sum_grad / dp_world_size) / (global_num_tokens / dp_world_size)
+        #              = global_sum_grad/global_num_tokens
+        # 2. PER TOKEN MEAN loss: gather_mean(per_token_grad * gradient_accumulation_steps) / gradient_accumulation_steps
+        #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size ) / gradient_accumulation_steps
+        #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
+        counts = counts / self.device_mesh.data_world_size
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
