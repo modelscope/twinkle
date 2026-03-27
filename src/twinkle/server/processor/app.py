@@ -124,6 +124,9 @@ def build_processor_app(ncpu_proc_per_node: int,
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
+    from twinkle.server.utils.metrics import create_metrics_middleware
+    app.middleware('http')(create_metrics_middleware('Processor'))
+
     def get_self() -> ProcessorManagement:
         return serve.get_replica_context().servable_object
 

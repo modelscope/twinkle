@@ -81,7 +81,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         self._replica_registered = False
 
         # Initialize mixins
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
+        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Model')
         self._init_adapter_manager(**adapter_config)
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -163,6 +163,9 @@ def build_model_app(model_id: str,
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
+
+    from twinkle.server.utils.metrics import create_metrics_middleware
+    app.middleware('http')(create_metrics_middleware('Model'))
 
     def get_self() -> ModelManagement:
         return serve.get_replica_context().servable_object

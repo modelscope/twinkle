@@ -123,3 +123,13 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
+
+# Monitoring configuration (optional)
+# Uncomment to customize Ray Dashboard and metrics export settings.
+# When enabled, Ray Dashboard is accessible at http://<host>:<dashboard_port>
+# and Prometheus metrics are exported at http://<host>:<metrics_export_port>.
+# monitoring:
+#   dashboard_host: "0.0.0.0"
+#   dashboard_port: 8265
+#   metrics_export_port: 8080
+#   metrics_update_interval: 15

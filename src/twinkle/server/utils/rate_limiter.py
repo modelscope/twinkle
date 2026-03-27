@@ -41,6 +41,8 @@ class RateLimiter:
         window_seconds: float = 1.0,
         token_cleanup_multiplier: float = 10.0,
         token_cleanup_interval: float = 60.0,
+        active_tokens_gauge=None,
+        deployment_name: str = '',
     ):
         """Initialize the rate limiter.
 
@@ -53,6 +55,8 @@ class RateLimiter:
                 will be removed. Default is 10.0 (10x the window).
             token_cleanup_interval: How often to run the cleanup task in seconds.
                 Default is 60.0 (every minute).
+            active_tokens_gauge: Optional ray.util.metrics Gauge for tracking active token count.
+            deployment_name: Deployment name for metrics labels.
         """
         self.rps_limit = rps_limit
         self.tps_limit = tps_limit
@@ -71,6 +75,10 @@ class RateLimiter:
         # Cleanup tasks
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_started = False
+
+        # Metrics gauge for active token count
+        self._active_tokens_gauge = active_tokens_gauge
+        self._deployment_name = deployment_name
 
     def _cleanup_old_requests(self, token: str, current_time: float) -> None:
         """Remove requests outside the sliding window.
@@ -121,6 +129,13 @@ class RateLimiter:
                     if tokens_to_remove:
                         logger.debug(f'[RateLimiter] Cleaned up {len(tokens_to_remove)} inactive tokens. '
                                      f'Active tokens remaining: {len(self._token_requests)}')
+
+                    if self._active_tokens_gauge is not None:
+                        try:
+                            tags = {'deployment': self._deployment_name} if self._deployment_name else {}
+                            self._active_tokens_gauge.set(len(self._token_requests), tags=tags)
+                        except Exception:
+                            pass
 
             except asyncio.CancelledError:
                 logger.debug('[RateLimiter] Cleanup task cancelled')
@@ -193,6 +208,12 @@ class RateLimiter:
 
             # Record this request
             self._token_requests[token].append((current_time, input_tokens))
+            if self._active_tokens_gauge is not None:
+                try:
+                    tags = {'deployment': self._deployment_name} if self._deployment_name else {}
+                    self._active_tokens_gauge.set(len(self._token_requests), tags=tags)
+                except Exception:
+                    pass
             return True, None
 
     def get_stats(self, token: str) -> dict[str, Any]:

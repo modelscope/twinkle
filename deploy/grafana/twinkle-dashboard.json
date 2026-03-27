@@ -1,0 +1,185 @@
+{
+  "__inputs": [],
+  "__elements": {},
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    }
+  ],
+  "id": null,
+  "uid": "twinkle-server",
+  "title": "Twinkle Server Monitoring",
+  "tags": ["twinkle", "ray", "monitoring"],
+  "timezone": "browser",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "15s",
+  "schemaVersion": 38,
+  "templating": {
+    "list": [
+      {
+        "name": "deployment",
+        "type": "query",
+        "query": "label_values(twinkle_requests_total, deployment)",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "title": "Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Active Sessions",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_active_sessions", "legendFormat": "Sessions" }],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 100 }] } } }
+    },
+    {
+      "title": "Active Models",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_active_models", "legendFormat": "Models" }],
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] } } }
+    },
+    {
+      "title": "Active Sampling Sessions",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_active_sampling_sessions", "legendFormat": "Sampling" }],
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] } } }
+    },
+    {
+      "title": "Active Futures",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_active_futures", "legendFormat": "Futures" }],
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 500 }] } } }
+    },
+    {
+      "title": "Total QPS (by deployment)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(rate(twinkle_requests_total{deployment=~\"$deployment\"}[1m])) by (deployment)", "legendFormat": "{{ deployment }}" }],
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 5 },
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "title": "Request Metrics",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "collapsed": false
+    },
+    {
+      "title": "Request Rate by Endpoint",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(rate(twinkle_requests_total{deployment=~\"$deployment\"}[1m])) by (deployment, method)", "legendFormat": "{{ deployment }} {{ method }}" }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "title": "Latency P50 / P95 / P99",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(twinkle_request_duration_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment))", "legendFormat": "p50 {{ deployment }}" },
+        { "expr": "histogram_quantile(0.95, sum(rate(twinkle_request_duration_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment))", "legendFormat": "p95 {{ deployment }}" },
+        { "expr": "histogram_quantile(0.99, sum(rate(twinkle_request_duration_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment))", "legendFormat": "p99 {{ deployment }}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Error Rate (5xx)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(rate(twinkle_requests_total{deployment=~\"$deployment\", status=~\"5..\"}[1m])) by (deployment)", "legendFormat": "{{ deployment }}" }],
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "red" } } }
+    },
+    {
+      "title": "Task Queue",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "collapsed": false
+    },
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_task_queue_depth{deployment=~\"$deployment\"}", "legendFormat": "{{ deployment }}" }],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "title": "Queue Wait P50 / P95",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(twinkle_task_queue_wait_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment))", "legendFormat": "p50 {{ deployment }}" },
+        { "expr": "histogram_quantile(0.95, sum(rate(twinkle_task_queue_wait_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment))", "legendFormat": "p95 {{ deployment }}" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Execution Time by Task Type",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(twinkle_task_execution_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment, task_type))", "legendFormat": "p50 {{ deployment }}/{{ task_type }}" },
+        { "expr": "histogram_quantile(0.95, sum(rate(twinkle_task_execution_seconds_bucket{deployment=~\"$deployment\"}[5m])) by (le, deployment, task_type))", "legendFormat": "p95 {{ deployment }}/{{ task_type }}" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Rate Limiting",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "collapsed": false
+    },
+    {
+      "title": "Rate Limit Rejections",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(rate(twinkle_rate_limit_rejections_total{deployment=~\"$deployment\"}[1m])) by (deployment)", "legendFormat": "{{ deployment }}" }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "orange" } } }
+    },
+    {
+      "title": "Active Tokens (Rate Limiter)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "twinkle_rate_limiter_active_tokens{deployment=~\"$deployment\"}", "legendFormat": "{{ deployment }}" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    }
+  ]
+}

@@ -128,7 +128,14 @@ class ServerLauncher:
             # Use runtime_env to apply patches in worker processes
             # This is required because Ray Serve's ProxyActor runs in separate processes
             runtime_env = get_runtime_env_for_patches()
-            ray.init(namespace=namespace, runtime_env=runtime_env)
+            monitoring = self.config.get('monitoring', {})
+            ray.init(
+                namespace=namespace,
+                runtime_env=runtime_env,
+                dashboard_host=monitoring.get('dashboard_host', '0.0.0.0'),
+                dashboard_port=monitoring.get('dashboard_port', 8265),
+                _metrics_export_port=monitoring.get('metrics_export_port', 8080),
+            )
             logger.info(f'Ray initialized with namespace={namespace}')
 
         self._ray_initialized = True

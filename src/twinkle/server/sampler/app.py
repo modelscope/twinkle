@@ -80,7 +80,7 @@ class SamplerManagement(TaskQueueMixin):
         self.state: ServerStateProxy = get_server_state()
 
         # Initialize task queue mixin
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
+        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Sampler')
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -134,6 +134,9 @@ def build_sampler_app(model_id: str,
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
+
+    from twinkle.server.utils.metrics import create_metrics_middleware
+    app.middleware('http')(create_metrics_middleware('Sampler'))
 
     def get_self() -> SamplerManagement:
         return serve.get_replica_context().servable_object
