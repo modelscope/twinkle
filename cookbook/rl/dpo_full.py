@@ -36,19 +36,12 @@ Environment variables (all optional):
     MODEL_GPUS        – GPUs for policy model                 (default: 4)
     REF_MODEL_GPUS    – GPUs for reference model              (default: 4, 0 to disable)
     BATCH_SIZE        – global batch size (preference pairs)  (default: 8)
-    MICRO_BATCH_SIZE  – per-device micro batch size           (default: 2)
     MAX_STEPS         – total optimization steps              (default: 1000)
     LR                – learning rate                         (default: 1e-5)
     DPO_BETA          – DPO temperature parameter             (default: 0.1)
     LOSS_TYPE         – DPO variant (sigmoid/hinge/ipo/simpo/orpo/cpo) (default: sigmoid)
     SAVE_STEPS        – checkpoint save interval              (default: 100)
     MAX_LENGTH        – max sequence length                   (default: 2048)
-
-    Dataset field mapping (for custom datasets):
-    PROMPT_KEY        – key for prompt field                  (default: 'prompt')
-    CHOSEN_KEY        – key for chosen response               (default: 'answer_zh')
-    REJECTED_KEY      – key for rejected response             (default: 'answer_en')
-    SYSTEM_PROMPT     – system prompt to prepend              (default: 'You are a helpful assistant.')
 """
 
 import os
@@ -76,7 +69,6 @@ REF_MODEL_GPUS = int(os.environ.get('REF_MODEL_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + REF_MODEL_GPUS
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
@@ -198,7 +190,7 @@ def main():
     reference_free = LOSS_TYPE in ['simpo', 'orpo', 'cpo']
 
     # Set up loss function and metrics
-    loss_fn = create_loss(LOSS_TYPE, DPO_BETA, sft_weight=SFT_WEIGHT, reference_free=False)
+    loss_fn = create_loss(LOSS_TYPE, DPO_BETA, sft_weight=SFT_WEIGHT, reference_free=reference_free)
 
     # Configure optimizer based on backend (full-parameter training)
     if USE_MEGATRON:

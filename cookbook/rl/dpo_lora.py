@@ -34,19 +34,12 @@ Environment variables (all optional):
     DATASET_ID        – (default: ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji)
     MODEL_GPUS        – GPUs for policy model                 (default: 8)
     BATCH_SIZE        – global batch size (preference pairs)  (default: 8)
-    MICRO_BATCH_SIZE  – per-device micro batch size           (default: 2)
     MAX_STEPS         – total optimization steps              (default: 1000)
     LR                – learning rate                         (default: 1e-4)
     DPO_BETA          – DPO temperature parameter             (default: 0.1)
     LOSS_TYPE         – DPO variant (sigmoid/hinge/ipo)       (default: sigmoid)
     SAVE_STEPS        – checkpoint save interval              (default: 100)
     MAX_LENGTH        – max sequence length                   (default: 2048)
-
-    Dataset field mapping (for custom datasets):
-    PROMPT_KEY        – key for prompt field                  (default: 'prompt')
-    CHOSEN_KEY        – key for chosen response               (default: 'answer_zh')
-    REJECTED_KEY      – key for rejected response             (default: 'answer_en')
-    SYSTEM_PROMPT     – system prompt to prepend              (default: 'You are a helpful assistant.')
 """
 
 import os
@@ -74,7 +67,6 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))  # LoRA DPO requires higher LR (1e-4 to 3e-4)
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
