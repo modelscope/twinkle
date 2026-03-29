@@ -56,7 +56,6 @@ class DPOMetric(Metric):
         if src_len == target_len:
             return logps
         elif src_len < target_len:
-            breakpoint()
             raise ValueError(
                 f'ref_logps seq_len ({src_len}) < target seq_len ({target_len}). '
                 f'This should not happen when both models process the same batch.'

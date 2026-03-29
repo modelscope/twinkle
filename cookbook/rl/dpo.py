@@ -70,8 +70,8 @@ logger = get_logger()
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-7B-Instruct')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-REF_MODEL_GPUS = int(os.environ.get('REF_MODEL_GPUS', 4))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 2))
+REF_MODEL_GPUS = int(os.environ.get('REF_MODEL_GPUS', 2))
 NUM_GPUS = MODEL_GPUS + REF_MODEL_GPUS
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs

@@ -19,7 +19,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
     for d in outputs:
         all_keys.update(d.keys())
 
-    outputs = [r for i, r in enumerate(outputs) if i in device_mesh.get_pp_last_ranks()]
+    outputs = [r for i, r in enumerate(outputs) if i in device_mesh.get_collect_ranks()]
     result = {}
     for key in all_keys:
         values = [d[key] for d in outputs if key in d]

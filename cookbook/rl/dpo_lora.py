@@ -68,10 +68,10 @@ logger = get_logger()
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-7B-Instruct')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 2))
 
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 8))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))  # Number of preference pairs
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))  # LoRA DPO requires higher LR (1e-4 to 3e-4)
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))

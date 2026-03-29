@@ -40,6 +40,9 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils import get_logger
+
+logger = get_logger()
 
 
 @dataclass
@@ -188,6 +191,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+        # breakpoint()
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
@@ -415,7 +419,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if isinstance(inputs, dict):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
-        breakpoint()
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
@@ -443,6 +446,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        logger.info(f'logps: {outputs["logps"].sum()}')
         outputs = copy(outputs)
         outputs['past_key_values'] = None
         if not return_logits:
