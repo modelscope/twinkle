@@ -115,10 +115,7 @@ class Template:
 
     def preprocess_image(self, image: ImageInput) -> 'Image.Image':
         if isinstance(image, dict):
-            if image.get('path'):
-                image = image['path']
-            else:
-                image = image['bytes']
+            image = image.get('bytes') or image.get('path')
         return load_image(image)
 
     def preprocess_video(self, video: VideoInput) -> List['Image.Image']:
@@ -214,21 +211,40 @@ class Template:
             trajectory['extend_message'] = result
         return [trajectory]
 
+    _truncatable_fields = {'input_ids', 'labels'}
+
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
         if self.max_length and len(input_feature['input_ids']) > self.max_length:
             if self.truncation_strategy == 'raise':
                 raise ValueError(f'An input message(length: {len(input_feature["input_ids"])} '
                                  f'exceeds the maximum length({self.max_length})')
             elif self.truncation_strategy == 'left':
-                return [InputFeature(**{key: value[-self.max_length:] for key, value in input_feature.items()})]
+                return [
+                    InputFeature(
+                        **{
+                            key: (value[-self.max_length:] if key in self._truncatable_fields else value)
+                            for key, value in input_feature.items()
+                        })
+                ]
             elif self.truncation_strategy == 'right':
-                return [InputFeature(**{key: value[:self.max_length] for key, value in input_feature.items()})]
+                return [
+                    InputFeature(
+                        **{
+                            key: (value[:self.max_length] if key in self._truncatable_fields else value)
+                            for key, value in input_feature.items()
+                        })
+                ]
             else:  # split
                 result = []
                 total_length = len(input_feature['input_ids'])
                 for start in range(0, total_length, self.max_length):
                     end = min(start + self.max_length, total_length)
-                    result.append(InputFeature(**{key: value[start:end] for key, value in input_feature.items()}))
+                    result.append(
+                        InputFeature(
+                            **{
+                                key: (value[start:end] if key in self._truncatable_fields else value)
+                                for key, value in input_feature.items()
+                            }))
                 return result
         else:
             return [input_feature]
@@ -250,27 +266,56 @@ class Template:
         for message in messages:
             message = copy(message)
             content = message['content']
-            msg_images = message.get('images')
-            msg_videos = message.get('videos')
-            msg_audios = message.get('audios')
-            if msg_images:
-                message['images'] = self.preprocess_images(msg_images)
-                assert len(message['images']) == content.count(self.image_placeholder)
-            if msg_videos:
-                message['videos'] = self.preprocess_videos(msg_videos)
-                assert len(message['videos']) == content.count(self.video_placeholder)
-            if msg_audios:
-                message['audios'] = self.preprocess_audios(msg_audios)
-                assert len(message['audios']) == content.count(self.audio_placeholder)
-            new_messages.append(
-                transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
-                                             self.audio_placeholder, self.is_mm))
-
+            if isinstance(content, list):
+                # Transformers standard format: content is List[Dict].
+                # Preprocess media references (url/path/bytes) to PIL objects in-place.
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type')
+                    if btype == 'image':
+                        for key in ('image', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                block[key] = self.preprocess_image(block[key])
+                                break
+                    elif btype == 'video':
+                        for key in ('video', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                block[key] = self.preprocess_video(block[key])
+                                break
+            else:
+                # content is str with placeholders,
+                # media stored in message['images']/['videos']/['audios'].
+                msg_images = message.get('images')
+                msg_videos = message.get('videos')
+                msg_audios = message.get('audios')
+                if msg_images:
+                    message['images'] = self.preprocess_images(msg_images)
+                    assert len(message['images']) == content.count(self.image_placeholder)
+                if msg_videos:
+                    message['videos'] = self.preprocess_videos(msg_videos)
+                    assert len(message['videos']) == content.count(self.video_placeholder)
+                if msg_audios:
+                    message['audios'] = self.preprocess_audios(msg_audios)
+                    assert len(message['audios']) == content.count(self.audio_placeholder)
+                message = transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
+                                                       self.audio_placeholder, self.is_mm)
+            new_messages.append(message)
         trajectory['messages'] = new_messages
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory['messages']]
+        # Arrow serialization may pad content blocks with null keys (e.g. 'image': None
+        # on text-only blocks). Jinja checks `'image' in item` on dict keys, so these
+        # phantom keys cause wrong token counts. Strip them here.
+        for msg in messages:
+            if not isinstance(msg.get('content'), list):
+                continue
+            msg['content'] = [{
+                k: v
+                for k, v in b.items() if v is not None
+            } for b in msg['content'] if isinstance(b, dict)]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
         inputs = self.processor.apply_chat_template(
             messages,
