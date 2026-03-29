@@ -410,7 +410,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
 
         if micro_batch_size is None:
-            micro_batch_size = 1
+            # Compatible with DPO
+            micro_batch_size = 2
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting

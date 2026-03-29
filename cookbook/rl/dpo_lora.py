@@ -1,25 +1,27 @@
 """DPO (Direct Preference Optimization) Training with LoRA (Single GPU Group).
 
 LoRA-based DPO training: uses the base model (without LoRA adapter) as reference
-model by calling forward_only with adapter_name=''. This eliminates the need for
+model by calling forward_only with disable_lora=True. This eliminates the need for
 a separate reference model GPU group.
+
+Supports both Transformers (FSDP) and Megatron backends via USE_MEGATRON flag.
 
 Pipeline:
     1. Load preference dataset with chosen/rejected pairs.
     2. Encode positive and negative separately.
-    3. Compute reference model log probabilities using base model (adapter_name='').
+    3. Compute reference model log probabilities using base model (disable_lora=True).
     4. Train policy model (with LoRA adapter) using DPO loss.
 
 Architecture (Ray - Single Group):
     ┌─────────────────────────────────────────────────────────────────┐
     │ Driver (CPU)                                                    │
     │  dataloader ──► batched preference pairs                       │
-    │  policy_model.forward_only(adapter_name='') ──► reference logps│
+    │  policy_model.forward_only(disable_lora=True) ──► ref logps    │
     │  policy_model.forward_backward() ──► DPO loss + gradient       │
     └─────────────────────────────────────────────────────────────────┘
          │
     PolicyModel (with LoRA adapter)
-     - forward_only(adapter_name='') → base model inference (reference)
+     - forward_only(disable_lora=True) → base model inference (reference)
      - forward_backward() → LoRA adapter training (policy)
 
 DPO data format (after preprocessing):
@@ -27,9 +29,10 @@ DPO data format (after preprocessing):
     - negative: List[Trajectory] - rejected responses
 
 Environment variables (all optional):
-    MODEL_ID          – (default: ms://Qwen/Qwen2.5-7B-Instruct)
+    USE_MEGATRON      – Use Megatron backend (default: 0, use Transformers)
+    MODEL_ID          – (default: ms://Qwen/Qwen3-4B)
     DATASET_ID        – (default: ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji)
-    MODEL_GPUS        – GPUs for policy model                 (default: 4)
+    MODEL_GPUS        – GPUs for policy model                 (default: 8)
     BATCH_SIZE        – global batch size (preference pairs)  (default: 8)
     MICRO_BATCH_SIZE  – per-device micro batch size           (default: 2)
     MAX_STEPS         – total optimization steps              (default: 1000)
@@ -58,20 +61,20 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import DPOLoss
 from twinkle.metric import DPOMetric
-from twinkle.model import MegatronModel
 from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle.processor import InputProcessor
 
 logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+USE_MEGATRON = int(os.environ.get('USE_MEGATRON', 0))
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 8))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))  # LoRA DPO requires higher LR (1e-4 to 3e-4)
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
@@ -137,8 +140,19 @@ def main():
         DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
     ]
 
-    policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=4, pp_size=2)
-    twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_groups)
+    # Configure device mesh based on backend
+    if USE_MEGATRON:
+        # Megatron: dp=4, pp=2
+        from twinkle.model import MegatronModel
+        policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=4, pp_size=2)
+        ModelClass = MegatronModel
+    else:
+        # Transformers: fsdp=4, dp=2
+        from twinkle.model import TransformersModel
+        policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, fsdp_size=4, dp_size=2)
+        ModelClass = TransformersModel
+
+    twinkle.initialize(mode='ray', nproc_per_node=MODEL_GPUS, groups=device_groups)
 
     # ── DataLoader Setup ──────────────────────────────────────────────────────
     dataloader = DataLoader(
@@ -147,7 +161,6 @@ def main():
         min_batch_size=BATCH_SIZE,
         device_mesh=policy_mesh,
     )
-    length = len(dataloader)
 
     # ── Policy Model Setup with LoRA ──────────────────────────────────────────
     lora_config = LoraConfig(
@@ -157,15 +170,21 @@ def main():
         lora_dropout=0.05,
     )
 
-    policy_model = MegatronModel(
+    policy_model = ModelClass(
         model_id=MODEL_ID,
         device_mesh=policy_mesh,
         remote_group='policy',
     )
     MAX_STEPS = len(dataloader)
     policy_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    policy_model.set_optimizer('default', lr=LEARNING_RATE, weight_decay=0.01, adapter_name=ADAPTER_NAME)
-    policy_model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, adapter_name=ADAPTER_NAME)
+
+    # Configure optimizer based on backend
+    if USE_MEGATRON:
+        policy_model.set_optimizer('default', lr=LEARNING_RATE, weight_decay=0.01, adapter_name=ADAPTER_NAME)
+        policy_model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, adapter_name=ADAPTER_NAME)
+    else:
+        policy_model.set_optimizer('AdamW', lr=LEARNING_RATE, weight_decay=0.01)
+        policy_model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=LEARNING_RATE * 0.1)
 
     # Set up loss function and metrics
     loss_fn = DPOLoss(
@@ -174,14 +193,16 @@ def main():
         reference_free=False,  # We use base model as reference via disable_lora=True
         sft_weight=SFT_WEIGHT,
     )
-    policy_model.set_loss(loss_fn, adapter_name=ADAPTER_NAME)
-    policy_model.add_metric(DPOMetric, beta=DPO_BETA, adapter_name=ADAPTER_NAME)
-    policy_model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
-    policy_model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
+
+    policy_model.set_loss(loss_fn)
+    policy_model.add_metric(DPOMetric, beta=DPO_BETA)
+    policy_model.set_processor(InputProcessor)
+    policy_model.set_template('Template', model_id=MODEL_ID)
 
     optim_step = 0
+    backend_name = 'Megatron' if USE_MEGATRON else 'Transformers'
     logger.info(get_device_placement())
-    logger.info(f'Starting LoRA DPO training: loss_type={LOSS_TYPE}, beta={DPO_BETA}, lr={LEARNING_RATE}')
+    logger.info(f'Starting LoRA DPO training ({backend_name}): loss_type={LOSS_TYPE}, beta={DPO_BETA}, lr={LEARNING_RATE}')
     logger.info(f'Using base model (disable_lora=True) as reference model')
 
     # ── Training Loop ─────────────────────────────────────────────────────────
@@ -191,33 +212,24 @@ def main():
 
         # Get reference outputs using base model (without LoRA adapter)
         # disable_lora=True tells the model to skip LoRA and use base weights
-        ref_outputs = policy_model.forward_only(inputs=dpo_batch, micro_batch_size=2, disable_lora=True, adapter_name=ADAPTER_NAME)
-        # Forward-backward pass with DPO loss (using LoRA adapter)
-        # ref_outputs is passed to loss which extracts logps internally
-        policy_model.forward_backward(
-            inputs=dpo_batch,
-            ref_outputs=ref_outputs,
-            micro_batch_size=2,
-            adapter_name=ADAPTER_NAME
-        )
+        ref_outputs = policy_model.forward_only(inputs=dpo_batch, disable_lora=True)
+        policy_model.forward_backward(inputs=dpo_batch, ref_outputs=ref_outputs)
+        policy_model.clip_grad_and_step()
 
-        # Gradient clipping and optimizer step
-        policy_model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
+        optim_step += 1
 
         # Logging
-        if optim_step % 16 == 0:
-            metrics = policy_model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME)
+        if optim_step % GRADIENT_ACCUMULATION_STEPS == 0:
+            metrics = policy_model.calculate_metric(is_training=True)
             logger.info(f'[Step {optim_step // GRADIENT_ACCUMULATION_STEPS}/{MAX_STEPS}] {metrics}')
 
         # Checkpointing
         if optim_step % SAVE_STEPS == 0:
-            policy_model.save(f'dpo-lora-checkpoint-{optim_step}', adapter_name=ADAPTER_NAME)
-        
-        optim_step += 1
+            policy_model.save(f'dpo-lora-checkpoint-{optim_step}')
 
     # ── Save Final Checkpoint ─────────────────────────────────────────────────
     logger.info(f'Training completed. Total steps: {optim_step}')
-    policy_model.save('dpo-lora-final-checkpoint', adapter_name=ADAPTER_NAME)
+    policy_model.save('dpo-lora-final-checkpoint')
 
 
 if __name__ == '__main__':
