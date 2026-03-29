@@ -205,7 +205,7 @@ class MultiLora:
 
                 lora_A_keys = self.lora_A.keys()
                 for active_adapter in self.active_adapters:
-                    if active_adapter not in lora_A_keys:
+                    if active_adapter not in lora_A_keys or self.disable_adapters:
                         continue
                     _lora = _self.find_lora(active_adapter)
                     target_modules = _lora.tenant_config.target_modules
@@ -238,7 +238,7 @@ class MultiLora:
 
                 lora_embedding_A_keys = self.lora_embedding_A.keys()
                 for active_adapter in self.active_adapters:
-                    if active_adapter not in lora_embedding_A_keys:
+                    if active_adapter not in lora_embedding_A_keys or self.disable_adapters:
                         continue
                     _lora = self.find_lora(active_adapter)
                     target_modules = _lora.tenant_config.target_modules

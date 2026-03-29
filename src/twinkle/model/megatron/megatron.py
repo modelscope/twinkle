@@ -400,7 +400,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 seq_length = original_seq_length + (divisor - original_seq_length % divisor)
             else:
                 seq_length = original_seq_length
-
+        
+        if 'ref_outputs' in kwargs:
+            breakpoint()
         num_microbatches = len(inputs)
         loss_extra_kwargs_per_mb = []
         if num_microbatches <= 1:

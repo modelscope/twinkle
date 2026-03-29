@@ -58,7 +58,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.loss import DPOLoss
 from twinkle.metric import DPOMetric
-from twinkle.model import MegatronModel
+from twinkle.model import MultiLoraMegatronModel
 from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle.processor import InputProcessor
 
@@ -68,7 +68,7 @@ logger = get_logger()
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen2.5-7B-Instruct')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 2))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))  # Number of preference pairs
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
@@ -137,7 +137,7 @@ def main():
         DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
     ]
 
-    policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=1, pp_size=2, cp_size=2, tp_size=2)
     twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_groups)
 
     # ── DataLoader Setup ──────────────────────────────────────────────────────
@@ -157,15 +157,17 @@ def main():
         lora_dropout=0.05,
     )
 
-    policy_model = MegatronModel(
+    policy_model = MultiLoraMegatronModel(
         model_id=MODEL_ID,
         device_mesh=policy_mesh,
         remote_group='policy',
     )
     MAX_STEPS = len(dataloader)
     policy_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    policy_model.set_optimizer('default', lr=LEARNING_RATE, weight_decay=0.01)
-    policy_model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS)
+    # policy_model.set_optimizer('AdamW', lr=LEARNING_RATE, weight_decay=0.01, adapter_name=ADAPTER_NAME)
+    # policy_model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, adapter_name=ADAPTER_NAME)
+    policy_model.set_optimizer('default', lr=LEARNING_RATE, weight_decay=0.01, adapter_name=ADAPTER_NAME)
+    policy_model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, adapter_name=ADAPTER_NAME)
 
     # Set up loss function and metrics
     loss_fn = DPOLoss(
@@ -174,10 +176,10 @@ def main():
         reference_free=False,  # We use base model as reference via disable_lora=True
         sft_weight=SFT_WEIGHT,
     )
-    policy_model.set_loss(loss_fn)
-    policy_model.add_metric(DPOMetric, beta=DPO_BETA)
-    policy_model.set_processor(InputProcessor)
-    policy_model.set_template('Template', model_id=MODEL_ID)
+    policy_model.set_loss(loss_fn, adapter_name=ADAPTER_NAME)
+    policy_model.add_metric(DPOMetric, beta=DPO_BETA, adapter_name=ADAPTER_NAME)
+    policy_model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
+    policy_model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
     optim_step = 0
     logger.info(get_device_placement())
@@ -191,32 +193,32 @@ def main():
 
         # Get reference outputs using base model (without LoRA adapter)
         # disable_lora=True tells the model to skip LoRA and use base weights
-        ref_outputs = policy_model.forward_only(inputs=dpo_batch, micro_batch_size=2, disable_lora=True)
-
+        ref_outputs = policy_model.forward_only(inputs=dpo_batch, micro_batch_size=2, disable_lora=True, adapter_name=ADAPTER_NAME)
         # Forward-backward pass with DPO loss (using LoRA adapter)
         # ref_outputs is passed to loss which extracts logps internally
         policy_model.forward_backward(
             inputs=dpo_batch,
             ref_outputs=ref_outputs,
             micro_batch_size=2,
+            adapter_name=ADAPTER_NAME
         )
 
         # Gradient clipping and optimizer step
-        policy_model.clip_grad_and_step()
+        policy_model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
         optim_step += 1
 
         # Logging
         if optim_step % 1 == 0:
-            metrics = policy_model.calculate_metric(is_training=True)
+            metrics = policy_model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME)
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {metrics}')
 
         # Checkpointing
         if optim_step % SAVE_STEPS == 0:
-            policy_model.save(f'dpo-lora-checkpoint-{optim_step}')
+            policy_model.save(f'dpo-lora-checkpoint-{optim_step}', adapter_name=ADAPTER_NAME)
 
     # ── Save Final Checkpoint ─────────────────────────────────────────────────
     logger.info(f'Training completed. Total steps: {optim_step}')
-    policy_model.save('dpo-lora-final-checkpoint')
+    policy_model.save('dpo-lora-final-checkpoint', adapter_name=ADAPTER_NAME)
 
 
 if __name__ == '__main__':

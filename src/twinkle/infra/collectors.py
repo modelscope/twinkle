@@ -61,7 +61,7 @@ def _pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -20
         raise ValueError('Empty tensor list')
 
     if len(tensors) == 1:
-        return tensors[0].unsqueeze(0)
+        return tensors[0]
 
     max_ndim = max(t.ndim for t in tensors)
     expanded_tensors = []

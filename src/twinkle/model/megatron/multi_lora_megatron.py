@@ -129,7 +129,7 @@ class MultiLoraMegatronModel(MegatronModel):
         with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
-    @remote_function(dispatch='slice_dp', collect='mean', sync=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
