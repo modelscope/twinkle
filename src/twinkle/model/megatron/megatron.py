@@ -25,6 +25,7 @@ import twinkle.patch
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, torch_util
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
@@ -38,53 +39,28 @@ from .strategy import MegatronStrategy
 
 
 @dataclass
-class MegatronOptimizerGroup:
+class MegatronOptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Megatron training.
 
     Similar to OptimizerGroup but adapted for Megatron's distributed training.
     """
-    adapter_name: str = None
-    adapter_config: Any = None
-    optimizer: Optimizer = None
-    lr_scheduler: LRScheduler = None
-    inputs: List[InputFeature] = None
-    outputs: ModelOutput = None
-    loss_instance: Loss = None
-    loss_value: Any = None
-    eval_inputs: List[InputFeature] = None
-    eval_outputs: ModelOutput = None
-    eval_loss_value: Any = None
-    template: Template = None
-    processor: InputProcessor = None
-    gradient_accumulation_steps: int = 1
-    cur_step: int = 0
-    _dp_group = None
-    train_metrics: List[Metric] = field(default_factory=list)
-    eval_metrics: List[Metric] = field(default_factory=list)
-    _device_mesh: DeviceMesh = None
-    # Megatron optimizer specific fields
-    _last_grad_norm: float = 0.0
+    # Megatron-specific fields
     _last_step_success: bool = True
-
-    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
-        if gradient_accumulation_steps is None:
-            gradient_accumulation_steps = self.gradient_accumulation_steps
-        else:
-            self.gradient_accumulation_steps = gradient_accumulation_steps
-        return (self.cur_step - 1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
         if self._device_mesh.data_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
-        self.train_metrics = [
+        train_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.train_status = TrainStatus(metrics=train_metrics)
 
-        self.eval_metrics = [
+        eval_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.eval_status = TrainStatus(metrics=eval_metrics)
 
     def _get_lr(self):
         _lrs = []
@@ -92,36 +68,6 @@ class MegatronOptimizerGroup:
         for param_group in self.optimizer.param_groups:
             _lrs.append(param_group.get('lr', _default_lr))
         return _lrs
-
-    def accumulate_metrics(self, is_training):
-        if is_training:
-            metrics = self.train_metrics
-            inputs = self.inputs
-            outputs = self.outputs
-        else:
-            metrics = self.eval_metrics
-            inputs = self.eval_inputs
-            outputs = self.eval_outputs
-        if len(metrics) > 0 and inputs is not None and outputs is not None:
-            for metric in metrics:
-                metric.accumulate(
-                    inputs,
-                    outputs,
-                    lr=self._get_lr(),
-                    step=self.cur_step - 1,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm)
-
-    def calculate_metrics(self, is_training):
-        self.accumulate_metrics(is_training)
-        if is_training:
-            metrics = self.train_metrics
-        else:
-            metrics = self.eval_metrics
-        results = {}
-        for metric in metrics:
-            results.update(metric.calculate())
-        return results
 
 
 _default_adapter_name = ''
@@ -610,11 +556,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if not return_logits:
             logits = None
         if forward_only:
-            optimizer_config.eval_inputs = inputs
-            optimizer_config.eval_outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.eval_status.inputs = inputs
+            optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
         else:
-            optimizer_config.inputs = inputs
-            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.train_status.inputs = inputs
+            optimizer_config.train_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
         return ModelOutput(logits=logits, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
@@ -760,9 +706,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
         if is_training is None or is_training is True:
-            optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.train_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
         if not is_training:
-            optimizer_config.eval_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
