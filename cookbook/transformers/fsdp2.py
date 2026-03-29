@@ -1,9 +1,8 @@
-import os
 from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
-from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle import DeviceMesh, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -68,7 +67,7 @@ def train():
         model.forward_backward(inputs=batch)
         # Step
         model.clip_grad_and_step()
-        if step % 1 == 0:
+        if step % 20 == 0:
             # Print metric
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
