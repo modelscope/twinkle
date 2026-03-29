@@ -477,6 +477,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Handle disable_lora for base model inference (e.g., reference in DPO)
         def _set_disable_adapters(model, value: bool):
+            model = self.strategy.unwrap_model(model)
             if isinstance(model, list):
                 for m in model:
                     if isinstance(m, PeftModel):

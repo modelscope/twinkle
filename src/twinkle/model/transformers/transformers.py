@@ -40,9 +40,6 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
-from twinkle.utils import get_logger
-
-logger = get_logger()
 
 
 @dataclass
@@ -427,8 +424,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs = self.sp_strategy.preprocess_inputs(inputs)
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
-            if disable_lora and isinstance(self.model, PeftModel):
-                with self.model.disable_adapter():
+            unwrapped_model = self.strategy.unwrap_model(self.model)
+            if disable_lora and isinstance(unwrapped_model, PeftModel):
+                with unwrapped_model.disable_adapter():
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
@@ -446,7 +444,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        logger.info(f'logps: {outputs["logps"].sum()}')
         outputs = copy(outputs)
         outputs['past_key_values'] = None
         if not return_logits:

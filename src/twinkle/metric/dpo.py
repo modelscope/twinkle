@@ -137,6 +137,10 @@ class DPOMetric(Metric):
                 ref_seq_logps = self._compute_sequence_logps(ref_logps, labels)
                 ref_chosen_logps, ref_rejected_logps = self._split_chosen_rejected(ref_seq_logps)
 
+                # Accumulate ref logps
+                self.total_ref_chosen_logps += ref_chosen_logps.sum().item()
+                self.total_ref_rejected_logps += ref_rejected_logps.sum().item()
+
                 # Compute rewards: β * (policy - ref)
                 chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
                 rejected_rewards = self.beta * (rejected_logps - ref_rejected_logps)
@@ -154,6 +158,8 @@ class DPOMetric(Metric):
         """Reset all accumulated values."""
         self.total_chosen_logps = 0.0
         self.total_rejected_logps = 0.0
+        self.total_ref_chosen_logps = 0.0
+        self.total_ref_rejected_logps = 0.0
         self.total_chosen_rewards = 0.0
         self.total_rejected_rewards = 0.0
         self.total_reward_margin = 0.0
@@ -166,6 +172,8 @@ class DPOMetric(Metric):
         local_results = [{
             'chosen_logps': self.total_chosen_logps,
             'rejected_logps': self.total_rejected_logps,
+            'ref_chosen_logps': self.total_ref_chosen_logps,
+            'ref_rejected_logps': self.total_ref_rejected_logps,
             'chosen_rewards': self.total_chosen_rewards,
             'rejected_rewards': self.total_rejected_rewards,
             'reward_margin': self.total_reward_margin,
@@ -177,6 +185,8 @@ class DPOMetric(Metric):
 
         total_chosen_logps = sum(r['chosen_logps'] for r in all_results)
         total_rejected_logps = sum(r['rejected_logps'] for r in all_results)
+        total_ref_chosen_logps = sum(r['ref_chosen_logps'] for r in all_results)
+        total_ref_rejected_logps = sum(r['ref_rejected_logps'] for r in all_results)
         total_chosen_rewards = sum(r['chosen_rewards'] for r in all_results)
         total_rejected_rewards = sum(r['rejected_rewards'] for r in all_results)
         total_reward_margin = sum(r['reward_margin'] for r in all_results)
@@ -195,6 +205,8 @@ class DPOMetric(Metric):
         }
 
         if has_rewards:
+            results['logps/ref_chosen'] = f'{total_ref_chosen_logps / total_count:.2f}'
+            results['logps/ref_rejected'] = f'{total_ref_rejected_logps / total_count:.2f}'
             results['rewards/chosen'] = f'{total_chosen_rewards / total_count:.4f}'
             results['rewards/rejected'] = f'{total_rejected_rewards / total_count:.4f}'
             results['rewards/margins'] = f'{total_reward_margin / total_count:.4f}'

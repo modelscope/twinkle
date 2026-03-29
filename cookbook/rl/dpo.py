@@ -74,8 +74,8 @@ MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 2))
 REF_MODEL_GPUS = int(os.environ.get('REF_MODEL_GPUS', 2))
 NUM_GPUS = MODEL_GPUS + REF_MODEL_GPUS
 
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 8))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))  # Number of preference pairs
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))  # TRL default for DPO is 5e-7 to 5e-6
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
