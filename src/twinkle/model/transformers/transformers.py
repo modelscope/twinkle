@@ -31,6 +31,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
+from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
 from twinkle.patch import Patch, apply_patch
@@ -42,53 +43,33 @@ from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
 
 @dataclass
-class OptimizerGroup:
-    adapter_name: str = None
+class OptimizerGroup(BaseOptimizerGroup):
+    """Optimizer group for Transformers training."""
     adapter_config: PeftConfig = None
-    optimizer: Optimizer = None
-    lr_scheduler: LRScheduler = None
-    inputs: List[InputFeature] = None
-    outputs: ModelOutput = None
     loss_instance: Loss = CrossEntropyLoss
-    loss_value: Any = None
-    template: Template = None
-    processor: InputProcessor = None
     scaler: GradScaler = None
-    _last_grad_norm: float = 0.0
     scaler_has_nan: bool = False
-    gradient_accumulation_steps: int = 1
-    cur_step: int = 0
-    num_tokens: int = 0
-    train_metrics: List[Metric] = field(default_factory=list)
-    eval_metrics: List[Metric] = field(default_factory=list)
     checkpoint_engine: CheckpointEngine = None
-    _dp_group = None
-    _device_mesh: DeviceMesh = None
     _handler: Any = None
-
-    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
-        if gradient_accumulation_steps is None:
-            gradient_accumulation_steps = self.gradient_accumulation_steps
-        else:
-            self.gradient_accumulation_steps = gradient_accumulation_steps
-        return (self.cur_step - 1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
         self._ensure_dp_group()
         self._build_metrics()
 
     def _build_metrics(self):
-        self.train_metrics = [
-            LossMetric(self._device_mesh, self._dp_group, loss_reduction='sum'),
+        train_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
             Accuracy(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.train_status = TrainStatus(metrics=train_metrics)
 
-        self.eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group, loss_reduction='sum'),
+        eval_metrics = [
+            LossMetric(self._device_mesh, self._dp_group),
             Accuracy(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.eval_status = TrainStatus(metrics=eval_metrics)
 
     def _ensure_dp_group(self):
         if self._dp_group is not None or self._device_mesh is None:
@@ -117,33 +98,18 @@ class OptimizerGroup:
 
     def accumulate_metrics(self, is_training):
         self._ensure_dp_group()
-        if is_training:
-            metrics = self.train_metrics
-        else:
-            metrics = self.eval_metrics
-        if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
-            for metric in metrics:
+        status = self.train_status if is_training else self.eval_status
+        if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            for metric in status.metrics:
                 metric.accumulate(
-                    self.inputs,
-                    self.outputs,
+                    status.inputs,
+                    status.outputs,
                     lr=self._get_lr(),
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     grad_norm=self._last_grad_norm,
-                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'))
-
-    def calculate_metrics(self, is_training):
-        self.accumulate_metrics(is_training)
-        if is_training:
-            metrics = self.train_metrics
-        else:
-            metrics = self.eval_metrics
-        results = {}
-        for metric in metrics:
-            results.update(metric.calculate())
-        self.inputs = None
-        self.outputs = None
-        return results
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
+                    **status.forward_kwargs)
 
 
 _default_adapter_name = ''
@@ -278,7 +244,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
 
     def _get_default_group(self):
-        """Get the only group has optimizer, else return the default one"""
+        """Get the only group, else return the default one"""
         if len(self.optimizer_group) == 1:
             return next(iter(self.optimizer_group))
         return self.active_group
@@ -403,9 +369,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if self.sp_strategy is not None and labels is None:
             outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
-        optimizer_config.inputs = inputs
-        optimizer_config.outputs = outputs
-        optimizer_config.loss_value = outputs.get('aux_loss', 0)
+        optimizer_config.train_status.inputs = inputs
+        optimizer_config.train_status.outputs = outputs
+        optimizer_config.train_status.forward_kwargs = kwargs
+        optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
         if labels is not None:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
@@ -427,10 +394,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
             **kwargs:
                 adapter_name: Lora adapter name.
+                disable_lora: If True, disable LoRA and use base model for inference.
         Returns:
             The output of the model forward.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
@@ -454,13 +423,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs = self.sp_strategy.preprocess_inputs(inputs)
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
-            outputs = self.model(**inputs)
+            unwrapped_model = self.strategy.unwrap_model(self.model)
+            if disable_lora and isinstance(unwrapped_model, PeftModel):
+                with unwrapped_model.disable_adapter():
+                    outputs = self.model(**inputs)
+            else:
+                outputs = self.model(**inputs)
             if self.sp_strategy is not None and labels is None:
                 outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
-        optimizer_config.inputs = inputs
-        optimizer_config.outputs = outputs
-        optimizer_config.loss_value = outputs.get('aux_loss', 0)
+        optimizer_config.eval_status.inputs = inputs
+        optimizer_config.eval_status.outputs = outputs
+        optimizer_config.eval_status.forward_kwargs = kwargs
+        optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
         if labels is not None:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
@@ -489,24 +464,38 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.loss_instance
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        inputs = optimizer_config.inputs
-        outputs = optimizer_config.outputs
+        inputs = optimizer_config.train_status.inputs
+        outputs = optimizer_config.train_status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
         loss_value = result['loss']
         counts = result['num_tokens']
         if not counts:
-            counts = torch.tensor(0, device=loss_value.device)
+            counts = torch.tensor(1, device=loss_value.device)
+        # Later will gather this value, so it becomes:
+        # 1. SUM loss: gather_sum(local_num_tokens / dp_world_size) = global_num_tokens / dp_world_size
+        # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps / dp_world_size )
+        #   = gradient_accumulation_steps
+        # Then, grad will divided by this value:
+        # 1. SUM loss: gather_mean(local_sum_grad) / (global_num_tokens / dp_world_size)
+        #              = (global_sum_grad / dp_world_size) / (global_num_tokens / dp_world_size)
+        #              = global_sum_grad/global_num_tokens
+        # 2. PER TOKEN MEAN loss: gather_mean(per_token_grad * gradient_accumulation_steps)
+        #                               / gradient_accumulation_steps
+        #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
+        #                               / gradient_accumulation_steps
+        #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
+        counts = counts / self.device_mesh.data_world_size
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.num_tokens += counts.item()
+        optimizer_config.train_status.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
             reduction = getattr(loss_instance, 'reduction', None)
             if reduction is not None:
                 self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
-        optimizer_config.loss_value += loss_value
-        outputs['loss'] = optimizer_config.loss_value
-        return optimizer_config.loss_value.item()
+        optimizer_config.train_status.loss_value += loss_value
+        outputs['loss'] = optimizer_config.train_status.loss_value
+        return optimizer_config.train_status.loss_value.item()
 
     @remote_function()
     def backward(self, **kwargs):
@@ -519,7 +508,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        loss_value = optimizer_config.loss_value
+        loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
         scaler = optimizer_config.scaler
         if scaler is None and self.mixed_precision == 'fp16':
@@ -531,7 +520,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         else:
             loss_value.backward()
         optimizer_config.cur_step += 1
-        optimizer_config.loss_value = None
+        optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -582,7 +571,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 scaler.unscale_(optimizer)
 
             optimizer_config._ensure_dp_group()
-            num_tokens = optimizer_config.num_tokens
+            num_tokens = optimizer_config.train_status.num_tokens
             num_tokens = torch_util.gather_object([num_tokens], self.device_mesh, optimizer_config._dp_group)
             num_tokens = sum(num_tokens)
             parameters = list(self._get_trainable_parameters(adapter_name).values())
@@ -599,7 +588,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 **ep_clip_kwargs,
             )
             optimizer_config._last_grad_norm = grad_norm
-            optimizer_config.num_tokens = 0
+            optimizer_config.train_status.num_tokens = 0
             return grad_norm
 
     @remote_function(dispatch='all')
@@ -1016,8 +1005,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
-        self.optimizer_group[adapter_name] = self.optimizer_group.pop(_default_adapter_name,
-                                                                      self._construct_default_optimizer_group())
+        self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
@@ -1086,6 +1074,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         grad_scaler_config.update(kwargs)
         optimizer_config.scaler = GradScaler(**grad_scaler_config)
 
+    @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
@@ -1101,9 +1090,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
         if is_training is None or is_training is True:
-            optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.train_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
         if not is_training:
-            optimizer_config.eval_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         return PeftModel.get_nb_trainable_parameters(model)
