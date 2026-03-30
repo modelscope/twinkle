@@ -124,8 +124,12 @@ class AccelerateStrategy:
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
 
+    def _get_fsdp_plugin(self):
+        state = self.accelerator.state
+        return state.fsdp_plugin if hasattr(state, 'fsdp_plugin') else None
+
     def _prepare_fsdp2_sd_options(self):
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is None or fsdp_plugin.fsdp_version != 2:
             return None
 
@@ -139,11 +143,11 @@ class AccelerateStrategy:
         )
 
     def needs_wrapped_optimizer_state(self) -> bool:
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
             import torch
@@ -158,7 +162,7 @@ class AccelerateStrategy:
             torch.save(optimizer.state_dict(), output_path)
 
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
             import torch
