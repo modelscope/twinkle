@@ -150,15 +150,6 @@ class SequenceParallel:
                 if self.world_size == 1:
                     return _flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len,
                                                     *args, **kwargs)
-                if dist.is_available() and dist.is_initialized() and dist.get_rank() in (0, 1):
-                    pos = kwargs.get('position_ids')
-                    # print(
-                    #     f'[rank{dist.get_rank()}] flash_attention_forward '
-                    #     f'query_states={tuple(query_states.shape)} key_states={tuple(key_states.shape)} '
-                    #     f'value_states={tuple(value_states.shape)} '
-                    #     f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)} '
-                    #     f'q_len_in={q_len} q_len_passed={q_len * self.sp_world_size} '
-                    #     f'position_ids={None if pos is None else tuple(pos.shape)}')
                 return _distributed_flash_attention(query_states, key_states, value_states, attention_mask,
                                                     q_len * self.sp_world_size, *args, **kwargs)
 

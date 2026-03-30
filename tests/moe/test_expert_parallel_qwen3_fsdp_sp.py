@@ -260,8 +260,6 @@ def _compare_grad_dicts(
         b32 = b.to(dtype=torch.float32)
         diff = b32 - a32
         rel = diff.norm() / (a32.norm() + 1e-12)
-        max_abs_diff = diff.abs().max().item()
-        print(f'[rank{rank}] grad key={k} rel_diff={rel.item():.6e} max_abs_diff={max_abs_diff:.6e}')
         assert rel.item() <= rel_tol
 
 
@@ -430,32 +428,6 @@ def _run_worker_ep_fsdp_sp_align(
         sp_logits = sp_out.logits.detach()
 
         # Forward alignment (full-seq logits reconstructed by SP gather).
-        local_base_logits = base_logits[:, start:end].detach()
-        local_max_abs_diff = (sp_local_logits.detach() - local_base_logits).abs().max().item()
-        alt_start, alt_end = (0, end - start) if start != 0 else (end, end + (end - start))
-        alt_base_logits = base_logits[:, alt_start:alt_end].detach()
-        alt_local_max_abs_diff = (sp_local_logits.detach() - alt_base_logits).abs().max().item()
-        runtime_sp_group = sequence_parallel._sp_group
-        runtime_sp_rank = sequence_parallel._sp_rank
-        runtime_group_rank = dist.get_rank(runtime_sp_group) if runtime_sp_group is not None else -1
-        test_group_rank = dist.get_rank(sp_group) if sp_group is not None else -1
-        print(
-            f'[rank{rank}] fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} '
-            f'alt_max_abs_diff={alt_local_max_abs_diff:.6e} '
-            f'start={start} end={end} alt_start={alt_start} alt_end={alt_end} '
-            f'runtime_sp_rank={runtime_sp_rank} runtime_group_rank={runtime_group_rank} '
-            f'test_group_rank={test_group_rank}')
-        print(
-            f'[rank{rank}] fsdp+sp inputs shapes '
-            f'sp_local_logits={tuple(sp_local_logits.shape)} '
-            f'base_local_logits={tuple(local_base_logits.shape)} '
-            f'position_ids={tuple(position_ids.shape)} '
-            f'attention_mask={tuple(attention_mask.shape)}')
-        if rank == 0:
-            print(f'[rank{rank}] fsdp+sp position_ids_row0={position_ids[0].detach().cpu().tolist()}')
-            print(f'[rank{rank}] fsdp+sp attention_mask_row0={attention_mask[0].detach().cpu().tolist()}')
-        max_abs_diff = (sp_logits - base_logits).abs().max().item()
-        print(f'[rank{rank}] fsdp+sp vs fsdp max_abs_diff={max_abs_diff:.6e}')
         assert torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4)
 
         # Router alignment on this rank's slice: compare selected experts exactly.
@@ -645,32 +617,6 @@ def _run_worker_fsdp_sp_align(
 
         # Forward alignment (full-seq logits reconstructed by SP gather).
         start, end = _sp_slice_range_for_seq_len(seq_len, sp_group=sp_group, sp_size=sp_size)
-        local_base_logits = base_logits[:, start:end].detach()
-        local_max_abs_diff = (sp_local_logits.detach() - local_base_logits).abs().max().item()
-        alt_start, alt_end = (0, end - start) if start != 0 else (end, end + (end - start))
-        alt_base_logits = base_logits[:, alt_start:alt_end].detach()
-        alt_local_max_abs_diff = (sp_local_logits.detach() - alt_base_logits).abs().max().item()
-        runtime_sp_group = sequence_parallel._sp_group
-        runtime_sp_rank = sequence_parallel._sp_rank
-        runtime_group_rank = dist.get_rank(runtime_sp_group) if runtime_sp_group is not None else -1
-        test_group_rank = dist.get_rank(sp_group) if sp_group is not None else -1
-        print(
-            f'[rank{rank}] ep+fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} '
-            f'alt_max_abs_diff={alt_local_max_abs_diff:.6e} '
-            f'start={start} end={end} alt_start={alt_start} alt_end={alt_end} '
-            f'runtime_sp_rank={runtime_sp_rank} runtime_group_rank={runtime_group_rank} '
-            f'test_group_rank={test_group_rank}')
-        print(
-            f'[rank{rank}] ep+fsdp+sp inputs shapes '
-            f'sp_local_logits={tuple(sp_local_logits.shape)} '
-            f'base_local_logits={tuple(local_base_logits.shape)} '
-            f'position_ids={tuple(position_ids.shape)} '
-            f'attention_mask={tuple(attention_mask.shape)}')
-        if rank == 0:
-            print(f'[rank{rank}] ep+fsdp+sp position_ids_row0={position_ids[0].detach().cpu().tolist()}')
-            print(f'[rank{rank}] ep+fsdp+sp attention_mask_row0={attention_mask[0].detach().cpu().tolist()}')
-        max_abs_diff = (sp_logits - base_logits).abs().max().item()
-        print(f'[rank{rank}] ep+fsdp+sp vs ep+fsdp max_abs_diff={max_abs_diff:.6e}')
         assert torch.allclose(sp_logits, base_logits, rtol=1e-3, atol=1e-4)
 
         # Backward alignment: local CE(sum) on SP, compare gathered full-seq inputs_embeds grads.
@@ -689,8 +635,6 @@ def _run_worker_fsdp_sp_align(
         base_full = base_embed_grad.to(device=device, dtype=torch.float32)[:, :seq_len].contiguous()
         diff = sp_full - base_full
         rel = diff.norm() / (base_full.norm() + 1e-12)
-        max_abs_diff = diff.abs().max().item()
-        print(f'[rank{rank}] input_grad rel_diff={rel.item():.6e} max_abs_diff={max_abs_diff:.6e}')
         grad_rel_tol = float(os.environ.get('TWINKLE_INPUT_GRAD_REL_TOL', '1e-2'))
         assert rel.item() <= grad_rel_tol
     finally:
