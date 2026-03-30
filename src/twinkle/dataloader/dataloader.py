@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
+import warnings
 from functools import partial
 from typing import Callable, Optional, Type, Union
 
@@ -51,6 +53,9 @@ class DataLoader:
         self.dataloader_params['batch_size'] = batch_size
         self.device_mesh = device_mesh
         self.processor: Optional[InputProcessor] = None
+        self._skip_samples = 0
+        self._base_batch_sampler = None
+        self._base_sampler = None
         self._set_work_init_fn()
 
     def _set_work_init_fn(self):
@@ -97,7 +102,9 @@ class DataLoader:
 
             if not isinstance(self.dataset, IterableDataset):
                 self.dataloader.__initialized = False
-                self._repeat_sample_and_shard()
+                self._base_batch_sampler = self.dataloader.batch_sampler
+                self._base_sampler = self.dataloader.sampler
+                self._rebuild_sampler_stack()
                 self.dataloader.__initialized = True
 
     @remote_function()
@@ -116,11 +123,39 @@ class DataLoader:
                 max_retries=self.max_retries)
         return _iter
 
-    def _repeat_sample_and_shard(self):
-        if self.dataloader.batch_sampler is not None and hasattr(self.dataloader.batch_sampler, 'sampler'):
-            self.dataloader.batch_sampler.sampler = RetrySampler(
-                self.dataloader.batch_sampler.sampler, self.dataset, max_retries=self.max_retries)
-            self.dataloader.batch_sampler = DeviceMeshSampler(self.dataloader.batch_sampler, self.device_mesh,
-                                                              self.min_batch_size)
-        elif self.dataloader.sampler is not None:
-            self.dataloader.sampler = RetrySampler(self.dataloader.sampler, self.dataset, max_retries=self.max_retries)
+    @remote_function()
+    def skip_consumed_samples(self, consumed_train_samples: int) -> None:
+        from torch.utils.data import IterableDataset
+
+        if isinstance(self.dataset, IterableDataset):
+            warnings.warn('IterableDataset does not support consumed-data skipping; continuing without skipping.')
+            self._skip_samples = 0
+            return
+
+        self._skip_samples = max(int(consumed_train_samples), 0)
+        if self.dataloader is not None:
+            self.dataloader.__initialized = False
+            self._rebuild_sampler_stack()
+            self.dataloader.__initialized = True
+
+    def _rebuild_sampler_stack(self):
+        if self._base_batch_sampler is not None and hasattr(self._base_batch_sampler, 'sampler'):
+            batch_sampler = copy.copy(self._base_batch_sampler)
+            batch_sampler.sampler = RetrySampler(
+                self._base_sampler,
+                self.dataset,
+                max_retries=self.max_retries,
+            )
+            self.dataloader.batch_sampler = DeviceMeshSampler(
+                batch_sampler,
+                self.device_mesh,
+                self.min_batch_size,
+                skip_samples=self._skip_samples,
+            )
+        elif self._base_sampler is not None:
+            self.dataloader.sampler = RetrySampler(
+                self._base_sampler,
+                self.dataset,
+                max_retries=self.max_retries,
+                skip_samples=self._skip_samples,
+            )

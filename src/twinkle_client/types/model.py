@@ -89,6 +89,22 @@ class LoadRequest(BaseModel):
         extra = 'allow'
 
 
+class LoadTrainingStateRequest(BaseModel):
+    adapter_name: str
+    name: str
+
+    class Config:
+        extra = 'allow'
+
+
+class ReadTrainingProgressRequest(BaseModel):
+    adapter_name: str
+    name: str
+
+    class Config:
+        extra = 'allow'
+
+
 class AddAdapterRequest(BaseModel):
     adapter_name: str
     config: str
@@ -210,6 +226,11 @@ class SaveResponse(BaseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
     twinkle_path: str
     checkpoint_dir: Optional[str] = None
+
+
+class TrainingProgressResponse(BaseModel):
+    """Response for /read_training_progress endpoint (returns progress metadata)."""
+    result: Dict[str, Any]
 
 
 # --- Void responses (return None → OkResponse) ---

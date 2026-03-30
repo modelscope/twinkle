@@ -410,9 +410,19 @@ def train():
     model.set_lr_scheduler('LinearLR')
 
     # 恢复训练（如有检查点）
-    if resume_path:
-        logger.info(f'Resuming training from {resume_path}')
-        model.load(resume_path, load_optimizer=True)
+    resume_from_checkpoint = resume_path
+    resume_only_model = False
+    ignore_data_skip = False
+    if resume_from_checkpoint:
+        logger.info(f'Resuming training from {resume_from_checkpoint}')
+        model.load(name=resume_from_checkpoint)
+
+        if not resume_only_model:
+            trainer_state = model.load_training_state(resume_from_checkpoint)
+            dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+        elif not ignore_data_skip:
+            progress = model.read_training_progress(resume_from_checkpoint)
+            dataloader.skip_consumed_samples(progress['consumed_train_samples'])
 
     logger.info(model.get_train_configs())
 
@@ -444,6 +454,14 @@ if __name__ == '__main__':
 - API 与本地训练完全一致，无额外学习成本
 - 支持断点续训、检查点管理
 - 可动态切换 LoRA 适配器、损失函数、优化器等组件
+
+Resume 模式：
+
+- `resume_from_checkpoint=None`：开始新的训练任务。
+- `resume_only_model=False`：恢复权重、optimizer、scheduler、scaler、RNG 和进度元数据。
+- `resume_only_model=True` 且 `ignore_data_skip=False`：恢复权重，读取进度元数据，并跳过已消费样本。
+- `resume_only_model=True` 且 `ignore_data_skip=True`：只恢复权重，训练步数和数据进度从 0 开始。
+- `skip_consumed_samples(...)` 不适用于 iterable / streaming dataset。
 
 ### 3.2 Tinker Client：简洁即用
 
