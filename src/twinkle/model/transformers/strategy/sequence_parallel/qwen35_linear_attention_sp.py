@@ -230,6 +230,13 @@ class Qwen35LinearAttentionSPPatch(Patch):
             cache_position=None,
             attention_mask: Optional[torch.Tensor] = None,
         ):
+            if dist.is_available() and dist.is_initialized():
+                print(
+                    f'[rank{dist.get_rank()}] hit sp_linear_forward '
+                    f'hidden_states={tuple(hidden_states.shape)} '
+                    f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
+                    flush=True,
+                )
             if sequence_parallel.world_size <= 1:
                 return origin_forward(
                     mod,

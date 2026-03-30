@@ -342,12 +342,12 @@ class DistributedAttention(torch.nn.Module):
         debug_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
         if debug_rank in (0, 1):
             pos = kwargs.get('position_ids')
-            print(
-                f'[rank{debug_rank}] DistributedAttention.forward '
-                f'query={tuple(query.shape)} key={tuple(key.shape)} value={tuple(value.shape)} '
-                f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)} '
-                f'position_ids={None if pos is None else tuple(pos.shape)} '
-                f'sp_rank={self.sequence_parallel.sp_rank} rp_rank={self.sequence_parallel.rp_rank}')
+            # print(
+            #     f'[rank{debug_rank}] DistributedAttention.forward '
+            #     f'query={tuple(query.shape)} key={tuple(key.shape)} value={tuple(value.shape)} '
+            #     f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)} '
+            #     f'position_ids={None if pos is None else tuple(pos.shape)} '
+            #     f'sp_rank={self.sequence_parallel.sp_rank} rp_rank={self.sequence_parallel.rp_rank}')
         if self.sequence_parallel.rp_world_size > 1 and attention_mask is not None:
             if torch.is_tensor(attention_mask) and not attention_mask.all():
                 raise NotImplementedError(
@@ -369,12 +369,12 @@ class DistributedAttention(torch.nn.Module):
             if position_ids is not None and self.sequence_parallel.sp_world_size > 1:
                 # Reuse the generic gather path to support both 2D and 3D position_ids (e.g. mrope).
                 position_ids = self.sequence_parallel.gather(position_ids.contiguous(), dim=-1, position_ids=None)
-        if debug_rank in (0, 1):
-            print(
-                f'[rank{debug_rank}] DistributedAttention.after_a2a '
-                f'query_layer={tuple(query_layer.shape)} key_layer={tuple(key_layer.shape)} '
-                f'value_layer={tuple(value_layer.shape)} '
-                f'gathered_position_ids={None if position_ids is None else tuple(position_ids.shape)}')
+        # if debug_rank in (0, 1):
+        #     print(
+        #         f'[rank{debug_rank}] DistributedAttention.after_a2a '
+        #         f'query_layer={tuple(query_layer.shape)} key_layer={tuple(key_layer.shape)} '
+        #         f'value_layer={tuple(value_layer.shape)} '
+        #         f'gathered_position_ids={None if position_ids is None else tuple(position_ids.shape)}')
 
         context_layer = self.local_attn(
             query_layer, key_layer, value_layer, attention_mask, *args, position_ids=position_ids, **kwargs)
