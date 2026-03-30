@@ -29,6 +29,7 @@ wheels/
 /temp
 MANIFEST
 .locks/
+tmp_test_checkpoints/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
