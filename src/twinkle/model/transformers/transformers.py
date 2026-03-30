@@ -961,10 +961,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 model_sd = model.state_dict()
                 converted_weights = {}
                 for key, value in adapter_weights.items():
-                    if f'.{adapter_name}.weight' not in key:
-                        key = key.replace('.weight', f'.{adapter_name}.weight')
-                    if key in model_sd:
-                        param = model_sd[key]
+                    model_key = key
+                    if f'.{adapter_name}.weight' not in model_key:
+                        model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
+                    if model_key in model_sd:
+                        param = model_sd[model_key]
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                     converted_weights[key] = value
