@@ -65,6 +65,7 @@ class InputProcessor:
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
             self.split_cp,
+            self.apply_transformers_sp,
             self.prepare_outputs,
         ]
 
@@ -106,6 +107,12 @@ class InputProcessor:
             return _input
 
         return [to_tensor(_input) for _input in inputs]
+
+    def apply_transformers_sp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        sp_strategy = kwargs.get('sp_strategy')
+        if self.framework != 'transformers' or sp_strategy is None:
+            return inputs
+        return [InputFeature(**sp_strategy.preprocess_inputs(dict(_input))) for _input in inputs]
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 

@@ -2,466 +2,29 @@
 import math
 import torch
 import torch.distributed as dist
+from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
+from types import MethodType
 from transformers import PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
-
-
-def get_config_attr(config, key, default=None):
-    return getattr(config, key, default)
-
-
-def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
-    position_ids = position_ids[0]
-    seq_start_indices = torch.where(position_ids == 0)[0]
-    seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)])
-    seq_lengths = seq_end_indices - seq_start_indices
-    cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0)
-    return cu_seqlens
-
-
-def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
-    dp_world_size = device_mesh.dp_world_size or 1
-    fsdp_world_size = device_mesh.fsdp_world_size or 1
-    if dp_world_size <= 0:
-        dp_world_size = 1
-    if fsdp_world_size <= 0:
-        fsdp_world_size = 1
-    return dp_world_size * fsdp_world_size
-
-
-def _get_raw_data_rank(device_mesh: DeviceMesh, rank: int) -> Optional[int]:
-    coord = device_mesh._get_coord_for_rank(rank)
-    if coord is None:
-        return None
-
-    dp_rank = None
-    fsdp_rank = None
-    if device_mesh.has_dim('dp'):
-        dp_rank = coord[device_mesh._get_dim_index('dp')]
-    if device_mesh.has_dim('fsdp'):
-        fsdp_rank = coord[device_mesh._get_dim_index('fsdp')]
-
-    fsdp_world_size = device_mesh.fsdp_world_size
-    data_rank = dp_rank if dp_rank is not None else None
-    if fsdp_world_size is not None and fsdp_world_size > 1:
-        if dp_rank is not None and fsdp_rank is not None:
-            data_rank = dp_rank * fsdp_world_size + fsdp_rank
-        elif fsdp_rank is not None:
-            data_rank = fsdp_rank
-
-    if data_rank is None:
-        data_rank = 0
-    return int(data_rank)
-
-
-def _get_sp_group_from_device_mesh(
-    device_mesh: Optional[DeviceMesh],
-    sp_size: int,
-) -> Optional[dist.ProcessGroup]:
-    """Return the SP (sequence-parallel) process group for the current rank.
-
-    If the mesh defines an explicit "sp" dimension, use it directly. Otherwise,
-    derive SP groups by chunking data-parallel ranks (dp/fsdp) while keeping
-    all other mesh dimensions (tp/pp/ep/etc.) fixed.
-
-    Example (no explicit "sp" dim, sp_size=2):
-        mesh_dim_names = ("dp", "fsdp", "tp")
-        mesh = np.arange(8).reshape(2, 2, 2)
-        # coords are (dp, fsdp, tp). dp/fsdp are "data" dims; tp is "non-data".
-        # raw_data_rank = dp * fsdp_world_size + fsdp, so ranges [0..3].
-        # group_id = raw_data_rank // sp_size partitions data ranks into 2 groups.
-        #
-        # For tp=0:
-        #   data ranks 0,1 -> group_id=0  => ranks at coords:
-        #     (dp=0,fsdp=0,tp=0) -> rank 0
-        #     (dp=0,fsdp=1,tp=0) -> rank 2
-        #   data ranks 2,3 -> group_id=1  => ranks at coords:
-        #     (dp=1,fsdp=0,tp=0) -> rank 4
-        #     (dp=1,fsdp=1,tp=0) -> rank 6
-        #
-        # For tp=1:
-        #   data ranks 0,1 -> group_id=0  => ranks at coords:
-        #     (dp=0,fsdp=0,tp=1) -> rank 1
-        #     (dp=0,fsdp=1,tp=1) -> rank 3
-        #   data ranks 2,3 -> group_id=1  => ranks at coords:
-        #     (dp=1,fsdp=0,tp=1) -> rank 5
-        #     (dp=1,fsdp=1,tp=1) -> rank 7
-        #
-        # Final SP groups (keyed by (group_id, non_data_key)):
-        #   (0, (tp=0)) -> [0, 2]
-        #   (1, (tp=0)) -> [4, 6]
-        #   (0, (tp=1)) -> [1, 3]
-        #   (1, (tp=1)) -> [5, 7]
-        #
-        # Each SP group has size=2 and never crosses tp.
-    """
-    if device_mesh is None or sp_size <= 1:
-        return None
-    if device_mesh.has_dim('sp'):
-        return device_mesh.create_process_group(['sp'])
-    if not dist.is_available() or not dist.is_initialized():
-        return None
-
-    raw_data_world_size = _get_raw_data_world_size(device_mesh)
-    if raw_data_world_size % sp_size != 0:
-        raise ValueError(f'data_world_size ({raw_data_world_size}) must be divisible by sp_size ({sp_size}).')
-
-    rank = dist.get_rank()
-    ref_coord = device_mesh._get_coord_for_rank(rank)
-    if ref_coord is None:
-        return None
-
-    non_data_indices = []
-    if device_mesh.mesh_dim_names is not None:
-        for i, name in enumerate(device_mesh.mesh_dim_names):
-            if name in ('dp', 'fsdp'):
-                continue
-            non_data_indices.append(i)
-
-    # Group ranks by (data-parallel chunk, non-data mesh coordinates).
-    groups: Dict[Tuple[int, Tuple[int, ...]], list[int]] = {}
-    for r in device_mesh.mesh.flatten().tolist():
-        r = int(r)
-        coord = device_mesh._get_coord_for_rank(r)
-        if coord is None:
-            continue
-        raw_rank = _get_raw_data_rank(device_mesh, r)
-        if raw_rank is None:
-            continue
-        group_id = raw_rank // sp_size
-        non_data_key = tuple(coord[i] for i in non_data_indices)
-        key = (group_id, non_data_key)
-        groups.setdefault(key, []).append(r)
-
-    group_list = []
-    for key, ranks in groups.items():
-        ranks = sorted(ranks)
-        if len(ranks) != sp_size:
-            raise ValueError(f'SP group size mismatch for key={key}: expected {sp_size}, got {len(ranks)}')
-        group_list.append((key, ranks))
-
-    group_list.sort(key=lambda item: item[0])
-
-    sp_group = None
-    for _, ranks in group_list:
-        pg = dist.new_group(ranks=ranks)
-        if rank in ranks:
-            sp_group = pg
-    return sp_group
-
-
-def _derive_sequence_parallel_sizes(num_heads: int, seq_world_size: int) -> Tuple[int, int]:
-    if seq_world_size <= 1:
-        return 1, 1
-    sp_world_size = math.gcd(int(num_heads), int(seq_world_size))
-    sp_world_size = max(1, sp_world_size)
-    if seq_world_size % sp_world_size != 0:
-        raise ValueError(
-            f'seq_world_size ({seq_world_size}) must be divisible by derived sp_world_size ({sp_world_size}).')
-    rp_world_size = seq_world_size // sp_world_size
-    return sp_world_size, rp_world_size
-
-
-def _get_sequence_group_specs(
-    device_mesh: Optional[DeviceMesh],
-    seq_world_size: int,
-    sp_world_size: int,
-    rp_world_size: int,
-) -> List[Dict[str, Any]]:
-    if device_mesh is None or seq_world_size <= 1:
-        return []
-
-    if seq_world_size != sp_world_size * rp_world_size:
-        raise ValueError(
-            f'seq_world_size ({seq_world_size}) must equal sp_world_size ({sp_world_size}) * '
-            f'rp_world_size ({rp_world_size}).')
-
-    raw_data_world_size = _get_raw_data_world_size(device_mesh)
-    if raw_data_world_size % seq_world_size != 0:
-        raise ValueError(
-            f'data_world_size ({raw_data_world_size}) must be divisible by seq_world_size ({seq_world_size}).')
-
-    non_data_indices = []
-    if device_mesh.mesh_dim_names is not None:
-        for i, name in enumerate(device_mesh.mesh_dim_names):
-            if name in ('dp', 'fsdp'):
-                continue
-            non_data_indices.append(i)
-
-    groups: Dict[Tuple[int, Tuple[int, ...]], List[Tuple[int, int]]] = {}
-    for r in device_mesh.mesh.flatten().tolist():
-        rank = int(r)
-        coord = device_mesh._get_coord_for_rank(rank)
-        if coord is None:
-            continue
-        raw_rank = _get_raw_data_rank(device_mesh, rank)
-        if raw_rank is None:
-            continue
-        group_id = raw_rank // seq_world_size
-        seq_local_rank = raw_rank % seq_world_size
-        non_data_key = tuple(coord[i] for i in non_data_indices)
-        key = (group_id, non_data_key)
-        groups.setdefault(key, []).append((seq_local_rank, rank))
-
-    group_specs = []
-    for key, items in groups.items():
-        items = sorted(items, key=lambda item: item[0])
-        local_ranks = [local_rank for local_rank, _ in items]
-        if local_ranks != list(range(seq_world_size)):
-            raise ValueError(f'Invalid sequence-parallel rank layout for key={key}: {local_ranks}')
-        seq_ranks = [rank for _, rank in items]
-        if len(seq_ranks) != seq_world_size:
-            raise ValueError(
-                f'Sequence-parallel group size mismatch for key={key}: expected {seq_world_size}, got {len(seq_ranks)}'
-            )
-        sp_groups = [seq_ranks[i * sp_world_size:(i + 1) * sp_world_size] for i in range(rp_world_size)]
-        rp_groups = [[sp_groups[rp_idx][sp_idx] for rp_idx in range(rp_world_size)] for sp_idx in range(sp_world_size)]
-        group_specs.append({
-            'key': key,
-            'seq_ranks': seq_ranks,
-            'sp_groups': sp_groups,
-            'rp_groups': rp_groups,
-        })
-
-    group_specs.sort(key=lambda item: item['key'])
-    return group_specs
-
-
-def _get_seq_groups_from_device_mesh(
-    device_mesh: Optional[DeviceMesh],
-    seq_world_size: int,
-    sp_world_size: int,
-    rp_world_size: int,
-) -> Tuple[Optional[dist.ProcessGroup], Optional[dist.ProcessGroup], Optional[dist.ProcessGroup], int, int]:
-    if device_mesh is None or seq_world_size <= 1:
-        return None, None, None, 0, 0
-    if not dist.is_available() or not dist.is_initialized():
-        return None, None, None, 0, 0
-
-    rank = dist.get_rank()
-    sp_group = None
-    rp_group = None
-    data_rank_group = None
-    sp_rank = 0
-    rp_rank = 0
-    group_specs = _get_sequence_group_specs(device_mesh, seq_world_size, sp_world_size, rp_world_size)
-
-    for spec in group_specs:
-        seq_pg = dist.new_group(ranks=spec['seq_ranks'])
-        if rank in spec['seq_ranks']:
-            data_rank_group = seq_pg
-
-        if sp_world_size > 1:
-            for ranks in spec['sp_groups']:
-                pg = dist.new_group(ranks=ranks)
-                if rank in ranks:
-                    sp_group = pg
-                    sp_rank = ranks.index(rank)
-
-        if rp_world_size > 1:
-            for ranks in spec['rp_groups']:
-                pg = dist.new_group(ranks=ranks)
-                if rank in ranks:
-                    rp_group = pg
-                    rp_rank = ranks.index(rank)
-
-    if data_rank_group is None:
-        raise RuntimeError('Failed to create sequence-parallel data group from DeviceMesh.')
-    if sp_world_size > 1 and sp_group is None:
-        raise RuntimeError('Failed to create sequence-parallel SP group from DeviceMesh.')
-    if rp_world_size > 1 and rp_group is None:
-        raise RuntimeError('Failed to create sequence-parallel ring group from DeviceMesh.')
-
-    return sp_group, rp_group, data_rank_group, sp_rank, rp_rank
-
-
-class GatherLoss(torch.autograd.Function):
-    """Gather loss from sequence group."""
-
-    @staticmethod
-    def forward(ctx, loss, labels, gather_idx=None, position_ids=None):
-        """
-        Args:
-            loss: loss tensor after splitting
-            labels: labels tensor after splitting
-            gather_idx: gather the tensors on this dim
-        """
-        ctx.scatter_shape = loss.shape[gather_idx or 0]
-        ctx.gather_idx = gather_idx or 0
-        if position_ids is not None:
-            position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
-        ctx.position_ids = position_ids
-        # Gather split losses/labels to compute aux losses on full sequence length.
-        output = sequence_parallel.gather(loss, dim=ctx.gather_idx, position_ids=position_ids)
-        if labels is not None:
-            labels_output = sequence_parallel.gather(labels, dim=ctx.gather_idx, position_ids=position_ids)
-        else:
-            labels_output = None
-        return output, labels_output
-
-    @staticmethod
-    def backward(ctx, *grad_output):
-        # Split grads back to local sequence chunk.
-        _grad = grad_output[0]
-        if sequence_parallel.world_size > 1 and sequence_parallel._data_rank_group is not None:
-            # Gather replicates the sequence dimension across SP ranks. Scale once here
-            # so downstream FSDP avg does not shrink this path by an extra SP factor.
-            _grad = _grad * sequence_parallel.world_size
-            _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
-        return _grad, None, None, None
-
-
-# Code borrowed from deepspeed, here is why:
-# 1. Reduce the dependency
-# 2. The original code is complex
-def _generate_layout_params(scatter_idx, seq_world_size, input):
-    if scatter_idx < 2:
-        bs, global_seq_len, num_local_head, head_dim = input.shape
-        pre_all2all_inp_shape = [bs, seq_world_size, global_seq_len // seq_world_size, num_local_head, head_dim]
-        pre_all2all_permute_idx = (1, 0, 2, 3, 4)
-
-        post_all2all_permute_idx = (1, 2, 0, 3, 4)
-        post_all2all_res_shape = [bs, global_seq_len // seq_world_size, seq_world_size * num_local_head, head_dim]
-    else:
-        bs, local_seq_len, num_total_head, head_dim = input.shape
-        assert num_total_head % seq_world_size == 0, (f'Number of heads ({num_total_head}) must be divisible '
-                                                      f'by the sequence parallel size ({seq_world_size})!')
-        pre_all2all_inp_shape = [bs, local_seq_len, seq_world_size, num_total_head // seq_world_size, head_dim]
-        pre_all2all_permute_idx = (2, 0, 1, 3, 4)
-
-        post_all2all_permute_idx = (1, 0, 2, 3, 4)
-        post_all2all_res_shape = [bs, seq_world_size * local_seq_len, num_total_head // seq_world_size, head_dim]
-
-    return pre_all2all_permute_idx, pre_all2all_inp_shape, post_all2all_permute_idx, post_all2all_res_shape
-
-
-def post_all2all(permute_idx, res_shape):
-    """
-    Post-processing function for `all2all` communication.
-    """
-
-    def post_func(input):
-        if permute_idx is not None:
-            input = input.permute(permute_idx).contiguous()
-        output = input.reshape(res_shape).contiguous()
-
-        return output
-
-    return post_func
-
-
-def pre_all2all_fun(permute_idx, inp_shape, input):
-    """
-    Pre-processing function for `all2all` communication.
-    """
-    input_t = input.reshape(inp_shape).contiguous()
-    if permute_idx is not None:
-        input_t = input_t.permute(permute_idx).contiguous()
-    return input_t
-
-
-def single_all_to_all(input, scatter_idx, gather_idx, group, **kwargs):
-    seq_world_size = dist.get_world_size(group)
-    num_heads = input.shape[2]
-    if num_heads % seq_world_size != 0 and not scatter_idx < 2:
-        raise NotImplementedError(f'num_heads {num_heads} cannot be split by sp world size {seq_world_size}')
-    pre_all2all_permute_idx, pre_all2all_inp_shape, post_all2all_permute_idx, post_all2all_res_shape = (
-        _generate_layout_params(scatter_idx, seq_world_size, input))
-
-    input_t = pre_all2all_fun(pre_all2all_permute_idx, pre_all2all_inp_shape, input)
-
-    post_all2all_fun = post_all2all(post_all2all_permute_idx, post_all2all_res_shape)
-    output = torch.empty_like(input_t)
-    dist.all_to_all_single(output, input_t, group=group)
-
-    res = post_all2all_fun(output)
-    return res
-
-
-class _SeqAllToAll(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        group: dist.ProcessGroup,
-        input: torch.Tensor,
-        scatter_idx: int,
-        gather_idx: int,
-    ) -> torch.Tensor:
-        ctx.group = group
-        ctx.scatter_idx = scatter_idx
-        ctx.gather_idx = gather_idx
-        res = single_all_to_all(input, scatter_idx, gather_idx, group)
-        return res
-
-    @staticmethod
-    def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
-        # Reverse scatter/gather in backward to match forward layout transform.
-        return None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None
-
-
-class DistributedAttention(torch.nn.Module):
-
-    def __init__(
-        self,
-        local_attention,
-        sequence_parallel,
-        scatter_idx: int = 2,
-        gather_idx: int = 1,
-    ) -> None:
-        super().__init__()
-        self.local_attn = local_attention
-        self.sequence_parallel = sequence_parallel
-        self.scatter_idx = scatter_idx
-        self.gather_idx = gather_idx
-
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor, *args:
-                Any, **kwargs) -> torch.Tensor:
-        if self.sequence_parallel.world_size == 1:
-            return self.local_attn(query, key, value, attention_mask, *args, **kwargs)
-        if self.sequence_parallel.rp_world_size > 1 and attention_mask is not None:
-            if torch.is_tensor(attention_mask) and not attention_mask.all():
-                raise NotImplementedError(
-                    'Derived ring attention only supports padding-free / packed inputs without masked padding.')
-
-        # Gather ulysses first, ring-attention next.
-        if self.sequence_parallel.sp_world_size > 1:
-            query_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, query, self.scatter_idx, self.gather_idx)
-            key_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, key, self.scatter_idx, self.gather_idx)
-            value_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, value, self.scatter_idx, self.gather_idx)
-        else:
-            query_layer, key_layer, value_layer = query, key, value
-
-        if self.sequence_parallel.rp_world_size > 1:
-            kwargs.pop('position_ids', None)
-            position_ids = self.sequence_parallel.real_position_ids
-            position_ids = self.sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
-        else:
-            position_ids = kwargs.pop('position_ids')
-            if position_ids is not None and self.sequence_parallel.sp_world_size > 1:
-                shape0 = position_ids.shape[0]
-                position_ids_output = torch.empty(
-                    (shape0 * self.sequence_parallel.sp_world_size, position_ids.shape[1]),
-                    dtype=position_ids.dtype,
-                    device=position_ids.device)
-                dist.all_gather_into_tensor(position_ids_output, position_ids, group=self.sequence_parallel._sp_group)
-                position_ids = torch.cat(position_ids_output.split(shape0, dim=0), dim=1)
-
-        context_layer = self.local_attn(
-            query_layer, key_layer, value_layer, attention_mask, *args, position_ids=position_ids, **kwargs)
-
-        if self.sequence_parallel.sp_world_size > 1:
-            output = _SeqAllToAll.apply(self.sequence_parallel._sp_group, context_layer, self.gather_idx,
-                                        self.scatter_idx)
-        else:
-            output = context_layer
-
-        return output
+from twinkle.patch import apply_patch
+from .qwen35_linear_attention_sp import Qwen35LinearAttentionSPPatch
+from .utils import (
+    GatherLoss,
+    DistributedAttention,
+    _SeqAllToAll,
+    post_all2all,
+    get_config_attr,
+    is_moe_config,
+    get_cu_seqlens_from_position_ids,
+    _derive_sequence_parallel_sizes,
+    _get_ulysses_size,
+    _get_seq_groups_from_device_mesh,
+)
 
 
 # main content copied from ms-swift
@@ -739,6 +302,46 @@ class SequenceParallel:
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
 
+    def _prepare_multimodal_deepstack(self, base_model: torch.nn.Module):
+
+        def _patch_deepstack_process(module: torch.nn.Module) -> bool:
+            origin = getattr(module, '_deepstack_process', None)
+            if not callable(origin):
+                return False
+            if getattr(module, '_twinkle_sp_mm_patched', False):
+                return False
+
+            def _deepstack_process(_self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor,
+                                   visual_embeds: torch.Tensor):
+                world_size = sequence_parallel.world_size
+                if world_size and world_size > 1 and visual_pos_masks is not None:
+                    visual_pos_masks, visual_embeds = sequence_parallel.pad_and_split_mm_tokens(
+                        visual_pos_masks, visual_embeds)
+                if visual_pos_masks is None:
+                    return hidden_states + visual_embeds.mean() * 0
+                visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+                visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+                if hidden_states.ndim == 3 and visual_pos_masks.ndim == 3:
+                    visual_pos_masks = visual_pos_masks[..., 0]
+                local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+                hidden_states[visual_pos_masks, :] = local_this
+                return hidden_states
+
+            module._deepstack_process = MethodType(_deepstack_process, module)
+            module._twinkle_sp_mm_patched = True
+            return True
+
+        for submodule in base_model.modules():
+            _patch_deepstack_process(submodule)
+        _patch_deepstack_process(base_model)
+
+    def _prepare_qwen35_linear_attention(self):
+        if int(self.rp_world_size or 1) > 1:
+            raise NotImplementedError(
+                'SequenceParallel: Qwen3.5 linear attention SP patch does not support rp_world_size > 1 '
+                '(derived ring attention).')
+        apply_patch(None, Qwen35LinearAttentionSPPatch, sequence_parallel=self)
+
     def _prepare_moe_aux_loss(self, base_model: torch.nn.Module):
 
         def moe_aux_loss_hook(module, args, kwargs, output):
@@ -772,15 +375,6 @@ class SequenceParallel:
 
         base_model.register_forward_hook(moe_aux_loss_hook, with_kwargs=True)
 
-    @staticmethod
-    def _is_moe_model(config) -> bool:
-        if 'Moe' in config.__class__.__name__:
-            return True
-        for key in ['num_experts', 'num_experts_per_tok', 'moe_intermediate_size']:
-            if get_config_attr(config, key):
-                return True
-        return False
-
     def prepare(
         self,
         sp_size: int,
@@ -809,11 +403,13 @@ class SequenceParallel:
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
             self._prepare_flash_attn(llm_model)
+            self._prepare_qwen35_linear_attention()
             SequenceParallel._global_inited = True
 
         self._prepare_forward_hook(llm_model)
+        self._prepare_multimodal_deepstack(llm_model)
 
-        if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
+        if is_moe_config(getattr(model, 'config', None)):
             self._prepare_moe_aux_loss(llm_model)
 
         self.model_dtype = next(model.parameters()).dtype
@@ -864,6 +460,26 @@ class SequenceParallel:
             return torch.cat(padded, dim=dim)
         return _do_pad(tensor)
 
+    def pad_and_split_mm_tokens(self, visual_mask, mm_embeds):
+        input_ids = self.extra_kwargs['input_ids']
+        empty_embeds = torch.empty(
+            (input_ids.shape[0], input_ids.shape[1], mm_embeds.shape[-1])).to(mm_embeds.device).to(mm_embeds.dtype)
+        empty_embeds[visual_mask] = mm_embeds
+
+        embeds = SimpleNamespace(weight=mm_embeds)
+
+        _, split_input_embeds, _, _, _, _, extra_values = self.pad_and_split_inputs(
+            None,
+            empty_embeds,
+            None,
+            None,
+            None,
+            None,
+            embeds,
+            self.real_position_ids,
+            extra_split_values=[(visual_mask, 0, -1)])
+        visual_mask = extra_values[0]
+        return visual_mask, split_input_embeds[visual_mask]
     def gather(self, local_output, dim: int, position_ids=None):
         """Gather tensor for sequence parallel - reverse of split."""
         if self.world_size == 1:
@@ -1150,20 +766,13 @@ class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
-    loss_reduction: str = 'mean'
-    compensate_fsdp_avg: bool = False
 
 
-def _get_ulysses_size(device_mesh, sp_config: Optional[Dict[str, Any]] = None) -> int:
-    if sp_config:
-        cfg_size = sp_config.get('ulysses_size')
-        if cfg_size is not None:
-            return int(cfg_size)
-    if device_mesh is None:
-        return 1
-    if getattr(device_mesh, 'ulysses_size', None) is not None:
-        return int(device_mesh.ulysses_size)
-    return 1
+@dataclass
+class SequenceParallelLossState:
+    applied: bool = False
+    reduction: Optional[str] = None
+    local_counts: Optional[torch.Tensor] = None
 
 
 class SequenceParallelStrategy:
@@ -1253,69 +862,74 @@ class SequenceParallelStrategy:
         outputs['logits'] = gathered
         return outputs
 
-    def reduce_loss(self, loss: torch.Tensor, labels: Optional[torch.Tensor], ignore_index: int = -100) -> torch.Tensor:
+    def prepare_loss_inputs(
+        self,
+        loss_instance: Any,
+        inputs: Dict[str, Any],
+        outputs: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], SequenceParallelLossState]:
+        state = SequenceParallelLossState()
+        if inputs is None or outputs is None:
+            return inputs, outputs, state
+        if not self.enabled or self.ulysses_size <= 1:
+            return inputs, outputs, state
+        labels = inputs.get('labels')
+        logps = outputs.get('logps')
+        state.reduction = getattr(loss_instance, 'reduction', None)
+        if labels is None or logps is None:
+            return inputs, outputs, state
+        loss_inputs = copy(inputs)
+        loss_outputs = copy(outputs)
+        loss_inputs, loss_outputs = self.gather_loss_inputs(loss_inputs, loss_outputs)
+        state.applied = True
+        if str(state.reduction).lower() == 'sum':
+            ignore_index = getattr(loss_instance, 'ignore_index', -100)
+            state.local_counts = (labels != ignore_index).sum().to(device=labels.device)
+        return loss_inputs, loss_outputs, state
+
+    def gather_loss_inputs(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if not self.enabled or self.ulysses_size <= 1:
+            return inputs, outputs
+        if inputs is None or outputs is None:
+            return inputs, outputs
+        labels = inputs.get('labels', None)
+        logps = outputs.get('logps', None)
+        if labels is None or logps is None:
+            return inputs, outputs
+        if not torch.is_tensor(logps) or logps.dim() < 2:
+            raise TypeError('SequenceParallelStrategy.gather_loss_inputs expects outputs[\"logps\"] to be a '
+                            f'sequence tensor, got type={type(logps)} shape={getattr(logps, "shape", None)}')
+        real_position_ids = sequence_parallel.real_position_ids
+        gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
+        outputs['logps'] = gathered_logps
+        inputs['labels'] = gathered_labels
+        return inputs, outputs
+
+    def align_gathered_loss(self, loss: torch.Tensor, reduction: Optional[str] = None) -> torch.Tensor:
         if not self.enabled or self.ulysses_size <= 1:
             return loss
-        if labels is None or sequence_parallel._data_rank_group is None:
+        reduction = str(reduction or 'mean').lower()
+        if reduction != 'sum' or sequence_parallel.world_size <= 1:
             return loss
-        # Compute global loss via autograd-aware all-reduce.
-        reduction = str(self.sp_config.get('loss_reduction', 'mean')).lower()
-        if reduction == 'none':
-            raise ValueError("SequenceParallelStrategy.reduce_loss only supports reduction='sum' or 'mean'. "
-                             'Please aggregate per-token losses before calling reduce_loss.')
-        compensate_fsdp_avg = bool(self.sp_config.get('compensate_fsdp_avg', False))
-        compensate_factor = float(sequence_parallel.world_size if compensate_fsdp_avg else 1.0)
-        sum_metric_scale = float(sequence_parallel.world_size)
+        aligned = loss / float(sequence_parallel.world_size)
+        # Keep the forward value aligned with the old scalar-reduction path while
+        # preserving gradients from the gathered loss computation.
+        return loss + (aligned - loss).detach()
 
-        class _ReduceSequenceParallelLoss(torch.autograd.Function):
-
-            @staticmethod
-            def forward(ctx, local_mean: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
-                local_tokens = num_valid_tokens.detach().clone()
-                local_sum = local_mean * local_tokens
-                if local_tokens.item() == 0:
-                    local_sum = torch.nan_to_num(local_sum)
-                global_sum = local_sum.detach().clone()
-                dist.all_reduce(global_sum, group=sequence_parallel._data_rank_group)
-                global_tokens = num_valid_tokens.detach().clone()
-                dist.all_reduce(global_tokens, group=sequence_parallel._data_rank_group)
-                ctx.save_for_backward(local_tokens, global_tokens)
-                if global_tokens.item() == 0:
-                    return local_sum
-                return global_sum / global_tokens
-
-            @staticmethod
-            def backward(ctx, grad_output: torch.Tensor):
-                local_tokens, global_tokens = ctx.saved_tensors
-                if global_tokens.item() == 0:
-                    return torch.zeros_like(grad_output), None
-                # d(global_mean)/d(local_mean) = local_tokens / global_tokens.
-                grad_local_mean = grad_output * (local_tokens / global_tokens) * compensate_factor
-                return grad_local_mean, None
-
-        class _ReduceSequenceParallelSum(torch.autograd.Function):
-
-            @staticmethod
-            def forward(ctx, local_sum: torch.Tensor) -> torch.Tensor:
-                ctx.sum_metric_scale = sum_metric_scale
-                global_sum = local_sum.detach().clone()
-                dist.all_reduce(global_sum, group=sequence_parallel._data_rank_group)
-                # Keep logging/metric value aligned with non-SP sum semantics under
-                # outer collect='mean' by removing one SP replication factor.
-                return global_sum / ctx.sum_metric_scale
-
-            @staticmethod
-            def backward(ctx, grad_output: torch.Tensor):
-                # Keep training gradient scale unchanged; forward-side scaling is for
-                # logging/metric alignment under outer collect='mean'.
-                return grad_output
-
-        if reduction == 'sum':
-            return _ReduceSequenceParallelSum.apply(loss)
-
-        # Default to mean reduction: `loss` is local mean.
-        num_valid_tokens = (labels != ignore_index).sum().to(loss.device)
-        return _ReduceSequenceParallelLoss.apply(loss, num_valid_tokens)
+    def finalize_loss_result(
+        self,
+        loss: torch.Tensor,
+        counts: Any,
+        state: Optional[SequenceParallelLossState],
+    ) -> Tuple[torch.Tensor, Any]:
+        if state is None or not state.applied:
+            return loss, counts
+        if not self.enabled or self.ulysses_size <= 1:
+            return loss, counts
+        if state.local_counts is not None:
+            counts = state.local_counts.to(device=loss.device)
+        loss = self.align_gathered_loss(loss, state.reduction)
+        return loss, counts
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()
