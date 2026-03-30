@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 from twinkle import DeviceMesh, remote_class, remote_function, template
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.infra import collect_tensor_dict
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
@@ -88,7 +89,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _lazy_wrap_model(self):
         pass
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         optimizer_config = self.optimizer_group[kwargs.get('adapter_name')]
@@ -104,10 +105,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
             return super().forward(inputs=inputs, **kwargs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
-        self._check_adapter_valid(kwargs.get('adapter_name'))
-        optimizer_config = self.optimizer_group[kwargs.get('adapter_name')]
+        adapter_name = kwargs.get('adapter_name')
+        disable_lora = kwargs.get('disable_lora', False)
+        self._check_adapter_valid(adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
                                                                         and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
@@ -117,7 +120,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         self.multi_adapter.check_length(inputs)
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
     @remote_function()
@@ -244,6 +247,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().set_grad_scaler(**kwargs)
 
+    @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().add_metric(metric_cls, is_training, **kwargs)

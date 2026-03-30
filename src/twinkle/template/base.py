@@ -176,9 +176,6 @@ class Template:
         if self.use_chat_template and self.default_system:
             if trajectory['messages'][0]['role'] == 'user':
                 trajectory['messages'].insert(0, Message(role='system', content=self.default_system))
-            for (_, messages) in trajectory.get('extend_message', []):
-                if messages and messages[0]['role'] == 'user':
-                    messages.insert(0, Message(role='system', content=self.default_system))
         return [trajectory]
 
     def _to_standard_reasoning_content(self, trajectory: Trajectory) -> List[Trajectory]:
@@ -203,51 +200,46 @@ class Template:
             return result
 
         trajectory['messages'] = _extract_reasoning_content(trajectory['messages'])
-        extra_messages = trajectory.get('extend_message', [])
-        if extra_messages:
-            result = []
-            for key, extra_message in trajectory.get('extend_message', []):
-                result.append((key, _extract_reasoning_content(extra_message)))
-            trajectory['extend_message'] = result
         return [trajectory]
 
-    _truncatable_fields = {'input_ids', 'labels'}
+    def _truncate_feature(self, feature: InputFeature, strategy: str) -> InputFeature:
+        """Truncate input_ids and labels in a single InputFeature."""
+        length = len(feature['input_ids'])
+        if length <= self.max_length:
+            return feature
+        if strategy == 'raise':
+            raise ValueError(f'Input length {length} exceeds max_length {self.max_length}')
+        result = dict(feature)
+        if strategy == 'left':
+            result['input_ids'] = result['input_ids'][-self.max_length:]
+            if 'labels' in result:
+                result['labels'] = result['labels'][-self.max_length:]
+        elif strategy == 'right':
+            result['input_ids'] = result['input_ids'][:self.max_length]
+            if 'labels' in result:
+                result['labels'] = result['labels'][:self.max_length]
+        return InputFeature(**result)
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
-        if self.max_length and len(input_feature['input_ids']) > self.max_length:
-            if self.truncation_strategy == 'raise':
-                raise ValueError(f'An input message(length: {len(input_feature["input_ids"])} '
-                                 f'exceeds the maximum length({self.max_length})')
-            elif self.truncation_strategy == 'left':
-                return [
-                    InputFeature(
-                        **{
-                            key: (value[-self.max_length:] if key in self._truncatable_fields else value)
-                            for key, value in input_feature.items()
-                        })
-                ]
-            elif self.truncation_strategy == 'right':
-                return [
-                    InputFeature(
-                        **{
-                            key: (value[:self.max_length] if key in self._truncatable_fields else value)
-                            for key, value in input_feature.items()
-                        })
-                ]
-            else:  # split
-                result = []
-                total_length = len(input_feature['input_ids'])
-                for start in range(0, total_length, self.max_length):
-                    end = min(start + self.max_length, total_length)
-                    result.append(
-                        InputFeature(
-                            **{
-                                key: (value[start:end] if key in self._truncatable_fields else value)
-                                for key, value in input_feature.items()
-                            }))
-                return result
-        else:
+        if not self.max_length:
             return [input_feature]
+
+        strategy = self.truncation_strategy
+
+        # Split strategy
+        if strategy == 'split':
+            results = []
+            for start in range(0, len(input_feature['input_ids']), self.max_length):
+                end = min(start + self.max_length, len(input_feature['input_ids']))
+                feat = dict(input_feature)
+                feat['input_ids'] = feat['input_ids'][start:end]
+                if 'labels' in feat:
+                    feat['labels'] = feat['labels'][start:end]
+                results.append(InputFeature(**feat))
+            return results
+
+        # left/right/raise
+        return [self._truncate_feature(input_feature, strategy)]
 
     def _add_attention_fields(self, input_feature: InputFeature) -> List[InputFeature]:
         input_ids = input_feature['input_ids']
@@ -260,15 +252,13 @@ class Template:
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
         return [input_feature]
 
-    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
-        messages = trajectory['messages']
+    def _process_mm_messages(self, messages: List) -> List:
+        """Process multimodal content in a list of messages."""
         new_messages = []
         for message in messages:
             message = copy(message)
             content = message['content']
             if isinstance(content, list):
-                # Transformers standard format: content is List[Dict].
-                # Preprocess media references (url/path/bytes) to PIL objects in-place.
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -283,9 +273,8 @@ class Template:
                             if key in block and block[key] is not None:
                                 block[key] = self.preprocess_video(block[key])
                                 break
+                new_messages.append(message)
             else:
-                # content is str with placeholders,
-                # media stored in message['images']/['videos']/['audios'].
                 msg_images = message.get('images')
                 msg_videos = message.get('videos')
                 msg_audios = message.get('audios')
@@ -298,10 +287,13 @@ class Template:
                 if msg_audios:
                     message['audios'] = self.preprocess_audios(msg_audios)
                     assert len(message['audios']) == content.count(self.audio_placeholder)
-                message = transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
-                                                       self.audio_placeholder, self.is_mm)
-            new_messages.append(message)
-        trajectory['messages'] = new_messages
+                new_messages.append(
+                    transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
+                                                 self.audio_placeholder, self.is_mm))
+        return new_messages
+
+    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
+        trajectory['messages'] = self._process_mm_messages(trajectory['messages'])
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -328,7 +320,8 @@ class Template:
             **kwargs)
         return inputs
 
-    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
+    def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
+        """Encode a single trajectory's messages into InputFeature."""
         if self.use_chat_template:
             if add_generation_prompt:
                 # For inference: just get input_ids with generation prompt, no labels needed
@@ -351,11 +344,17 @@ class Template:
             input_ids = self.tokenizer.encode(text)
             encoded = {}
             labels = deepcopy(input_ids)
-        return InputFeature(
+
+        input_feature = InputFeature(
             input_ids=np.array(input_ids),
             labels=np.array(labels),
             **encoded,
         )
+        trajectory.update(input_feature)
+        return trajectory
+
+    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
+        return self._encode_messages(trajectory, add_generation_prompt)
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
@@ -383,18 +382,67 @@ class Template:
 
         return columns
 
-    def batch_encode(self,
-                     trajectories: Union[Dict[str, Any], List[Trajectory]],
-                     add_generation_prompt: bool = False) -> List[InputFeature]:
-        output = []
+    def _is_trajectory(self, obj: Any) -> bool:
+        """Check if an object is a Trajectory (has 'messages' key)."""
+        return isinstance(obj, Mapping) and 'messages' in obj
+
+    def _get_trajectory_keys(self, columnar: Mapping) -> List[str]:
+        """Get keys whose values are lists of Trajectories in columnar format."""
+        keys = []
+        for k, v in columnar.items():
+            if isinstance(v, list) and v and self._is_trajectory(v[0]):
+                keys.append(k)
+        return keys
+
+    def batch_encode(
+        self,
+        trajectories: Union[Dict[str, Any], List[Trajectory]],
+        add_generation_prompt: bool = False,
+    ) -> Union[Dict[str, Any], List[InputFeature]]:
+        """Encode trajectories into InputFeatures.
+
+        Args:
+            trajectories: Either List[Trajectory] or columnar Dict[str, List].
+                For DPO, columnar format with 'positive'/'negative' keys containing
+                List[Trajectory] is supported.
+            add_generation_prompt: Whether to add generation prompt.
+
+        Returns:
+            List[InputFeature] or columnar Dict[str, List[InputFeature]].
+        """
         _transfer = False
+
         if isinstance(trajectories, Mapping):
             _transfer = True
-            trajectories = self.map_col_to_row(trajectories)
+            # Check if it has trajectory list columns (DPO format)
+            traj_keys = self._get_trajectory_keys(trajectories)
+            if traj_keys:
+                # DPO format: encode each trajectory list separately, keep other columns
+                result = {}
+                for key in trajectories:
+                    if key in traj_keys:
+                        # Encode this trajectory list
+                        result[key] = self.batch_encode(trajectories[key], add_generation_prompt=add_generation_prompt)
+                    else:
+                        # Keep non-trajectory columns as-is
+                        result[key] = trajectories[key]
+                return result
+            else:
+                # Standard columnar format
+                trajectories = self.map_col_to_row(trajectories)
+
+        # Process List[Trajectory]
         trajectories = self._invoke_pre_pipeline(trajectories)
-        for trajectory in trajectories:
-            output.append(self.encode(trajectory, add_generation_prompt=add_generation_prompt))
+
+        # Use thread pool for parallel encoding
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        encode_fn = partial(self.encode, add_generation_prompt=add_generation_prompt)
+        with ThreadPoolExecutor() as executor:
+            output = list(executor.map(encode_fn, trajectories))
+
         output = self._invoke_post_pipeline(output)
+
         if _transfer:
             output = self.map_row_to_col(output)
         return output
