@@ -190,3 +190,36 @@ def stateless_init_process_group(
 
     communicator = Communicator(pg, device=device)
     return communicator
+
+
+def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200) -> 'torch.Tensor':
+    import torch
+    if not tensors:
+        raise ValueError('Empty tensor list')
+
+    if len(tensors) == 1:
+        return tensors[0]
+
+    max_ndim = max(t.ndim for t in tensors)
+    expanded_tensors = []
+    for t in tensors:
+        while t.ndim < max_ndim:
+            t = t.unsqueeze(0)
+        expanded_tensors.append(t)
+
+    max_shape = []
+    for dim in range(max_ndim):
+        max_shape.append(max(t.shape[dim] for t in expanded_tensors))
+
+    padded_tensors = []
+    for t in expanded_tensors:
+        if list(t.shape) == max_shape:
+            padded_tensors.append(t)
+        else:
+            pad_params = []
+            for dim in range(max_ndim - 1, -1, -1):
+                pad_params.extend([0, max_shape[dim] - t.shape[dim]])
+            padded = torch.nn.functional.pad(t, pad_params, value=pad_value)
+            padded_tensors.append(padded)
+
+    return torch.cat(padded_tensors, dim=0)

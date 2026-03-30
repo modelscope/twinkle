@@ -30,6 +30,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
+from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -38,83 +39,37 @@ from .strategy import MegatronStrategy
 
 
 @dataclass
-class MegatronOptimizerGroup:
+class MegatronOptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Megatron training.
 
     Similar to OptimizerGroup but adapted for Megatron's distributed training.
     """
-    adapter_name: str = None
-    adapter_config: Any = None
-    optimizer: Optimizer = None
-    lr_scheduler: LRScheduler = None
-    inputs: List[InputFeature] = None
-    outputs: ModelOutput = None
-    loss_instance: Loss = None
-    loss_value: Any = None
-    template: Template = None
-    processor: InputProcessor = None
-    gradient_accumulation_steps: int = 1
-    cur_step: int = 0
-    _dp_group = None
-    train_metrics: List[Metric] = field(default_factory=list)
-    eval_metrics: List[Metric] = field(default_factory=list)
-    _device_mesh: DeviceMesh = None
-    # Megatron optimizer specific fields
-    _last_grad_norm: float = 0.0
+    # Megatron-specific fields
     _last_step_success: bool = True
-
-    def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
-        if gradient_accumulation_steps is None:
-            gradient_accumulation_steps = self.gradient_accumulation_steps
-        else:
-            self.gradient_accumulation_steps = gradient_accumulation_steps
-        return (self.cur_step - 1) % gradient_accumulation_steps == 0 and self.cur_step > 1
 
     def __post_init__(self):
         if self._device_mesh.data_world_size > 1:
             self._dp_group = self._device_mesh.create_process_group(['dp', 'fsdp'])
-        self.train_metrics = [
+        train_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.train_status = TrainStatus(metrics=train_metrics)
 
-        self.eval_metrics = [
+        eval_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
+        self.eval_status = TrainStatus(metrics=eval_metrics)
 
     def _get_lr(self):
         _lrs = []
+        if self.optimizer is None:
+            return _lrs
         _default_lr = self.optimizer.chained_optimizers[0].config.lr
         for param_group in self.optimizer.param_groups:
             _lrs.append(param_group.get('lr', _default_lr))
         return _lrs
-
-    def accumulate_metrics(self, is_training):
-        if is_training:
-            metrics = self.train_metrics
-        else:
-            metrics = self.eval_metrics
-        if len(metrics) > 0 and self.inputs is not None and self.outputs is not None:
-            for metric in metrics:
-                metric.accumulate(
-                    self.inputs,
-                    self.outputs,
-                    lr=self._get_lr(),
-                    step=self.cur_step - 1,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm)
-
-    def calculate_metrics(self, is_training):
-        self.accumulate_metrics(is_training)
-        if is_training:
-            metrics = self.train_metrics
-        else:
-            metrics = self.eval_metrics
-        results = {}
-        for metric in metrics:
-            results.update(metric.calculate())
-        return results
 
 
 _default_adapter_name = ''
@@ -245,7 +200,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
-            loss_instance=CrossEntropyLoss(),
+            loss_instance=CrossEntropyLoss(reduction='sum'),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,
@@ -296,6 +251,38 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def _not_encoded(inputs):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
+
+    @staticmethod
+    def _slice_value_for_microbatch(value, mb_start: int, mb_end: int, micro_batch_size: int):
+        """Recursively slice a value for microbatch processing.
+
+        Handles nested dicts (e.g., ref_outputs: {"logps": tensor}) by recursively
+        slicing internal tensors.
+
+        Args:
+            value: The value to slice (tensor, ndarray, list, dict, or scalar)
+            mb_start: Start index of the microbatch
+            mb_end: End index of the microbatch
+            micro_batch_size: Size of each microbatch
+
+        Returns:
+            Sliced value with the same structure
+        """
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] > micro_batch_size:
+            return value[mb_start:mb_end]
+        elif isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] > micro_batch_size:
+            return value[mb_start:mb_end]
+        elif isinstance(value, (list, tuple)) and len(value) > micro_batch_size:
+            return value[mb_start:mb_end]
+        elif isinstance(value, dict):
+            # Recursively slice dict values (e.g., ref_outputs: {"logps": tensor})
+            return {
+                k: MegatronModel._slice_value_for_microbatch(v, mb_start, mb_end, micro_batch_size)
+                for k, v in value.items()
+            }
+        else:
+            # Scalars, small tensors, or non-sliceable values pass through as-is
+            return value
 
     def _postprocess_tensor_cp(self, tensor):
         """All-gather and reconstruct full sequence from CP-split tensor.
@@ -405,6 +392,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
         return_logits = kwargs.pop('return_logits', False)
@@ -424,7 +412,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
 
         if micro_batch_size is None:
-            micro_batch_size = 1
+            # Compatible with DPO
+            micro_batch_size = min(2, len(inputs))
         inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
 
         # Get parallelism settings for sequence padding and splitting
@@ -455,17 +444,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             for mb_idx in range(num_microbatches):
                 mb_start = mb_idx * micro_batch_size
                 mb_end = mb_start + micro_batch_size
-                mb_kwargs = {}
-                for key, value in kwargs.items():
-                    if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] > micro_batch_size:
-                        mb_kwargs[key] = value[mb_start:mb_end]
-                    elif isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] > micro_batch_size:
-                        mb_kwargs[key] = value[mb_start:mb_end]
-                    elif isinstance(value, (list, tuple)) and len(value) > micro_batch_size:
-                        mb_kwargs[key] = value[mb_start:mb_end]
-                    else:
-                        # Scalars, small tensors, or non-sliceable values pass through as-is
-                        mb_kwargs[key] = value
+                mb_kwargs = {
+                    key: self._slice_value_for_microbatch(value, mb_start, mb_end, micro_batch_size)
+                    for key, value in kwargs.items()
+                }
                 loss_extra_kwargs_per_mb.append(mb_kwargs)
 
         _mb_counter = [0]  # mutable counter for closure
@@ -479,6 +461,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
+                # Later will gather this value, so it becomes:
+                # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
+                # 2. PER TOKEN MEAN loss: gather_sum(1 * gradient_accumulation_steps )
+                #       = gradient_accumulation_steps * world_size
+                # Then, grad will divided by this value:
+                # 1. SUM loss: (global_sum_grad) / (global_num_tokens) = global_sum_grad/global_num_tokens
+                # 2. PER TOKEN MEAN loss: (gather_sum(per_token_grad * gradient_accumulation_steps))
+                #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
             return self.strategy.reduce_loss(losses, counts, output_tensor, logps)
 
@@ -487,7 +477,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
-            output_tensor = model(**batch)
+            # Handle disable_lora for base model inference (e.g., reference in DPO)
+            unwrapped_model = self.strategy.unwrap_model([model])[0]
+            if disable_lora and isinstance(unwrapped_model, PeftModel):
+                with unwrapped_model.disable_adapter():
+                    output_tensor = model(**batch)
+            else:
+                output_tensor = model(**batch)
             batch['labels'] = labels
             logps = None
             if labels is not None and mpu.is_pipeline_last_stage():
@@ -571,7 +567,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
-        optimizer_config.inputs = inputs
         if logps and len({_logps.shape[1] for _logps in logps}) == 1:
             logps = torch.cat(logps, dim=0)
         if logits and len({_logits.shape[1] for _logits in logits}) == 1:
@@ -580,8 +575,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             loss = loss.detach().cpu().float().numpy()
         if not return_logits:
             logits = None
-        if not forward_only:
-            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+        if forward_only:
+            optimizer_config.eval_status.inputs = inputs
+            optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.eval_status.forward_kwargs = kwargs
+        else:
+            optimizer_config.train_status.inputs = inputs
+            optimizer_config.train_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+            optimizer_config.train_status.forward_kwargs = kwargs
         return ModelOutput(logits=logits, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
@@ -712,6 +713,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.loss_instance = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
 
+    @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
@@ -727,9 +729,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
         if is_training is None or is_training is True:
-            optimizer_config.train_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.train_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
         if not is_training:
-            optimizer_config.eval_metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
 
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
@@ -793,16 +795,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         opt_config = OptimizerConfig(
             optimizer='adam',
             lr=lr,
-            min_lr=kwargs.get('min_lr', 0.0),
-            weight_decay=kwargs.get('weight_decay', 0.01),
-            adam_beta1=kwargs.get('adam_beta1', 0.9),
-            adam_beta2=kwargs.get('adam_beta2', 0.999),
-            adam_eps=kwargs.get('adam_eps', 1e-8),
-            clip_grad=kwargs.get('clip_grad', 1.0),
-            bf16=kwargs.get('bf16', True),
+            min_lr=kwargs.pop('min_lr', 0.0),
+            weight_decay=kwargs.pop('weight_decay', 0.01),
+            adam_beta1=kwargs.pop('adam_beta1', 0.9),
+            adam_beta2=kwargs.pop('adam_beta2', 0.999),
+            adam_eps=kwargs.pop('adam_eps', 1e-8),
+            clip_grad=kwargs.pop('clip_grad', 1.0),
+            bf16=kwargs.pop('bf16', True),
             use_distributed_optimizer=use_distributed_optimizer,
-            overlap_param_gather=kwargs.get('overlap_param_gather', False),
-            log_num_zeros_in_grad=kwargs.get('log_num_zeros_in_grad', False),
+            overlap_param_gather=kwargs.pop('overlap_param_gather', False),
+            log_num_zeros_in_grad=kwargs.pop('log_num_zeros_in_grad', False),
             **kwargs,
         )
 
