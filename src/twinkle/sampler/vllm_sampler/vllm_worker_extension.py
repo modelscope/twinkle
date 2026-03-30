@@ -131,11 +131,6 @@ class TwinkleWorkerExtension:
 
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
-        else:
-            try:
-                self.monkey_patch_model()
-            except Exception as e:
-                logger.warning(f'Failed to apply MoE weight_loader patch before load_weights: {e}')
 
         # Detect TP rank — vLLM sets self.rank on each worker.
         tp_rank = getattr(self, 'rank', 0)
@@ -357,12 +352,6 @@ class TwinkleWorkerExtension:
         if self.device is None:
             # fix: Keep device resolution consistent with update_weights_from_ipc to avoid path divergence.
             self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
-
-        if not (peft_config and base_sync_done):
-            try:
-                self.monkey_patch_model()
-            except Exception as e:
-                logger.warning(f'Failed to apply MoE weight_loader patch before load_weights: {e}')
 
         weight_list = list(weights.items())
         self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
