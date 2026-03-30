@@ -168,7 +168,6 @@ def test_save_training_state_writes_split_files(tmp_path, tiny_local_model_dir):
     [
         ('optimizer.pt', 'optimizer.pt'),
         ('scheduler.pt', 'scheduler.pt'),
-        ('scaler.pt', 'scaler.pt'),
         ('rng_state.pt', 'rng_state.pt'),
         ('trainer_state.json', 'trainer_state.json'),
     ],
@@ -186,6 +185,21 @@ def test_load_training_state_fails_when_required_file_missing(tmp_path, tiny_loc
 
     with pytest.raises(FileNotFoundError, match=expected_pattern):
         restored.load_training_state(str(ckpt_dir))
+
+
+def test_load_training_state_allows_missing_scaler_file(tmp_path, tiny_local_model_dir):
+    ckpt_dir = prepare_full_param_checkpoint(tmp_path, tiny_local_model_dir, cur_step=8, consumed_train_samples=16)
+    (ckpt_dir / 'scaler.pt').unlink()
+
+    restored = build_full_param_model(ckpt_dir)
+    restored.set_optimizer('AdamW', lr=1e-4)
+    restored.set_lr_scheduler('LinearLR')
+
+    trainer_state = restored.load_training_state(str(ckpt_dir))
+
+    assert trainer_state['cur_step'] == 8
+    assert trainer_state['consumed_train_samples'] == 16
+    assert restored.optimizer_group[''].cur_step == 8
 
 
 def test_load_training_state_fails_for_malformed_trainer_state(tmp_path, tiny_local_model_dir):

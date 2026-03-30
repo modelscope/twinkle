@@ -1064,7 +1064,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             'trainer_state': os.path.join(checkpoint_dir, 'trainer_state.json'),
             'optimizer': os.path.join(checkpoint_dir, 'optimizer.pt'),
             'scheduler': os.path.join(checkpoint_dir, 'scheduler.pt'),
-            'scaler': os.path.join(checkpoint_dir, 'scaler.pt'),
             'rng': os.path.join(checkpoint_dir, 'rng_state.pt'),
         }
         for path in required_paths.values():
@@ -1073,7 +1072,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         trainer_state = self.read_training_progress(checkpoint_dir)
         self._load_optimizer(checkpoint_dir, adapter_name=adapter_name, strict=True)
-        self._load_scaler_state(required_paths['scaler'], adapter_name=adapter_name)
+        scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
+        if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
+            self._load_scaler_state(scaler_path, adapter_name=adapter_name)
         self._load_rng_state(required_paths['rng'])
 
         optimizer_config.cur_step = trainer_state['cur_step']
