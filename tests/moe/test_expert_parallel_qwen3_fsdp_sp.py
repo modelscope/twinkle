@@ -432,7 +432,19 @@ def _run_worker_ep_fsdp_sp_align(
         # Forward alignment (full-seq logits reconstructed by SP gather).
         local_base_logits = base_logits[:, start:end].detach()
         local_max_abs_diff = (sp_local_logits.detach() - local_base_logits).abs().max().item()
-        print(f'[rank{rank}] fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} start={start} end={end}')
+        alt_start, alt_end = (0, end - start) if start != 0 else (end, end + (end - start))
+        alt_base_logits = base_logits[:, alt_start:alt_end].detach()
+        alt_local_max_abs_diff = (sp_local_logits.detach() - alt_base_logits).abs().max().item()
+        runtime_sp_group = sequence_parallel._sp_group
+        runtime_sp_rank = sequence_parallel._sp_rank
+        runtime_group_rank = dist.get_rank(runtime_sp_group) if runtime_sp_group is not None else -1
+        test_group_rank = dist.get_rank(sp_group) if sp_group is not None else -1
+        print(
+            f'[rank{rank}] fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} '
+            f'alt_max_abs_diff={alt_local_max_abs_diff:.6e} '
+            f'start={start} end={end} alt_start={alt_start} alt_end={alt_end} '
+            f'runtime_sp_rank={runtime_sp_rank} runtime_group_rank={runtime_group_rank} '
+            f'test_group_rank={test_group_rank}')
         print(
             f'[rank{rank}] fsdp+sp inputs shapes '
             f'sp_local_logits={tuple(sp_local_logits.shape)} '
@@ -635,7 +647,19 @@ def _run_worker_fsdp_sp_align(
         start, end = _sp_slice_range_for_seq_len(seq_len, sp_group=sp_group, sp_size=sp_size)
         local_base_logits = base_logits[:, start:end].detach()
         local_max_abs_diff = (sp_local_logits.detach() - local_base_logits).abs().max().item()
-        print(f'[rank{rank}] ep+fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} start={start} end={end}')
+        alt_start, alt_end = (0, end - start) if start != 0 else (end, end + (end - start))
+        alt_base_logits = base_logits[:, alt_start:alt_end].detach()
+        alt_local_max_abs_diff = (sp_local_logits.detach() - alt_base_logits).abs().max().item()
+        runtime_sp_group = sequence_parallel._sp_group
+        runtime_sp_rank = sequence_parallel._sp_rank
+        runtime_group_rank = dist.get_rank(runtime_sp_group) if runtime_sp_group is not None else -1
+        test_group_rank = dist.get_rank(sp_group) if sp_group is not None else -1
+        print(
+            f'[rank{rank}] ep+fsdp+sp local_logits max_abs_diff={local_max_abs_diff:.6e} '
+            f'alt_max_abs_diff={alt_local_max_abs_diff:.6e} '
+            f'start={start} end={end} alt_start={alt_start} alt_end={alt_end} '
+            f'runtime_sp_rank={runtime_sp_rank} runtime_group_rank={runtime_group_rank} '
+            f'test_group_rank={test_group_rank}')
         print(
             f'[rank{rank}] ep+fsdp+sp inputs shapes '
             f'sp_local_logits={tuple(sp_local_logits.shape)} '
