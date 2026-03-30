@@ -1297,29 +1297,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     else:
                         target_modules = list(config.target_modules)
 
-                    expanded_modules = get_target_modules(_model, target_modules)
+                    expanded_modules = self.get_target_modules(_model, target_modules)
                     config.target_modules = expanded_modules
 
-                _model = get_peft_model(_model, config, adapter_name=adapter_name)
-                # setting average_gradients_across_tp_domain
-                for m in _model.modules():
-                    if isinstance(m, LoraLinear):
-                        # just check
-                        # TODO untested code
-                        from .args import get_args
-                        args = get_args()
-                        from .tuners import LoraParallelLinear
-                        assert args.is_multimodal and not isinstance(m, LoraParallelLinear)
-                        for p in m.parameters():
-                            if p.requires_grad:
-                                p.average_gradients_across_tp_domain = True
+                _model = get_peft_model(_model, config, adapter_name=adapter_name) # noqa
             _models.append(_model)
         self.model = _models
 
         # Create optimizer group for adapter
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config
+        self.optimizer_group[adapter_name].adapter_config = config # noqa
         self.optimizer_group[adapter_name].gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor

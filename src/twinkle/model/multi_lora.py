@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
 from types import MethodType
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable
 
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
@@ -191,7 +191,7 @@ class MultiLora:
         # Megatron is an optional dependency; if megatron-core/megatron is missing,
         # we must not crash the entire service just because we try to import megatron modules.
         try:
-            from twinkle.model.megatron.tuners import LoraParallelLinear as _LoraParallelLinear
+            from mcore_bridge import LoraParallelLinear as _LoraParallelLinear
         except Exception:  # noqa: broad-except
             _LoraParallelLinear = ()
 
@@ -394,32 +394,25 @@ class MultiLora:
                 return _module
 
             def _patch_megatron(_module):
-                # Mark expert layers for MoE models
-                from .megatron.tuners.utils import set_linear_is_expert
-                set_linear_is_expert(_module)
-
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
+                if isinstance(_module, PeftModel):
+                    _module.add_adapter(lora_tenant.adapter_name, _config)
+                else:
+                    # TODO first wrap needs parse target_modules, need to fix later
+                    if _config.target_modules:
+                        if isinstance(_config.target_modules, str):
+                            target_modules = [_config.target_modules]
+                        else:
+                            target_modules = list(_config.target_modules)
 
-                from .megatron.tuners.utils import patch_deepcopy
-                with patch_deepcopy():
-                    if isinstance(_module, PeftModel):
-                        _module.add_adapter(lora_tenant.adapter_name, _config)
-                    else:
-                        # TODO first wrap needs parse target_modules, need to fix later
-                        if _config.target_modules:
-                            if isinstance(_config.target_modules, str):
-                                target_modules = [_config.target_modules]
-                            else:
-                                target_modules = list(_config.target_modules)
+                        from .base import TwinkleModel
+                        _config.target_modules = TwinkleModel.get_target_modules(_module, target_modules)
+                    _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
 
-                            from .megatron.tuners.utils import get_target_modules
-                            _config.target_modules = get_target_modules(_module, target_modules)
-                        _module = get_peft_model(_module, _config, lora_tenant.adapter_name)
-
-                    for name, submodule in _module.named_modules():
-                        if isinstance(submodule, LoraLayer):
-                            self._patch_lora_forward(name, submodule)
+                for name, submodule in _module.named_modules():
+                    if isinstance(submodule, LoraLayer):
+                        self._patch_lora_forward(name, submodule)
                 return _module
 
             if isinstance(module, list):
