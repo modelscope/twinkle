@@ -121,7 +121,7 @@ def create_metrics_middleware(deployment: str) -> Callable:
         response = await call_next(request)
         elapsed = time.monotonic() - start
         status = str(response.status_code)
-        method = request.url.path
+        method = request.scope['route'].path if 'route' in request.scope else request.url.path
         m = _get_request_metrics(deployment)
         m.requests_total.inc(tags={
             'deployment': deployment,
