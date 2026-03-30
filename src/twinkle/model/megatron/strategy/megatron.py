@@ -4,7 +4,7 @@ from typing import List, Literal, Optional, Dict, Any
 import torch
 import torch.nn as nn
 
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, Platform, torch_util
 
 
 class MegatronStrategy:
@@ -31,8 +31,6 @@ class MegatronStrategy:
         elif self.mixed_precision == 'no':
             params_dtype = torch.float32
         self._params_dtype = params_dtype
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        model_parallel_cuda_manual_seed(self._seed)
 
         parallel_kwargs = {
             'tensor_model_parallel_size': self.device_mesh.tp_world_size or 1,
@@ -40,12 +38,17 @@ class MegatronStrategy:
             'context_parallel_size': self.device_mesh.cp_world_size or 1,
             'expert_model_parallel_size': self.device_mesh.ep_size or 1,
             'expert_tensor_parallel_size': self.device_mesh.etp_world_size or 1,
-            'virtual_pipeline_model_parallel_size': self.device_mesh.vpp_size or 1,
+            'virtual_pipeline_model_parallel_size': self.device_mesh.vpp_size or None,
         }
+        if not self.device_mesh.vpp_size:
+            # non-interleave does not support overlap_p2p_comm
+            kwargs['overlap_p2p_comm'] = False
         mpu.initialize_model_parallel(
             order=self.device_mesh.order,
             **parallel_kwargs,
         )
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        model_parallel_cuda_manual_seed(self._seed)
         self.config = self.get_model_config(model_dir, parallel_kwargs, **kwargs)
 
     @property
@@ -198,9 +201,25 @@ class MegatronStrategy:
         load_weights: bool = True,
     ) -> List[nn.Module]:
         from mcore_bridge import get_mcore_model
+        import torch.distributed as dist
         mg_models = get_mcore_model(self.config)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        _models = []
+        for _model in mg_models:
+            _model = self._move_model_to_gpu(_model)
+            _models.append(_model)
+
         if load_weights:
             # Load weights
             bridge = self.config.bridge
             bridge.load_weights(mg_models, self.model_dir)
-        return mg_models
+        return _models
+
+    @staticmethod
+    def _move_model_to_gpu(model: nn.Module) -> nn.Module:
+        model = model.to(Platform.get_local_device())
+        torch_util.synchronize()
+        return model

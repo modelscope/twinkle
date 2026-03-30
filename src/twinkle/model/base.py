@@ -159,7 +159,7 @@ class TwinkleModel(ABC):
             dist.init_process_group(**init_kwargs)
 
     @staticmethod
-    def get_target_modules(model: torch.nn.Module, target_modules: List[str]) -> List[str]:
+    def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
         import torch
 
         def find_layers(model: torch.nn.Module, cond_fn) -> List[str]:

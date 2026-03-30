@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from Cython.Compiler.Code import contextmanager
+from contextlib import contextmanager
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
@@ -136,12 +136,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,
         )
-
-    @staticmethod
-    def _move_model_to_gpu(model: nn.Module) -> nn.Module:
-        model = model.to(Platform.get_local_device())
-        torch_util.synchronize()
-        return model
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:

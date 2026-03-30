@@ -2,10 +2,6 @@ import socket
 from datetime import timedelta
 from typing import Optional
 from typing import TYPE_CHECKING, Any, List, Mapping, Union
-
-import torch
-
-from twinkle import requires
 from .network import is_valid_ipv6_address
 
 if TYPE_CHECKING:
@@ -229,8 +225,8 @@ def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200
     return torch.cat(padded_tensors, dim=0)
 
 
-def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: Optional[torch.Tensor], dim: int):
-    requires('megatron_core')
+def split_cp_inputs(inputs: 'torch.Tensor', cu_seqlens: Optional['torch.Tensor'], dim: int):
+    import torch
     from megatron.core import mpu
     if dim < 0:
         dim = (dim + inputs.ndim) % inputs.ndim
