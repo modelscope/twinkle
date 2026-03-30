@@ -147,20 +147,6 @@ class OptimizerGroup:
         self.outputs = None
         return results
 
-
-def _normalize_checkpoint_state(value: Any):
-    """Convert nested DTensor state into plain CPU tensors for checkpointing."""
-    if isinstance(value, dict):
-        return {k: _normalize_checkpoint_state(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_normalize_checkpoint_state(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_normalize_checkpoint_state(v) for v in value)
-    if torch.is_tensor(value):
-        return Torch.to_local_tensor(value).cpu()
-    return value
-
-
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
@@ -892,13 +878,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer = optimizer_config.optimizer
+        lr_scheduler = optimizer_config.lr_scheduler
 
+        if optimizer is not None:
+            optimizer_path = os.path.join(output_dir, 'optimizer.pt')
+            if hasattr(self.strategy, 'save_optimizer_checkpoint'):
+                self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
+            elif Platform.is_master():
+                torch.save(optimizer.state_dict(), optimizer_path)
         if Platform.is_master():
-            optimizer = optimizer_config.optimizer
-            lr_scheduler = optimizer_config.lr_scheduler
-            if optimizer is not None:
-                state_dict = _normalize_checkpoint_state(optimizer.state_dict())
-                torch.save(state_dict, os.path.join(output_dir, 'optimizer.pt'))
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
 
@@ -1007,8 +996,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             raise FileNotFoundError(scheduler_path)
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
-            state_dict = torch.load(optimizer_path, map_location='cpu', weights_only=False)
-            optimizer_config.optimizer.load_state_dict(state_dict)
+            if getattr(self.strategy, 'needs_wrapped_optimizer_state', lambda: False)() and not self._model_wrapped:
+                self._lazy_wrap_model()
+            if hasattr(self.strategy, 'load_optimizer_checkpoint'):
+                self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
+            else:
+                state_dict = torch.load(optimizer_path, map_location='cpu', weights_only=False)
+                optimizer_config.optimizer.load_state_dict(state_dict)
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=False)
