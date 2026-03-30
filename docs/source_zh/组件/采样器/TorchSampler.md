@@ -13,7 +13,7 @@ sampler = TorchSampler(
     device_mesh=DeviceMesh.from_sizes(dp_size=1),
 )
 
-response = sampler.sample(trajectories, sampling_params=params)
+responses = sampler.sample(trajectories, sampling_params=params)
 ```
 
 ## 特性

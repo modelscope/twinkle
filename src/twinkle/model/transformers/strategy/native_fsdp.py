@@ -7,6 +7,7 @@ from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
+from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -18,13 +19,18 @@ class NativeFSDPStrategy:
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
                  fsdp_config: Dict[str, Any] = None,
+                 memory_efficient_init: bool = False,
                  enable_ep: bool = True,
                  ep_size: Optional[int] = None):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self.fsdp_config = fsdp_config or {}
+        self._memory_efficient_init = memory_efficient_init
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
+
+    def pretrained_load_context(self):
+        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -48,6 +54,23 @@ class NativeFSDPStrategy:
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
+
+            # Drop optimizer references to pre-shard params before fully_shard to reduce peak memory.
+            if optimizer is not None:
+                _unbind_optimizer_params(optimizer)
+
+            # EP path requires experts on a real device, incompatible with meta-device flow.
+            use_meta = self._memory_efficient_init and not ep_enabled
+
+            original_sd = None
+            saved_buffers = None
+            if use_meta:
+                original_sd = model.state_dict()
+                saved_buffers = _get_non_persistent_buffers(model)
+                model = model.to(torch.device('meta'))
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights()
+
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
                 _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
@@ -57,11 +80,9 @@ class NativeFSDPStrategy:
             if ep_enabled:
                 _ensure_ep_fsdp_supported(model)
 
-            # Collect experts map and expert params
             experts_map = _collect_ep_experts_map(model) if ep_enabled else {}
             expert_params = _collect_expert_params(model) if self.enable_ep else None
 
-            # Build layer_pairs: [(layer_mod, experts_mod_or_None)]
             layers = _get_decoder_layers(model)
             layer_pairs = []
             if layers is not None:
@@ -69,7 +90,6 @@ class NativeFSDPStrategy:
                     experts_mod = _find_experts_in_layer(layer_mod, experts_map)
                     layer_pairs.append((layer_mod, experts_mod))
 
-            # FSDP2 wrapping per layer
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
@@ -79,9 +99,6 @@ class NativeFSDPStrategy:
                 if experts_mod is not None and ep_fsdp_mesh_1d is not None:
                     from torch.distributed.tensor import Shard
 
-                    # PreMulSum (used by set_gradient_divide_factor) only supports
-                    # float16/float32/float64; override reduce_dtype to float32
-                    # when the base policy uses bfloat16.
                     ep_mp_policy = _build_ep_mp_policy(mp_policy)
                     fully_shard(
                         experts_mod,
@@ -90,7 +107,6 @@ class NativeFSDPStrategy:
                         mp_policy=ep_mp_policy,
                         shard_placement_fn=lambda param: Shard(1),
                     )
-                    # gradient_divide_factor = world_size
                     experts_mod.set_gradient_divide_factor(world_size)
                     layer_mod._fsdp_modules.append(experts_mod)
 
@@ -103,7 +119,6 @@ class NativeFSDPStrategy:
                 )
                 layer_mod._fsdp_modules.append(layer_mod)
 
-            # Root model
             fully_shard(
                 model,
                 mesh=fsdp_mesh,
@@ -112,11 +127,22 @@ class NativeFSDPStrategy:
                 ignored_params=expert_params,
             )
 
-            # Manual prefetch
+            if use_meta:
+                device_type = self.device_mesh.device_type or 'cuda'
+                is_rank0 = (dist.get_rank() == 0)
+                _broadcast_sharded_state_dict(
+                    model,
+                    original_sd if is_rank0 else {},
+                    device_type=device_type,
+                )
+                target_device = torch.device(device_type)
+                _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights()
+
             if ep_enabled and layer_pairs:
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
-            # Rebuild groups after wrapping so grad clip sees the live Parameter objects.
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
 
@@ -398,3 +424,76 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
         return optimizer
     optimizer.param_groups[0]['params'] = list(model.parameters())
     return optimizer
+
+
+def _broadcast_sharded_state_dict(
+    model: nn.Module,
+    full_sd: dict,
+    device_type: str = 'cuda',
+) -> None:
+    """Broadcast full state dict from rank 0 and materialise local shards via distribute_tensor."""
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    meta_sharded_sd = model.state_dict()
+    sharded_sd = {}
+    is_rank0 = (dist.get_rank() == 0)
+
+    for param_name, sharded_param in meta_sharded_sd.items():
+        shape = sharded_param.size()
+        dtype = sharded_param.dtype
+
+        if is_rank0:
+            full_param = full_sd[param_name]
+            full_tensor = full_param.detach().to(device_type)
+            if isinstance(full_tensor, DTensor):
+                full_tensor = full_tensor.to_local()
+        else:
+            full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
+
+        dist.broadcast(full_tensor, src=0)
+        torch_util.synchronize()
+
+        device_mesh = sharded_param.device_mesh
+        placements = sharded_param.placements
+        sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+        del full_tensor
+
+        sharded_sd[param_name] = sharded_tensor
+
+    model.load_state_dict(sharded_sd, assign=True)
+
+
+def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Return {fqn: tensor} for non-persistent buffers (lost on to('meta'))."""
+    non_persistent_fqns: Set[str] = set()
+    for fqn, module in model.named_modules():
+        for buf_name in getattr(module, '_non_persistent_buffers_set', set()):
+            full_fqn = f'{fqn}.{buf_name}' if fqn else buf_name
+            non_persistent_fqns.add(full_fqn)
+
+    return {k: v.clone() for k, v in model.named_buffers() if k in non_persistent_fqns}
+
+
+def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
+    """Drop optimizer refs to pre-shard params before fully_shard to lower peak memory."""
+    for group in optimizer.param_groups:
+        for i in range(len(group['params'])):
+            param = group['params'][i]
+            group['params'][i] = torch.empty(1, dtype=param.dtype, device=param.device)
+
+
+def _restore_non_persistent_buffers(
+    model: nn.Module,
+    saved_buffers: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Re-register non-persistent buffers saved before to('meta')."""
+    for fqn, buf_tensor in saved_buffers.items():
+        buf_tensor = buf_tensor.to(device)
+        if '.' in fqn:
+            parent_fqn, local_name = fqn.rsplit('.', 1)
+            parent = model.get_submodule(parent_fqn)
+        else:
+            local_name = fqn
+            parent = model
+        parent.register_buffer(local_name, buf_tensor, persistent=False)

@@ -768,7 +768,7 @@ class vLLMSampler(Sampler):
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
-    ) -> SampleResponseModel:
+    ) -> List[SampleResponseModel]:
         """Sample from the model.
 
         Args:
@@ -795,7 +795,7 @@ class vLLMSampler(Sampler):
             json_data=json_data
         )
         response.raise_for_status()
-        return SampleResponseModel(**response.json())
+        return [SampleResponseModel(**r) for r in response.json()['samples']]
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
@@ -805,6 +805,14 @@ class vLLMSampler(Sampler):
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())
+    
+    def apply_patch(self, patch_cls: str, **kwargs) -> None:
+        """Apply a patch to the model."""
+        response = http_post(
+            url=f'{self.server_url}/apply_patch',
+            json_data={'patch_cls': patch_cls, 'adapter_name': self.adapter_name, **kwargs}
+        )
+        response.raise_for_status()
 '''
 
     # Write the sampler client file

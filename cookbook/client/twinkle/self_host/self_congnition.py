@@ -21,11 +21,20 @@ from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
+base_model = 'Qwen/Qwen3.5-4B'
+base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
+
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
 # - base_url: the address of the running Twinkle server
 # - api_key: authentication token (loaded from environment variable)
-client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+
+# List available models of the server
+print('Available models:')
+for item in client.get_server_capabilities().supported_models:
+    print('- ' + item.model_name)
 
 # Step 3: Query the server for existing training runs and their checkpoints.
 # This is useful for resuming a previous training session.
@@ -50,7 +59,7 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply a chat template so the data matches the model's expected input format
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
     dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
@@ -64,7 +73,7 @@ def train():
     # Step 5: Configure the model
 
     # Create a multi-LoRA Transformers model pointing to the base model on ModelScope
-    model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+    model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
 
     # Define LoRA configuration: apply low-rank adapters to all linear layers
     lora_config = LoraConfig(target_modules='all-linear')

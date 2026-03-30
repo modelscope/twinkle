@@ -53,7 +53,7 @@ class ServerState:
 
     # ----- Session Management -----
 
-    def create_session(self, payload: dict[str, Any]) -> str:
+    async def create_session(self, payload: dict[str, Any]) -> str:
         """Create a new session with the given payload.
 
         Args:
@@ -79,7 +79,7 @@ class ServerState:
         """
         return self._session_mgr.touch(session_id)
 
-    def get_session_last_heartbeat(self, session_id: str) -> float | None:
+    async def get_session_last_heartbeat(self, session_id: str) -> float | None:
         """Get the last heartbeat timestamp for a session.
 
         Returns:
@@ -89,11 +89,11 @@ class ServerState:
 
     # ----- Model Registration -----
 
-    def register_model(self,
-                       payload: dict[str, Any],
-                       token: str,
-                       model_id: str | None = None,
-                       replica_id: str | None = None) -> str:
+    async def register_model(self,
+                             payload: dict[str, Any],
+                             token: str,
+                             model_id: str | None = None,
+                             replica_id: str | None = None) -> str:
         """Register a new model with the server state.
 
         Args:
@@ -122,7 +122,7 @@ class ServerState:
         self._model_mgr.add(_model_id, record)
         return _model_id
 
-    def unload_model(self, model_id: str) -> bool:
+    async def unload_model(self, model_id: str) -> bool:
         """Remove a model from the registry.
 
         Returns:
@@ -130,14 +130,14 @@ class ServerState:
         """
         return self._model_mgr.remove(model_id)
 
-    def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
+    async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
         """Get metadata for a registered model as a plain dict."""
         record = self._model_mgr.get(model_id)
         return record.model_dump() if record is not None else None
 
     # ----- Replica Management -----
 
-    def register_replica(self, replica_id: str, max_loras: int) -> None:
+    async def register_replica(self, replica_id: str, max_loras: int) -> None:
         """Register a replica and its LoRA capacity.
 
         Args:
@@ -146,7 +146,7 @@ class ServerState:
         """
         self._model_mgr.register_replica(replica_id, max_loras)
 
-    def unregister_replica(self, replica_id: str) -> None:
+    async def unregister_replica(self, replica_id: str) -> None:
         """Remove a replica from the registry.
 
         Args:
@@ -167,7 +167,7 @@ class ServerState:
 
     # ----- Sampling Session Management -----
 
-    def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
+    async def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
         """Create a new sampling session.
 
         Args:
@@ -188,7 +188,7 @@ class ServerState:
         self._sampling_mgr.add(_sampling_session_id, record)
         return _sampling_session_id
 
-    def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
+    async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
         """Get a sampling session by ID as a plain dict."""
         record = self._sampling_mgr.get(sampling_session_id)
         return record.model_dump() if record is not None else None
@@ -241,7 +241,7 @@ class ServerState:
 
     # ----- Resource Cleanup -----
 
-    def cleanup_expired_resources(self) -> dict[str, int]:
+    async def cleanup_expired_resources(self) -> dict[str, int]:
         """Clean up expired sessions, models, sampling_sessions, and futures.
 
         Sessions expire based on last_heartbeat (or created_at).  Models and
@@ -275,7 +275,7 @@ class ServerState:
         while self._cleanup_running:
             try:
                 await asyncio.sleep(self.cleanup_interval)
-                stats = self.cleanup_expired_resources()
+                stats = await self.cleanup_expired_resources()
                 if any(stats.values()):
                     logger.debug(f'[ServerState Cleanup] Removed expired resources: {stats}')
             except asyncio.CancelledError:
@@ -284,7 +284,7 @@ class ServerState:
                 logger.warning(f'[ServerState Cleanup] Error during cleanup: {e}')
                 continue
 
-    def start_cleanup_task(self) -> bool:
+    async def start_cleanup_task(self) -> bool:
         """Start the background cleanup task.
 
         Returns:
@@ -296,7 +296,7 @@ class ServerState:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         return True
 
-    def stop_cleanup_task(self) -> bool:
+    async def stop_cleanup_task(self) -> bool:
         """Stop the background cleanup task.
 
         Returns:
@@ -310,7 +310,7 @@ class ServerState:
             self._cleanup_task = None
         return True
 
-    def get_cleanup_stats(self) -> dict[str, Any]:
+    async def get_cleanup_stats(self) -> dict[str, Any]:
         """Get current cleanup configuration and resource counts.
 
         Returns:
@@ -347,48 +347,48 @@ class ServerStateProxy:
 
     # ----- Session Management -----
 
-    def create_session(self, payload: dict[str, Any]) -> str:
-        return ray.get(self._actor.create_session.remote(payload))
+    async def create_session(self, payload: dict[str, Any]) -> str:
+        return await self._actor.create_session.remote(payload)
 
     async def touch_session(self, session_id: str) -> bool:
         return await self._actor.touch_session.remote(session_id)
 
-    def get_session_last_heartbeat(self, session_id: str) -> float | None:
-        return ray.get(self._actor.get_session_last_heartbeat.remote(session_id))
+    async def get_session_last_heartbeat(self, session_id: str) -> float | None:
+        return await self._actor.get_session_last_heartbeat.remote(session_id)
 
     # ----- Model Registration -----
 
-    def register_model(self,
-                       payload: dict[str, Any],
-                       token: str,
-                       model_id: str | None = None,
-                       replica_id: str | None = None) -> str:
-        return ray.get(self._actor.register_model.remote(payload, token, model_id, replica_id))
+    async def register_model(self,
+                             payload: dict[str, Any],
+                             token: str,
+                             model_id: str | None = None,
+                             replica_id: str | None = None) -> str:
+        return await self._actor.register_model.remote(payload, token, model_id, replica_id)
 
-    def unload_model(self, model_id: str) -> bool:
-        return ray.get(self._actor.unload_model.remote(model_id))
+    async def unload_model(self, model_id: str) -> bool:
+        return await self._actor.unload_model.remote(model_id)
 
-    def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
-        return ray.get(self._actor.get_model_metadata.remote(model_id))
+    async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
+        return await self._actor.get_model_metadata.remote(model_id)
 
     # ----- Replica Management -----
 
-    def register_replica(self, replica_id: str, max_loras: int) -> None:
-        ray.get(self._actor.register_replica.remote(replica_id, max_loras))
+    async def register_replica(self, replica_id: str, max_loras: int) -> None:
+        await self._actor.register_replica.remote(replica_id, max_loras)
 
-    def unregister_replica(self, replica_id: str) -> None:
-        ray.get(self._actor.unregister_replica.remote(replica_id))
+    async def unregister_replica(self, replica_id: str) -> None:
+        await self._actor.unregister_replica.remote(replica_id)
 
     async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
         return await self._actor.get_available_replica_ids.remote(candidate_ids)
 
     # ----- Sampling Session Management -----
 
-    def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
-        return ray.get(self._actor.create_sampling_session.remote(payload, sampling_session_id))
+    async def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
+        return await self._actor.create_sampling_session.remote(payload, sampling_session_id)
 
-    def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
-        return ray.get(self._actor.get_sampling_session.remote(sampling_session_id))
+    async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
+        return await self._actor.get_sampling_session.remote(sampling_session_id)
 
     # ----- Future Management -----
 
@@ -405,23 +405,23 @@ class ServerStateProxy:
         queue_state: str | None = None,
         queue_state_reason: str | None = None,
     ) -> None:
-        """Store task status with optional result (synchronous)."""
+        """Store task status with optional result."""
         await self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
                                                      queue_state_reason)
 
     # ----- Resource Cleanup -----
 
-    def cleanup_expired_resources(self) -> dict[str, int]:
-        return ray.get(self._actor.cleanup_expired_resources.remote())
+    async def cleanup_expired_resources(self) -> dict[str, int]:
+        return await self._actor.cleanup_expired_resources.remote()
 
-    def start_cleanup_task(self) -> bool:
-        return ray.get(self._actor.start_cleanup_task.remote())
+    async def start_cleanup_task(self) -> bool:
+        return await self._actor.start_cleanup_task.remote()
 
-    def stop_cleanup_task(self) -> bool:
-        return ray.get(self._actor.stop_cleanup_task.remote())
+    async def stop_cleanup_task(self) -> bool:
+        return await self._actor.stop_cleanup_task.remote()
 
-    def get_cleanup_stats(self) -> dict[str, Any]:
-        return ray.get(self._actor.get_cleanup_stats.remote())
+    async def get_cleanup_stats(self) -> dict[str, Any]:
+        return await self._actor.get_cleanup_stats.remote()
 
 
 # ---------------------------------------------------------------------------

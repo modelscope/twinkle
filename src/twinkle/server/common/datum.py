@@ -11,7 +11,12 @@ from twinkle.template import Template
 
 def datum_to_input_feature(datum: types.Datum | list[types.Datum],
                            template: Template) -> InputFeature | list[InputFeature]:
-    """Convert a Datum to a dictionary of input features for model inference."""
+    """Convert a Datum to a dictionary of input features for model inference.
+
+    Supports multimodal inputs (images) via ImageChunk and ImageAssetPointerChunk,
+    and can restore preprocessed multimodal tensors packed in ``loss_fn_inputs``
+    (e.g. ``pixel_values``, ``image_grid_thw``) for Tinker-Twinkle bridge.
+    """
     if isinstance(datum, list):
         return [datum_to_input_feature(d, template) for d in datum]
 
@@ -37,7 +42,16 @@ def datum_to_input_feature(datum: types.Datum | list[types.Datum],
         weights = (labels != 0).astype(np.float32)
         datum.loss_fn_inputs['weights'] = types.TensorData.from_numpy(weights)
 
-    # 3. Invoke post-pipeline hooks
+    # 3. Restore multimodal features packed in loss_fn_inputs (if any)
+    #    For multimodal models, the client may send preprocessed image tensors
+    #    such as ``pixel_values`` and ``image_grid_thw`` via loss_fn_inputs to
+    #    avoid re-running image preprocessing on the server.
+    if 'pixel_values' in datum.loss_fn_inputs:
+        input_feature['pixel_values'] = datum.loss_fn_inputs['pixel_values'].to_numpy()
+    if 'image_grid_thw' in datum.loss_fn_inputs:
+        input_feature['image_grid_thw'] = datum.loss_fn_inputs['image_grid_thw'].to_numpy()
+
+    # 4. Invoke post-pipeline hooks
     input_feature = template._add_attention_fields(input_feature)[0]
     return input_feature
 
@@ -67,6 +81,11 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
     ``-100`` are treated as masked positions and will be encoded with
     zero weights so that converting back via ``datum_to_input_feature``
     reproduces the same labels.
+
+    For multimodal models, this function can optionally pack already
+    preprocessed image tensors (e.g. ``pixel_values``, ``image_grid_thw``)
+    into ``loss_fn_inputs`` so that the server can restore them without
+    re-running image preprocessing.
     """
 
     # 1. Build ModelInput from input_ids
@@ -111,5 +130,16 @@ def input_feature_to_datum(input_feature: InputFeature) -> types.Datum:
 
         loss_fn_inputs['target_tokens'] = types.TensorData.from_numpy(target_tokens_arr)
         loss_fn_inputs['weights'] = types.TensorData.from_numpy(weights_arr)
+
+    # 3. Optionally pack multimodal tensors into loss_fn_inputs so that
+    #    the server-side ``datum_to_input_feature`` can restore them.
+    for key in ('pixel_values', 'image_grid_thw'):
+        if key in input_feature and input_feature[key] is not None:
+            value = input_feature[key]
+            if hasattr(value, 'detach'):
+                value = value.detach().cpu().numpy()
+            elif not isinstance(value, np.ndarray):
+                value = np.asarray(value)
+            loss_fn_inputs[key] = types.TensorData.from_numpy(value)
 
     return types.Datum(loss_fn_inputs=loss_fn_inputs, model_input=model_input)

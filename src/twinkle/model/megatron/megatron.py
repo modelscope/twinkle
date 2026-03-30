@@ -26,7 +26,8 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.loss import Loss, VocabParallelCrossEntropyLoss
+from twinkle.infra import collect_tensor_dict
+from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.patch import Patch, apply_patch
@@ -133,6 +134,12 @@ _BASE_LAYER_SUFFIXES = [
     '.mlp.gate.weight',
     '.mlp.gate.bias',
     '.mlp.gate.e_score_correction_bias',
+    '.in_proj_qkv.weight',
+    '.in_proj_z.weight',
+    '.in_proj_a.weight',
+    '.in_proj_b.weight',
+    '.out_proj.weight',
+    '.conv1d.weight',
 ]
 
 
@@ -238,7 +245,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
-            loss_instance=VocabParallelCrossEntropyLoss(),
+            loss_instance=CrossEntropyLoss(),
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh, framework='megatron'),
             _device_mesh=self.device_mesh,
@@ -339,7 +346,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='last_pp')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -364,7 +371,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def backward(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect='mean', sync=True)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -398,7 +405,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -485,6 +494,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
+                output_tensor.div_(temperature)
                 logps = selective_log_softmax(output_tensor, masked_labels)
                 if cp_size > 1:
                     logps = self._postprocess_tensor_cp(logps)
@@ -564,11 +574,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         optimizer_config.inputs = inputs
         if logps and len({_logps.shape[1] for _logps in logps}) == 1:
             logps = torch.cat(logps, dim=0)
+        if logits and len({_logits.shape[1] for _logits in logits}) == 1:
+            logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()
+        if not return_logits:
+            logits = None
         if not forward_only:
-            optimizer_config.outputs = ModelOutput(logits=None, loss=loss, logps=logps)
-        return ModelOutput(logits=None, loss=loss, logps=logps)
+            optimizer_config.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
+        return ModelOutput(logits=logits, loss=loss, logps=logps)
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):
@@ -1579,7 +1593,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
-
+                # LoRA Training and sync full model(merge_adapter)
                 def weight_generator():
                     for _model in self.strategy.unwrap_model(self.model):
                         if isinstance(_model, PeftModel):
@@ -1608,7 +1622,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         yield name, tensor
 
         else:
-
+            # First full base-model sync.
             def _raw_weights():
                 for name, tensor in self.get_hf_state_dict(adapter_name=''):
                     if name is None or tensor is None:
@@ -1619,7 +1633,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     yield _trim_vocab(name, tensor)
 
             def weight_generator():
-                if is_peft_format:
+                if is_peft_format and not merge_and_sync:
                     yield from _add_base_layer_suffix(_raw_weights())
                 else:
                     yield from _raw_weights()
@@ -1631,36 +1645,27 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 pass
             return
 
-        import queue
-        buf: queue.Queue = queue.Queue(maxsize=4)
-        error: list = []
+        async def _send():
+            await engine.send_weights(weight_generator())
 
-        def _send():
+        result_container = {'error': None}
 
-            def _iter():
-                while (item := buf.get()) is not None:
-                    yield item
-
-            loop = asyncio.new_event_loop()
+        def _run():
             try:
-                loop.run_until_complete(engine.send_weights(_iter()))
-            except Exception as exc:
-                error.append(exc)
-            finally:
-                loop.close()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_send())
+                finally:
+                    loop.close()
+            except Exception as e:
+                result_container['error'] = e
 
-        sender = threading.Thread(target=_send, name='ce-broadcast', daemon=True)
-        sender.start()
-        try:
-            for name, tensor in weight_generator():
-                buf.put((name, tensor.clone()))
-                if error:
-                    break
-        finally:
-            buf.put(None)  # sentinel
-        sender.join()
-        if error:
-            raise error[0]
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+        if result_container['error'] is not None:
+            raise result_container['error']
 
     @remote_function(collect='first')
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:

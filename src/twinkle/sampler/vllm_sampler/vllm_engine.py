@@ -53,7 +53,7 @@ class VLLMEngine(BaseSamplerEngine):
         gpu_memory_utilization: float = 0.7,
         max_model_len: Optional[int] = None,
         max_num_seqs: int = 256,
-        enable_lora: bool = True,
+        enable_lora: bool = False,
         max_loras: int = 1,
         max_lora_rank: int = 32,
         enable_sleep_mode: bool = False,
@@ -176,21 +176,16 @@ class VLLMEngine(BaseSamplerEngine):
     # Core Sampling API
     # =========================================================================
 
-    async def sample(
-        self,
-        prompt_token_ids: List[int],
-        sampling_params: Union[SamplingParams, Dict[str, Any]],
-        num_samples: int = 1,
-        logprobs: bool = True,
-        include_prompt_logprobs: bool = False,
-        topk_prompt_logprobs: int = 0,
-        lora_request: Optional[Any] = None,
-        request_id: Optional[str] = None,
-        priority: int = 0,
-        *,
-        images: Optional[List[Any]] = None,
-        videos: Optional[List[Any]] = None,
-    ) -> SampleResponse:
+    async def sample(self,
+                     prompt_token_ids: List[int],
+                     sampling_params: Union[SamplingParams, Dict[str, Any]],
+                     lora_request: Optional[Any] = None,
+                     request_id: Optional[str] = None,
+                     priority: int = 0,
+                     *,
+                     images: Optional[List[Any]] = None,
+                     videos: Optional[List[Any]] = None,
+                     **kwargs) -> SampleResponse:
         """
         Sample completions from the model.
 
@@ -219,12 +214,9 @@ class VLLMEngine(BaseSamplerEngine):
         # Convert to vLLM params
         if isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
-        prompt_logprobs_k = topk_prompt_logprobs if topk_prompt_logprobs > 0 else (1 if include_prompt_logprobs else 0)
-        vllm_params = sampling_params.to_vllm(
-            num_samples=num_samples,
-            logprobs=logprobs,
-            prompt_logprobs=prompt_logprobs_k,
-        )
+        prompt_logprobs_k = sampling_params.prompt_logprobs or 0
+        logprobs = sampling_params.logprobs or 0
+        vllm_params = sampling_params.to_vllm(**kwargs)
 
         # Build request
         if request_id is None:
@@ -283,8 +275,9 @@ class VLLMEngine(BaseSamplerEngine):
             if output.logprobs is not None:
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
-                    if i < len(token_ids) and token_ids[i] in lp:
-                        seq_logprobs.append(lp[token_ids[i]].logprob)
+                    if i < len(token_ids):
+                        sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
+                        seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
 
             # Map finish_reason to StopReason
             stop_reason: StopReason = 'length'
@@ -315,19 +308,15 @@ class VLLMEngine(BaseSamplerEngine):
                     token_id = prompt_token_ids[i]
                     if token_id in lp_dict:
                         lp_obj = lp_dict[token_id]
-                        result_prompt_logprobs.append(lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
+                        result_prompt_logprobs.append(lp_obj.logprob)
                     else:
                         result_prompt_logprobs.append(None)
                 else:
                     result_prompt_logprobs.append(None)
 
                 # Get top-k logprobs
-                sorted_items = sorted(
-                    lp_dict.items(), key=lambda x: -(x[1].logprob
-                                                     if hasattr(x[1], 'logprob') else x[1]))[:prompt_logprobs_k]
-                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj)
-                                                    for tid, lp_obj in sorted_items])
-
+                sorted_items = sorted(lp_dict.items(), key=lambda x: -(x[1].logprob))[:prompt_logprobs_k]
+                result_topk_prompt_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
         return SampleResponse(
             sequences=sequences,
             prompt_logprobs=result_prompt_logprobs,

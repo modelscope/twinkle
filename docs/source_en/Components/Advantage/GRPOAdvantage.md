@@ -38,28 +38,27 @@ Using the advantage function in GRPO training:
 from twinkle.advantage import GRPOAdvantage
 from twinkle.model import TransformersModel
 from twinkle.sampler import vLLMSampler
-from twinkle.reward import MathReward
 
 # Create components
 actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = MathReward()
+reward_fn = ...
 advantage_fn = GRPOAdvantage()
 
 # Training loop
 for batch in dataloader:
-    # 1. Sample generation
-    response = sampler.sample(batch, num_samples=4)
+    # Sample generation
+    sample_response = sampler.sample(batch, num_samples=4)
+    input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
+    ...
+    rewards = reward_fn(...)
 
-    # 2. Calculate rewards
-    rewards = reward_fn(response.trajectories, batch.ground_truths)
-
-    # 3. Calculate advantages
+    # Calculate advantages
     advantages = advantage_fn(rewards, num_generations=4)
 
     # 4. Policy optimization
     loss = actor.forward_backward(
-        inputs=response.inputs,
+        inputs=input_data,
         advantages=advantages
     )
     actor.clip_grad_and_step()

@@ -60,6 +60,7 @@ from .sampler import (
     SampledSequenceModel,
     SampleRequest,
     SampleResponseModel,
+    SampleResponseModelList,
     SetTemplateRequest as SamplerSetTemplateRequest,
     SetTemplateResponse as SamplerSetTemplateResponse,
 )
@@ -67,7 +68,9 @@ from .server import (
     CheckpointPathResponse,
     DeleteCheckpointResponse,
     ErrorResponse,
+    GetServerCapabilitiesResponse,
     HealthResponse,
+    SupportedModel,
     WeightsInfoRequest,
     WeightsInfoResponse as ServerWeightsInfoResponse,
 )

@@ -19,7 +19,7 @@ by <a href="https://modelscope.cn/home">ModelScope</a>
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
+        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
 </p>
 
 ## ✨ What is Twinkle?
@@ -101,9 +101,9 @@ Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/enviro
 
 ## Changelog
 
+- 🎉2026-03-24 Twinkle Web site is now live at https://modelscope.github.io/twinkle-web/
+- 🎉2026-03-19 Support GKD training ，please refer to this [cookbook](cookbook/rl/gkd_on_policy.py).
 - 🎉2026-02-13 Initial version of Twinkle✨ released, including SFT/PT/RL support for text models.
-We also made available serverless training capabilities on [ModelScope](https://modelscope.cn) via
-Tinker-compatible APIs.
 
 ## Training as a Service on ModelScope
 
@@ -130,7 +130,7 @@ supported on Twinkle✨ framework.
 > For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it
 > is currently provided via the Tinker-compatible APIs. We will be rolling out services that support
 > both Tinker APIs, as well as the full-fledged Twinkle✨ native APIs. The serverless endpoint is backed
-> by one training base at a time, and currently it is [Qwen3-30B-A3B-Instruct-2507](https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507).
+> by one training base at a time, and currently it is [Qwen3.5-4B](https://modelscope.cn/models/Qwen/Qwen3.5-4B).
 
 | Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                 |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
@@ -235,7 +235,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3-30B-A3B-Instruct-2507'
+base_model = 'ms://Qwen/Qwen3.5-4B'
 base_url='your-base-url'
 api_key='your-api-key'
 

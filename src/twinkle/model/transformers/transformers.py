@@ -8,6 +8,7 @@ import threading
 import torch
 import torch.distributed as dist
 import transformers
+from copy import copy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
 from peft.utils import load_peft_weights, set_peft_model_state_dict
@@ -26,6 +27,7 @@ from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
+from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
@@ -104,11 +106,14 @@ class OptimizerGroup:
         self._dp_group = self._device_mesh.create_process_group(dims)
 
     def _get_lr(self):
-        _lrs = []
-        _default_lr = self.optimizer.defaults.get('lr')
-        for param_group in self.optimizer.param_groups:
-            _lrs.append(param_group.get('lr', _default_lr))
-        return _lrs
+        if self.optimizer is not None:
+            _lrs = []
+            _default_lr = self.optimizer.defaults.get('lr')
+            for param_group in self.optimizer.param_groups:
+                _lrs.append(param_group.get('lr', _default_lr))
+            return _lrs
+        else:
+            return []
 
     def accumulate_metrics(self, is_training):
         self._ensure_dp_group()
@@ -124,7 +129,8 @@ class OptimizerGroup:
                     lr=self._get_lr(),
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm)
+                    grad_norm=self._last_grad_norm,
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'))
 
     def calculate_metrics(self, is_training):
         self.accumulate_metrics(is_training)
@@ -183,6 +189,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
+            memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -195,6 +202,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
+        self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         if isinstance(model_cls, str):
@@ -203,8 +211,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.model = model_cls.from_config(config, **kwargs)
         else:
             model_id = HubOperation.download_model(model_id)
-            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
-        # Construct sequence-parallel strategy lazily during wrapping to reduce init-time side effects.
+            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
+            with self.strategy.pretrained_load_context():
+                self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -229,6 +238,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 fsdp_config=self._fsdp_config,
                 device_mesh=self.device_mesh,
+                memory_efficient_init=self._memory_efficient_init,
                 enable_ep=self._enable_expert_parallel,
                 ep_size=ep_size,
             )
@@ -237,7 +247,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 mixed_precision=self.mixed_precision,
                 ddp_config=self._ddp_config,
                 fsdp_config=self._fsdp_config,
-                device_mesh=self.device_mesh)
+                device_mesh=self.device_mesh,
+                memory_efficient_init=self._memory_efficient_init)
 
         # Sequence parallel ("ulysses") is derived from dp/fsdp ranks; it does not change world size.
         # We construct `sp_strategy` after the underlying HF model is initialized (see __init__).
@@ -284,6 +295,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
+
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
@@ -293,7 +305,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                self.model = self.strategy.wrap_model(self.model)
+                result = self.strategy.wrap_model(self.model)
+                if isinstance(result, tuple):
+                    self.model = result[0]
+                else:
+                    self.model = result
             self._model_wrapped = True
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
@@ -349,7 +365,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             _device_mesh=self.device_mesh,
         )
 
-    @remote_function()
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
@@ -361,6 +377,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -392,10 +410,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
-            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
+            logits = outputs['logits']
+            logits.div_(temperature)
+            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
+        outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
@@ -407,6 +431,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        temperature = float(kwargs.pop('temperature', 1.0))
+        return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
         if not inputs:
@@ -439,7 +465,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
-            outputs['logps'] = selective_log_softmax(outputs['logits'], masked_labels)
+            logits = outputs['logits']
+            logits.div_(temperature)
+            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+        outputs = copy(outputs)
+        outputs['past_key_values'] = None
+        if not return_logits:
+            outputs['logits'] = None
         return outputs
 
     @remote_function(collect='mean')
@@ -501,7 +533,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.cur_step += 1
         optimizer_config.loss_value = None
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Do forward, calculate loss, and backward.
@@ -1137,21 +1169,28 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 
+        def _normalize(name: str, keep_base_layer: bool) -> str:
+            name = name.replace('base_model.model.', '')
+            if not keep_base_layer:
+                name = name.replace('.base_layer', '')
+            return name
+
+        def _is_lora_key(name: str) -> bool:
+            return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+
         if base_sync_done and adapter_name:
             if merge_and_sync:
-
+                # LoRA Training and sync full model(merge_adapter)
+                # merge and skip lora weigts(already merged)
+                # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
                     if isinstance(model, PeftModel):
                         model.merge_adapter()
                     for name, tensor in model.state_dict().items():
-                        # Skip LoRA-specific weights for base model sync
-                        if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                        if _is_lora_key(name):
                             continue
                         tensor = Torch.to_local_tensor(tensor)
-                        # Keep original names (including .base_layer for PEFT models).
-                        # The sampler side will strip .base_layer based on whether
-                        # vLLM has enable_lora=True/False.
-                        yield name, tensor
+                        yield _normalize(name, keep_base_layer=False), tensor
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -1166,19 +1205,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         yield name, tensor
 
         else:
-            # Full model mode: send all weights (base model sync).
+            # First full base-model sync.  Whether to keep ``.base_layer.``
+            # depends on whether the sampler uses ``enable_lora``:
+            #   merge_and_sync=True  → enable_lora=False → strip .base_layer
+            #   merge_and_sync=False → enable_lora=True  → keep .base_layer
+            keep_base_layer = not merge_and_sync
             state_dict = model.state_dict()
 
             def weight_generator():
                 for name, tensor in state_dict.items():
-                    # Skip LoRA-specific weights for base model sync
-                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                    if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    # Keep original names (including .base_layer for PEFT models).
-                    # The sampler side will strip .base_layer based on whether
-                    # vLLM has enable_lora=True/False.
-                    yield name, tensor
+                    yield _normalize(name, keep_base_layer=keep_base_layer), tensor
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
