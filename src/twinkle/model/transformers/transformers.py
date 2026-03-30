@@ -148,6 +148,19 @@ class OptimizerGroup:
         return results
 
 
+def _normalize_checkpoint_state(value: Any):
+    """Convert nested DTensor state into plain CPU tensors for checkpointing."""
+    if isinstance(value, dict):
+        return {k: _normalize_checkpoint_state(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_checkpoint_state(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_checkpoint_state(v) for v in value)
+    if torch.is_tensor(value):
+        return Torch.to_local_tensor(value).cpu()
+    return value
+
+
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
@@ -884,7 +897,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer = optimizer_config.optimizer
             lr_scheduler = optimizer_config.lr_scheduler
             if optimizer is not None:
-                torch.save(optimizer.state_dict(), os.path.join(output_dir, 'optimizer.pt'))
+                state_dict = _normalize_checkpoint_state(optimizer.state_dict())
+                torch.save(state_dict, os.path.join(output_dir, 'optimizer.pt'))
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
 
