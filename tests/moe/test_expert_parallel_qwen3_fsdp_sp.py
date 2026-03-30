@@ -18,8 +18,8 @@ from typing import Dict, List, Optional, Tuple
 
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
-from twinkle.model.transformers.strategy.sequence_parallel import (SequenceParallelStrategy,
-                                                                   _get_sp_group_from_device_mesh, sequence_parallel)
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel.utils import _get_seq_groups_from_device_mesh
 from twinkle.utils import DeviceMesh
 
 # QWEN3_MOE_MODEL_ID=/path/to/Qwen3-MoE \
@@ -309,7 +309,8 @@ def _run_worker_ep_fsdp_sp_align(
             ulysses_size=2,
         )
         sp_size = 2
-        sp_group = _get_sp_group_from_device_mesh(device_mesh, sp_size)
+        sp_group, _, _, _, _ = _get_seq_groups_from_device_mesh(
+            device_mesh=device_mesh, seq_world_size=sp_size, sp_world_size=sp_size, rp_world_size=1)
 
         # Shared input (same across ranks) + per-rank slice loss (matches SP slice ownership).
         # Keep seq_len divisible by sp_size to avoid padding complexity here.
@@ -533,7 +534,8 @@ def _run_worker_fsdp_sp_align(
             device_type='cuda',
         )
         sp_size = 2
-        sp_group = _get_sp_group_from_device_mesh(device_mesh, sp_size)
+        sp_group, _, _, _, _ = _get_seq_groups_from_device_mesh(
+            device_mesh=device_mesh, seq_world_size=sp_size, sp_world_size=sp_size, rp_world_size=1)
 
         batch_size = 2
         seq_len = 16
