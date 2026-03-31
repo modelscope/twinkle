@@ -11,8 +11,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
-from twinkle.utils import DeviceMesh
+from twinkle.utils import DeviceMesh, selective_log_softmax
 
 try:
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
@@ -228,11 +229,22 @@ def _run_forward_grad_alignment_worker(rank: int, world_size: int, port: int):
             use_cache=False,
         )
         baseline_logits = baseline_outputs.logits.float()
-        baseline_loss = _causal_ce_sum(baseline_logits, labels)
+        baseline_loss = F.cross_entropy(
+            baseline_logits.reshape(-1, baseline_logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction='mean',
+        )
         baseline_loss.backward()
         baseline_grad = baseline_embeds.grad.detach().float()
 
         strategy = _make_strategy(sp_model, world_size)
+        processed_inputs = strategy.preprocess_inputs({
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'labels': labels,
+        })
+        local_labels = processed_inputs['labels']
         sp_embeds = sp_model.get_input_embeddings()(input_ids).detach().clone().requires_grad_(True)
         sp_outputs = sp_model(
             inputs_embeds=sp_embeds,
@@ -240,13 +252,24 @@ def _run_forward_grad_alignment_worker(rank: int, world_size: int, port: int):
             position_ids=position_ids,
             use_cache=False,
         )
-        sp_outputs = strategy.postprocess_outputs(sp_outputs)
-        sp_logits = sp_outputs.logits.float()
-        if not torch.allclose(sp_logits, baseline_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-            max_diff = (sp_logits - baseline_logits).abs().max().item()
+        gathered_outputs = strategy.postprocess_outputs(copy(sp_outputs))
+        gathered_logits = gathered_outputs.logits.float()
+        if not torch.allclose(gathered_logits, baseline_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+            max_diff = (gathered_logits - baseline_logits).abs().max().item()
             raise AssertionError(f'forward logits mismatch on rank {rank}: max_diff={max_diff}')
 
-        sp_loss = _causal_ce_sum(sp_logits, labels)
+        loss_instance = CrossEntropyLoss(reduction='mean')
+        local_logits = sp_outputs.logits
+        masked_local_labels = local_labels.masked_fill(local_labels == -100, 0)
+        local_logps = selective_log_softmax(local_logits, masked_local_labels)
+        loss_inputs = {'labels': local_labels}
+        loss_outputs = {'logits': local_logits, 'logps': local_logps}
+        loss_inputs, loss_outputs, sp_loss_state = strategy.prepare_loss_inputs(loss_instance, loss_inputs, loss_outputs)
+        result = loss_instance(loss_inputs, loss_outputs)
+        sp_loss = result['loss']
+        counts = result['num_tokens']
+        sp_loss, counts = strategy.finalize_loss_result(sp_loss, counts, sp_loss_state)
+        del counts
         if not torch.allclose(sp_loss.detach(), baseline_loss.detach(), atol=LOSS_ATOL, rtol=0):
             raise AssertionError(
                 f'forward loss mismatch on rank {rank}: baseline={baseline_loss.item()} sp={sp_loss.item()}')
@@ -267,8 +290,10 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
         _set_determinism(4321)
         os.environ['QWEN35_SP_LINEAR_HEAD_PARALLEL'] = '1'
 
+        # Keep one full-attention layer so HF's Qwen3.5 cache can derive seq length
+        # from KV cache during decode; all-linear cache is not supported upstream.
         baseline_model = _build_tiny_qwen35(
-            device, layer_types=['linear_attention', 'linear_attention'], use_cache=True)
+            device, layer_types=['linear_attention', 'full_attention'], use_cache=True)
         sp_model = copy.deepcopy(baseline_model)
         (
             input_ids,
