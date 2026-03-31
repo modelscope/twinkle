@@ -257,7 +257,11 @@ class MultiLoraMegatronModel(MegatronModel):
 
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
+        # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
         kwargs.pop('use_distributed_optimizer', None)
+        kwargs.pop('loss_scale', None)
+        kwargs['fp16'] = False
+        kwargs['bf16'] = True
         super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function()

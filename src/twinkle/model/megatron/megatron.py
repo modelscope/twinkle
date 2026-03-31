@@ -630,7 +630,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             self._model_wrapped = True
 
         # Check if requesting Megatron distributed optimizer
-        if not optimizer_cls or optimizer_cls in ('MegatronDistributedOptimizer', 'default', 'Adam'):
+        if not optimizer_cls or optimizer_cls in ('MegatronOptimizer', 'default', 'Adam'):
             optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)  # noqa
         else:
             raise NotImplementedError(
