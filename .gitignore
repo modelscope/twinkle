@@ -29,7 +29,6 @@ wheels/
 /temp
 MANIFEST
 .locks/
-tmp_test_checkpoints/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -144,7 +143,6 @@ images
 /custom/
 megatron_output/
 .qoder
-.worktrees/
 
 # Pytorch
 *.pth
