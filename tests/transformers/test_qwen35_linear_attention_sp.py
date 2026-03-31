@@ -164,6 +164,16 @@ def _causal_ce_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _gather_sequence_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
+    if sequence_parallel.world_size is None or sequence_parallel.world_size <= 1:
+        return hidden_states
+    gathered = sequence_parallel.gather(hidden_states, dim=1, position_ids=sequence_parallel.real_position_ids)
+    real_pos = sequence_parallel.real_position_ids
+    if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
+        gathered = gathered[:, :real_pos.shape[1]].contiguous()
+    return gathered
+
+
 def _all_reduce_full_grad(grad: torch.Tensor) -> torch.Tensor:
     if sequence_parallel._sp_group is None or dist.get_world_size(sequence_parallel._sp_group) <= 1:
         return grad
@@ -349,8 +359,9 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
             raise AssertionError(f'prefill logits mismatch on rank {rank}: max_diff={max_diff}')
         for layer_idx, (sp_hidden, base_hidden) in enumerate(
                 zip(sp_prefill.hidden_states, baseline_prefill.hidden_states)):
-            if not torch.allclose(sp_hidden.float(), base_hidden.float(), rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-                max_diff = (sp_hidden.float() - base_hidden.float()).abs().max().item()
+            gathered_hidden = _gather_sequence_hidden(sp_hidden)
+            if not torch.allclose(gathered_hidden.float(), base_hidden.float(), rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+                max_diff = (gathered_hidden.float() - base_hidden.float()).abs().max().item()
                 raise AssertionError(
                     f'prefill hidden_states mismatch on rank {rank} layer={layer_idx}: max_diff={max_diff}')
 
@@ -375,8 +386,9 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
         sp_decode_logits = sp_decode.logits.float()
         for layer_idx, (sp_hidden, base_hidden) in enumerate(
                 zip(sp_decode.hidden_states, baseline_decode.hidden_states)):
-            if not torch.allclose(sp_hidden.float(), base_hidden.float(), rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-                max_diff = (sp_hidden.float() - base_hidden.float()).abs().max().item()
+            gathered_hidden = _gather_sequence_hidden(sp_hidden)
+            if not torch.allclose(gathered_hidden.float(), base_hidden.float(), rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+                max_diff = (gathered_hidden.float() - base_hidden.float()).abs().max().item()
                 raise AssertionError(
                     f'decode hidden_states mismatch on rank {rank} layer={layer_idx}: max_diff={max_diff}')
         if not torch.allclose(sp_decode_logits, baseline_decode_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
