@@ -56,6 +56,14 @@ class SequenceParallel:
         """The real position ids, this is different from the position_ids in mrope"""
         return self.extra_kwargs.get('position_ids')
 
+    @staticmethod
+    def _extract_real_position_ids(position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if position_ids is None or not torch.is_tensor(position_ids):
+            return position_ids
+        if position_ids.dim() == 3:
+            return position_ids[0]
+        return position_ids
+
     @property
     def sp_rank(self) -> int:
         return self._sp_rank
@@ -96,12 +104,6 @@ class SequenceParallel:
                                                                                                      cache_position,
                                                                                                      kv_length, *args,
                                                                                                      **kwargs)
-                # Rebuild cache positions from real (full) position ids.
-                device = cache_position.device
-                cache_position = self.real_position_ids[0]
-                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
-                cache_position = torch.arange(0, cache_position.shape[0], device=device)
-                kv_length = cache_position.shape[0]
                 return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
                                                                                                  cache_position,
                                                                                                  kv_length, *args,
@@ -115,13 +117,29 @@ class SequenceParallel:
                 if self.world_size == 1:
                     return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
                                                                    *args, **kwargs)
-                input_embeds = torch.ones(
-                    (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
+                global_seq_len = input_embeds.shape[1] * self.sp_world_size
+                if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+                    global_seq_len = attention_mask.shape[-1]
+
+                full_input_embeds = torch.ones(
+                    (input_embeds.shape[0], global_seq_len, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
-                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
-                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                               *args, **kwargs)
+
+                if cache_position is None:
+                    full_cache_position = torch.arange(0, global_seq_len, device=input_embeds.device)
+                else:
+                    full_cache_position = cache_position.reshape(-1)
+                    if full_cache_position.numel() != global_seq_len:
+                        start = int(full_cache_position[0].item()) if full_cache_position.numel() > 0 else 0
+                        full_cache_position = torch.arange(
+                            start,
+                            start + global_seq_len,
+                            device=full_cache_position.device,
+                            dtype=full_cache_position.dtype,
+                        )
+                return masking_utils.origin_create_causal_mask(
+                    config, full_input_embeds, attention_mask, full_cache_position, *args, **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
@@ -281,7 +299,9 @@ class SequenceParallel:
             input_ids = kwargs.get('input_ids', None)
             inputs_embeds = kwargs.get('inputs_embeds', None)
             position_ids = kwargs['position_ids']
+            real_position_ids = self._extract_real_position_ids(position_ids)
             attention_mask = kwargs.get('attention_mask', None)
+            cache_position = kwargs.get('cache_position', None)
             if hasattr(_self, 'language_model'):
                 embed_tokens = getattr(_self.language_model, 'embed_tokens', None)
             else:
@@ -294,7 +314,8 @@ class SequenceParallel:
                 attention_mask,
                 None,
                 embed_tokens=embed_tokens,
-                real_position_ids=self.real_position_ids)
+                real_position_ids=real_position_ids,
+                cache_position=cache_position)
             kwargs['input_ids'] = input_ids
             kwargs['inputs_embeds'] = inputs_embeds
             kwargs['position_ids'] = position_ids
@@ -601,6 +622,7 @@ class SequenceParallel:
                              loss_scale,
                              embed_tokens=None,
                              real_position_ids=None,
+                             cache_position=None,
                              extra_split_values=None):
         """Common implementation for padding and splitting inputs
 
@@ -662,12 +684,12 @@ class SequenceParallel:
             # no need position_ids here, because padding_free does not need attention_mask,
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
-            cache_position = torch.arange(0, attn_shape, device=inputs.device)
+            local_cache_position = torch.arange(0, attn_shape, device=inputs.device)
             # FlashAttention2 expects a 2D padding mask (or None). Converting it to a 4D causal mask here breaks
             # the later per-rank sequence split and changes the attention contract relative to the baseline path.
-            if (hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
+            if (cache_position is None and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
                     and self.attn_implementation != 'flash_attention_2'):
-                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
+                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), local_cache_position,
                                                        None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
@@ -751,15 +773,16 @@ class SequenceParallel:
         position_ids = None
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
-        if position_ids is not None and input_ids is not None and position_ids.shape[0] == input_ids.shape[0]:
-            self.extra_kwargs['position_ids'] = position_ids.clone()
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
+        real_position_ids = self._extract_real_position_ids(position_ids)
+        if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
+            self.extra_kwargs['position_ids'] = real_position_ids.clone()
+        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
             labels = inputs['labels']
             _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
-                None, None, labels, None, None, None, real_position_ids=position_ids)
+                None, None, labels, None, None, None, real_position_ids=real_position_ids)
             inputs['labels'] = labels
         return inputs
 
