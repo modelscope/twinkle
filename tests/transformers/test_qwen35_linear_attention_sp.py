@@ -188,8 +188,18 @@ def _make_decode_batch(device: torch.device):
     next_input_ids = torch.tensor([[31], [32]], device=device, dtype=torch.long)
     next_attention_mask = torch.ones((2, 1), device=device, dtype=torch.long)
     next_position_ids = torch.full((2, 1), input_ids.shape[1], device=device, dtype=torch.long)
-    cache_position = torch.tensor([input_ids.shape[1]], device=device, dtype=torch.long)
-    return input_ids, attention_mask, position_ids, next_input_ids, next_attention_mask, next_position_ids, cache_position
+    prefill_cache_position = torch.arange(input_ids.shape[1], device=device, dtype=torch.long)
+    decode_cache_position = torch.tensor([input_ids.shape[1]], device=device, dtype=torch.long)
+    return (
+        input_ids,
+        attention_mask,
+        position_ids,
+        next_input_ids,
+        next_attention_mask,
+        next_position_ids,
+        prefill_cache_position,
+        decode_cache_position,
+    )
 
 
 def _make_packed_batch(device: torch.device):
@@ -260,14 +270,26 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
         baseline_model = _build_tiny_qwen35(
             device, layer_types=['linear_attention', 'linear_attention'], use_cache=True)
         sp_model = copy.deepcopy(baseline_model)
-        (input_ids, attention_mask, position_ids, next_input_ids, next_attention_mask, next_position_ids,
-         cache_position) = _make_decode_batch(device)
+        (
+            input_ids,
+            attention_mask,
+            position_ids,
+            next_input_ids,
+            next_attention_mask,
+            next_position_ids,
+            prefill_cache_position,
+            decode_cache_position,
+        ) = _make_decode_batch(device)
+
+        baseline_cache = hf_qwen35.Qwen3_5DynamicCache(config=baseline_model.config)
 
         baseline_prefill = baseline_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=True,
+            past_key_values=baseline_cache,
+            cache_position=prefill_cache_position,
         )
         baseline_prefill_logits = baseline_prefill.logits.float()
         baseline_decode = baseline_model(
@@ -276,16 +298,19 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
             position_ids=next_position_ids,
             use_cache=True,
             past_key_values=baseline_prefill.past_key_values,
-            cache_position=cache_position,
+            cache_position=decode_cache_position,
         )
         baseline_decode_logits = baseline_decode.logits.float()
 
         strategy = _make_strategy(sp_model, world_size)
+        sp_cache = hf_qwen35.Qwen3_5DynamicCache(config=sp_model.config)
         sp_prefill = sp_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=True,
+            past_key_values=sp_cache,
+            cache_position=prefill_cache_position,
         )
         sp_prefill = strategy.postprocess_outputs(sp_prefill)
         sp_prefill_logits = sp_prefill.logits.float()
@@ -307,7 +332,7 @@ def _run_cache_decode_alignment_worker(rank: int, world_size: int, port: int):
             position_ids=next_position_ids,
             use_cache=True,
             past_key_values=sp_cache,
-            cache_position=cache_position,
+            cache_position=decode_cache_position,
         )
         sp_decode = strategy.postprocess_outputs(sp_decode)
         sp_decode_logits = sp_decode.logits.float()
