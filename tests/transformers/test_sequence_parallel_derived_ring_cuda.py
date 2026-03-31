@@ -14,8 +14,9 @@ import torch.nn.functional as F
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
 
+from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
-from twinkle.utils import DeviceMesh
+from twinkle.utils import DeviceMesh, selective_log_softmax
 
 LOGITS_RTOL = 1e-2
 LOGITS_ATOL = 5e-3
@@ -249,13 +250,14 @@ def _measure_peak_memory(
         attention_mask=None,
         use_cache=False,
     )
-    local_loss = F.cross_entropy(
-        outputs.logits.float().view(-1, outputs.logits.size(-1)),
-        local_labels.view(-1),
-        ignore_index=-100,
-        reduction='mean',
-    )
-    global_loss = strategy.reduce_loss(local_loss, local_labels)
+    loss_instance = CrossEntropyLoss(reduction='mean')
+    local_logits = outputs.logits
+    masked_local_labels = local_labels.masked_fill(local_labels == -100, 0)
+    local_logps = selective_log_softmax(local_logits, masked_local_labels)
+    loss_inputs = {'labels': local_labels}
+    loss_outputs = {'logits': local_logits, 'logps': local_logps}
+    loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
+    global_loss = loss_instance(loss_inputs, loss_outputs)['loss']
     global_loss.backward()
     torch.cuda.synchronize(device)
 
@@ -359,13 +361,13 @@ def _run_precision_worker(rank: int, world_size: int, port: int, case_name: str)
         gathered_outputs = strategy.postprocess_outputs(sp_outputs)
         sp_logits = gathered_outputs.logits.detach().float()
 
-        local_loss = F.cross_entropy(
-            local_logits.float().view(-1, local_logits.size(-1)),
-            local_labels.view(-1),
-            ignore_index=-100,
-            reduction='mean',
-        )
-        global_loss = strategy.reduce_loss(local_loss, local_labels)
+        loss_instance = CrossEntropyLoss(reduction='mean')
+        masked_local_labels = local_labels.masked_fill(local_labels == -100, 0)
+        local_logps = selective_log_softmax(local_logits, masked_local_labels)
+        loss_inputs = {'labels': local_labels}
+        loss_outputs = {'logits': local_logits, 'logps': local_logps}
+        loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
+        global_loss = loss_instance(loss_inputs, loss_outputs)['loss']
         global_loss.backward()
         sp_attention_grads = _collect_attention_param_grads(sp_model)
 

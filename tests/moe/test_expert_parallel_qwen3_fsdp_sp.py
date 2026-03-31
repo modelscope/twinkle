@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
-from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy
 from twinkle.model.transformers.strategy.sequence_parallel.utils import _get_seq_groups_from_device_mesh
 from twinkle.utils import DeviceMesh
 
@@ -301,16 +301,26 @@ def _run_worker_ep_fsdp_sp_align(
         torch.manual_seed(1234)
         torch.cuda.manual_seed_all(1234)
 
-        # 4 GPUs: (fsdp=2, ep=2); SP is derived with ulysses_size=2 over raw data ranks (fsdp).
+        # 4 GPUs: dp=2, fsdp=2 with a separate EP overlay (ep=2, ep_fsdp=2).
+        # SP is derived from the raw dp/fsdp data ranks via ulysses_size=2.
         device_mesh = DeviceMesh(
             device_type='cuda',
             mesh=np.arange(world_size).reshape(2, 2),
-            mesh_dim_names=('fsdp', 'ep'),
+            mesh_dim_names=('dp', 'fsdp'),
+            ep_size=2,
+            ep_fsdp_size=2,
             ulysses_size=2,
         )
         sp_size = 2
         sp_group, _, _, _, _ = _get_seq_groups_from_device_mesh(
             device_mesh=device_mesh, seq_world_size=sp_size, sp_world_size=sp_size, rp_world_size=1)
+        fsdp_strategy = NativeFSDPStrategy(
+            device_mesh=device_mesh,
+            mixed_precision='bf16',
+            fsdp_config={},
+            enable_ep=True,
+            ep_size=2,
+        )
 
         # Shared input (same across ranks) + per-rank slice loss (matches SP slice ownership).
         # Keep seq_len divisible by sp_size to avoid padding complexity here.
@@ -340,11 +350,10 @@ def _run_worker_ep_fsdp_sp_align(
             config={
                 'enabled': True,
                 'router_dtype': 'fp32',
-                'all_to_all': 'torch',
                 'keep_router_logits': False,
             },
+            ep_fsdp_device_mesh=fsdp_strategy.ep_fsdp_device_mesh,
         )
-        fsdp_strategy = NativeFSDPStrategy(device_mesh=device_mesh, mixed_precision='bf16', fsdp_config={})
         model_base, _ = fsdp_strategy.wrap_model(model_base, optimizer=None)
 
         base_states, base_state_handles = _capture_router_state(getattr(model_base, 'model', model_base))
@@ -390,9 +399,9 @@ def _run_worker_ep_fsdp_sp_align(
             config={
                 'enabled': True,
                 'router_dtype': 'fp32',
-                'all_to_all': 'torch',
                 'keep_router_logits': False,
             },
+            ep_fsdp_device_mesh=fsdp_strategy.ep_fsdp_device_mesh,
         )
         sp_strategy = SequenceParallelStrategy(
             device_mesh=device_mesh,
@@ -413,7 +422,6 @@ def _run_worker_ep_fsdp_sp_align(
         sp_label_inputs = sp_strategy.preprocess_inputs(sp_label_inputs)
         sp_local_labels = sp_label_inputs['labels']
 
-        sequence_parallel.extra_kwargs['position_ids'] = position_ids.clone()
         sp_states, sp_state_handles = _capture_router_state(getattr(model_sp, 'model', model_sp))
         sp_out = model_sp(
             inputs_embeds=sp_embeds,
@@ -604,7 +612,6 @@ def _run_worker_fsdp_sp_align(
         sp_label_inputs = sp_strategy.preprocess_inputs(sp_label_inputs)
         sp_local_labels = sp_label_inputs['labels']
 
-        sequence_parallel.extra_kwargs['position_ids'] = position_ids.clone()
         sp_out = model_sp(
             inputs_embeds=sp_embeds,
             position_ids=position_ids,

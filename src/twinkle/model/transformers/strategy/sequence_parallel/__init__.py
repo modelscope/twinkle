@@ -374,7 +374,23 @@ class SequenceParallel:
             _patch_deepstack_process(submodule)
         _patch_deepstack_process(base_model)
 
-    def _prepare_qwen35_linear_attention(self):
+    @staticmethod
+    def _is_qwen35_model(model: torch.nn.Module) -> bool:
+        config = getattr(model, 'config', None)
+        model_type = str(getattr(config, 'model_type', '') or '')
+        if model_type == 'qwen3_5':
+            return True
+
+        architectures = getattr(config, 'architectures', None) or []
+        if any('Qwen3_5' in str(arch) for arch in architectures):
+            return True
+
+        model_module = getattr(model.__class__, '__module__', '') or ''
+        return 'transformers.models.qwen3_5' in model_module
+
+    def _prepare_qwen35_linear_attention(self, model: torch.nn.Module):
+        if not self._is_qwen35_model(model):
+            return
         if int(self.rp_world_size or 1) > 1:
             raise NotImplementedError(
                 'SequenceParallel: Qwen3.5 linear attention SP patch does not support rp_world_size > 1 '
@@ -443,7 +459,7 @@ class SequenceParallel:
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
             self._prepare_flash_attn(llm_model)
-            self._prepare_qwen35_linear_attention()
+            self._prepare_qwen35_linear_attention(model)
             SequenceParallel._global_inited = True
 
         self._prepare_forward_hook(llm_model)
