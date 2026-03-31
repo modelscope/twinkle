@@ -618,13 +618,14 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
 
-    def load_training_state(self, name: str, **kwargs) -> None:
+    def load_training_state(self, name: str, **kwargs) -> Dict[str, Any]:
         """Load optimizer, scheduler, scaler, RNG, and progress metadata from a checkpoint."""
         response = http_post(
             url=f'{self.server_url}/load_training_state',
             json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
+        return TrainingProgressResponse(**response.json()).result
 
     def read_training_progress(self, name: str, **kwargs) -> Dict[str, Any]:
         """Read progress-only checkpoint metadata for resume-only-model flows."""

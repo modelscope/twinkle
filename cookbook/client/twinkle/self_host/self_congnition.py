@@ -99,9 +99,13 @@ def train():
     # model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
+    consumed_train_samples = 0
     if resume_path:
-        logger.info(f'Resuming training from {resume_path}')
-        model.load(resume_path, load_optimizer=True)
+        logger.info(f'Resuming model weights from {resume_path}')
+        model.load(resume_path)
+        trainer_state = model.load_training_state(resume_path)
+        dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+        consumed_train_samples = int(trainer_state['consumed_train_samples'])
 
     # Step 7: Run the training loop
     logger.info(model.get_train_configs().model_dump())
@@ -114,6 +118,7 @@ def train():
 
             # Step
             model.clip_grad_and_step()
+            consumed_train_samples += len(batch)
             # Equal to the following steps:
             # # Clip gradients to prevent exploding gradients (max norm = 1.0)
             # model.clip_grad_norm(1.0)
@@ -131,7 +136,11 @@ def train():
                 logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric.result}')
 
         # Step 8: Save the trained checkpoint
-        twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+        twinkle_path = model.save(
+            name=f'twinkle-epoch-{epoch}',
+            save_optimizer=True,
+            consumed_train_samples=consumed_train_samples,
+        )
         logger.info(f'Saved checkpoint: {twinkle_path}')
 
     # Step 9: Upload the checkpoint to ModelScope Hub

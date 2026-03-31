@@ -83,3 +83,16 @@ class DataLoader(object):
         response.raise_for_status()
         return response.json()["result"]
     
+
+    def skip_consumed_samples(self, consumed_train_samples: int):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'skip_consumed_samples',
+                **{'consumed_train_samples': consumed_train_samples},
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    

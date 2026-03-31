@@ -349,12 +349,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         await run_task(self.schedule_task_and_wait(_task, task_type='load'))
 
-    @app.post('/twinkle/load_training_state')
+    @app.post('/twinkle/load_training_state', response_model=types.TrainingProgressResponse)
     async def load_training_state(
             request: Request,
             body: types.LoadTrainingStateRequest,
             self: ModelManagement = Depends(self_fn),
-    ) -> None:
+    ) -> types.TrainingProgressResponse:
         token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
@@ -366,13 +366,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             checkpoint_dir = (
                 Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
                 if resolved.checkpoint_dir else body.name)
-            self.model.load_training_state(
+            ret = self.model.load_training_state(
                 checkpoint_dir,
                 adapter_name=adapter_name,
                 **extra_kwargs,
             )
+            return {'result': ret}
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='load_training_state'))
+        return await run_task(self.schedule_task_and_wait(_task, task_type='load_training_state'))
 
     @app.post('/twinkle/read_training_progress', response_model=types.TrainingProgressResponse)
     async def read_training_progress(
