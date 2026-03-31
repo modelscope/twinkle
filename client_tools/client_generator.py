@@ -1,4 +1,4 @@
-﻿# Copyright (c) ModelScope Contributors. All rights reserved.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
@@ -869,5 +869,4 @@ if __name__ == '__main__':
     generate_samplers()
 
     print('\n' + '=' * 60)
-    print('\nAll client code generation complete!\n')
-
+    print('\n✓ All client code generation complete!\n')
