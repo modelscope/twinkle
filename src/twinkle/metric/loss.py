@@ -52,7 +52,6 @@ class LossMetric(Metric):
             'grad_norm': self.grad_norm,
             'num_tokens': self.num_tokens
         }]
-
         all_results = self.gather_results(local_results)
 
         total_loss = sum(r['loss'] for r in all_results)
@@ -61,8 +60,10 @@ class LossMetric(Metric):
         num_tokens = sum(r['num_tokens'] for r in all_results)
         if num_tokens > 0:
             avg_loss = total_loss / num_tokens
-        else:
+        elif total_count > 0:
             avg_loss = total_loss / total_count
+        else:
+            avg_loss = 0.0
         self.reset()
         results = {}
         if avg_loss is not None:
