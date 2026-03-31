@@ -100,25 +100,28 @@ def train():
 
     # Step 6: Optionally resume from a previous checkpoint
     consumed_train_samples = 0
+    global_step = 0
     if resume_path:
         logger.info(f'Resuming model weights from {resume_path}')
         model.load(resume_path)
         trainer_state = model.load_training_state(resume_path)
         dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
         consumed_train_samples = int(trainer_state['consumed_train_samples'])
+        global_step = int(trainer_state['cur_step'])
 
     # Step 7: Run the training loop
     logger.info(model.get_train_configs().model_dump())
 
     for epoch in range(3):
         logger.info(f'Starting epoch {epoch}')
-        for step, batch in enumerate(dataloader):
+        for _, batch in enumerate(dataloader):
             # Forward pass + backward pass (computes gradients)
             model.forward_backward(inputs=batch)
 
             # Step
             model.clip_grad_and_step()
             consumed_train_samples += len(batch)
+            global_step += 1
             # Equal to the following steps:
             # # Clip gradients to prevent exploding gradients (max norm = 1.0)
             # model.clip_grad_norm(1.0)
@@ -130,10 +133,10 @@ def train():
             # model.lr_step()
 
             # Log the loss every 2 steps (aligned with gradient accumulation)
-            if step % 2 == 0:
+            if global_step % 2 == 0:
                 # Print metric
                 metric = model.calculate_metric(is_training=True)
-                logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric.result}')
+                logger.info(f'Current is step {global_step} of {len(dataloader)}, metric: {metric.result}')
 
         # Step 8: Save the trained checkpoint
         twinkle_path = model.save(
