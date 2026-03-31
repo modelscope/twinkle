@@ -408,3 +408,48 @@ class InputProcessor:
                     output[key] = res[key][i:i + micro_batch_size]
                 outputs.append(output)
             return outputs
+
+    def postprocess_tensor_cp(self, tensor):
+        """All-gather and reconstruct full sequence from CP-split tensor.
+
+        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
+        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
+
+        Only the current rank's slice retains the original tensor (and its
+        gradient graph); other ranks' slices are plain copies.  This means
+        backward through the reconstructed tensor only produces gradients for
+        the local chunk, naturally distributing the gradient across CP ranks
+        without extra scaling.
+
+        Args:
+            tensor: [batch_size, seq_len/cp_size] CP-split tensor
+
+        Returns:
+            [batch_size, full_seq_len] reconstructed full tensor
+        """
+        if self.device_mesh.cp_world_size <= 1:
+            return tensor
+
+        from megatron.core import parallel_state as mpu
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        cp_group = mpu.get_context_parallel_group()
+
+        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+        gathered[cp_rank] = tensor
+
+        batch_size = tensor.shape[0]
+        seq_len_per_cp = tensor.shape[1]
+        full_seq_len = seq_len_per_cp * cp_size
+        chunk_len = full_seq_len // (2 * cp_size)
+        half_len = seq_len_per_cp // 2
+
+        output = tensor.new_zeros(batch_size, full_seq_len)
+        for j in range(cp_size):
+            o = gathered[j]
+            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
+            reverse_idx = 2 * cp_size - j - 1
+            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
+
+        return output

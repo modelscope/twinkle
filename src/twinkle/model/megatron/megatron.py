@@ -2,23 +2,22 @@
 import asyncio
 import json
 import logging
+import numpy as np
 import os
 import random
 import re
 import threading
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
-
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from contextlib import contextmanager
+from dataclasses import dataclass
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PretrainedConfig
+from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
 import twinkle.metric
@@ -119,12 +118,19 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        self.strategy = MegatronStrategy(self._model_path,
-                                         self.device_mesh,
-                                         mixed_precision=mixed_precision,
-                                         config=config,
-                                         ddp_config=ddp_config or {},
-                                         seed=seed, **kwargs)
+        if config is None:
+            from transformers import AutoConfig
+            self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        self.strategy = MegatronStrategy(
+            self._model_path,
+            self.device_mesh,
+            mixed_precision=mixed_precision,
+            config=self.hf_config,
+            ddp_config=ddp_config or {},
+            seed=seed,
+            **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
 
         self._model_wrapped = False
@@ -199,51 +205,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         else:
             # Scalars, small tensors, or non-sliceable values pass through as-is
             return value
-
-    def _postprocess_tensor_cp(self, tensor):
-        """All-gather and reconstruct full sequence from CP-split tensor.
-
-        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
-        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
-
-        Only the current rank's slice retains the original tensor (and its
-        gradient graph); other ranks' slices are plain copies.  This means
-        backward through the reconstructed tensor only produces gradients for
-        the local chunk, naturally distributing the gradient across CP ranks
-        without extra scaling.
-
-        Args:
-            tensor: [batch_size, seq_len/cp_size] CP-split tensor
-
-        Returns:
-            [batch_size, full_seq_len] reconstructed full tensor
-        """
-        from megatron.core import parallel_state as mpu
-        cp_size = mpu.get_context_parallel_world_size()
-        if cp_size <= 1:
-            return tensor
-
-        cp_rank = mpu.get_context_parallel_rank()
-        cp_group = mpu.get_context_parallel_group()
-
-        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
-        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
-        gathered[cp_rank] = tensor
-
-        batch_size = tensor.shape[0]
-        seq_len_per_cp = tensor.shape[1]
-        full_seq_len = seq_len_per_cp * cp_size
-        chunk_len = full_seq_len // (2 * cp_size)
-        half_len = seq_len_per_cp // 2
-
-        output = tensor.new_zeros(batch_size, full_seq_len)
-        for j in range(cp_size):
-            o = gathered[j]
-            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
-            reverse_idx = 2 * cp_size - j - 1
-            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
-
-        return output
 
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -409,9 +370,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 masked_labels[~loss_mask] = 0
                 output_tensor.div_(temperature)
                 logps = selective_log_softmax(output_tensor, masked_labels)
-                if cp_size > 1:
-                    logps = self._postprocess_tensor_cp(logps)
-                    batch['labels'] = self._postprocess_tensor_cp(labels)
+                logps = processor.postprocess_tensor_cp(logps)
+                batch['labels'] = processor.postprocess_tensor_cp(labels)
             return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
 
         # Get Megatron's forward-backward function
@@ -1279,7 +1239,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             target_device=None,  # Keep on current device for IPC transfer
             only_master_rank=False,  # All ranks participate in weight sync
             peft_format=bool(adapter_name),
-            # adapter_name=adapter_name if adapter_name else None,
             tqdm_desc='Weight sync: ',
         )
 
@@ -1310,14 +1269,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     expanded_modules = self.get_target_modules(_model, target_modules)
                     config.target_modules = expanded_modules
 
-                _model = get_peft_model(_model, config, adapter_name=adapter_name) # noqa
+                _model = get_peft_model(_model, config, adapter_name=adapter_name)  # noqa
             _models.append(_model)
         self.model = _models
 
         # Create optimizer group for adapter
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config # noqa
+        self.optimizer_group[adapter_name].adapter_config = config  # noqa
         self.optimizer_group[adapter_name].gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
         # Fix: use .processor instead of .tokenizer - Template class uses self.processor
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
@@ -1453,6 +1412,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if base_sync_done and adapter_name:
             # The first base model synchronization finished, and is lora training
             if merge_and_sync:
+
                 def weight_generator():
                     with merge_lora():
                         for name, tensor in self.get_hf_state_dict(adapter_name=''):
@@ -1464,6 +1424,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                             yield name, tensor
 
             else:
+
                 def weight_generator():
                     for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
                         if name is None or tensor is None:
@@ -1488,7 +1449,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     yield from _add_base_layer_suffix(_raw_weights())
                 else:
                     yield from _raw_weights()
-
 
         is_sender = (engine.rank is not None and engine.rank == 0)
 
@@ -1537,3 +1497,48 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if isinstance(config, dict):
             config = config.get(adapter_name, next(iter(config.values())))
         return config.to_dict() if hasattr(config, 'to_dict') else dict(config)
+
+    @staticmethod
+    def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
+        import torch
+
+        def find_layers(model: torch.nn.Module, cond_fn) -> List[str]:
+            result = []
+            for name, module in model.named_modules():
+                if cond_fn(name, module):
+                    result.append(name)
+            return result
+
+        def find_all_linears(model: torch.nn.Module) -> List[str]:
+            from megatron.core.extensions.transformer_engine import (TEGroupedLinear, TELayerNormColumnParallelLinear,
+                                                                     TELinear)
+
+            def _cond(name: str, module: torch.nn.Module) -> bool:
+                if name == 'output_layer' or 'lora' in name:
+                    return False
+                if isinstance(module, (TELinear, TELayerNormColumnParallelLinear, TEGroupedLinear, torch.nn.Linear)):
+                    return True
+                return False
+
+            return find_layers(model, _cond)
+
+        def find_router(model: torch.nn.Module) -> List[str]:
+            from megatron.core.transformer.moe.router import TopKRouter
+            return find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
+
+        def find_embedding(model: torch.nn.Module) -> List[str]:
+            from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+            return find_layers(model,
+                               lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
+
+        result = target_modules.copy()
+        if 'all-linear' in result:
+            result.remove('all-linear')
+            result += find_all_linears(model)
+        if 'all-embedding' in result:
+            result.remove('all-embedding')
+            result += find_embedding(model)
+        if 'all-router' in result:
+            result.remove('all-router')
+            result += find_router(model)
+        return list(set(result))

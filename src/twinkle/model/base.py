@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type, Union
 
 from twinkle import Platform, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
@@ -157,48 +157,3 @@ class TwinkleModel(ABC):
             if backend in ('nccl', 'hccl'):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
-
-    @staticmethod
-    def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
-        import torch
-
-        def find_layers(model: torch.nn.Module, cond_fn) -> List[str]:
-            result = []
-            for name, module in model.named_modules():
-                if cond_fn(name, module):
-                    result.append(name)
-            return result
-
-        def find_all_linears(model: torch.nn.Module) -> List[str]:
-            from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, \
-                TELinear
-
-            def _cond(name: str, module: torch.nn.Module) -> bool:
-                if name == 'output_layer' or 'lora' in name:
-                    return False
-                if isinstance(module, (TELinear, TELayerNormColumnParallelLinear, TEGroupedLinear, torch.nn.Linear)):
-                    return True
-                return False
-
-            return find_layers(model, _cond)
-
-        def find_router(model: torch.nn.Module) -> List[str]:
-            from megatron.core.transformer.moe.router import TopKRouter
-            return find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
-
-        def find_embedding(model: torch.nn.Module) -> List[str]:
-            from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-            return find_layers(model,
-                               lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
-
-        result = target_modules.copy()
-        if 'all-linear' in result:
-            result.remove('all-linear')
-            result += find_all_linears(model)
-        if 'all-embedding' in result:
-            result.remove('all-embedding')
-            result += find_embedding(model)
-        if 'all-router' in result:
-            result.remove('all-router')
-            result += find_router(model)
-        return list(set(result))

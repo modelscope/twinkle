@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Generator, TypedDict, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Generator, Optional, TypedDict
 
 if TYPE_CHECKING:
     import torch

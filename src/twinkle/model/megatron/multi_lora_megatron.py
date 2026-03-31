@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import torch
 import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig
@@ -25,21 +24,21 @@ from .strategy import MegatronStrategy
 class MultiLoraMegatronModel(MegatronModel):
 
     def __init__(
-            self,
-            model_id: str,
-            config: Optional[PretrainedConfig] = None,
-            ddp_config: Optional[Dict[str, Any]] = None,
-            device_mesh: Optional[DeviceMesh] = None,
-            mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
-            load_weights: bool = True,
-            recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
-            recompute_method: Optional[str] = 'uniform',
-            recompute_num_layers: Optional[int] = 1,
-            recompute_modules: Optional[list] = None,  # Modules to recompute
-            max_loras: int = 5,
-            max_r: int = 32,
-            max_length: int = 8192,
-            **kwargs,
+        self,
+        model_id: str,
+        config: Optional[PretrainedConfig] = None,
+        ddp_config: Optional[Dict[str, Any]] = None,
+        device_mesh: Optional[DeviceMesh] = None,
+        mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
+        load_weights: bool = True,
+        recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+        recompute_method: Optional[str] = 'uniform',
+        recompute_num_layers: Optional[int] = 1,
+        recompute_modules: Optional[list] = None,  # Modules to recompute
+        max_loras: int = 5,
+        max_r: int = 32,
+        max_length: int = 8192,
+        **kwargs,
     ):
         requires('megatron_core')
         requires('mcore_bridge')
@@ -69,12 +68,18 @@ class MultiLoraMegatronModel(MegatronModel):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        self.strategy = MegatronStrategy(self._model_path,
-                                         self.device_mesh,
-                                         mixed_precision=mixed_precision,
-                                         config=config,
-                                         ddp_config=ddp_config or {},
-                                         seed=seed, **kwargs)
+        if config is None:
+            self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        self.strategy = MegatronStrategy(
+            self._model_path,
+            self.device_mesh,
+            mixed_precision=mixed_precision,
+            config=self.hf_config,
+            ddp_config=ddp_config or {},
+            seed=seed,
+            **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
         MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)

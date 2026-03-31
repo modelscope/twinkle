@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import List, Literal, Optional, Dict, Any
-
 import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
+from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
 
@@ -30,7 +29,11 @@ class MegatronStrategy:
         self.seed = seed
         self.variable_seq_lengths = variable_seq_lengths
         self.ddp_config = ddp_config or {}
-
+        if config is None:
+            from transformers import AutoConfig
+            self.hf_config = AutoConfig.from_pretrained(self.model_dir, trust_remote_code=True)
+        else:
+            self.hf_config = config
         if 'overlap_grad_reduce' not in self.ddp_config:
             self.ddp_config['overlap_grad_reduce'] = False
         if 'overlap_param_gather' not in self.ddp_config:
@@ -72,10 +75,7 @@ class MegatronStrategy:
         )
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(self.seed)
-        if config is None:
-            self.config = self.get_model_config(model_dir, parallel_kwargs, **kwargs)
-        else:
-            self.config = config
+        self.config = self.get_model_config(self.hf_config, parallel_kwargs, **kwargs)
 
     @property
     def sequence_parallel(self) -> bool:
@@ -163,18 +163,17 @@ class MegatronStrategy:
         if ddp_config['overlap_grad_reduce']:
             assert self.config.no_sync_func is None, (
                 'When overlap_grad_reduce is True, config.no_sync_func must be None; '
-                'a custom no_sync_func is not supported when overlapping grad-reduce'
-            )
-            self.config.no_sync_func = [model_chunk.no_sync for model_chunk in model] # noqa
+                'a custom no_sync_func is not supported when overlapping grad-reduce')
+            self.config.no_sync_func = [model_chunk.no_sync for model_chunk in model]  # noqa
             if len(model) == 1:
-                self.config.no_sync_func = self.config.no_sync_func[0] # noqa
-            self.config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model] # noqa
+                self.config.no_sync_func = self.config.no_sync_func[0]  # noqa
+            self.config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]  # noqa
             if len(model) == 1:
-                self.config.grad_sync_func = self.config.grad_sync_func[0] # noqa
+                self.config.grad_sync_func = self.config.grad_sync_func[0]  # noqa
         if ddp_config['overlap_param_gather'] and ddp_config['align_param_gather']:
-            self.config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model] # noqa
+            self.config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]  # noqa
             if len(model) == 1:
-                self.config.param_sync_func = self.config.param_sync_func[0] # noqa
+                self.config.param_sync_func = self.config.param_sync_func[0]  # noqa
 
     @staticmethod
     def _wrap_with_megatron_ddp(
@@ -222,14 +221,12 @@ class MegatronStrategy:
 
     def get_model_config(
         self,
-        model_dir: str,
+        hf_config: PreTrainedConfig,
         parallel_kwargs: Dict[str, Any],
         **kwargs,
     ):
         from mcore_bridge import ModelConfig, hf_to_mcore_config
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
-        from transformers import AutoConfig
-        hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         config_kwargs = hf_to_mcore_config(hf_config)
         config_kwargs.update(kwargs)
         if 'calculate_per_token_loss' not in config_kwargs:
@@ -268,8 +265,8 @@ class MegatronStrategy:
         self,
         load_weights: bool = True,
     ) -> List[nn.Module]:
-        from mcore_bridge import get_mcore_model
         import torch.distributed as dist
+        from mcore_bridge import get_mcore_model
         mg_models = get_mcore_model(self.config)
 
         if dist.is_initialized():
