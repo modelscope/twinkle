@@ -84,7 +84,7 @@ applications:
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
         name: model
-        ranks: 4       # GPU rank indices
+        ranks: 4
         device_type: cuda
       device_mesh:
         device_type: cuda

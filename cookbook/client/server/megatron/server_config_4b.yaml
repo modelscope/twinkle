@@ -44,7 +44,7 @@ applications:
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: 2                              # GPU rank indices
+        ranks: 2
         device_type: cuda
       device_mesh:
         device_type: cuda
@@ -56,7 +56,7 @@ applications:
       adapter_config:
         adapter_timeout: 30                        # Seconds before idle adapter unload
         adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
-      max_loras: 1                                 # Maximum number of LoRA adapters per model
+      max_loras: 5                                 # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
         autoscaling_config:
