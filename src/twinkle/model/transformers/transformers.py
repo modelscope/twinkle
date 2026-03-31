@@ -39,11 +39,10 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils.logger import get_logger
 from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
-
+from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
@@ -989,8 +988,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             raise FileNotFoundError(optimizer_path)
         if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
             logger.warning(
-                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.',
-            )
+                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if getattr(self.strategy, 'needs_wrapped_optimizer_state', lambda: False)() and not self._model_wrapped:
