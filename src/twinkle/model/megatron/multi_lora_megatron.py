@@ -25,25 +25,26 @@ from .strategy import MegatronStrategy
 class MultiLoraMegatronModel(MegatronModel):
 
     def __init__(
-        self,
-        model_id: str,
-        config: Optional[PretrainedConfig] = None,
-        device_mesh: Optional[DeviceMesh] = None,
-        mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
-        load_weights: bool = True,
-        recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
-        recompute_method: Optional[str] = 'uniform',
-        recompute_num_layers: Optional[int] = 1,
-        recompute_modules: Optional[list] = None,  # Modules to recompute
-        max_loras: int = 5,
-        max_r: int = 32,
-        max_length: int = 8192,
-        **kwargs,
+            self,
+            model_id: str,
+            config: Optional[PretrainedConfig] = None,
+            ddp_config: Optional[Dict[str, Any]] = None,
+            device_mesh: Optional[DeviceMesh] = None,
+            mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
+            load_weights: bool = True,
+            recompute_granularity: Optional[str] = 'full',  # Activation checkpointing
+            recompute_method: Optional[str] = 'uniform',
+            recompute_num_layers: Optional[int] = 1,
+            recompute_modules: Optional[list] = None,  # Modules to recompute
+            max_loras: int = 5,
+            max_r: int = 32,
+            max_length: int = 8192,
+            **kwargs,
     ):
         requires('megatron_core')
+        requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
-        from .args import TwinkleMegatronArgs, set_args
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -52,56 +53,37 @@ class MultiLoraMegatronModel(MegatronModel):
         self.mixed_precision = mixed_precision
 
         self._model_path = HubOperation.download_model(model_id)
-        self.hf_config = config or AutoConfig.from_pretrained(self._model_path)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-
-        self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
+        self._try_init_process_group()
 
-        self.strategy = MegatronStrategy(
-            self.device_mesh,
-            sequence_parallel=self.device_mesh.sequence_parallel,
-            mixed_precision=mixed_precision,
-            **kwargs)
-
-        # Determine params_dtype and activation checkpointing kwargs
-        params_dtype = torch.bfloat16
-        if self.mixed_precision == 'fp16':
-            params_dtype = torch.float16
-        elif self.mixed_precision == 'no':
-            params_dtype = torch.float32
-
-        ac_kwargs = {
+        kwargs.update({
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
             'recompute_method': recompute_method,
             'recompute_num_layers': recompute_num_layers,
-        }
-
-        # Initialize TwinkleMegatronArgs BEFORE creating the model
-        args = TwinkleMegatronArgs.from_hf_config(
-            self.hf_config,
-            model_dir=self._model_path,
-            device_mesh=self.device_mesh,
-            params_dtype=params_dtype,
-            sequence_parallel=self.strategy.sequence_parallel,
-            **ac_kwargs,
-        )
-
-        set_args(args)
-        self._initialized = False
-        self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
-
+            'variable_seq_lengths': self.variable_seq_lengths,
+        })
+        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        self.strategy = MegatronStrategy(self._model_path,
+                                         self.device_mesh,
+                                         mixed_precision=mixed_precision,
+                                         config=config,
+                                         ddp_config=ddp_config or {},
+                                         seed=seed, **kwargs)
+        self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
         MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.model = self.strategy.wrap_model(self.model)
-        self._model_wrapped = True
+        self.strategy.finish_param_config(self.model, None)
         self.multi_adapter.save_initial_weights()
+        self._model_wrapped = True
+        self._finish_config = True
         # Active group for compatibility with single adapter
         self.active_group = None
 
@@ -110,6 +92,9 @@ class MultiLoraMegatronModel(MegatronModel):
                                                                        f'current is: {adapter_name}')
 
     def _lazy_wrap_model(self):
+        pass
+
+    def _lazy_finish_param_config(self):
         pass
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)

@@ -3,6 +3,7 @@ from typing import List, Literal, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
+from transformers import PreTrainedConfig
 
 from twinkle import DeviceMesh, Platform, torch_util
 
@@ -17,6 +18,8 @@ class MegatronStrategy:
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         seed: int = 42,
         variable_seq_lengths: bool = False,
+        config: PreTrainedConfig = None,
+        ddp_config: Dict[str, Any] = None,
         **kwargs,
     ):
         from megatron.core import mpu
@@ -26,6 +29,17 @@ class MegatronStrategy:
         self.model_dir = model_dir
         self.seed = seed
         self.variable_seq_lengths = variable_seq_lengths
+        self.ddp_config = ddp_config or {}
+
+        if 'overlap_grad_reduce' not in self.ddp_config:
+            self.ddp_config['overlap_grad_reduce'] = False
+        if 'overlap_param_gather' not in self.ddp_config:
+            self.ddp_config['overlap_param_gather'] = False
+        if 'align_param_gather' not in self.ddp_config:
+            self.ddp_config['align_param_gather'] = False
+        if 'grad_reduce_in_fp32' not in self.ddp_config:
+            self.ddp_config['grad_reduce_in_fp32'] = True
+
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
         if self.mixed_precision == 'fp16':
@@ -58,7 +72,10 @@ class MegatronStrategy:
         )
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(self.seed)
-        self.config = self.get_model_config(model_dir, parallel_kwargs, **kwargs)
+        if config is None:
+            self.config = self.get_model_config(model_dir, parallel_kwargs, **kwargs)
+        else:
+            self.config = config
 
     @property
     def sequence_parallel(self) -> bool:
@@ -126,7 +143,7 @@ class MegatronStrategy:
             return model
 
         self._check_device_mesh()
-        return self._wrap_with_megatron_ddp(model, use_distributed_optimizer)
+        return self._wrap_with_megatron_ddp(model, use_distributed_optimizer, self.ddp_config)
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
@@ -140,10 +157,30 @@ class MegatronStrategy:
             _models.append(_model)
         return _models
 
+    def finish_param_config(self, model: List[nn.Module], optimizer: Any):
+        self.config.grad_scale_func = getattr(optimizer, 'scale_loss') if optimizer is not None else None
+        ddp_config = self.ddp_config
+        if ddp_config['overlap_grad_reduce']:
+            assert self.config.no_sync_func is None, (
+                'When overlap_grad_reduce is True, config.no_sync_func must be None; '
+                'a custom no_sync_func is not supported when overlapping grad-reduce'
+            )
+            self.config.no_sync_func = [model_chunk.no_sync for model_chunk in model] # noqa
+            if len(model) == 1:
+                self.config.no_sync_func = self.config.no_sync_func[0] # noqa
+            self.config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model] # noqa
+            if len(model) == 1:
+                self.config.grad_sync_func = self.config.grad_sync_func[0] # noqa
+        if ddp_config['overlap_param_gather'] and ddp_config['align_param_gather']:
+            self.config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model] # noqa
+            if len(model) == 1:
+                self.config.param_sync_func = self.config.param_sync_func[0] # noqa
+
     @staticmethod
     def _wrap_with_megatron_ddp(
         model: List[nn.Module],
         use_distributed_optimizer: bool,
+        ddp_config: Dict[str, Any],
     ) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
         from megatron.core.distributed import DistributedDataParallelConfig
@@ -157,15 +194,13 @@ class MegatronStrategy:
             if not isinstance(model, Float16Module) and (config.fp16 or config.bf16):
                 _model = Float16Module(config, _model)
 
-            ddp_config = DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                overlap_grad_reduce=False,
+            ddp_config_cls = DistributedDataParallelConfig(
+                **ddp_config,
                 use_distributed_optimizer=use_distributed_optimizer,
             )
-
             wrapped_model = MegatronDDP(
                 config=config,
-                ddp_config=ddp_config,
+                ddp_config=ddp_config_cls,
                 module=_model,
             )
 
@@ -219,7 +254,7 @@ class MegatronStrategy:
                 # Use native implementation for DDP models
                 return _native_finalize_model_grads(model, *args, **kwargs)
 
-        config = ModelConfig(
+        return ModelConfig(
             use_cpu_initialization=True,
             params_dtype=self.params_type,
             sequence_parallel=self.sequence_parallel,
@@ -228,7 +263,6 @@ class MegatronStrategy:
             **parallel_kwargs,
             **config_kwargs,
         )
-        return config
 
     def create_megatron_model(
         self,

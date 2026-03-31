@@ -83,6 +83,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self,
         model_id: str,
         config: Optional[PretrainedConfig] = None,
+        ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         load_weights: bool = True,
@@ -95,6 +96,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         requires('megatron_core')
         requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -117,11 +119,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        self.strategy = MegatronStrategy(self._model_path, self.device_mesh, mixed_precision=mixed_precision,
+        self.strategy = MegatronStrategy(self._model_path,
+                                         self.device_mesh,
+                                         mixed_precision=mixed_precision,
+                                         config=config,
+                                         ddp_config=ddp_config or {},
                                          seed=seed, **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
 
         self._model_wrapped = False
+        self._finish_config = False
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {
             _default_adapter_name: self._construct_default_optimizer_group()
@@ -142,6 +149,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if not self._model_wrapped:
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
+
+    def _lazy_finish_param_config(self):
+        if self._finish_config:
+            return
+        self._finish_config = True
+        optimizer = self.optimizer_group[self._get_default_group()].optimizer
+        self.strategy.finish_param_config(self.model, optimizer)
 
     def _get_default_group(self):
         """Get the only group has optimizer, else return the default one"""
@@ -289,6 +303,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             Average loss value across all microbatches.
         """
         self._lazy_wrap_model()
+        self._lazy_finish_param_config()
         from functools import partial
         from megatron.core import parallel_state as mpu
         from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -1142,7 +1157,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _merge_lora_adapters(self, adapter_name: str = 'default'):
         """Merge LoRA adapters into base model weights."""
-        from mcoreself.strategy.bridge import LoraParallelLinear
+        from mcore_bridge import LoraParallelLinear
         with torch.no_grad():
             for model in self.strategy.unwrap_model(self.model):
                 for module in model.modules():
@@ -1151,7 +1166,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _unmerge_lora_adapters(self):
         """Unmerge LoRA adapters to restore training state."""
-        from mcoreself.strategy.bridge import LoraParallelLinear
+        from mcore_bridge import LoraParallelLinear
         with torch.no_grad():
             for model in self.strategy.unwrap_model(self.model):
                 for module in model.modules():

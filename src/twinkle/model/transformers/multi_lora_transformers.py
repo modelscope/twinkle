@@ -36,6 +36,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             **kwargs):
         assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
         if isinstance(model_cls, str):
