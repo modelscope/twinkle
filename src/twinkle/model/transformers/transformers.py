@@ -39,9 +39,13 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.utils.logger import get_logger
 from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+
+
+logger = get_logger()
 
 
 @dataclass
@@ -983,8 +987,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if strict and not os.path.exists(optimizer_path):
             raise FileNotFoundError(optimizer_path)
-        if strict and not os.path.exists(scheduler_path):
-            raise FileNotFoundError(scheduler_path)
+        if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
+            logger.warning(
+                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.',
+            )
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
             if getattr(self.strategy, 'needs_wrapped_optimizer_state', lambda: False)() and not self._model_wrapped:
@@ -1062,7 +1068,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         required_paths = {
             'trainer_state': os.path.join(checkpoint_dir, 'trainer_state.json'),
             'optimizer': os.path.join(checkpoint_dir, 'optimizer.pt'),
-            'scheduler': os.path.join(checkpoint_dir, 'scheduler.pt'),
             'rng': os.path.join(checkpoint_dir, 'rng_state.pt'),
         }
         for path in required_paths.values():
