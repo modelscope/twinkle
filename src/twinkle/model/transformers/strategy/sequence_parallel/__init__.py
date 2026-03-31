@@ -797,13 +797,6 @@ class SequenceParallelConfig:
     gather_logits: bool = True
 
 
-@dataclass
-class SequenceParallelLossState:
-    applied: bool = False
-    reduction: Optional[str] = None
-    local_counts: Optional[torch.Tensor] = None
-
-
 class SequenceParallelStrategy:
     """Ulysses sequence-parallel strategy implementation."""
 
@@ -891,74 +884,29 @@ class SequenceParallelStrategy:
         outputs['logits'] = gathered
         return outputs
 
-    def prepare_loss_inputs(
+    def gather_loss_tensors(
         self,
-        loss_instance: Any,
         inputs: Dict[str, Any],
         outputs: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], SequenceParallelLossState]:
-        state = SequenceParallelLossState()
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if inputs is None or outputs is None:
-            return inputs, outputs, state
+            return inputs, outputs
         if not self.enabled or self.ulysses_size <= 1:
-            return inputs, outputs, state
+            return inputs, outputs
         labels = inputs.get('labels')
         logps = outputs.get('logps')
-        state.reduction = getattr(loss_instance, 'reduction', None)
-        if labels is None or logps is None:
-            return inputs, outputs, state
-        loss_inputs = copy(inputs)
-        loss_outputs = copy(outputs)
-        loss_inputs, loss_outputs = self.gather_loss_inputs(loss_inputs, loss_outputs)
-        state.applied = True
-        if str(state.reduction).lower() == 'sum':
-            ignore_index = getattr(loss_instance, 'ignore_index', -100)
-            state.local_counts = (labels != ignore_index).sum().to(device=labels.device)
-        return loss_inputs, loss_outputs, state
-
-    def gather_loss_inputs(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        if not self.enabled or self.ulysses_size <= 1:
-            return inputs, outputs
-        if inputs is None or outputs is None:
-            return inputs, outputs
-        labels = inputs.get('labels', None)
-        logps = outputs.get('logps', None)
         if labels is None or logps is None:
             return inputs, outputs
         if not torch.is_tensor(logps) or logps.dim() < 2:
             raise TypeError('SequenceParallelStrategy.gather_loss_inputs expects outputs[\"logps\"] to be a '
                             f'sequence tensor, got type={type(logps)} shape={getattr(logps, "shape", None)}')
+        inputs = copy(inputs)
+        outputs = copy(outputs)
         real_position_ids = sequence_parallel.real_position_ids
         gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
         return inputs, outputs
-
-    def align_gathered_loss(self, loss: torch.Tensor, reduction: Optional[str] = None) -> torch.Tensor:
-        if not self.enabled or self.ulysses_size <= 1:
-            return loss
-        reduction = str(reduction or 'mean').lower()
-        if reduction != 'sum' or sequence_parallel.world_size <= 1:
-            return loss
-        aligned = loss / float(sequence_parallel.world_size)
-        # Keep the forward value aligned with the old scalar-reduction path while
-        # preserving gradients from the gathered loss computation.
-        return loss + (aligned - loss).detach()
-
-    def finalize_loss_result(
-        self,
-        loss: torch.Tensor,
-        counts: Any,
-        state: Optional[SequenceParallelLossState],
-    ) -> Tuple[torch.Tensor, Any]:
-        if state is None or not state.applied:
-            return loss, counts
-        if not self.enabled or self.ulysses_size <= 1:
-            return loss, counts
-        if state.local_counts is not None:
-            counts = state.local_counts.to(device=loss.device)
-        loss = self.align_gathered_loss(loss, state.reduction)
-        return loss, counts
 
     def wrap_model(self, model, optimizer=None):
         self.initialize()

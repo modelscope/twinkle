@@ -174,11 +174,13 @@ def _gather_sequence_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
     return gathered
 
 
-def _all_reduce_full_grad(grad: torch.Tensor) -> torch.Tensor:
-    if sequence_parallel._sp_group is None or dist.get_world_size(sequence_parallel._sp_group) <= 1:
+def _gather_full_grad(grad: torch.Tensor) -> torch.Tensor:
+    if sequence_parallel.world_size is None or sequence_parallel.world_size <= 1:
         return grad
-    grad = grad.clone()
-    dist.all_reduce(grad, group=sequence_parallel._sp_group)
+    grad = sequence_parallel.gather(grad, dim=1, position_ids=sequence_parallel.real_position_ids)
+    real_pos = sequence_parallel.real_position_ids
+    if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
+        grad = grad[:, :real_pos.shape[1]].contiguous()
     return grad
 
 
@@ -276,17 +278,14 @@ def _run_forward_grad_alignment_worker(rank: int, world_size: int, port: int):
         local_logps = selective_log_softmax(local_logits, masked_local_labels)
         loss_inputs = {'labels': local_labels}
         loss_outputs = {'logits': local_logits, 'logps': local_logps}
-        loss_inputs, loss_outputs, sp_loss_state = strategy.prepare_loss_inputs(loss_instance, loss_inputs, loss_outputs)
+        loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
         result = loss_instance(loss_inputs, loss_outputs)
         sp_loss = result['loss']
-        counts = result['num_tokens']
-        sp_loss, counts = strategy.finalize_loss_result(sp_loss, counts, sp_loss_state)
-        del counts
         if not torch.allclose(sp_loss.detach(), baseline_loss.detach(), atol=LOSS_ATOL, rtol=0):
             raise AssertionError(
                 f'forward loss mismatch on rank {rank}: baseline={baseline_loss.item()} sp={sp_loss.item()}')
         sp_loss.backward()
-        sp_grad = _all_reduce_full_grad(sp_embeds.grad.detach().float())
+        sp_grad = _gather_full_grad(sp_embeds.grad.detach().float())
         if not torch.allclose(sp_grad, baseline_grad, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (sp_grad - baseline_grad).abs().max().item()
             raise AssertionError(f'input grad mismatch on rank {rank}: max_diff={max_diff}')

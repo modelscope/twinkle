@@ -487,18 +487,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         loss_inputs = inputs
         loss_outputs = outputs
-        sp_loss_state = None
         if self.sp_strategy is not None:
-            loss_inputs, loss_outputs, sp_loss_state = self.sp_strategy.prepare_loss_inputs(
-                loss_instance,
-                inputs,
-                outputs,
-            )
+            loss_inputs, loss_outputs = self.sp_strategy.gather_loss_tensors(inputs, outputs)
         result = loss_instance(loss_inputs, loss_outputs, **kwargs)
         loss_value = result['loss']
         counts = result['num_tokens']
-        if self.sp_strategy is not None:
-            loss_value, counts = self.sp_strategy.finalize_loss_result(loss_value, counts, sp_loss_state)
         if not counts:
             counts = torch.tensor(0, device=loss_value.device)
         optimizer_config = self.optimizer_group[adapter_name]
