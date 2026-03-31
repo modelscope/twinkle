@@ -15,10 +15,9 @@ import torch
 from peft import LoraConfig
 
 from twinkle import get_logger
-from twinkle.dataset import DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta
 from twinkle_client import init_twinkle_client
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import LazyDataset
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle.loss import DPOLoss
 from twinkle.metric import DPOMetric
@@ -65,7 +64,7 @@ for run in runs:
 
 def create_dpo_dataset():
     """Create DPO dataset with positive/negative format."""
-    dataset = LazyDataset(dataset_meta=DatasetMeta(dataset_id, data_slice=range(6000)))
+    dataset = Dataset(DatasetMeta(dataset_id, data_slice=range(600)))
     dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=max_length)
     dataset.map(
         EmojiDPOProcessor,
@@ -75,7 +74,7 @@ def create_dpo_dataset():
     )
     # DPO preprocessor returns {'positive': [...], 'negative': [...]}
     # batch_encode handles this format automatically
-    dataset.encode(batched=True)
+    dataset.encode()
     return dataset
 
 
@@ -179,7 +178,7 @@ def train():
         # Get reference outputs using base model (without LoRA adapter)
         # disable_lora=True tells the model to skip LoRA and use base weights
         ref_outputs = model.forward_only(inputs=dpo_batch, disable_lora=True)
-        model.forward_backward(inputs=dpo_batch, ref_outputs=ref_outputs)
+        model.forward_backward(inputs=dpo_batch, ref_outputs=ref_outputs.result)
         model.clip_grad_and_step()
 
         optim_step += 1

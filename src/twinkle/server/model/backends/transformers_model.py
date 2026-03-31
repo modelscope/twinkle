@@ -11,6 +11,7 @@ from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
@@ -106,7 +107,13 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+        """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        output = super().forward_only(inputs=inputs, **kwargs)
+        return to_cpu_safe_output(output)
+
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""

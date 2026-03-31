@@ -50,6 +50,9 @@ class DPOMetric(Metric):
             Aligned tensor with shape matching target_shape
         """
         import torch
+
+        if not torch.is_tensor(logps):
+            logps = torch.as_tensor(logps)
         logps = logps.to(device=device, dtype=dtype)
         batch_size, src_len = logps.shape
         _, target_len = target_shape
