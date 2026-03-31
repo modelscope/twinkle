@@ -1,12 +1,11 @@
 import concurrent.futures
 import importlib.util
 import sys
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
-
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 
 class _NoOpProcessPoolExecutor:
@@ -86,7 +85,10 @@ def test_load_training_state_route_resolves_checkpoint_path_and_calls_model(monk
 
     response = client.post(
         '/twinkle/load_training_state',
-        json={'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1', 'adapter_name': ''},
+        json={
+            'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1',
+            'adapter_name': ''
+        },
     )
 
     assert response.status_code == 200
@@ -102,7 +104,10 @@ def test_load_training_state_route_prefixes_non_empty_adapter_name(monkeypatch):
 
     response = client.post(
         '/twinkle/load_training_state',
-        json={'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1', 'adapter_name': 'adapter-a'},
+        json={
+            'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1',
+            'adapter_name': 'adapter-a'
+        },
     )
 
     assert response.status_code == 200
@@ -117,7 +122,10 @@ def test_load_training_state_route_uses_raw_name_when_checkpoint_dir_missing(mon
 
     response = client.post(
         '/twinkle/load_training_state',
-        json={'name': 'local-checkpoint-dir', 'adapter_name': ''},
+        json={
+            'name': 'local-checkpoint-dir',
+            'adapter_name': ''
+        },
     )
 
     assert response.status_code == 200
@@ -133,7 +141,10 @@ def test_read_training_progress_route_returns_progress_and_calls_model(monkeypat
 
     response = client.post(
         '/twinkle/read_training_progress',
-        json={'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1', 'adapter_name': ''},
+        json={
+            'name': 'twinkle://training_runs/run-1/checkpoints/weights/ckpt-1',
+            'adapter_name': ''
+        },
     )
 
     assert response.status_code == 200

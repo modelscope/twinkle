@@ -430,4 +430,3 @@ Recommended guidance text:
 - `ignore_data_skip=True` disables progress restore and starts from step 0
 - Full-parameter checkpoints restore weights during model initialization and restore training state afterward
 - Iterable and streaming datasets do not support consumed-data skipping and will resume without skipping data
-

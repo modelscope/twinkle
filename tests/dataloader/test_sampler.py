@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import concurrent.futures
-import os
 import numpy as np
+import os
 import pytest
 from pathlib import Path
-from torch.utils.data import RandomSampler, SequentialSampler
 from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import RandomSampler, SequentialSampler
 
 
 class _NoOpProcessPoolExecutor:
@@ -183,6 +183,7 @@ class TestSamplerComparison:
 class TestResumeSkipSamplerOrdering:
 
     def test_sequential_sampler_skip_happens_before_device_mesh_slice(self):
+
         class _InMemoryDataset(TorchDataset):
 
             def __init__(self, rows):
@@ -195,10 +196,18 @@ class TestResumeSkipSamplerOrdering:
                 return self.rows[idx]
 
         dataset = _InMemoryDataset([
-            {'text': 'Hello world'},
-            {'text': 'Test data'},
-            {'text': 'Another example'},
-            {'text': 'Sample text'},
+            {
+                'text': 'Hello world'
+            },
+            {
+                'text': 'Test data'
+            },
+            {
+                'text': 'Another example'
+            },
+            {
+                'text': 'Sample text'
+            },
         ])
         sampler = SequentialSampler(dataset)
         device_mesh = DeviceMesh(device_type='cpu', mesh=np.array([0, 1]), mesh_dim_names=('dp', ))

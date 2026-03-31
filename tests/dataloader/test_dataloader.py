@@ -39,10 +39,18 @@ def convert_to_messages(example):
 
 def _build_resume_rows():
     return [
-        {'text': 'Hello world'},
-        {'text': 'Test data'},
-        {'text': 'Another example'},
-        {'text': 'Sample text'},
+        {
+            'text': 'Hello world'
+        },
+        {
+            'text': 'Test data'
+        },
+        {
+            'text': 'Another example'
+        },
+        {
+            'text': 'Sample text'
+        },
     ]
 
 

@@ -149,8 +149,8 @@ class AccelerateStrategy:
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
-            from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
             import torch
+            from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
             optim_state = get_optimizer_state_dict(model, optimizer, options=self._prepare_fsdp2_sd_options())
             if self.accelerator.process_index == 0:
@@ -164,8 +164,8 @@ class AccelerateStrategy:
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
-            from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
             import torch
+            from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
             optim_state = None
             rank0_only = getattr(fsdp_plugin.optim_state_dict_config, 'rank0_only', False)

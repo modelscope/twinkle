@@ -8,11 +8,11 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 """
 from __future__ import annotations
 
+import os
 import torch
 import traceback
-import os
-from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
+from pathlib import Path
 from peft import LoraConfig
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -363,8 +363,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             resolved = checkpoint_manager.resolve_load_path(body.name)
-            checkpoint_dir = (Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
-                              if resolved.checkpoint_dir else body.name)
+            checkpoint_dir = (
+                Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
+                if resolved.checkpoint_dir else body.name)
             self.model.load_training_state(
                 checkpoint_dir,
                 adapter_name=adapter_name,
@@ -387,8 +388,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             resolved = checkpoint_manager.resolve_load_path(body.name)
-            checkpoint_dir = (Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
-                              if resolved.checkpoint_dir else body.name)
+            checkpoint_dir = (
+                Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
+                if resolved.checkpoint_dir else body.name)
             ret = self.model.read_training_progress(
                 checkpoint_dir,
                 adapter_name=adapter_name,

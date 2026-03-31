@@ -2,11 +2,11 @@
 import asyncio
 import contextlib
 import json
+import numpy as np
 import os
 import random
 import re
 import threading
-import numpy as np
 import torch
 import torch.distributed as dist
 import transformers
@@ -146,6 +146,7 @@ class OptimizerGroup:
         self.inputs = None
         self.outputs = None
         return results
+
 
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
@@ -1055,7 +1056,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not os.path.exists(trainer_state_path):
             raise FileNotFoundError(trainer_state_path)
 
-        with open(trainer_state_path, 'r', encoding='utf-8') as f:
+        with open(trainer_state_path, encoding='utf-8') as f:
             trainer_state = json.load(f)
 
         required_keys = {'checkpoint_version', 'cur_step', 'gradient_accumulation_steps', 'consumed_train_samples'}

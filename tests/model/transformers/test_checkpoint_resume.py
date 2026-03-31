@@ -1,19 +1,20 @@
 import concurrent.futures
+import pytest
 import sys
+import torch
 import types
 import uuid
 from pathlib import Path
-from types import ModuleType
-
-import pytest
 from peft import LoraConfig
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import Qwen3Config, Qwen3ForCausalLM, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+from types import ModuleType
 
 
 class _NoOpProcessPoolExecutor:
+
     def __init__(self, *args, **kwargs):
         pass
 
@@ -39,6 +40,7 @@ if 'zmq' not in sys.modules:
     sys.modules['zmq'] = fake_zmq
 
 from twinkle.model.transformers import MultiLoraTransformersModel, TransformersModel
+from twinkle.model.transformers.strategy import NativeFSDPStrategy
 
 
 def build_tiny_tokenizer():
@@ -94,6 +96,16 @@ def build_full_param_model(model_dir):
     )
 
 
+def build_native_fsdp_strategy():
+    device_mesh = types.SimpleNamespace(
+        world_size=2,
+        ep_size=1,
+        ep_fsdp_size=None,
+        device_type='cpu',
+    )
+    return NativeFSDPStrategy(device_mesh=device_mesh)
+
+
 def build_multi_lora_model(model_dir):
     device_mesh = types.SimpleNamespace(fsdp_world_size=0, data_world_size=1)
     model = MultiLoraTransformersModel(
@@ -103,7 +115,8 @@ def build_multi_lora_model(model_dir):
         device_mesh=device_mesh,
         grad_scaler_config={},
     )
-    model.add_adapter_to_model('default', LoraConfig(r=2, lora_alpha=4, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']))
+    model.add_adapter_to_model('default',
+                               LoraConfig(r=2, lora_alpha=4, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']))
     return model
 
 
@@ -173,7 +186,7 @@ def test_save_training_state_writes_split_files(tmp_path, tiny_local_model_dir):
     ],
 )
 def test_load_training_state_fails_when_required_file_missing(tmp_path, tiny_local_model_dir, missing_name,
-                                                             expected_pattern):
+                                                              expected_pattern):
     ckpt_dir = prepare_full_param_checkpoint(tmp_path, tiny_local_model_dir)
     _ensure_file_exists(ckpt_dir / missing_name)
     (ckpt_dir / missing_name).unlink()
@@ -291,3 +304,81 @@ def test_read_training_progress_returns_metadata_without_mutating_optimizer_stat
     assert progress['consumed_train_samples'] == 12
     assert restored.optimizer_group[''].cur_step == 0
     assert restored.optimizer_group[''].gradient_accumulation_steps == 1
+
+
+def test_native_fsdp_strategy_requires_wrapped_optimizer_state():
+    strategy = build_native_fsdp_strategy()
+
+    assert strategy.needs_wrapped_optimizer_state() is True
+
+
+def test_native_fsdp_strategy_save_optimizer_checkpoint_uses_full_state_dict(monkeypatch, tmp_path):
+    strategy = build_native_fsdp_strategy()
+    model = object()
+    optimizer = object()
+    optimizer_path = tmp_path / 'optimizer.pt'
+    captured = {}
+
+    from torch.distributed.checkpoint import state_dict as checkpoint_state_dict
+
+    def fake_get_optimizer_state_dict(model_arg, optimizer_arg, *, options=None):
+        captured['model'] = model_arg
+        captured['optimizer'] = optimizer_arg
+        captured['options'] = options
+        return {'state': {'step': 3}}
+
+    def fake_save(obj, path):
+        captured['saved_obj'] = obj
+        captured['saved_path'] = path
+
+    monkeypatch.setattr(checkpoint_state_dict, 'get_optimizer_state_dict', fake_get_optimizer_state_dict)
+    monkeypatch.setattr(torch, 'save', fake_save)
+
+    strategy.save_optimizer_checkpoint(model, optimizer, str(optimizer_path))
+
+    assert captured['model'] is model
+    assert captured['optimizer'] is optimizer
+    assert captured['saved_obj'] == {'state': {'step': 3}}
+    assert captured['saved_path'] == str(optimizer_path)
+    assert captured['options'].full_state_dict is True
+    assert captured['options'].cpu_offload is True
+    assert captured['options'].broadcast_from_rank0 is False
+
+
+def test_native_fsdp_strategy_load_optimizer_checkpoint_broadcasts_from_rank0(monkeypatch, tmp_path):
+    strategy = build_native_fsdp_strategy()
+    model = object()
+    optimizer = object()
+    optimizer_path = tmp_path / 'optimizer.pt'
+    optimizer_path.write_bytes(b'placeholder')
+    expected_state = {'state': {'step': 7}}
+    captured = {}
+
+    from torch.distributed.checkpoint import state_dict as checkpoint_state_dict
+
+    def fake_load(path, map_location=None, weights_only=None):
+        captured['loaded_path'] = path
+        captured['map_location'] = map_location
+        captured['weights_only'] = weights_only
+        return expected_state
+
+    def fake_set_optimizer_state_dict(model_arg, optimizer_arg, optim_state_dict, *, options=None):
+        captured['model'] = model_arg
+        captured['optimizer'] = optimizer_arg
+        captured['optim_state_dict'] = optim_state_dict
+        captured['options'] = options
+
+    monkeypatch.setattr(torch, 'load', fake_load)
+    monkeypatch.setattr(checkpoint_state_dict, 'set_optimizer_state_dict', fake_set_optimizer_state_dict)
+
+    strategy.load_optimizer_checkpoint(model, optimizer, str(optimizer_path))
+
+    assert captured['loaded_path'] == str(optimizer_path)
+    assert captured['map_location'] == 'cpu'
+    assert captured['weights_only'] is True
+    assert captured['model'] is model
+    assert captured['optimizer'] is optimizer
+    assert captured['optim_state_dict'] == expected_state
+    assert captured['options'].full_state_dict is True
+    assert captured['options'].cpu_offload is False
+    assert captured['options'].broadcast_from_rank0 is True
