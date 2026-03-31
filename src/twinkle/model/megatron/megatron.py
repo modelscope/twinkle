@@ -877,7 +877,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 **kwargs,
             )
         else:
-            bridge = self.self.strategy.bridge
+            bridge = self.strategy.bridge
             for _model in self.strategy.unwrap_model(self.model):
                 bridge.load_weights(
                     _model,
@@ -1186,7 +1186,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Get the model (unwrap if DDP wrapped)
         model = self.strategy.unwrap_model(self.model)
 
-        self.self.strategy.bridge.save_weights(
+        self.strategy.bridge.save_weights(
             model, output_dir, is_peft_format=is_peft_format, adapter_name=adapter_name, lora_converter=lora_converter)
 
         # Save config on rank 0 only
@@ -1259,12 +1259,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             ...     print(f"{name}: {tensor.shape}")
         """
         model = self.strategy.unwrap_model(self.model)
-        yield from self.self.strategy.bridge.export_weights(
+        yield from self.strategy.bridge.export_weights(
             model,
             target_device=None,  # Keep on current device for IPC transfer
-            only_last_rank=False,  # All ranks participate in weight sync
-            is_peft_format=bool(adapter_name),
-            adapter_name=adapter_name if adapter_name else None,
+            only_master_rank=False,  # All ranks participate in weight sync
+            peft_format=bool(adapter_name),
+            # adapter_name=adapter_name if adapter_name else None,
             tqdm_desc='Weight sync: ',
         )
 

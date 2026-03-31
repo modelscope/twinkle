@@ -619,81 +619,101 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
 
+        def _handle_worker_redispatch(self, args, kwargs, device_mesh):
+            """Handle worker-side redispatch when args contain Ray ObjectRefs."""
+            from ._ray import RayHelper
+            if RayHelper.has_ref(args, kwargs):
+                args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
+                world_size = Platform.get_world_size()
+                rank = Platform.get_rank()
+                _workers_and_args = _dispatch_args(
+                    _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args, kwargs)
+                _, args, kwargs = _workers_and_args[rank]
+            return args, kwargs
+
+        def _handle_driver_dispatch(self, func_name, args, kwargs, device_mesh):
+            """Handle driver-side dispatch and result collection."""
+            from ._ray import RayHelper
+            execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+            if RayHelper.has_ref(args, kwargs):
+                _workers_and_args = _dispatch_args(
+                    _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
+            else:
+                _workers_and_args = _dispatch_args(
+                    _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
+
+            result = execute_method(func_name, _workers_and_args)
+            result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
+            _local_lazy_collect = _lazy_collect
+
+            if func_name == '__iter__':
+                return self
+
+            if func_name == '__len__':
+                import ray
+                return ray.get(result[0])
+
+            if func_name == '__next__':
+                import ray
+                for _res in result:
+                    stop = ray.get(_res[1])
+                    if stop:
+                        raise StopIteration()
+                result = [_res[0] for _res in result]
+                result_func._futures = result
+
+            if lazy_collect is not None:
+                _local_lazy_collect = lazy_collect
+            if hasattr(self, '_lazy_collect'):
+                _local_lazy_collect = self._lazy_collect
+            return result_func if _local_lazy_collect else result_func()
+
+        def _set_wrapper_attrs(wrapper_func):
+            """Set common attributes on wrapper function."""
+            wrapper_func._execute = execute
+            wrapper_func._collect = collect
+            wrapper_func._dispatch = dispatch
+            wrapper_func._lazy_collect = _lazy_collect
+            wrapper_func._sync = sync
+            return wrapper_func
+
+        def _run_func(func, self, args, kwargs):
+            """Run function, handling both sync and async functions."""
+            result = func(self, *args, **kwargs)
+            if inspect.iscoroutine(result):
+                import asyncio
+                # Run coroutine in event loop
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    # Already in an event loop, create task
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, result)
+                        return future.result()
+                else:
+                    return asyncio.run(result)
+            return result
+
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
             device_mesh = getattr(self, 'device_mesh', None)
             if _mode == 'local':
-                return func(self, *args, **kwargs)
+                return _run_func(func, self, args, kwargs)
             elif _mode == 'ray':
                 check_unsafe(*args, **kwargs)
                 if not hasattr(self, '_actors'):
-                    # This is the worker
-                    from ._ray import RayHelper
-                    if RayHelper.has_ref(args, kwargs):
-                        # In this case, driver dispatch is all, redispatch here
-                        args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                        world_size = Platform.get_world_size()
-                        rank = Platform.get_rank()
-                        # Redispatch here
-                        _workers_and_args = _dispatch_args(
-                            _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args, kwargs)
-                        _, args, kwargs = _workers_and_args[rank]
-                    return func(self, *args, **kwargs)
+                    # Worker side
+                    args, kwargs = _handle_worker_redispatch(self, args, kwargs, device_mesh)
+                    return _run_func(func, self, args, kwargs)
                 else:
-                    # This is the driver
-                    from ._ray import RayHelper
-                    execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
-                    if RayHelper.has_ref(args, kwargs):
-                        # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
-                        # for example, dataloader returns any data list.
-                        _workers_and_args = _dispatch_args(
-                            _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
-                    else:
-                        # dispatch now
-                        _workers_and_args = _dispatch_args(
-                            _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
-
-                    result = execute_method(func.__name__, _workers_and_args)
-                    # This is a result future, call it to get the actual result
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
-                    _local_lazy_collect = _lazy_collect
-                    if func.__name__ == '__iter__':
-                        # return self
-                        return self
-
-                    if func.__name__ == '__len__':
-                        # Get the first result and ignore the `lazy_collect`
-                        import ray
-                        return ray.get(result[0])
-
-                    if func.__name__ == '__next__':
-                        import ray
-                        for _res in result:
-                            # raise when any worker raises StopIteration
-                            stop = ray.get(_res[1])
-                            if stop:
-                                raise StopIteration()
-                        result = [_res[0] for _res in result]
-                        result_func._futures = result
-
-                    if lazy_collect is not None:
-                        # Maybe this function returns a small object
-                        _local_lazy_collect = lazy_collect
-                    if hasattr(self, '_lazy_collect'):
-                        # _lazy_collect in class has the highest priority
-                        # This is the unique case that an object ref contains another
-                        # And this is user independent, only decided by the code.
-                        _local_lazy_collect = self._lazy_collect
-                    result = result_func if _local_lazy_collect else result_func()
-                    return result
+                    # Driver side - Ray handles remote execution
+                    return _handle_driver_dispatch(self, func.__name__, args, kwargs, device_mesh)
             else:
                 raise NotImplementedError(f'Unsupported mode {_mode}')
 
-        wrapper._execute = execute
-        wrapper._collect = collect
-        wrapper._dispatch = dispatch
-        wrapper._lazy_collect = _lazy_collect
-        wrapper._sync = sync
-        return wrapper
+        return _set_wrapper_attrs(wrapper)
 
     return decorator
