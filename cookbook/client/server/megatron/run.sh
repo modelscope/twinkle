@@ -4,16 +4,16 @@
 # Twinkle Megatron 服务启动脚本
 # ============================================
 # 功能：启动 Ray 集群（支持多 GPU/CPU 节点）、Prometheus 监控和 Twinkle 服务器
-# 
+#
 # 用法：./run.sh [选项]
-# 
+#
 # 选项：
 #   --head NODE          Head 节点 GPU 配置，格式 "设备列表:数量" (默认: 0,1,2,3:4)
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7:4)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
 #   --temp-dir DIR       Ray 临时目录 (默认: /dashscope/caches/application/ray_logs)
 #   --help               显示帮助信息
-# 
+#
 # 示例：
 #   ./run.sh                                    # 使用默认配置
 #   ./run.sh --head "0,1,2,3" --gpu-workers "4,5,6,7" --cpu-workers 1
@@ -232,11 +232,14 @@ if [ ! -d "$TEMP_DIR" ]; then
 fi
 
 # ============================================
-# 停止已有 Ray 集群
+# 停止已有 Ray 集群和 Prometheus
 # ============================================
 print_header "清理环境"
 print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
+
+print_info "停止已有的 Prometheus..."
+pkill prometheus 2>/dev/null || true
 
 # ============================================
 # 启动 Ray Head 节点
@@ -303,10 +306,10 @@ print_header "启动监控（可选）"
 PROMETHEUS_PID=""
 if [ -f "$PROMETHEUS_BIN" ]; then
     print_info "检测到 Prometheus，正在启动监控服务..."
-    
+
     # 等待 Ray 生成 Prometheus 配置
     sleep 2
-    
+
     if [ -f "$PROMETHEUS_CONFIG" ]; then
         nohup "$PROMETHEUS_BIN" --config.file="$PROMETHEUS_CONFIG" > prometheus.log 2>&1 &
         PROMETHEUS_PID=$!
