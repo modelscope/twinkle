@@ -34,17 +34,24 @@ class MegatronStrategy:
             params_dtype = torch.float32
         self._params_dtype = params_dtype
 
+        vpp_size = self.device_mesh.vpp_size
+        if vpp_size in (0, 1):
+            vpp_size = None
+
         parallel_kwargs = {
             'tensor_model_parallel_size': self.device_mesh.tp_world_size or 1,
             'pipeline_model_parallel_size': self.device_mesh.pp_world_size or 1,
             'context_parallel_size': self.device_mesh.cp_world_size or 1,
             'expert_model_parallel_size': self.device_mesh.ep_size or 1,
             'expert_tensor_parallel_size': self.device_mesh.etp_world_size or 1,
-            'virtual_pipeline_model_parallel_size': self.device_mesh.vpp_size or None,
+            'virtual_pipeline_model_parallel_size': vpp_size,
         }
-        if not self.device_mesh.vpp_size:
+        if not vpp_size:
             # non-interleave does not support overlap_p2p_comm
             kwargs['overlap_p2p_comm'] = False
+        if 'overlap_p2p_comm' not in kwargs:
+            kwargs['overlap_p2p_comm'] = True
+            kwargs['batch_p2p_comm'] = not kwargs['overlap_p2p_comm']
         mpu.initialize_model_parallel(
             order=self.device_mesh.order,
             **parallel_kwargs,

@@ -325,7 +325,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if self.variable_seq_lengths:
             seq_length = 4096
         else:
-            original_seq_length = inputs[0]['input_ids'].shape[1]
+            original_seq_length = inputs[0]['input_ids'].shape[1] * cp_size
             if cp_size > 1:
                 divisor = 2 * cp_size
             elif self.strategy.sequence_parallel and self.device_mesh.tp_world_size > 1:
@@ -388,7 +388,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**batch)
             batch['labels'] = labels
             logps = None
-            if labels is not None and mpu.is_pipeline_last_stage():
+            if labels is not None and mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
@@ -877,7 +877,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 **kwargs,
             )
         else:
-            bridge = self._bridge
+            bridge = self.self.strategy.bridge
             for _model in self.strategy.unwrap_model(self.model):
                 bridge.load_weights(
                     _model,
@@ -1142,7 +1142,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _merge_lora_adapters(self, adapter_name: str = 'default'):
         """Merge LoRA adapters into base model weights."""
-        from mcore_bridge import LoraParallelLinear
+        from mcoreself.strategy.bridge import LoraParallelLinear
         with torch.no_grad():
             for model in self.strategy.unwrap_model(self.model):
                 for module in model.modules():
@@ -1151,7 +1151,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     def _unmerge_lora_adapters(self):
         """Unmerge LoRA adapters to restore training state."""
-        from mcore_bridge import LoraParallelLinear
+        from mcoreself.strategy.bridge import LoraParallelLinear
         with torch.no_grad():
             for model in self.strategy.unwrap_model(self.model):
                 for module in model.modules():
@@ -1186,7 +1186,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Get the model (unwrap if DDP wrapped)
         model = self.strategy.unwrap_model(self.model)
 
-        self._bridge.save_weights(
+        self.self.strategy.bridge.save_weights(
             model, output_dir, is_peft_format=is_peft_format, adapter_name=adapter_name, lora_converter=lora_converter)
 
         # Save config on rank 0 only
@@ -1259,7 +1259,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             ...     print(f"{name}: {tensor.shape}")
         """
         model = self.strategy.unwrap_model(self.model)
-        yield from self._bridge.export_weights(
+        yield from self.self.strategy.bridge.export_weights(
             model,
             target_device=None,  # Keep on current device for IPC transfer
             only_last_rank=False,  # All ranks participate in weight sync
