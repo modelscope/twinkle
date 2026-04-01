@@ -365,7 +365,14 @@ class SequenceParallel:
         return 'transformers.models.qwen3_5' in model_module
 
     def _prepare_qwen35_linear_attention(self, model: torch.nn.Module):
-        if not self._is_qwen35_model(model):
+        has_qwen35_linear_attention = self._is_qwen35_model(model)
+        if not has_qwen35_linear_attention:
+            try:
+                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+            except Exception:
+                return
+            has_qwen35_linear_attention = any(isinstance(module, Qwen3_5GatedDeltaNet) for module in model.modules())
+        if not has_qwen35_linear_attention:
             return
         if int(self.rp_world_size or 1) > 1:
             raise NotImplementedError(
@@ -456,7 +463,7 @@ class SequenceParallel:
             # these operations are global initializations and patches
             self._prepare_flash_attn(llm_model)
             SequenceParallel._global_inited = True
-        self._prepare_qwen35_linear_attention(model)
+        self._prepare_qwen35_linear_attention(llm_model)
 
         self._prepare_forward_hook(llm_model)
         self._prepare_multimodal_deepstack(llm_model)
