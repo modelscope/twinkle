@@ -97,9 +97,9 @@ class OlympiadBenchProcessor(Preprocessor):
         # Build question content with image placeholders
         content_parts = []
 
-        # Add image placeholders at the beginning
-        for _ in images:
-            content_parts.append({'type': 'image'})
+        # Add images directly in blocks
+        for img in images:
+            content_parts.append({'type': 'image', 'url': img})
 
         # Add context if exists
         if context:
@@ -113,7 +113,6 @@ class OlympiadBenchProcessor(Preprocessor):
             user_message = Message(
                 role='user',
                 content=content_parts,
-                images=images,
             )
         else:
             # No images, use plain text

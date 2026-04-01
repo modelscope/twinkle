@@ -448,7 +448,6 @@ class Template:
                     if key in traj_keys else trajectories[key]
                     for key in trajectories
                 }
-         }
             else:
                 # Standard columnar format
                 trajectories = self.map_col_to_row(trajectories)
