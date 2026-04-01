@@ -43,7 +43,6 @@ from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.logger import get_logger
-from twinkle.utils.platforms import Platform
 
 logger = get_logger()
 

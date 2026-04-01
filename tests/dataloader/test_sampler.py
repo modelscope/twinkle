@@ -7,6 +7,11 @@ from pathlib import Path
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import RandomSampler, SequentialSampler
 
+import twinkle
+from twinkle import DeviceMesh
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+
 
 class _NoOpProcessPoolExecutor:
 
@@ -18,11 +23,6 @@ class _NoOpProcessPoolExecutor:
 
 
 concurrent.futures.ProcessPoolExecutor = _NoOpProcessPoolExecutor
-
-import twinkle
-from twinkle import DeviceMesh
-from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta
 
 twinkle.initialize(mode='local')
 

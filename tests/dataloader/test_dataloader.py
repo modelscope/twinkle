@@ -7,6 +7,13 @@ from pathlib import Path
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import IterableDataset as TorchIterableDataset
 
+import twinkle
+from twinkle import DeviceMesh
+from twinkle.data_format import Message
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
+from twinkle.processor import InputProcessor
+
 
 class _NoOpProcessPoolExecutor:
 
@@ -18,13 +25,6 @@ class _NoOpProcessPoolExecutor:
 
 
 concurrent.futures.ProcessPoolExecutor = _NoOpProcessPoolExecutor
-
-import twinkle
-from twinkle import DeviceMesh
-from twinkle.data_format import Message
-from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
-from twinkle.processor import InputProcessor
 
 twinkle.initialize(mode='local')
 
