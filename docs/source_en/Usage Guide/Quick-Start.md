@@ -230,6 +230,71 @@ When running, you need to launch training like this:
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train.py
 ```
 
+### Resume from Checkpoint
+
+The local and `torchrun` training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py` together with `cookbook/transformers/resume_utils.py`.
+
+When saving a checkpoint intended for resumption, save both model weights and training progress:
+
+```python
+consumed_train_samples = 0
+
+def save_checkpoint(model, checkpoint_name):
+    model.save(
+        checkpoint_name,
+        output_dir='./output/fsdp2',
+        adapter_name='default',
+        save_optimizer=True,
+        consumed_train_samples=consumed_train_samples,
+    )
+```
+
+`save_optimizer=True` stores optimizer-related state, and `consumed_train_samples` is written into `trainer_state.json` so the dataloader can skip samples that have already been consumed.
+
+To resume training, restore the checkpoint before entering the main loop:
+
+```python
+from pathlib import Path
+
+from resume_utils import resume_from_checkpoint
+
+RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
+RESUME_ONLY_MODEL = False
+IGNORE_DATA_SKIP = False
+
+consumed_train_samples = 0
+if RESUME_FROM_CHECKPOINT:
+    consumed_train_samples = resume_from_checkpoint(
+        model=model,
+        dataloader=dataloader,
+        checkpoint_path=Path(RESUME_FROM_CHECKPOINT).expanduser().resolve(),
+        resume_only_model=RESUME_ONLY_MODEL,
+        ignore_data_skip=IGNORE_DATA_SKIP,
+        adapter_name='default',
+    )
+```
+
+This helper provides two common resume modes:
+
+- Full resume: restore weights, optimizer, scheduler, scaler, RNG state, and training progress, then skip consumed samples in the dataloader.
+- Weights-only resume: restore only model weights. This is useful when you want to continue with fresh optimizer state or intentionally restart the schedule.
+
+When `RESUME_ONLY_MODEL=True`, `IGNORE_DATA_SKIP=False` still skips already consumed samples based on `trainer_state.json`. If you want to reload weights but restart the dataset from the beginning, set `IGNORE_DATA_SKIP=True`.
+
+The flow above is intended for LoRA / adapter training. For full-parameter training, restore model weights by passing the checkpoint path as `model_id` when constructing `TransformersModel`, instead of calling `model.load(...)`. For example:
+
+```python
+resume_path = './output/fsdp2/last-checkpoint'
+model = TransformersModel(model_id=resume_path)
+trainer_state = model.load_training_state(resume_path)
+dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+```
+
+In other words:
+
+- LoRA / adapter resume: create `TransformersModel` from the original base model, then restore via `model.load(...)` or `resume_from_checkpoint(...)`.
+- Full-parameter resume: construct `TransformersModel(...)` with the checkpoint path as `model_id`, then call `load_training_state(...)` to restore optimizer state and training progress.
+
 ### Ray Training
 
 [Ray](https://github.com/ray-project/ray) is a commonly used scheduling middleware framework for multi-machine model training and inference scenarios. It provides additional optimizations for multi-model, multi-device execution and resource management, and supports integration with Kubernetes systems for production deployment. These characteristics make it particularly suitable for complex training scenarios such as RL and GKD.
@@ -412,6 +477,8 @@ python train.py
 ### Remote Training
 
 A major feature of Twinkle is support for multi-tenant mixed training. Specifically, multiple users can use a single base model for LoRA training, which can greatly reduce server-side deployment costs.
+
+Checkpoint resumption is also supported in client-server training. The recommended flow is to restore weights with `model.load(resume_path)`, then restore optimizer and progress metadata with `model.load_training_state(resume_path)`, and finally call `dataloader.skip_consumed_samples(...)`. See `docs/source_en/Usage Guide/Server and Client/Twinkle-Client.md` and `cookbook/client/twinkle/self_host/self_congnition.py`.
 
 Suppose we start a service using eight GPUs. First, we need to start the Ray cluster:
 

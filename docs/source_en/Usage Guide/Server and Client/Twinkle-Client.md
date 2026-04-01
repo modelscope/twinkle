@@ -122,32 +122,36 @@ model.set_optimizer('AdamW', lr=1e-4)
 model.set_lr_scheduler('LinearLR')
 
 # Step 5: Resume training (optional)
+consumed_train_samples = 0
+global_step = 0
 if resume_path:
-    logger.info(f'Resuming training from {resume_path}')
-    model.load(resume_path, load_optimizer=True)
+    logger.info(f'Resuming model weights from {resume_path}')
+    model.load(resume_path)
+    trainer_state = model.load_training_state(resume_path)
+    dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+    consumed_train_samples = int(trainer_state['consumed_train_samples'])
+    global_step = int(trainer_state['cur_step'])
 
 # Step 6: Training loop
-for step, batch in enumerate(dataloader):
+for _, batch in enumerate(dataloader):
     # Forward propagation + backward propagation
-    output = model.forward_backward(inputs=batch)
+    model.forward_backward(inputs=batch)
 
-    if step % 2 == 0:
-        logger.info(f'Step {step // 2}, loss: {output}')
+    # Step
+    model.clip_grad_and_step()
+    consumed_train_samples += len(batch)
+    global_step += 1
 
-    # Gradient clipping
-    model.clip_grad_norm(1.0)
-
-    # Optimizer update
-    model.step()
-
-    # Zero gradients
-    model.zero_grad()
-
-    # Learning rate scheduling
-    model.lr_step()
+    if global_step % 2 == 0:
+        metric = model.calculate_metric(is_training=True)
+        logger.info(f'Current is step {global_step} of {len(dataloader)}, metric: {metric.result}')
 
 # Step 7: Save checkpoint
-twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
+twinkle_path = model.save(
+    name=f'step-{global_step}',
+    save_optimizer=True,
+    consumed_train_samples=consumed_train_samples,
+)
 logger.info(f"Saved checkpoint: {twinkle_path}")
 
 # Step 8: Upload to ModelScope Hub (optional)
@@ -157,6 +161,15 @@ model.upload_to_hub(
     async_upload=False
 )
 ```
+
+For checkpoint resumption, the recommended client-side flow is:
+
+1. Query the server for an existing checkpoint path with `client.list_checkpoints(...)` or `client.get_latest_checkpoint_path(...)`.
+2. Call `model.load(resume_path)` to restore adapter weights.
+3. Call `model.load_training_state(resume_path)` to restore optimizer, scheduler, RNG, and progress metadata.
+4. Call `dataloader.skip_consumed_samples(...)` with `consumed_train_samples` from the returned trainer state.
+
+This matches the end-to-end example in `cookbook/client/twinkle/self_host/self_congnition.py`.
 
 ## Differences with Megatron Backend
 

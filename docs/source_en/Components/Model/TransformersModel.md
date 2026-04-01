@@ -50,3 +50,16 @@ for data in dataloader:
   model.forward_backward(...)
   model.clip_grad_and_step(..., gradient_accumulation_steps=16)
 ```
+
+## Checkpoint and Resume
+
+`TransformersModel.save()` can save either weights only or a resumable training checkpoint.
+
+- `model.save(name, save_optimizer=True, consumed_train_samples=...)` saves weights together with optimizer, scheduler, scaler, RNG, and `trainer_state.json`.
+- `model.load(name, output_dir=..., adapter_name=...)` restores LoRA / adapter model weights.
+- `model.read_training_progress(checkpoint_dir, ...)` reads checkpoint metadata such as `cur_step`, `gradient_accumulation_steps`, and `consumed_train_samples`.
+- `model.load_training_state(checkpoint_dir, ...)` restores optimizer-related state and returns the training progress dictionary.
+
+For full-parameter training, restore model weights by constructing `TransformersModel` with the checkpoint path as `model_id`, for example `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`, and then call `load_training_state(...)` to restore optimizer state and training progress.
+
+For end-to-end resume logic, including dataloader skipping, refer to `cookbook/transformers/fsdp2.py` and `cookbook/transformers/resume_utils.py`.

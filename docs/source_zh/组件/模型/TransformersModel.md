@@ -50,3 +50,16 @@ for data in dataloader:
   model.forward_backward(...)
   model.clip_grad_and_step(..., gradient_accumulation_steps=16)
 ```
+
+## 检查点保存与续训
+
+`TransformersModel.save()` 既可以只保存权重，也可以保存可续训的训练检查点。
+
+- `model.save(name, save_optimizer=True, consumed_train_samples=...)` 会在保存权重的同时，保存优化器、学习率调度器、梯度缩放器、随机数状态以及 `trainer_state.json`。
+- `model.load(name, output_dir=..., adapter_name=...)` 用于恢复 LoRA / adapter 模型权重。
+- `model.read_training_progress(checkpoint_dir, ...)` 用于读取 checkpoint 中的训练进度元数据，例如 `cur_step`、`gradient_accumulation_steps` 和 `consumed_train_samples`。
+- `model.load_training_state(checkpoint_dir, ...)` 用于恢复优化器等训练状态，并返回训练进度字典。
+
+对于全参训练，恢复模型权重时需要在创建 `TransformersModel` 时直接把 checkpoint 路径传给 `model_id`，例如 `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`，随后再调用 `load_training_state(...)` 恢复优化器和训练进度。
+
+如果需要完整的断点续训流程，包括 dataloader 跳过已消费数据的逻辑，建议直接参考 `cookbook/transformers/fsdp2.py` 和 `cookbook/transformers/resume_utils.py`。

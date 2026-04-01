@@ -122,32 +122,36 @@ model.set_optimizer('AdamW', lr=1e-4)
 model.set_lr_scheduler('LinearLR')
 
 # Step 5: 恢复训练（可选）
+consumed_train_samples = 0
+global_step = 0
 if resume_path:
-    logger.info(f'Resuming training from {resume_path}')
-    model.load(resume_path, load_optimizer=True)
+    logger.info(f'Resuming model weights from {resume_path}')
+    model.load(resume_path)
+    trainer_state = model.load_training_state(resume_path)
+    dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+    consumed_train_samples = int(trainer_state['consumed_train_samples'])
+    global_step = int(trainer_state['cur_step'])
 
 # Step 6: 训练循环
-for step, batch in enumerate(dataloader):
+for _, batch in enumerate(dataloader):
     # 前向传播 + 反向传播
-    output = model.forward_backward(inputs=batch)
+    model.forward_backward(inputs=batch)
 
-    if step % 2 == 0:
-        logger.info(f'Step {step // 2}, loss: {output}')
+    # Step
+    model.clip_grad_and_step()
+    consumed_train_samples += len(batch)
+    global_step += 1
 
-    # 梯度裁剪
-    model.clip_grad_norm(1.0)
-
-    # 优化器更新
-    model.step()
-
-    # 梯度清零
-    model.zero_grad()
-
-    # 学习率调度
-    model.lr_step()
+    if global_step % 2 == 0:
+        metric = model.calculate_metric(is_training=True)
+        logger.info(f'Current is step {global_step} of {len(dataloader)}, metric: {metric.result}')
 
 # Step 7: 保存检查点
-twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
+twinkle_path = model.save(
+    name=f'step-{global_step}',
+    save_optimizer=True,
+    consumed_train_samples=consumed_train_samples,
+)
 logger.info(f"Saved checkpoint: {twinkle_path}")
 
 # Step 8: 上传到 ModelScope Hub（可选）
@@ -157,6 +161,15 @@ model.upload_to_hub(
     async_upload=False
 )
 ```
+
+Twinkle Client 场景下，推荐的断点续训流程是：
+
+1. 先通过 `client.list_checkpoints(...)` 或 `client.get_latest_checkpoint_path(...)` 获取已有 checkpoint 路径。
+2. 调用 `model.load(resume_path)` 恢复 adapter 权重。
+3. 调用 `model.load_training_state(resume_path)` 恢复优化器、调度器、随机数状态和训练进度元数据。
+4. 使用返回结果中的 `consumed_train_samples` 调用 `dataloader.skip_consumed_samples(...)`，跳过已经训练过的数据。
+
+完整示例可直接参考 `cookbook/client/twinkle/self_host/self_congnition.py`。
 
 ## Megatron 后端的差异
 
