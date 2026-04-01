@@ -134,29 +134,13 @@ class SequenceParallel:
                 if self.world_size == 1:
                     return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
                                                                    *args, **kwargs)
-                global_seq_len = input_embeds.shape[1] * self.sp_world_size
-                if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
-                    global_seq_len = attention_mask.shape[-1]
-
-                full_input_embeds = torch.ones(
-                    (input_embeds.shape[0], global_seq_len, input_embeds.shape[2]),
+                input_embeds = torch.ones(
+                    (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
-
-                if cache_position is None:
-                    full_cache_position = torch.arange(0, global_seq_len, device=input_embeds.device)
-                else:
-                    full_cache_position = cache_position.reshape(-1)
-                    if full_cache_position.numel() != global_seq_len:
-                        start = int(full_cache_position[0].item()) if full_cache_position.numel() > 0 else 0
-                        full_cache_position = torch.arange(
-                            start,
-                            start + global_seq_len,
-                            device=full_cache_position.device,
-                            dtype=full_cache_position.dtype,
-                        )
-                return masking_utils.origin_create_causal_mask(
-                    config, full_input_embeds, attention_mask, full_cache_position, *args, **kwargs)
+                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
+                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
+                                                               *args, **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
@@ -393,7 +377,7 @@ class SequenceParallel:
             return
         if int(self.rp_world_size or 1) > 1:
             raise NotImplementedError(
-                'SequenceParallel: Qwen3.5 linear attention SP patch does not support rp_world_size > 1 '
+                'SequenceParallel: Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
                 '(derived ring attention).')
         apply_patch(None, Qwen35LinearAttentionSPPatch, sequence_parallel=self)
 

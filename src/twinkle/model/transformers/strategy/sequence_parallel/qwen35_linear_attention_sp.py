@@ -39,36 +39,32 @@ def _maybe_slice_tensor_output(output: Any) -> torch.Tensor:
     raise TypeError(f'Unexpected tensor output type: {type(output)}')
 
 
-def _resolve_local_padding_mask(
-    attention_mask: Optional[torch.Tensor],
+def _get_local_padding_mask(
+    attention_mask: torch.Tensor,
     local_seq_len: int,
     sequence_parallel_context,
-) -> Optional[torch.Tensor]:
-    if attention_mask is None or not torch.is_tensor(attention_mask):
+) -> torch.Tensor:
+    if attention_mask.shape[-1] == local_seq_len or not _sp_is_enabled(sequence_parallel_context):
         return attention_mask
-    if attention_mask.dim() != 2:
-        return attention_mask
-    if attention_mask.shape[-1] == local_seq_len:
-        return attention_mask
-    if not _sp_is_enabled(sequence_parallel_context):
-        return attention_mask
-    real_position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
-    if real_position_ids is None:
-        return attention_mask
-    return sequence_parallel_context.split(attention_mask, dim=1, position_ids=real_position_ids)
+    return sequence_parallel_context.split(
+        attention_mask,
+        dim=1,
+        position_ids=sequence_parallel_context.real_position_ids,
+    )
 
 
-def _ensure_linear_attention_fast_path(mod: torch.nn.Module):
+def _ensure_linear_attention_kernels(mod: torch.nn.Module):
     mod.causal_conv1d_fn = getattr(mod, 'causal_conv1d_fn', None) or _FLA_CAUSAL_CONV1D_FN
     mod.chunk_gated_delta_rule = getattr(mod, 'chunk_gated_delta_rule', None) or _FLA_CHUNK_GATED_DELTA_RULE
     if mod.chunk_gated_delta_rule is None:
-        raise ImportError('Qwen35LinearAttentionSPPatch requires chunk gated delta rule implementations.')
+        raise ImportError('Qwen3.5 linear attention sequence parallel requires chunk gated delta rule implementations.')
     if mod.causal_conv1d_fn is None:
         raise ImportError(
-            'Qwen35LinearAttentionSPPatch requires fla.modules.convolution.causal_conv1d for training/prefill.')
+            'Qwen3.5 linear attention sequence parallel requires fla.modules.convolution.causal_conv1d for '
+            'training/prefill.')
 
 
-def _get_local_conv_params(
+def _get_local_conv_weights(
     mod: torch.nn.Module,
     *,
     sp_rank: int,
@@ -106,7 +102,8 @@ def _apply_varlen_conv(
 ) -> torch.Tensor:
     if mod.causal_conv1d_fn is None:
         raise ImportError(
-            'Qwen35LinearAttentionSPPatch requires fla.modules.convolution.causal_conv1d for prefill/train.')
+            'Qwen3.5 linear attention sequence parallel requires fla.modules.convolution.causal_conv1d for '
+            'prefill/train.')
     output = mod.causal_conv1d_fn(
         x=mixed_qkv,
         weight=conv_weight,
@@ -137,10 +134,16 @@ class Qwen35LinearAttentionSPPatch(Patch):
         cu_seq_lens_q: Optional[torch.Tensor] = None,
         sequence_parallel_context=None,
     ) -> torch.Tensor:
-        _ensure_linear_attention_fast_path(mod)
+        _ensure_linear_attention_kernels(mod)
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
-        local_attention_mask = _resolve_local_padding_mask(attention_mask, hidden_states.shape[1], sequence_parallel_context)
+        local_attention_mask = attention_mask
+        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+            local_attention_mask = _get_local_padding_mask(
+                attention_mask,
+                hidden_states.shape[1],
+                sequence_parallel_context,
+            )
         hidden_states = apply_mask_to_padding_states(hidden_states, local_attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -148,8 +151,8 @@ class Qwen35LinearAttentionSPPatch(Patch):
         use_precomputed_states = has_previous_state and seq_len == 1 and cache_position is not None
         if use_precomputed_states:
             raise NotImplementedError(
-                'Qwen35LinearAttentionSPPatch only supports training/prefill paths; decode with cached states '
-                'is not supported.')
+                'Qwen3.5 linear attention sequence parallel only supports training/prefill paths; decode with '
+                'cached states is not supported.')
 
         mixed_qkv = mod.in_proj_qkv(hidden_states)
         z = mod.in_proj_z(hidden_states).reshape(batch_size, seq_len, mod.num_v_heads, mod.head_v_dim)
@@ -161,7 +164,7 @@ class Qwen35LinearAttentionSPPatch(Patch):
             sp_world_size = int(sequence_parallel_context.sp_world_size)
             if mod.num_k_heads % sp_world_size != 0 or mod.num_v_heads % sp_world_size != 0:
                 raise RuntimeError(
-                    'Qwen35LinearAttentionSPPatch requires sp_world_size to divide both '
+                    'Qwen3.5 linear attention sequence parallel requires sp_world_size to divide both '
                     f'linear_num_key_heads ({mod.num_k_heads}) and linear_num_value_heads ({mod.num_v_heads}).')
             local_num_k_heads = mod.num_k_heads // sp_world_size
             local_num_v_heads = mod.num_v_heads // sp_world_size
@@ -184,7 +187,7 @@ class Qwen35LinearAttentionSPPatch(Patch):
                 dim=-1,
             )
             sp_rank = _get_sp_rank(sequence_parallel_context)
-            conv_weight, conv_bias = _get_local_conv_params(
+            conv_weight, conv_bias = _get_local_conv_weights(
                 mod, sp_rank=sp_rank, local_num_k_heads=local_num_k_heads, local_num_v_heads=local_num_v_heads)
         else:
             local_num_k_heads = mod.num_k_heads
@@ -204,8 +207,8 @@ class Qwen35LinearAttentionSPPatch(Patch):
                 packed_cu_seqlens = packed_cu_seqlens.to(dtype=torch.int32, device=mixed_qkv.device)
         if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('is_packed', False)) and packed_cu_seqlens is None:
             raise ValueError(
-                'Packed Qwen3.5 linear attention requires cu_seq_lens_q to be populated by sequence parallel input '
-                'preparation.')
+                'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '
+                'sequence parallel input preparation.')
 
         if cache_params is not None:
             cache_params.conv_states[mod.layer_idx] = F.pad(
@@ -255,7 +258,8 @@ class Qwen35LinearAttentionSPPatch(Patch):
             return
         if int(getattr(sequence_parallel, 'rp_world_size', 1) or 1) > 1:
             raise NotImplementedError(
-                'Qwen35LinearAttentionSPPatch does not support rp_world_size > 1 (derived ring attention).')
+                'Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
+                '(derived ring attention).')
         if os.environ.get('QWEN35_SP_LINEAR_HEAD_PARALLEL', '1') != '1':
             return
 
