@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import os
 import warnings
 from functools import partial
 from typing import Callable, Optional, Type, Union
@@ -56,6 +57,7 @@ class DataLoader:
         self._skip_samples = 0
         self._base_batch_sampler = None
         self._base_sampler = None
+        self._retry_sampler_seed = self._resolve_retry_sampler_seed()
         self._set_work_init_fn()
 
     def _set_work_init_fn(self):
@@ -64,6 +66,17 @@ class DataLoader:
             DataLoader._seed_worker,
             num_workers=num_workers,
             rank=self.device_mesh.data_rank if self.device_mesh else 0)
+
+    @staticmethod
+    def _resolve_retry_sampler_seed() -> int:
+        env_seed = os.environ.get('TWINKLE_SEED')
+        if env_seed is not None:
+            return int(env_seed)
+        try:
+            from twinkle.infra import _seed
+            return int(_seed)
+        except Exception:
+            return 42
 
     @remote_function()
     def __len__(self):
@@ -145,6 +158,7 @@ class DataLoader:
                 self._base_sampler,
                 self.dataset,
                 max_retries=self.max_retries,
+                seed=self._retry_sampler_seed,
             )
             self.dataloader.batch_sampler = DeviceMeshSampler(
                 batch_sampler,
@@ -158,4 +172,5 @@ class DataLoader:
                 self.dataset,
                 max_retries=self.max_retries,
                 skip_samples=self._skip_samples,
+                seed=self._retry_sampler_seed,
             )

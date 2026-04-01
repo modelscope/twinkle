@@ -14,11 +14,17 @@ class RetrySampler(Sampler):
         max_retries: The maximum number of retries.
     """
 
-    def __init__(self, original_sampler: Sampler, dataset: Dataset, max_retries=20, skip_samples: int = 0):
+    def __init__(self,
+                 original_sampler: Sampler,
+                 dataset: Dataset,
+                 max_retries=20,
+                 skip_samples: int = 0,
+                 seed: int = 42):
         self.original_sampler = original_sampler
         self.dataset = dataset
         self.max_retries = max_retries
         self.skip_samples = skip_samples
+        self.seed = int(seed)
 
     def __iter__(self):
         emitted = 0
@@ -48,9 +54,9 @@ class RetrySampler(Sampler):
         if emitted >= target_total:
             return
 
-        for idx in np.random.RandomState().permutation(len(self.dataset)).tolist():
+        for idx in np.random.RandomState(self.seed).permutation(len(self.dataset)).tolist():
             if emitted >= target_total:
-                raise StopIteration
+                return
             for _ in range(self.max_retries):
                 try:
                     # Skip None values and raises
