@@ -353,8 +353,7 @@ class DistributedAttention(torch.nn.Module):
         else:
             query_layer, key_layer, value_layer = query, key, value
 
-        if (self.sequence_parallel.sp_world_size > 1 and torch.is_tensor(attention_mask)
-                and attention_mask.dim() == 4):
+        if (self.sequence_parallel.sp_world_size > 1 and torch.is_tensor(attention_mask) and attention_mask.dim() == 4):
             if attention_mask.shape[-1] != key_layer.shape[1]:
                 attention_mask = self.sequence_parallel.gather(attention_mask, dim=-1, position_ids=None)
             if attention_mask.shape[-2] != query_layer.shape[1]:
