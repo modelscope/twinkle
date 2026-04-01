@@ -72,15 +72,37 @@ def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
 
 
 def _summarize_batch(batch: dict[str, Any]) -> dict[str, Any]:
-    summary = {}
-    for key, value in batch.items():
-        if torch.is_tensor(value):
-            summary[key] = _tensor_summary(value)
-    if 'labels' in batch and torch.is_tensor(batch['labels']):
-        summary['labels_non_ignore'] = int((batch['labels'] != -100).sum().item())
-    if 'attention_mask' in batch and torch.is_tensor(batch['attention_mask']):
-        summary['attention_mask_total'] = int(batch['attention_mask'].sum().item())
-    return summary
+    if isinstance(batch, dict):
+        summary = {'batch_type': 'dict'}
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                summary[key] = _tensor_summary(value)
+        if 'labels' in batch and torch.is_tensor(batch['labels']):
+            summary['labels_non_ignore'] = int((batch['labels'] != -100).sum().item())
+        if 'attention_mask' in batch and torch.is_tensor(batch['attention_mask']):
+            summary['attention_mask_total'] = int(batch['attention_mask'].sum().item())
+        return summary
+
+    if isinstance(batch, list):
+        summary = {
+            'batch_type': 'list',
+            'batch_size': len(batch),
+        }
+        if batch and isinstance(batch[0], dict):
+            first_item = batch[0]
+            summary['item_keys'] = sorted(first_item.keys())
+            if 'messages' in first_item and isinstance(first_item['messages'], list):
+                summary['first_item_message_count'] = len(first_item['messages'])
+                user_content = first_item['messages'][0].get('content', '')
+                if isinstance(user_content, str):
+                    summary['first_item_user_content_preview'] = user_content[:120]
+                summary['first_item_image_count'] = len(first_item['messages'][0].get('images', []) or [])
+        return summary
+
+    return {
+        'batch_type': type(batch).__name__,
+        'repr': repr(batch)[:200],
+    }
 
 
 def _resolve_first_linear_attn_module(model: TransformersModel):
