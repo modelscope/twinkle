@@ -2,10 +2,11 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.distributed.tensor  # noqa: F401
 
 
 def _load(path: str):
-    return torch.load(path, map_location='cpu')
+    return torch.load(path, map_location='cpu', weights_only=False)
 
 
 def _grad_norm(grad_dict: dict[str, torch.Tensor]) -> float:
