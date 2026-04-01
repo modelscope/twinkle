@@ -49,7 +49,7 @@ class RetrySampler(Sampler):
                     traceback.print_exc()
                     continue
             else:
-                raise StopIteration(f'Max retries exceeded: {self.max_retries}, no valid data found.')
+                raise RuntimeError(f'Max retries exceeded: {self.max_retries}, no valid data found.')
 
         if emitted >= target_total:
             return

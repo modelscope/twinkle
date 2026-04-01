@@ -996,11 +996,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if hasattr(self.strategy, 'load_optimizer_checkpoint'):
                 self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
             else:
-                state_dict = torch.load(optimizer_path, map_location='cpu', weights_only=False)
+                state_dict = torch.load(optimizer_path, map_location='cpu', weights_only=True)
                 optimizer_config.optimizer.load_state_dict(state_dict)
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
-            state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=False)
+            state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
     def _load_scaler_state(self, scaler_path, **kwargs):
@@ -1009,7 +1009,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.scaler is None:
             raise ValueError(f'Grad scaler is not configured for adapter {adapter_name!r}')
 
-        scaler_state = torch.load(scaler_path, map_location='cpu', weights_only=False)
+        scaler_state = torch.load(scaler_path, map_location='cpu', weights_only=True)
         optimizer_config.scaler.load_state_dict(scaler_state['scaler_state_dict'])
         optimizer_config.scaler_has_nan = scaler_state.get('scaler_has_nan', False)
 
