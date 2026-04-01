@@ -1,13 +1,17 @@
 import math
-from typing import Any, Dict, List, Optional, Tuple
-
 import torch
 import torch.distributed as dist
+from typing import Any, Dict, List, Optional, Tuple
+
 from twinkle.utils import DeviceMesh
 
 
 def get_config_attr(config, key, default=None):
     return getattr(config, key, default)
+
+
+def is_hccl_backend(group=None) -> bool:
+    return dist.get_backend(group) == 'hccl'
 
 
 def is_moe_config(config) -> bool:
@@ -87,9 +91,8 @@ def _get_sequence_group_specs(
         return []
 
     if seq_world_size != sp_world_size * rp_world_size:
-        raise ValueError(
-            f'seq_world_size ({seq_world_size}) must equal sp_world_size ({sp_world_size}) * '
-            f'rp_world_size ({rp_world_size}).')
+        raise ValueError(f'seq_world_size ({seq_world_size}) must equal sp_world_size ({sp_world_size}) * '
+                         f'rp_world_size ({rp_world_size}).')
 
     raw_data_world_size = _get_raw_data_world_size(device_mesh)
     if raw_data_world_size % seq_world_size != 0:
@@ -127,8 +130,7 @@ def _get_sequence_group_specs(
         seq_ranks = [rank for _, rank in items]
         if len(seq_ranks) != seq_world_size:
             raise ValueError(
-                f'Sequence-parallel group size mismatch for key={key}: expected {seq_world_size}, got {len(seq_ranks)}'
-            )
+                f'Sequence-parallel group size mismatch for key={key}: expected {seq_world_size}, got {len(seq_ranks)}')
         sp_groups = [seq_ranks[i * sp_world_size:(i + 1) * sp_world_size] for i in range(rp_world_size)]
         rp_groups = [[sp_groups[rp_idx][sp_idx] for rp_idx in range(rp_world_size)] for sp_idx in range(sp_world_size)]
         group_specs.append({

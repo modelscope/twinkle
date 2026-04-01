@@ -2,14 +2,13 @@
 import copy
 import os
 import socket
-import unittest
-from datetime import timedelta
-from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+import unittest
+from datetime import timedelta
+from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
@@ -25,7 +24,6 @@ except Exception:
     Qwen3_5TextConfig = None
     hf_qwen35 = None
     _HAS_QWEN35 = False
-
 
 WORLD_SIZE = 2
 LOGITS_RTOL = 5e-2
@@ -142,11 +140,15 @@ def _make_train_batch(device: torch.device):
     input_ids = torch.tensor([
         [0, 0, 11, 12, 13, 14, 15, 16],
         [21, 22, 23, 24, 25, 26, 27, 28],
-    ], device=device, dtype=torch.long)
+    ],
+                             device=device,
+                             dtype=torch.long)
     attention_mask = torch.tensor([
         [0, 0, 1, 1, 1, 1, 1, 1],
         [1, 1, 1, 1, 1, 1, 1, 1],
-    ], device=device, dtype=torch.long)
+    ],
+                                  device=device,
+                                  dtype=torch.long)
     position_ids = torch.arange(input_ids.shape[1], device=device, dtype=torch.long).unsqueeze(0).expand_as(input_ids)
     labels = _make_shift_labels(input_ids, attention_mask)
     return input_ids, attention_mask, position_ids, labels

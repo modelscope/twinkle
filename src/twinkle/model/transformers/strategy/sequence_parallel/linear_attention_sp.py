@@ -83,7 +83,7 @@ def _get_local_conv_weights(
     return local_conv_weight, torch.cat([local_q_bias, local_k_bias, local_v_bias], dim=0)
 
 
-class Qwen35LinearAttentionSPPatch(Patch):
+class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
 
     @staticmethod
     def _run_forward(
@@ -267,7 +267,7 @@ class Qwen35LinearAttentionSPPatch(Patch):
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                 )
-            return Qwen35LinearAttentionSPPatch._run_forward(
+            return Qwen3_5GatedDeltaNetUlyssesPatch._run_forward(
                 mod,
                 hidden_states,
                 cache_params=cache_params,

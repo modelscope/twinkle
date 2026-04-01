@@ -3,15 +3,14 @@ import copy
 import math
 import os
 import socket
-import unittest
-from datetime import timedelta
-from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import unittest
+from datetime import timedelta
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
+from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
@@ -104,15 +103,13 @@ def _validate_case_config(case: dict) -> tuple[str, int, int]:
     expected_mode = case.get('expected_mode')
 
     if hidden_size % num_heads != 0:
-        raise ValueError(
-            f'Invalid test case config: hidden_size ({hidden_size}) must be divisible by '
-            f'num_attention_heads ({num_heads}).')
+        raise ValueError(f'Invalid test case config: hidden_size ({hidden_size}) must be divisible by '
+                         f'num_attention_heads ({num_heads}).')
 
     head_dim = hidden_size // num_heads
     if head_dim % 2 != 0:
-        raise ValueError(
-            f'Invalid test case config: head_dim ({head_dim}) must be even for RoPE. '
-            f'Got hidden_size={hidden_size}, num_attention_heads={num_heads}.')
+        raise ValueError(f'Invalid test case config: head_dim ({head_dim}) must be even for RoPE. '
+                         f'Got hidden_size={hidden_size}, num_attention_heads={num_heads}.')
 
     sp_world_size = math.gcd(num_heads, ulysses_size)
     rp_world_size = ulysses_size // sp_world_size
@@ -123,10 +120,9 @@ def _validate_case_config(case: dict) -> tuple[str, int, int]:
         mode = 'cp_sp'
 
     if expected_mode is not None and mode != expected_mode:
-        raise ValueError(
-            f'Invalid test case config: expected {expected_mode}, but derived {mode}. '
-            f'Got ulysses_size={ulysses_size}, num_attention_heads={num_heads}, '
-            f'sp_world_size={sp_world_size}, rp_world_size={rp_world_size}.')
+        raise ValueError(f'Invalid test case config: expected {expected_mode}, but derived {mode}. '
+                         f'Got ulysses_size={ulysses_size}, num_attention_heads={num_heads}, '
+                         f'sp_world_size={sp_world_size}, rp_world_size={rp_world_size}.')
     return mode, sp_world_size, rp_world_size
 
 
@@ -303,37 +299,32 @@ def _assert_grad_dict_close(case_name: str, rank: int, baseline_grads: dict[str,
         current = sp_grads[key]
         if not torch.allclose(current, baseline, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (current - baseline).abs().max().item()
-            raise AssertionError(
-                f'{case_name} attention grad mismatch on rank {rank} for {key}: max_diff={max_diff}')
+            raise AssertionError(f'{case_name} attention grad mismatch on rank {rank} for {key}: max_diff={max_diff}')
 
 
 def _assert_runtime_sequence_parallel_state(case: dict, strategy: SequenceParallelStrategy) -> None:
     expected_mode, expected_sp_world_size, expected_rp_world_size = _validate_case_config(case)
     if sequence_parallel.sp_world_size != expected_sp_world_size:
-        raise AssertionError(
-            f'{case["expected_mode"]} sp_world_size mismatch: '
-            f'expected={expected_sp_world_size}, actual={sequence_parallel.sp_world_size}')
+        raise AssertionError(f'{case["expected_mode"]} sp_world_size mismatch: '
+                             f'expected={expected_sp_world_size}, actual={sequence_parallel.sp_world_size}')
     if sequence_parallel.rp_world_size != expected_rp_world_size:
-        raise AssertionError(
-            f'{case["expected_mode"]} rp_world_size mismatch: '
-            f'expected={expected_rp_world_size}, actual={sequence_parallel.rp_world_size}')
+        raise AssertionError(f'{case["expected_mode"]} rp_world_size mismatch: '
+                             f'expected={expected_rp_world_size}, actual={sequence_parallel.rp_world_size}')
 
     data_rank_group = sequence_parallel._data_rank_group
     if data_rank_group is None:
         raise AssertionError(f'{expected_mode} should create a sequence data-rank group.')
     if dist.get_world_size(data_rank_group) != int(case['ulysses_size']):
-        raise AssertionError(
-            f'{expected_mode} data-rank group size mismatch: '
-            f'expected={int(case["ulysses_size"])}, actual={dist.get_world_size(data_rank_group)}')
+        raise AssertionError(f'{expected_mode} data-rank group size mismatch: '
+                             f'expected={int(case["ulysses_size"])}, actual={dist.get_world_size(data_rank_group)}')
 
     sp_group = sequence_parallel._sp_group
     if expected_sp_world_size > 1:
         if sp_group is None:
             raise AssertionError(f'{expected_mode} should create an SP group.')
         if dist.get_world_size(sp_group) != expected_sp_world_size:
-            raise AssertionError(
-                f'{expected_mode} SP group size mismatch: '
-                f'expected={expected_sp_world_size}, actual={dist.get_world_size(sp_group)}')
+            raise AssertionError(f'{expected_mode} SP group size mismatch: '
+                                 f'expected={expected_sp_world_size}, actual={dist.get_world_size(sp_group)}')
     elif sp_group is not None:
         raise AssertionError(f'{expected_mode} should not create an SP group when sp_world_size == 1.')
 
@@ -342,16 +333,14 @@ def _assert_runtime_sequence_parallel_state(case: dict, strategy: SequenceParall
         if rp_group is None:
             raise AssertionError(f'{expected_mode} should create an RP group.')
         if dist.get_world_size(rp_group) != expected_rp_world_size:
-            raise AssertionError(
-                f'{expected_mode} RP group size mismatch: '
-                f'expected={expected_rp_world_size}, actual={dist.get_world_size(rp_group)}')
+            raise AssertionError(f'{expected_mode} RP group size mismatch: '
+                                 f'expected={expected_rp_world_size}, actual={dist.get_world_size(rp_group)}')
     elif rp_group is not None:
         raise AssertionError(f'{expected_mode} should not create an RP group when rp_world_size == 1.')
 
     if strategy.ulysses_size != int(case['ulysses_size']):
-        raise AssertionError(
-            f'{expected_mode} ulysses_size mismatch: '
-            f'expected={int(case["ulysses_size"])}, actual={strategy.ulysses_size}')
+        raise AssertionError(f'{expected_mode} ulysses_size mismatch: '
+                             f'expected={int(case["ulysses_size"])}, actual={strategy.ulysses_size}')
 
 
 def _init_dist(rank: int, world_size: int, port: int, backend_config: dict):
@@ -663,15 +652,16 @@ class TestDerivedRingPrecision(unittest.TestCase):
         world_size = int(case['world_size'])
         backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_runtime_topology_worker, args=(world_size, port, 'sp_only', backend), nprocs=world_size, join=True)
+        mp.spawn(
+            _run_runtime_topology_worker, args=(world_size, port, 'sp_only', backend), nprocs=world_size, join=True)
 
     def test_cp_only_runtime_topology(self):
         case = _make_case('cp_only')
         world_size = int(case['world_size'])
         backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_runtime_topology_worker, args=(world_size, port, 'cp_only', backend), nprocs=world_size,
-                 join=True)
+        mp.spawn(
+            _run_runtime_topology_worker, args=(world_size, port, 'cp_only', backend), nprocs=world_size, join=True)
 
     def test_cp_sp_runtime_topology(self):
         case = _make_case('cp_sp')

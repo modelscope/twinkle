@@ -5,26 +5,17 @@ import torch.distributed as dist
 from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
-from types import MethodType, SimpleNamespace
 from transformers import PreTrainedTokenizer
+from types import MethodType, SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
-from twinkle.patch import apply_patch
-from .qwen35_linear_attention_sp import Qwen35LinearAttentionSPPatch
-from .utils import (
-    GatherLoss,
-    DistributedAttention,
-    _SeqAllToAll,
-    post_all2all,
-    get_config_attr,
-    is_moe_config,
-    get_cu_seqlens_from_position_ids,
-    _derive_sequence_parallel_sizes,
-    _get_ulysses_size,
-    _get_seq_groups_from_device_mesh,
-)
+from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
+from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
+                    _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
+                    is_moe_config, post_all2all)
 
 
 # main content copied from ms-swift
@@ -74,9 +65,8 @@ class SequenceParallel:
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
         if position_ids.shape[0] != 1:
-            raise ValueError(
-                'Packed sequence-parallel inputs require batch_size == 1 when deriving cu_seq_lens_q from '
-                'position_ids. Please populate cu_seq_lens_q explicitly for batched packed inputs.')
+            raise ValueError('Packed sequence-parallel inputs require batch_size == 1 when deriving cu_seq_lens_q from '
+                             'position_ids. Please populate cu_seq_lens_q explicitly for batched packed inputs.')
         safe_position_ids = position_ids.clone()
         safe_position_ids[safe_position_ids < 0] = 0
         self.extra_kwargs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
@@ -214,40 +204,28 @@ class SequenceParallel:
                             window_size=kwargs.get('sliding_window') or (-1, -1),
                             group=self._rp_group,
                         )
-                    # Packed batches (produced by PackingDataset + padding_free collate) require FA2 varlen
-                    # semantics to avoid cross-subsequence attention. We derive cu_seqlens from position_ids
-                    # resets (0,1,...) and pass cu_seq_lens_* to FA2.
-                    elif self.extra_kwargs.get('is_packed', False):
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
-                        pos = position_ids
-                        if pos.dim() == 1:
-                            pos = pos.unsqueeze(0)
-                        pos = pos.clone()
-                        pos[pos < 0] = 0
-
-                        cu_seqlens = get_cu_seqlens_from_position_ids(pos).to(torch.int32)
+                    elif self.extra_kwargs.get('is_packed', False) or 'cu_seq_lens_q' in kwargs:
+                        cu_seqlens = kwargs.get('cu_seq_lens_q')
+                        if cu_seqlens is None:
+                            position_ids = kwargs.get('position_ids')
+                            if position_ids is None:
+                                position_ids = self.real_position_ids
+                            pos = position_ids
+                            if pos.dim() == 1:
+                                pos = pos.unsqueeze(0)
+                            pos = pos.clone()
+                            pos[pos < 0] = 0
+                            cu_seqlens = get_cu_seqlens_from_position_ids(pos).to(torch.int32)
+                        else:
+                            cu_seqlens = cu_seqlens.to(dtype=torch.int32, device=query.device)
                         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                         assert query.shape[2] == cu_seqlens[-1]
                         kwargs['cu_seq_lens_q'] = cu_seqlens
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
-                        if len(args) > 0:
+                        if self.extra_kwargs.get('is_packed', False) and len(args) > 0:
                             args = (None, *args[1:])
-                    elif 'cu_seq_lens_q' in kwargs:
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
-                        position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
-                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
-                        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-                        assert query.shape[2] == cu_seqlens[-1]
-                        kwargs['cu_seq_lens_q'] = cu_seqlens
-                        kwargs['cu_seq_lens_k'] = cu_seqlens
-                        kwargs['max_length_q'] = max_seqlen
-                        kwargs['max_length_k'] = max_seqlen
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
 
@@ -379,7 +357,7 @@ class SequenceParallel:
             raise NotImplementedError(
                 'SequenceParallel: Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
                 '(derived ring attention).')
-        apply_patch(None, Qwen35LinearAttentionSPPatch, sequence_parallel=self)
+        apply_patch(None, Qwen3_5GatedDeltaNetUlyssesPatch, sequence_parallel=self)
 
     def _prepare_moe_aux_loss(self, base_model: torch.nn.Module):
 
@@ -421,16 +399,36 @@ class SequenceParallel:
         tokenizer: PreTrainedTokenizer,
         device_mesh: Optional[DeviceMesh] = None,
     ):
-        self.num_heads = get_config_attr(model.config, 'num_key_value_heads')
-        if self.num_heads is None:
-            self.num_heads = get_config_attr(model.config, 'num_attention_heads')
-        assert self.num_heads is not None, 'Cannot find num_heads config in config.json'
+        llm_model = get_llm_model(model)
+        config_candidates = [getattr(model, 'config', None)]
+        llm_config = getattr(llm_model, 'config', None)
+        if llm_config is not None and llm_config not in config_candidates:
+            config_candidates.append(llm_config)
+        text_config = getattr(getattr(model, 'config', None), 'text_config', None)
+        if text_config is not None and text_config not in config_candidates:
+            config_candidates.append(text_config)
+
+        self.num_heads = None
+        for config in config_candidates:
+            if config is None:
+                continue
+            self.num_heads = get_config_attr(config, 'num_key_value_heads')
+            if self.num_heads is None:
+                self.num_heads = get_config_attr(config, 'num_attention_heads')
+            if self.num_heads is not None:
+                break
+        assert self.num_heads is not None, 'Cannot find num_attention_heads/num_key_value_heads in model config'
         self.seq_world_size = sp_size
         self.sp_world_size, self.rp_world_size = _derive_sequence_parallel_sizes(self.num_heads, self.seq_world_size)
         self.world_size = self.seq_world_size
-        self.attn_implementation = getattr(model.config, '_attn_implementation', None)
 
-        llm_model = get_llm_model(model)
+        self.attn_implementation = None
+        for config in config_candidates:
+            if config is None:
+                continue
+            self.attn_implementation = getattr(config, '_attn_implementation', None)
+            if self.attn_implementation is not None:
+                break
 
         if hasattr(llm_model, 'language_model'):
             if hasattr(llm_model.language_model, '_update_causal_mask'):
@@ -520,6 +518,7 @@ class SequenceParallel:
             extra_split_values=[(visual_mask, 0, -1)])
         visual_mask = extra_values[0]
         return visual_mask, split_input_embeds[visual_mask]
+
     def gather(self, local_output, dim: int, position_ids=None):
         """Gather tensor for sequence parallel - reverse of split."""
         if self.world_size == 1:
@@ -570,8 +569,8 @@ class SequenceParallel:
                     chunk_size = local_length // 2
                     full_start = accumulated_local_length * self.rp_world_size + idx_rp * chunk_size
                     _assign(full_output, full_start, full_start + chunk_size, _slice(local_tensor, 0, chunk_size))
-                    full_start = accumulated_local_length * self.rp_world_size + (
-                        2 * self.rp_world_size - idx_rp - 1) * chunk_size
+                    full_start = accumulated_local_length * self.rp_world_size + (2 * self.rp_world_size - idx_rp
+                                                                                  - 1) * chunk_size
                     _assign(
                         full_output,
                         full_start,
@@ -582,8 +581,7 @@ class SequenceParallel:
             return full_output.contiguous()
 
         if self.sp_world_size > 1:
-            sp_backend = dist.get_backend(self._sp_group) if self._sp_group is not None else None
-            if sp_backend == 'hccl':
+            if is_hccl_backend(self._sp_group):
                 gathered_sp_chunks = [torch.zeros_like(local_output) for _ in range(self.sp_world_size)]
                 dist.all_gather(gathered_sp_chunks, local_output.contiguous(), group=self._sp_group)
                 gathered_sp = torch.cat(gathered_sp_chunks, dim=dim)
@@ -713,8 +711,8 @@ class SequenceParallel:
             # the later per-rank sequence split and changes the attention contract relative to the baseline path.
             if (cache_position is None and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
                     and self.attn_implementation != 'flash_attention_2'):
-                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), local_cache_position,
-                                                       None, None)
+                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype),
+                                                       local_cache_position, None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
                 extra_values.append(
@@ -764,8 +762,8 @@ class SequenceParallel:
         self.device_mesh = device_mesh
         self.dp_world_size = device_mesh.data_world_size or 1
         (self._sp_group, self._rp_group, self._data_rank_group, self._sp_rank,
-         self._rp_rank) = _get_seq_groups_from_device_mesh(
-             device_mesh, self.seq_world_size, self.sp_world_size, self.rp_world_size)
+         self._rp_rank) = _get_seq_groups_from_device_mesh(device_mesh, self.seq_world_size, self.sp_world_size,
+                                                           self.rp_world_size)
 
     @staticmethod
     def _is_packed_position_ids(position_ids: Optional[torch.Tensor]) -> bool:
@@ -867,9 +865,8 @@ class SequenceParallelStrategy:
         if not isinstance(self.device_mesh, DeviceMesh):
             raise RuntimeError('SequenceParallelStrategy requires a twinkle DeviceMesh when ulysses_size > 1.')
         if self.device_mesh.has_dim('cp'):
-            raise RuntimeError(
-                'Transformers sequence parallel no longer supports explicit device_mesh.cp. '
-                'Use ulysses_size as the total sequence parallel size instead.')
+            raise RuntimeError('Transformers sequence parallel no longer supports explicit device_mesh.cp. '
+                               'Use ulysses_size as the total sequence parallel size instead.')
         if self._model_ref is None:
             raise RuntimeError('SequenceParallelStrategy requires a model reference to initialize.')
         tokenizer = self._get_tokenizer()
