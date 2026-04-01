@@ -105,6 +105,20 @@ def _summarize_batch(batch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _summarize_model_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    summary = {}
+    for key, value in inputs.items():
+        if not torch.is_tensor(value):
+            continue
+        item = _tensor_summary(value)
+        if key == 'labels':
+            item['non_ignore'] = int((value != -100).sum().item())
+        if key == 'attention_mask':
+            item['positive'] = int((value > 0).sum().item())
+        summary[key] = item
+    return summary
+
+
 def _resolve_first_linear_attn_module(model: TransformersModel):
     module = model.model
     base_model = getattr(module, 'model', module)
@@ -138,6 +152,13 @@ def _capture_layer0_linear_attn_summary(model: TransformersModel, batch: dict[st
     finally:
         handle.remove()
     return captured or None
+
+
+def _capture_processor_summary(model: TransformersModel, batch: dict[str, Any]) -> dict[str, Any]:
+    optimizer_config = model.optimizer_group[model._get_default_group()]
+    processor = optimizer_config.processor
+    processed = processor(batch, sp_strategy=model.sp_strategy)
+    return _summarize_model_inputs(processed)
 
 
 def eval(model):
@@ -178,6 +199,7 @@ def train():
     for step, batch in enumerate(dataloader):
         if step in DEBUG_STEPS:
             logger.info(f'DEBUG batch_summary step={step}: {_summarize_batch(batch)}')
+            logger.info(f'DEBUG processor_outputs step={step}: {_capture_processor_summary(model, batch)}')
             logger.info(f'DEBUG layer0_linear_attn step={step}: {_capture_layer0_linear_attn_summary(model, batch)}')
 
         model.forward_backward(inputs=batch)
