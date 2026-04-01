@@ -18,6 +18,16 @@ from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_
                     is_moe_config, post_all2all)
 
 
+def is_qwen3_vl(model):
+    mt = getattr(getattr(model, 'config', None), 'model_type', '')
+    return 'qwen3_vl' in mt
+
+
+def is_qwen3_omni(model):
+    mt = getattr(getattr(model, 'config', None), 'model_type', '')
+    return 'qwen3_omni' in mt
+
+
 # main content copied from ms-swift
 class SequenceParallel:
 
@@ -184,6 +194,7 @@ class SequenceParallel:
                         position_ids = kwargs.get('position_ids')
                         if position_ids is None:
                             position_ids = self.real_position_ids
+                        position_ids = self._extract_real_position_ids(position_ids)
                         cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
                         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                         position_ids = self._split_packed(position_ids, cu_seqlens, dim=-1)
@@ -210,6 +221,7 @@ class SequenceParallel:
                             position_ids = kwargs.get('position_ids')
                             if position_ids is None:
                                 position_ids = self.real_position_ids
+                            position_ids = self._extract_real_position_ids(position_ids)
                             position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
                             cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
                         else:
@@ -217,10 +229,9 @@ class SequenceParallel:
                         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                         total_tokens = int(cu_seqlens[-1].item())
                         if query.shape[2] != total_tokens:
-                            raise ValueError(
-                                'Packed/varlen flash_attention_2 expects query sequence length to match '
-                                f'cu_seqlens total tokens, got query_seq_len={query.shape[2]} '
-                                f'and cu_seqlens_total={total_tokens}.')
+                            raise ValueError('Packed/varlen flash_attention_2 expects query sequence length to match '
+                                             f'cu_seqlens total tokens, got query_seq_len={query.shape[2]} '
+                                             f'and cu_seqlens_total={total_tokens}.')
                         kwargs['cu_seq_lens_q'] = cu_seqlens
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
@@ -305,6 +316,8 @@ class SequenceParallel:
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
 
     def _prepare_multimodal_deepstack(self, base_model: torch.nn.Module):
+        if not is_qwen3_vl(base_model):
+            return
 
         def _patch_deepstack_process(module: torch.nn.Module) -> bool:
             origin = getattr(module, '_deepstack_process', None)

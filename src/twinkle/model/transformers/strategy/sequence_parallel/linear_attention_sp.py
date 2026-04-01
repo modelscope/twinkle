@@ -1,13 +1,12 @@
 import os
-from typing import Any, Optional, Tuple
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from transformers.utils.import_utils import is_flash_linear_attention_available
+from typing import Any, Optional, Tuple
 
-from twinkle.patch import Patch
 from twinkle.model.transformers.strategy.sequence_parallel.utils import head_to_seq_shard, seq_to_head_shard
+from twinkle.patch import Patch
 
 if is_flash_linear_attention_available():
     from fla.modules.convolution import causal_conv1d as _FLA_CAUSAL_CONV1D_FN
@@ -137,8 +136,10 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             q_proj = seq_to_head_shard(q_proj, sequence_parallel_context)
             k_proj = seq_to_head_shard(k_proj, sequence_parallel_context)
             v_proj = seq_to_head_shard(v_proj, sequence_parallel_context)
-            b = seq_to_head_shard(b.reshape(batch_size, seq_len, mod.num_v_heads, 1), sequence_parallel_context).squeeze(-1)
-            a = seq_to_head_shard(a.reshape(batch_size, seq_len, mod.num_v_heads, 1), sequence_parallel_context).squeeze(-1)
+            b = seq_to_head_shard(b.reshape(batch_size, seq_len, mod.num_v_heads, 1),
+                                  sequence_parallel_context).squeeze(-1)
+            a = seq_to_head_shard(a.reshape(batch_size, seq_len, mod.num_v_heads, 1),
+                                  sequence_parallel_context).squeeze(-1)
             seq_after_shard = q_proj.shape[1]
             mixed_qkv = torch.cat(
                 (
@@ -167,7 +168,8 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             packed_cu_seqlens = getattr(sequence_parallel_context, 'extra_kwargs', {}).get('cu_seq_lens_q')
             if packed_cu_seqlens is not None:
                 packed_cu_seqlens = packed_cu_seqlens.to(dtype=torch.int32, device=mixed_qkv.device)
-        if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('is_packed', False)) and packed_cu_seqlens is None:
+        if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('is_packed',
+                                                                           False)) and packed_cu_seqlens is None:
             raise ValueError(
                 'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '
                 'sequence parallel input preparation.')
@@ -197,7 +199,8 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         value = value.reshape(batch_size, value.shape[1], local_num_v_heads, mod.head_v_dim)
 
         beta = b.sigmoid()
-        head_slice = slice(sp_rank * local_num_v_heads, (sp_rank + 1) * local_num_v_heads) if sp_enabled else slice(None)
+        head_slice = slice(sp_rank * local_num_v_heads,
+                           (sp_rank + 1) * local_num_v_heads) if sp_enabled else slice(None)
         g = -mod.A_log[head_slice].float().exp() * F.softplus(a.float() + mod.dt_bias[head_slice])
 
         if local_num_v_heads // local_num_k_heads > 1:
@@ -231,9 +234,8 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         if sequence_parallel is None:
             return
         if int(getattr(sequence_parallel, 'rp_world_size', 1) or 1) > 1:
-            raise NotImplementedError(
-                'Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
-                '(derived ring attention).')
+            raise NotImplementedError('Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
+                                      '(derived ring attention).')
         if os.environ.get('QWEN35_SP_LINEAR_HEAD_PARALLEL', '1') != '1':
             return
 
