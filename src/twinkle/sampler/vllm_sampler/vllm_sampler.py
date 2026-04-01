@@ -147,52 +147,17 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                                    trajectory: Trajectory,
                                    adapter_name: str = '',
                                    add_generation_prompt=True) -> InputFeature:
-        """Encode trajectory for vLLM - does not expand image tokens.
+        """Encode trajectory for vLLM.
 
-        Args:
-            trajectory: The trajectory to encode.
-            adapter_name: Optional LoRA adapter name.
-
-        Returns:
-            InputFeature with input_ids suitable for vLLM (unexpanded image tokens).
+        Messages should already use transformers standard format (content is List[Dict]).
+        ``batch_encode`` preprocesses media refs in-place (to PIL objects).
         """
         template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
 
-        # For vLLM: tokenize without passing images to the processor
-        # This gives us the text with placeholder tokens, which vLLM will expand
-        messages = [dict(msg) for msg in trajectory['messages']]
-
-        # Preprocess images for vLLM (load as PIL Images)
-        # vLLM expects PIL Images, not URLs
-        images = []
-        if trajectory.get('images'):
-            images = template.preprocess_images(trajectory['images'])
-        videos = []
-        if trajectory.get('videos'):
-            videos = template.preprocess_videos(trajectory['videos'])
-
-        # Apply chat template without images (to get unexpanded tokens)
-        # We need to convert <image> placeholders to the model's native format
-        for msg in messages:
-            content = msg.get('content', '')
-            if isinstance(content, str) and template.is_mm:
-                # Convert placeholders to standard format for tokenization
-                if template.image_placeholder in content:
-                    # Split content by image placeholder and rebuild with proper format
-                    parts = content.split(template.image_placeholder)
-                    new_content = []
-                    for i, part in enumerate(parts):
-                        if i > 0:
-                            # Add image token structure (vLLM will expand this)
-                            new_content.append({'type': 'image'})
-                        if part.strip():
-                            new_content.append({'type': 'text', 'text': part})
-                    msg['content'] = new_content if new_content else [{'type': 'text', 'text': ''}]
-
         encoded = template.batch_encode(
-            [Trajectory(messages=messages)],
+            [trajectory],
             add_generation_prompt=add_generation_prompt,
         )[0]
 
@@ -204,16 +169,51 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         result = trajectory
         result.update(encoded)
-
-        # Attach preprocessed images/videos for vLLM
-        if images:
-            result['images'] = images
-        if videos:
-            result['videos'] = videos
         return result
 
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
+
+    @staticmethod
+    def _extract_multi_modal_data(feat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build vLLM ``multi_modal_data`` dict from feat.
+
+        Checks top-level 'images'/'videos' first, then falls back to
+        extracting PIL objects from transformers-standard message content blocks.
+        """
+        images = feat.get('images')
+        videos = feat.get('videos')
+
+        if not images and not videos:
+            for msg in feat.get('messages', []):
+                content = msg.get('content')
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type')
+                    if btype == 'image':
+                        for key in ('image', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                if images is None:
+                                    images = []
+                                images.append(block[key])
+                                break
+                    elif btype == 'video':
+                        for key in ('video', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                if videos is None:
+                                    videos = []
+                                videos.append(block[key])
+                                break
+
+        mm_data = {}
+        if images:
+            mm_data['image'] = images
+        if videos:
+            mm_data['video'] = videos
+        return mm_data or None
 
     async def _sample_single(
         self,
@@ -240,15 +240,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if hasattr(input_ids, 'tolist'):
             input_ids = input_ids.tolist()
 
-        images = feat.get('images')
-        videos = feat.get('videos')
+        multi_modal_data = self._extract_multi_modal_data(feat)
 
         response = await self.engine.sample(
             prompt_token_ids=input_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
-            images=images,
-            videos=videos,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
 
         if not logprobs_only:

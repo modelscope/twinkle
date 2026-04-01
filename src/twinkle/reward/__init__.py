@@ -4,3 +4,4 @@ from .format_reward import FormatReward
 from .gsm8k import GSM8KAccuracyReward, GSM8KFormatReward
 from .math_reward import MathReward
 from .olympiad_bench import OlympiadBenchAccuracyReward, OlympiadBenchFormatReward, OlympiadBenchReasoningReward
+from .mm_reward import MultiModalAccuracyReward
