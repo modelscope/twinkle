@@ -29,16 +29,6 @@ def _get_sp_rank(sequence_parallel_context) -> int:
     return dist.get_rank(group=sequence_parallel_context._sp_group)
 
 
-def _maybe_slice_tensor_output(output: Any) -> torch.Tensor:
-    if torch.is_tensor(output):
-        return output
-    if isinstance(output, (tuple, list)) and output:
-        first = output[0]
-        if torch.is_tensor(first):
-            return first
-    raise TypeError(f'Unexpected tensor output type: {type(output)}')
-
-
 def _get_local_padding_mask(
     attention_mask: torch.Tensor,
     local_seq_len: int,
@@ -91,34 +81,6 @@ def _get_local_conv_weights(
     local_k_bias = conv_bias[mod.key_dim + key_offset:mod.key_dim + key_offset + local_key_dim]
     local_v_bias = conv_bias[2 * mod.key_dim + value_offset:2 * mod.key_dim + value_offset + local_value_dim]
     return local_conv_weight, torch.cat([local_q_bias, local_k_bias, local_v_bias], dim=0)
-
-
-def _apply_varlen_conv(
-    mod: torch.nn.Module,
-    mixed_qkv: torch.Tensor,
-    conv_weight: torch.Tensor,
-    conv_bias: Optional[torch.Tensor],
-    cu_seq_lens_q: Optional[torch.Tensor],
-) -> torch.Tensor:
-    if mod.causal_conv1d_fn is None:
-        raise ImportError(
-            'Qwen3.5 linear attention sequence parallel requires fla.modules.convolution.causal_conv1d for '
-            'prefill/train.')
-    output = mod.causal_conv1d_fn(
-        x=mixed_qkv,
-        weight=conv_weight,
-        bias=conv_bias,
-        activation=mod.activation,
-        seq_idx=None,
-        backend='triton',
-        cu_seqlens=cu_seq_lens_q,
-    )
-    output = _maybe_slice_tensor_output(output)
-    if output.dim() == 2:
-        output = output.unsqueeze(0)
-    if output.dim() != 3:
-        raise ValueError(f'Unexpected conv output dims: {tuple(output.shape)}')
-    return output
 
 
 class Qwen35LinearAttentionSPPatch(Patch):
@@ -213,7 +175,19 @@ class Qwen35LinearAttentionSPPatch(Patch):
         if cache_params is not None:
             cache_params.conv_states[mod.layer_idx] = F.pad(
                 mixed_qkv.transpose(1, 2).contiguous(), (mod.conv_kernel_size - mixed_qkv.shape[1], 0))
-        mixed_qkv = _apply_varlen_conv(mod, mixed_qkv, conv_weight, conv_bias, packed_cu_seqlens)
+        mixed_qkv, _ = mod.causal_conv1d_fn(
+            x=mixed_qkv,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation=mod.activation,
+            seq_idx=None,
+            backend='triton',
+            cu_seqlens=packed_cu_seqlens,
+        )
+        if mixed_qkv.dim() == 2:
+            mixed_qkv = mixed_qkv.unsqueeze(0)
+        if mixed_qkv.dim() != 3:
+            raise ValueError(f'Unexpected conv output dims: {tuple(mixed_qkv.shape)}')
 
         local_key_dim = local_num_k_heads * mod.head_k_dim
         local_value_dim = local_num_v_heads * mod.head_v_dim

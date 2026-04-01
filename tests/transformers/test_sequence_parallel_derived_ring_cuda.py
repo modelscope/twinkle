@@ -15,7 +15,7 @@ from transformers.modeling_flash_attention_utils import is_flash_attn_available
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
-from twinkle.utils import DeviceMesh, selective_log_softmax
+from twinkle.utils import DeviceMesh, Platform, ensure_hccl_socket_env, selective_log_softmax, torch_util
 
 LOGITS_RTOL = 1e-2
 LOGITS_ATOL = 5e-3
@@ -38,6 +38,14 @@ def _make_labels(input_ids: torch.Tensor) -> torch.Tensor:
 
 def _make_case(case_name: str) -> dict:
     cases = {
+        'sp_only': {
+            'expected_mode': 'sp_only',
+            'world_size': 2,
+            'ulysses_size': 2,
+            'num_attention_heads': 8,
+            'hidden_size': 128,
+            'seq_len': 769,
+        },
         'cp_only': {
             'expected_mode': 'cp_only',
             'world_size': 2,
@@ -89,7 +97,7 @@ def _make_case(case_name: str) -> dict:
     return copy.deepcopy(cases[case_name])
 
 
-def _validate_case_config(case: dict):
+def _validate_case_config(case: dict) -> tuple[str, int, int]:
     hidden_size = int(case['hidden_size'])
     num_heads = int(case['num_attention_heads'])
     ulysses_size = int(case['ulysses_size'])
@@ -119,14 +127,70 @@ def _validate_case_config(case: dict):
             f'Invalid test case config: expected {expected_mode}, but derived {mode}. '
             f'Got ulysses_size={ulysses_size}, num_attention_heads={num_heads}, '
             f'sp_world_size={sp_world_size}, rp_world_size={rp_world_size}.')
+    return mode, sp_world_size, rp_world_size
 
 
-def _build_tiny_llama(case: dict, device: torch.device) -> LlamaForCausalLM:
+def _get_runtime_backend() -> dict | None:
+    if torch.cuda.is_available():
+        return {
+            'device_type': 'cuda',
+            'dist_backend': 'nccl',
+            'device_count': int(torch.cuda.device_count()),
+            'label': 'CUDA',
+        }
+    if torch_util.is_npu_available():
+        return {
+            'device_type': 'npu',
+            'dist_backend': 'hccl',
+            'device_count': int(torch.npu.device_count()),
+            'label': 'NPU',
+        }
+    return None
+
+
+def _get_device_module(device_type: str):
+    if device_type == 'cuda':
+        return torch.cuda
+    if device_type == 'npu':
+        return torch.npu
+    raise ValueError(f'Unsupported device_type for derived ring tests: {device_type}')
+
+
+def _supports_peak_memory_stats(device_type: str) -> bool:
+    device_module = _get_device_module(device_type)
+    required_apis = ('empty_cache', 'reset_peak_memory_stats', 'synchronize', 'max_memory_allocated')
+    return all(hasattr(device_module, name) for name in required_apis)
+
+
+def _get_model_dtype(device_type: str) -> torch.dtype:
+    if device_type == 'cuda':
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if device_type == 'npu':
+        is_bf16_supported = getattr(torch.npu, 'is_bf16_supported', None)
+        if callable(is_bf16_supported):
+            try:
+                if is_bf16_supported():
+                    return torch.bfloat16
+            except Exception:
+                pass
+        return torch.float16
+    raise ValueError(f'Unsupported device_type for derived ring tests: {device_type}')
+
+
+def _seed_backend(seed: int, device_type: str) -> None:
+    torch.manual_seed(seed)
+    if device_type == 'cuda':
+        torch.cuda.manual_seed_all(seed)
+    elif device_type == 'npu':
+        torch.npu.manual_seed_all(seed)
+
+
+def _build_tiny_llama(case: dict, device: torch.device, device_type: str) -> LlamaForCausalLM:
     _validate_case_config(case)
     hidden_size = int(case['hidden_size'])
     num_heads = int(case['num_attention_heads'])
     num_hidden_layers = int(case.get('num_hidden_layers', 1))
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _get_model_dtype(device_type)
     max_seq_len = int(case.get('seq_len', max(case.get('seq_lens', [1024])))) + 32
     config = LlamaConfig(
         vocab_size=256,
@@ -243,7 +307,54 @@ def _assert_grad_dict_close(case_name: str, rank: int, baseline_grads: dict[str,
                 f'{case_name} attention grad mismatch on rank {rank} for {key}: max_diff={max_diff}')
 
 
-def _init_dist(rank: int, world_size: int, port: int):
+def _assert_runtime_sequence_parallel_state(case: dict, strategy: SequenceParallelStrategy) -> None:
+    expected_mode, expected_sp_world_size, expected_rp_world_size = _validate_case_config(case)
+    if sequence_parallel.sp_world_size != expected_sp_world_size:
+        raise AssertionError(
+            f'{case["expected_mode"]} sp_world_size mismatch: '
+            f'expected={expected_sp_world_size}, actual={sequence_parallel.sp_world_size}')
+    if sequence_parallel.rp_world_size != expected_rp_world_size:
+        raise AssertionError(
+            f'{case["expected_mode"]} rp_world_size mismatch: '
+            f'expected={expected_rp_world_size}, actual={sequence_parallel.rp_world_size}')
+
+    data_rank_group = sequence_parallel._data_rank_group
+    if data_rank_group is None:
+        raise AssertionError(f'{expected_mode} should create a sequence data-rank group.')
+    if dist.get_world_size(data_rank_group) != int(case['ulysses_size']):
+        raise AssertionError(
+            f'{expected_mode} data-rank group size mismatch: '
+            f'expected={int(case["ulysses_size"])}, actual={dist.get_world_size(data_rank_group)}')
+
+    sp_group = sequence_parallel._sp_group
+    if expected_sp_world_size > 1:
+        if sp_group is None:
+            raise AssertionError(f'{expected_mode} should create an SP group.')
+        if dist.get_world_size(sp_group) != expected_sp_world_size:
+            raise AssertionError(
+                f'{expected_mode} SP group size mismatch: '
+                f'expected={expected_sp_world_size}, actual={dist.get_world_size(sp_group)}')
+    elif sp_group is not None:
+        raise AssertionError(f'{expected_mode} should not create an SP group when sp_world_size == 1.')
+
+    rp_group = sequence_parallel._rp_group
+    if expected_rp_world_size > 1:
+        if rp_group is None:
+            raise AssertionError(f'{expected_mode} should create an RP group.')
+        if dist.get_world_size(rp_group) != expected_rp_world_size:
+            raise AssertionError(
+                f'{expected_mode} RP group size mismatch: '
+                f'expected={expected_rp_world_size}, actual={dist.get_world_size(rp_group)}')
+    elif rp_group is not None:
+        raise AssertionError(f'{expected_mode} should not create an RP group when rp_world_size == 1.')
+
+    if strategy.ulysses_size != int(case['ulysses_size']):
+        raise AssertionError(
+            f'{expected_mode} ulysses_size mismatch: '
+            f'expected={int(case["ulysses_size"])}, actual={strategy.ulysses_size}')
+
+
+def _init_dist(rank: int, world_size: int, port: int, backend_config: dict):
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
@@ -251,10 +362,14 @@ def _init_dist(rank: int, world_size: int, port: int):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(port)
 
-    device = torch.device(f'cuda:{rank}')
-    torch.cuda.set_device(device)
+    device_type = backend_config['device_type']
+    dist_backend = backend_config['dist_backend']
+    if dist_backend == 'hccl':
+        ensure_hccl_socket_env(port)
+    device = torch.device(Platform.get_local_device(rank, platform=device_type))
+    _get_device_module(device_type).set_device(rank)
     dist.init_process_group(
-        backend='nccl',
+        backend=dist_backend,
         rank=rank,
         world_size=world_size,
         init_method=f'tcp://127.0.0.1:{port}',
@@ -271,6 +386,7 @@ def _measure_peak_memory(
     batch_size: int,
     seq_len: int,
     device: torch.device,
+    device_type: str,
 ) -> int:
     vocab_size = int(model.config.vocab_size)
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
@@ -278,8 +394,9 @@ def _measure_peak_memory(
     local_labels = _prepare_label_inputs(strategy, input_ids, position_ids)
 
     model.zero_grad(set_to_none=True)
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    device_module = _get_device_module(device_type)
+    device_module.empty_cache()
+    device_module.reset_peak_memory_stats(device)
     outputs = model(
         input_ids=input_ids,
         position_ids=position_ids,
@@ -289,9 +406,9 @@ def _measure_peak_memory(
     local_logits = outputs.logits
     loss_sum, _ = _compute_training_path_loss(local_logits, local_labels, strategy)
     loss_sum.backward()
-    torch.cuda.synchronize(device)
+    device_module.synchronize(device)
 
-    peak = torch.tensor([int(torch.cuda.max_memory_allocated(device))], device=device)
+    peak = torch.tensor([int(device_module.max_memory_allocated(device))], device=device)
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)
     return int(peak.item())
 
@@ -338,15 +455,33 @@ def _format_memory_table(case_name: str, peaks: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _run_precision_worker(rank: int, world_size: int, port: int, case_name: str):
-    device = _init_dist(rank, world_size, port)
+def _run_runtime_topology_worker(rank: int, world_size: int, port: int, case_name: str, backend_config: dict):
+    device = _init_dist(rank, world_size, port, backend_config)
     try:
-        torch.manual_seed(1234)
-        torch.cuda.manual_seed_all(1234)
+        _seed_backend(1234, backend_config['device_type'])
+        case = _make_case(case_name)
+        model = _build_tiny_llama(case, device, backend_config['device_type'])
+        device_mesh = DeviceMesh.from_sizes(
+            fsdp_size=world_size,
+            dp_size=1,
+            ulysses_size=int(case['ulysses_size']),
+            device_type=backend_config['device_type'],
+        )
+        strategy = _make_strategy(model, device_mesh, int(case['ulysses_size']))
+        _assert_runtime_sequence_parallel_state(case, strategy)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_precision_worker(rank: int, world_size: int, port: int, case_name: str, backend_config: dict):
+    device = _init_dist(rank, world_size, port, backend_config)
+    try:
+        _seed_backend(1234, backend_config['device_type'])
         case = _make_case(case_name)
 
-        base_model = _build_tiny_llama(case, device)
-        sp_model = _build_tiny_llama(case, device)
+        base_model = _build_tiny_llama(case, device, backend_config['device_type'])
+        sp_model = _build_tiny_llama(case, device, backend_config['device_type'])
         sp_model.load_state_dict(base_model.state_dict())
 
         seq_len = int(case['seq_len'])
@@ -371,9 +506,10 @@ def _run_precision_worker(rank: int, world_size: int, port: int, case_name: str)
             fsdp_size=world_size,
             dp_size=1,
             ulysses_size=int(case['ulysses_size']),
-            device_type='cuda',
+            device_type=backend_config['device_type'],
         )
         strategy = _make_strategy(sp_model, device_mesh, int(case['ulysses_size']))
+        _assert_runtime_sequence_parallel_state(case, strategy)
         local_labels = _prepare_label_inputs(strategy, input_ids, position_ids)
 
         sp_model.zero_grad(set_to_none=True)
@@ -409,45 +545,58 @@ def _run_precision_worker(rank: int, world_size: int, port: int, case_name: str)
         dist.destroy_process_group()
 
 
-def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str):
-    device = _init_dist(rank, world_size, port)
+def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str, backend_config: dict):
+    device = _init_dist(rank, world_size, port, backend_config)
     try:
-        torch.manual_seed(1234)
-        torch.cuda.manual_seed_all(1234)
+        _seed_backend(1234, backend_config['device_type'])
         case = _make_case(case_name)
         baseline_device_mesh = DeviceMesh.from_sizes(
             fsdp_size=world_size,
             dp_size=1,
             ulysses_size=1,
-            device_type='cuda',
+            device_type=backend_config['device_type'],
         )
-        baseline_model = _build_tiny_llama(case, device)
+        baseline_model = _build_tiny_llama(case, device, backend_config['device_type'])
         baseline_strategy = _make_strategy(baseline_model, baseline_device_mesh, 1)
 
         baseline_peaks = {}
         for batch_size in case['batch_sizes']:
             for seq_len in case['seq_lens']:
                 baseline_peak = _measure_peak_memory(
-                    baseline_model, baseline_strategy, batch_size=batch_size, seq_len=seq_len, device=device)
+                    baseline_model,
+                    baseline_strategy,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=device,
+                    device_type=backend_config['device_type'],
+                )
                 baseline_peaks[(int(batch_size), int(seq_len))] = int(baseline_peak)
 
         del baseline_model
         del baseline_strategy
-        torch.cuda.empty_cache()
+        _get_device_module(backend_config['device_type']).empty_cache()
 
         device_mesh = DeviceMesh.from_sizes(
             fsdp_size=world_size,
             dp_size=1,
             ulysses_size=int(case['ulysses_size']),
-            device_type='cuda',
+            device_type=backend_config['device_type'],
         )
-        model = _build_tiny_llama(case, device)
+        model = _build_tiny_llama(case, device, backend_config['device_type'])
         strategy = _make_strategy(model, device_mesh, int(case['ulysses_size']))
+        _assert_runtime_sequence_parallel_state(case, strategy)
 
         peaks = []
         for batch_size in case['batch_sizes']:
             for seq_len in case['seq_lens']:
-                peak = _measure_peak_memory(model, strategy, batch_size=batch_size, seq_len=seq_len, device=device)
+                peak = _measure_peak_memory(
+                    model,
+                    strategy,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=device,
+                    device_type=backend_config['device_type'],
+                )
                 if rank == 0:
                     baseline_peak = baseline_peaks[(int(batch_size), int(seq_len))]
                     delta_bytes = int(peak) - int(baseline_peak)
@@ -495,58 +644,94 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str):
 
 class TestDerivedRingPrecision(unittest.TestCase):
 
-    def _skip_if_unavailable(self, world_size: int = 4):
-        if not torch.cuda.is_available():
-            self.skipTest('CUDA is required for derived ring precision tests.')
-        if torch.cuda.device_count() < world_size:
-            self.skipTest(f'Requires at least {world_size} CUDA devices.')
+    def _get_backend_or_skip(self, world_size: int = 4) -> dict:
+        backend = _get_runtime_backend()
+        if backend is None:
+            self.skipTest('CUDA or NPU is required for derived ring runtime tests.')
+        if backend['device_count'] < world_size:
+            self.skipTest(f'Requires at least {world_size} {backend["label"]} devices.')
         if not is_flash_attn_available():
-            self.skipTest('flash_attention_2 is required for derived ring precision tests.')
+            if backend['device_type'] == 'npu':
+                self.skipTest(
+                    'Derived ring runtime tests currently require flash_attention_2, which is unavailable on NPU in '
+                    'this environment.')
+            self.skipTest('flash_attention_2 is required for derived ring runtime tests.')
+        return backend
+
+    def test_sp_only_runtime_topology(self):
+        case = _make_case('sp_only')
+        world_size = int(case['world_size'])
+        backend = self._get_backend_or_skip(world_size)
+        port = _find_free_port()
+        mp.spawn(_run_runtime_topology_worker, args=(world_size, port, 'sp_only', backend), nprocs=world_size, join=True)
+
+    def test_cp_only_runtime_topology(self):
+        case = _make_case('cp_only')
+        world_size = int(case['world_size'])
+        backend = self._get_backend_or_skip(world_size)
+        port = _find_free_port()
+        mp.spawn(_run_runtime_topology_worker, args=(world_size, port, 'cp_only', backend), nprocs=world_size,
+                 join=True)
+
+    def test_cp_sp_runtime_topology(self):
+        case = _make_case('cp_sp')
+        world_size = int(case['world_size'])
+        backend = self._get_backend_or_skip(world_size)
+        port = _find_free_port()
+        mp.spawn(_run_runtime_topology_worker, args=(world_size, port, 'cp_sp', backend), nprocs=world_size, join=True)
 
     def test_cp_only_precision_alignment(self):
         case = _make_case('cp_only')
         world_size = int(case['world_size'])
-        self._skip_if_unavailable(world_size)
+        backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_only'), nprocs=world_size, join=True)
+        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_only', backend), nprocs=world_size, join=True)
 
     def test_cp_sp_precision_alignment(self):
         case = _make_case('cp_sp')
         world_size = int(case['world_size'])
-        self._skip_if_unavailable(world_size)
+        backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_sp'), nprocs=world_size, join=True)
+        mp.spawn(_run_precision_worker, args=(world_size, port, 'cp_sp', backend), nprocs=world_size, join=True)
 
 
 class TestDerivedRingMemoryProfile(unittest.TestCase):
 
-    def _skip_if_unavailable(self, world_size: int = 4):
+    def _get_backend_or_skip(self, world_size: int = 4) -> dict:
         if os.environ.get('TWINKLE_RUN_MEMORY_TESTS', '0') != '1':
-            self.skipTest('Set TWINKLE_RUN_MEMORY_TESTS=1 to run CUDA memory profile tests.')
-        if not torch.cuda.is_available():
-            self.skipTest('CUDA is required for derived ring memory tests.')
-        if torch.cuda.device_count() < world_size:
-            self.skipTest(f'Requires at least {world_size} CUDA devices.')
+            self.skipTest('Set TWINKLE_RUN_MEMORY_TESTS=1 to run derived ring memory profile tests.')
+        backend = _get_runtime_backend()
+        if backend is None:
+            self.skipTest('CUDA or NPU is required for derived ring memory tests.')
+        if backend['device_count'] < world_size:
+            self.skipTest(f'Requires at least {world_size} {backend["label"]} devices.')
         if not is_flash_attn_available():
+            if backend['device_type'] == 'npu':
+                self.skipTest(
+                    'Derived ring memory tests currently require flash_attention_2, which is unavailable on NPU in '
+                    'this environment.')
             self.skipTest('flash_attention_2 is required for derived ring memory tests.')
+        if not _supports_peak_memory_stats(backend['device_type']):
+            self.skipTest(f'{backend["label"]} peak-memory stats are unavailable in this environment.')
+        return backend
 
     def test_sp_only_memory_profile_grid(self):
         case = _make_case('sp_only_memory')
         world_size = int(case['world_size'])
-        self._skip_if_unavailable(world_size)
+        backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(world_size, port, 'sp_only_memory'), nprocs=world_size, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'sp_only_memory', backend), nprocs=world_size, join=True)
 
     def test_cp_only_memory_profile_grid(self):
         case = _make_case('cp_only_memory')
         world_size = int(case['world_size'])
-        self._skip_if_unavailable(world_size)
+        backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_only_memory'), nprocs=world_size, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_only_memory', backend), nprocs=world_size, join=True)
 
     def test_cp_sp_memory_profile_grid(self):
         case = _make_case('cp_sp_memory')
         world_size = int(case['world_size'])
-        self._skip_if_unavailable(world_size)
+        backend = self._get_backend_or_skip(world_size)
         port = _find_free_port()
-        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_sp_memory'), nprocs=world_size, join=True)
+        mp.spawn(_run_memory_worker, args=(world_size, port, 'cp_sp_memory', backend), nprocs=world_size, join=True)
