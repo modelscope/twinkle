@@ -43,6 +43,7 @@ from twinkle.utils import construct_class, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.logger import get_logger
+from twinkle.utils.platforms import Platform
 
 logger = get_logger()
 
@@ -1019,12 +1020,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             'numpy_rng_state': np.random.get_state(),
             'torch_rng_state': torch.get_rng_state(),
         }
-        if hasattr(torch, 'npu') and torch.npu.is_available():
-            state['device_type'] = 'npu'
-            state['device_rng_state'] = torch.npu.get_rng_state()
-        elif torch.cuda.is_available():
-            state['device_type'] = 'cuda'
-            state['device_rng_state'] = torch.cuda.get_rng_state_all()
+
+        device_prefix = Platform.device_prefix()
+        device_module = getattr(torch, device_prefix, None)
+        if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+            state['device_type'] = device_prefix
+            state['device_rng_state'] = device_module.get_rng_state()
         else:
             state['device_type'] = 'cpu'
             state['device_rng_state'] = None
@@ -1038,10 +1039,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         device_type = rng_state.get('device_type')
         device_rng_state = rng_state.get('device_rng_state')
-        if device_type == 'npu' and hasattr(torch, 'npu') and torch.npu.is_available() and device_rng_state is not None:
-            torch.npu.set_rng_state(device_rng_state)
-        elif device_type == 'cuda' and torch.cuda.is_available() and device_rng_state is not None:
-            torch.cuda.set_rng_state_all(device_rng_state)
+        if device_type != 'cpu' and device_rng_state is not None:
+            device_module = getattr(torch, device_type, None)
+            if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+                device_module.set_rng_state(device_rng_state)
 
     @remote_function()
     def read_training_progress(self, checkpoint_dir, **kwargs):
