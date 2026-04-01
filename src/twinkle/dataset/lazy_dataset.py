@@ -22,6 +22,7 @@ class LazyDataset(Dataset):
         assert self.template.truncation_strategy != 'split', ('Lazy tokenize does not support '
                                                               'truncation_strategy==`split`')
         self.do_encode = True
+        self.encode_kwargs = kwargs
 
     @remote_function()
     def check(self, **kwargs):
@@ -33,7 +34,11 @@ class LazyDataset(Dataset):
         item = self.dataset[idx]
         # may raise errors
         if self.do_encode:
-            item = self.template.batch_encode([item])[0]
+            encoded = self.template.batch_encode([item], **self.encode_kwargs)[0]
+            for key in item:
+                if key not in encoded:
+                    encoded[key] = item[key]
+            item = encoded
         elif self.do_check:
             item = self.template.check(item)
         return item

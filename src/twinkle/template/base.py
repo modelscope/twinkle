@@ -115,10 +115,7 @@ class Template:
 
     def preprocess_image(self, image: ImageInput) -> 'Image.Image':
         if isinstance(image, dict):
-            if image.get('path'):
-                image = image['path']
-            else:
-                image = image['bytes']
+            image = image.get('bytes') or image.get('path')
         return load_image(image)
 
     def preprocess_video(self, video: VideoInput) -> List['Image.Image']:
@@ -261,21 +258,38 @@ class Template:
         for message in messages:
             message = copy(message)
             content = message['content']
-            msg_images = message.get('images')
-            msg_videos = message.get('videos')
-            msg_audios = message.get('audios')
-            if msg_images:
-                message['images'] = self.preprocess_images(msg_images)
-                assert len(message['images']) == content.count(self.image_placeholder)
-            if msg_videos:
-                message['videos'] = self.preprocess_videos(msg_videos)
-                assert len(message['videos']) == content.count(self.video_placeholder)
-            if msg_audios:
-                message['audios'] = self.preprocess_audios(msg_audios)
-                assert len(message['audios']) == content.count(self.audio_placeholder)
-            new_messages.append(
-                transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
-                                             self.audio_placeholder, self.is_mm))
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type')
+                    if btype == 'image':
+                        for key in ('image', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                block[key] = self.preprocess_image(block[key])
+                                break
+                    elif btype == 'video':
+                        for key in ('video', 'url', 'path'):
+                            if key in block and block[key] is not None:
+                                block[key] = self.preprocess_video(block[key])
+                                break
+                new_messages.append(message)
+            else:
+                msg_images = message.get('images')
+                msg_videos = message.get('videos')
+                msg_audios = message.get('audios')
+                if msg_images:
+                    message['images'] = self.preprocess_images(msg_images)
+                    assert len(message['images']) == content.count(self.image_placeholder)
+                if msg_videos:
+                    message['videos'] = self.preprocess_videos(msg_videos)
+                    assert len(message['videos']) == content.count(self.video_placeholder)
+                if msg_audios:
+                    message['audios'] = self.preprocess_audios(msg_audios)
+                    assert len(message['audios']) == content.count(self.audio_placeholder)
+                new_messages.append(
+                    transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
+                                                 self.audio_placeholder, self.is_mm))
         return new_messages
 
     def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
@@ -284,6 +298,16 @@ class Template:
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory['messages']]
+        # Arrow serialization may pad content blocks with null keys (e.g. 'image': None
+        # on text-only blocks). Jinja checks `'image' in item` on dict keys, so these
+        # phantom keys cause wrong token counts. Strip them here.
+        for msg in messages:
+            if not isinstance(msg.get('content'), list):
+                continue
+            msg['content'] = [{
+                k: v
+                for k, v in b.items() if v is not None
+            } for b in msg['content'] if isinstance(b, dict)]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
         inputs = self.processor.apply_chat_template(
             messages,

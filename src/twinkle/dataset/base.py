@@ -169,6 +169,19 @@ class Dataset(TorchDataset):
         return dataset
 
     @remote_function()
+    def cast_column(self, column: str, decode: bool = True) -> None:
+        """Cast an image/audio column's decode mode.
+
+        Useful for setting ``decode=False`` before ``.map()`` to keep media
+        as raw bytes and avoid expensive PIL encode/decode round-trips.
+        """
+        from datasets import Image as ImageFeature
+        for key in list(self.datasets.keys()):
+            self.datasets[key] = self.datasets[key].cast_column(column, ImageFeature(decode=decode))
+        if len(self.datasets) == 1:
+            self.dataset = self.datasets[next(iter(self.datasets.keys()))]
+
+    @remote_function()
     def map(self,
             preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
             dataset_meta: DatasetMeta = None,
