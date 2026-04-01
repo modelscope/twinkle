@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 from peft import LoraConfig
+from typing import Any
 
 import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
@@ -109,6 +110,81 @@ def _collect_grad_snapshot(model: TransformersModel) -> dict:
     return grads
 
 
+def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    cpu_tensor = tensor.detach().cpu()
+    summary = {
+        'shape': list(cpu_tensor.shape),
+        'dtype': str(cpu_tensor.dtype),
+        'numel': int(cpu_tensor.numel()),
+    }
+    if cpu_tensor.numel() == 0:
+        return summary
+    if cpu_tensor.dtype.is_floating_point:
+        float_tensor = cpu_tensor.float()
+        summary.update({
+            'sum': float(float_tensor.sum().item()),
+            'mean': float(float_tensor.mean().item()),
+            'std': float(float_tensor.std(unbiased=False).item()),
+            'abs_max': float(float_tensor.abs().max().item()),
+        })
+    else:
+        int_tensor = cpu_tensor.to(torch.int64)
+        summary.update({
+            'sum': int(int_tensor.sum().item()),
+            'min': int(int_tensor.min().item()),
+            'max': int(int_tensor.max().item()),
+        })
+    return summary
+
+
+def _summarize_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    summary = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            summary[key] = _tensor_summary(value)
+    if 'labels' in batch and torch.is_tensor(batch['labels']):
+        labels = batch['labels']
+        summary['labels_non_ignore'] = int((labels != -100).sum().item())
+    if 'attention_mask' in batch and torch.is_tensor(batch['attention_mask']):
+        summary['attention_mask_total'] = int(batch['attention_mask'].sum().item())
+    return summary
+
+
+def _resolve_first_linear_attn_module(model: TransformersModel):
+    module = model.model
+    base_model = getattr(module, 'model', module)
+    language_model = getattr(getattr(base_model, 'model', None), 'language_model', None)
+    if language_model is None:
+        return None
+    layers = getattr(language_model, 'layers', None)
+    if not layers:
+        return None
+    first_layer = layers[0]
+    return getattr(first_layer, 'linear_attn', None)
+
+
+def _capture_layer0_linear_attn_summary(model: TransformersModel, batch: dict[str, Any]) -> dict[str, Any] | None:
+    linear_attn = _resolve_first_linear_attn_module(model)
+    if linear_attn is None:
+        return None
+
+    captured: dict[str, Any] = {}
+
+    def _hook(_module, hook_inputs, hook_output):
+        if hook_inputs and torch.is_tensor(hook_inputs[0]):
+            captured['input'] = _tensor_summary(hook_inputs[0])
+        output_tensor = hook_output[0] if isinstance(hook_output, (tuple, list)) else hook_output
+        if torch.is_tensor(output_tensor):
+            captured['output'] = _tensor_summary(output_tensor)
+
+    handle = linear_attn.register_forward_hook(_hook)
+    try:
+        model.forward_only(inputs=batch, adapter_name='default')
+    finally:
+        handle.remove()
+    return captured or None
+
+
 def main():
     device_mesh = _build_device_mesh()
     twinkle.initialize(
@@ -125,6 +201,8 @@ def main():
 
     captured = None
     for step, batch in enumerate(dataloader):
+        batch_summary = _summarize_batch(batch)
+        layer0_summary = _capture_layer0_linear_attn_summary(model, batch)
         outputs = model.forward_backward(inputs=batch, adapter_name='default')
         if step == TARGET_STEP:
             captured = {
@@ -132,6 +210,8 @@ def main():
                 'ulysses_size': getattr(device_mesh, 'ulysses_size', None),
                 'step': step,
                 'loss': float(outputs['loss']),
+                'batch_summary': batch_summary,
+                'layer0_linear_attn_summary': layer0_summary,
                 'param_filters': PARAM_FILTERS,
                 'gradients': _collect_grad_snapshot(model),
             }
