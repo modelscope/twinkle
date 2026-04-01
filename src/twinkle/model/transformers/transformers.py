@@ -393,6 +393,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
         labels: torch.Tensor = inputs.pop('labels', None)
+        if labels is not None and self.sp_strategy is not None:
+            labels = self.sp_strategy.prepare_local_labels(labels, inputs.get('position_ids'))
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
         if self.sp_strategy is not None and labels is None:
@@ -446,6 +448,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
             labels = inputs.pop('labels', None)
+            if labels is not None and self.sp_strategy is not None:
+                labels = self.sp_strategy.prepare_local_labels(labels, inputs.get('position_ids'))
             optimizer_config.accumulate_metrics(False)
             outputs = self.model(**inputs)
             if self.sp_strategy is not None and labels is None:
