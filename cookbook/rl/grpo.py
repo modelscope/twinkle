@@ -20,7 +20,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
@@ -36,7 +36,7 @@ MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8)) # global completion-
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2)) # per-device-micro-batch-size (completion-level), batch_size in forward_backward
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
-SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
+SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1))
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
@@ -72,29 +72,27 @@ def main():
     # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
     lora_config = LoraConfig(
         target_modules=[
-            'q_proj', 'k_proj', 'v_proj', 'o_proj',
-            'gate_proj', 'up_proj', 'down_proj',
-            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+            'all-linear',
         ],
         r=32, lora_alpha=64, lora_dropout=0.05,
     )
     if USE_MEGATRON:
-        from twinkle.model.megatron import MegatronModel
-        model = MegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
+        from twinkle.model.megatron import MultiLoraMegatronModel
+        model = MultiLoraMegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
     else:
         from transformers import Qwen3_5ForConditionalGeneration
         model = TransformersModel(model_id=MODEL_ID, model_cls=Qwen3_5ForConditionalGeneration, device_mesh=model_mesh, remote_group='model')
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     if USE_MEGATRON:
-        model.set_optimizer('default', lr=LEARNING_RATE)
-        model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
+        model.set_optimizer('default', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
+        model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
     else:
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
-    model.set_loss('GRPOLoss', epsilon=0.2)
-    model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_loss('GRPOLoss', epsilon=0.2, adapter_name=ADAPTER_NAME)
+    model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
+    model.set_template('Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -104,6 +102,7 @@ def main():
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,
+            'load_weights': 'dummy',
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
@@ -129,7 +128,7 @@ def main():
     logger.info(get_device_placement())
 
     for batch in dataloader:
-        if optim_step >= MAX_STEPS:
+        if optim_step >= 1:
             break
         metrics.reset()
         global_prompts = batch if isinstance(batch, list) else [batch]
@@ -176,21 +175,22 @@ def main():
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
                 micro_batch_size=MICRO_BATCH_SIZE,
+                adapter_name=ADAPTER_NAME
             )
-            model.clip_grad_and_step()
+            model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
             optim_step += 1
 
             if optim_step >= MAX_STEPS:
                 break
             if optim_step % SAVE_STEPS == 0:
-                model.save(f'grpo-gsm8k-checkpoint-{optim_step}')
+                model.save(f'grpo-gsm8k-checkpoint-{optim_step}', adapter_name=ADAPTER_NAME)
             log_dict = metrics.calculate()
-            log_dict.update(model.calculate_metric(is_training=True))
+            log_dict.update(model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME))
             metrics.reset()
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
-    model.save('grpo-gsm8k-checkpoint')
+    model.save('grpo-gsm8k-checkpoint', adapter_name=ADAPTER_NAME)
 
 if __name__ == '__main__':
     main()

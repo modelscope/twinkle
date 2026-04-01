@@ -258,38 +258,48 @@ class Template:
         for message in messages:
             message = copy(message)
             content = message['content']
+
+            # Extract and preprocess message-level media
+            images = self.preprocess_images(message.pop('images', None) or [])
+            videos = self.preprocess_videos(message.pop('videos', None) or [])
+            audios = self.preprocess_audios(message.pop('audios', None) or [])
+
             if isinstance(content, list):
+                # List format: preprocess inline URLs, prepend message-level media
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get('type')
-                    if btype == 'image':
-                        for key in ('image', 'url', 'path'):
-                            if key in block and block[key] is not None:
-                                block[key] = self.preprocess_image(block[key])
-                                break
-                    elif btype == 'video':
-                        for key in ('video', 'url', 'path'):
-                            if key in block and block[key] is not None:
-                                block[key] = self.preprocess_video(block[key])
-                                break
-                new_messages.append(message)
+                    for key in (btype, 'url', 'path'):
+                        if key and block.get(key) is not None:
+                            block[key] = getattr(self, f'preprocess_{btype}', lambda x: x)(block[key])
+                            break
+
+                # Prepend media from message-level fields
+                prepend = [{'type': 'image', 'url': u} for u in images]
+                prepend += [{'type': 'video', 'url': u} for u in videos]
+                prepend += [{'type': 'audio', 'url': u} for u in audios]
+                message['content'] = prepend + content
             else:
-                msg_images = message.get('images')
-                msg_videos = message.get('videos')
-                msg_audios = message.get('audios')
-                if msg_images:
-                    message['images'] = self.preprocess_images(msg_images)
-                    assert len(message['images']) == content.count(self.image_placeholder)
-                if msg_videos:
-                    message['videos'] = self.preprocess_videos(msg_videos)
-                    assert len(message['videos']) == content.count(self.video_placeholder)
-                if msg_audios:
-                    message['audios'] = self.preprocess_audios(msg_audios)
-                    assert len(message['audios']) == content.count(self.audio_placeholder)
-                new_messages.append(
-                    transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
-                                                 self.audio_placeholder, self.is_mm))
+                # String format: prepend missing placeholders
+                img_missing = len(images) - content.count(self.image_placeholder)
+                vid_missing = len(videos) - content.count(self.video_placeholder)
+                aud_missing = len(audios) - content.count(self.audio_placeholder)
+                if img_missing > 0:
+                    content = self.image_placeholder * img_missing + content
+                if vid_missing > 0:
+                    content = self.video_placeholder * vid_missing + content
+                if aud_missing > 0:
+                    content = self.audio_placeholder * aud_missing + content
+                message['content'] = content
+                message['images'] = images
+                message['videos'] = videos
+                message['audios'] = audios
+                message = transfer_to_standard_message(
+                    message, self.image_placeholder, self.video_placeholder,
+                    self.audio_placeholder, self.is_mm)
+
+            new_messages.append(message)
         return new_messages
 
     def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
@@ -438,6 +448,7 @@ class Template:
                     if key in traj_keys else trajectories[key]
                     for key in trajectories
                 }
+         }
             else:
                 # Standard columnar format
                 trajectories = self.map_col_to_row(trajectories)
