@@ -168,13 +168,12 @@ def _capture_local_label_summary(model: TransformersModel, batch: dict[str, Any]
     labels = processed.get('labels')
     if labels is None:
         return {'has_labels': False}
-    local_labels = model.sp_strategy.prepare_local_labels(labels, processed.get('position_ids'))
     return {
         'has_labels': True,
         'full_labels': _tensor_summary(labels),
         'full_non_ignore': int((labels != -100).sum().item()),
-        'local_labels': _tensor_summary(local_labels),
-        'local_non_ignore': int((local_labels != -100).sum().item()),
+        'local_labels': _tensor_summary(labels),
+        'local_non_ignore': int((labels != -100).sum().item()),
     }
 
 

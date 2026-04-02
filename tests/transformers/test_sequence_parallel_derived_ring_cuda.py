@@ -517,14 +517,12 @@ def _run_precision_worker(rank: int,
             'position_ids': position_ids,
             'labels': labels,
         })
-        local_input_ids = processed_inputs['input_ids']
-        local_position_ids = processed_inputs['position_ids']
         local_labels = processed_inputs['labels']
 
         sp_model.zero_grad(set_to_none=True)
         sp_outputs = sp_model(
-            input_ids=local_input_ids,
-            position_ids=local_position_ids,
+            input_ids=input_ids,
+            position_ids=position_ids,
             attention_mask=None,
             use_cache=False,
         )

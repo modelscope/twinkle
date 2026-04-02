@@ -798,8 +798,8 @@ class SequenceParallel:
 
         1. set extra_kwargs['position_ids']
         2. cache packed/varlen metadata
+        3. split labels
         """
-        position_ids = None
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         real_position_ids = self._extract_real_position_ids(position_ids)
@@ -809,22 +809,19 @@ class SequenceParallel:
         self._update_packed_varlen_metadata(real_position_ids)
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
+        if 'labels' in inputs:
+            labels = inputs.get('labels')
+            _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
+                None,
+                None,
+                labels,
+                None,
+                None,
+                None,
+                real_position_ids=real_position_ids,
+            )
+            inputs['labels'] = labels
         return inputs
-
-    def prepare_local_labels(self, labels: Optional[torch.Tensor], position_ids: Optional[torch.Tensor] = None):
-        if labels is None or not torch.is_tensor(labels) or self.world_size == 1:
-            return labels
-        real_position_ids = self._extract_real_position_ids(position_ids)
-        _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
-            None,
-            None,
-            labels,
-            None,
-            None,
-            None,
-            real_position_ids=real_position_ids,
-        )
-        return labels
 
 
 sequence_parallel = SequenceParallel()
@@ -902,11 +899,6 @@ class SequenceParallelStrategy:
         if not self.enabled or self.ulysses_size <= 1:
             return inputs
         return sequence_parallel.prepare_inputs(inputs)
-
-    def prepare_local_labels(self, labels: Optional[torch.Tensor], position_ids: Optional[torch.Tensor] = None):
-        if not self.enabled or self.ulysses_size <= 1:
-            return labels
-        return sequence_parallel.prepare_local_labels(labels, position_ids)
 
     def postprocess_outputs(self, outputs: Any) -> Any:
         if (not self.enabled or self.ulysses_size <= 1 or not self.sp_config.get('gather_logits', True)):
