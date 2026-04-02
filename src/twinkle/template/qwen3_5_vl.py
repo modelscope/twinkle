@@ -1,8 +1,11 @@
+import inspect
+
 import torch
 from PIL import Image
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle import remote_class, requires
+from twinkle.data_format import InputFeature
 from twinkle.template import Template
 from twinkle.template.base import ImageInput, VideoInput
 from twinkle.template.utils import get_inputs_embeds_hf
@@ -22,6 +25,16 @@ class Qwen3_5Template(Template):
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()
+        from transformers.models.qwen3_vl import Qwen3VLModel
+        with torch.device('meta'):
+            self.dummy_model = Qwen3VLModel(self.config)
+            self.rope_index_func = self.get_rope_index()
+
+    def get_rope_index(self):
+        for _, sub_module in self.dummy_model.named_modules():
+            if hasattr(sub_module, 'get_rope_index'):
+                return sub_module.get_rope_index
+        raise NotImplementedError(f'Module {self.dummy_model.__class__.__name__} has no get_rope_index method!')
 
     def _init_vision_config(self):
         """Initialize vision config from processor."""
@@ -82,3 +95,26 @@ class Qwen3_5Template(Template):
         inputs_embeds = get_inputs_embeds_hf(inputs_embeds, inputs, base_model.model.visual, self.processor,
                                              model.config)
         return {'inputs_embeds': inputs_embeds}
+
+    def set_mm_position_ids(self, input_feature: InputFeature):
+        kwargs = {}
+        attention_mask = input_feature.get('attention_mask')
+        input_ids = input_feature['input_ids']
+        if 'mm_token_type_ids' in inspect.signature(self.rope_index_func).parameters:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[input_ids == self.processor.image_token_id] = 1
+            mm_token_type_ids[input_ids == self.processor.video_token_id] = 2
+            kwargs['mm_token_type_ids'] = mm_token_type_ids
+        position_ids, _ = self.rope_index_func(
+            input_ids,
+            image_grid_thw=input_feature.get('image_grid_thw'),
+            video_grid_thw=input_feature.get('video_grid_thw'),
+            attention_mask=attention_mask,
+            **kwargs)
+        return self._concat_text_position_ids(position_ids)
+
+    @staticmethod
+    def _concat_text_position_ids(position_ids):
+        seq_len = position_ids.shape[-1]
+        text_position_ids = torch.arange(seq_len, device=position_ids.device).expand(1, *position_ids.shape[1:])
+        return torch.concat([text_position_ids, position_ids], dim=0)

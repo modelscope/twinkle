@@ -222,6 +222,9 @@ class Template:
                 result['labels'] = result['labels'][:self.max_length]
         return InputFeature(**result)
 
+    def set_mm_position_ids(self, input_feature: InputFeature):
+        return np.arange(len(input_feature['input_ids']))
+
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
         if not self.max_length or 'input_ids' not in input_feature:
             return [input_feature]
@@ -248,7 +251,7 @@ class Template:
             return [input_feature]
         input_ids = input_feature['input_ids']
         input_feature['attention_mask'] = np.ones_like(input_ids)
-        input_feature['position_ids'] = np.arange(len(input_ids))
+        input_feature['position_ids'] = self.set_mm_position_ids(input_feature)
         input_feature['length'] = len(input_ids)
         return [input_feature]
 
