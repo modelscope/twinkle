@@ -512,12 +512,19 @@ def _run_precision_worker(rank: int,
         )
         strategy = _make_strategy(sp_model, device_mesh, int(case['ulysses_size']))
         _assert_runtime_sequence_parallel_state(case, strategy)
-        local_labels = _prepare_label_inputs(strategy, input_ids, position_ids)
+        processed_inputs = strategy.preprocess_inputs({
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'labels': labels,
+        })
+        local_input_ids = processed_inputs['input_ids']
+        local_position_ids = processed_inputs['position_ids']
+        local_labels = processed_inputs['labels']
 
         sp_model.zero_grad(set_to_none=True)
         sp_outputs = sp_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
+            input_ids=local_input_ids,
+            position_ids=local_position_ids,
             attention_mask=None,
             use_cache=False,
         )
