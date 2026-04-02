@@ -82,10 +82,9 @@ def create_olympiad_dataset():
         dataset.map(OlympiadBenchProcessor(language='zh'), dataset_meta=ds)
 
     # Set template and preprocess
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
     # Mix all datasets (interleave)
     dataset.mix_dataset(interleave=True)
-    dataset.encode()
     return dataset
 
 
@@ -163,7 +162,7 @@ def main():
 
     model.set_loss('GRPOLoss', epsilon=0.2, adapter_name=ADAPTER_NAME)
     model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, adapter_name=ADAPTER_NAME, enable_thinking=False)
 
     # Sampler setup
     sampler = vLLMSampler(
@@ -178,7 +177,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     # Checkpoint manager
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
