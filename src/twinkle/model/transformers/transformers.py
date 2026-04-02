@@ -496,7 +496,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.train_status.num_tokens += counts.item()
         optimizer_config.train_status.loss_value += loss_value
-        optimizer_config.outputs['loss'] = optimizer_config.train_status.loss_value
+        outputs['loss'] = optimizer_config.train_status.loss_value
         return optimizer_config.train_status.loss_value.item()
 
     @remote_function()
