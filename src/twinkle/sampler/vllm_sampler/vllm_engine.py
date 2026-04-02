@@ -183,31 +183,25 @@ class VLLMEngine(BaseSamplerEngine):
                      request_id: Optional[str] = None,
                      priority: int = 0,
                      *,
-                     images: Optional[List[Any]] = None,
-                     videos: Optional[List[Any]] = None,
+                     multi_modal_data: Optional[Dict[str, Any]] = None,
+                     mm_processor_kwargs: Optional[Dict[str, Any]] = None,
                      **kwargs) -> SampleResponse:
         """
         Sample completions from the model.
 
-        This is the core API aligned with tinker's sampling interface.
-
         Args:
             prompt_token_ids: Input token IDs.
             sampling_params: Sampling parameters (tinker.types.SamplingParams or dict).
-            num_samples: Number of samples to generate.
-            logprobs: Whether to return log probabilities for generated tokens.
-            include_prompt_logprobs: Whether to compute logprobs on prompt tokens.
-            topk_prompt_logprobs: If > 0, returns top-k logprobs for each prompt token.
             lora_request: LoRARequest for sampling.
             request_id: Optional request ID for tracking.
             priority: Request priority (higher = more urgent).
-            images: Optional list of images for multimodal models.
-                    Can be PIL.Image, file paths, URLs, or bytes.
-            videos: Optional list of videos for multimodal models.
-                    Can be file paths or list of frames.
+            multi_modal_data: Optional dict of multimodal data for vLLM
+                (e.g. ``{'image': [PIL_Image, ...], 'video': [...]}``)
+            mm_processor_kwargs: Optional kwargs forwarded to vLLM's multimodal processor
+                (e.g. ``{'do_resize': False}``)
 
         Returns:
-            tinker.types.SampleResponse containing sequences and optionally prompt_logprobs.
+            SampleResponse containing sequences and optionally prompt_logprobs.
         """
         from vllm.inputs import TokensPrompt
 
@@ -222,21 +216,11 @@ class VLLMEngine(BaseSamplerEngine):
         if request_id is None:
             request_id = uuid.uuid4().hex
 
-        # Build multi_modal_data if images or videos provided
-        multi_modal_data = {}
-        if images:
-            multi_modal_data['image'] = images
-        if videos:
-            multi_modal_data['video'] = videos
-
-        # Build prompt (with or without multimodal data)
+        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         if multi_modal_data:
-            prompt = TokensPrompt(
-                prompt_token_ids=prompt_token_ids,
-                multi_modal_data=multi_modal_data,
-            )
-        else:
-            prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            prompt['multi_modal_data'] = multi_modal_data
+        if mm_processor_kwargs:
+            prompt['mm_processor_kwargs'] = mm_processor_kwargs
 
         if lora_request is not None and not self.enable_lora:
             logger.warning('lora_request provided but enable_lora is '
