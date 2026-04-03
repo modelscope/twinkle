@@ -55,7 +55,7 @@ class Template:
         self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
             self._add_default_system,  # Add a default system field
             self._to_standard_reasoning_content,  # Convert thinking to standard field
-            self._build_mm_messages,  # turn to standard mm messages
+            self._build_standard_messages,  # turn to standard mm messages
         ]
         self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
             self._check_max_length,  # Check and split input_features
@@ -419,13 +419,16 @@ class Template:
 
         return new_messages
 
-    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
+    def _build_standard_messages(self, trajectory: Trajectory) -> List[Trajectory]:
         # Extract trajectory-level media
         images = self.preprocess_images(trajectory.pop('images', None) or [])
         videos = self.preprocess_videos(trajectory.pop('videos', None) or [])
         audios = self.preprocess_audios(trajectory.pop('audios', None) or [])
 
         trajectory['messages'] = self._process_mm_messages(trajectory['messages'], images, videos, audios)
+        if not self.is_mm:
+            for message in trajectory['messages']:
+                message['content'] = message['content'][0]['text']
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):

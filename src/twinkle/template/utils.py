@@ -115,7 +115,7 @@ def transfer_to_standard_message(message: Message, image_placeholder, video_plac
                                                audio_placeholder, message.get('images'), message.get('videos'),
                                                message.get('audios'))
     else:
-        new_content = message['content']
+        new_content = [{'type': 'text', 'text': message['content']}]
 
     return Message(
         role=message['role'],
