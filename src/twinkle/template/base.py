@@ -534,7 +534,7 @@ class Template:
                     keys.append(k)
         else:
             for k, v in trajectories.items():
-                if v and self._is_trajectory(v):
+                if v is not None and self._is_trajectory(v):
                     keys.append(k)
         return keys
 
