@@ -134,11 +134,13 @@ class CheckpointEngineManager:
                 (re.compile(r'language_model\.model'), ('model.language_model', )),
                 (re.compile(r'^visual\.'), ('model.visual.', )),
             ]
+            expanded_keys = list(self._model_keys)
             for key in self._model_keys:
                 for pattern, individuals in _STACKED_MAPPINGS:
                     if pattern.search(key):
                         for ind in individuals:
-                            self._model_keys.append(pattern.sub(ind, key))
+                            expanded_keys.append(pattern.sub(ind, key))
+            self._model_keys = expanded_keys
 
         model_result = self.model.send_weights(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)

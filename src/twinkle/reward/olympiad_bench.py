@@ -250,7 +250,7 @@ class OlympiadBenchAccuracyReward(Reward):
             if not is_multiple:
                 pred = _normalize_answer(predicted[-1])
                 gt_val = gt_parts[0] if gt_parts else ''
-                logger.info(f'pred: {pred}, gt_val: {gt_val}')
+                logger.debug(f'pred: {pred}, gt_val: {gt_val}')
                 if pred == gt_val or _is_numeric_match(pred, gt_val):
                     rewards.append(1.0)
                 else:

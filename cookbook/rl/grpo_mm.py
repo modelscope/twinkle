@@ -16,21 +16,19 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
+from twinkle.dataset import DatasetMeta, LazyDataset
+from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
-from twinkle.processor import InputProcessor
+from twinkle.preprocessor.olympiad_bench import OlympiadBenchProcessor
 from twinkle.reward.olympiad_bench import (
     OlympiadBenchAccuracyReward,
     OlympiadBenchFormatReward,
     OlympiadBenchQualityReward,
 )
 from twinkle.sampler import vLLMSampler
-from twinkle.template import Template
-from twinkle.metric import CompletionRewardMetric
-from twinkle.preprocessor.olympiad_bench import OlympiadBenchProcessor
-import swanlab
 
-run = swanlab.init(
+import swanlab
+swanlab.init(
     project='twinkle',
 )
 logger = get_logger()

@@ -136,6 +136,7 @@ class LazyDataset(Dataset):
         if self._mix_interleave:
             # Round-robin: idx 0 -> ds0[0], idx 1 -> ds1[0], idx 2 -> ds2[0], idx 3 -> ds0[1], ...
             num_datasets = len(dataset_info)
+            assert num_datasets >= 1
             dataset_idx = idx % num_datasets
             local_idx = idx // num_datasets
             key, length = dataset_info[dataset_idx]
