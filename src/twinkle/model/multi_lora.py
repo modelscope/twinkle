@@ -175,7 +175,8 @@ class MultiLora:
         if isinstance(target_modules, (list, set)) and len(target_modules) == 0:
             return False
 
-        if isinstance(target_modules, (list, set)) and len(target_modules) == 1 and next(iter(target_modules)) == 'all-linear':
+        if isinstance(target_modules,
+                      (list, set)) and len(target_modules) == 1 and next(iter(target_modules)) == 'all-linear':
             return True
 
         if target_modules == 'all-linear':

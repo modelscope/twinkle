@@ -271,10 +271,7 @@ class Template:
             audios: Trajectory-level audios
         """
         # Determine format: list or string (check first non-system message)
-        is_list_format = any(
-            isinstance(m.get('content'), list)
-            for m in messages if m.get('role') != 'system'
-        )
+        is_list_format = any(isinstance(m.get('content'), list) for m in messages if m.get('role') != 'system')
 
         if is_list_format:
             return self._process_mm_list_format(messages, images, videos, audios)
@@ -351,26 +348,21 @@ class Template:
         """Process string format content with trajectory-level media."""
         # Count total placeholders across all messages
         total_img = sum(
-            m.get('content', '').count(self.image_placeholder)
-            for m in messages if isinstance(m.get('content'), str) and m.get('role') != 'system'
-        )
+            m.get('content', '').count(self.image_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
         total_vid = sum(
-            m.get('content', '').count(self.video_placeholder)
-            for m in messages if isinstance(m.get('content'), str) and m.get('role') != 'system'
-        )
+            m.get('content', '').count(self.video_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
         total_aud = sum(
-            m.get('content', '').count(self.audio_placeholder)
-            for m in messages if isinstance(m.get('content'), str) and m.get('role') != 'system'
-        )
+            m.get('content', '').count(self.audio_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
 
         img_missing = len(images) - total_img
         vid_missing = len(videos) - total_vid
         aud_missing = len(audios) - total_aud
 
         # Find first user message index
-        first_user_idx = next(
-            (i for i, m in enumerate(messages) if m.get('role') == 'user'), None
-        )
+        first_user_idx = next((i for i, m in enumerate(messages) if m.get('role') == 'user'), None)
 
         new_messages = []
         img_iter, vid_iter, aud_iter = iter(images), iter(videos), iter(audios)
@@ -414,9 +406,8 @@ class Template:
             message['videos'] = [v for v in msg_videos if v is not None]
             message['audios'] = [a for a in msg_audios if a is not None]
 
-            message = transfer_to_standard_message(
-                message, self.image_placeholder, self.video_placeholder,
-                self.audio_placeholder, self.is_mm)
+            message = transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
+                                                   self.audio_placeholder, self.is_mm)
 
             new_messages.append(message)
 
@@ -428,8 +419,7 @@ class Template:
         videos = self.preprocess_videos(trajectory.pop('videos', None) or [])
         audios = self.preprocess_audios(trajectory.pop('audios', None) or [])
 
-        trajectory['messages'] = self._process_mm_messages(
-            trajectory['messages'], images, videos, audios)
+        trajectory['messages'] = self._process_mm_messages(trajectory['messages'], images, videos, audios)
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -473,7 +463,8 @@ class Template:
                         input_ids = input_ids.squeeze(0)
                     labels = np.full_like(input_ids, -100)  # No labels for inference
             elif self._template_support_assistant_tokens_mask:
-                encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=kwargs.get('tokenize', True), **kwargs)
+                encoded = self._apply_chat_template(
+                    trajectory, return_assistant_tokens_mask=kwargs.get('tokenize', True), **kwargs)
                 if 'input_ids' in encoded:
                     input_ids = encoded.pop('input_ids')
                     assistant_masks = encoded.pop('assistant_masks')
@@ -597,7 +588,11 @@ class Template:
         # Use thread pool for parallel encoding
         from concurrent.futures import ThreadPoolExecutor
         from functools import partial
-        encode_fn = partial(self.encode, add_generation_prompt=add_generation_prompt, **kwargs,)
+        encode_fn = partial(
+            self.encode,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
         with ThreadPoolExecutor() as executor:
             output = list(executor.map(encode_fn, trajectories))
 

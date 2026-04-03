@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 import time
-from typing import Optional, List
+from typing import List, Optional
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
@@ -118,7 +118,7 @@ class CheckpointEngineManager:
             if self._peft_config is None:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
-        
+
         if self._model_keys is None:
             if hasattr(self.sampler, 'get_state_keys'):
                 self._model_keys = self.sampler.get_state_keys()
@@ -131,8 +131,8 @@ class CheckpointEngineManager:
             _STACKED_MAPPINGS = [
                 (re.compile(r'qkv_proj'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
                 (re.compile(r'gate_up_proj'), ('gate_proj', 'up_proj')),
-                (re.compile(r'language_model\.model'), ('model.language_model',)),
-                (re.compile(r'^visual\.'), ('model.visual.',)),
+                (re.compile(r'language_model\.model'), ('model.language_model', )),
+                (re.compile(r'^visual\.'), ('model.visual.', )),
             ]
             for key in self._model_keys:
                 for pattern, individuals in _STACKED_MAPPINGS:
@@ -140,7 +140,8 @@ class CheckpointEngineManager:
                         for ind in individuals:
                             self._model_keys.append(pattern.sub(ind, key))
 
-        model_result = self.model.send_weights(base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
+        model_result = self.model.send_weights(
+            base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
         sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
         model_result()
         sampler_result()

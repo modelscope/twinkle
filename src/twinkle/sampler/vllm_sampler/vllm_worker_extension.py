@@ -427,7 +427,7 @@ class TwinkleWorkerExtension:
 
             self.model_runner.model.load_weights(converted)
             logger.info(f'Loaded {len(converted)} base weights')
-    
+
     def get_state_keys(self):
         return list(self.model_runner.model.state_dict().keys())
 

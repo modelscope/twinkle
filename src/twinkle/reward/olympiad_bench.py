@@ -9,8 +9,9 @@ Three core rewards, all normalized to [0, 1]:
 import math
 import re
 from typing import Any, Dict, List
-from twinkle.utils import get_logger
+
 from twinkle.reward.base import Reward
+from twinkle.utils import get_logger
 
 logger = get_logger()
 
@@ -24,8 +25,7 @@ def _get_completion(trajectory: Dict[str, Any]) -> str:
             if isinstance(content, list):
                 return ''.join(
                     block.get('text', '') for block in content
-                    if isinstance(block, dict) and block.get('type') == 'text'
-                )
+                    if isinstance(block, dict) and block.get('type') == 'text')
             return content
     return ''
 
@@ -50,7 +50,7 @@ def _extract_boxed_answers(text: str) -> List[str]:
                 depth -= 1
             j += 1
         if depth == 0:
-            answers.append(text[start:j-1])
+            answers.append(text[start:j - 1])
         i = j
     return answers
 
@@ -67,10 +67,9 @@ def _normalize_answer(answer: str) -> str:
     """
     # === Phase 1: Handle LaTeX commands BEFORE removing backslash ===
     # Full-width numbers/letters → half-width
-    answer = answer.translate(str.maketrans(
-        '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ',
-        '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-    ))
+    answer = answer.translate(
+        str.maketrans('０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ',
+                      '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'))
     # Chinese punctuation → English
     answer = answer.replace('，', ',').replace('。', '.')
     answer = answer.replace('（', '(').replace('）', ')')
@@ -297,7 +296,7 @@ class OlympiadBenchFormatReward(Reward):
                     score += 0.3
 
                 # Answer consistency
-                unique_answers = set(_normalize_answer(a) for a in boxed_answers)
+                unique_answers = {_normalize_answer(a) for a in boxed_answers}
                 if len(unique_answers) == 1:
                     score += 0.3
                 elif len(unique_answers) > 2:
@@ -369,7 +368,7 @@ class OlympiadBenchQualityReward(Reward):
 
         # Check chunk uniqueness
         chunk_size = 50
-        chunks = [completion[i:i+chunk_size] for i in range(0, len(completion) - chunk_size, chunk_size // 2)]
+        chunks = [completion[i:i + chunk_size] for i in range(0, len(completion) - chunk_size, chunk_size // 2)]
         if not chunks:
             return 1.0
 
@@ -378,7 +377,7 @@ class OlympiadBenchQualityReward(Reward):
         # Check n-gram uniqueness
         words = completion.split()
         if len(words) >= 4:
-            ngrams = [' '.join(words[i:i+4]) for i in range(len(words) - 3)]
+            ngrams = [' '.join(words[i:i + 4]) for i in range(len(words) - 3)]
             ngram_ratio = len(set(ngrams)) / len(ngrams) if ngrams else 1.0
         else:
             ngram_ratio = 1.0

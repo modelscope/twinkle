@@ -25,18 +25,14 @@ class OlympiadBenchProcessor(Preprocessor):
         2. Creates multimodal message with image placeholders
         3. Stores ground truth in user_data for reward computation
     """
-    system_prompt_zh = (
-        '你是一个专业的数学和物理解题助手。请仔细分析题目，'
-        '逐步推理解答，并将最终答案用 \\boxed{} 格式给出。'
-        '如果有多个答案，请用逗号分隔。'
-    )
+    system_prompt_zh = ('你是一个专业的数学和物理解题助手。请仔细分析题目，'
+                        '逐步推理解答，并将最终答案用 \\boxed{} 格式给出。'
+                        '如果有多个答案，请用逗号分隔。')
 
-    system_prompt_en = (
-        'You are a professional math and physics problem solver. '
-        'Analyze the problem carefully, solve it step by step, '
-        'and provide your final answer in \\boxed{} format. '
-        'If there are multiple answers, separate them with commas.'
-    )
+    system_prompt_en = ('You are a professional math and physics problem solver. '
+                        'Analyze the problem carefully, solve it step by step, '
+                        'and provide your final answer in \\boxed{} format. '
+                        'If there are multiple answers, separate them with commas.')
 
     def __init__(self, system: Optional[str] = None, language: str = 'zh'):
         """Initialize the preprocessor.
@@ -86,10 +82,7 @@ class OlympiadBenchProcessor(Preprocessor):
         question = row.get('question', '')
         context = row.get('context', '')
         final_answer = row.get('final_answer', [])
-        solution = row.get('solution', [])
         unit = row.get('unit', '')
-        is_multiple_answer = row.get('is_multiple_answer', False)
-        subject = row.get('subject', 'maths')
 
         # Collect images
         images = self._collect_images(row)
@@ -126,7 +119,6 @@ class OlympiadBenchProcessor(Preprocessor):
 
         # Format ground truth
         ground_truth = self._format_final_answer(final_answer, unit)
-        solution_text = '\n'.join(solution) if isinstance(solution, list) else str(solution)
 
         return Trajectory(
             messages=messages,

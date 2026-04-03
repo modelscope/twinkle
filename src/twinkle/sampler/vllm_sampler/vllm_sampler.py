@@ -252,8 +252,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     tokens=seq.tokens,
                     logprobs=seq.logprobs,
                     decoded=self.template.decode(seq.tokens),
-                    new_input_feature=_convert_ndarray_to_list(
-                        self.template.concat_input_feature(feat, seq.tokens)),
+                    new_input_feature=_convert_ndarray_to_list(self.template.concat_input_feature(feat, seq.tokens)),
                 )
                 sequences.append(sampled_seq)
             return SampleResponse(
@@ -371,7 +370,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
     @remote_function(dispatch='all', collect='first')
     def reset_prefix_cache(self):
         self._run_in_loop(self.engine.reset_prefix_cache())
-    
+
     @remote_function(dispatch='all', collect='first')
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())

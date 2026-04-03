@@ -157,6 +157,11 @@ class MultiLoraMegatronModel(MegatronModel):
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+            # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
+            kwargs.pop('use_distributed_optimizer', None)
+            kwargs.pop('loss_scale', None)
+            kwargs['fp16'] = False
+            kwargs['bf16'] = True
             return super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function(dispatch='all')
@@ -254,15 +259,6 @@ class MultiLoraMegatronModel(MegatronModel):
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, Callable], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().set_processor(processor_cls, **kwargs)
-
-    @remote_function(dispatch='all')
-    def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
-        # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
-        kwargs.pop('use_distributed_optimizer', None)
-        kwargs.pop('loss_scale', None)
-        kwargs['fp16'] = False
-        kwargs['bf16'] = True
-        super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):

@@ -115,8 +115,7 @@ class LazyDataset(Dataset):
         """Record encode operation for lazy execution."""
         assert self.template is not None
         assert self.template.truncation_strategy != 'split', (
-            'Lazy tokenize does not support truncation_strategy==`split`'
-        )
+            'Lazy tokenize does not support truncation_strategy==`split`')
         self.do_encode = True
         self.add_generation_prompt = add_generation_prompt
         self.encode_kwargs = kwargs
@@ -177,9 +176,9 @@ class LazyDataset(Dataset):
 
         # Lazy encode
         if self.do_encode:
-            encoded = self.template.batch_encode(
-                [item], add_generation_prompt=self.add_generation_prompt, **self.encode_kwargs
-            )[0]
+            encoded = self.template.batch_encode([item],
+                                                 add_generation_prompt=self.add_generation_prompt,
+                                                 **self.encode_kwargs)[0]
             # Preserve extra fields not produced by encoding
             for key in item:
                 if key not in encoded:
