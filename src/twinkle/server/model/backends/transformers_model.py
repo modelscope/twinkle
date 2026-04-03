@@ -50,7 +50,22 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         if loss_fn == 'cross_entropy':
             super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         elif loss_fn == 'importance_sampling':
-            super().set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=0.2, beta=0.0)
+            # Detect DPO format: datums contain ref_logps in loss_fn_inputs
+            has_ref_logps = any('ref_logps' in d.loss_fn_inputs for d in inputs)
+            if has_ref_logps:
+                # DPO mode: read optional DPO params from loss_fn_config kwargs
+                beta = kwargs.pop('dpo_beta', 0.1)
+                loss_type = kwargs.pop('dpo_loss_type', 'sigmoid')
+                sft_weight = kwargs.pop('dpo_sft_weight', 0.0)
+                super().set_loss(
+                    'DPOLoss', adapter_name=adapter_name, beta=beta, loss_type=loss_type, sft_weight=sft_weight)
+                super().add_metric('DPOMetric', adapter_name=adapter_name, beta=beta)
+            else:
+                # GRPO mode: read optional GRPO params from loss_fn_config kwargs
+                # Also pop DPO-specific kwargs to prevent leaking into forward/backward
+                epsilon = kwargs.pop('epsilon', 0.2)
+                grpo_beta = kwargs.pop('beta', 0.0)
+                super().set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
         else:
             super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         template = self.get_template(adapter_name)
@@ -58,6 +73,19 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
         loss_values = extract_rl_feature(inputs)
         loss_kwargs = kwargs.copy()
+        # Convert ref_logps list-of-lists into a padded tensor wrapped in ref_outputs
+        # so that DPOLoss and DPOMetric can consume it via ref_outputs.get('logps').
+        # if 'ref_logps' in loss_values:
+        #     import torch
+        #     import torch.nn.functional as F
+        #     ref_logps_lists = loss_values.pop('ref_logps')
+        #     max_len = max(len(r) for r in ref_logps_lists)
+        #     padded = [
+        #         F.pad(torch.tensor(r, dtype=torch.float32), (0, max_len - len(r)))
+        #         for r in ref_logps_lists
+        #     ]
+        #     ref_logps_tensor = torch.stack(padded)  # [batch, max_seq_len]
+        #     loss_kwargs['ref_outputs'] = {'logps': ref_logps_tensor}
         loss_kwargs.update(loss_values)
         loss = super().calculate_loss(adapter_name=adapter_name, **loss_kwargs)
         super().backward(adapter_name=adapter_name, **kwargs)

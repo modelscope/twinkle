@@ -71,6 +71,11 @@ def extract_rl_feature(datum: types.Datum | list[types.Datum]) -> dict:
         if 'advantages' in d.loss_fn_inputs:
             advantages = d.loss_fn_inputs['advantages'].to_numpy().tolist()
             result['advantages'].append(advantages)
+
+        # 'ref_logps' -> 'ref_logps' (for DPO loss)
+        if 'ref_logps' in d.loss_fn_inputs:
+            ref_logps = d.loss_fn_inputs['ref_logps'].to_numpy().tolist()
+            result['ref_logps'].append(ref_logps)
     return result
 
 
