@@ -149,14 +149,21 @@ def _normalize_answer(answer: str) -> str:
     answer = re.sub(r'(°|度|米|千克|克|秒)', '', answer)  # Chinese units always remove
 
     # === Phase 5: Cleanup ===
+    # Ratio colon → slash: 3:2 → 3/2
+    answer = re.sub(r'(\d+):(\d+)', r'\1/\2', answer)
+
+    # Normalize simple fractions: a/b → (a)/(b) for consistency with \frac output
+    # Only match simple numeric fractions like 3/2, not complex expressions
+    answer = re.sub(r'(?<![(/])(\d+)/(\d+)(?![)/])', r'(\1)/(\2)', answer)
+
     # Remove whitespace
     answer = re.sub(r'\s+', '', answer)
 
     # Remove consecutive commas: ,, → ,
     answer = re.sub(r',+', ',', answer)
 
-    # Remove leading/trailing commas
-    answer = answer.strip(',')
+    # Remove leading/trailing commas and periods
+    answer = answer.strip(',.')
 
     return answer.strip()
 
