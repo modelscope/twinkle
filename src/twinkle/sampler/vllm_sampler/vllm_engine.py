@@ -203,7 +203,7 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             SampleResponse containing sequences and optionally prompt_logprobs.
         """
-        from vllm.inputs import TokensPrompt, TextPrompt
+        from vllm.inputs import TextPrompt, TokensPrompt
 
         # Convert to vLLM params
         if isinstance(sampling_params, dict):
@@ -437,7 +437,7 @@ class VLLMEngine(BaseSamplerEngine):
 
     async def reset_prefix_cache(self) -> None:
         await self.engine.reset_prefix_cache()
-    
+
     async def get_state_keys(self) -> List[str]:
         results = await self.engine.collective_rpc('get_state_keys')
         all_keys = set()

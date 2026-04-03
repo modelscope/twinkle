@@ -31,7 +31,7 @@ from twinkle.preprocessor.olympiad_bench import OlympiadBenchProcessor
 import swanlab
 
 run = swanlab.init(
-    project="twinkle",
+    project='twinkle',
 )
 logger = get_logger()
 

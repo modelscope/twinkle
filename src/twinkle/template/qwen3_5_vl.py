@@ -1,8 +1,7 @@
 import inspect
-from copy import copy
-
 import numpy as np
 import torch
+from copy import copy
 from PIL import Image
 from typing import Any, Dict, List, Optional, Union
 

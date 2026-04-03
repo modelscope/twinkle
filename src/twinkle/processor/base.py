@@ -87,6 +87,7 @@ class InputProcessor:
             return inputs
 
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
+
         def to_tensor(_input):
             import torch
             for key in list(_input.keys()):
