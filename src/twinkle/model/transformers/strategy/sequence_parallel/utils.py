@@ -239,10 +239,12 @@ class GatherLoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_output):
         from . import sequence_parallel
-        _grad = grad_output[0]
-        if sequence_parallel.world_size > 1 and sequence_parallel._data_rank_group is not None:
-            _grad = _grad * sequence_parallel.world_size
+        _grad = grad_output[0] * sequence_parallel.world_size
+        if sequence_parallel.rp_world_size > 1:
             _grad = sequence_parallel.split(_grad, dim=ctx.gather_idx, position_ids=ctx.position_ids).contiguous()
+        else:
+            _grad = _grad.split(
+                ctx.scatter_shape, dim=ctx.gather_idx)[dist.get_rank(group=sequence_parallel._sp_group)].contiguous()
         return _grad, None, None, None
 
 

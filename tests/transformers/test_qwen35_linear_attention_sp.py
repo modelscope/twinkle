@@ -28,11 +28,11 @@ except Exception:
     _HAS_QWEN35 = False
 
 WORLD_SIZE = 2
-LOGITS_RTOL = 5e-2
-LOGITS_ATOL = 5e-2
-LOSS_ATOL = 5e-2
-GRAD_RTOL = 1e-1
-GRAD_ATOL = 5e-2
+LOGITS_RTOL = 5e-3
+LOGITS_ATOL = 5e-3
+LOSS_ATOL = 5e-3
+GRAD_RTOL = 5e-3
+GRAD_ATOL = 2e-3
 _HAS_FLA_PREFILL = bool(
     _HAS_QWEN35 and (getattr(hf_qwen35, 'causal_conv1d_fn', None) is not None or is_flash_linear_attention_available()))
 
