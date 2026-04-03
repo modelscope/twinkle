@@ -58,7 +58,7 @@ SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
 SUBSETS = [
     'OE_MM_maths_zh_CEE',
     'OE_MM_physics_zh_CEE',
-    # 'OE_TO_maths_zh_CEE',
+    'OE_TO_maths_zh_CEE',
 ]
 
 
