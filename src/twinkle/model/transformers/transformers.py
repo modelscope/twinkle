@@ -1151,6 +1151,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name: str = None,
         base_sync_done: bool = False,
         merge_and_sync: bool = False,
+        **kwargs,
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()

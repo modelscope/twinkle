@@ -68,6 +68,3 @@ class Message(TypedDict, total=False):
     content: Union[str, List[Dict[str, str]]]
     tool_calls: List[ToolCall]
     reasoning_content: str
-    images: Optional[List[Union[str, Any]]]
-    videos: Optional[List[Union[str, Any]]]
-    audios: Optional[List[Union[str, Any]]]

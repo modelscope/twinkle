@@ -137,5 +137,6 @@ class SampledSequence:
 class SampleResponse:
     """Response from a sampling request."""
     sequences: Sequence[SampledSequence]
+    prompt_token_ids: Optional[List[int]] = None
     prompt_logprobs: Optional[List[Optional[float]]] = None
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None

@@ -80,6 +80,10 @@ class InputProcessor:
         if self.framework == 'transformers':
             return inputs[0]
         else:
+            for _input in inputs:
+                if 'position_ids' in _input and _input['position_ids'].dim() > 2:
+                    # megatron needs 3, 1, N
+                    _input['position_ids'] = _input['position_ids'][1:]
             return inputs
 
     def prepare_inputs(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
@@ -234,8 +238,8 @@ class InputProcessor:
     @staticmethod
     def _pad_sequence(sequences, padding_value, padding_side):
         if padding_side == 'right':
-            from torch.nn.utils.rnn import pad_sequence
-            return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+            from twinkle.utils import pad_and_stack_tensors
+            return pad_and_stack_tensors(sequences, pad_value=padding_value, concat=sequences[0].dim() >= 2)
         else:
             # left padding
             import torch
@@ -282,7 +286,6 @@ class InputProcessor:
             max_seqlen_q=max_length,
             max_seqlen_kv=max_length,
             qkv_format='thd')
-
         if torch_util.is_torch_npu_available():
             packed.cu_seqlens_q_padded = cu_seqlens
             packed.cu_seqlens_kv_padded = cu_seqlens
@@ -294,6 +297,8 @@ class InputProcessor:
         is_padding_free = False
         for _input in inputs:
             position_ids = _input['position_ids']
+            if position_ids.dim() == 3:
+                position_ids = position_ids[0]
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0)
             # Each row may contains multiple sequences
@@ -301,8 +306,8 @@ class InputProcessor:
                 _position_ids = position_ids[i]
                 # multiple 0/1, multiple sequences
                 zero_count = torch.sum(_position_ids == 0).item()
-                one_count = torch.sum(_position_ids == 1).item()
-                is_padding_free = is_padding_free or (zero_count > 1 and one_count > 1)
+                ten_count = torch.sum(_position_ids == 10).item()
+                is_padding_free = is_padding_free or (zero_count > 1 and ten_count > 1)
         return is_padding_free
 
     @staticmethod
@@ -348,6 +353,11 @@ class InputProcessor:
 
         result = {}
 
+        def is_mm_position_ids(position_ids):
+            if position_ids is None:
+                return False
+            return position_ids.dim() > 1 and position_ids.shape[0] > 1
+
         padding_free = self.padding_free or self._any_packing(inputs)
         if padding_free:
             for key in text_keys:
@@ -355,6 +365,9 @@ class InputProcessor:
                 if key == 'attention_mask':
                     # attention_mask is not needed
                     continue
+                if key == 'position_ids' and is_mm_position_ids(values[0]):
+                    # mrope needs to cat the sequence and unsequeeze the middle dim
+                    value = torch.cat(values, dim=2).unsqueeze(1)
                 if isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
@@ -366,18 +379,25 @@ class InputProcessor:
                 values = [item[key] for item in text_inputs]
                 if self.framework == 'megatron' and key == 'attention_mask':
                     result[key] = self._create_4d_attention_mask(values)
+                elif key == 'position_ids' and is_mm_position_ids(values[0]):
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                    result[key] = result[key].reshape(values[0].shape[0], len(values), -1)
                 elif isinstance(values[0], torch.Tensor):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                    if result[key].dim() == 1:
+                        result[key] = result[key].unsqueeze(0)
                 else:
                     result[key] = values
             result = InputFeature(**result)
         for field, values in vlm_fields.items():
             if values:
-                if values[0].dim() == 1:
-                    # image_thw may be squeezed
-                    values = [value.unsqueeze(0) for value in values]
-                result[field] = torch.cat(values, dim=0)
-
+                _values = []
+                for value in values:
+                    if value.dim() == 1:
+                        # image_thw may be squeezed
+                        value = value.unsqueeze(0)
+                    _values.append(value)
+                result[field] = _values
         return result
 
     def collate_fn(self,
@@ -389,13 +409,21 @@ class InputProcessor:
             return inputs
         if micro_batch_size is None:
             # normal collate
-            return [self._collate_macro_batch(inputs)]
+            outputs = self._collate_macro_batch(inputs)
+            for key in outputs:
+                if key in self.VLM_CONCAT_FIELDS:
+                    outputs[key] = torch.cat(outputs[key], dim=0)
+            return [outputs]
         elif variable_seq_lengths:
             # each macro batch has its own length
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
-                outputs.append(self._collate_macro_batch(inputs[i:i + micro_batch_size]))
+                _output = self._collate_macro_batch(inputs[i:i + micro_batch_size])
+                for key in _output:
+                    if key in self.VLM_CONCAT_FIELDS:
+                        _output[key] = torch.cat(_output[key], dim=0)
+                outputs.append(_output)
             return outputs
         else:
             # each macro batch shares the same length
@@ -403,8 +431,59 @@ class InputProcessor:
             keys = list(res.keys())
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
+                end = i + micro_batch_size
                 output = {}
                 for key in keys:
-                    output[key] = res[key][i:i + micro_batch_size]
+                    if key == 'position_ids' and res[key].dim() > 2:
+                        output[key] = res[key][:, i:end, :]
+                    elif key in self.VLM_CONCAT_FIELDS:
+                        output[key] = torch.cat(res[key][i:end], dim=0)
+                    else:
+                        output[key] = res[key][i:end]
                 outputs.append(output)
             return outputs
+
+    def postprocess_tensor_cp(self, tensor):
+        """All-gather and reconstruct full sequence from CP-split tensor.
+
+        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
+        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
+
+        Only the current rank's slice retains the original tensor (and its
+        gradient graph); other ranks' slices are plain copies.  This means
+        backward through the reconstructed tensor only produces gradients for
+        the local chunk, naturally distributing the gradient across CP ranks
+        without extra scaling.
+
+        Args:
+            tensor: [batch_size, seq_len/cp_size] CP-split tensor
+
+        Returns:
+            [batch_size, full_seq_len] reconstructed full tensor
+        """
+        if self.device_mesh.cp_world_size <= 1:
+            return tensor
+
+        from megatron.core import parallel_state as mpu
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        cp_group = mpu.get_context_parallel_group()
+
+        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+        gathered[cp_rank] = tensor
+
+        batch_size = tensor.shape[0]
+        seq_len_per_cp = tensor.shape[1]
+        full_seq_len = seq_len_per_cp * cp_size
+        chunk_len = full_seq_len // (2 * cp_size)
+        half_len = seq_len_per_cp // 2
+
+        output = tensor.new_zeros(batch_size, full_seq_len)
+        for j in range(cp_size):
+            o = gathered[j]
+            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
+            reverse_idx = 2 * cp_size - j - 1
+            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
+
+        return output

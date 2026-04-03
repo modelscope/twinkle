@@ -40,7 +40,7 @@ SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=400)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -94,7 +94,7 @@ def main():
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -108,7 +108,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(Template, model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

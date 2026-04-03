@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Generator, TypedDict
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Generator, Optional, TypedDict
 
 if TYPE_CHECKING:
     import torch
@@ -37,6 +37,8 @@ class CheckpointEngine(ABC):
     ...     weights.append((name, tensor))
     >>> engine.finalize()
     """
+
+    rank: Optional[int] = None
 
     @abstractmethod
     def prepare(self) -> dict[str, Any]:

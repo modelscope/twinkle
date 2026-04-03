@@ -177,7 +177,7 @@ class VLLMEngine(BaseSamplerEngine):
     # =========================================================================
 
     async def sample(self,
-                     prompt_token_ids: List[int],
+                     prompt: Union[List[int], str],
                      sampling_params: Union[SamplingParams, Dict[str, Any]],
                      lora_request: Optional[Any] = None,
                      request_id: Optional[str] = None,
@@ -190,7 +190,7 @@ class VLLMEngine(BaseSamplerEngine):
         Sample completions from the model.
 
         Args:
-            prompt_token_ids: Input token IDs.
+            prompt: Input token IDs or string.
             sampling_params: Sampling parameters (tinker.types.SamplingParams or dict).
             lora_request: LoRARequest for sampling.
             request_id: Optional request ID for tracking.
@@ -203,7 +203,7 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             SampleResponse containing sequences and optionally prompt_logprobs.
         """
-        from vllm.inputs import TokensPrompt
+        from vllm.inputs import TextPrompt, TokensPrompt
 
         # Convert to vLLM params
         if isinstance(sampling_params, dict):
@@ -216,7 +216,10 @@ class VLLMEngine(BaseSamplerEngine):
         if request_id is None:
             request_id = uuid.uuid4().hex
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if isinstance(prompt, str):
+            prompt = TextPrompt(prompt=prompt)
+        else:
+            prompt = TokensPrompt(prompt_token_ids=prompt)
         if multi_modal_data:
             prompt['multi_modal_data'] = multi_modal_data
         if mm_processor_kwargs:
@@ -303,6 +306,7 @@ class VLLMEngine(BaseSamplerEngine):
                 result_topk_prompt_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
         return SampleResponse(
             sequences=sequences,
+            prompt_token_ids=result.prompt_token_ids,
             prompt_logprobs=result_prompt_logprobs,
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
@@ -433,6 +437,13 @@ class VLLMEngine(BaseSamplerEngine):
 
     async def reset_prefix_cache(self) -> None:
         await self.engine.reset_prefix_cache()
+
+    async def get_state_keys(self) -> List[str]:
+        results = await self.engine.collective_rpc('get_state_keys')
+        all_keys = set()
+        for r in results:
+            all_keys.update(r)
+        return list(all_keys)
 
     async def update_weights(
         self,
