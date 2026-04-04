@@ -29,7 +29,7 @@ logger = get_logger()
 
 # ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
-USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '0')))
+USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
@@ -37,7 +37,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
-LEARNING_RATE = float(os.environ.get('LR', 1e-5))
+LEARNING_RATE = float(os.environ.get('LR', 1e-6))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
@@ -144,7 +144,7 @@ def main():
             remote_group='model',
         )
 
-    # model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     if USE_MEGATRON:
         model.set_optimizer('default', lr=LEARNING_RATE)
         model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
@@ -161,8 +161,9 @@ def main():
         engine_args={
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
-            'max_lora_rank': max(32, LORA_RANK),
-            'enable_lora': False,
+            'max_lora_rank': 32, # save as lora_config
+            # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            'enable_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
@@ -197,7 +198,7 @@ def main():
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
 
-        ckpt_manager.sync_weights(merge_and_sync=True)
+        ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
         sample_responses = sampler.sample(

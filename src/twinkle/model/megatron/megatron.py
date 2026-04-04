@@ -1424,6 +1424,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                             # Skip LoRA-specific weights for base model sync
                             if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                                 continue
+                            name = name.replace('base_model.model.', '')
                             yield name, tensor
 
             else:
@@ -1446,6 +1447,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     # Skip LoRA-specific weights for base model sync
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
+                    name = name.replace('base_model.model.', '')
                     yield name, tensor
 
             def weight_generator():
