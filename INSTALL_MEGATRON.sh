@@ -81,6 +81,8 @@ MAX_JOBS=8 \
 FLASH_ATTENTION_FORCE_BUILD=TRUE \
 pip install flash-attn --no-build-isolation --no-cache-dir
 
+pip install flash-linear-attention -U
+
 # Install numpy
 echo ""
 echo "Installing numpy==2.2 and deep_gemm..."

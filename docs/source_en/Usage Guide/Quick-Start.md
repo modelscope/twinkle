@@ -692,10 +692,6 @@ if __name__ == '__main__':
 
 Multiple developers can use a single base model from this service for parallel training and sampling. Furthermore, the training methods they use are allowed to differ. For example, User A can perform SFT, User B can perform RL, and User C can perform sampling. Similarly, Twinkle also supports Tinker-like APIs for remote training:
 
->[!Note]
-> One important note: in the current Twinkle implementation, the client-side Twinkle API and Tinker API cannot be used simultaneously on the same server. When you need to provide the Tinker API, you need to start the service under cookbook/client/tinker.
-> This issue will be addressed with high priority in upcoming iterations.
-
 ```python
 from tinker import types
 from tqdm import tqdm

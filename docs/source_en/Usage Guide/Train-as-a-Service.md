@@ -2,7 +2,7 @@
 
 Alongside the open-source release of the Twinkle framework, we also provide a hosted model training service (Training as a Service) powered by ModelScope's backend infrastructure. Developers can use this service to experience Twinkle's training API for free.
 
-The model currently running on the cluster is [Qwen/Qwen3.5-4B](https://www.modelscope.cn/models/Qwen/Qwen3.5-4B). Below are the detailed usage instructions:
+The model currently running on the cluster is [Qwen/Qwen3.5-27B](https://www.modelscope.cn/models/Qwen/Qwen3.5-27B). Below are the detailed usage instructions:
 
 ## Step 1. Register a ModelScope Account and Apply to Join the twinkle-explorers Organization
 
@@ -30,7 +30,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.5-4B'
+base_model = 'ms://Qwen/Qwen3.5-27B'
 base_url='http://www.modelscope.cn/twinkle'
 api_key=os.environ.get('MODELSCOPE_TOKEN')
 
@@ -64,7 +64,7 @@ for epoch in range(2):
     print(f'Saved checkpoint for epoch {epoch} to {result.path}')
 ```
 
-With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.5-4B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
+With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.5-27B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
 
 ```python
 import os
@@ -79,7 +79,7 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = 'Qwen/Qwen3.5-4B'
+base_model = 'Qwen/Qwen3.5-27B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 # Step 2: Define the base model and connect to the server
@@ -92,7 +92,7 @@ service_client = ServiceClient(
 # The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.
 # The server will load the base model and apply the LoRA adapter weights.
 sampling_client = service_client.create_sampling_client(
-    model_path='twinkle://xxx-Qwen_Qwen3.5-4B-xxx/weights/twinkle-lora-1',
+    model_path='twinkle://xxx-Qwen_Qwen3.5-27B-xxx/weights/twinkle-lora-1',
     base_model=base_model
 )
 

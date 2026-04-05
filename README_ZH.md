@@ -114,7 +114,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 随着新模型的发布，我们将添加对更多模型的支持。下表列出了 Twinkle✨ 框架当前支持的模型。
 
 >[!Note]
-> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.5-4B](https://modelscope.cn/models/Qwen/Qwen3.5-4B)。
+> 通过 `base_url=https://www.modelscope.cn/twinkle` 访问的无服务器训练服务，目前是通过兼容Tinker的API提供的。我们将陆续推出同时支持Tinker API和完整Twinkle✨原生 API的服务。无服务器端点每次由一个训练基座支持，目前使用的是[Qwen3.5-27B](https://modelscope.cn/models/Qwen/Qwen3.5-27B)。
 
 | Model Type          | Model ID 举例                                                                                                     |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
@@ -162,7 +162,7 @@ twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_me
 
 def train():
     # to load model from Hugging Face, use 'hf://...'
-    base_model = 'ms://Qwen/Qwen3.5-4B'
+    base_model = 'ms://Qwen/Qwen3.5-27B'
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
@@ -218,7 +218,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.5-4B'
+base_model = 'ms://Qwen/Qwen3.5-27B'
 base_url='your-base-url'
 api_key='your-api-key'
 
