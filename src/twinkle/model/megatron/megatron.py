@@ -34,8 +34,10 @@ from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, selective_log_softmax
+from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from .strategy import MegatronStrategy
+
+logger = get_logger()
 
 
 @dataclass
@@ -1399,17 +1401,26 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(_model, PeftModel):
                     _model.unmerge_adapter()
 
-        def _add_base_layer_suffix(params):
-            for name, param in params:
-                if name.endswith('.weight'):
-                    base_layer_name = f'{name[:-7]}.base_layer.weight'
-                    if base_layer_name in model_keys or not model_keys:
-                        name = base_layer_name
-                elif name.endswith('.bias'):
-                    base_layer_name = f'{name[:-5]}.base_layer.bias'
-                    if base_layer_name in model_keys or not model_keys:
-                        name = base_layer_name
-                yield name, param
+        def _normalize(name: str, keep_base_layer: bool) -> str:
+            name = name.replace('base_model.model.', '')
+            if not keep_base_layer:
+                name = name.replace('.base_layer', '')
+            return name
+
+        def _print_weight_example(names):
+            for name in names[:3]:
+                logger.info(f'Sync weight: {name}')
+
+        def _add_base_layer_suffix(name):
+            if name.endswith('.weight'):
+                base_layer_name = f'{name[:-7]}.base_layer.weight'
+                if base_layer_name in model_keys or not model_keys:
+                    name = base_layer_name
+            elif name.endswith('.bias'):
+                base_layer_name = f'{name[:-5]}.base_layer.bias'
+                if base_layer_name in model_keys or not model_keys:
+                    name = base_layer_name
+            return name
 
         is_peft_format = (adapter_name != _default_adapter_name)
         if base_sync_done and adapter_name:
@@ -1418,41 +1429,54 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
                 def weight_generator():
                     with merge_lora():
+                        names = []
                         for name, tensor in self.get_hf_state_dict(adapter_name=''):
                             if name is None or tensor is None:
                                 continue
                             # Skip LoRA-specific weights for base model sync
                             if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                                 continue
+                            name = _normalize(name, keep_base_layer=False)
+                            names.append(name)
                             yield name, tensor
+                        _print_weight_example(names)
 
             else:
 
                 def weight_generator():
+                    names = []
                     for name, tensor in self.get_hf_state_dict(adapter_name=adapter_name):
                         if name is None or tensor is None:
                             continue
                         if 'lora' not in name:
                             continue
-                        name = name.replace('base_model.model.', '')
+                        name = _normalize(name, keep_base_layer=True)
+                        names.append(name)
                         yield name, tensor
+                    _print_weight_example(names)
         else:
             # Need to synchronize the base model
             # First full base-model sync.
-            def _raw_weights():
+            def _raw_weights(add_base_layer_suffix=False):
+                names = []
                 for name, tensor in self.get_hf_state_dict(adapter_name=''):
                     if name is None or tensor is None:
                         continue
                     # Skip LoRA-specific weights for base model sync
                     if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
                         continue
+                    name = _normalize(name, keep_base_layer=False)
+                    if add_base_layer_suffix:
+                        name = _add_base_layer_suffix(name)
+                    names.append(name)
                     yield name, tensor
+                _print_weight_example(names)
 
             def weight_generator():
                 if is_peft_format and (not merge_and_sync):
-                    yield from _add_base_layer_suffix(_raw_weights())
+                    yield from _raw_weights(True)
                 else:
-                    yield from _raw_weights()
+                    yield from _raw_weights(False)
 
         is_sender = (engine.rank is not None and engine.rank == 0)
 

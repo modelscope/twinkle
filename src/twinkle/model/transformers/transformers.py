@@ -37,9 +37,11 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, selective_log_softmax, torch_util
+from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+
+logger = get_logger()
 
 
 @dataclass
@@ -1165,6 +1167,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 name = name.replace('.base_layer', '')
             return name
 
+        def _print_weight_example(names):
+            for name in names[:3]:
+                logger.info(f'Sync weight: {name}')
+
         def _is_lora_key(name: str) -> bool:
             return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
 
@@ -1176,11 +1182,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 def weight_generator():
                     if isinstance(model, PeftModel):
                         model.merge_adapter()
+                    names = []
                     for name, tensor in model.state_dict().items():
                         if _is_lora_key(name):
                             continue
                         tensor = Torch.to_local_tensor(tensor)
-                        yield _normalize(name, keep_base_layer=False), tensor
+                        name = _normalize(name, keep_base_layer=False)
+                        names.append(name)
+                        yield name, tensor
+                    _print_weight_example(names)
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -1190,9 +1200,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 lora_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
 
                 def weight_generator():
+                    names = []
                     for name, tensor in lora_state_dict.items():
                         tensor = Torch.to_local_tensor(tensor)
+                        name = _normalize(name, keep_base_layer=True)
+                        names.append(name)
                         yield name, tensor
+                    _print_weight_example(names)
 
         else:
             # First full base-model sync.  Whether to keep ``.base_layer.``
@@ -1203,11 +1217,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = model.state_dict()
 
             def weight_generator():
+                names = []
                 for name, tensor in state_dict.items():
                     if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    yield _normalize(name, keep_base_layer=keep_base_layer), tensor
+                    name = _normalize(name, keep_base_layer=keep_base_layer)
+                    names.append(name)
+                    yield name, tensor
+                _print_weight_example(names)
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already
