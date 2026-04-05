@@ -37,10 +37,9 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, selective_log_softmax, torch_util
+from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
-from twinkle.utils import get_logger
 
 logger = get_logger()
 

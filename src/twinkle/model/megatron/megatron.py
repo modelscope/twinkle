@@ -34,9 +34,8 @@ from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, selective_log_softmax
+from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from .strategy import MegatronStrategy
-from twinkle.utils import get_logger
 
 logger = get_logger()
 
@@ -1407,7 +1406,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
             return name
-        
+
         def _print_weight_example(names):
             for name in names[:3]:
                 logger.info(f'Sync weight: {name}')
@@ -1452,7 +1451,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                         if 'lora' not in name:
                             continue
                         name = _normalize(name, keep_base_layer=True)
-                        logger.info(f'Sync weight: {name}')
                         names.append(name)
                         yield name, tensor
                     _print_weight_example(names)

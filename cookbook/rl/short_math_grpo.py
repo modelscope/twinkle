@@ -28,7 +28,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3-4B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
@@ -37,14 +37,14 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
-LEARNING_RATE = float(os.environ.get('LR', 1e-6))
+LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
-SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
+SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1000))
 LORA_RANK = int(os.environ.get('LORA_RANK', 16))
 
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
@@ -93,7 +93,7 @@ class GSM8KBrevityReward(Reward):
 # ========== Dataset ==========
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete')
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -123,7 +123,11 @@ def main():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
     lora_config = LoraConfig(
-        target_modules='all-linear',
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+        ],
         r=LORA_RANK,
         lora_alpha=LORA_RANK * 2,
         lora_dropout=0.05,
@@ -154,7 +158,7 @@ def main():
 
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -168,7 +172,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

@@ -138,7 +138,11 @@ def main():
 
     # LoRA configuration
     lora_config = LoraConfig(
-        target_modules=['all-linear'],
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+        ],
         r=16,
         lora_alpha=32,
         lora_dropout=0.05,

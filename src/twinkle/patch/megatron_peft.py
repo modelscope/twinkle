@@ -14,7 +14,7 @@ class MegatronPeft(Patch):
 
         if MegatronPeft._peft_patched:
             return
-        
+
         def _check_merge_allowed(*args, **kwargs):
             pass
 
