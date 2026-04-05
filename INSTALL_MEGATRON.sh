@@ -55,8 +55,8 @@ echo "Using CUDA architecture: $TORCH_CUDA_ARCH_LIST"
 
 # Install latest base packages
 echo ""
-echo "Installing peft, accelerate, transformers, modelscope, oss2..."
-pip install --upgrade peft accelerate transformers "modelscope[framework]" oss2
+echo "Installing peft, accelerate, transformers, modelscope..."
+pip install --upgrade peft accelerate transformers "modelscope[framework]"
 
 # Install latest vllm
 echo ""
