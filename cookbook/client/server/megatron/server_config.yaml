@@ -57,7 +57,7 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2  
+        dp_size: 2
         tp_size: 2                  # 2 TP replicas for multi-tenant throughput
       queue_config:
         rps_limit: 20                               # Max requests per second
