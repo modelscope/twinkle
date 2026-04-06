@@ -97,7 +97,8 @@ class InputProcessor:
                 # so tensor ops like labels != ignore_index or .to(device) would fail without this.
                 if isinstance(value, np.ndarray):
                     value = torch.from_numpy(value)
-                elif isinstance(value, list) and isinstance(value[0], (int, float, np.number)):
+                elif (isinstance(value, list) and isinstance(value[0],
+                                                             (int, float, np.number))) or key == 'position_ids':
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):

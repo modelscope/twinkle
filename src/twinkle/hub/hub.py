@@ -401,7 +401,7 @@ class MSHub(HubOperation):
         cls.try_login(token)
         if revision is None or revision == 'main':
             revision = 'master'
-        load_kwargs = {'trust_remote_code': True}
+        load_kwargs = {'trust_remote_code': kwargs.get('trust_remote_code', True)}
         return MsDataset.load(
             dataset_id,
             subset_name=subset_name,
@@ -595,6 +595,7 @@ class HFHub(HubOperation):
         from datasets import load_dataset
         if revision is None or revision == 'master':
             revision = 'main'
+        trust_remote_code = kwargs.get('trust_remote_code', True)
         return load_dataset(
             dataset_id,
             name=subset_name,
@@ -602,6 +603,7 @@ class HFHub(HubOperation):
             streaming=streaming,
             revision=revision,
             download_mode=download_mode,
+            trust_remote_code=trust_remote_code,
             num_proc=num_proc)
 
     @classmethod

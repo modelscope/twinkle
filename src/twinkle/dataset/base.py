@@ -51,6 +51,9 @@ class Dataset(TorchDataset):
     """
 
     def __init__(self, dataset_meta: DatasetMeta, **kwargs):
+        trust_remote_code = bool(os.environ.get('TWINKLE_TRUST_REMOTE_CODE', '1'))
+        if not trust_remote_code:
+            kwargs['trust_remote_code'] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets = {dataset_meta.get_id(): dataset}
         self.dataset = dataset
@@ -247,6 +250,9 @@ class Dataset(TorchDataset):
         Args:
             dataset_meta: The dataset_meta information of the loaded dataset.
         """
+        trust_remote_code = bool(os.environ.get('TWINKLE_TRUST_REMOTE_CODE', '1'))
+        if not trust_remote_code:
+            kwargs['trust_remote_code'] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets[dataset_meta.get_id()] = dataset
 

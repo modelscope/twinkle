@@ -4,7 +4,7 @@
 # which always occur error
 
 set -e  # Exit immediately on error
-
+export SETUPTOOLS_USE_DISTUTILS=local
 echo "=========================================="
 echo "Starting deep learning dependencies installation..."
 echo "=========================================="
@@ -55,8 +55,8 @@ echo "Using CUDA architecture: $TORCH_CUDA_ARCH_LIST"
 
 # Install latest base packages
 echo ""
-echo "Installing peft, accelerate, transformers, modelscope, oss2..."
-pip install --upgrade peft accelerate transformers "modelscope[framework]" oss2
+echo "Installing peft, accelerate, transformers, modelscope..."
+pip install --upgrade peft accelerate transformers "modelscope[framework]"
 
 # Install latest vllm
 echo ""
@@ -71,7 +71,9 @@ echo "Site-packages path: $SITE_PACKAGES"
 
 CUDNN_PATH=$SITE_PACKAGES/nvidia/cudnn \
 CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
-pip install --no-build-isolation "transformer_engine[pytorch]" megatron_core --no-cache-dir
+pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
+
+pip install megatron_core mcore_bridge --no-cache-dir
 
 # Install flash-attention (force local build)
 echo ""
@@ -87,11 +89,6 @@ pip install flash-linear-attention -U
 echo ""
 echo "Installing numpy==2.2 and deep_gemm..."
 pip install numpy==2.2
-pip uninstall deep_gemm -y
-cd /tmp
-git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
-cd DeepGEMM
-pip install . --no-build-isolation
 
 # Verify installation
 echo ""
@@ -100,7 +97,7 @@ echo ""
 python -c "
 import pkg_resources
 
-packages = ['peft', 'accelerate', 'transformers', 'modelscope', 'oss2', 'vllm', 'transformer_engine', 'megatron_core', 'flash_attn', 'numpy']
+packages = ['peft', 'accelerate', 'transformers', 'modelscope', 'vllm', 'transformer_engine', 'megatron_core', 'flash_attn', 'numpy']
 
 print('Installed package versions:')
 print('-' * 40)
