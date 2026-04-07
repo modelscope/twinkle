@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import torch
 import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig
@@ -28,6 +27,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self,
         model_id: str,
         config: Optional[PretrainedConfig] = None,
+        ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         load_weights: bool = True,
@@ -41,9 +41,9 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
+        requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
-        from .args import TwinkleMegatronArgs, set_args
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -52,56 +52,44 @@ class MultiLoraMegatronModel(MegatronModel):
         self.mixed_precision = mixed_precision
 
         self._model_path = HubOperation.download_model(model_id)
-        self.hf_config = config or AutoConfig.from_pretrained(self._model_path)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-
-        self._seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
+        self._try_init_process_group()
 
-        self.strategy = MegatronStrategy(
-            self.device_mesh,
-            sequence_parallel=self.device_mesh.sequence_parallel,
-            mixed_precision=mixed_precision,
-            **kwargs)
-
-        # Determine params_dtype and activation checkpointing kwargs
-        params_dtype = torch.bfloat16
-        if self.mixed_precision == 'fp16':
-            params_dtype = torch.float16
-        elif self.mixed_precision == 'no':
-            params_dtype = torch.float32
-
-        ac_kwargs = {
+        kwargs.update({
             'recompute_granularity': recompute_granularity,
             'recompute_modules': recompute_modules,
             'recompute_method': recompute_method,
             'recompute_num_layers': recompute_num_layers,
-        }
-
-        # Initialize TwinkleMegatronArgs BEFORE creating the model
-        args = TwinkleMegatronArgs.from_hf_config(
-            self.hf_config,
-            model_dir=self._model_path,
-            device_mesh=self.device_mesh,
-            params_dtype=params_dtype,
-            sequence_parallel=self.strategy.sequence_parallel,
-            **ac_kwargs,
-        )
-
-        set_args(args)
-        self._initialized = False
-        self.model: List[nn.Module] = self._create_megatron_model(load_weights, **kwargs)
-
+            'variable_seq_lengths': self.variable_seq_lengths,
+        })
+        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        if config is None:
+            self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        self.strategy = MegatronStrategy(
+            self._model_path,
+            self.device_mesh,
+            mixed_precision=mixed_precision,
+            config=self.hf_config,
+            ddp_config=ddp_config or {},
+            seed=seed,
+            use_distributed_optimizer=self.use_distributed_optimizer,
+            **kwargs)
+        self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
         MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model = self.multi_adapter.patch(self.model)
         self.model = self.strategy.wrap_model(self.model)
-        self._model_wrapped = True
+        self.strategy.finish_param_config(self.model, None)
         self.multi_adapter.save_initial_weights()
+        self._model_wrapped = True
+        self._finish_config = True
         # Active group for compatibility with single adapter
         self.active_group = None
 
@@ -110,6 +98,9 @@ class MultiLoraMegatronModel(MegatronModel):
                                                                        f'current is: {adapter_name}')
 
     def _lazy_wrap_model(self):
+        pass
+
+    def _lazy_finish_param_config(self):
         pass
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
@@ -166,6 +157,11 @@ class MultiLoraMegatronModel(MegatronModel):
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+            # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
+            kwargs.pop('use_distributed_optimizer', None)
+            kwargs.pop('loss_scale', None)
+            kwargs['fp16'] = False
+            kwargs['bf16'] = True
             return super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function(dispatch='all')
@@ -210,15 +206,15 @@ class MultiLoraMegatronModel(MegatronModel):
             checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             checkpoint_dir = os.path.join(output_dir, name)
-        bridge = self._bridge
+        bridge = self.strategy.bridge
         with self.multi_adapter.save_context(kwargs.get('adapter_name')) as adapter_name:
-            for _model in self.strategy.unwrap_model(self.model):
-                bridge.load_weights(
-                    _model,
-                    checkpoint_dir,
-                    True,
-                    adapter_name=adapter_name,
-                    lora_converter=self.multi_adapter.load_lora_converter)
+            model = self.strategy.unwrap_model(self.model)
+            bridge.load_weights(
+                model,
+                checkpoint_dir,
+                peft_format=True,
+                adapter_name=adapter_name,
+                converter=self.multi_adapter.load_lora_converter)
 
         if dist.is_initialized():
             dist.barrier()

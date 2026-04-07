@@ -34,6 +34,7 @@ class Template:
                  max_length: Optional[int] = 8192,
                  truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
                  default_system: Optional[str] = None,
+                 enable_thinking: bool = True,
                  **kwargs):
         model_id = HubOperation.download_model(model_id, ignore_model=True)
         if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
@@ -47,13 +48,14 @@ class Template:
 
         self.use_chat_template = use_chat_template
         self.max_length = max_length
+        self.enable_thinking = enable_thinking
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
         self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
             self._add_default_system,  # Add a default system field
             self._to_standard_reasoning_content,  # Convert thinking to standard field
-            self._build_mm_messages,  # turn to standard mm messages
+            self._build_standard_messages,  # turn to standard mm messages
         ]
         self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
             self._check_max_length,  # Check and split input_features
@@ -156,6 +158,7 @@ class Template:
 
     def concat_input_feature(self, prompt_input_feature: InputFeature, new_tokens: List[int]) -> InputFeature:
         import copy
+        import torch
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
@@ -163,6 +166,11 @@ class Template:
         labels = [-100] * len(prompt_ids) + new_tokens
         result['input_ids'] = input_ids
         result['labels'] = labels
+        if 'mm_token_type_ids' in result:
+            token_ids_shape = result['mm_token_type_ids'].shape
+            device = result['mm_token_type_ids'].device
+            padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
+            result['mm_token_type_ids'] = torch.cat((result['mm_token_type_ids'], padded_tokens), dim=1)
         new_input_feature = self._invoke_post_pipeline([result])[0]
         result.update(new_input_feature)
         messages: List[Message] = result.get('messages')
@@ -220,8 +228,11 @@ class Template:
                 result['labels'] = result['labels'][:self.max_length]
         return InputFeature(**result)
 
+    def set_mm_position_ids(self, input_feature: InputFeature):
+        return np.arange(len(input_feature['input_ids']))
+
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
-        if not self.max_length:
+        if not self.max_length or 'input_ids' not in input_feature:
             return [input_feature]
 
         strategy = self.truncation_strategy
@@ -242,58 +253,182 @@ class Template:
         return [self._truncate_feature(input_feature, strategy)]
 
     def _add_attention_fields(self, input_feature: InputFeature) -> List[InputFeature]:
+        if 'input_ids' not in input_feature:
+            return [input_feature]
         input_ids = input_feature['input_ids']
         input_feature['attention_mask'] = np.ones_like(input_ids)
-        input_feature['position_ids'] = np.arange(len(input_ids))
+        input_feature['position_ids'] = self.set_mm_position_ids(input_feature)
         input_feature['length'] = len(input_ids)
         return [input_feature]
 
     def _roll_labels(self, input_feature: InputFeature) -> List[InputFeature]:
+        if 'input_ids' not in input_feature:
+            return [input_feature]
         input_feature['labels'] = np.roll(input_feature['labels'], -1, axis=-1)
         return [input_feature]
 
-    def _process_mm_messages(self, messages: List) -> List:
-        """Process multimodal content in a list of messages."""
+    def _process_mm_messages(self, messages: List, images: List, videos: List, audios: List) -> List:
+        """Process multimodal content with trajectory-level media.
+
+        Args:
+            messages: List of messages to process
+            images: Trajectory-level images
+            videos: Trajectory-level videos
+            audios: Trajectory-level audios
+        """
+        # Determine format: list or string (check first non-system message)
+        is_list_format = any(isinstance(m.get('content'), list) for m in messages if m.get('role') != 'system')
+
+        if is_list_format:
+            return self._process_mm_list_format(messages, images, videos, audios)
+        else:
+            return self._process_mm_string_format(messages, images, videos, audios)
+
+    def _process_mm_list_format(self, messages: List, images: List, videos: List, audios: List) -> List:
+        """Process list format content with trajectory-level media."""
+        img_iter, vid_iter, aud_iter = iter(images), iter(videos), iter(audios)
         new_messages = []
-        for message in messages:
+        first_user_idx = None
+
+        for idx, message in enumerate(messages):
             message = copy(message)
-            content = message['content']
+            content = message.get('content')
+
+            if message.get('role') == 'user' and first_user_idx is None:
+                first_user_idx = idx
+
+            # Non-user messages: convert to list format but don't consume iterator
+            if message.get('role') != 'user':
+                if isinstance(content, str):
+                    message['content'] = [{'type': 'text', 'text': content}] if content else []
+                new_messages.append(message)
+                continue
+
+            # User messages: process list content and fill placeholders
             if isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get('type')
-                    if btype == 'image':
-                        for key in ('image', 'url', 'path'):
-                            if key in block and block[key] is not None:
-                                block[key] = self.preprocess_image(block[key])
+                    # Check if block has inline data
+                    has_data = any(block.get(k) for k in (btype, 'url', 'path'))
+                    if has_data:
+                        # Preprocess inline URL
+                        for key in (btype, 'url', 'path'):
+                            if key and block.get(key) is not None:
+                                block[key] = getattr(self, f'preprocess_{btype}', lambda x: x)(block[key])
                                 break
+                    elif btype == 'image':
+                        url = next(img_iter, None)
+                        if url:
+                            block['url'] = url
                     elif btype == 'video':
-                        for key in ('video', 'url', 'path'):
-                            if key in block and block[key] is not None:
-                                block[key] = self.preprocess_video(block[key])
-                                break
-                new_messages.append(message)
-            else:
-                msg_images = message.get('images')
-                msg_videos = message.get('videos')
-                msg_audios = message.get('audios')
-                if msg_images:
-                    message['images'] = self.preprocess_images(msg_images)
-                    assert len(message['images']) == content.count(self.image_placeholder)
-                if msg_videos:
-                    message['videos'] = self.preprocess_videos(msg_videos)
-                    assert len(message['videos']) == content.count(self.video_placeholder)
-                if msg_audios:
-                    message['audios'] = self.preprocess_audios(msg_audios)
-                    assert len(message['audios']) == content.count(self.audio_placeholder)
-                new_messages.append(
-                    transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
-                                                 self.audio_placeholder, self.is_mm))
+                        url = next(vid_iter, None)
+                        if url:
+                            block['url'] = url
+                    elif btype == 'audio':
+                        url = next(aud_iter, None)
+                        if url:
+                            block['url'] = url
+            elif isinstance(content, str):
+                # Convert string content to list format
+                message['content'] = [{'type': 'text', 'text': content}] if content else []
+
+            new_messages.append(message)
+
+        # Prepend remaining media to first user message
+        if first_user_idx is not None:
+            prepend = [{'type': 'image', 'url': u} for u in img_iter]
+            prepend += [{'type': 'video', 'url': u} for u in vid_iter]
+            prepend += [{'type': 'audio', 'url': u} for u in aud_iter]
+            if prepend:
+                msg = new_messages[first_user_idx]
+                content = msg.get('content', [])
+                if not isinstance(content, list):
+                    content = [{'type': 'text', 'text': content}] if content else []
+                msg['content'] = prepend + content
+
         return new_messages
 
-    def _build_mm_messages(self, trajectory: Trajectory) -> List[Trajectory]:
-        trajectory['messages'] = self._process_mm_messages(trajectory['messages'])
+    def _process_mm_string_format(self, messages: List, images: List, videos: List, audios: List) -> List:
+        """Process string format content with trajectory-level media."""
+        # Count total placeholders across all messages
+        total_img = sum(
+            m.get('content', '').count(self.image_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
+        total_vid = sum(
+            m.get('content', '').count(self.video_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
+        total_aud = sum(
+            m.get('content', '').count(self.audio_placeholder) for m in messages
+            if isinstance(m.get('content'), str) and m.get('role') != 'system')
+
+        img_missing = len(images) - total_img
+        vid_missing = len(videos) - total_vid
+        aud_missing = len(audios) - total_aud
+
+        # Find first user message index
+        first_user_idx = next((i for i, m in enumerate(messages) if m.get('role') == 'user'), None)
+
+        new_messages = []
+        img_iter, vid_iter, aud_iter = iter(images), iter(videos), iter(audios)
+
+        for idx, message in enumerate(messages):
+            message = copy(message)
+            content = message.get('content', '')
+
+            # Non-user messages: convert to list format but don't consume iterator
+            if message.get('role') != 'user':
+                if isinstance(content, str):
+                    message['content'] = [{'type': 'text', 'text': content}] if content else []
+                new_messages.append(message)
+                continue
+
+            # User messages: skip non-string content
+            if not isinstance(content, str):
+                new_messages.append(message)
+                continue
+
+            # Prepend missing placeholders to first user message
+            if idx == first_user_idx:
+                if img_missing > 0:
+                    content = self.image_placeholder * img_missing + content
+                if vid_missing > 0:
+                    content = self.video_placeholder * vid_missing + content
+                if aud_missing > 0:
+                    content = self.audio_placeholder * aud_missing + content
+
+            # Count placeholders in this message and assign media
+            msg_img_count = content.count(self.image_placeholder)
+            msg_vid_count = content.count(self.video_placeholder)
+            msg_aud_count = content.count(self.audio_placeholder)
+
+            msg_images = [next(img_iter, None) for _ in range(msg_img_count)]
+            msg_videos = [next(vid_iter, None) for _ in range(msg_vid_count)]
+            msg_audios = [next(aud_iter, None) for _ in range(msg_aud_count)]
+
+            message['content'] = content
+            message['images'] = [i for i in msg_images if i is not None]
+            message['videos'] = [v for v in msg_videos if v is not None]
+            message['audios'] = [a for a in msg_audios if a is not None]
+
+            message = transfer_to_standard_message(message, self.image_placeholder, self.video_placeholder,
+                                                   self.audio_placeholder, self.is_mm)
+
+            new_messages.append(message)
+
+        return new_messages
+
+    def _build_standard_messages(self, trajectory: Trajectory) -> List[Trajectory]:
+        # Extract trajectory-level media
+        images = self.preprocess_images(trajectory.pop('images', None) or [])
+        videos = self.preprocess_videos(trajectory.pop('videos', None) or [])
+        audios = self.preprocess_audios(trajectory.pop('audios', None) or [])
+
+        trajectory['messages'] = self._process_mm_messages(trajectory['messages'], images, videos, audios)
+        if not self.is_mm:
+            for message in trajectory['messages']:
+                message['content'] = message['content'][0]['text']
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -309,52 +444,65 @@ class Template:
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
+        if 'tokenize' not in kwargs:
+            kwargs['tokenize'] = True
+        if 'enable_thinking' not in kwargs:
+            kwargs['enable_thinking'] = self.enable_thinking
         inputs = self.processor.apply_chat_template(
             messages,
             tools=tools,
             padding=False,
-            tokenize=True,
             return_dict=True,
             add_generation_prompt=add_generation_prompt,
             return_tensors='pt',
             **kwargs)
         return inputs
 
-    def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
+    def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""
+        labels = None
+        input_ids = None
         if self.use_chat_template:
             if add_generation_prompt:
                 # For inference: just get input_ids with generation prompt, no labels needed
-                encoded = self._apply_chat_template(trajectory, add_generation_prompt=True)
-                input_ids = encoded.pop('input_ids')
-                if hasattr(input_ids, 'squeeze'):
-                    input_ids = input_ids.squeeze(0)
-                labels = np.full_like(input_ids, -100)  # No labels for inference
+                encoded = self._apply_chat_template(trajectory, add_generation_prompt=True, **kwargs)
+                if 'input_ids' in encoded:
+                    input_ids = encoded.pop('input_ids')
+                    if hasattr(input_ids, 'squeeze'):
+                        input_ids = input_ids.squeeze(0)
+                    labels = np.full_like(input_ids, -100)  # No labels for inference
             elif self._template_support_assistant_tokens_mask:
-                encoded = self._apply_chat_template(trajectory, return_assistant_tokens_mask=True)
-                input_ids = encoded.pop('input_ids')
-                assistant_masks = encoded.pop('assistant_masks')
-                labels = np.where(assistant_masks, input_ids, -100)
+                encoded = self._apply_chat_template(
+                    trajectory, return_assistant_tokens_mask=kwargs.get('tokenize', True), **kwargs)
+                if 'input_ids' in encoded:
+                    input_ids = encoded.pop('input_ids')
+                    assistant_masks = encoded.pop('assistant_masks')
+                    labels = np.where(assistant_masks, input_ids, -100)
             else:
-                input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(
-                    self.tokenizer, self._apply_chat_template, trajectory)
+                if kwargs.get('tokenize', True):
+                    input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(
+                        self.tokenizer, self._apply_chat_template, trajectory, **kwargs)
+                else:
+                    encoded = self._apply_chat_template(trajectory, **kwargs)
         else:
             assert len(trajectory['messages']) == 1 and trajectory['messages'][0]['role'] == 'user'
             text = trajectory['messages'][0]['content']
-            input_ids = self.tokenizer.encode(text)
+            input_ids = self.tokenizer.encode(text, **kwargs)
             encoded = {}
             labels = deepcopy(input_ids)
-
-        input_feature = InputFeature(
-            input_ids=np.array(input_ids),
-            labels=np.array(labels),
-            **encoded,
-        )
+        if isinstance(encoded, str):
+            input_feature = {'prompt': encoded}
+        else:
+            input_feature = InputFeature(
+                input_ids=np.array(input_ids),
+                labels=np.array(labels),
+                **encoded,
+            )
         trajectory.update(input_feature)
         return trajectory
 
-    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        return self._encode_messages(trajectory, add_generation_prompt)
+    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
+        return self._encode_messages(trajectory, add_generation_prompt, **kwargs)
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
@@ -395,7 +543,7 @@ class Template:
                     keys.append(k)
         else:
             for k, v in trajectories.items():
-                if v and self._is_trajectory(v):
+                if v is not None and self._is_trajectory(v):
                     keys.append(k)
         return keys
 
@@ -403,6 +551,7 @@ class Template:
         self,
         trajectories: Union[Dict[str, List[Any]], List[Trajectory]],
         add_generation_prompt: bool = False,
+        **kwargs,
     ) -> Union[Dict[str, Any], List[InputFeature]]:
         """Encode trajectories into InputFeatures.
 
@@ -448,7 +597,11 @@ class Template:
         # Use thread pool for parallel encoding
         from concurrent.futures import ThreadPoolExecutor
         from functools import partial
-        encode_fn = partial(self.encode, add_generation_prompt=add_generation_prompt)
+        encode_fn = partial(
+            self.encode,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
         with ThreadPoolExecutor() as executor:
             output = list(executor.map(encode_fn, trajectories))
 

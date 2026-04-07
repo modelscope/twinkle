@@ -1,4 +1,11 @@
+"""GRPO training script for GSM8K dataset.
+
+Converted from the Tinker client version to Ray-based training.
+Uses short reasoning format: shorter thinking gets higher format reward.
+Answer extracted from \\boxed{} or #### format.
+"""
 import os
+import re
 from typing import List, Tuple, Dict, Any
 
 from peft import LoraConfig
@@ -10,80 +17,136 @@ from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
+from twinkle.reward import GSM8KAccuracyReward
+from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
-from twinkle.template import Template
-from twinkle.metric import CompletionRewardMetric
 from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
 
+# ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS',4))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 200))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8)) # global prompt-level, global completion-level batch size = BATCH_SIZE * num_generations * dp_size
-MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8)) # global completion-level mini-batch-size
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2)) # per-device-micro-batch-size (completion-level), batch_size in forward_backward
+MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
+MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
-SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
+SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1000))
+LORA_RANK = int(os.environ.get('LORA_RANK', 16))
 
+SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
+                 'and put your final answer within \\boxed{}.')
+
+import swanlab
+swanlab.init(
+    project='twinkle',
+)
+
+
+# ========== Reward Functions ==========
+class GSM8KBrevityReward(Reward):
+    """Brevity reward: rewards shorter completions that contain a valid answer.
+
+    Returns 0.0 if no valid answer format (\\boxed{} or ####).
+    Otherwise returns higher score for shorter completions (1.0 at <=200 chars).
+    """
+
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+        rewards = []
+        for traj in trajectories:
+            messages = traj.get('messages', [])
+            completion = ''
+            for msg in reversed(messages):
+                if msg.get('role') == 'assistant':
+                    completion = msg.get('content', '')
+                    break
+
+            has_answer = bool(
+                re.search(r'\\boxed\{[^}]+\}', completion)
+                or re.search(r'####\s*[\-\d,\.]+', completion)
+            )
+
+            if not has_answer:
+                rewards.append(0.0)
+            else:
+                length = len(completion)
+                if length <= 200:
+                    rewards.append(1.0)
+                else:
+                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
+        return rewards
+
+
+# ========== Dataset ==========
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
-    dataset.map(GSM8KProcessor())
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
+    dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
+
 
 def compute_rewards(
     trajectories: List[Dict[str, Any]],
 ) -> Tuple[List[float], List[float], List[float]]:
     accuracy_reward_fn = GSM8KAccuracyReward()
-    format_reward_fn = GSM8KFormatReward()
+    brevity_reward_fn = GSM8KBrevityReward()
 
     accuracy_rewards = accuracy_reward_fn(trajectories)
-    format_rewards = format_reward_fn(trajectories)
-    total_rewards = [a + f for a, f in zip(accuracy_rewards, format_rewards)]
-    return total_rewards, format_rewards, accuracy_rewards
+    brevity_rewards = brevity_reward_fn(trajectories)
+    total_rewards = [a + b for a, b in zip(accuracy_rewards, brevity_rewards)]
+    return total_rewards, brevity_rewards, accuracy_rewards
 
+
+# ========== Main ==========
 def main():
-    # set sampler and model separate to use different gpus
     device_groups = [
-        DeviceGroup(name='model',ranks=list(range(MODEL_GPUS)),device_type='GPU'),
-        DeviceGroup(name='sampler',ranks=list(range(MODEL_GPUS, NUM_GPUS)),device_type='GPU'),
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
     ]
-    if USE_MEGATRON:
-        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
-    else:
-        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
-    # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',
             'gate_proj', 'up_proj', 'down_proj',
             'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
         ],
-        r=32, lora_alpha=64, lora_dropout=0.05,
+        r=LORA_RANK,
+        lora_alpha=LORA_RANK * 2,
+        lora_dropout=0.05,
     )
+
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
-        model = MegatronModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
+        model = MegatronModel(
+            model_id=MODEL_ID,
+            device_mesh=model_mesh,
+            remote_group='model',
+            mixed_precision='bf16',
+        )
     else:
-        from transformers import Qwen3_5ForConditionalGeneration
-        model = TransformersModel(model_id=MODEL_ID, model_cls=Qwen3_5ForConditionalGeneration, device_mesh=model_mesh, remote_group='model')
+        model = TransformersModel(
+            model_id=MODEL_ID,
+            device_mesh=model_mesh,
+            remote_group='model',
+        )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
     if USE_MEGATRON:
@@ -92,15 +155,16 @@ def main():
     else:
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
+
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.8,
-            'max_model_len': 4496,
+            'max_model_len': 8192,
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,
@@ -108,7 +172,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -120,23 +184,29 @@ def main():
         device_mesh=model_mesh,
         remote_group='model',
     )
+
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
-
-    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95)
 
     optim_step = 0
+    logger.info('Starting GSM8K GRPO training (short reasoning)')
     logger.info(get_device_placement())
 
     for batch in dataloader:
         if optim_step >= MAX_STEPS:
             break
+
         metrics.reset()
-        global_prompts = batch if isinstance(batch, list) else [batch]
+        expand_prompts = []
+        for prompt in batch:
+            expand_prompts.extend([prompt] * NUM_GENERATIONS)
+
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
+
         sample_responses = sampler.sample(
-            global_prompts*NUM_GENERATIONS,
+            expand_prompts,
             sampling_params,
         )
 
@@ -149,21 +219,20 @@ def main():
                 all_input_data.append(sequence.new_input_feature)
                 all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
                 all_completion_lengths.append(len(sequence.tokens))
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
-            all_input_data
-        )
+
+        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(all_input_data)
+
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
                 'total': total_rewards,
-                'format': format_rewards,
+                'brevity': brevity_rewards,
                 'accuracy': accuracy_rewards,
             },
         )
 
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
 
-        # Split completions into mini-batches and run one optim step per mini-batch.
         total_completions = len(all_input_data)
         for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
             mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
@@ -183,14 +252,17 @@ def main():
             if optim_step >= MAX_STEPS:
                 break
             if optim_step % SAVE_STEPS == 0:
-                model.save(f'grpo-gsm8k-checkpoint-{optim_step}')
-            log_dict = metrics.calculate()
-            log_dict.update(model.calculate_metric(is_training=True))
-            metrics.reset()
-            logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
+                model.save(f'math-grpo-checkpoint-{optim_step}')
+
+        log_dict = metrics.calculate()
+        log_dict.update(model.calculate_metric(is_training=True))
+        swanlab.log(log_dict)
+        metrics.reset()
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
-    model.save('grpo-gsm8k-checkpoint')
+    model.save('math-grpo-final')
+
 
 if __name__ == '__main__':
     main()

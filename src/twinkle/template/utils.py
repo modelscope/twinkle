@@ -115,7 +115,7 @@ def transfer_to_standard_message(message: Message, image_placeholder, video_plac
                                                audio_placeholder, message.get('images'), message.get('videos'),
                                                message.get('audios'))
     else:
-        new_content = message['content']
+        new_content = [{'type': 'text', 'text': message['content']}]
 
     return Message(
         role=message['role'],
@@ -193,11 +193,8 @@ class TokenizeByRound:
     """
 
     @staticmethod
-    def tokenize_with_assistant_labels(
-        tokenizer: 'PreTrainedTokenizer',
-        encode_func: Callable,
-        trajectory: Trajectory,
-    ) -> Tuple[List[int], List[int], Dict[str, Any]]:
+    def tokenize_with_assistant_labels(tokenizer: 'PreTrainedTokenizer', encode_func: Callable, trajectory: Trajectory,
+                                       **kwargs) -> Tuple[List[int], List[int], Dict[str, Any]]:
         """Tokenize trajectory and generate labels for assistant turns.
 
         Args:
@@ -214,7 +211,7 @@ class TokenizeByRound:
         messages = trajectory['messages']
 
         # Encode full trajectory
-        encoded = encode_func(trajectory)
+        encoded = encode_func(trajectory, **kwargs)
         full_ids = encoded.pop('input_ids')
         if isinstance(full_ids, torch.Tensor):
             full_ids = full_ids.tolist()[0]
@@ -233,7 +230,7 @@ class TokenizeByRound:
             # encode(messages[:i], add_generation_prompt=True) includes the prefix
             partial_trajectory = copy(trajectory)
             partial_trajectory['messages'] = list(messages[:i])
-            partial_ids = encode_func(partial_trajectory, add_generation_prompt=True)['input_ids']
+            partial_ids = encode_func(partial_trajectory, add_generation_prompt=True, **kwargs)['input_ids']
             if isinstance(partial_ids, torch.Tensor):
                 partial_ids = partial_ids.tolist()[0]
             start_pos = len(partial_ids)
@@ -241,7 +238,7 @@ class TokenizeByRound:
             # Get end position: encode(messages[:i+1]) includes full assistant turn
             partial_trajectory = copy(trajectory)
             partial_trajectory['messages'] = list(messages[:i + 1])
-            partial_ids = encode_func(partial_trajectory)['input_ids']
+            partial_ids = encode_func(partial_trajectory, **kwargs)['input_ids']
             if isinstance(partial_ids, torch.Tensor):
                 partial_ids = partial_ids.tolist()[0]
             end_pos = len(partial_ids)

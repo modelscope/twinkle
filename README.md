@@ -131,7 +131,7 @@ supported on Twinkle✨ framework.
 > For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it
 > is currently provided via the Tinker-compatible APIs. We will be rolling out services that support
 > both Tinker APIs, as well as the full-fledged Twinkle✨ native APIs. The serverless endpoint is backed
-> by one training base at a time, and currently it is [Qwen3.5-4B](https://modelscope.cn/models/Qwen/Qwen3.5-4B).
+> by one training base at a time, and currently it is [Qwen3.5-27B](https://modelscope.cn/models/Qwen/Qwen3.5-27B).
 
 | Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                 |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
@@ -180,7 +180,7 @@ twinkle.initialize(mode='ray', groups=device_group, global_device_mesh=device_me
 
 def train():
     # to load model from Hugging Face, use 'hf://...'
-    base_model = 'ms://Qwen/Qwen3.5-4B'
+    base_model = 'ms://Qwen/Qwen3.5-27B'
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
@@ -236,7 +236,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.5-4B'
+base_model = 'ms://Qwen/Qwen3.5-27B'
 base_url='your-base-url'
 api_key='your-api-key'
 

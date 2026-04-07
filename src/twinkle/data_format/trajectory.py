@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from .message import Message, Tool
 
@@ -15,3 +15,7 @@ class Trajectory(TypedDict, total=False):
     messages: List[Message]
     tools: List[Tool]
     user_data: List[Tuple[str, Any]]
+    images: Optional[List[Union[str, Any]]]
+    videos: Optional[List[Union[str, Any]]]
+    audios: Optional[List[Union[str, Any]]]
+    prompt: Optional[str]
