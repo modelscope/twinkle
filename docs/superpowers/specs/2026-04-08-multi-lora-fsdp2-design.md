@@ -1,33 +1,29 @@
-# Multi-LoRA Transformers FSDP2 Staged Support Design
+# Multi-LoRA Transformers FSDP2 SFT Support Design
 
 ## Summary
 
-Enable `MultiLoraTransformersModel` to run under FSDP2 for both `AccelerateStrategy` and `NativeFSDPStrategy`, with staged delivery. The end goal is to run both SFT and GRPO training under FSDP2, but implementation will proceed in this order:
+Enable `MultiLoraTransformersModel` to run under FSDP2 for SFT across both `AccelerateStrategy` and `NativeFSDPStrategy`, with staged delivery. Implementation will proceed in this order:
 
 1. `AccelerateStrategy + SFT`
-2. `AccelerateStrategy + GRPO`
-3. `native_fsdp + SFT`
-4. `native_fsdp + GRPO`
+2. `native_fsdp + SFT`
 
-The design centers on a shared FSDP2 compatibility layer for transformers multi-LoRA, so each later stage builds on the same model lifecycle, adapter-slot semantics, and distributed weight handling.
+The design centers on a shared FSDP2 compatibility layer for transformers multi-LoRA, so the native FSDP stage builds on the same model lifecycle, adapter-slot semantics, and distributed weight handling established by the accelerate stage.
 
 ## Goals
 
 ### Final Goal
 
-Make `MultiLoraTransformersModel` work under FSDP2 for both SFT and GRPO, across both supported transformers strategies:
+Make `MultiLoraTransformersModel` work under FSDP2 for SFT across both supported transformers strategies:
 
 - `AccelerateStrategy`
 - `NativeFSDPStrategy`
 
 ### Delivery Goal
 
-Ship the capability in four stages:
+Ship the capability in two stages:
 
 1. `AccelerateStrategy + SFT`
-2. `AccelerateStrategy + GRPO`
-3. `native_fsdp + SFT`
-4. `native_fsdp + GRPO`
+2. `native_fsdp + SFT`
 
 Each stage must leave the shared foundations in a state that later stages can reuse without strategy-specific rewrites.
 
@@ -37,7 +33,8 @@ Each stage must leave the shared foundations in a state that later stages can re
 - No sampler or checkpoint-engine LoRA sync expansion in this workstream
 - No attempt to solve all distributed checkpoint migration cases across arbitrary sharding layouts
 - No requirement to support multi-adapter concurrent training in the initial stages
-- No large-scale performance tuning or RL throughput optimization as part of correctness work
+- No GRPO support in this workstream
+- No large-scale performance tuning as part of correctness work
 - No deep rewrite that merges `MultiLoraTransformersModel` into the single-adapter transformers implementation
 
 ## Current Problem
@@ -57,14 +54,14 @@ Because of that:
 - `AccelerateStrategy` cannot shard the model for multi-LoRA training
 - `NativeFSDPStrategy` is not wired into multi-LoRA at all
 - adapter slot persistence is unsafe once LoRA parameters become DTensors or other sharded parameter forms
-- GRPO-specific paths such as `forward_only`, `disable_lora`, and server-side forward-backward entrypoints cannot be trusted under FSDP2
+- SFT under FSDP2 is currently blocked for both strategy paths
 
 ## Design Principles
 
 - Keep the existing multi-slot adapter model: tenants bind to preallocated internal LoRA slots
 - Build one shared FSDP2 compatibility layer instead of separate accelerate-only and native-only implementations
 - Let strategy differences stay in strategy code paths, not in duplicated multi-LoRA business logic
-- Stage rollout by training scenario, but avoid temporary patches that block later phases
+- Stage rollout by strategy, but avoid temporary patches that block later phases
 - Prefer the smallest regression tests that prove correctness at each phase
 
 ## Proposed Architecture
@@ -72,7 +69,7 @@ Because of that:
 The work is split into two layers:
 
 1. A shared FSDP2 compatibility foundation for transformers multi-LoRA
-2. A staged rollout over SFT and GRPO for accelerate and native FSDP2
+2. A staged rollout over SFT for accelerate and native FSDP2
 
 ### Shared Foundation
 
@@ -121,9 +118,8 @@ The following behaviors must stay valid after wrapping:
 - `deactivate_adapter`
 - `save_context`
 - `remove_adapter`
-- `disable_lora` inference paths
 
-This is especially important for GRPO, where policy-style and LoRA-disabled paths need to coexist without corrupting adapter state.
+This is important even in SFT because adapter activation, save/load, and slot reset must behave the same before and after wrapping.
 
 #### 4. Unified save/load/remove semantics
 
@@ -148,7 +144,6 @@ Shared fixtures/helpers should cover:
 - a minimal multi-LoRA transformers model builder
 - adapter-slot inspection helpers
 - minimal SFT input samples
-- minimal GRPO input samples
 
 This avoids rebuilding test infrastructure at every phase.
 
@@ -180,35 +175,11 @@ Implementation focus:
 
 Explicitly out of scope for this phase:
 
-- GRPO server entrypoints
+- GRPO
 - multi-adapter concurrent training
 - sampler sync
 
-### Phase 2: `AccelerateStrategy + GRPO`
-
-Build on Phase 1 and add GRPO-specific correctness.
-
-Supported flow:
-
-- `forward_only` under wrapped accelerate FSDP2
-- `disable_lora` behavior for reference-style inference
-- `GRPOLoss` training inputs, including `old_logps` and `advantages`
-- minimal GRPO forward-backward-step flow through:
-  - twinkle-native path
-  - tinker-compatible server path
-
-Implementation focus:
-
-- active adapter switching during GRPO paths
-- correctness of `disable_lora` under wrapped PEFT model state
-- minimal regression coverage for GRPO entrypoints
-
-Explicitly out of scope for this phase:
-
-- online sampler orchestration
-- large-scale RL performance tuning
-
-### Phase 3: `native_fsdp + SFT`
+### Phase 2: `native_fsdp + SFT`
 
 Add native FSDP2 support by reusing the shared foundation.
 
@@ -232,25 +203,6 @@ Key risk areas:
 - optimizer param-group rebinding after wrapping
 - LoRA forward patch assumptions when parameters are sharded
 
-### Phase 4: `native_fsdp + GRPO`
-
-Complete the matrix by validating GRPO under native FSDP2.
-
-Supported flow:
-
-- `forward_only`
-- `disable_lora`
-- `GRPOLoss`
-- `clip_grad_norm`
-- `step`
-- minimal GRPO server/backend path
-
-Implementation focus:
-
-- native FSDP interaction with GRPO control flow
-- slot-state correctness while toggling LoRA-enabled and LoRA-disabled execution
-- final GRPO regression coverage under native FSDP2
-
 ## Test Plan
 
 Tests should expand phase by phase, but stay narrow and behavior-oriented.
@@ -272,21 +224,9 @@ Tests should expand phase by phase, but stay narrow and behavior-oriented.
 
 #### Phase 2
 
-- accelerate FSDP2 GRPO forward-backward path succeeds
-- `disable_lora` behavior stays correct under wrapped execution
-- minimal server/backend GRPO entrypoint succeeds
-
-#### Phase 3
-
 - native FSDP2 construction succeeds
 - native SFT forward-backward-step succeeds
 - native save/load/remove semantics are correct
-
-#### Phase 4
-
-- native FSDP2 GRPO forward-backward path succeeds
-- native `disable_lora` path remains correct
-- minimal native GRPO server/backend entrypoint succeeds
 
 ## Risks
 
@@ -294,12 +234,12 @@ Tests should expand phase by phase, but stay narrow and behavior-oriented.
 - accelerate and native FSDP2 may expose LoRA parameters through different tensor representations
 - some helper logic may accidentally reconstruct full tensors when only local shards are needed
 - lazy wrap may surface ordering issues around optimizer creation, adapter activation, or template hooks
-- GRPO adds path complexity because it mixes training, inference-style forward passes, and LoRA-disabled execution
 
 ## Deferred Work
 
 These should remain outside this design unless later stages prove them necessary for correctness:
 
+- GRPO support for either strategy
 - sampler or checkpoint-engine LoRA synchronization enhancements
 - memory-efficient-init customization specific to transformers multi-LoRA
 - megatron multi-LoRA parity work
@@ -308,16 +248,14 @@ These should remain outside this design unless later stages prove them necessary
 
 ## Acceptance Criteria
 
-This design is complete when all four stages are delivered in order and each stage has dedicated regression coverage:
+This design is complete when both stages are delivered in order and each stage has dedicated regression coverage:
 
 1. `AccelerateStrategy + SFT`
-2. `AccelerateStrategy + GRPO`
-3. `native_fsdp + SFT`
-4. `native_fsdp + GRPO`
+2. `native_fsdp + SFT`
 
-At the end of the full rollout:
+At the end of the rollout:
 
 - `MultiLoraTransformersModel` supports FSDP2 under both accelerate and native strategies
-- SFT and GRPO both run through the supported transformers multi-LoRA paths
+- SFT runs through the supported transformers multi-LoRA paths under both strategies
 - save, load, and remove adapter semantics remain correct under FSDP2
 - unsupported areas remain explicitly unchanged
