@@ -1,132 +1,323 @@
-# Multi-LoRA Transformers FSDP2 Support Design
+# Multi-LoRA Transformers FSDP2 Staged Support Design
 
 ## Summary
 
-Enable `MultiLoraTransformersModel` to run with FSDP2 model sharding while keeping `AccelerateStrategy` as the default strategy. The initial scope is intentionally narrow: support the training critical path and LoRA weight persistence for the transformers multi-LoRA backend, without expanding into sampler sync or broader checkpoint compatibility work.
+Enable `MultiLoraTransformersModel` to run under FSDP2 for both `AccelerateStrategy` and `NativeFSDPStrategy`, with staged delivery. The end goal is to run both SFT and GRPO training under FSDP2, but implementation will proceed in this order:
 
-## Goal
+1. `AccelerateStrategy + SFT`
+2. `AccelerateStrategy + GRPO`
+3. `native_fsdp + SFT`
+4. `native_fsdp + GRPO`
 
-Make the following flow work when `device_mesh.fsdp_world_size > 1`:
+The design centers on a shared FSDP2 compatibility layer for transformers multi-LoRA, so each later stage builds on the same model lifecycle, adapter-slot semantics, and distributed weight handling.
 
-- construct `MultiLoraTransformersModel`
-- add a LoRA adapter
-- run `forward`, `calculate_loss`, `backward`, `step`, and `zero_grad`
-- save and load LoRA adapter weights
-- remove an adapter and restore the slot to its initial state
+## Goals
+
+### Final Goal
+
+Make `MultiLoraTransformersModel` work under FSDP2 for both SFT and GRPO, across both supported transformers strategies:
+
+- `AccelerateStrategy`
+- `NativeFSDPStrategy`
+
+### Delivery Goal
+
+Ship the capability in four stages:
+
+1. `AccelerateStrategy + SFT`
+2. `AccelerateStrategy + GRPO`
+3. `native_fsdp + SFT`
+4. `native_fsdp + GRPO`
+
+Each stage must leave the shared foundations in a state that later stages can reuse without strategy-specific rewrites.
 
 ## Non-Goals
 
-- No new sampler or checkpoint-engine synchronization behavior
-- No dedicated `native_fsdp` path for multi-LoRA in this iteration
-- No broader refactor to merge `MultiLoraTransformersModel` into the single-adapter transformers stack
-- No new guarantees around optimizer state migration across sharding layouts
-- No changes to megatron multi-LoRA behavior
+- No megatron multi-LoRA changes in this workstream
+- No sampler or checkpoint-engine LoRA sync expansion in this workstream
+- No attempt to solve all distributed checkpoint migration cases across arbitrary sharding layouts
+- No requirement to support multi-adapter concurrent training in the initial stages
+- No large-scale performance tuning or RL throughput optimization as part of correctness work
+- No deep rewrite that merges `MultiLoraTransformersModel` into the single-adapter transformers implementation
 
 ## Current Problem
 
-`MultiLoraTransformersModel` currently blocks FSDP usage and bypasses the normal transformers wrapping lifecycle:
+`MultiLoraTransformersModel` currently does not participate correctly in the transformers FSDP2 lifecycle.
 
-- it asserts that FSDP is unsupported during construction
-- it always uses `AccelerateStrategy(device_mesh=None)`
-- it eagerly wraps the model in `__init__`
-- multi-LoRA save/load helpers assume local tensors and perform direct `parameter.data.copy_` writes
+Current blockers:
 
-That combination prevents Accelerate FSDP2 from sharding the model and makes adapter state handling unsafe once LoRA parameters become sharded tensors.
+- construction hard-rejects FSDP via an assert
+- the class always uses `AccelerateStrategy(device_mesh=None)`
+- the model is eagerly wrapped in `__init__` instead of participating in lazy wrap
+- multi-LoRA weight helpers assume local tensors and directly mutate `parameter.data`
+- save, load, and slot-reset behavior is not strategy-aware
 
-## Proposed Approach
+Because of that:
 
-Keep the existing class and multi-slot adapter design, but make it FSDP2-compatible under the default Accelerate path.
+- `AccelerateStrategy` cannot shard the model for multi-LoRA training
+- `NativeFSDPStrategy` is not wired into multi-LoRA at all
+- adapter slot persistence is unsafe once LoRA parameters become DTensors or other sharded parameter forms
+- GRPO-specific paths such as `forward_only`, `disable_lora`, and server-side forward-backward entrypoints cannot be trusted under FSDP2
 
-### 1. Strategy and wrapping lifecycle
+## Design Principles
 
-Update `MultiLoraTransformersModel` so it no longer hard-disables FSDP.
+- Keep the existing multi-slot adapter model: tenants bind to preallocated internal LoRA slots
+- Build one shared FSDP2 compatibility layer instead of separate accelerate-only and native-only implementations
+- Let strategy differences stay in strategy code paths, not in duplicated multi-LoRA business logic
+- Stage rollout by training scenario, but avoid temporary patches that block later phases
+- Prefer the smallest regression tests that prove correctness at each phase
 
-- remove the constructor assert that rejects FSDP
-- instantiate `AccelerateStrategy` with the real `device_mesh`
-- keep `multi_adapter.patch(self.model)` before any wrapping so the sharded model includes all LoRA slots
-- stop eager wrapping in `__init__`
-- implement `_lazy_wrap_model()` by reusing the parent lifecycle so wrapping happens after optimizers are created
+## Proposed Architecture
 
-This preserves the current default strategy choice while allowing Accelerate's FSDP2 plugin to own sharding.
+The work is split into two layers:
 
-### 2. DTensor-safe multi-LoRA weight access
+1. A shared FSDP2 compatibility foundation for transformers multi-LoRA
+2. A staged rollout over SFT and GRPO for accelerate and native FSDP2
 
-Adjust `MultiLora` helper methods so they work when LoRA parameters are represented as sharded tensors.
+### Shared Foundation
 
-Methods that need FSDP2-aware handling:
+The shared foundation must be correct before later phases can be added safely.
 
-- `save_initial_weights`
-- `_load_initial_weights`
-- `set_state_dict`
-- `get_state_dict`
-- `save_lora_converter`
+#### 1. Unified strategy selection and lazy wrap lifecycle
 
-Design rules:
+`MultiLoraTransformersModel` should stop managing wrapping as a special case.
 
-- reading weights should operate on a local or reconstructed tensor view rather than assuming a plain parameter tensor
-- writing weights should detect DTensor-like parameters and transform incoming checkpoint tensors to the target layout before copy
-- LoRA rank slicing rules remain unchanged for `lora_A`, `lora_B`, `lora_embedding_A`, and `lora_embedding_B`
+Required changes:
 
-The intent is not to create a fully generic distributed checkpoint layer, only to make the current LoRA slot persistence logic safe for FSDP2.
+- remove the constructor assert that blocks FSDP
+- stop forcing `AccelerateStrategy(device_mesh=None)`
+- let the class honor the requested strategy:
+  - default remains `AccelerateStrategy`
+  - `strategy='native_fsdp'` must instantiate `NativeFSDPStrategy`
+- keep `multi_adapter.patch(self.model)` before wrapping so LoRA slots exist in the wrapped model graph
+- move wrapping back into `_lazy_wrap_model()` so optimizer creation and strategy wrapping follow the same lifecycle as transformers models
 
-### 3. Multi-LoRA load path
+This is the main prerequisite for supporting both accelerate and native FSDP2 without forking the class.
 
-Extend `MultiLoraTransformersModel.load()` to mirror the existing single-adapter transformers FSDP2 behavior.
+#### 2. Strategy-aware multi-LoRA parameter access
 
-Current single-adapter transformers code already converts CPU adapter weights into the destination distributed layout before applying them. The multi-LoRA path should reuse the same idea, but route tensors into the tenant-owned slot inside `MultiLora` instead of using `set_peft_model_state_dict` directly.
+`MultiLora` needs a small internal abstraction for reading and writing LoRA slot tensors under both unsharded and sharded parameter representations.
 
-Expected behavior:
+This abstraction should support:
 
-- checkpoint weights load on CPU first
-- keys are mapped into the real internal adapter slot
-- tensors are distributed as needed to match the wrapped parameter layout
-- values are copied into the correct LoRA slot for the tenant adapter
+- reading a saveable tensor view from LoRA slot parameters
+- writing checkpoint tensors into LoRA slot parameters with the correct target layout
+- restoring initial slot values when an adapter is removed
+- preserving existing rank slicing rules for:
+  - `lora_A`
+  - `lora_B`
+  - `lora_embedding_A`
+  - `lora_embedding_B`
 
-### 4. Test coverage
+The goal is not a generic distributed checkpoint layer. The goal is to make the current multi-LoRA slot logic safe under FSDP2.
 
-Add the smallest set of tests that proves the supported scope.
+#### 3. Stable adapter-slot state machine after wrapping
 
-Required checks:
+The tenant-to-slot model is part of the multi-LoRA contract and should remain unchanged.
 
-- constructing `MultiLoraTransformersModel` with an FSDP-enabled mesh no longer fails
-- adding an adapter and running one training step succeeds under Accelerate FSDP2
-- `get_state_dict` followed by `load` round-trips LoRA weights correctly
-- removing an adapter restores the slot to its initial values
+The following behaviors must stay valid after wrapping:
 
-Test strategy:
+- `activate_adapter`
+- `deactivate_adapter`
+- `save_context`
+- `remove_adapter`
+- `disable_lora` inference paths
 
-- prefer a focused regression test near the transformers model tests
-- keep the model and world size small
-- assert behavior on LoRA slot tensors, not just that no exception was raised
+This is especially important for GRPO, where policy-style and LoRA-disabled paths need to coexist without corrupting adapter state.
 
-## Implementation Outline
+#### 4. Unified save/load/remove semantics
 
-1. Update `MultiLoraTransformersModel.__init__` to keep the default Accelerate path but pass through `device_mesh`
-2. Move model wrapping out of construction and back into `_lazy_wrap_model`
-3. Add FSDP2-safe tensor conversion helpers in `MultiLora`
-4. Update multi-LoRA load and slot-reset code to use those helpers
-5. Add regression tests for FSDP2 construction, train step, save/load, and remove
+The same slot-aware semantics should apply regardless of strategy.
+
+Required behaviors:
+
+- `get_state_dict` returns the tenant adapter's LoRA state with correct rank slicing
+- `load` maps checkpoint weights into the correct internal slot
+- `remove_adapter` restores the slot to its initial weights
+- save/load logic works under both wrapped and unwrapped model states
+
+Single-adapter transformers already has FSDP2-aware load behavior. Multi-LoRA should reuse that idea, but route tensors through tenant-owned slots instead of direct single-adapter PEFT application.
+
+#### 5. Reusable test scaffolding
+
+Even though rollout is staged, the test base should be reusable from the start.
+
+Shared fixtures/helpers should cover:
+
+- a minimal FSDP2-capable device mesh
+- a minimal multi-LoRA transformers model builder
+- adapter-slot inspection helpers
+- minimal SFT input samples
+- minimal GRPO input samples
+
+This avoids rebuilding test infrastructure at every phase.
+
+## Staged Rollout
+
+### Phase 1: `AccelerateStrategy + SFT`
+
+This is the first delivery milestone and the narrowest supported training loop.
+
+Supported flow:
+
+- construct `MultiLoraTransformersModel` with accelerate FSDP2
+- add a single LoRA adapter
+- run SFT training:
+  - `forward`
+  - `calculate_loss(CrossEntropyLoss)`
+  - `backward`
+  - `clip_grad_norm`
+  - `step`
+  - `zero_grad`
+- save and load LoRA adapter state
+- remove the adapter and restore the slot
+
+Implementation focus:
+
+- strategy/lazy-wrap integration
+- FSDP2-safe slot state persistence
+- SFT regression coverage
+
+Explicitly out of scope for this phase:
+
+- GRPO server entrypoints
+- multi-adapter concurrent training
+- sampler sync
+
+### Phase 2: `AccelerateStrategy + GRPO`
+
+Build on Phase 1 and add GRPO-specific correctness.
+
+Supported flow:
+
+- `forward_only` under wrapped accelerate FSDP2
+- `disable_lora` behavior for reference-style inference
+- `GRPOLoss` training inputs, including `old_logps` and `advantages`
+- minimal GRPO forward-backward-step flow through:
+  - twinkle-native path
+  - tinker-compatible server path
+
+Implementation focus:
+
+- active adapter switching during GRPO paths
+- correctness of `disable_lora` under wrapped PEFT model state
+- minimal regression coverage for GRPO entrypoints
+
+Explicitly out of scope for this phase:
+
+- online sampler orchestration
+- large-scale RL performance tuning
+
+### Phase 3: `native_fsdp + SFT`
+
+Add native FSDP2 support by reusing the shared foundation.
+
+Supported flow:
+
+- construct `MultiLoraTransformersModel` with `strategy='native_fsdp'`
+- add a single LoRA adapter
+- run the same minimal SFT loop as Phase 1
+- save, load, and remove LoRA adapters correctly
+
+Implementation focus:
+
+- compatibility with `NativeFSDPStrategy.wrap_model`
+- parameter layout handling after `fully_shard`
+- optimizer rebinding and lazy-wrap correctness
+- native SFT regression coverage
+
+Key risk areas:
+
+- wrapped parameter representation under native FSDP2
+- optimizer param-group rebinding after wrapping
+- LoRA forward patch assumptions when parameters are sharded
+
+### Phase 4: `native_fsdp + GRPO`
+
+Complete the matrix by validating GRPO under native FSDP2.
+
+Supported flow:
+
+- `forward_only`
+- `disable_lora`
+- `GRPOLoss`
+- `clip_grad_norm`
+- `step`
+- minimal GRPO server/backend path
+
+Implementation focus:
+
+- native FSDP interaction with GRPO control flow
+- slot-state correctness while toggling LoRA-enabled and LoRA-disabled execution
+- final GRPO regression coverage under native FSDP2
+
+## Test Plan
+
+Tests should expand phase by phase, but stay narrow and behavior-oriented.
+
+### Shared test requirements
+
+- use the smallest model and mesh that still exercises the target strategy
+- assert adapter-slot tensor behavior, not only absence of exceptions
+- validate save/load round-trip and slot reset where relevant
+
+### Phase-specific checks
+
+#### Phase 1
+
+- accelerate FSDP2 construction succeeds
+- SFT forward-backward-step succeeds
+- LoRA state round-trips through save/load
+- `remove_adapter` restores initial slot values
+
+#### Phase 2
+
+- accelerate FSDP2 GRPO forward-backward path succeeds
+- `disable_lora` behavior stays correct under wrapped execution
+- minimal server/backend GRPO entrypoint succeeds
+
+#### Phase 3
+
+- native FSDP2 construction succeeds
+- native SFT forward-backward-step succeeds
+- native save/load/remove semantics are correct
+
+#### Phase 4
+
+- native FSDP2 GRPO forward-backward path succeeds
+- native `disable_lora` path remains correct
+- minimal native GRPO server/backend entrypoint succeeds
 
 ## Risks
 
-- LoRA parameter layouts under Accelerate FSDP2 may differ from the assumptions used by direct slicing in patched LoRA forward code
-- some helper methods may reconstruct full tensors when only local shards are needed, which can increase test-time memory usage
-- eager assumptions about adapter activation order may be exposed once wrapping becomes lazy again
+- patched LoRA forward code may assume local tensor access patterns that do not hold after sharding
+- accelerate and native FSDP2 may expose LoRA parameters through different tensor representations
+- some helper logic may accidentally reconstruct full tensors when only local shards are needed
+- lazy wrap may surface ordering issues around optimizer creation, adapter activation, or template hooks
+- GRPO adds path complexity because it mixes training, inference-style forward passes, and LoRA-disabled execution
 
 ## Deferred Work
 
-These should stay out of this change unless the minimal support cannot be made correct without them:
+These should remain outside this design unless later stages prove them necessary for correctness:
 
-- sampler LoRA sync compatibility
-- optimizer state load/save guarantees under FSDP2
-- memory-efficient initialization specific to multi-LoRA
-- a deeper unification with `TransformersModel` adapter management
+- sampler or checkpoint-engine LoRA synchronization enhancements
+- memory-efficient-init customization specific to transformers multi-LoRA
+- megatron multi-LoRA parity work
+- broader adapter lifecycle redesign beyond the current slot model
+- large-scale performance benchmarking or throughput tuning
 
 ## Acceptance Criteria
 
-This design is complete when:
+This design is complete when all four stages are delivered in order and each stage has dedicated regression coverage:
 
-- `MultiLoraTransformersModel` can run the narrow training flow under Accelerate FSDP2
-- multi-LoRA adapter save/load works for the supported LoRA tensor types
-- regression tests cover the new supported behavior
+1. `AccelerateStrategy + SFT`
+2. `AccelerateStrategy + GRPO`
+3. `native_fsdp + SFT`
+4. `native_fsdp + GRPO`
+
+At the end of the full rollout:
+
+- `MultiLoraTransformersModel` supports FSDP2 under both accelerate and native strategies
+- SFT and GRPO both run through the supported transformers multi-LoRA paths
+- save, load, and remove adapter semantics remain correct under FSDP2
 - unsupported areas remain explicitly unchanged
