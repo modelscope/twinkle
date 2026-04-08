@@ -494,7 +494,7 @@ class MultiLora:
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
-            return None, None
+            return None
 
     def set_state_dict(self, tenant_adapter_name, state_dict):
         _lora = self.find_lora_by_tenant(tenant_adapter_name)
