@@ -14,14 +14,17 @@
 #
 # The server must be running first (see server.py and server_config.yaml).
 
+import os
 import numpy as np
 import torch
 from tqdm import tqdm
 from typing import Any, Dict, List
 
+import swanlab
+
 from tinker import types
 from twinkle import init_tinker_client, get_logger
-from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
 from twinkle.dataloader import DataLoader
 from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle.server.common import input_feature_to_datum
@@ -48,6 +51,7 @@ sft_weight = 1.0
 max_length = 2048
 lora_rank = 8
 system_prompt = 'You are a helpful assistant.'
+use_swanlab = True
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +60,7 @@ system_prompt = 'You are a helpful assistant.'
 
 def create_dpo_dataset():
     """Create DPO dataset with positive/negative format."""
-    dataset = Dataset(DatasetMeta(dataset_id, data_slice=range(100)))
+    dataset = LazyDataset(DatasetMeta(dataset_id, data_slice=range(5000)))
     dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=max_length)
     dataset.map(
         EmojiDPOProcessor,
@@ -92,6 +96,24 @@ def prepare_dpo_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def train():
+    # Step 0: Initialize SwanLab if enabled
+    if use_swanlab:
+        swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
+        swanlab.init(
+            project='twinkle-dpo',
+            experiment_name='dpo-lora-training',
+            config={
+                'base_model': base_model,
+                'batch_size': batch_size,
+                'learning_rate': learning_rate,
+                'dpo_beta': dpo_beta,
+                'sft_weight': sft_weight,
+                'max_length': max_length,
+                'lora_rank': lora_rank,
+            },
+        )
+        logger.info('SwanLab initialized')
+
     # Step 1: Prepare dataset & dataloader
     logger.info('Loading DPO dataset...')
     dataset = create_dpo_dataset()
@@ -165,6 +187,10 @@ def train():
         ).result()
 
         logger.info(f'[Step {step}] metrics={optim_result.metrics}')
+
+        # Log metrics to SwanLab
+        if use_swanlab and optim_result.metrics:
+            swanlab.log(optim_result.metrics, step=step)
 
     # Step 4: Save checkpoint
     save_result = training_client.save_state('dpo-lora-final').result()
