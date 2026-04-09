@@ -111,7 +111,7 @@ def build_sampler_app(model_id: str,
     Twinkle (synchronous /twinkle/*) sampler clients.
 
     Args:
-        model_id: Model identifier (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
+        model_id: Model identifier (e.g., "Qwen/Qwen3.5-4B")
         nproc_per_node: Number of processes per node
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism

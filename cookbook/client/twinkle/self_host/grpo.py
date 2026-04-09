@@ -55,7 +55,7 @@ GRADIENT_ACCUMULATION_STEPS = 4
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
     dataset.map('GSM8KProcessor')
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -112,11 +112,11 @@ def train():
 
     # Set processor and template for encoding inputs
     model.set_processor('InputProcessor')
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
     sampler = vLLMSampler(model_id=MODEL_ID)
-    sampler.set_template('Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function
     advantage_fn = GRPOAdvantage()

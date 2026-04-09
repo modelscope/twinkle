@@ -93,7 +93,7 @@ for run in runs:
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
 
 # Set chat template to match model's input format
-dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
 
 # Data preprocessing: Replace placeholders with custom names
 dataset.map('SelfCognitionProcessor',
@@ -106,14 +106,14 @@ dataset.encode(batched=True)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
 # Step 4: Configure model
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 
 # Configure LoRA
 lora_config = LoraConfig(target_modules='all-linear')
 model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
 # Set template, processor, loss function
-model.set_template('Template')
+model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 

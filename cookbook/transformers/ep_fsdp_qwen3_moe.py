@@ -13,7 +13,7 @@ logger = get_logger()
 
 MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
-TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'Template')
+TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'Qwen3_5Template')
 _num_layers_env = os.environ.get('NUM_LAYERS')
 NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
@@ -47,7 +47,7 @@ def train():
     try:
         dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)
     except ValueError:
-        dataset.set_template('Template', model_id=MODEL_ID)
+        dataset.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     dataset.encode(batched=True)

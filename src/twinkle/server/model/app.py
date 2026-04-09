@@ -143,7 +143,7 @@ def build_model_app(model_id: str,
     Supports both Tinker (polling-style) and Twinkle (synchronous) clients.
 
     Args:
-        model_id: Base model identifier (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
+        model_id: Base model identifier (e.g., "Qwen/Qwen3.5-4B")
         nproc_per_node: Number of processes per node for distributed training
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for tensor parallelism

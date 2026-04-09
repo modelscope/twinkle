@@ -67,8 +67,8 @@ In the YAML configuration file, **each component needs to occupy a separate Node
 ```yaml
 applications:
   # Model service occupies GPU 0-3 (physical card numbers)
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /models/Qwen/Qwen2.5-7B-Instruct
+  - name: models-Qwen3.5-4B
+    route_prefix: /models/Qwen/Qwen3.5-4B
     import_path: model
     args:
       nproc_per_node: 4
@@ -84,8 +84,8 @@ applications:
         # ep_size: 1           # Expert parallel size (optional)
 
   # Sampler service occupies GPU 4-5 (physical card numbers)
-  - name: sampler-Qwen2.5-7B-Instruct
-    route_prefix: /sampler/Qwen/Qwen2.5-7B-Instruct
+  - name: sampler-Qwen3.5-4B
+    route_prefix: /sampler/Qwen/Qwen3.5-4B
     import_path: sampler
     args:
       nproc_per_node: 2
@@ -291,12 +291,12 @@ applications:
 The difference from the Megatron backend is only in the `use_megatron` parameter of the Model service:
 
 ```yaml
-  - name: models-Qwen2.5-7B-Instruct
-    route_prefix: /api/v1/model/Qwen/Qwen2.5-7B-Instruct
+  - name: models-Qwen3.5-4B
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
       use_megatron: false                              # Use Transformers backend
-      model_id: "ms://Qwen/Qwen2.5-7B-Instruct"
+      model_id: "ms://Qwen/Qwen3.5-4B"
       nproc_per_node: 2
       device_group:
         name: model

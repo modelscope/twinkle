@@ -27,10 +27,6 @@ from twinkle.reward.olympiad_bench import (
 )
 from twinkle.sampler import vLLMSampler
 
-import swanlab
-swanlab.init(
-    project='twinkle',
-)
 logger = get_logger()
 
 # Model configuration
@@ -184,6 +180,9 @@ def main():
             'gpu_memory_utilization': 0.8,
             'max_model_len': 32000,
             'max_lora_rank': 32,
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
             'limit_mm_per_prompt': {'image': 9},  # OlympiadBench has up to 9 images
         },
@@ -221,6 +220,9 @@ def main():
         metrics.reset()
 
         # Sync weights to sampler
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
@@ -282,7 +284,6 @@ def main():
         log_dict.update(model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME))
         metrics.reset()
         logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
-        swanlab.log(log_dict)
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('olympiad-grpo-mixed-final', adapter_name=ADAPTER_NAME)

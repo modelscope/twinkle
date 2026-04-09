@@ -58,7 +58,7 @@ response = rest_client.list_training_runs(limit=50).result()
 print(f"Found {len(response.training_runs)} training runs")
 
 # Step 3: Create training client
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen3-4B"
 
 # Create new training session
 training_client = service_client.create_lora_training_client(
@@ -137,6 +137,7 @@ for epoch in range(2):
 Tinker compatible mode can also leverage Twinkle's dataset components to simplify data preparation instead of manually constructing `Datum`:
 
 ```python
+import os
 from tqdm import tqdm
 from tinker import types
 from twinkle import init_tinker_client
@@ -150,11 +151,11 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen3.5-4B"
 
 # Use Twinkle's Dataset component to load and preprocess data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
 dataset.map(SelfCognitionProcessor('twinkle model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
@@ -223,7 +224,7 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = "Qwen/Qwen2.5-0.5B-Instruct"
+base_model = "Qwen/Qwen3.5-4B"
 
 service_client = ServiceClient(
     base_url='http://localhost:8000',

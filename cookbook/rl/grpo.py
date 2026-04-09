@@ -103,6 +103,9 @@ def main():
             'max_model_len': 4496,
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
@@ -133,6 +136,9 @@ def main():
             break
         metrics.reset()
         global_prompts = batch if isinstance(batch, list) else [batch]
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
         sample_responses = sampler.sample(

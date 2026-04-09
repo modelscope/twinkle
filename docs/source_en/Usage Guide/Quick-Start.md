@@ -70,7 +70,7 @@ def train():
 
     dataset = PackingDataset(dataset_meta)
     dataset.map(SelfCognitionProcessor(model_name='Twinkle Model', model_author='ModelScope Community'))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
     dataset.encode()
     dataset.pack_dataset()
 
@@ -114,7 +114,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -182,7 +182,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -271,7 +271,7 @@ ADAPTER_NAME = 'default'
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -303,7 +303,7 @@ def main():
     model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -316,7 +316,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(Template, model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     dataloader = DataLoader(
         dataset=create_gsm8k_dataset,
@@ -476,7 +476,7 @@ def create_countdown_dataset():
     """Create Countdown Game dataset for GRPO training."""
 
     dataset = Dataset(dataset_meta=DatasetMeta('ms://zouxuhong/Countdown-Tasks-3to4', data_slice=range(500)))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=8192)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=8192)
     dataset.map('CountdownProcessor')
     dataset.encode(add_generation_prompt=True, batched=True)
     return dataset
@@ -570,11 +570,11 @@ def train():
 
     # Set processor and template for encoding inputs
     model.set_processor('InputProcessor')
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
     sampler = vLLMSampler(model_id=MODEL_ID)
-    sampler.set_template('Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function
     advantage_fn = GRPOAdvantage()
@@ -712,7 +712,7 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply the chat template matching the base model (max 256 tokens per sample)
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
 
     # Replace placeholder names with custom model/author identity
     dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_cache_file=False)
@@ -925,7 +925,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset

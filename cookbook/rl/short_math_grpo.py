@@ -50,12 +50,6 @@ LORA_RANK = int(os.environ.get('LORA_RANK', 16))
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
 
-import swanlab
-swanlab.init(
-    project='twinkle',
-)
-
-
 # ========== Reward Functions ==========
 class GSM8KBrevityReward(Reward):
     """Brevity reward: rewards shorter completions that contain a valid answer.
@@ -167,6 +161,9 @@ def main():
             'max_model_len': 8192,
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
@@ -202,6 +199,9 @@ def main():
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
 
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
@@ -256,7 +256,6 @@ def main():
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
-        swanlab.log(log_dict)
         metrics.reset()
         logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 

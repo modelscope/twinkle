@@ -67,3 +67,6 @@ See: [HCCLCheckpointEngine](HCCLCheckpointEngine.md)
 - **HCCLCheckpointEngine**: Suitable for Ascend NPU environments
 
 > Checkpoint engine is a key component of RLHF training infrastructure, ensuring that trainers and samplers use consistent model weights.
+> Currently, synchronization is divided into two cases based on merge_and_sync=True/False. When set to True, the LoRA is merged into the base model and then synchronized.
+> When set to False, only the LoRA weights are synchronized. Additionally, for multi-tenant scenarios, LoRA files are directly attached to vLLM.
+> When merge_and_sync=False or in multi-tenant mode, vLLM's startup parameter enable_lora=True needs to be enabled. When merge_and_sync=True or using full parameters, this value should be set to False.
