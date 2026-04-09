@@ -42,6 +42,44 @@ class MultiLora:
                 return _lora
         return None
 
+    def _read_param_tensor(self, parameter):
+        return torch_util.to_local_tensor(parameter)
+
+    def _write_param_tensor(self, parameter, value):
+        value = value.to(dtype=parameter.dtype)
+        if hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements'):
+            from torch.distributed.tensor import distribute_tensor
+            value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
+        else:
+            value = value.to(parameter.device)
+        parameter.data.copy_(value)
+
+    @staticmethod
+    def _slice_rank_tensor(name: str, tensor: torch.Tensor, rank: int) -> torch.Tensor:
+        if 'embedding_A' in name:
+            return tensor[:, :rank]
+        if 'embedding_B' in name:
+            return tensor[:rank, :]
+        if '_A' in name:
+            return tensor[:rank, :]
+        if '_B' in name:
+            return tensor[:, :rank]
+        return tensor
+
+    @staticmethod
+    def _copy_rank_tensor(name: str, target: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        if 'embedding_A' in name:
+            target[:, :value.shape[1]].copy_(value)
+        elif 'embedding_B' in name:
+            target[:value.shape[0], :].copy_(value)
+        elif '_A' in name:
+            target[:value.shape[0], :].copy_(value)
+        elif '_B' in name:
+            target[:, :value.shape[1]].copy_(value)
+        else:
+            target.copy_(value)
+        return target
+
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
@@ -435,7 +473,7 @@ class MultiLora:
             def _store_weights(_module):
                 for name, parameter in _module.named_parameters():
                     if pattern.search(name):
-                        lora_tenant.lora_A_weights[name] = parameter.data.clone().to('cpu')
+                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
 
             if isinstance(self.module, list):
                 for _module in self.module:
@@ -482,15 +520,7 @@ class MultiLora:
         pattern_no_adapter = re.compile(r'\.lora_\w+\.weight')
         if (pattern.search(name) or pattern_no_adapter.search(name)) and self.match_target_modules(
                 name, _lora.tenant_config.target_modules):
-            _param = torch_util.to_local_tensor(parameter)
-            if 'embedding_A' in name:
-                _param = _param[:, :_lora.tenant_config.r]
-            elif 'embedding_B' in name:
-                _param = _param[:_lora.tenant_config.r, :]
-            elif '_A' in name:
-                _param = _param[:_lora.tenant_config.r, :]
-            elif '_B' in name:
-                _param = _param[:, :_lora.tenant_config.r]
+            _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
@@ -503,20 +533,11 @@ class MultiLora:
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    name = name.replace(f'.{_lora.adapter_name}.', '.')
-                    src_tensor = state_dict[name]
-                    if 'embedding_A' in name:
-                        r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
-                    elif 'embedding_B' in name:
-                        r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
-                    elif '_A' in name:
-                        r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
-                    elif '_B' in name:
-                        r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
+                    state_key = name.replace(f'.{_lora.adapter_name}.', '.')
+                    target_tensor = self._read_param_tensor(parameter).clone()
+                    src_tensor = state_dict[state_key].to(dtype=target_tensor.dtype, device=target_tensor.device)
+                    self._copy_rank_tensor(name, target_tensor, src_tensor)
+                    self._write_param_tensor(parameter, target_tensor)
 
         if isinstance(self.module, list):
             for _module in self.module:
@@ -533,15 +554,7 @@ class MultiLora:
             state_dict = {}
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    _param = torch_util.to_local_tensor(parameter)
-                    if 'embedding_A' in name:
-                        _param = _param[:, :_lora.tenant_config.r]
-                    elif 'embedding_B' in name:
-                        _param = _param[:_lora.tenant_config.r, :]
-                    elif '_A' in name:
-                        _param = _param[:_lora.tenant_config.r, :]
-                    elif '_B' in name:
-                        _param = _param[:, :_lora.tenant_config.r]
+                    _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
                     name = name.replace(f'.{_lora.adapter_name}.', '.')
                     state_dict[name] = _param
             return state_dict
@@ -561,9 +574,11 @@ class MultiLora:
         def _load_initial_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern_A.search(name):
-                    parameter.data.copy_(_lora.lora_A_weights[name])
+                    target_device = self._read_param_tensor(parameter).device
+                    value = _lora.lora_A_weights[name].to(dtype=parameter.dtype, device=target_device)
+                    self._write_param_tensor(parameter, value)
                 if pattern_B.search(name):
-                    parameter.data.copy_(torch.zeros_like(parameter.data).to(parameter.data.dtype))
+                    self._write_param_tensor(parameter, torch.zeros_like(self._read_param_tensor(parameter)))
 
         if isinstance(self.module, list):
             for _module in self.module:

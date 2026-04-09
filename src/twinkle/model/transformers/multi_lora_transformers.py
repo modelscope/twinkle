@@ -15,7 +15,6 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
-from .strategy import AccelerateStrategy
 from .transformers import OptimizerGroup, TransformersModel
 
 
@@ -29,36 +28,42 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
             mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+            strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+            ddp_config: Dict[str, Any] = None,
+            fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
+            memory_efficient_init: bool = False,
             max_loras: int = 5,
             max_r: int = 32,
             max_length: int = 8192,
             **kwargs):
-        assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
-        model_id = HubOperation.download_model(model_id)
-        if isinstance(model_cls, str):
-            model_cls = getattr(transformers, model_cls)
-        self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
+        self._fsdp_config = dict(fsdp_config or {})
+        self._ddp_config = ddp_config or {}
+        self._memory_efficient_init = memory_efficient_init
+        self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
+        if isinstance(model_cls, str):
+            model_cls = getattr(transformers, model_cls)
+        model_id = HubOperation.download_model(model_id)
+        with self.strategy.pretrained_load_context():
+            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
+        self.model_id = model_id
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._model_wrapped = False
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
-        self._expert_parallel_config = None
-        self._enable_expert_parallel = False
-        self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model)
-        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
-        self.model = self.strategy.wrap_model(self.model)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -88,7 +93,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         pass
 
     def _lazy_wrap_model(self):
-        pass
+        return super()._lazy_wrap_model()
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
