@@ -46,7 +46,7 @@ class MultiLora:
         return torch_util.to_local_tensor(parameter)
 
     def _write_param_tensor(self, parameter, value):
-        value = value.to(dtype=parameter.dtype)
+        value = value.detach().to(dtype=parameter.dtype)
         if hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements'):
             from torch.distributed.tensor import distribute_tensor
             value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)

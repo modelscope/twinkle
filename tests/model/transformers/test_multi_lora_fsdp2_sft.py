@@ -263,6 +263,34 @@ def test_multi_lora_load_initial_weights_uses_tensor_write_helper():
     assert calls
 
 
+def test_multi_lora_write_param_tensor_distributes_leaf_tensor(monkeypatch):
+    multi_lora = MultiLora(max_loras=1, max_r=4, max_length=8)
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    parameter.device_mesh = object()
+    parameter.placements = ('shard0', )
+
+    recorded = {}
+
+    def fake_distribute_tensor(value, device_mesh, placements):
+        if not value.is_leaf:
+            raise RuntimeError('`distribute_tensor` should be used to distribute leaf tensors!')
+        recorded['is_leaf'] = value.is_leaf
+        recorded['device_mesh'] = device_mesh
+        recorded['placements'] = placements
+        return value
+
+    monkeypatch.setattr('torch.distributed.tensor.distribute_tensor', fake_distribute_tensor)
+
+    source = torch.ones(2, 2, requires_grad=True) * 3
+
+    multi_lora._write_param_tensor(parameter, source)
+
+    assert recorded['is_leaf'] is True
+    assert recorded['device_mesh'] is parameter.device_mesh
+    assert recorded['placements'] == parameter.placements
+    assert torch.equal(parameter.data, torch.full((2, 2), 3.0))
+
+
 @pytest.mark.skipif(accelerator_device_count() < 2, reason='Requires 2+ CUDA GPUs or NPUs')
 def test_multi_lora_accelerate_fsdp2_sft_round_trip(model_path):
     output_dir = make_workspace_temp_dir('accelerate-ckpt')
