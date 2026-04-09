@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
@@ -50,6 +51,7 @@ class SamplerManagement(TaskQueueMixin):
         else:
             self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
         self.sampler_type = sampler_type
+        self.model_id = model_id
         replica_context = serve.get_replica_context()
         replica_id = replica_context.replica_id.unique_id
 
@@ -76,11 +78,10 @@ class SamplerManagement(TaskQueueMixin):
                 remote_group=self.device_group.name,
                 **kwargs)
 
-        self.sampler.set_template('Template', model_id=model_id)
         self.state: ServerStateProxy = get_server_state()
 
         # Initialize task queue mixin
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
+        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Sampler')
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -134,6 +135,8 @@ def build_sampler_app(model_id: str,
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
+
+    app.middleware('http')(create_metrics_middleware('Sampler'))
 
     def get_self() -> SamplerManagement:
         return serve.get_replica_context().servable_object

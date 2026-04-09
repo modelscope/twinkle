@@ -10,11 +10,12 @@ to bypass the 'tml-' prefix validation for api_key.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Mapping, Union
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
 
 from twinkle_client.http.utils import get_api_key, get_request_id
 
 _patched = False
+_loss_fn_config_patched = False
 
 
 async def _create_sampling_session(self, model_path: str | None = None, base_model: str | None = None) -> str:

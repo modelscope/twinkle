@@ -11,7 +11,7 @@ async def verify_request_token(request: Request, call_next):
     This middleware:
     1. Extracts the Bearer token from Authorization header
     2. Validates the token
-    3. Extracts X-Ray-Serve-Request-Id for sticky sessions
+    3. Extracts X-Ray-Serve-Request-Id for sticky sessions (skipped for healthz endpoint)
     4. Stores token and request_id in request.state for later use
 
     Args:
@@ -26,11 +26,16 @@ async def verify_request_token(request: Request, call_next):
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
-    request_id = request.headers.get('X-Ray-Serve-Request-Id')
-    if not request_id:
-        return JSONResponse(
-            status_code=400, content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
-    request.state.request_id = request_id
+    # Skip X-Ray-Serve-Request-Id check for healthz endpoint (path ends with /healthz)
+    if not request.url.path.endswith('/healthz'):
+        request_id = request.headers.get('X-Ray-Serve-Request-Id')
+        if not request_id:
+            return JSONResponse(
+                status_code=400,
+                content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
+        request.state.request_id = request_id
+    else:
+        request.state.request_id = ''
     request.state.token = token
     request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
     response = await call_next(request)

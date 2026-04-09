@@ -11,6 +11,7 @@ from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
@@ -30,43 +31,33 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # Tinker-compat methods (Datum-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
-    def tinker_forward_only(self, *, inputs: List[types.Datum], **kwargs):
-        template = self.get_template(**kwargs)
+    @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
+    def tinker_forward_only(self, *, inputs: List[types.Datum], adapter_name: str = None, **kwargs):
+        template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
-        outputs = super().forward_only(inputs=input_features, **kwargs)
-        logits = outputs.get('logits')
-        if logits is not None:
-            logits = logits.detach().cpu()
-        logps = outputs.get('logps', None)
-        if logps is not None:
-            logps = logps.detach().cpu()
-        results = self._get_forward_output(inputs, logits, logps)
-        return results
+        outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
+        results = self._tinker_build_output(inputs, outputs)
+        return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
     def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
-        if loss_fn == 'cross_entropy':
-            super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
-        elif loss_fn == 'importance_sampling':
-            super().set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=0.2, beta=0.0)
-        else:
-            super().set_loss('CrossEntropyLoss', adapter_name=adapter_name)
+        self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
         loss_values = extract_rl_feature(inputs)
         loss_kwargs = kwargs.copy()
+        # Convert ref_logps list-of-lists into a padded tensor wrapped in ref_outputs
+        # so that DPOLoss and DPOMetric can consume it via ref_outputs.get('logps').
+        ref_outputs_dict = self._tinker_prepare_ref_outputs(loss_values, loss_kwargs)
+        if ref_outputs_dict is not None:
+            # Propagate to train_status.forward_kwargs so DPOMetric.accumulate
+            # gets ref_outputs on the next forward() call (where accumulate_metrics runs).
+            self.optimizer_group[adapter_name].train_status.forward_kwargs['ref_outputs'] = ref_outputs_dict
         loss_kwargs.update(loss_values)
         loss = super().calculate_loss(adapter_name=adapter_name, **loss_kwargs)
         super().backward(adapter_name=adapter_name, **kwargs)
-        logits = outputs.get('logits')
-        if logits is not None:
-            logits = logits.detach()
-        logps = outputs.get('logps', None)
-        if logps is not None:
-            logps = logps.detach().cpu()
-        results = self._get_forward_output(inputs, logits, logps)
+        results = self._tinker_build_output(inputs, outputs)
         return [results, loss]
 
     @remote_function()
@@ -106,7 +97,13 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+        """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        output = super().forward_only(inputs=inputs, **kwargs)
+        return to_cpu_safe_output(output)
+
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""

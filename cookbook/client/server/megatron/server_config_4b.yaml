@@ -7,7 +7,7 @@ proxy_location: EveryNode
 # HTTP listener settings
 http_options:
   host: 0.0.0.0        # Listen on all network interfaces
-  port: 8000            # Port number for the server
+  port: 9000            # Port number for the server
 
 # Applications: each entry defines a service component deployed on the server
 applications:
@@ -39,25 +39,24 @@ applications:
     import_path: model
     args:
       use_megatron: true
-      model_cls: Qwen3_5ForConditionalGeneration
       model_id: "ms://Qwen/Qwen3.5-4B" # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 2                            # Number of GPU processes per node
       device_group:
         name: model
-        ranks: 2                              # GPU rank indices
+        ranks: 2
         device_type: cuda
       device_mesh:
         device_type: cuda
         dp_size: 2
       queue_config:
         rps_limit: 100                             # Max requests per second
-        tps_limit: 10000                           # Max tokens per second for a single user
-        max_input_tokens: 10000                    # Maximum input tokens per request
+        tps_limit: 100000                           # Max tokens per second for a single user
+        max_input_tokens: 60000                    # Maximum input tokens per request
       adapter_config:
         adapter_timeout: 30                        # Seconds before idle adapter unload
         adapter_max_lifetime: 36000                # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
-      max_loras: 1                                 # Maximum number of LoRA adapters per model
+      max_loras: 5                                 # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -80,8 +79,8 @@ applications:
       nproc_per_node: 2               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
-        max_model_len: 4096           # Maximum sequence length the engine supports
-        gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
+        max_model_len: 16000           # Maximum sequence length the engine supports
+        gpu_memory_utilization: 0.7   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
         logprobs_mode: processed_logprobs # Logprobs mode for sampling results
       device_group:                   # Logical device group for the sampler

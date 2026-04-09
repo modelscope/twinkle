@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -47,6 +48,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             try:
                 # Extract prompt token IDs from ModelInput
                 prompt_inputs = {'input_ids': body.prompt.to_ints()}
+
+                # Set template for sampler based on model type
+                template = get_template_for_model(self.model_id)
+                self.sampler.set_template(template, model_id=self.model_id)
 
                 # Get model_path from body or sampling session
                 model_path = body.model_path

@@ -125,3 +125,17 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer])
 
         ckpt_dir = checkpoint_manager.get_ckpt_dir(run_id, checkpoint_id)
         return types.CheckpointPathResponse(path=str(ckpt_dir), twinkle_path=checkpoint.twinkle_path)
+
+    @app.get('/twinkle/status')
+    async def status(
+            request: Request,
+            self: GatewayServer = Depends(self_fn),
+    ) -> dict:
+        cleanup_stats = await self.state.get_cleanup_stats()
+        return {
+            'resources': cleanup_stats['resource_counts'],
+            'cleanup': {
+                'running': cleanup_stats['cleanup_running'],
+                'expiration_timeout': cleanup_stats['expiration_timeout'],
+            },
+        }
