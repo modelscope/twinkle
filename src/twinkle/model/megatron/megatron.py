@@ -1426,11 +1426,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def _add_base_layer_suffix(name):
             if name.endswith('.weight'):
                 base_layer_name = f'{name[:-7]}.base_layer.weight'
-                if base_layer_name in model_keys or not model_keys:
+                if not model_keys or base_layer_name in model_keys:
                     name = base_layer_name
             elif name.endswith('.bias'):
                 base_layer_name = f'{name[:-5]}.base_layer.bias'
-                if base_layer_name in model_keys or not model_keys:
+                if not model_keys or base_layer_name in model_keys:
                     name = base_layer_name
             return name
 
