@@ -116,6 +116,7 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
+    # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',
