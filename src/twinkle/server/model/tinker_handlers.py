@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .app import ModelManagement
 
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -46,11 +47,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
                     self.register_resource(adapter_name, token, session_id=body.session_id)
                     self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
-                    # For Qwen3.5, use Qwen3_5Template
-                    if 'Qwen3.5' in self.base_model:
-                        template = 'Qwen3_5Template'
-                    else:
-                        template = 'Template'
+                    # Select template based on model type
+                    template = get_template_for_model(self.base_model)
                     self.model.set_template(template, adapter_name=adapter_name, model_id=self.base_model)
                     self.model.set_processor('InputProcessor', adapter_name=adapter_name)
                     self.model.set_optimizer('Adam', adapter_name=adapter_name)

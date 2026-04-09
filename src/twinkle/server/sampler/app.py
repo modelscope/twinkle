@@ -51,6 +51,7 @@ class SamplerManagement(TaskQueueMixin):
         else:
             self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
         self.sampler_type = sampler_type
+        self.model_id = model_id
         replica_context = serve.get_replica_context()
         replica_id = replica_context.replica_id.unique_id
 
@@ -77,7 +78,6 @@ class SamplerManagement(TaskQueueMixin):
                 remote_group=self.device_group.name,
                 **kwargs)
 
-        self.sampler.set_template('Template', model_id=model_id)
         self.state: ServerStateProxy = get_server_state()
 
         # Initialize task queue mixin
