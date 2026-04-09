@@ -138,11 +138,7 @@ def main():
 
     # LoRA configuration
     lora_config = LoraConfig(
-        target_modules=[
-            'q_proj', 'k_proj', 'v_proj', 'o_proj',
-            'gate_proj', 'up_proj', 'down_proj',
-            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
-        ],
+        target_modules=['all-linear'], # including ViT and Merger/Connector
         r=16,
         lora_alpha=32,
         lora_dropout=0.05,
@@ -186,6 +182,7 @@ def main():
             'max_lora_rank': 32,
             'enable_lora': True,
             'limit_mm_per_prompt': {'image': 9},  # OlympiadBench has up to 9 images
+            'enable_tower_connector_lora': True, # enable ViT(tower) and Merger(connector) LoRA on vLLM side
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
