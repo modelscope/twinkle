@@ -91,9 +91,35 @@ def make_workspace_temp_dir(prefix: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f'{prefix}-', dir=base_dir))
 
 
+def _npu_device_count() -> int:
+    npu = getattr(torch, 'npu', None)
+    if npu is None:
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            return 0
+        npu = getattr(torch, 'npu', None)
+
+    if npu is None:
+        return 0
+
+    try:
+        if npu.is_available():
+            return npu.device_count()
+    except Exception:
+        return 0
+    return 0
+
+
+def accelerator_device_count() -> int:
+    return max(torch.cuda.device_count(), _npu_device_count())
+
+
 def build_device_mesh(fsdp_size: int = 2) -> DeviceMesh:
     if torch.cuda.device_count() >= fsdp_size:
         return DeviceMesh.from_sizes(fsdp_size=fsdp_size, device_type='cuda')
+    if _npu_device_count() >= fsdp_size:
+        return DeviceMesh.from_sizes(fsdp_size=fsdp_size, device_type='npu')
     return DeviceMesh.from_sizes(world_size=1, dp_size=1, device_type='cpu')
 
 
@@ -137,6 +163,43 @@ def test_multi_lora_native_fsdp2_uses_lazy_wrap(model_path):
     model = build_multi_lora_model(model_path, strategy='native_fsdp')
     assert model.strategy.device_mesh is not None
     assert model._model_wrapped is False
+
+
+def test_build_device_mesh_prefers_npu_when_available(monkeypatch):
+    class FakeNPU:
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 0)
+    monkeypatch.setattr(torch, 'npu', FakeNPU(), raising=False)
+
+    mesh = build_device_mesh(fsdp_size=2)
+
+    assert mesh.device_type == 'npu'
+    assert mesh.fsdp_world_size == 2
+
+
+def test_accelerator_device_count_uses_npu_when_cuda_absent(monkeypatch):
+    class FakeNPU:
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 0)
+    monkeypatch.setattr(torch, 'npu', FakeNPU(), raising=False)
+
+    assert accelerator_device_count() == 2
 
 
 def test_multi_lora_state_dict_round_trip_preserves_rank_slices():
@@ -184,7 +247,7 @@ def test_multi_lora_load_initial_weights_uses_tensor_write_helper():
     assert calls
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='Requires 2+ GPUs')
+@pytest.mark.skipif(accelerator_device_count() < 2, reason='Requires 2+ CUDA GPUs or NPUs')
 def test_multi_lora_accelerate_fsdp2_sft_round_trip(model_path):
     output_dir = make_workspace_temp_dir('accelerate-ckpt')
     model = build_multi_lora_model(model_path, strategy='accelerate')
@@ -207,7 +270,7 @@ def test_multi_lora_accelerate_fsdp2_sft_round_trip(model_path):
     shutil.rmtree(output_dir, ignore_errors=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='Requires 2+ GPUs')
+@pytest.mark.skipif(accelerator_device_count() < 2, reason='Requires 2+ CUDA GPUs or NPUs')
 def test_multi_lora_native_fsdp_sft_round_trip(model_path):
     output_dir = make_workspace_temp_dir('native-ckpt')
     model = build_multi_lora_model(model_path, strategy='native_fsdp')
