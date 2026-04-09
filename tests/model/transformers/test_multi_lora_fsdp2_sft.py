@@ -29,7 +29,12 @@ def build_lora_config(r: int = 4) -> LoraConfig:
 
 
 def build_sft_batch():
-    return [{'input_ids': [1, 3, 4, 2], 'labels': [1, 3, 4, 2]}]
+    return [{
+        'input_ids': [1, 3, 4, 2],
+        'attention_mask': [1, 1, 1, 1],
+        'position_ids': [0, 1, 2, 3],
+        'labels': [1, 3, 4, 2],
+    }]
 
 
 def assert_same_lora_state(state_before, state_after):
@@ -200,6 +205,17 @@ def test_accelerator_device_count_uses_npu_when_cuda_absent(monkeypatch):
     monkeypatch.setattr(torch, 'npu', FakeNPU(), raising=False)
 
     assert accelerator_device_count() == 2
+
+
+def test_build_sft_batch_includes_processor_fields():
+    batch = build_sft_batch()
+
+    assert batch == [{
+        'input_ids': [1, 3, 4, 2],
+        'attention_mask': [1, 1, 1, 1],
+        'position_ids': [0, 1, 2, 3],
+        'labels': [1, 3, 4, 2],
+    }]
 
 
 def test_multi_lora_state_dict_round_trip_preserves_rank_slices():
