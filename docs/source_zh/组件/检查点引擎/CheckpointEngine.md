@@ -67,3 +67,5 @@ Twinkle 提供了两种检查点引擎实现:
 - **HCCLCheckpointEngine**: 适用于昇腾 NPU 环境
 
 > 检查点引擎是 RLHF 训练基础设施的关键组件,确保训练器和采样器使用一致的模型权重。
+> 目前的同步分为merge_and_sync=True/False两种情况，为True时将lora合并仅基模并同步，为False时仅同步lora权重。另外，多租户直接附加lora文件到vLLM上，在merge_and_sync=False，或使用多租户时，
+> vLLM的启动参数需要开启`enable_lora=True`，在merge_and_sync=True或全参时，该值设置为False.

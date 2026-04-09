@@ -173,6 +173,9 @@ def main():
     # ── Student vLLM sampler (for on-policy generation) ────────────────────────
     student_sampler = vLLMSampler(
         model_id=STUDENT_MODEL_ID,
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         engine_args={'gpu_memory_utilization': 0.85, 'max_model_len': 4096, 'enable_lora': True, 'max_loras': 1},
         device_mesh=sampler_mesh,
         remote_group='student_sampler',
@@ -210,6 +213,9 @@ def main():
             break
 
         # 1. Sync student model weights to student sampler
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         student_sampler.reset_prefix_cache()
 
