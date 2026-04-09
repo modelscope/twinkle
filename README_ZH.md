@@ -166,7 +166,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id=base_model)
+    dataset.set_template('Qwen3_5Template', model_id=base_model)
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -224,7 +224,7 @@ api_key='your-api-key'
 
 # Use twinkle dataset to load the data
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-dataset.set_template('Template', model_id=base_model, max_length=256)
+dataset.set_template('Qwen3_5Template', model_id=base_model, max_length=256)
 dataset.map(SelfCognitionProcessor('twinkle Model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)

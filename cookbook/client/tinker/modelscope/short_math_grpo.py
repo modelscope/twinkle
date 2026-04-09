@@ -182,7 +182,7 @@ def create_math_dataset():
         data_slice=range(DATA_NUM),
     )
     dataset = Dataset(meta)
-    dataset.set_template('Template', model_id=BASE_MODEL, max_length=4096, truncation_strategy='delete')
+    dataset.set_template('Qwen3_5Template', model_id=BASE_MODEL, max_length=4096, truncation_strategy='delete')
     dataset.map(MathPreprocessor())
     dataset.filter(lambda row: bool(row['messages']))
     dataset.encode(add_generation_prompt=True)

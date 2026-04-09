@@ -16,8 +16,36 @@ RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --
     echo "Checking out: $LATEST_RELEASE" && \
     git checkout --track "$LATEST_RELEASE"
 
-RUN sh INSTALL_MEGATRON.sh
+ENV SETUPTOOLS_USE_DISTUTILS=local
 
+# Install base packages
+RUN pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
+
+# Install vllm
+RUN pip install --upgrade vllm --no-cache-dir
+
+# Install transformer_engine and megatron_core
+RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    CUDNN_PATH=$SITE_PACKAGES/nvidia/cudnn \
+    CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
+    pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
+
+RUN pip install megatron_core mcore_bridge --no-cache-dir
+
+# Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
+ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
+RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+    MAX_JOBS=8 \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    pip install flash-attn --no-build-isolation --no-cache-dir
+
+RUN pip install flash-linear-attention -U --no-cache-dir
+
+# Install numpy
+RUN pip install numpy==2.2 --no-cache-dir
+
+# Install tinker, ray, and other deps
 RUN pip install --no-cache-dir tinker==0.14.0 "ray[serve]" transformers peft accelerate -U
 
+# Install twinkle itself
 RUN pip install -e . --no-build-isolation

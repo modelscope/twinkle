@@ -56,12 +56,12 @@ echo "Using CUDA architecture: $TORCH_CUDA_ARCH_LIST"
 # Install latest base packages
 echo ""
 echo "Installing peft, accelerate, transformers, modelscope..."
-pip install --upgrade peft accelerate transformers "modelscope[framework]"
+pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
 
 # Install latest vllm
 echo ""
 echo "Installing latest vllm..."
-pip install --upgrade vllm
+pip install --upgrade vllm --no-cache-dir
 
 # Get site-packages path and install transformer_engine and megatron_core
 echo ""
@@ -83,12 +83,12 @@ MAX_JOBS=8 \
 FLASH_ATTENTION_FORCE_BUILD=TRUE \
 pip install flash-attn --no-build-isolation --no-cache-dir
 
-pip install flash-linear-attention -U
+pip install flash-linear-attention -U --no-cache-dir
 
 # Install numpy
 echo ""
 echo "Installing numpy==2.2 and deep_gemm..."
-pip install numpy==2.2
+pip install numpy==2.2 --no-cache-dir
 
 # Verify installation
 echo ""

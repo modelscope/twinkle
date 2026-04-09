@@ -34,7 +34,7 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply the chat template matching the base model (max 256 tokens per sample)
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
 
     # Replace placeholder names with custom model/author identity
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'), load_from_cache_file=False)
