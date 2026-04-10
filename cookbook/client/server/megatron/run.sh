@@ -264,6 +264,28 @@ fi
 # 停止已有 Ray 集群和 Prometheus
 # ============================================
 print_header "清理环境"
+
+# 停止 Twinkle server.py（twinkle.server 模块）
+print_info "停止已有的 Twinkle Server..."
+pkill -f "twinkle.server" 2>/dev/null || true
+
+# 停止 vLLM 进程
+print_info "停止已有的 vLLM 进程..."
+pkill -f "vllm" 2>/dev/null || true
+
+# 等待上述进程退出
+sleep 2
+
+# 若仍有残留则强制 SIGKILL
+if pgrep -f "twinkle.server" > /dev/null 2>&1; then
+    print_warning "Twinkle Server 未退出，强制终止..."
+    pkill -9 -f "twinkle.server" 2>/dev/null || true
+fi
+if pgrep -f "vllm" > /dev/null 2>&1; then
+    print_warning "vLLM 进程未退出，强制终止..."
+    pkill -9 -f "vllm" 2>/dev/null || true
+fi
+
 print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
 
