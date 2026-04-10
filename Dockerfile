@@ -45,7 +45,7 @@ WORKDIR /twinkle
 RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --sort=-v:refname && \
     LATEST_RELEASE=$(git branch -r -l 'origin/release/*' --sort=-v:refname | head -n 1 | tr -d ' ') && \
     echo "Checking out: $LATEST_RELEASE" && \
-    git checkout --track "$LATEST_RELEASE" \
+    git checkout --track "$LATEST_RELEASE"
 
 # Install twinkle itself
 RUN pip install -e . --no-build-isolation
