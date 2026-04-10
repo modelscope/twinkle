@@ -168,8 +168,8 @@ class Template:
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
             mm_token_type_ids = result['mm_token_type_ids']
-            if isinstance(mm_token_type_ids, list):
-                mm_token_type_ids = torch.tensor(mm_token_type_ids)
+            if not isinstance(mm_token_type_ids, torch.Tensor):
+                mm_token_type_ids = torch.as_tensor(mm_token_type_ids)
             token_ids_shape = mm_token_type_ids.shape
             device = mm_token_type_ids.device
             padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
