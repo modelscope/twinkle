@@ -50,6 +50,7 @@ applications:
         enable_lora: true             # Allow loading LoRA adapters during inference
         max_loras: 5                  # Max allowed loras working on vLLM at the same time
         max_lora_rank: 32             # Support up to rank 64 LoRA adapters
+        enable_tower_connector_lora: true
       device_group:                   # Logical device group for the sampler
         name: sampler
         gpus_per_worker: 2
