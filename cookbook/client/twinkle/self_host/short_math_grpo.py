@@ -25,38 +25,84 @@ dotenv.load_dotenv('.env')
 
 import gc
 import os
+import re
 from peft import LoraConfig
 from typing import List, Tuple, Dict, Any
 
+import swanlab
+
 from twinkle import get_logger
-from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
+from twinkle.reward import GSM8KAccuracyReward
+from twinkle.reward.base import Reward
 from twinkle.advantage import GRPOAdvantage
 from twinkle.dataset import DatasetMeta
 from twinkle.metric import CompletionRewardMetric
-from twinkle_client import init_twinkle_client
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+from twinkle import init_twinkle_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset
+from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.sampler import vLLMSampler
 
 logger = get_logger()
 
+
+class GSM8KBrevityReward(Reward):
+    """Brevity reward: rewards shorter completions that contain a valid answer.
+
+    Returns 0.0 if no valid answer format (\\boxed{} or ####).
+    Otherwise returns higher score for shorter completions (1.0 at <=200 chars).
+    """
+
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+        rewards = []
+        for traj in trajectories:
+            messages = traj.get('messages', [])
+            completion = ''
+            for msg in reversed(messages):
+                if msg.get('role') == 'assistant':
+                    completion = msg.get('content', '')
+                    break
+
+            has_answer = bool(
+                re.search(r'\\boxed\{[^}]+\}', completion)
+                or re.search(r'####\s*[\-\d,\.]+', completion)
+            )
+
+            if not has_answer:
+                rewards.append(0.0)
+            else:
+                length = len(completion)
+                if length <= 200:
+                    rewards.append(1.0)
+                else:
+                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
+        return rewards
+
 # ========== Configuration ==========
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
-LEARNING_RATE = 1e-5
-MAX_STEPS = 10
+LEARNING_RATE = 2e-5
+MAX_STEPS = 100
 BATCH_SIZE = 2
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1  # Save weights for sampler every N steps
-GRADIENT_ACCUMULATION_STEPS = 4
+GRADIENT_ACCUMULATION_STEPS = 1
+DATA_NUM = 2000  # Number of Math samples to use
 
+USE_SWANLAB = True
+SWANLAB_PROJECT = 'twinkle-grpo'
+SWANLAB_EXPERIMENT_NAME = 'short-math-grpo'
+
+
+SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
+                 'and put your final answer within \\boxed{}.')
 
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
-    dataset.map('GSM8KProcessor')
+    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
+    dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
 
@@ -64,24 +110,44 @@ def compute_rewards(
     trajectories: List[Dict[str, Any]],
 ) -> Tuple[List[float], List[float], List[float]]:
     accuracy_reward_fn = GSM8KAccuracyReward()
-    format_reward_fn = GSM8KFormatReward()
+    brevity_reward_fn = GSM8KBrevityReward()
 
     accuracy_rewards = accuracy_reward_fn(trajectories)
-    format_rewards = format_reward_fn(trajectories)
-    total_rewards = [a + f for a, f in zip(accuracy_rewards, format_rewards)]
-    return total_rewards, format_rewards, accuracy_rewards
+    brevity_rewards = brevity_reward_fn(trajectories)
+    total_rewards = [a + b for a, b in zip(accuracy_rewards, brevity_rewards)]
+    return total_rewards, brevity_rewards, accuracy_rewards
 
 
 def train():
+    # Step 0: Initialize SwanLab if enabled
+    if USE_SWANLAB:
+        swanlab.login(api_key=os.environ.get('SWANLAB_API_KEY', ''))
+        swanlab.init(
+            project=SWANLAB_PROJECT,
+            experiment_name=SWANLAB_EXPERIMENT_NAME,
+            config={
+                'model_id': MODEL_ID,
+                'num_generations': NUM_GENERATIONS,
+                'max_new_tokens': MAX_NEW_TOKENS,
+                'learning_rate': LEARNING_RATE,
+                'max_steps': MAX_STEPS,
+                'batch_size': BATCH_SIZE,
+                'temperature': TEMPERATURE,
+                'sync_interval': SYNC_INTERVAL,
+                'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
+            },
+        )
+        logger.info('SwanLab initialized')
+
     # Step 1: Initialize the Twinkle client
     client = init_twinkle_client(
         base_url='http://127.0.0.1:8000',
-        api_key=os.environ.get('MODELSCOPE_TOKEN'),
+        api_key='EMPTY_TOKEN',
     )
 
     # Step 2: Prepare dataset and dataloader
     dataset = create_gsm8k_dataset()
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
+    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
 
     # Step 3: Configure the training model
     model = MultiLoraTransformersModel(model_id=MODEL_ID)
@@ -172,14 +238,14 @@ def train():
 
         # ========== 3. Compute rewards ==========
 
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(
+        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(
             all_input_data
         )
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
                 'total': total_rewards,
-                'format': format_rewards,
+                'brevity': brevity_rewards,
                 'accuracy': accuracy_rewards,
             },
         )
@@ -217,6 +283,11 @@ def train():
         log_dict.update(model.calculate_metric(is_training=True).result)
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         logger.info(f'Step {step}: {log_dict}')
+
+        # Log metrics to SwanLab
+        if USE_SWANLAB and log_dict:
+            swanlab.log(log_dict, step=step)
+
         step += 1
         metrics.reset()
 

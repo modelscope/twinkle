@@ -33,7 +33,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.metric import CompletionRewardMetric
-from twinkle.template import Template
+from twinkle.template import Qwen3_5Template
 
 logger = get_logger()
 
@@ -41,9 +41,9 @@ logger = get_logger()
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 4096
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 2e-5
 MAX_STEPS = 1000
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1  # Save weights for sampler every N steps
 LORA_RANK = 16
@@ -92,7 +92,7 @@ def create_gsm8k_dataset():
     """Create GSM8K dataset."""
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
     dataset.set_template('Qwen3_5Template', model_id=f'ms://{BASE_MODEL}', max_length=4096,
-                         truncation_strategy='delete', enable_thinking=False)
+                         truncation_strategy='delete', enable_thinking=True)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -117,7 +117,7 @@ def main():
     # Step 1: Prepare dataset and dataloader (client-side)
     dataset = create_gsm8k_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
-    template = Template(model_id=f'ms://{BASE_MODEL}')
+    template = Qwen3_5Template(model_id=f'ms://{BASE_MODEL}')
 
     logger.info('Dataset and template initialized')
 
