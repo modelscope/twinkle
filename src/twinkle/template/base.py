@@ -167,10 +167,13 @@ class Template:
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
-            token_ids_shape = result['mm_token_type_ids'].shape
-            device = result['mm_token_type_ids'].device
+            mm_token_type_ids = result['mm_token_type_ids']
+            if not isinstance(mm_token_type_ids, torch.Tensor):
+                mm_token_type_ids = torch.as_tensor(mm_token_type_ids)
+            token_ids_shape = mm_token_type_ids.shape
+            device = mm_token_type_ids.device
             padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
-            result['mm_token_type_ids'] = torch.cat((result['mm_token_type_ids'], padded_tokens), dim=1)
+            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=1)
         new_input_feature = self._invoke_post_pipeline([result])[0]
         result.update(new_input_feature)
         messages: List[Message] = result.get('messages')
@@ -466,6 +469,8 @@ class Template:
             # Set default values for processor_kwargs
             if 'enable_thinking' not in kwargs:
                 processor_kwargs['enable_thinking'] = self.enable_thinking
+            if 'padding' not in kwargs:
+                processor_kwargs['padding'] = False
 
             # Add remaining kwargs to processor_kwargs
             processor_kwargs.update(kwargs)
@@ -473,7 +478,6 @@ class Template:
             inputs = self.processor.apply_chat_template(
                 messages,
                 tools=tools,
-                padding=False,
                 return_dict=True,
                 add_generation_prompt=add_generation_prompt,
                 return_tensors='pt',

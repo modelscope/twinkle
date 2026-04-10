@@ -1,12 +1,12 @@
-# Tinker-Compatible Client - Math GRPO Training Example
+# Tinker-Compatible Client - GSM8K GRPO Training Example
 #
-# This script demonstrates Math problem training using the
+# This script demonstrates GSM8K math problem training using the
 # Tinker-compatible client API with save_weights_for_sampler for weight sync.
 # Instead of calling sync_weights directly, it periodically saves weights and
 # creates a sampling client for generation.
 #
 # Flow:
-#   1. Prepare Math dataset (client-side)
+#   1. Prepare GSM8K dataset (client-side)
 #   2. Initialize Tinker-compatible training & sampling clients
 #   3. Training loop:
 #      a. Every SYNC_INTERVAL steps: save_weights_for_sampler → sampling_client
@@ -22,191 +22,102 @@ import numpy as np
 import os
 import re
 from tinker import types
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 from twinkle import init_tinker_client
 from twinkle import get_logger
 from twinkle.advantage import GRPOAdvantage
-from twinkle.data_format import Message, Trajectory
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
-from twinkle.preprocessor import Preprocessor
+from twinkle.preprocessor.llm import GSM8KProcessor
+from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.metric import CompletionRewardMetric
-from twinkle.template import Template
+from twinkle.template import Qwen3_5Template
 
 logger = get_logger()
 
 # ========== Configuration ==========
 BASE_MODEL = 'Qwen/Qwen3.5-27B'
-NUM_GENERATIONS = 8
+NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 4096
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-5
 MAX_STEPS = 1000
 BATCH_SIZE = 2
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1  # Save weights for sampler every N steps
-LORA_RANK = 8
+LORA_RANK = 16
 DATA_NUM = 2000  # Number of Math samples to use
 
-SYSTEM_PROMPT = ('You are a math assistant that values brevity. '
-                 'Solve problems with minimal but correct reasoning.\n\n'
-                 'Rules:\n'
-                 '1. Use <step> </step> tags for reasoning\n'
-                 '2. Final answer after ####\n\n'
-                 'Example:\n<step>Key step1 -> Ket step 2 -> conclusion</step>\n#### 42')
+SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
+                 'and put your final answer within \\boxed{}.')
 
 
+# ========== Reward Functions ==========
+class GSM8KBrevityReward(Reward):
+    """Brevity reward: rewards shorter completions that contain a valid answer.
 
-class MathPreprocessor(Preprocessor):
-
-    def __call__(self, rows):
-        rows = self.map_col_to_row(rows)
-        rows = [self.preprocess(row) for row in rows]
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def preprocess(self, sample):
-        if sample['level'] not in ('Level 4', 'Level 5'):
-            return Trajectory(messages=[], user_data=[])
-
-        def get_boxed_answer(text):
-            match = re.search(r'\\boxed{([^}]*)}', text)
-            return match.group(1) if match else None
-
-        ground_truth = get_boxed_answer(sample['solution'])
-        if ground_truth is None:
-            return Trajectory(messages=[], user_data=[])
-        problem = sample['problem']
-        return Trajectory(
-            messages=[
-                Message(role='system', content=SYSTEM_PROMPT),
-                Message(role='user', content=problem),
-            ],
-            user_data=[('ground_truth', ground_truth)],
-        )
-
-
-# ========== Math Reward Functions ==========
-class MathAccuracyReward(Reward):
-    """Accuracy reward for Math: checks if the model's answer matches ground truth.
-
-    Extracts the last '#### <number>' from model output and compares with ground truth.
-    Returns 1.0 for correct, 0.0 for incorrect.
+    Returns 0.0 if no valid answer format (\\boxed{} or ####).
+    Otherwise returns higher score for shorter completions (1.0 at <=200 chars).
     """
 
-    @staticmethod
-    def extract_answer(completion: str) -> str:
-        """Extract the last #### answer from model completion."""
-        # Only check last 500 chars for efficiency
-        text = completion[-500:] if len(completion) > 500 else completion
-        matches = re.findall(r'####\s*([\-\d,\.\s]+)', text)
-        if matches:
-            return matches[-1].replace(',', '').replace(' ', '').strip()
-        return ''
-
-    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]) -> List[float]:
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
-        for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            # Get model completion (last assistant message)
+        for traj in trajectories:
+            messages = traj.get('messages', [])
             completion = ''
             for msg in reversed(messages):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
 
-            # Get ground truth from user_data
-            gt = ''
-            user_data = trajectory.get('user_data', [])
-            if isinstance(user_data, list):
-                for item in user_data:
-                    if isinstance(item, (list, tuple)) and len(item) == 2:
-                        if item[0] == 'ground_truth':
-                            gt = str(item[1])
-                            break
+            has_answer = bool(
+                re.search(r'\\boxed\{[^}]+\}', completion)
+                or re.search(r'####\s*[\-\d,\.]+', completion)
+            )
 
-            predicted = self.extract_answer(completion)
-
-            # Numeric comparison
-            correct = False
-            if predicted and gt:
-                try:
-                    correct = abs(float(predicted) - float(gt)) < 1e-5
-                except (ValueError, OverflowError):
-                    correct = predicted == gt
-
-            rewards.append(1.0 if correct else 0.0)
-        return rewards
-
-
-class MathFormatReward(Reward):
-    """Format reward: checks format and rewards shorter completions.
-
-    Returns higher score for shorter completions (1.0 at length 100 or less).
-    Returns 0.0 if format is incorrect.
-    """
-
-    def __call__(self, trajectories: List[Trajectory], ground_truths: List[Trajectory]) -> List[float]:
-        rewards = []
-        for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
-
-            has_think = bool(re.search(r'<step>.*?</step>', completion, re.DOTALL))
-            has_answer = bool(re.search(r'####\s*[\-\d,\.]+', completion))
-
-            if not (has_think and has_answer):
+            if not has_answer:
                 rewards.append(0.0)
             else:
                 length = len(completion)
-                if length <= 100:
+                if length <= 200:
                     rewards.append(1.0)
                 else:
-                    reward = max(0.0, 1.0 - (length - 100) / 2000)
-                    rewards.append(reward)
-
+                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
         return rewards
 
 
-def create_math_dataset():
-    """Create Math dataset."""
-    meta = DatasetMeta(
-        'ms://modelscope/competition_math',
-        subset_name='default',
-        split='train',
-        data_slice=range(DATA_NUM),
-    )
-    dataset = Dataset(meta)
-    dataset.set_template('Qwen3_5Template', model_id=BASE_MODEL, max_length=4096, truncation_strategy='delete')
-    dataset.map(MathPreprocessor())
-    dataset.filter(lambda row: bool(row['messages']))
+# ========== Dataset ==========
+def create_gsm8k_dataset():
+    """Create GSM8K dataset."""
+    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{BASE_MODEL}', max_length=4096,
+                         truncation_strategy='delete', enable_thinking=True)
+    dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
 
 
-def compute_rewards(trajectories: List[Trajectory], ) -> Tuple[List[float], List[float], List[float]]:
-    """Compute accuracy and format rewards for Math."""
-    accuracy_reward_fn = MathAccuracyReward()
-    format_reward_fn = MathFormatReward()
+def compute_rewards(
+    trajectories: List[Dict[str, Any]],
+) -> Tuple[List[float], List[float], List[float]]:
+    """Compute accuracy and brevity rewards for GSM8K."""
+    accuracy_reward_fn = GSM8KAccuracyReward()
+    brevity_reward_fn = GSM8KBrevityReward()
 
-    accuracy_rewards = accuracy_reward_fn(trajectories, [])
-    format_rewards = format_reward_fn(trajectories, [])
-    total_rewards = [a + f for a, f in zip(accuracy_rewards, format_rewards)]
-    return total_rewards, format_rewards, accuracy_rewards
+    accuracy_rewards = accuracy_reward_fn(trajectories)
+    brevity_rewards = brevity_reward_fn(trajectories)
+    total_rewards = [a + b for a, b in zip(accuracy_rewards, brevity_rewards)]
+    return total_rewards, brevity_rewards, accuracy_rewards
 
 
 def main():
-    logger.info('Starting Math GRPO training...')
+    logger.info('Starting GSM8K GRPO training...')
 
     # Step 1: Prepare dataset and dataloader (client-side)
-    dataset = create_math_dataset()
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
-    template = Template(model_id=f'ms://{BASE_MODEL}')
+    dataset = create_gsm8k_dataset()
+    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
+    template = Qwen3_5Template(model_id=f'ms://{BASE_MODEL}')
 
     logger.info('Dataset and template initialized')
 
@@ -254,7 +165,7 @@ def main():
         if step % SYNC_INTERVAL == 0:
             logger.info(f'Step {step}: Saving weights for sampler...')
 
-            sampling_client = (training_client.save_weights_and_get_sampling_client(name=f'Math-step-{step}'))
+            sampling_client = (training_client.save_weights_and_get_sampling_client(name=f'GSM8K-step-{step}'))
             logger.info(f'Step {step}: Sampling client ready')
 
         if sampling_client is None:
@@ -317,14 +228,12 @@ def main():
             completion_lengths.append(len(seq.tokens))
 
         # ========== 4. Compute rewards ==========
-        total_rewards, format_rewards, accuracy_rewards = compute_rewards(trajectories)
+        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(trajectories)
         metrics.accumulate(
-            None,
-            None,
             completion_lengths=completion_lengths,
             rewards={
                 'total': total_rewards,
-                'format': format_rewards,
+                'brevity': brevity_rewards,
                 'accuracy': accuracy_rewards,
             })
 
@@ -407,7 +316,7 @@ def main():
         step += 1
 
     # Save final checkpoint
-    save_future = training_client.save_state('Math-grpo-final')
+    save_future = training_client.save_state('gsm8k-grpo-final')
     save_result = save_future.result()
     logger.info(f'Saved final checkpoint to {save_result.path}')
 

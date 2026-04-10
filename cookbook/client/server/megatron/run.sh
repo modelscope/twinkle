@@ -12,6 +12,8 @@
 #   --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7:4)
 #   --cpu-workers N      CPU Worker 数量 (默认: 1)
 #   --temp-dir DIR       Ray 临时目录 (默认: /dashscope/caches/application/ray_logs)
+#   --save-dir DIR       Twinkle 模型保存目录 (默认: /dashscope/caches/application/save)
+#   --server-config FILE Twinkle 服务器配置文件路径 (默认: /twinkle/cookbook/client/server/megatron/server_config.yaml)
 #   --help               显示帮助信息
 #
 # 示例：
@@ -49,6 +51,8 @@ RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 # --- 路径配置 ---
 DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
 LOG_FILE="run.log"
+DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
+DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
 # --- Prometheus 监控配置 ---
 PROMETHEUS_BIN="/dashscope/caches/application/monitor/prometheus-3.10.0.linux-amd64/prometheus"
@@ -67,6 +71,8 @@ HEAD_NODE="0,1,2,3"
 GPU_WORKERS_INPUT="4,5,6,7"
 CPU_WORKER_COUNT="1"
 TEMP_DIR="$DEFAULT_TEMP_DIR"
+SAVE_DIR="$DEFAULT_SAVE_DIR"
+SERVER_CONFIG_FILE="$DEFAULT_SERVER_CONFIG_FILE"
 
 # 解析命名参数
 while [[ $# -gt 0 ]]; do
@@ -103,6 +109,22 @@ while [[ $# -gt 0 ]]; do
             TEMP_DIR="${1#*=}"
             shift
             ;;
+        --save-dir)
+            SAVE_DIR="$2"
+            shift 2
+            ;;
+        --save-dir=*)
+            SAVE_DIR="${1#*=}"
+            shift
+            ;;
+        --server-config)
+            SERVER_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --server-config=*)
+            SERVER_CONFIG_FILE="${1#*=}"
+            shift
+            ;;
         --help|-h)
             echo "用法: ./run.sh [选项]"
             echo ""
@@ -111,6 +133,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpu-workers LIST   GPU Worker 列表，分号分隔多个节点 (默认: 4,5,6,7)"
             echo "  --cpu-workers N      CPU Worker 数量 (默认: 1)"
             echo "  --temp-dir DIR       Ray 临时目录"
+            echo "  --save-dir DIR       Twinkle 模型保存目录 (默认: $DEFAULT_SAVE_DIR)"
+            echo "  --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)"
             echo "  --help, -h           显示帮助信息"
             echo ""
             echo "示例:"
@@ -128,6 +152,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# 将 SAVE_DIR export 给子进程（python server 通过环境变量读取）
+export TWINKLE_DEFAULT_SAVE_DIR="$SAVE_DIR"
 
 # 将分号分隔的字符串转为数组
 if [ -z "$GPU_WORKERS_INPUT" ]; then
@@ -222,6 +249,8 @@ echo ""
 print_info "运行参数："
 echo "  - Ray 地址: $RAY_ADDRESS"
 echo "  - 临时目录: $TEMP_DIR"
+echo "  - 保存目录: $TWINKLE_DEFAULT_SAVE_DIR"
+echo "  - 服务配置: $SERVER_CONFIG_FILE"
 echo "  - 日志文件: $LOG_FILE"
 echo ""
 
@@ -235,6 +264,28 @@ fi
 # 停止已有 Ray 集群和 Prometheus
 # ============================================
 print_header "清理环境"
+
+# 停止 Twinkle server.py（twinkle.server 模块）
+print_info "停止已有的 Twinkle Server..."
+pkill -f "twinkle.server" 2>/dev/null || true
+
+# 停止 vLLM 进程
+print_info "停止已有的 vLLM 进程..."
+pkill -f "vllm" 2>/dev/null || true
+
+# 等待上述进程退出
+sleep 2
+
+# 若仍有残留则强制 SIGKILL
+if pgrep -f "twinkle.server" > /dev/null 2>&1; then
+    print_warning "Twinkle Server 未退出，强制终止..."
+    pkill -9 -f "twinkle.server" 2>/dev/null || true
+fi
+if pgrep -f "vllm" > /dev/null 2>&1; then
+    print_warning "vLLM 进程未退出，强制终止..."
+    pkill -9 -f "vllm" 2>/dev/null || true
+fi
+
 print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
 
@@ -334,8 +385,10 @@ print_info "日志输出到: $LOG_FILE"
 echo ""
 
 # 启动服务器并实时显示日志
-nohup python server.py > "$LOG_FILE" 2>&1 &
+touch "$LOG_FILE"  # 预创建文件，避免 tail -f 在文件尚未写入时报错
+nohup python -m twinkle.server --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
+print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
 
 # 实时显示日志
 tail -f "$LOG_FILE"

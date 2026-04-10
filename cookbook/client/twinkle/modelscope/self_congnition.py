@@ -14,9 +14,9 @@ from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+from twinkle import init_twinkle_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
