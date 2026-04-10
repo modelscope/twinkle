@@ -70,6 +70,7 @@ def main():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
     # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
+    # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',

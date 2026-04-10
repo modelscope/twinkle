@@ -1169,11 +1169,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Save config on rank 0 only
         if dp_rank == 0:
             self.hf_config.save_pretrained(output_dir)
+            if isinstance(model[0], PeftModel):
+                model[0].peft_config[adapter_name].save_pretrained(output_dir)
 
     def _save_megatron_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in Megatron checkpoint format."""
         os.makedirs(output_dir, exist_ok=True)
-
+        from megatron.core import parallel_state as mpu
+        dp_rank = mpu.get_data_parallel_rank() if mpu.is_initialized() else 0
         state_dict = self._get_trainable_parameters(adapter_name)
         cpu_state_dict = {}
         for k, v in state_dict.items():
@@ -1189,6 +1192,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         rank = dist.get_rank() if dist.is_initialized() else 0
         checkpoint_path = os.path.join(output_dir, f'model_rank{rank}.pt')
         torch.save(cpu_state_dict, checkpoint_path)
+        # Save config on rank 0 only
+        model = self.strategy.unwrap_model(self.model)
+        if dp_rank == 0:
+            self.hf_config.save_pretrained(output_dir)
+            if isinstance(model[0], PeftModel):
+                model[0].peft_config[adapter_name].save_pretrained(output_dir)
 
     def _save_tokenizer(self, output_dir: str, **kwargs):
         from twinkle.utils import is_last_rank
@@ -1417,11 +1426,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def _add_base_layer_suffix(name):
             if name.endswith('.weight'):
                 base_layer_name = f'{name[:-7]}.base_layer.weight'
-                if base_layer_name in model_keys or not model_keys:
+                if not model_keys or base_layer_name in model_keys:
                     name = base_layer_name
             elif name.endswith('.bias'):
                 base_layer_name = f'{name[:-5]}.base_layer.bias'
-                if base_layer_name in model_keys or not model_keys:
+                if not model_keys or base_layer_name in model_keys:
                     name = base_layer_name
             return name
 

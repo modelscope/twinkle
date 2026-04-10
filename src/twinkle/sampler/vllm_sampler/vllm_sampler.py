@@ -235,14 +235,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         """
         multi_modal_data = self._extract_multi_modal_data(feat)
         response = await self.engine.sample(
-            prompt=feat['prompt'],
+            prompt=feat['prompt'] if 'prompt' in feat else feat['input_ids'],
             sampling_params=sampling_params,
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
-        feat['input_ids'] = response.prompt_token_ids
-        feat['labels'] = [-100] * len(response.prompt_token_ids)
+        if 'input_ids' not in feat:
+            feat['input_ids'] = response.prompt_token_ids
+            feat['labels'] = [-100] * len(response.prompt_token_ids)
         if not logprobs_only:
             # response.sequences contains num_samples sequences for this prompt
             sequences = []
@@ -318,7 +319,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         inputs_list = self._normalize_inputs(inputs)
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
-        is_trajectory = 'prompt' not in inputs_list[0] or 'input_ids' not in inputs_list[0]
+        is_trajectory = 'prompt' not in inputs_list[0] and 'input_ids' not in inputs_list[0]
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             sampling_params.max_tokens = 1
