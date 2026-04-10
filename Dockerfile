@@ -8,14 +8,6 @@ ENV PATH="/opt/conda/bin:${PATH}"
 RUN conda create -n twinkle python=3.12 -y --override-channels -c conda-forge
 ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
 
-# Clone and install twinkle, checkout to latest v-tag
-RUN git clone https://github.com/modelscope/twinkle.git
-WORKDIR /twinkle
-RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --sort=-v:refname && \
-    LATEST_RELEASE=$(git branch -r -l 'origin/release/*' --sort=-v:refname | head -n 1 | tr -d ' ') && \
-    echo "Checking out: $LATEST_RELEASE" && \
-    git checkout --track "$LATEST_RELEASE"
-
 ENV SETUPTOOLS_USE_DISTUTILS=local
 
 # Install base packages
@@ -46,6 +38,14 @@ RUN pip install numpy==2.2 --no-cache-dir
 
 # Install tinker, ray, and other deps
 RUN pip install --no-cache-dir tinker==0.14.0 "ray[serve]" transformers peft accelerate -U
+
+# Clone and install twinkle, checkout to latest v-tag
+RUN git clone https://github.com/modelscope/twinkle.git
+WORKDIR /twinkle
+RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --sort=-v:refname && \
+    LATEST_RELEASE=$(git branch -r -l 'origin/release/*' --sort=-v:refname | head -n 1 | tr -d ' ') && \
+    echo "Checking out: $LATEST_RELEASE" && \
+    git checkout --track "$LATEST_RELEASE" \
 
 # Install twinkle itself
 RUN pip install -e . --no-build-isolation
