@@ -334,7 +334,7 @@ print_info "日志输出到: $LOG_FILE"
 echo ""
 
 # 启动服务器并实时显示日志
-nohup python server.py > "$LOG_FILE" 2>&1 &
+nohup python "$(dirname "$0")/server.py" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
 # 实时显示日志
