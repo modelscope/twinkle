@@ -24,7 +24,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def __init__(
             self,  # noqa
-            model_cls=AutoModelForCausalLM,
+            model_cls=None,
             model_id: Optional[str] = None,
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
@@ -39,9 +39,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
+        self.model_id = model_id
+        if config is None:
+            from transformers import AutoConfig
+            self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        if model_cls is None and hasattr(self.hf_config, 'architectures'):
+            model_cls = self.hf_config.architectures[0]
+        if model_cls is None:
+            model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
+        self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self.device_mesh = device_mesh
