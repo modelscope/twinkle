@@ -16,6 +16,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
+from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
 
@@ -41,7 +42,6 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
-        requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         nn.Module.__init__(self)
@@ -59,6 +59,9 @@ class MultiLoraMegatronModel(MegatronModel):
         self.optimizer_group = {}
         torch_util.set_device()
         self._try_init_process_group()
+        self._ensure_megatron_process_group()
+        ensure_mindspeed_adaptor_patched()
+        requires('mcore_bridge')
 
         kwargs.update({
             'recompute_granularity': recompute_granularity,

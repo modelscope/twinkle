@@ -16,7 +16,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
@@ -35,6 +35,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
+from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -83,7 +84,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def __init__(
         self,
         model_id: str,
-        config: Optional[PretrainedConfig] = None,
+        config: Optional[PreTrainedConfig] = None,
         ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
@@ -95,7 +96,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ):
         requires('megatron_core')
-        requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         nn.Module.__init__(self)
@@ -111,6 +111,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
         self._try_init_process_group()
+        self._ensure_megatron_process_group()
+        # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
+        # mcore_bridge pulls in megatron.core/TE too early on NPU.
+        ensure_mindspeed_adaptor_patched()
+        requires('mcore_bridge')
 
         kwargs.update({
             'recompute_granularity': recompute_granularity,
@@ -145,6 +150,32 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
+
+    def _ensure_megatron_process_group(self):
+        """Megatron still requires a default PG even for single-rank local smoke.
+
+        TwinkleModel._try_init_process_group() intentionally skips world_size==1,
+        because most frameworks do not need a default process group there.
+        Megatron is different: initialize_model_parallel() still assumes a default
+        PG already exists, so local NPU/GPU smoke needs a 1-rank fallback PG here.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            from twinkle import find_free_port
+
+            backend = Platform.device_backend()
+            init_kwargs = {
+                'backend': backend,
+                'init_method': f'tcp://127.0.0.1:{find_free_port()}',
+                'rank': 0,
+                'world_size': 1,
+            }
+            # Keep NCCL's device binding behavior, but avoid binding HCCL default PG
+            # here so the later Gloo sub-groups stay decoupled on NPU.
+            if backend == 'nccl':
+                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+            dist.init_process_group(**init_kwargs)
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
@@ -358,6 +389,26 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
+            # MindSpeed 0.15.3 patches TE attention to a flash-attention based
+            # NPU implementation. That path expects to generate its own
+            # compressed causal mask (for example [2048, 2048]) when
+            # ``attention_mask`` is ``None``. Twinkle's generic Megatron
+            # processor, however, always expands the 1D token mask into a 4D
+            # dense causal mask. On NPU this makes FlashAttention receive the
+            # wrong mask shape and the real 8-card run fails in
+            # ``aclnnFlashAttentionScore``. For decoder-only causal training
+            # with right padding, the 4D mask is redundant: a causal mask
+            # already prevents valid tokens from attending to the padded tail,
+            # and padded query positions are ignored by labels == -100. So on
+            # the NPU TE path, drop this dense mask and let MindSpeed build the
+            # compressed causal mask it requires.
+            if Platform.device_prefix() == 'npu':
+                attention_mask = batch.get('attention_mask')
+                if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
+                    unwrapped_model = self.strategy.unwrap_model([model])[0]
+                    attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
+                    if attention_mask_type == 'causal':
+                        batch['attention_mask'] = None
             # Handle disable_lora for base model inference (e.g., reference in DPO)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             if disable_lora and isinstance(unwrapped_model, PeftModel):
