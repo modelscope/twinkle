@@ -162,8 +162,11 @@ class Template:
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
+        labels = result['labels']
         input_ids = list(prompt_ids) + new_tokens
-        labels = [-100] * len(prompt_ids) + new_tokens
+        labels = labels[-1:] + labels[:-1] # roll to input order
+        labels = labels + new_tokens
+        labels = labels[1:] + labels[:1] # roll to input-1 order
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
@@ -181,6 +184,23 @@ class Template:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             messages.append(Message(role='assistant', content=response_text))
             result['messages'] = messages
+            prompt = self.batch_encode(
+                [result],
+                add_generation_prompt=False,
+                tokenize=False,
+            )[0] # regenerate prompt
+            
+            decoded = self.decode(input_ids[-10])
+            suffix = ['\n']
+            # Models like qwen3 may end with <im_end>\n, this will mismatch
+            # with the vLLM output, which endwith <im_end>
+            if self.tokenizer.eos_token:
+                suffix += [self.tokenizer.eos_token]
+            _prompt = prompt['prompt']
+            for token in suffix:
+                if _prompt.endswith(token) and not decoded.endswith(token):
+                    _prompt = _prompt[:-len(token)]
+            result['prompt'] = _prompt
         return result
 
     def _add_default_system(self, trajectory: Trajectory) -> List[Trajectory]:
@@ -467,8 +487,6 @@ class Template:
                 apply_chat_template_kwargs['tokenize'] = True
 
             # Set default values for processor_kwargs
-            if 'enable_thinking' not in kwargs:
-                processor_kwargs['enable_thinking'] = self.enable_thinking
             if 'padding' not in kwargs:
                 processor_kwargs['padding'] = False
 
@@ -482,6 +500,7 @@ class Template:
                 add_generation_prompt=add_generation_prompt,
                 return_tensors='pt',
                 processor_kwargs=processor_kwargs,
+                enable_thinking=self.enable_thinking,
                 **apply_chat_template_kwargs)
         else:
             # No processor_kwargs support, pass all kwargs directly

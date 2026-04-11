@@ -248,9 +248,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
+
         if 'input_ids' not in feat or multi_modal_data:
-            feat['input_ids'] = response.prompt_token_ids
-            feat['labels'] = [-100] * len(response.prompt_token_ids)
+            if 'input_ids' in feat:
+                if len(feat['input_ids']) != len(response.prompt_token_ids):
+                    breakpoint()
+                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not match prompt_token_ids length {len(response.prompt_token_ids)}')
+            else:
+                feat['input_ids'] = response.prompt_token_ids
+                feat['labels'] = [-100] * len(response.prompt_token_ids)
         if not logprobs_only:
             # response.sequences contains num_samples sequences for this prompt
             sequences = []
@@ -331,12 +337,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if sampling_params.max_tokens == 0:
             sampling_params.max_tokens = 1
             logprobs_only = True
+            assert not is_trajectory, 'Logprobs only not supported for Trajectory inputs'
 
         multi_modal_data_list = []
         for feat in inputs_list:
             multi_modal_data_list.append(self._extract_multi_modal_data(feat))
 
-        if is_trajectory or any(multi_modal_data_list):
+        if is_trajectory or any(multi_modal_data_list) and not logprobs_only:
             template = self.template
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
