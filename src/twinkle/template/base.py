@@ -162,8 +162,11 @@ class Template:
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
+        labels = list(result['labels'])
         input_ids = list(prompt_ids) + new_tokens
-        labels = [-100] * len(prompt_ids) + new_tokens
+        labels = labels[-1:] + labels[:-1]  # roll to input order
+        labels = labels + new_tokens
+        labels = labels[1:] + labels[:1]  # roll to input-1 order
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
@@ -233,6 +236,9 @@ class Template:
 
     def set_mm_position_ids(self, input_feature: InputFeature):
         return np.arange(len(input_feature['input_ids']))
+
+    def get_vllm_input_ids(self, input_ids):
+        return input_ids
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
         if not self.max_length or 'input_ids' not in input_feature:
@@ -467,8 +473,6 @@ class Template:
                 apply_chat_template_kwargs['tokenize'] = True
 
             # Set default values for processor_kwargs
-            if 'enable_thinking' not in kwargs:
-                processor_kwargs['enable_thinking'] = self.enable_thinking
             if 'padding' not in kwargs:
                 processor_kwargs['padding'] = False
 
@@ -482,6 +486,7 @@ class Template:
                 add_generation_prompt=add_generation_prompt,
                 return_tensors='pt',
                 processor_kwargs=processor_kwargs,
+                enable_thinking=self.enable_thinking,
                 **apply_chat_template_kwargs)
         else:
             # No processor_kwargs support, pass all kwargs directly

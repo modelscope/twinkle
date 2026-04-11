@@ -155,17 +155,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
-
-        prompt = template.batch_encode(
-            [trajectory],
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,
-        )[0]
         encoded = template.batch_encode(
             [trajectory],
             add_generation_prompt=add_generation_prompt,
         )[0]
-        encoded['prompt'] = prompt['prompt']
+        for key in encoded:
+            if isinstance(encoded[key], np.ndarray):
+                encoded[key] = encoded[key].tolist()
         return encoded
 
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
@@ -218,6 +214,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         sampling_params: SamplingParams,
         lora_request: Optional[Any] = None,
         *,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
     ) -> SampleResponse:
         """Sample a single input asynchronously.
@@ -228,22 +225,28 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             adapter_path: Optional LoRA adapter path (legacy, prefer lora_request).
             lora_request: Pre-built LoRARequest to attach to the sampling request.
                 Avoids repeated ``_get_or_load_lora`` calls per input.
+            multi_modal_data: The multi modal data dict.
             logprobs_only: Only return logprobs (no generated tokens).
 
         Returns:
             A SampleResponse object
         """
-        multi_modal_data = self._extract_multi_modal_data(feat)
         response = await self.engine.sample(
-            prompt=feat['prompt'] if 'prompt' in feat else feat['input_ids'],
+            prompt=self.template.get_vllm_input_ids(feat['input_ids']),
             sampling_params=sampling_params,
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
-        if 'input_ids' not in feat:
-            feat['input_ids'] = response.prompt_token_ids
-            feat['labels'] = [-100] * len(response.prompt_token_ids)
+
+        if 'input_ids' not in feat or multi_modal_data:
+            if 'input_ids' in feat:
+                if len(feat['input_ids']) != len(response.prompt_token_ids):
+                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not'
+                                       f'match prompt_token_ids length {len(response.prompt_token_ids)}')
+            else:
+                feat['input_ids'] = response.prompt_token_ids
+                feat['labels'] = [-100] * len(response.prompt_token_ids)
         if not logprobs_only:
             # response.sequences contains num_samples sequences for this prompt
             sequences = []
@@ -319,13 +322,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         inputs_list = self._normalize_inputs(inputs)
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
-        is_trajectory = 'prompt' not in inputs_list[0] and 'input_ids' not in inputs_list[0]
+        is_trajectory = 'input_ids' not in inputs_list[0]
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             sampling_params.max_tokens = 1
             logprobs_only = True
+            assert not is_trajectory, 'Logprobs only not supported for Trajectory inputs'
 
-        if is_trajectory:
+        multi_modal_data_list = []
+        for feat in inputs_list:
+            multi_modal_data_list.append(self._extract_multi_modal_data(feat))
+
+        if is_trajectory and not logprobs_only:
             template = self.template
             assert template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
@@ -349,8 +357,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     feat,
                     sampling_params,
                     lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
-                ) for feat in encoded_inputs
+                ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
             ]
             return await asyncio.gather(*tasks)
 
