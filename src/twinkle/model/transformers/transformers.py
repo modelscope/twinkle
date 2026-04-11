@@ -476,8 +476,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.loss_instance
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        inputs = optimizer_config.train_status.inputs
-        outputs = optimizer_config.train_status.outputs
+        if self.model.training:
+            status = optimizer_config.train_status
+        else:
+            status = optimizer_config.eval_status
+        inputs = status.inputs
+        outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
         loss_value = result['loss']
@@ -499,15 +503,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
         counts = counts / self.device_mesh.data_world_size
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.train_status.num_tokens += counts.item()
+        status.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
             reduction = getattr(loss_instance, 'reduction', None)
             if reduction is not None:
                 self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
-        optimizer_config.train_status.loss_value += loss_value
-        outputs['loss'] = optimizer_config.train_status.loss_value
-        return optimizer_config.train_status.loss_value.item()
+        status.loss_value += loss_value
+        outputs['loss'] = status.loss_value
+        return status.loss_value.item()
 
     @remote_function()
     def backward(self, **kwargs):
@@ -1163,6 +1167,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name: str = None,
         base_sync_done: bool = False,
         merge_and_sync: bool = False,
+        model_keys: List[str] = None,
         **kwargs,
     ):
         if adapter_name is None:
@@ -1175,6 +1180,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
+            else:
+                if 'conv1d.weight' in name:
+                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
+                        name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
             return name
 
         def _print_weight_example(names):

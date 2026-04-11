@@ -26,9 +26,11 @@ class Qwen3_5Template(Template):
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()
-        from transformers.models.qwen3_vl import Qwen3VLModel
         with torch.device('meta'):
-            self.dummy_model = Qwen3VLModel(self.config)
+            import transformers
+            model_cls = self.config.architectures[0]
+            model_cls = getattr(transformers, model_cls)
+            self.dummy_model = model_cls(self.config)
             self.rope_index_func = self.get_rope_index()
 
     def get_rope_index(self):
@@ -127,6 +129,35 @@ class Qwen3_5Template(Template):
             attention_mask=attention_mask,
             **kwargs)
         return self._concat_text_position_ids(position_ids)
+
+    def get_vllm_input_ids(self, input_ids):
+        """Collapse each <vision_start> <image_pad>... <vision_end> group
+        into <vision_start> <image_pad> <vision_end> (single pad token)."""
+        image_token_id = self.config.image_token_id
+        vision_start_id = self.config.vision_start_token_id
+        vision_end_id = self.config.vision_end_token_id
+
+        result = []
+        i = 0
+        while i < len(input_ids):
+            if input_ids[i] == vision_start_id:
+                result.append(vision_start_id)
+                i += 1
+                # Skip all consecutive image_pad tokens, keep only one
+                found_pad = False
+                while i < len(input_ids) and input_ids[i] == image_token_id:
+                    if not found_pad:
+                        result.append(image_token_id)
+                        found_pad = True
+                    i += 1
+                # Append vision_end if present
+                if i < len(input_ids) and input_ids[i] == vision_end_id:
+                    result.append(vision_end_id)
+                    i += 1
+            else:
+                result.append(input_ids[i])
+                i += 1
+        return result
 
     @staticmethod
     def _concat_text_position_ids(position_ids):

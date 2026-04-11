@@ -89,7 +89,7 @@ def train():
             # Print metric
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
-        if step > 0 and step % 40 == 0:
+        if step > 0 and step % 200 == 0:
             metrics = eval(model)
             logger.info(f'Eval metric: {metrics}')
             metrics['step'] = step

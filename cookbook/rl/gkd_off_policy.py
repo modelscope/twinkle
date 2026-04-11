@@ -60,8 +60,8 @@ logger = get_logger()
 STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
 TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', 'ms://Qwen/Qwen3-8B')
 
-MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 8))
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 16))
