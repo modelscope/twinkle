@@ -162,7 +162,7 @@ class Template:
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
-        labels = result['labels']
+        labels = list(result['labels'])
         input_ids = list(prompt_ids) + new_tokens
         labels = labels[-1:] + labels[:-1]  # roll to input order
         labels = labels + new_tokens
@@ -237,7 +237,7 @@ class Template:
     def set_mm_position_ids(self, input_feature: InputFeature):
         return np.arange(len(input_feature['input_ids']))
 
-    def get_vllm_input_ids(input_ids):
+    def get_vllm_input_ids(self, input_ids):
         return input_ids
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:

@@ -1182,7 +1182,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 name = name.replace('.base_layer', '')
             else:
                 if 'conv1d.weight' in name:
-                    if any('conv1d.base_layer.weight' in name for name in model_keys):
+                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
                         name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
             return name
 
