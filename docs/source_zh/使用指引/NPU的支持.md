@@ -165,45 +165,11 @@ python -c "import mindspeed.megatron_adaptor; from twinkle.model.megatron._minds
 
 ### SFT LoRA 微调
 
-已验证的 4 卡 DP+FSDP 训练示例：
-
-**示例路径**：[cookbook/sft/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/sft/lora_npu.py)
-
-**运行方式**：
-```bash
-# 指定使用 4 张 NPU 卡
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-
-# 运行训练
-python cookbook/sft/lora_npu.py
-```
-
-**示例特性**：
-- ✅ Ray 分布式模式
-- ✅ DP + FSDP 混合并行（2x2）
-- ✅ LoRA 微调
-- ✅ 完整的数据加载和训练循环
+当前 NPU 文档不再提供这类 SFT cookbook 示例；这部分能力需要结合实际可用的 cookbook 示例或后续补充的 NPU 脚本来说明。
 
 ### GRPO 强化学习训练
 
-已验证的多卡 GRPO 训练示例：
-
-**示例路径**：[cookbook/grpo/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/grpo/lora_npu.py)
-
-**运行方式**：
-```bash
-# 指定使用 8 张 NPU 卡
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# 运行训练
-python cookbook/grpo/lora_npu.py
-```
-
-**示例特性**：
-- ✅ Actor-Critic 架构
-- ✅ 支持 Reference Model
-- ✅ 可选 TorchSampler 或 vLLMSampler
-- ✅ 完整的 RL 训练流程
+当前 NPU 文档不再提供这类 GRPO cookbook 示例；这部分能力需要结合实际可用的 cookbook 示例或后续补充的 NPU 脚本来说明。
 
 ### 更多示例
 
@@ -215,12 +181,12 @@ Twinkle 在 NPU 上目前支持以下**经过验证**的并行策略：
 
 | 并行类型 | 说明 | NPU 支持 | 验证状态 |
 |---------|------|---------|---------|
-| DP (Data Parallel) | 数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
-| FSDP (Fully Sharded Data Parallel) | 完全分片数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
-| TP (Tensor Parallel) | 张量并行（Megatron） | ✅ | 已验证（Megatron NPU smoke 示例） |
-| PP (Pipeline Parallel) | 流水线并行（Megatron） | ✅ | 已验证（Megatron NPU smoke 示例） |
-| CP (Context Parallel) | 上下文并行 | ✅ | 已验证（Megatron NPU smoke 示例） |
-| EP (Expert Parallel) | 专家并行（MoE） | ✅ | 已验证（Megatron NPU smoke 示例） |
+| DP (Data Parallel) | 数据并行 | ✅ | 暂无对应 cookbook 示例 |
+| FSDP (Fully Sharded Data Parallel) | 完全分片数据并行 | ✅ | 暂无对应 cookbook 示例 |
+| TP (Tensor Parallel) | 张量并行（Megatron） | ✅ | 已验证（见 `cookbook/megatron/ascend/tp_npu.py`） |
+| PP (Pipeline Parallel) | 流水线并行（Megatron） | ✅ | 已验证（见 `cookbook/megatron/ascend/tp_npu.py`） |
+| CP (Context Parallel) | 上下文并行 | ✅ | 已验证（见 `cookbook/megatron/ascend/tp_moe_cp_npu.py`） |
+| EP (Expert Parallel) | 专家并行（MoE） | ✅ | 已验证（见 `cookbook/megatron/ascend/tp_moe_npu.py`） |
 
 **图例说明**：
 - ✅ 已验证：有实际运行示例代码
@@ -229,21 +195,9 @@ Twinkle 在 NPU 上目前支持以下**经过验证**的并行策略：
 
 ### DP + FSDP 示例
 
-以下示例来自 `cookbook/sft/lora_npu.py`，在实际 NPU 环境中验证通过：
+当前 NPU 文档暂不提供对应的 cookbook 代码片段。
 
-```python
-import numpy as np
-from twinkle import DeviceMesh
-
-# 4 卡：DP=2, FSDP=2
-device_mesh = DeviceMesh(
-    device_type='npu',
-    mesh=np.array([[0, 1], [2, 3]]),
-    mesh_dim_names=('dp', 'fsdp')
-)
-```
-
-**Megatron 后端说明**：Twinkle 的 Megatron NPU 路径已经提供了可直接运行的 smoke 示例，安装和运行依赖请参考上面的 “Megatron 后端依赖” 小节。当前优先建议先验证基础 TP smoke，再逐步切到 MoE 和 CP smoke。
+**Megatron 后端说明**：Twinkle 的 Megatron NPU 路径已经提供了可直接运行的 smoke 示例，安装和运行依赖请参考上面的 “Megatron 后端依赖” 小节。当前优先建议先验证 `cookbook/megatron/ascend/tp_npu.py`，再逐步切到 `cookbook/megatron/ascend/tp_moe_npu.py` 和 `cookbook/megatron/ascend/tp_moe_cp_npu.py`。
 
 ## 常见问题
 
@@ -279,14 +233,14 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 
 | 功能 | GPU | NPU | 验证示例 | 说明 |
 |------|-----|-----|---------|------|
-| SFT + LoRA | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
-| GRPO | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
-| DP 并行 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
-| FSDP 并行 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
-| Ray 分布式 | ✅ | ✅ | cookbook/sft/lora_npu.py | 已验证可用 |
-| TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
-| vLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | 已验证可用 |
-| 全量微调 | ✅ | 🚧 | - | 理论支持，待验证 |
+| SFT + LoRA | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| GRPO | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| DP 并行 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| FSDP 并行 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| Ray 分布式 | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| TorchSampler | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| vLLMSampler | ✅ | ✅ | - | 暂无对应 cookbook 示例 |
+| 全量微调 | ✅ | ✅ | - | 已验证可用 |
 | QLoRA | ✅ | ❌ | - | 量化算子暂不支持 |
 | DPO | ✅ | 🚧 | - | 理论支持，待验证 |
 | Megatron TP/PP | ✅ | 🚧 | - | 待适配和验证 |
@@ -303,38 +257,6 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 2. “待验证”功能可以尝试，但可能遇到兼容性问题
 3. 遇到问题时，参考对应的示例代码进行配置
 
-## 示例代码
-
-Twinkle 提供了以下经过验证的 NPU 训练示例：
-
-### SFT 训练
-- **4 卡 DP+FSDP LoRA 微调**：[cookbook/sft/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/sft/lora_npu.py)
-  - 使用 Ray 模式进行分布式训练
-  - 演示 DP + FSDP 混合并行
-  - 包含完整的数据加载和训练循环
-
-### GRPO 训练
-- **多卡 GRPO RL 训练**：[cookbook/grpo/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/grpo/lora_npu.py)
-  - Actor-Critic 架构
-  - 支持参考模型（Reference Model）
-  - 可选 TorchSampler 或 vLLMSampler
-
-### 远程训练（Tinker 协议）
-- **服务端配置**：[cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
-  - 提供 HTTP API 接口
-  - 支持远程训练和推理
-  - 适用于生产环境部署
-
-**运行示例**：
-```bash
-# SFT 训练
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-python cookbook/sft/lora_npu.py
-
-# GRPO 训练
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-python cookbook/grpo/lora_npu.py
-```
 
 ## 参考资源
 
