@@ -164,12 +164,11 @@ class TwinkleCompatModelBase:
 
     def _tinker_build_output(self, inputs, outputs):
         """Extract logits/logps from model outputs and build per-datum output list."""
-        logits = outputs.get('logits')
-        if logits is not None:
-            logits = self._normalize_tensor_output(logits)
-        logps = outputs.get('logps', None)
-        if logps is not None:
-            logps = self._normalize_tensor_output(logps)
+        logits = self._normalize_tensor_output(outputs.get('logits'))
+        logps = self._normalize_tensor_output(outputs.get('logps'))
+        if logits is None and logps is None:
+            # non-last PP stage: no outputs produced, collector will discard this
+            return []
         return self._get_forward_output(inputs, logits, logps)
 
     @staticmethod
@@ -177,9 +176,9 @@ class TwinkleCompatModelBase:
         """Normalize various output formats (tensor, list of tensors, nested lists, floats) to a single tensor.
 
         Handles:
+        - None or empty list: returns None
         - torch.Tensor: detach and move to cpu
         - list of torch.Tensor: cat along dim=0
-        - nested lists: recursively flatten and cat
         - list of floats/int: convert to tensor
         """
         if value is None:
@@ -189,6 +188,10 @@ class TwinkleCompatModelBase:
             return value.detach().cpu()
 
         if isinstance(value, list):
+            if not value:  # empty list (e.g. non-last PP stage): treat as missing
+                return None
+            if isinstance(value[0], torch.Tensor):
+                return torch.cat(value, dim=0).detach().cpu()
             return torch.as_tensor(value, dtype=torch.float32).detach().cpu()
 
         if isinstance(value, (int, float)):

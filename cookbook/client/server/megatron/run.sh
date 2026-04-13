@@ -271,7 +271,7 @@ pkill -f "twinkle.server" 2>/dev/null || true
 
 # 停止 vLLM 进程
 print_info "停止已有的 vLLM 进程..."
-pkill -f "vllm" 2>/dev/null || true
+pkill -if "vLLM" 2>/dev/null || true
 
 # 等待上述进程退出
 sleep 2
@@ -281,9 +281,9 @@ if pgrep -f "twinkle.server" > /dev/null 2>&1; then
     print_warning "Twinkle Server 未退出，强制终止..."
     pkill -9 -f "twinkle.server" 2>/dev/null || true
 fi
-if pgrep -f "vllm" > /dev/null 2>&1; then
+if pgrep -if "vLLM" > /dev/null 2>&1; then
     print_warning "vLLM 进程未退出，强制终止..."
-    pkill -9 -f "vllm" 2>/dev/null || true
+    pkill -9if "vLLM" 2>/dev/null || true
 fi
 
 print_info "停止已有的 Ray 集群..."
@@ -385,10 +385,6 @@ print_info "日志输出到: $LOG_FILE"
 echo ""
 
 # 启动服务器并实时显示日志
-touch "$LOG_FILE"  # 预创建文件，避免 tail -f 在文件尚未写入时报错
 nohup python -m twinkle.server --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
-
-# 实时显示日志
-tail -f "$LOG_FILE"
