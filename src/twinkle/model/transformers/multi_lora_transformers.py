@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import torch.distributed as dist
 import transformers
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
@@ -225,7 +226,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
-            return super().save(name, output_dir, interval, **kwargs)
+            checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
+        if dist.is_initialized():
+            dist.barrier()
+        return checkpoint_dir
 
     @remote_function()
     def load(self, name: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
@@ -247,6 +251,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
             if load_optimizer:
                 self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+        if dist.is_initialized():
+            dist.barrier()
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):

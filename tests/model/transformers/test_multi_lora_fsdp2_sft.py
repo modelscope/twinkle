@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import os
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 from twinkle import DeviceMesh
 from twinkle.model.multi_lora import MultiLora
 from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+from twinkle.model.transformers.transformers import TransformersModel
 
 TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID')
 
@@ -289,6 +291,72 @@ def test_multi_lora_write_param_tensor_distributes_leaf_tensor(monkeypatch):
     assert recorded['device_mesh'] is parameter.device_mesh
     assert recorded['placements'] == parameter.placements
     assert torch.equal(parameter.data, torch.full((2, 2), 3.0))
+
+
+def _build_stub_multi_lora_model():
+    model = object.__new__(MultiLoraTransformersModel)
+    model._check_adapter_valid = lambda adapter_name: None
+    model.multi_adapter = type(
+        'DummyMultiAdapter',
+        (),
+        {
+            'save_context': staticmethod(lambda adapter_name: nullcontext()),
+            'set_state_dict': lambda self, adapter_name, state_dict: None,
+        },
+    )()
+    model.strategy = type('DummyStrategy', (), {'unwrap_model': lambda self, wrapped: wrapped})()
+    model.model = object()
+    model._load_optimizer = lambda checkpoint_dir, adapter_name=None: None
+    return model
+
+
+def test_multi_lora_save_barriers_after_checkpoint_write(monkeypatch):
+    model = _build_stub_multi_lora_model()
+    events = []
+
+    def fake_save(self, name, output_dir=None, interval=1, **kwargs):
+        events.append('save')
+        return 'ckpt'
+
+    monkeypatch.setattr(TransformersModel, 'save', fake_save)
+    monkeypatch.setattr('torch.distributed.is_initialized', lambda: True)
+    monkeypatch.setattr('torch.distributed.barrier', lambda: events.append('barrier'))
+
+    checkpoint_dir = model.save('ckpt', output_dir='output', adapter_name='default')
+
+    assert checkpoint_dir == 'ckpt'
+    assert events == ['save', 'barrier']
+
+
+def test_multi_lora_load_barriers_after_adapter_restore(monkeypatch):
+    model = _build_stub_multi_lora_model()
+    events = []
+
+    class FakePeftModel:
+        pass
+
+    fake_peft_model = FakePeftModel()
+    model.model = fake_peft_model
+
+    def fake_set_state_dict(adapter_name, state_dict):
+        events.append(('set_state_dict', adapter_name, state_dict))
+
+    model.multi_adapter.set_state_dict = fake_set_state_dict
+
+    monkeypatch.setattr('twinkle.model.transformers.multi_lora_transformers.PeftModel', FakePeftModel)
+    monkeypatch.setattr('twinkle.model.transformers.multi_lora_transformers.load_peft_weights',
+                        lambda checkpoint_dir, device='cpu': events.append(('load_peft_weights', checkpoint_dir,
+                                                                            device)) or {'layer.weight': torch.ones(1)})
+    monkeypatch.setattr('torch.distributed.is_initialized', lambda: True)
+    monkeypatch.setattr('torch.distributed.barrier', lambda: events.append('barrier'))
+
+    model.load('ckpt', output_dir='output', adapter_name='default')
+
+    assert events == [
+        ('load_peft_weights', os.path.join('output', 'ckpt'), 'cpu'),
+        ('set_state_dict', 'default', {'layer.weight': torch.ones(1)}),
+        'barrier',
+    ]
 
 
 @pytest.mark.skipif(accelerator_device_count() < 2, reason='Requires 2+ CUDA GPUs or NPUs')
