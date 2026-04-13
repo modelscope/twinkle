@@ -407,7 +407,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
                     unwrapped_model = self.strategy.unwrap_model([model])[0]
                     attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
-                    if attention_mask_type == 'causal':
+                    if attention_mask_type == 'causal' and self.device_mesh.cp_world_size > 1:
                         batch['attention_mask'] = None
             # Handle disable_lora for base model inference (e.g., reference in DPO)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
