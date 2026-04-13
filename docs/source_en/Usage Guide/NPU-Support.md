@@ -146,8 +146,8 @@ pip install -e ".[transformers,ray]"
 **Runtime environment variables**:
 
 ```bash
-export PYTHONPATH=$PYTHONPATH:/home/zyh/code1/Megatron-LM
-export MEGATRON_LM_PATH=/home/zyh/code1/Megatron-LM
+export PYTHONPATH=$PYTHONPATH:<path/to/Megatron-LM>
+export MEGATRON_LM_PATH=</path/to/Megatron-LM>
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ```
 
