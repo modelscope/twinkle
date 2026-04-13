@@ -159,16 +159,6 @@ First run a minimal import check to make sure the current environment can resolv
 python -c "import mindspeed.megatron_adaptor; from twinkle.model.megatron._mindspeed_runtime import ensure_mindspeed_adaptor_patched; ensure_mindspeed_adaptor_patched(); print('✓ Megatron backend imports are ready')"
 ```
 
-Then run the cookbook smoke tests to verify the actual TP / MoE / CP training paths:
-
-```bash
-torchrun --standalone --nproc_per_node=8 cookbook/megatron/tp_npu.py
-torchrun --standalone --nproc_per_node=8 cookbook/megatron/tp_moe_npu.py
-torchrun --standalone --nproc_per_node=8 cookbook/megatron/tp_moe_cp_npu.py
-```
-
-If you only want to validate the base Megatron TP path first, start with `tp_npu.py`.
-
 ## Quick Start
 
 **Important Notice**: The following examples are from the `cookbook/` directory and have been verified in actual NPU environments. It is recommended to run scripts directly from the cookbook rather than copying and pasting code snippets.
@@ -227,10 +217,10 @@ Twinkle currently supports the following **verified** parallelization strategies
 |---------|------|---------|---------|
 | DP (Data Parallel) | Data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
 | FSDP (Fully Sharded Data Parallel) | Fully sharded data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
-| TP (Tensor Parallel) | Tensor parallelism (Megatron) | ✅ | Verified (see cookbook/megatron/tp_npu.py) |
-| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | ✅ | Verified (see cookbook/megatron/tp_npu.py) |
-| CP (Context Parallel) | Context parallelism | ✅ | Verified (see cookbook/megatron/tp_moe_cp_npu.py) |
-| EP (Expert Parallel) | Expert parallelism (MoE) | ✅ | Verified (see cookbook/megatron/tp_moe_npu.py) |
+| TP (Tensor Parallel) | Tensor parallelism (Megatron) | ✅ | Verified (Megatron NPU smoke example) |
+| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | ✅ | Verified (Megatron NPU smoke example) |
+| CP (Context Parallel) | Context parallelism | ✅ | Verified (Megatron NPU smoke example) |
+| EP (Expert Parallel) | Expert parallelism (MoE) | ✅ | Verified (Megatron NPU smoke example) |
 
 **Legend**:
 - ✅ Verified: Has actual running example code
@@ -253,7 +243,7 @@ device_mesh = DeviceMesh(
 )
 ```
 
-**Megatron backend note**: Twinkle now provides runnable NPU smoke scripts for the Megatron backend. Please follow the installation section above before running the cookbook examples, and start with `cookbook/megatron/tp_npu.py` before moving on to `tp_moe_npu.py` and `tp_moe_cp_npu.py`.
+**Megatron backend note**: Twinkle now provides runnable NPU smoke scripts for the Megatron backend. Please follow the installation section above before running the cookbook examples, and start with the base TP smoke script before moving on to the MoE and CP smoke scripts.
 
 ## Common Issues
 

@@ -217,10 +217,10 @@ Twinkle 在 NPU 上目前支持以下**经过验证**的并行策略：
 |---------|------|---------|---------|
 | DP (Data Parallel) | 数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
 | FSDP (Fully Sharded Data Parallel) | 完全分片数据并行 | ✅ | 已验证（见 cookbook/sft/lora_npu.py） |
-| TP (Tensor Parallel) | 张量并行（Megatron） | ✅ | 已验证（见 cookbook/megatron/tp_npu.py） |
-| PP (Pipeline Parallel) | 流水线并行（Megatron） | ✅ | 已验证（见 cookbook/megatron/tp_npu.py） |
-| CP (Context Parallel) | 上下文并行 | ✅ | 已验证（见 cookbook/megatron/tp_moe_cp_npu.py） |
-| EP (Expert Parallel) | 专家并行（MoE） | ✅ | 已验证（见 cookbook/megatron/tp_moe_npu.py） |
+| TP (Tensor Parallel) | 张量并行（Megatron） | ✅ | 已验证（Megatron NPU smoke 示例） |
+| PP (Pipeline Parallel) | 流水线并行（Megatron） | ✅ | 已验证（Megatron NPU smoke 示例） |
+| CP (Context Parallel) | 上下文并行 | ✅ | 已验证（Megatron NPU smoke 示例） |
+| EP (Expert Parallel) | 专家并行（MoE） | ✅ | 已验证（Megatron NPU smoke 示例） |
 
 **图例说明**：
 - ✅ 已验证：有实际运行示例代码
@@ -243,7 +243,7 @@ device_mesh = DeviceMesh(
 )
 ```
 
-**Megatron 后端说明**：Twinkle 的 Megatron NPU 路径已经提供了可直接运行的 smoke 示例，安装和运行依赖请参考上面的 “Megatron 后端依赖” 小节。当前优先建议从 `cookbook/megatron/tp_npu.py` 开始验证，再逐步切到 `tp_moe_npu.py` 和 `tp_moe_cp_npu.py`。
+**Megatron 后端说明**：Twinkle 的 Megatron NPU 路径已经提供了可直接运行的 smoke 示例，安装和运行依赖请参考上面的 “Megatron 后端依赖” 小节。当前优先建议先验证基础 TP smoke，再逐步切到 MoE 和 CP smoke。
 
 ## 常见问题
 
