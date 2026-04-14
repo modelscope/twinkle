@@ -155,6 +155,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # PG so Megatron's later Gloo DP groups stay decoupled on NPU.
         return backend == 'nccl'
 
+    @staticmethod
+    def _drop_npu_causal_4d_mask(batch, unwrapped_model):
+        """On NPU, drop the generic 4D dense mask so MindSpeed can build
+        its own compressed causal mask for FlashAttention."""
+        if Platform.device_prefix() != 'npu':
+            return
+        attention_mask = batch.get('attention_mask')
+        if (isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+                and getattr(unwrapped_model.config, 'attention_mask_type', None) == 'causal'):
+            batch['attention_mask'] = None
+
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
             loss_instance=CrossEntropyLoss(reduction='sum'),
@@ -367,28 +378,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
-            # MindSpeed 0.15.3 patches TE attention to a flash-attention based
-            # NPU implementation. That path expects to generate its own
-            # compressed causal mask (for example [2048, 2048]) when
-            # ``attention_mask`` is ``None``. Twinkle's generic Megatron
-            # processor, however, always expands the 1D token mask into a 4D
-            # dense causal mask. On NPU this makes FlashAttention receive the
-            # wrong mask shape and the real 8-card run fails in
-            # ``aclnnFlashAttentionScore``. For decoder-only causal training
-            # with right padding, the 4D mask is redundant: a causal mask
-            # already prevents valid tokens from attending to the padded tail,
-            # and padded query positions are ignored by labels == -100. So on
-            # the NPU TE path, drop this dense mask and let MindSpeed build the
-            # compressed causal mask it requires.
-            if Platform.device_prefix() == 'npu':
-                attention_mask = batch.get('attention_mask')
-                if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
-                    unwrapped_model = self.strategy.unwrap_model([model])[0]
-                    attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
-                    if attention_mask_type == 'causal':
-                        batch['attention_mask'] = None
-            # Handle disable_lora for base model inference (e.g., reference in DPO)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
+            self._drop_npu_causal_4d_mask(batch, unwrapped_model)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     output_tensor = model(**batch)
