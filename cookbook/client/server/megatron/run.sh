@@ -49,9 +49,8 @@ RAY_PORT=6379
 RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 
 # --- 路径配置 ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
-LOG_FILE="$SCRIPT_DIR/run.log"
+LOG_FILE="run.log"
 DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
@@ -385,5 +384,11 @@ print_header "启动 Twinkle 服务器"
 print_info "日志输出到: $LOG_FILE"
 echo ""
 
-# 启动服务器（前台运行，日志同时输出到文件和终端）
-python -m twinkle.server --config "$SERVER_CONFIG_FILE" 2>&1 | tee "$LOG_FILE"
+# 启动服务器并实时显示日志
+touch "$LOG_FILE"  # 预创建文件，避免 tail -f 在文件尚未写入时报错
+nohup python -m twinkle.server --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+SERVER_PID=$!
+print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
+
+# 实时显示日志（阻塞进程）
+tail -f "$LOG_FILE"
