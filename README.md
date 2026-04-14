@@ -100,7 +100,7 @@ Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/enviro
 | twinkle client finetuning         | transformer     | [Script](cookbook/client/twinkle/transformer)        |
 
 ## Changelog
-
+- 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.5-27B](https://www.modelscope.cn/models/Qwen/Qwen3.5-27B) with a new release 0.2.0.
 - 🎉2026-03-28 Support DPO training with both Transformers and Megatron backends. See [dpo_full.py](cookbook/rl/dpo_full.py) and [dpo_lora.py](cookbook/rl/dpo_lora.py).
 - 🎉2026-03-24 Twinkle Web site is now live at https://modelscope.github.io/twinkle-web/
 - 🎉2026-03-19 Support GKD training ，please refer to this [cookbook](cookbook/rl/gkd_on_policy.py).
