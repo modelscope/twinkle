@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
+from torch.distributed.tensor import distribute_tensor
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -50,7 +51,6 @@ class MultiLora:
             return
         value = value.detach().to(dtype=parameter.dtype)
         if hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements'):
-            from torch.distributed.tensor import distribute_tensor
             value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
         else:
             value = value.to(parameter.device)
