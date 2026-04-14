@@ -63,6 +63,12 @@ cd twinkle
 pip install -e .
 ```
 
+### Use our docker image：
+
+```text
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.0
+```
+
 If you need to use Twinkle's Client, you can use our one-click installation script:
 
 ```shell
@@ -80,8 +86,6 @@ If you need to install Megatron-related dependencies, you can use the following 
 ```shell
 sh INSTALL_MEGATRON.sh
 ```
-
-Or use ModelScope's [official image](https://www.modelscope.cn/docs/intro/environment-setup).
 
 ## Tutorials
 
