@@ -64,6 +64,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 32000                            # Max tokens per second
+        max_input_tokens: 32000
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -100,6 +101,7 @@ applications:
       queue_config:
         rps_limit: 20                               # Max requests per second
         tps_limit: 32000                            # Max tokens per second
+        max_input_tokens: 32000
       adapter_config:
         adapter_timeout: 120                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
