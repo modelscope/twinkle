@@ -1,7 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import re
 import torch.distributed as dist
 import torch.nn as nn
+from contextlib import contextmanager
 from functools import partial
 from peft import LoraConfig
 from torch.optim import Optimizer
@@ -55,7 +57,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._model_path = HubOperation.download_model(model_id)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
-        self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
+        self.use_distributed_optimizer = False
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         self.optimizer_group = {}
         torch_util.set_device()
@@ -154,21 +156,48 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return super().set_loss(loss_cls, **kwargs)
 
+    @contextmanager
+    def optimizer_context(self, adapter_name: str):
+        """Temporarily replace named_parameters on each module in self.model
+        so that only parameters belonging to ``adapter_name`` are visible."""
+        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        originals = []
+        for module in self.model:
+            orig = module.named_parameters
+
+            def make_filtered(orig_fn):
+
+                def filtered(prefix: str = '', recurse: bool = True, **kwargs):
+                    for name, param in orig_fn(prefix=prefix, recurse=recurse, **kwargs):
+                        if param.requires_grad and pattern.search(name):
+                            yield name, param
+
+                return filtered
+
+            module.named_parameters = make_filtered(orig)
+            originals.append((module, orig))
+        try:
+            yield
+        finally:
+            for module, orig in originals:
+                module.named_parameters = orig
+
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
-            # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
-            kwargs.pop('use_distributed_optimizer', None)
-            kwargs.pop('loss_scale', None)
-            kwargs['fp16'] = False
-            kwargs['bf16'] = True
-            return super().set_optimizer(optimizer_cls, **kwargs)
+        with self.multi_adapter.adapter(kwargs.get('adapter_name')) as adapter_name:
+            with self.optimizer_context(adapter_name):
+                # Multi lora cannot config use_distributed_optimizer/loss_scale/mix_precision
+                kwargs.pop('use_distributed_optimizer', None)
+                kwargs.pop('loss_scale', None)
+                kwargs['fp16'] = False
+                kwargs['bf16'] = True
+                super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function(dispatch='all')
     def set_lr_scheduler(self, scheduler_cls: Union[LRScheduler, Type[LRScheduler], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        return super().set_lr_scheduler(scheduler_cls, **kwargs)
+        super().set_lr_scheduler(scheduler_cls, **kwargs)
 
     @remote_function(dispatch='all', collect='first', sync=True)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):

@@ -33,6 +33,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_LONG_POLL_TIMEOUT: "120"
 
   # 3. Sampler Service - Runs inference / sampling using vLLM engine
   #    Used for generating text from the model (e.g., evaluating LoRA results).
@@ -74,6 +75,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_LONG_POLL_TIMEOUT: "120"
 
   # 2. Model Service - Hosts the base model for training.
   #    Config: PP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, comfortable for LoRA training
@@ -99,7 +101,7 @@ applications:
         rps_limit: 20                               # Max requests per second
         tps_limit: 32000                            # Max tokens per second
       adapter_config:
-        adapter_timeout: 30                       # Seconds before idle adapter unload
+        adapter_timeout: 120                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
@@ -112,6 +114,7 @@ applications:
           runtime_env:
             env_vars:
               TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_LONG_POLL_TIMEOUT: "120"
 
   # 4. Processor Service
   - name: processor

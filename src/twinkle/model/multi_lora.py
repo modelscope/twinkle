@@ -424,6 +424,20 @@ class MultiLora:
             else:
                 module = _patch_peft(module)
 
+        # PEFT's add_adapter calls set_adapter(active_adapters) which only keeps the
+        # first adapter's requires_grad=True.  We need ALL LoRA params to be trainable
+        # so that MegatronDDP registers them all in its gradient buffers (main_grad).
+        def _enable_all_lora_grad(_module):
+            for name, param in _module.named_parameters():
+                if 'lora_' in name and not param.requires_grad:
+                    param.requires_grad_(True)
+
+        if isinstance(module, list):
+            for _m in module:
+                _enable_all_lora_grad(_m)
+        else:
+            _enable_all_lora_grad(module)
+
         self.module = module
         return module
 
