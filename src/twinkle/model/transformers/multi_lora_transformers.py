@@ -48,12 +48,25 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
+        if model_id is not None:
+            model_id = HubOperation.download_model(model_id)
+        self.model_id = model_id
+        if config is None:
+            from transformers import AutoConfig
+            self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        if model_cls is None and hasattr(self.hf_config, 'architectures'):
+            model_cls = self.hf_config.architectures[0]
+        if model_cls is None:
+            model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        model_id = HubOperation.download_model(model_id)
-        with self.strategy.pretrained_load_context():
-            self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
-        self.model_id = model_id
+        if model_id is None:
+            self.model = model_cls.from_config(self.hf_config, **kwargs)
+        else:
+            with self.strategy.pretrained_load_context():
+                self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self._model_wrapped = False
