@@ -59,7 +59,6 @@ class MultiLoraMegatronModel(MegatronModel):
         self.optimizer_group = {}
         torch_util.set_device()
         self._try_init_process_group()
-        self._ensure_megatron_process_group()
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
 

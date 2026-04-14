@@ -111,7 +111,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
         self._try_init_process_group()
-        self._ensure_megatron_process_group()
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
         # mcore_bridge pulls in megatron.core/TE too early on NPU.
         ensure_mindspeed_adaptor_patched()
@@ -151,31 +150,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
 
-    def _ensure_megatron_process_group(self):
-        """Megatron still requires a default PG even for single-rank local smoke.
-
-        TwinkleModel._try_init_process_group() intentionally skips world_size==1,
-        because most frameworks do not need a default process group there.
-        Megatron is different: initialize_model_parallel() still assumes a default
-        PG already exists, so local NPU/GPU smoke needs a 1-rank fallback PG here.
-        """
-        import torch.distributed as dist
-
-        if not dist.is_initialized():
-            from twinkle import find_free_port
-
-            backend = Platform.device_backend()
-            init_kwargs = {
-                'backend': backend,
-                'init_method': f'tcp://127.0.0.1:{find_free_port()}',
-                'rank': 0,
-                'world_size': 1,
-            }
-            # Keep NCCL's device binding behavior, but avoid binding HCCL default PG
-            # here so the later Gloo sub-groups stay decoupled on NPU.
-            if backend == 'nccl':
-                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
-            dist.init_process_group(**init_kwargs)
+    def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
+        # Keep NCCL's device binding behavior, but avoid binding HCCL's default
+        # PG so Megatron's later Gloo DP groups stay decoupled on NPU.
+        return backend == 'nccl'
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
