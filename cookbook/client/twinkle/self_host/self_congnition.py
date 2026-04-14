@@ -14,9 +14,9 @@ from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+from twinkle import init_twinkle_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
@@ -59,7 +59,7 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply a chat template so the data matches the model's expected input format
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=512)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=512)
 
     # Replace placeholder names in the dataset with custom model/author names
     dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
@@ -84,7 +84,7 @@ def train():
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
     # Set the same chat template used during data preprocessing
-    model.set_template('Template')
+    model.set_template('Qwen3_5Template')
 
     # Set the input processor (pads sequences on the right side)
     model.set_processor('InputProcessor', padding_side='right')

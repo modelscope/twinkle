@@ -93,7 +93,7 @@ for run in runs:
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
 
 # 设置 chat 模板，使数据匹配模型的输入格式
-dataset.set_template('Template', model_id='ms://Qwen/Qwen2.5-7B-Instruct', max_length=512)
+dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
 
 # 数据预处理：替换占位符为自定义名称
 dataset.map('SelfCognitionProcessor',
@@ -106,14 +106,14 @@ dataset.encode(batched=True)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
 # Step 4: 配置模型
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen2.5-7B-Instruct')
+model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
 
 # 配置 LoRA
 lora_config = LoraConfig(target_modules='all-linear')
 model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
 # 设置模板、处理器、损失函数
-model.set_template('Template')
+model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 

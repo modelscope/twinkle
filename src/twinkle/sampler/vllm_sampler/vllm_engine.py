@@ -291,8 +291,8 @@ class VLLMEngine(BaseSamplerEngine):
                     continue
 
                 # Get logprob for the actual token
-                if i < len(prompt_token_ids):
-                    token_id = prompt_token_ids[i]
+                if i < len(result.prompt_token_ids):
+                    token_id = result.prompt_token_ids[i]
                     if token_id in lp_dict:
                         lp_obj = lp_dict[token_id]
                         result_prompt_logprobs.append(lp_obj.logprob)

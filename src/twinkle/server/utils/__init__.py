@@ -5,3 +5,4 @@ from .device_utils import auto_fill_device_group_visible_devices, wrap_builder_w
 from .lifecycle import AdapterManagerMixin, ProcessorManagerMixin, SessionResourceMixin
 from .rate_limiter import RateLimiter
 from .task_queue import QueueState, TaskQueueConfig, TaskQueueMixin, TaskStatus
+from .template_utils import get_template_for_model

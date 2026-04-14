@@ -50,12 +50,6 @@ LORA_RANK = int(os.environ.get('LORA_RANK', 16))
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
 
-import swanlab
-swanlab.init(
-    project='twinkle',
-)
-
-
 # ========== Reward Functions ==========
 class GSM8KBrevityReward(Reward):
     """Brevity reward: rewards shorter completions that contain a valid answer.
@@ -93,7 +87,7 @@ class GSM8KBrevityReward(Reward):
 # ========== Dataset ==========
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=True)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -122,6 +116,7 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
+    # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',
@@ -158,7 +153,7 @@ def main():
 
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -167,12 +162,15 @@ def main():
             'max_model_len': 8192,
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -202,6 +200,9 @@ def main():
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
 
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
@@ -256,7 +257,6 @@ def main():
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
-        swanlab.log(log_dict)
         metrics.reset()
         logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 

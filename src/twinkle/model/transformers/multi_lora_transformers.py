@@ -24,7 +24,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def __init__(
             self,  # noqa
-            model_cls=AutoModelForCausalLM,
+            model_cls=None,
             model_id: Optional[str] = None,
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
@@ -41,9 +41,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
-        self.model_id = model_id
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-        self._default_tokenizer = None
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
@@ -58,6 +55,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        self._default_tokenizer = None
         self._model_wrapped = False
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)

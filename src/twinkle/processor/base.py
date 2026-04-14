@@ -130,7 +130,7 @@ class InputProcessor:
                 if input_tensor is None:
                     return input_tensor
 
-                seq_len = input_tensor.shape[1]
+                seq_len = input_tensor.shape[-1]
 
                 # Calculate required divisor based on parallelism settings
                 if cp_size > 1:

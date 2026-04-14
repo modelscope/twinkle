@@ -9,8 +9,8 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import MegatronModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-# Construct a device_mesh, tp=pp=cp=ep=2, dp=1
-device_mesh = DeviceMesh.from_sizes(dp_size=1, tp_size=2, pp_size=2, cp_size=2, ep_size=2)
+# Construct a device_mesh, tp=pp=ep=dp=2
+device_mesh = DeviceMesh.from_sizes(dp_size=2, tp_size=2, pp_size=2, ep_size=2, sequence_parallel=True)
 # use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
@@ -20,7 +20,7 @@ logger = get_logger()
 def eval(model):
     # 100 Samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     dataset.encode()
     dataloader = DataLoader(dataset=dataset, batch_size=16)
@@ -34,7 +34,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-35B-A3B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     # Encode dataset

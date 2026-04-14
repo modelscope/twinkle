@@ -516,15 +516,16 @@ class MultiLora:
 
     def save_lora_converter(self, name, parameter, adapter_name):
         _lora = self.find_lora(adapter_name)
-        pattern = re.compile(rf'\.lora_\w+\.{adapter_name}\.')
-        pattern_no_adapter = re.compile(r'\.lora_\w+\.weight')
-        if (pattern.search(name) or pattern_no_adapter.search(name)) and self.match_target_modules(
+        # Skip weights belonging to OTHER adapters
+        if re.search(r'\.lora_\w+\.\w+\.', name) and not re.search(rf'\.lora_\w+\.{adapter_name}\.', name):
+            return None
+        if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name) and self.match_target_modules(
                 name, _lora.tenant_config.target_modules):
             _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
-            return None, None
+            return None
 
     def set_state_dict(self, tenant_adapter_name, state_dict):
         _lora = self.find_lora_by_tenant(tenant_adapter_name)

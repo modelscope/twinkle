@@ -42,7 +42,7 @@ def sample():
     sampler = vLLMSampler(model_id=MODEL_ID)
 
     # Step 4: Set the chat template so the sampler can encode Trajectory inputs
-    sampler.set_template('Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Prepare inputs as Trajectory dicts (messages format)
     # Each trajectory is a conversation with system and user messages

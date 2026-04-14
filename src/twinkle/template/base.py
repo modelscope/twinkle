@@ -162,15 +162,21 @@ class Template:
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
+        labels = list(result['labels'])
         input_ids = list(prompt_ids) + new_tokens
-        labels = [-100] * len(prompt_ids) + new_tokens
+        labels = labels[-1:] + labels[:-1]  # roll to input order
+        labels = labels + new_tokens
+        labels = labels[1:] + labels[:1]  # roll to input-1 order
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
-            token_ids_shape = result['mm_token_type_ids'].shape
-            device = result['mm_token_type_ids'].device
+            mm_token_type_ids = result['mm_token_type_ids']
+            if not isinstance(mm_token_type_ids, torch.Tensor):
+                mm_token_type_ids = torch.as_tensor(mm_token_type_ids)
+            token_ids_shape = mm_token_type_ids.shape
+            device = mm_token_type_ids.device
             padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
-            result['mm_token_type_ids'] = torch.cat((result['mm_token_type_ids'], padded_tokens), dim=1)
+            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=1)
         new_input_feature = self._invoke_post_pipeline([result])[0]
         result.update(new_input_feature)
         messages: List[Message] = result.get('messages')
@@ -230,6 +236,9 @@ class Template:
 
     def set_mm_position_ids(self, input_feature: InputFeature):
         return np.arange(len(input_feature['input_ids']))
+
+    def get_vllm_input_ids(self, input_ids):
+        return input_ids
 
     def _check_max_length(self, input_feature: InputFeature) -> List[InputFeature]:
         if not self.max_length or 'input_ids' not in input_feature:
@@ -444,18 +453,56 @@ class Template:
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
         tools = [dict(tool) for tool in trajectory.get('tools', [])]
-        if 'tokenize' not in kwargs:
-            kwargs['tokenize'] = True
-        if 'enable_thinking' not in kwargs:
-            kwargs['enable_thinking'] = self.enable_thinking
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tools=tools,
-            padding=False,
-            return_dict=True,
-            add_generation_prompt=add_generation_prompt,
-            return_tensors='pt',
-            **kwargs)
+
+        # Use inspect to get apply_chat_template signature params
+        sig = inspect.signature(self.processor.apply_chat_template)
+        supported_params = set(sig.parameters.keys())
+
+        # Check if processor_kwargs is supported
+        if 'processor_kwargs' in supported_params:
+            # Separate supported params from processor_kwargs
+            apply_chat_template_kwargs = {}
+            processor_kwargs = {}
+
+            for key in list(kwargs.keys()):
+                if key in supported_params:
+                    apply_chat_template_kwargs[key] = kwargs.pop(key)
+
+            # tokenize is in apply_chat_template_kwargs, set default value
+            if 'tokenize' not in apply_chat_template_kwargs:
+                apply_chat_template_kwargs['tokenize'] = True
+
+            # Set default values for processor_kwargs
+            if 'padding' not in kwargs:
+                processor_kwargs['padding'] = False
+
+            # Add remaining kwargs to processor_kwargs
+            processor_kwargs.update(kwargs)
+
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tools=tools,
+                return_dict=True,
+                add_generation_prompt=add_generation_prompt,
+                return_tensors='pt',
+                processor_kwargs=processor_kwargs,
+                enable_thinking=self.enable_thinking,
+                **apply_chat_template_kwargs)
+        else:
+            # No processor_kwargs support, pass all kwargs directly
+            if 'tokenize' not in kwargs:
+                kwargs['tokenize'] = True
+            if 'enable_thinking' not in kwargs:
+                kwargs['enable_thinking'] = self.enable_thinking
+
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tools=tools,
+                padding=False,
+                return_dict=True,
+                add_generation_prompt=add_generation_prompt,
+                return_tensors='pt',
+                **kwargs)
         return inputs
 
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:

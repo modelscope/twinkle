@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .app import ModelManagement
 
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -42,11 +43,14 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             try:
                 _model_id = await self.state.register_model(body.model_dump(), token=token, replica_id=self.replica_id)
                 if body.lora_config:
+                    # TODO: Make LoraConfig more flexible
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')
                     adapter_name = self.get_adapter_name(adapter_name=_model_id)
                     self.register_resource(adapter_name, token, session_id=body.session_id)
                     self.model.add_adapter_to_model(adapter_name=adapter_name, config_or_dir=lora_cfg)
-                    self.model.set_template('Template', adapter_name=adapter_name, model_id=self.base_model)
+                    # Select template based on model type
+                    template = get_template_for_model(self.base_model)
+                    self.model.set_template(template, adapter_name=adapter_name, model_id=self.base_model)
                     self.model.set_processor('InputProcessor', adapter_name=adapter_name)
                     self.model.set_optimizer('Adam', adapter_name=adapter_name)
                     self.set_resource_state(adapter_name, 'grad_ready', False)
@@ -111,12 +115,12 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 self.assert_resource_exists(adapter_name)
                 datum_list = body.forward_input.data
                 loss_fn_config = body.forward_input.loss_fn_config or {}
-                output = self.model.tinker_forward_only(inputs=datum_list, adapter_name=adapter_name)
-                loss = self.model.calculate_loss(adapter_name=adapter_name, **loss_fn_config)
+                output, loss = self.model.tinker_forward_only(
+                    inputs=datum_list, adapter_name=adapter_name, **loss_fn_config)
                 return types.ForwardBackwardOutput(
                     loss_fn_output_type='CrossEntropyLossReturn',
                     loss_fn_outputs=output,
-                    metrics={'loss:sum': loss},
+                    metrics={'loss:avg': loss},
                 )
             except Exception:
                 logger.error(traceback.format_exc())
