@@ -41,7 +41,7 @@ from tinker import ServiceClient  # noqa: E402 (must follow init_tinker_client)
 # ---------------------------------------------------------------------------
 base_model = 'Qwen/Qwen3.6-35B-A3B'
 base_url = 'http://www.modelscope.cn/twinkle'
-api_key = 'EMPTY_API_KEY'
+api_key = os.environ.get('MODELSCOPE_TOKEN')
 dataset_id = 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji'
 
 batch_size = 4
