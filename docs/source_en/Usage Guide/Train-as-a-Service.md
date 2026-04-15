@@ -31,7 +31,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3.6-35B-A3B'
-base_url='http://www.modelscope.cn/twinkle'
+base_url='https://www.modelscope.cn/twinkle'
 api_key=os.environ.get('MODELSCOPE_TOKEN')
 
 # Use twinkle dataset to load the data
@@ -80,7 +80,7 @@ init_tinker_client()
 from tinker import ServiceClient
 
 base_model = 'Qwen/Qwen3.6-35B-A3B'
-base_url = 'http://www.modelscope.cn/twinkle'
+base_url = 'https://www.modelscope.cn/twinkle'
 
 # Step 2: Define the base model and connect to the server
 service_client = ServiceClient(
@@ -121,7 +121,7 @@ params = types.SamplingParams(
 )
 
 # Step 6: Send the sampling request to the server.
-# num_samples=1 generates 1 independent completions for the same prompt.
+# num_samples=1 generates 1 independent completion for the same prompt.
 print('Sampling...')
 future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
 result = future.result()
@@ -134,9 +134,9 @@ for i, seq in enumerate(result.sequences):
 
 Developers can also merge this LoRA with the base model and then deploy it using their own service, calling it through the OpenAI-compatible standard API.
 
-> The ModelScope server is tinker-compatible, so use the tinker cookbooks. In the future version, we will support a server works both for twinkle/tinker clients.
+> The ModelScope server is currently Tinker-compatible, so please use the Tinker cookbooks. In a future version, we will support a server that works for both Twinkle and Tinker clients.
 
-Developers can customize datasets, advantage functions, rewards, templates, and more. However, the Loss component is not currently customizable since it needs to be executed on the server side (for security reasons). If you need support for additional Loss functions, you can upload your Loss implementation to ModelHub and contact us via the Q&A group or through an issue to have the corresponding component added to the whitelist.
+Developers can customize datasets, advantage functions, rewards, templates, and more. However, the Loss component is not currently customizable since it needs to be executed on the server side (for security reasons). If you need support for additional Loss functions, you can upload your Loss implementation to [ModelHub](https://modelscope.cn) and contact us via the Q&A group or through an [issue](https://github.com/modelscope/twinkle/issues) to have the corresponding component added to the whitelist.
 
 ## Appendix: Supported Training Methods
 

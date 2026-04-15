@@ -1,8 +1,8 @@
-# Twinkle: Training workbench to make your model glow
+<h1 align="center">Twinkle: Training workbench to make your model glow</h1>
 
 <p align="center">
     <img src="assets/slogan.png" width="200"/>
-<p>
+</p>
 <p align="center">
 <a href="https://modelscope.cn/home">ModelScope</a>
 <br>
@@ -71,7 +71,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 这个脚本会下载或利用conda，创建一个叫`twinkle-client`的虚拟环境，这个环境可以直接用于远端训练。
 
-如果你需要安装Megatron相关依赖，可以如下脚本：
+如果你需要安装Megatron相关依赖，可以使用如下脚本：
 
 ```shell
 sh INSTALL_MEGATRON.sh
@@ -79,17 +79,28 @@ sh INSTALL_MEGATRON.sh
 
 ## 教程
 
-| 训练类型                     | 模型框架 | Cookbook 路径                                     |
-| ---------------------------- | -------- | ------------------------------------------------- |
-| FSDP 微调                    | transformers    | [脚本](cookbook/transformers/fsdp2.py)             |
-| FSDP MoE 微调                | transformers    | [脚本](cookbook/transformers/fsdp2_moe.py)         |
-| EP MoE 微调                  | transformers    | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
-| pp/tp/cp 微调                | megatron        | [脚本](cookbook/megatron/tp.py)                    |
-| pp/tp/cp MoE 微调            | megatron        | [脚本](cookbook/megatron/tp_moe.py)                |
-| tinker 客户端微调            | megatron        | [脚本](cookbook/client/tinker/megatron)            |
-| tinker 客户端微调/采样       | transformers    | [脚本](cookbook/client/tinker/transformer)         |
-| twinkle 客户端微调           | megatron        | [脚本](cookbook/client/twinkle/megatron)           |
-| twinkle 客户端微调           | transformer     | [脚本](cookbook/client/twinkle/transformer)        |
+| 训练类型                            | 模型框架              | Cookbook 路径                                          |
+| ----------------------------------- | --------------------- | ----------------------------------------------------- |
+| FSDP 微调                           | transformers          | [脚本](cookbook/transformers/fsdp2.py)                 |
+| FSDP MoE 微调                       | transformers          | [脚本](cookbook/transformers/fsdp2_moe.py)             |
+| EP FSDP MoE 微调                    | transformers          | [脚本](cookbook/transformers/ep_fsdp_qwen3_moe.py)    |
+| SP FSDP 微调                        | transformers          | [脚本](cookbook/transformers/sp_fsdp_dense.py)        |
+| pp/tp/cp 微调                       | megatron              | [脚本](cookbook/megatron/tp.py)                        |
+| pp/tp/cp MoE 微调                   | megatron              | [脚本](cookbook/megatron/tp_moe.py)                    |
+| 多模态 FSDP 微调                    | transformers          | [脚本](cookbook/mm/fsdp2.py)                           |
+| GRPO 强化学习训练                    | megatron              | [脚本](cookbook/rl/grpo.py)                            |
+| GRPO 多模态强化学习训练             | megatron              | [脚本](cookbook/rl/grpo_mm.py)                         |
+| GRPO 数学强化学习训练               | megatron              | [脚本](cookbook/rl/short_math_grpo.py)                 |
+| DPO 全参数训练                      | transformers          | [脚本](cookbook/rl/dpo_full.py)                        |
+| DPO LoRA 训练                       | transformers          | [脚本](cookbook/rl/dpo_lora.py)                        |
+| DPO 多 LoRA 训练                    | transformers          | [脚本](cookbook/rl/dpo_multi_lora.py)                  |
+| GKD 在线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_on_policy.py)                   |
+| GKD 离线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_off_policy.py)                  |
+| Tinker 客户端微调（自部署）         | transformers          | [脚本](cookbook/client/tinker/self_host)               |
+| Tinker 客户端微调（ModelScope）      | transformers          | [脚本](cookbook/client/tinker/modelscope)              |
+| Twinkle 客户端微调（自部署）        | transformers          | [脚本](cookbook/client/twinkle/self_host)              |
+| Twinkle 客户端微调（ModelScope）     | transformers          | [脚本](cookbook/client/twinkle/modelscope)             |
+| 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/client/server)                         |
 
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](docs/source_zh/使用指引/快速开始.md)
 
@@ -97,7 +108,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 🎉2026-04-16 ModelScope的训练服务部署为[Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B)，并发布了0.2.0版本.
 🎉2026-03-28 支持 DPO 训练，同时支持 Transformers 和 Megatron 后端。参考 [dpo_full.py](cookbook/rl/dpo_full.py) 和 [dpo_lora.py](cookbook/rl/dpo_lora.py)。
 🎉2026-03-24 Twinkle 站点上线，访问地址 https://modelscope.github.io/twinkle-web/
-🎉2026-03-19 支持GKD蒸馏能力，参考[cookbook](cookbook/rl/gkd_on_policy.py)。
+🎉2026-03-19 支持 GKD 蒸馏能力，参考 [cookbook](cookbook/rl/gkd_on_policy.py)。
 🎉2026-02-13 Twinkle✨ 初始版本发布，支持文本模型的SFT/PT/RL训练。我们还通过兼容Tinker的API，在魔搭社区上提供了无服务器训练功能。
 
 ## ModelScope 的训练服务
