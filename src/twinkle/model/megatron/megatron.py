@@ -1432,6 +1432,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 base_layer_name = f'{name[:-5]}.base_layer.bias'
                 if not model_keys or base_layer_name in model_keys:
                     name = base_layer_name
+            if 'experts' in name:
+                return base_layer_name
             return name
 
         is_peft_format = (adapter_name != _default_adapter_name)
