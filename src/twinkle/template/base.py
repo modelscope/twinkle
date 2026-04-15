@@ -548,8 +548,23 @@ class Template:
         trajectory.update(input_feature)
         return trajectory
 
-    def _encode(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
-        return self._encode_messages(trajectory, add_generation_prompt, **kwargs)
+    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
+        """Encode a single trajectory into an InputFeature.
+
+        This is a convenience wrapper around :meth:`batch_encode` for encoding
+        a single trajectory.
+
+        Args:
+            trajectory: The trajectory to encode.
+            add_generation_prompt: Whether to add generation prompt.
+
+        Returns:
+            The encoded InputFeature.
+        """
+        assert self.truncation_strategy != 'split', (
+            'encode() does not support truncation_strategy=="split" because it may produce multiple outputs. '
+            'Use batch_encode() instead.')
+        return self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)[0]
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
@@ -645,7 +660,7 @@ class Template:
         from concurrent.futures import ThreadPoolExecutor
         from functools import partial
         encode_fn = partial(
-            self._encode,
+            self._encode_messages,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
@@ -661,7 +676,7 @@ class Template:
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None
         try:
-            encoded = self.batch_encode([trajectory])
+            encoded = self.encode(trajectory)
             if not encoded:
                 return None
             else:

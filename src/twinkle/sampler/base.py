@@ -79,11 +79,11 @@ class Sampler(ABC):
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
 
-        encoded = template._encode(trajectory, add_generation_prompt=add_generation_prompt)
+        encoded = template.encode(trajectory, add_generation_prompt=add_generation_prompt)
 
         input_ids = encoded.get('input_ids')
         if input_ids is None:
-            raise ValueError("Template._encode() must return 'input_ids'")
+            raise ValueError("Template.encode() must return 'input_ids'")
         if hasattr(input_ids, 'tolist'):
             input_ids = input_ids.tolist()
 
