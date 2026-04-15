@@ -113,7 +113,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 
 ## ModelScope 的训练服务
 
-我们正在 ModelScope 上推出基于 Twinkle✨ 构建的训练服务。目前处于 _Beta_ 阶段。你可以通过加入 [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) 组织来注册免费访问，并通过 API 端点 `base_url=https://www.modelscope.cn/twinkle` 进行训练。更多详情请参阅我们的[文档](docs/source_zh/使用指引/训练服务.md)。
+我们正在 ModelScope 上推出基于 Twinkle✨ 构建的训练服务。你可以通过 API 端点 `base_url=https://www.modelscope.cn/twinkle` 进行训练。更多详情请参阅我们的[文档](docs/source_zh/使用指引/训练服务.md)。
 
 ## 支持的硬件
 

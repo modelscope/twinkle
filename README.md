@@ -121,8 +121,7 @@ sh INSTALL_MEGATRON.sh
 
 ## Training as a Service on ModelScope
 
-We are rolling out training service built atop Twinkle✨ on ModelScope. It is currently in _Beta_. You may
-sign up for free access by joining the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, and
+We are rolling out training service built atop Twinkle✨ on ModelScope. You may
 train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
 our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
 

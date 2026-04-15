@@ -4,13 +4,13 @@ Alongside the open-source release of the Twinkle framework, we also provide a ho
 
 The model currently running on the cluster is [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B). Below are the detailed usage instructions:
 
-## Step 1. Register a ModelScope Account and Apply to Join the twinkle-explorers Organization
+## Step 1. Register a ModelScope Account and Obtain Your API Key
 
-Developers first need to register as a ModelScope user and apply to join the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization to obtain access permissions. The current free Serverless training experience is still in beta testing and is only available to users within the organization. You can also use Twinkle✨ by deploying the service locally.
+Developers first need to register as a ModelScope user. You can also use Twinkle✨ by deploying the service locally.
 
 Registration link: https://www.modelscope.cn/
 
-After registering and being approved to join the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, obtain your API-Key (i.e., the ModelScope platform access token) from this page: https://www.modelscope.cn/my/access/token.
+After registering, obtain your API-Key (i.e., the ModelScope platform access token) from this page: https://www.modelscope.cn/my/access/token.
 
 API endpoint: `base_url="https://www.modelscope.cn/twinkle"`
 
