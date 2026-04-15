@@ -109,7 +109,7 @@ def eval():
         ]
     )
 
-    input_feature = template.encode(trajectory, add_generation_prompt=True)
+    input_feature = template.batch_encode([trajectory], add_generation_prompt=True)[0]
 
     input_ids = input_feature['input_ids'].tolist()
 

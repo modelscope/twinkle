@@ -47,8 +47,9 @@ from twinkle.dataset import Dataset
 from twinkle.model import MultiLoraTransformersModel
 
 # Remote training code (after migration)
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+# DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
+from twinkle.dataloader import DataLoader        # or: from twinkle_client.dataloader import DataLoader
+from twinkle.dataset import Dataset              # or: from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 ```
 
@@ -57,32 +58,38 @@ Training loops, data processing, and other logic do not need any modifications.
 ## Complete Training Example (Transformers Backend)
 
 ```python
-import os
 import dotenv
 dotenv.load_dotenv('.env')
 
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-
-# Import from twinkle_client instead of twinkle to enable remote calls
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client import init_twinkle_client
+
+# DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset
+from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
+base_model = 'Qwen/Qwen3.5-4B'
+base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
+
 # Step 1: Initialize client
-client = init_twinkle_client(
-    base_url='http://127.0.0.1:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
-)
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+
+# List available models on the server
+print('Available models:')
+for item in client.get_server_capabilities().supported_models:
+    print('- ' + item.model_name)
 
 # Step 2: Query existing training runs (optional, for resuming training)
 runs = client.list_training_runs()
 resume_path = None
 for run in runs:
+    logger.info(run.model_dump_json(indent=2))
     checkpoints = client.list_checkpoints(run.training_run_id)
     for checkpoint in checkpoints:
         logger.info(checkpoint.model_dump_json(indent=2))
@@ -90,10 +97,11 @@ for run in runs:
         # resume_path = checkpoint.twinkle_path
 
 # Step 3: Prepare dataset
-dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
+# data_slice limits the number of samples loaded
+dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
 # Set chat template to match model's input format
-dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=512)
 
 # Data preprocessing: Replace placeholders with custom names
 dataset.map('SelfCognitionProcessor',
@@ -103,13 +111,14 @@ dataset.map('SelfCognitionProcessor',
 dataset.encode(batched=True)
 
 # Create DataLoader
-dataloader = DataLoader(dataset=dataset, batch_size=8)
+dataloader = DataLoader(dataset=dataset, batch_size=4)
 
 # Step 4: Configure model
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
 
-# Configure LoRA
+# Configure LoRA: apply low-rank adapters to all linear layers
 lora_config = LoraConfig(target_modules='all-linear')
+# gradient_accumulation_steps=2: accumulate gradients over 2 micro-batches before each optimizer step
 model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
 # Set template, processor, loss function
@@ -117,9 +126,11 @@ model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 
-# Set optimizer and learning rate scheduler
-model.set_optimizer('AdamW', lr=1e-4)
-model.set_lr_scheduler('LinearLR')
+# Set optimizer (only Adam is supported if the server uses Megatron backend)
+model.set_optimizer('Adam', lr=1e-4)
+
+# Set LR scheduler (not supported if the server uses Megatron backend)
+# model.set_lr_scheduler('LinearLR')
 
 # Step 5: Resume training (optional)
 if resume_path:
@@ -127,35 +138,34 @@ if resume_path:
     model.load(resume_path, load_optimizer=True)
 
 # Step 6: Training loop
-for step, batch in enumerate(dataloader):
-    # Forward propagation + backward propagation
-    output = model.forward_backward(inputs=batch)
+logger.info(model.get_train_configs().model_dump())
 
-    if step % 2 == 0:
-        logger.info(f'Step {step // 2}, loss: {output}')
+for epoch in range(3):
+    logger.info(f'Starting epoch {epoch}')
+    for step, batch in enumerate(dataloader):
+        # Forward propagation + backward propagation
+        model.forward_backward(inputs=batch)
 
-    # Gradient clipping
-    model.clip_grad_norm(1.0)
+        # Gradient clipping + optimizer update (equivalent to clip_grad_norm / step / zero_grad / lr_step)
+        model.clip_grad_and_step()
 
-    # Optimizer update
-    model.step()
+        # Log metrics every 2 steps (aligned with gradient_accumulation_steps)
+        if step % 2 == 0:
+            metric = model.calculate_metric(is_training=True)
+            logger.info(f'Epoch {epoch}, step {step}/{len(dataloader)}, metric: {metric.result}')
 
-    # Zero gradients
-    model.zero_grad()
-
-    # Learning rate scheduling
-    model.lr_step()
-
-# Step 7: Save checkpoint
-twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
-logger.info(f"Saved checkpoint: {twinkle_path}")
+    # Step 7: Save checkpoint
+    twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+    logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: Upload to ModelScope Hub (optional)
-model.upload_to_hub(
-    checkpoint_dir=twinkle_path,
-    hub_model_id='your-username/your-model-name',
-    async_upload=False
-)
+# YOUR_USER_NAME = "your_username"
+# hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
+# model.upload_to_hub(
+#     checkpoint_dir=twinkle_path,
+#     hub_model_id=hub_model_id,
+#     async_upload=False
+# )
 ```
 
 ## Differences with Megatron Backend

@@ -47,8 +47,9 @@ from twinkle.dataset import Dataset
 from twinkle.model import MultiLoraTransformersModel
 
 # 远端训练代码（迁移后）
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
+# DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
+from twinkle.dataloader import DataLoader        # 或 from twinkle_client.dataloader import DataLoader
+from twinkle.dataset import Dataset              # 或 from twinkle_client.dataset import Dataset
 from twinkle_client.model import MultiLoraTransformersModel
 ```
 
@@ -57,32 +58,38 @@ from twinkle_client.model import MultiLoraTransformersModel
 ## 完整训练示例（Transformers 后端）
 
 ```python
-import os
 import dotenv
 dotenv.load_dotenv('.env')
 
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-
-# 从 twinkle_client import 替代 twinkle，实现远端调用
-from twinkle_client.dataloader import DataLoader
-from twinkle_client.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client import init_twinkle_client
+
+# DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset
+from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
+base_model = 'Qwen/Qwen3.5-4B'
+base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
+
 # Step 1: 初始化客户端
-client = init_twinkle_client(
-    base_url='http://127.0.0.1:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')
-)
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+
+# 列出服务器支持的模型
+print('Available models:')
+for item in client.get_server_capabilities().supported_models:
+    print('- ' + item.model_name)
 
 # Step 2: 查询已有训练运行（可选，用于恢复训练）
 runs = client.list_training_runs()
 resume_path = None
 for run in runs:
+    logger.info(run.model_dump_json(indent=2))
     checkpoints = client.list_checkpoints(run.training_run_id)
     for checkpoint in checkpoints:
         logger.info(checkpoint.model_dump_json(indent=2))
@@ -90,26 +97,28 @@ for run in runs:
         # resume_path = checkpoint.twinkle_path
 
 # Step 3: 准备数据集
-dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition'))
+# data_slice 可限制加载的数据量
+dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
 # 设置 chat 模板，使数据匹配模型的输入格式
-dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=512)
 
 # 数据预处理：替换占位符为自定义名称
 dataset.map('SelfCognitionProcessor',
-            init_args={'model_name': 'twinkle模型', 'model_author': 'twinkle团队'})
+            init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
 
 # 编码数据集为模型可用的 token
 dataset.encode(batched=True)
 
 # 创建 DataLoader
-dataloader = DataLoader(dataset=dataset, batch_size=8)
+dataloader = DataLoader(dataset=dataset, batch_size=4)
 
 # Step 4: 配置模型
-model = MultiLoraTransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
 
-# 配置 LoRA
+# 配置 LoRA：对所有线性层应用低秩适配器
 lora_config = LoraConfig(target_modules='all-linear')
+# gradient_accumulation_steps=2 表示累积 2 个 micro-batch 的梯度后再执行一次优化器更新
 model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
 
 # 设置模板、处理器、损失函数
@@ -117,9 +126,11 @@ model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 
-# 设置优化器和学习率调度器
-model.set_optimizer('AdamW', lr=1e-4)
-model.set_lr_scheduler('LinearLR')
+# 设置优化器（如果服务器使用 Megatron 后端，仅支持 Adam 优化器）
+model.set_optimizer('Adam', lr=1e-4)
+
+# 设置学习率调度器（如果服务器使用 Megatron 后端，不支持 LR 调度器）
+# model.set_lr_scheduler('LinearLR')
 
 # Step 5: 恢复训练（可选）
 if resume_path:
@@ -127,35 +138,34 @@ if resume_path:
     model.load(resume_path, load_optimizer=True)
 
 # Step 6: 训练循环
-for step, batch in enumerate(dataloader):
-    # 前向传播 + 反向传播
-    output = model.forward_backward(inputs=batch)
+logger.info(model.get_train_configs().model_dump())
 
-    if step % 2 == 0:
-        logger.info(f'Step {step // 2}, loss: {output}')
+for epoch in range(3):
+    logger.info(f'Starting epoch {epoch}')
+    for step, batch in enumerate(dataloader):
+        # 前向传播 + 反向传播
+        model.forward_backward(inputs=batch)
 
-    # 梯度裁剪
-    model.clip_grad_norm(1.0)
+        # 梯度裁剪 + 优化器更新（等价于依次调用 clip_grad_norm / step / zero_grad / lr_step）
+        model.clip_grad_and_step()
 
-    # 优化器更新
-    model.step()
+        # 每 2 步打印一次指标（与 gradient_accumulation_steps 对齐）
+        if step % 2 == 0:
+            metric = model.calculate_metric(is_training=True)
+            logger.info(f'Epoch {epoch}, step {step}/{len(dataloader)}, metric: {metric.result}')
 
-    # 梯度清零
-    model.zero_grad()
-
-    # 学习率调度
-    model.lr_step()
-
-# Step 7: 保存检查点
-twinkle_path = model.save(name=f'step-{step}', save_optimizer=True)
-logger.info(f"Saved checkpoint: {twinkle_path}")
+    # Step 7: 保存检查点
+    twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+    logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: 上传到 ModelScope Hub（可选）
-model.upload_to_hub(
-    checkpoint_dir=twinkle_path,
-    hub_model_id='your-username/your-model-name',
-    async_upload=False
-)
+# YOUR_USER_NAME = "your_username"
+# hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
+# model.upload_to_hub(
+#     checkpoint_dir=twinkle_path,
+#     hub_model_id=hub_model_id,
+#     async_upload=False
+# )
 ```
 
 ## Megatron 后端的差异

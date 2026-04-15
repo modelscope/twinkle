@@ -34,110 +34,11 @@ After initialization, simply import `from tinker import ServiceClient` to connec
 
 ## Complete Training Example
 
+> **Note**: `DataLoader` and `Dataset` in Tinker compatible mode only support local `twinkle` imports; `twinkle_client` is not supported.
+
 ```python
 import os
 import numpy as np
-import dotenv
-dotenv.load_dotenv('.env')
-
-# Step 1: Initialize Tinker client before importing ServiceClient
-from twinkle import init_tinker_client
-init_tinker_client()
-
-from tinker import types, ServiceClient
-from modelscope import AutoTokenizer
-
-service_client = ServiceClient(
-    base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
-)
-
-# Step 2: Query existing training runs (optional)
-rest_client = service_client.create_rest_client()
-response = rest_client.list_training_runs(limit=50).result()
-print(f"Found {len(response.training_runs)} training runs")
-
-# Step 3: Create training client
-base_model = "Qwen/Qwen3-4B"
-
-# Create new training session
-training_client = service_client.create_lora_training_client(
-    base_model=base_model
-)
-
-# Or resume from checkpoint
-# resume_path = "twinkle://run_id/weights/checkpoint_name"
-# training_client = service_client.create_training_client_from_state_with_optimizer(path=resume_path)
-
-# Step 4: Prepare training data
-examples = [
-    {"input": "banana split", "output": "anana-bay plit-say"},
-    {"input": "quantum physics", "output": "uantum-qay ysics-phay"},
-    {"input": "donut shop", "output": "onut-day op-shay"},
-]
-
-tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
-
-def process_example(example: dict, tokenizer) -> types.Datum:
-    """Convert raw sample to Datum format required by Tinker API.
-
-    Datum contains:
-      - model_input: Input token IDs
-      - loss_fn_inputs: Target tokens and per-token weights (0=ignore, 1=compute loss)
-    """
-    prompt = f"English: {example['input']}\nPig Latin:"
-
-    # Prompt part: weight=0, does not participate in loss computation
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
-    prompt_weights = [0] * len(prompt_tokens)
-
-    # Completion part: weight=1, participates in loss computation
-    completion_tokens = tokenizer.encode(f" {example['output']}\n\n", add_special_tokens=False)
-    completion_weights = [1] * len(completion_tokens)
-
-    # Concatenate and construct next-token prediction format
-    tokens = prompt_tokens + completion_tokens
-    weights = prompt_weights + completion_weights
-
-    input_tokens = tokens[:-1]
-    target_tokens = tokens[1:]
-    weights = weights[1:]
-
-    return types.Datum(
-        model_input=types.ModelInput.from_ints(tokens=input_tokens),
-        loss_fn_inputs=dict(weights=weights, target_tokens=target_tokens)
-    )
-
-processed_examples = [process_example(ex, tokenizer) for ex in examples]
-
-# Step 5: Training loop
-for epoch in range(2):
-    for batch in range(5):
-        # Send training data to Server: forward + backward propagation
-        fwdbwd_future = training_client.forward_backward(processed_examples, "cross_entropy")
-        # Optimizer update
-        optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
-
-        # Wait for results
-        fwdbwd_result = fwdbwd_future.result()
-        optim_result = optim_future.result()
-
-        # Calculate weighted average log-loss
-        logprobs = np.concatenate([o['logprobs'].tolist() for o in fwdbwd_result.loss_fn_outputs])
-        weights = np.concatenate([e.loss_fn_inputs['weights'].tolist() for e in processed_examples])
-        print(f"Epoch {epoch}, Batch {batch}: Loss = {-np.dot(logprobs, weights) / weights.sum():.4f}")
-
-    # Save checkpoint every epoch
-    save_result = training_client.save_state(f"lora-epoch-{epoch}").result()
-    print(f"Saved checkpoint to {save_result.path}")
-```
-
-## Using Twinkle Dataset Components
-
-Tinker compatible mode can also leverage Twinkle's dataset components to simplify data preparation instead of manually constructing `Datum`:
-
-```python
-import os
 from tqdm import tqdm
 from tinker import types
 from twinkle import init_tinker_client
@@ -146,40 +47,55 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-# Initialize Tinker client before importing ServiceClient
+# Step 1: Initialize Tinker client before importing ServiceClient
 init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = "Qwen/Qwen3.5-4B"
+base_model = 'Qwen/Qwen3.5-4B'
+base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
 
-# Use Twinkle's Dataset component to load and preprocess data
+# Step 2: Prepare dataset
 dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
 dataset.map(SelfCognitionProcessor('twinkle model', 'ModelScope Team'), load_from_cache_file=False)
 dataset.encode(batched=True, load_from_cache_file=False)
 dataloader = DataLoader(dataset=dataset, batch_size=8)
 
-# Initialize client
-service_client = ServiceClient(
-    base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
-)
+# Step 3: Initialize training client
+service_client = ServiceClient(base_url=base_url, api_key=api_key)
+
+# Create LoRA training client (rank=16 specifies the LoRA adapter rank)
 training_client = service_client.create_lora_training_client(base_model=base_model, rank=16)
 
-# Training loop: Use input_feature_to_datum to convert data format
+# Step 4: Training loop
 for epoch in range(3):
+    print(f'Epoch {epoch}')
     for step, batch in tqdm(enumerate(dataloader)):
-        # Convert Twinkle's InputFeature to Tinker's Datum
+        # Convert Twinkle's InputFeature to Tinker's Datum format
         input_datum = [input_feature_to_datum(input_feature) for input_feature in batch]
 
-        fwdbwd_future = training_client.forward_backward(input_datum, "cross_entropy")
+        # Send data to Server: forward + backward propagation
+        fwdbwd_future = training_client.forward_backward(input_datum, 'cross_entropy')
+
+        # Optimizer step: update model weights with Adam
         optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 
+        # Wait for both operations to complete
         fwdbwd_result = fwdbwd_future.result()
         optim_result = optim_future.result()
 
-    training_client.save_state(f"twinkle-lora-{epoch}").result()
+        # Compute weighted average log-loss per token for monitoring
+        logprobs = np.concatenate([output['logprobs'].tolist() for output in fwdbwd_result.loss_fn_outputs])
+        weights = np.concatenate([example.loss_fn_inputs['weights'].tolist() for example in input_datum])
+        print(f'Loss per token: {-np.dot(logprobs, weights) / weights.sum():.4f}')
+        print(f'Training Metrics: {optim_result}')
+
+    # Save a checkpoint after each epoch
+    save_future = training_client.save_state(f'twinkle-lora-{epoch}')
+    save_result = save_future.result()
+    print(f'Saved checkpoint to {save_result.path}')
 ```
 
 ## Inference Sampling
@@ -216,49 +132,55 @@ You can also load saved checkpoints for inference:
 ```python
 import os
 from tinker import types
-from modelscope import AutoTokenizer
 from twinkle import init_tinker_client
+from twinkle.data_format import Message, Trajectory
+from twinkle.template import Template
 
 # Initialize Tinker client before importing ServiceClient
 init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = "Qwen/Qwen3.5-4B"
+base_model = 'Qwen/Qwen3.5-4B'
+base_url = 'http://localhost:8000'
+api_key = 'EMPTY_API_KEY'
 
-service_client = ServiceClient(
-    base_url='http://localhost:8000',
-    api_key=os.environ.get('MODELSCOPE_TOKEN')  # Recommended: set to ModelScope Token
-)
+service_client = ServiceClient(base_url=base_url, api_key=api_key)
 
 # Create sampling client from saved checkpoint
 sampling_client = service_client.create_sampling_client(
-    model_path="twinkle://run_id/weights/checkpoint_name",  # twinkle:// path of the checkpoint
+    model_path='twinkle://run_id/weights/checkpoint_name',  # twinkle:// path of the checkpoint
     base_model=base_model
 )
 
-# Prepare inference input
-tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+# Use Twinkle's Template to build multi-turn dialogue input
+template = Template(model_id=f'ms://{base_model}')
 
-# Construct multi-turn dialogue input
-inputs = [
-    {'role': 'system', 'content': 'You are a helpful assistant.'},
-    {'role': 'user', 'content': 'what is your name?'}
-]
-input_ids = tokenizer.apply_chat_template(inputs, tokenize=True, add_generation_prompt=True)
+trajectory = Trajectory(
+    messages=[
+        Message(role='system', content='You are a helpful assistant'),
+        Message(role='user', content='What is your name?'),
+    ]
+)
+
+input_feature = template.batch_encode([trajectory], add_generation_prompt=True)[0]
+input_ids = input_feature['input_ids'].tolist()
 
 prompt = types.ModelInput.from_ints(input_ids)
 params = types.SamplingParams(
     max_tokens=50,       # Maximum number of tokens to generate
     temperature=0.2,     # Low temperature, more focused answers
-    stop=["\n"]          # Stop when encountering newline
 )
 
 # Generate multiple completions
-result = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8).result()
+print('Sampling...')
+future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
+result = future.result()
 
+# Decode and print each response
+print('Responses:')
 for i, seq in enumerate(result.sequences):
-    print(f"{i}: {tokenizer.decode(seq.tokens)}")
+    print(f'{i}: {repr(template.decode(seq.tokens))}')
 ```
 
 ### Publishing Checkpoint to ModelScope Hub

@@ -49,26 +49,35 @@ Complete runnable examples are located in the `cookbook/client/` directory:
 cookbook/client/
 ├── server/                         # Server startup configuration
 │   ├── transformer/                # Transformers backend
-│   │   ├── server.py               # Startup script
+│   │   ├── run.sh                  # Startup script
+│   │   ├── server.py               # Server entry point
 │   │   └── server_config.yaml      # Configuration file
 │   └── megatron/                   # Megatron backend
+│       ├── run.sh
 │       ├── server.py
 │       ├── server_config.yaml
 │       └── server_config_4b.yaml
 ├── twinkle/                        # Twinkle Client examples
 │   ├── self_host/                  # Self-hosted Server
-│   │   ├── grpo.py                 # GRPO training client
+│   │   ├── dpo.py                  # DPO training client
+│   │   ├── multi_modal.py          # Multi-modal training client
 │   │   ├── sample.py               # Inference sampling client
-│   │   └── self_congnition.py      # Self-cognition training client
+│   │   ├── self_congnition.py      # Self-cognition training client
+│   │   └── short_math_grpo.py      # GRPO math training client
 │   └── modelscope/                 # ModelScope managed service
+│       ├── dpo.py
+│       ├── multi_modal.py
 │       └── self_congnition.py
 └── tinker/                         # Tinker Client examples
     ├── self_host/                  # Self-hosted Server
+    │   ├── dpo.py                  # DPO training client
     │   ├── lora.py                 # LoRA training client
+    │   ├── multi_modal.py          # Multi-modal training client
     │   ├── sample.py               # Inference sampling client
     │   ├── self_cognition.py       # Self-cognition training client
     │   └── short_math_grpo.py      # GRPO math training client
     └── modelscope/                 # ModelScope managed service
+        ├── dpo.py
         ├── sample.py
         ├── self_cognition.py
         └── short_math_grpo.py
