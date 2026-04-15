@@ -524,7 +524,7 @@ Alongside the open-source release of Twinkle, ModelScope provides a hosted model
 
 **How to use:**
 
-1. Register a ModelScope account and apply to join the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization
+1. Register a ModelScope account at [modelscope.cn](https://www.modelscope.cn/)
 2. Obtain your API Key on the [Token Management page](https://www.modelscope.cn/my/access/token)
 3. Use the Tinker Client code above with the following endpoint:
 

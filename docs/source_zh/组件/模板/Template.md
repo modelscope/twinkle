@@ -13,10 +13,6 @@ class Template:
                  default_system: Optional[str] = None):
         ...
 
-    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        # 编码单条样本
-        ...
-
     def batch_encode(self, trajectories: Union[Dict[str, Any], List[Trajectory]]) -> List[InputFeature]:
         # 批量编码样本
         ...

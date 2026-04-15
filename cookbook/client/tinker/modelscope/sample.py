@@ -16,7 +16,7 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = 'Qwen/Qwen3.5-27B'
+base_model = 'Qwen/Qwen3.6-35B-A3B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 # Step 2: Define the base model and connect to the server
@@ -29,7 +29,7 @@ service_client = ServiceClient(
 # The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.
 # The server will load the base model and apply the LoRA adapter weights.
 sampling_client = service_client.create_sampling_client(
-    model_path='twinkle://xxx-Qwen_Qwen3.5-27B-xxx/weights/twinkle-lora-1',
+    model_path='twinkle://xxx-Qwen_Qwen3.6-35B-A3B-xxx/weights/twinkle-lora-1',
     base_model=base_model
 )
 
@@ -45,7 +45,7 @@ trajectory = Trajectory(
     ]
 )
 
-input_feature = template.batch_encode([trajectory], add_generation_prompt=True)[0]
+input_feature = template.encode(trajectory, add_generation_prompt=True)
 
 input_ids = input_feature['input_ids'].tolist()
 

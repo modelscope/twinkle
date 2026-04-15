@@ -29,16 +29,15 @@ class TestTextTemplate:
         ]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
-        assert len(encoded[0]['input_ids']) > 0
-        assert len(encoded[0]['labels']) == len(encoded[0]['input_ids'])
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
+        assert len(encoded['input_ids']) > 0
+        assert len(encoded['labels']) == len(encoded['input_ids'])
 
-        input_ids = encoded[0]['input_ids']
-        labels = encoded[0]['labels']
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
 
         assert isinstance(input_ids, np.ndarray)
         assert isinstance(labels, np.ndarray)
@@ -61,12 +60,11 @@ class TestTextTemplate:
         ]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
-        assert len(encoded[0]['input_ids']) > 0
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
+        assert len(encoded['input_ids']) > 0
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_qwen25_text_template_labels_correctness(self):
@@ -78,10 +76,10 @@ class TestTextTemplate:
         messages = [Message(role='user', content='Hello'), Message(role='assistant', content='Hi there')]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        input_ids = encoded[0]['input_ids']
-        labels = encoded[0]['labels']
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
 
         assert len(input_ids) == len(labels)
 
@@ -113,16 +111,15 @@ class TestMultimodalTemplate:
         ]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
-        assert len(encoded[0]['input_ids']) > 0
-        assert len(encoded[0]['labels']) == len(encoded[0]['input_ids'])
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
+        assert len(encoded['input_ids']) > 0
+        assert len(encoded['labels']) == len(encoded['input_ids'])
 
-        input_ids = encoded[0]['input_ids']
-        labels = encoded[0]['labels']
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
 
         assert isinstance(input_ids, np.ndarray)
         assert isinstance(labels, np.ndarray)
@@ -141,14 +138,13 @@ class TestMultimodalTemplate:
         ]
         trajectory = Trajectory(messages=messages, images=[image_url])
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
 
-        if 'pixel_values' in encoded[0]:
-            assert encoded[0]['pixel_values'].shape[0] > 0
+        if 'pixel_values' in encoded:
+            assert encoded['pixel_values'].shape[0] > 0
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_qwen2vl_multimodal_template_labels_correctness(self):
@@ -164,10 +160,10 @@ class TestMultimodalTemplate:
         ]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        input_ids = encoded[0]['input_ids']
-        labels = encoded[0]['labels']
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
 
         assert len(input_ids) == len(labels)
 
@@ -191,11 +187,10 @@ class TestMultimodalTemplate:
         ]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
 
 
 class TestTemplateEdgeCases:
@@ -210,11 +205,10 @@ class TestTemplateEdgeCases:
         messages = [Message(role='user', content='Hello')]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert 'input_ids' in encoded[0]
-        assert 'labels' in encoded[0]
+        assert 'input_ids' in encoded
+        assert 'labels' in encoded
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_text_template_max_length_truncation(self):
@@ -227,7 +221,6 @@ class TestTemplateEdgeCases:
         messages = [Message(role='user', content=long_text), Message(role='assistant', content='Response')]
         trajectory = Trajectory(messages=messages)
 
-        encoded = template.batch_encode([trajectory])
+        encoded = template.encode(trajectory)
 
-        assert len(encoded) == 1
-        assert len(encoded[0]['input_ids']) <= 50
+        assert len(encoded['input_ids']) <= 50

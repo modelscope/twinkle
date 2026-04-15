@@ -30,9 +30,12 @@ Twinkle DOCUMENTATION
    组件/采样器/index.rst
    组件/奖励/index.rst
    组件/优势/index.rst
+   组件/Gym/index.rst
+   组件/Hub/index.rst
    组件/检查点引擎/index.rst
    组件/指标/index.rst
    组件/损失/index.rst
+   组件/损失缩放/index.rst
    组件/LRScheduler/index.rst
    组件/补丁/index.rst
    组件/组件化/index.rst

@@ -150,15 +150,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         """Encode trajectory for vLLM.
 
         Messages should already use transformers standard format (content is List[Dict]).
-        ``batch_encode`` preprocesses media refs in-place (to PIL objects).
+        ``encode`` preprocesses media refs in-place (to PIL objects).
         """
         template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
-        encoded = template.batch_encode(
-            [trajectory],
+        encoded = template.encode(
+            trajectory,
             add_generation_prompt=add_generation_prompt,
-        )[0]
+        )
         for key in encoded:
             if isinstance(encoded[key], np.ndarray):
                 encoded[key] = encoded[key].tolist()

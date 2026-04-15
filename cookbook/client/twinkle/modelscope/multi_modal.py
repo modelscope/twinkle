@@ -24,7 +24,7 @@ from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
-base_model = 'Qwen/Qwen3.5-27B'
+base_model = 'Qwen/Qwen3.6-35B-A3B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.

@@ -21,8 +21,8 @@ class TestMMModel(unittest.TestCase):
             ),
         ]
         trajectory = Trajectory(messages=messages)
-        encoded = template.batch_encode([trajectory])
-        self.assertTrue('input_ids' in encoded[0])
+        encoded = template.encode(trajectory)
+        self.assertTrue('input_ids' in encoded)
 
     def test_mm(self):
         model_dir = HubOperation.download_model('ms://Qwen/Qwen3-VL-2B-Instruct')
@@ -39,5 +39,5 @@ class TestMMModel(unittest.TestCase):
             ),
         ]
         trajectory = Trajectory(messages=messages)
-        encoded = template.batch_encode([trajectory])
-        self.assertTrue('input_ids' in encoded[0])
+        encoded = template.encode(trajectory)
+        self.assertTrue('input_ids' in encoded)

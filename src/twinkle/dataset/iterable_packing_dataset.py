@@ -63,8 +63,8 @@ class IterablePackingDataset(IterableDataset):
     def _processor(self):
         while True:
             i, data = self._in_queue.get()
-            encoded_data = self.template.batch_encode([data])
-            data.update(encoded_data[0])
+            encoded_data = self.template.encode(data)
+            data.update(encoded_data)
             self._out_queue.put((i, data))
 
     def _put_data_in_queue(self, iterator) -> int:
