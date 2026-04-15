@@ -6,4 +6,6 @@
    TrainMetric.md
    LossMetric.md
    Accuracy.md
+   CompletionRewardMetric.md
+   DPOMetric.md
    构建指标.md
