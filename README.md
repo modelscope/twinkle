@@ -43,9 +43,9 @@ Note: Twinkle✨is built by the team behind [ms-swift](https://github.com/models
 we expect the two projects to evolve together. We expect some fundamental components in Twinkle✨will likely
 be reused in [ms-swift](https://github.com/modelscope/ms-swift).
 
-|                  Twinkle Wechat Group                  |
-|:------------------------------------------------------:|
-| <img src="assets/wechat.jpg" width="200" height="200"> |
+[Discord Group](https://discord.gg/yeN59wxjwe)              |                  Twinkle Wechat Group                  |
+:------------------------------------------------------:|:------------------------------------------------------:|
+<img src="assets/discord_qr.jpg" width="200" height="200">  | <img src="assets/wechat.jpg" width="200" height="200"> |
 
 ## Installation
 
