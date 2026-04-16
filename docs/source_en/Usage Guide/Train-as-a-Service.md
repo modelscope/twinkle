@@ -2,15 +2,15 @@
 
 Alongside the open-source release of the Twinkle framework, we also provide a hosted model training service (Training as a Service) powered by ModelScope's backend infrastructure. Developers can use this service to experience Twinkle's training API for free.
 
-The model currently running on the cluster is [Qwen/Qwen3.5-27B](https://www.modelscope.cn/models/Qwen/Qwen3.5-27B). Below are the detailed usage instructions:
+The model currently running on the cluster is [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B). Below are the detailed usage instructions:
 
-## Step 1. Register a ModelScope Account and Apply to Join the twinkle-explorers Organization
+## Step 1. Register a ModelScope Account and Obtain Your API Key
 
-Developers first need to register as a ModelScope user and apply to join the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization to obtain access permissions. The current free Serverless training experience is still in beta testing and is only available to users within the organization. You can also use Twinkle✨ by deploying the service locally.
+Developers first need to register as a ModelScope user. You can also use Twinkle✨ by deploying the service locally.
 
 Registration link: https://www.modelscope.cn/
 
-After registering and being approved to join the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, obtain your API-Key (i.e., the ModelScope platform access token) from this page: https://www.modelscope.cn/my/access/token.
+After registering, obtain your API-Key (i.e., the ModelScope platform access token) from this page: https://www.modelscope.cn/my/access/token.
 
 API endpoint: `base_url="https://www.modelscope.cn/twinkle"`
 
@@ -30,8 +30,8 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.server.common import input_feature_to_datum
 
-base_model = 'ms://Qwen/Qwen3.5-27B'
-base_url='http://www.modelscope.cn/twinkle'
+base_model = 'ms://Qwen/Qwen3.6-35B-A3B'
+base_url='https://www.modelscope.cn/twinkle'
 api_key=os.environ.get('MODELSCOPE_TOKEN')
 
 # Use twinkle dataset to load the data
@@ -64,7 +64,7 @@ for epoch in range(2):
     print(f'Saved checkpoint for epoch {epoch} to {result.path}')
 ```
 
-With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.5-27B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
+With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.6-35B-A3B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
 
 ```python
 import os
@@ -79,8 +79,8 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = 'Qwen/Qwen3.5-27B'
-base_url = 'http://www.modelscope.cn/twinkle'
+base_model = 'Qwen/Qwen3.6-35B-A3B'
+base_url = 'https://www.modelscope.cn/twinkle'
 
 # Step 2: Define the base model and connect to the server
 service_client = ServiceClient(
@@ -92,7 +92,7 @@ service_client = ServiceClient(
 # The model_path is a twinkle:// URI pointing to a previously saved LoRA checkpoint.
 # The server will load the base model and apply the LoRA adapter weights.
 sampling_client = service_client.create_sampling_client(
-    model_path='twinkle://xxx-Qwen_Qwen3.5-27B-xxx/weights/twinkle-lora-1',
+    model_path='twinkle://xxx-Qwen_Qwen3.6-35B-A3B-xxx/weights/twinkle-lora-1',
     base_model=base_model
 )
 
@@ -108,7 +108,7 @@ trajectory = Trajectory(
     ]
 )
 
-input_feature = template.encode(trajectory, add_generation_prompt=True)
+input_feature = template.batch_encode([trajectory], add_generation_prompt=True)[0]
 
 input_ids = input_feature['input_ids'].tolist()
 
@@ -121,7 +121,7 @@ params = types.SamplingParams(
 )
 
 # Step 6: Send the sampling request to the server.
-# num_samples=1 generates 1 independent completions for the same prompt.
+# num_samples=1 generates 1 independent completion for the same prompt.
 print('Sampling...')
 future = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=1)
 result = future.result()
@@ -134,9 +134,9 @@ for i, seq in enumerate(result.sequences):
 
 Developers can also merge this LoRA with the base model and then deploy it using their own service, calling it through the OpenAI-compatible standard API.
 
-> The ModelScope server is tinker-compatible, so use the tinker cookbooks. In the future version, we will support a server works both for twinkle/tinker clients.
+> The ModelScope server is currently Tinker-compatible, so please use the Tinker cookbooks. In a future version, we will support a server that works for both Twinkle and Tinker clients.
 
-Developers can customize datasets, advantage functions, rewards, templates, and more. However, the Loss component is not currently customizable since it needs to be executed on the server side (for security reasons). If you need support for additional Loss functions, you can upload your Loss implementation to ModelHub and contact us via the Q&A group or through an issue to have the corresponding component added to the whitelist.
+Developers can customize datasets, advantage functions, rewards, templates, and more. However, the Loss component is not currently customizable since it needs to be executed on the server side (for security reasons). If you need support for additional Loss functions, you can upload your Loss implementation to [ModelHub](https://modelscope.cn) and contact us via the Q&A group or through an [issue](https://github.com/modelscope/twinkle/issues) to have the corresponding component added to the whitelist.
 
 ## Appendix: Supported Training Methods
 

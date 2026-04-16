@@ -524,7 +524,7 @@ Twinkle 框架开源的同时，魔搭社区依托自身算力基础设施，提
 
 **使用方式：**
 
-1. 注册魔搭账号并申请加入 [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) 组织
+1. 注册魔搭账号：[modelscope.cn](https://www.modelscope.cn/)
 2. 在 [Token 管理页面](https://www.modelscope.cn/my/access/token) 获取 API Key
 3. 使用上面的 Tinker Client 代码，修改 endpoint：
 

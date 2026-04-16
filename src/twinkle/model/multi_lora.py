@@ -45,6 +45,14 @@ class MultiLora:
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
+    def reset_adapter_status(self):
+        """Force lora_0 require_grad, disable others"""
+        if isinstance(self.module, list):
+            for _module in self.module:
+                _module.set_adapter('lora_0')
+        else:
+            self.module.set_adapter('lora_0')
+
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
             raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
@@ -374,11 +382,15 @@ class MultiLora:
             base_layer.forward = MethodType(_megatron_forward, base_layer)
             base_layer.layer_name = name
 
-    def patch(self, module: Union[torch.nn.Module, List[torch.nn.Module]], *args, **kwargs):
+    def patch(self,
+              module: Union[torch.nn.Module, List[torch.nn.Module]],
+              target_modules='all-linear',
+              *args,
+              **kwargs):
         for i in range(self.max_loras):
             config = LoraConfig(
                 r=self.max_r,
-                target_modules='all-linear',
+                target_modules=target_modules,
                 lora_alpha=32,
             )
             lora_tenant = LoraTenant(index=i, adapter_name=f'lora_{i}', config=config)
@@ -400,6 +412,8 @@ class MultiLora:
             def _patch_megatron(_module):
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
+                if _config.target_modules == 'all-linear':
+                    _config.origin_target_modules = 'all-linear'
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config)
                 else:

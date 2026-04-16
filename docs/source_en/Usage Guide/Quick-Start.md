@@ -2,12 +2,12 @@
 
 ## ✨ What is Twinkle?
 
-A component library for large model training. Based on PyTorch, simpler, more flexible, production-ready.
+A component library for large model training. Based on PyTorch, it is simpler, more flexible, and production-ready.
 
 🧩 <b>Loosely Coupled Architecture</b> · Standardized Interfaces<br>
 🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
 🔌 <b>Multi-Framework Compatible</b> · Transformers / Megatron<br>
-👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment
+👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment<br>
 
 ## Twinkle Compatibility
 
@@ -764,13 +764,17 @@ This service shares the same code as the Tinker API section described above. The
 
 Twinkle provides a sampling API that can be used to control the sampling process more flexibly for result validation, or to participate in the sampling workflow of RL algorithms.
 
-## Using Hugging Face models
+> For complete examples of all supported training modes, please refer to the [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook) directory.
 
-Switch the prefix.
+## Using Hugging Face Models
+
+To load models from Hugging Face instead of ModelScope, simply switch the prefix:
 
 ```text
 ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 ```
+
+All components that accept a `model_id` parameter support this prefix-based routing.
 
 ## 🛠️ Twinkle✨ Modular Ecosystem
 
@@ -849,7 +853,7 @@ ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 
 ## Twinkle's Customizable Components
 
-In Twinkle's design, training using torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithm development.
+In Twinkle's design, training via torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithms.
 
 Below is a list of recommended components for customization:
 
@@ -869,11 +873,11 @@ Below is a list of recommended components for customization:
 | Template              | twinkle.template.Template                  | Used to process standard inputs and convert them to tokens required by the model |
 | Weight Synchronization | twinkle.checkpoint_engine.CheckpointEngine | Used for weight synchronization in RL training                 |
 
-> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized, just follow the base class API design.
+> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized; simply follow the base class API design.
 
 ## DeviceGroup and DeviceMesh
 
-DeviceGroup and DeviceMesh are the core of Twinkle's architecture. All code construction is based on these two designs.
+DeviceGroup and DeviceMesh are the core concepts of Twinkle's architecture. All code construction is based on these two designs.
 
 ```python
 import twinkle
@@ -892,7 +896,7 @@ twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_group)
 
 After defining the device_group, you need to use `twinkle.initialize` to initialize resources.
 
-DeviceGroup: Define how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting resource groups:
+DeviceGroup: Defines how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting a resource group:
 
 ```python
 from twinkle.model import TransformersModel
@@ -902,7 +906,7 @@ from twinkle.model import MegatronModel
 model = MegatronModel(model_id='Qwen/Qwen3.5-4B', remote_group='default', device_mesh=device_mesh)
 ```
 
-DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions, such as data acquisition, data consumption, data return, etc.
+DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions such as data acquisition, data consumption, and data return.
 
 ## Usage Example
 

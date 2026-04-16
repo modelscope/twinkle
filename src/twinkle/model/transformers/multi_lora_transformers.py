@@ -33,6 +33,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_loras: int = 5,
             max_r: int = 32,
             max_length: int = 8192,
+            target_modules: Union[List[str], str] = 'all-linear',
             **kwargs):
         assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -66,13 +67,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
-        self.model = self.multi_adapter.patch(self.model)
+        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
         self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
         self.model = self.strategy.wrap_model(self.model)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
         self.handler = self.register_global_mm_forward_hook()
+        self.multi_adapter.reset_adapter_status()
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '

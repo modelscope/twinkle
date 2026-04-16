@@ -23,7 +23,7 @@ init_tinker_client()
 from tinker import ServiceClient
 
 # The base model to fine-tune / evaluate
-base_model = 'Qwen/Qwen3.5-27B'
+base_model = 'Qwen/Qwen3.6-35B-A3B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 
@@ -107,7 +107,7 @@ def eval():
         ]
     )
 
-    input_feature = template.encode(trajectory, add_generation_prompt=True)
+    input_feature = template.batch_encode([trajectory], add_generation_prompt=True)[0]
 
     input_ids = input_feature['input_ids'].tolist()
 
