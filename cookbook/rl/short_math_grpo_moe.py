@@ -160,7 +160,7 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'tensor_parallel_size': SAMPLER_TP,
-            'gpu_memory_utilization': 0.7,
+            'gpu_memory_utilization': 0.6,
             'max_model_len': 8192,
             'max_lora_rank': LORA_RANK, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
