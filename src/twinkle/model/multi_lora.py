@@ -54,14 +54,12 @@ class MultiLora:
                 if call_enable:
                     # This will cost time
                     _module.enable_adapter_layers()
-                if _module.active_adapter != adapter_name:
-                    _module.set_adapter(adapter_name)
+                _module.set_adapter(adapter_name)
         else:
             if call_enable:
                 # This will cost time
                 self.module.enable_adapter_layers()
-            if self.module.active_adapter != adapter_name:
-                self.module.set_adapter(adapter_name)
+            self.module.set_adapter(adapter_name)
 
     def deactivate_adapter(self):
         if isinstance(self.module, list):
@@ -374,11 +372,11 @@ class MultiLora:
             base_layer.forward = MethodType(_megatron_forward, base_layer)
             base_layer.layer_name = name
 
-    def patch(self, module: Union[torch.nn.Module, List[torch.nn.Module]], *args, **kwargs):
+    def patch(self, module: Union[torch.nn.Module, List[torch.nn.Module]], target_modules='all-linear', *args, **kwargs):
         for i in range(self.max_loras):
             config = LoraConfig(
                 r=self.max_r,
-                target_modules='all-linear',
+                target_modules=target_modules,
                 lora_alpha=32,
             )
             lora_tenant = LoraTenant(index=i, adapter_name=f'lora_{i}', config=config)

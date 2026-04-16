@@ -41,6 +41,7 @@ class MultiLoraMegatronModel(MegatronModel):
         max_loras: int = 5,
         max_r: int = 32,
         max_length: int = 8192,
+        target_modules: Union[List[str], str] = 'all-linear',
         **kwargs,
     ):
         requires('megatron_core')
@@ -87,7 +88,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
         MegatronPeft().__call__()
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
-        self.model = self.multi_adapter.patch(self.model)
+        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
         self.model = self.strategy.wrap_model(self.model)
         self.strategy.finish_param_config(self.model, None)
         self.multi_adapter.save_initial_weights()
