@@ -129,9 +129,6 @@ class TwinkleWorkerExtension:
             logger.info(f'vLLM worker bind device: local_rank={local_rank}, device={device_str}')
             self.device = torch.device(device_str)
 
-        if peft_config and base_sync_done:
-            self.remove_lora(VLLM_LORA_INT_ID)
-
         # Detect TP rank — vLLM sets self.rank on each worker.
         tp_rank = getattr(self, 'rank', 0)
         tp_size = 1
@@ -200,6 +197,8 @@ class TwinkleWorkerExtension:
 
         # ── Step 3: Receive and process weight buckets ──
         partial_tensors: dict = {}
+        lora_bucket_accum: list[tuple[str, torch.Tensor]] = []
+        lora_mode = bool(peft_config and base_sync_done)
         while True:
             # Only the driver receives bucket metadata from VLLMEngine.
             if is_driver:
@@ -245,6 +244,10 @@ class TwinkleWorkerExtension:
                         tensor = cpu_u8.view(dtype=dtype).view(shape)
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape).clone()
+                    # In LoRA mode we accumulate across buckets; move to CPU
+                    # immediately to avoid GPU memory growth/OOM.
+                    if lora_mode and tensor.device.type != 'cpu':
+                        tensor = tensor.cpu()
                     weights.append((name, tensor))
                     continue
 
@@ -279,6 +282,8 @@ class TwinkleWorkerExtension:
                         tensor = assembled
                     else:
                         tensor = assembled.clone()
+                    if lora_mode and tensor.device.type != 'cpu':
+                        tensor = tensor.cpu()
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
@@ -292,7 +297,14 @@ class TwinkleWorkerExtension:
             if tp_size > 1:
                 dist.barrier(group=cpu_group)
 
-            self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            # LoRA weights are streamed in multiple buckets for large adapters.
+            # Applying add_lora() per-bucket will create incomplete adapters and
+            # break MoE triplet packing. Accumulate all LoRA tensors and load once
+            # at stream end.
+            if lora_mode:
+                lora_bucket_accum.extend(weights)
+            else:
+                self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
 
             if metadata['is_last']:
@@ -300,9 +312,16 @@ class TwinkleWorkerExtension:
                     pending = ', '.join(sorted(partial_tensors.keys())[:8])
                     raise RuntimeError(
                         f'Incomplete chunked weights at stream end: pending {len(partial_tensors)} ({pending})')
+                if lora_mode:
+                    self._load_weights(
+                        lora_bucket_accum,
+                        peft_config=peft_config,
+                        base_sync_done=base_sync_done,
+                    )
                 break
 
         partial_tensors.clear()
+        lora_bucket_accum.clear()
         metadata = None
         raw_u8 = None
         cpu_u8 = None
@@ -403,9 +422,6 @@ class TwinkleWorkerExtension:
         here.
         """
         if peft_config and base_sync_done:
-            # Remove existing LoRA before replacing
-            self.remove_lora(VLLM_LORA_INT_ID)
-
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 
             converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}
@@ -415,6 +431,7 @@ class TwinkleWorkerExtension:
                 lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=converted,
+                load_inplace=True,
             )
             self.add_lora(lora_request)
         else:

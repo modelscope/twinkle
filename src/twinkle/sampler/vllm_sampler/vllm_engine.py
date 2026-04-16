@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 import os
+import re
 import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -512,7 +513,14 @@ class VLLMEngine(BaseSamplerEngine):
         sync_id = uuid.uuid4().hex
         zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}-{os.getpid()}-{sync_id}.sock'
 
+        env_bucket_mb = os.environ.get('TWINKLE_VLLM_BUCKET_SIZE_MB')
+        if env_bucket_mb is not None:
+            bucket_size_mb = int(env_bucket_mb)
+        if bucket_size_mb <= 0:
+            raise ValueError(f'bucket_size_mb must be > 0, got {bucket_size_mb}')
+
         bucket_size = bucket_size_mb << 20
+        lora_mode = bool(base_sync_done and peft_config)
 
         # Create transfer buffer
         buffer = None
@@ -575,9 +583,14 @@ class VLLMEngine(BaseSamplerEngine):
         offset = 0
         bucket_meta: list[dict] = []
         n_weights = 0
+        current_expert_layer: Optional[str] = None
+
+        def _get_expert_layer_prefix(weight_name: str) -> Optional[str]:
+            m = re.match(r'^(.*\.mlp\.experts)\.\d+\.', weight_name)
+            return m.group(1) if m else None
 
         async def _flush_bucket(is_last: bool) -> None:
-            nonlocal offset, bucket_meta
+            nonlocal offset, bucket_meta, current_expert_layer
             if not bucket_meta and not is_last:
                 return
             if buffer.device.type != 'cpu':
@@ -593,6 +606,7 @@ class VLLMEngine(BaseSamplerEngine):
             )
             offset = 0
             bucket_meta = []
+            current_expert_layer = None
 
         async for name, weight in _chain_first():
             if use_shm and weight.device.type != 'cpu':
@@ -602,6 +616,15 @@ class VLLMEngine(BaseSamplerEngine):
 
             weight_u8 = weight.view(-1).view(torch.uint8)
             total_nbytes = int(weight_u8.numel())
+            expert_layer_prefix = _get_expert_layer_prefix(name) if lora_mode else None
+            if lora_mode and offset > 0:
+                # Keep each expert layer in an isolated bucket to avoid sending
+                # partial expert-layer weights.
+                if current_expert_layer != expert_layer_prefix:
+                    await _flush_bucket(is_last=False)
+            if lora_mode:
+                current_expert_layer = expert_layer_prefix
+
             chunk_offset = 0
             while chunk_offset < total_nbytes:
                 if offset >= bucket_size:
