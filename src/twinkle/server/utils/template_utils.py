@@ -10,6 +10,7 @@ making it easy to maintain and extend template configurations.
 # Key: model name pattern to match, Value: template name
 MODEL_TEMPLATE_MAPPING = {
     'Qwen3.5': 'Qwen3_5Template',
+    'Qwen3.6': 'Qwen3_5Template',
     # Add more model-template mappings here as needed
     # 'ModelName': 'TemplateName',
 }
