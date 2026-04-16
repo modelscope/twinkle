@@ -187,6 +187,7 @@ class MegatronStrategy:
 
         wrapped_models = []
         for _model in model:
+            _model = MegatronStrategy._move_model_to_gpu(_model)
             config: TransformerConfig = _model.config  # noqa
 
             if not isinstance(model, Float16Module) and (config.fp16 or config.bf16):
