@@ -45,6 +45,14 @@ class MultiLora:
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
+    def reset_adapter_status(self):
+        """Force lora_0 require_grad, disable others"""
+        if isinstance(self.module, list):
+            for _module in self.module:
+                _module.set_adapter('lora_0')
+        else:
+            self.module.set_adapter('lora_0')
+
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
             raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
@@ -54,12 +62,14 @@ class MultiLora:
                 if call_enable:
                     # This will cost time
                     _module.enable_adapter_layers()
-                _module.set_adapter(adapter_name)
+                if _module.active_adapter != adapter_name:
+                    _module.set_adapter(adapter_name)
         else:
             if call_enable:
                 # This will cost time
                 self.module.enable_adapter_layers()
-            self.module.set_adapter(adapter_name)
+            if self.module.active_adapter != adapter_name:
+                self.module.set_adapter(adapter_name)
 
     def deactivate_adapter(self):
         if isinstance(self.module, list):
