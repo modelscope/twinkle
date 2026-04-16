@@ -372,7 +372,11 @@ class MultiLora:
             base_layer.forward = MethodType(_megatron_forward, base_layer)
             base_layer.layer_name = name
 
-    def patch(self, module: Union[torch.nn.Module, List[torch.nn.Module]], target_modules='all-linear', *args, **kwargs):
+    def patch(self,
+              module: Union[torch.nn.Module, List[torch.nn.Module]],
+              target_modules='all-linear',
+              *args,
+              **kwargs):
         for i in range(self.max_loras):
             config = LoraConfig(
                 r=self.max_r,
