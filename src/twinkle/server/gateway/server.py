@@ -13,6 +13,7 @@ from ray import serve
 from typing import Any
 
 import twinkle_client.types as types
+from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
@@ -36,7 +37,7 @@ class GatewayServer:
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models) or [
-            types.SupportedModel(model_name='Qwen/Qwen3.5-4B'),
+            types.SupportedModel(model_name='Qwen/Qwen3.6-35B-A3B'),
         ]
         self._modelscope_config_lock = asyncio.Lock()
 
@@ -92,6 +93,8 @@ def build_server_app(deploy_options: dict[str, Any],
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
+
+    app.middleware('http')(create_metrics_middleware('Gateway'))
 
     def get_self() -> GatewayServer:
         return serve.get_replica_context().servable_object

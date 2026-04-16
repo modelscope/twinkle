@@ -39,10 +39,12 @@ from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPSt
 from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, selective_log_softmax, torch_util
+from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 from twinkle.utils.logger import get_logger
+
+logger = get_logger()
 
 logger = get_logger()
 
@@ -151,7 +153,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def __init__(
             self,  # noqa
-            model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = AutoModelForCausalLM,
+            model_cls: Optional[Union[Type[PreTrainedModel], str, Type[_BaseAutoModelClass]]] = None,
             model_id: Optional[str] = None,
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
@@ -165,8 +167,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
-        self.model_id = model_id
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
         self.device_mesh = device_mesh
@@ -176,15 +176,27 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
+        if model_id is not None:
+            model_id = HubOperation.download_model(model_id)
+        self.model_id = model_id
+        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        if config is None:
+            from transformers import AutoConfig
+            self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            self.hf_config = config
+        if model_cls is None and hasattr(self.hf_config, 'architectures'):
+            model_cls = self.hf_config.architectures[0]
+        if model_cls is None:
+            model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
-            self.model = model_cls.from_config(config, **kwargs)
+            self.model = model_cls.from_config(self.hf_config, **kwargs)
         else:
-            model_id = HubOperation.download_model(model_id)
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
-                self.model = model_cls.from_pretrained(model_id, config=config, **kwargs)
+                self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -469,8 +481,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance: Loss = optimizer_config.loss_instance
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
-        inputs = optimizer_config.train_status.inputs
-        outputs = optimizer_config.train_status.outputs
+        if self.model.training:
+            status = optimizer_config.train_status
+        else:
+            status = optimizer_config.eval_status
+        inputs = status.inputs
+        outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
         loss_value = result['loss']
@@ -492,15 +508,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
         counts = counts / self.device_mesh.data_world_size
         optimizer_config = self.optimizer_group[adapter_name]
-        optimizer_config.train_status.num_tokens += counts.item()
+        status.num_tokens += counts.item()
         if self.sp_strategy is not None and 'labels' in inputs:
             reduction = getattr(loss_instance, 'reduction', None)
             if reduction is not None:
                 self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
             loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
-        optimizer_config.train_status.loss_value += loss_value
-        outputs['loss'] = optimizer_config.train_status.loss_value
-        return optimizer_config.train_status.loss_value.item()
+        status.loss_value += loss_value
+        outputs['loss'] = status.loss_value
+        return status.loss_value.item()
 
     @remote_function()
     def backward(self, **kwargs):
@@ -1285,6 +1301,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_name: str = None,
         base_sync_done: bool = False,
         merge_and_sync: bool = False,
+        model_keys: List[str] = None,
+        **kwargs,
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
@@ -1296,7 +1314,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
                 name = name.replace('.base_layer', '')
+            else:
+                if 'conv1d.weight' in name:
+                    if model_keys and any('conv1d.base_layer.weight' in name for name in model_keys):
+                        name = name.replace('conv1d.weight', 'conv1d.base_layer.weight')
             return name
+
+        def _print_weight_example(names):
+            for name in names[:3]:
+                logger.info(f'Sync weight: {name}')
 
         def _is_lora_key(name: str) -> bool:
             return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
@@ -1309,11 +1335,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 def weight_generator():
                     if isinstance(model, PeftModel):
                         model.merge_adapter()
+                    names = []
                     for name, tensor in model.state_dict().items():
                         if _is_lora_key(name):
                             continue
                         tensor = Torch.to_local_tensor(tensor)
-                        yield _normalize(name, keep_base_layer=False), tensor
+                        name = _normalize(name, keep_base_layer=False)
+                        names.append(name)
+                        yield name, tensor
+                    _print_weight_example(names)
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -1323,9 +1353,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 lora_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
 
                 def weight_generator():
+                    names = []
                     for name, tensor in lora_state_dict.items():
                         tensor = Torch.to_local_tensor(tensor)
+                        name = _normalize(name, keep_base_layer=True)
+                        names.append(name)
                         yield name, tensor
+                    _print_weight_example(names)
 
         else:
             # First full base-model sync.  Whether to keep ``.base_layer.``
@@ -1336,11 +1370,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = model.state_dict()
 
             def weight_generator():
+                names = []
                 for name, tensor in state_dict.items():
                     if _is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    yield _normalize(name, keep_base_layer=keep_base_layer), tensor
+                    name = _normalize(name, keep_base_layer=keep_base_layer)
+                    names.append(name)
+                    yield name, tensor
+                _print_weight_example(names)
 
         # Run async send_weights in a dedicated event loop thread.
         # We cannot use the Ray worker's event loop because it may already

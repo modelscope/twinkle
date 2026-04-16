@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
+from twinkle.infra import collect_tensor_dict
 from twinkle.model.megatron import MultiLoraMegatronModel
 from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
@@ -24,55 +25,33 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
     def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass."""
-        if loss_fn == 'importance_sampling':
-            super().set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=0.2, beta=0.0)
+        self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name=adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         loss_values = extract_rl_feature(inputs)
         loss_kwargs = kwargs.copy()
+        # ref_logps → padded tensor; megatron forward_backward auto-stores loss_kwargs in
+        # train_status.forward_kwargs (megatron.py:465), so DPOMetric reads it next step.
+        self._tinker_prepare_ref_outputs(loss_values, loss_kwargs)
         loss_kwargs.update(loss_values)
+
         outputs = super().forward_backward(inputs=input_features, adapter_name=adapter_name, **loss_kwargs)
         loss = outputs.get('loss', None)
-        logits_list = outputs.get('logits', [])
-        logps = outputs.get('logps', [])
-        if logits_list is None and logps is None:
-            return [None, None]
-
-        logits = None
-        if logits_list is not None:
-            if isinstance(logits_list, torch.Tensor):
-                logits = logits_list.detach()
-            else:
-                logits = torch.cat([logit.detach() for logit in logits_list], dim=0)
-        logps = logps.detach().cpu()
-        results = self._get_forward_output(inputs, logits, logps)
-
         if isinstance(loss, torch.Tensor):
             loss = loss.item()
         else:
-            loss = float(loss)
-
+            loss = float(loss) if loss is not None else 0.0
+        results = self._tinker_build_output(inputs, outputs)
         return [results, loss]
 
-    @remote_function(dispatch='slice_dp', collect='flatten')
-    def tinker_forward_only(self, *, inputs: List[types.Datum], **kwargs):
+    @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
+    def tinker_forward_only(self, *, inputs: List[types.Datum], adapter_name: str = None, **kwargs):
         """Forward pass without gradient computation."""
-        template = self.get_template(**kwargs)
+        template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
-        outputs = super().forward_only(inputs=input_features, **kwargs)
-        logits = outputs.get('logits', None)
-        logps = outputs.get('logps', None)
-
-        if logits is not None:
-            if isinstance(logits, torch.Tensor):
-                logits = logits.detach().cpu()
-            elif isinstance(logits, list) and len(logits) > 0:
-                logits = torch.cat([logit.detach().cpu() for logit in logits], dim=0)
-            results = self._get_forward_output(inputs, logits, logps)
-        else:
-            results = [{'logprobs': None, 'elementwise_loss': None} for _ in inputs]
-
-        return results
+        outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
+        results = self._tinker_build_output(inputs, outputs)
+        return [results, 0.0]
 
     @remote_function(dispatch='all')
     def tinker_step(self, *, adam_params: types.AdamParams, **kwargs):
@@ -119,7 +98,13 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect='mean')
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+        """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
+        output = super().forward_only(inputs=inputs, **kwargs)
+        return to_cpu_safe_output(output)
+
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""

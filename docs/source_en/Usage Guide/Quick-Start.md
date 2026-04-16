@@ -2,12 +2,12 @@
 
 ## ✨ What is Twinkle?
 
-A component library for large model training. Based on PyTorch, simpler, more flexible, production-ready.
+A component library for large model training. Based on PyTorch, it is simpler, more flexible, and production-ready.
 
 🧩 <b>Loosely Coupled Architecture</b> · Standardized Interfaces<br>
 🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
 🔌 <b>Multi-Framework Compatible</b> · Transformers / Megatron<br>
-👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment
+👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment<br>
 
 ## Twinkle Compatibility
 
@@ -70,7 +70,7 @@ def train():
 
     dataset = PackingDataset(dataset_meta)
     dataset.map(SelfCognitionProcessor(model_name='Twinkle Model', model_author='ModelScope Community'))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
     dataset.encode()
     dataset.pack_dataset()
 
@@ -114,7 +114,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -182,7 +182,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset
@@ -336,7 +336,7 @@ ADAPTER_NAME = 'default'
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -368,7 +368,7 @@ def main():
     model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -381,7 +381,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(Template, model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     dataloader = DataLoader(
         dataset=create_gsm8k_dataset,
@@ -543,7 +543,7 @@ def create_countdown_dataset():
     """Create Countdown Game dataset for GRPO training."""
 
     dataset = Dataset(dataset_meta=DatasetMeta('ms://zouxuhong/Countdown-Tasks-3to4', data_slice=range(500)))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=8192)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=8192)
     dataset.map('CountdownProcessor')
     dataset.encode(add_generation_prompt=True, batched=True)
     return dataset
@@ -637,11 +637,11 @@ def train():
 
     # Set processor and template for encoding inputs
     model.set_processor('InputProcessor')
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
     sampler = vLLMSampler(model_id=MODEL_ID)
-    sampler.set_template('Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function
     advantage_fn = GRPOAdvantage()
@@ -759,10 +759,6 @@ if __name__ == '__main__':
 
 Multiple developers can use a single base model from this service for parallel training and sampling. Furthermore, the training methods they use are allowed to differ. For example, User A can perform SFT, User B can perform RL, and User C can perform sampling. Similarly, Twinkle also supports Tinker-like APIs for remote training:
 
->[!Note]
-> One important note: in the current Twinkle implementation, the client-side Twinkle API and Tinker API cannot be used simultaneously on the same server. When you need to provide the Tinker API, you need to start the service under cookbook/client/tinker.
-> This issue will be addressed with high priority in upcoming iterations.
-
 ```python
 from tinker import types
 from tqdm import tqdm
@@ -783,7 +779,7 @@ def train():
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
 
     # Apply the chat template matching the base model (max 256 tokens per sample)
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
 
     # Replace placeholder names with custom model/author identity
     dataset.map(SelfCognitionProcessor('twinkle model', 'twinkle team'), load_from_cache_file=False)
@@ -835,13 +831,17 @@ This service shares the same code as the Tinker API section described above. The
 
 Twinkle provides a sampling API that can be used to control the sampling process more flexibly for result validation, or to participate in the sampling workflow of RL algorithms.
 
-## Using Hugging Face models
+> For complete examples of all supported training modes, please refer to the [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook) directory.
 
-Switch the prefix.
+## Using Hugging Face Models
+
+To load models from Hugging Face instead of ModelScope, simply switch the prefix:
 
 ```text
 ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 ```
+
+All components that accept a `model_id` parameter support this prefix-based routing.
 
 ## 🛠️ Twinkle✨ Modular Ecosystem
 
@@ -920,7 +920,7 @@ ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 
 ## Twinkle's Customizable Components
 
-In Twinkle's design, training using torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithm development.
+In Twinkle's design, training via torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithms.
 
 Below is a list of recommended components for customization:
 
@@ -940,11 +940,11 @@ Below is a list of recommended components for customization:
 | Template              | twinkle.template.Template                  | Used to process standard inputs and convert them to tokens required by the model |
 | Weight Synchronization | twinkle.checkpoint_engine.CheckpointEngine | Used for weight synchronization in RL training                 |
 
-> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized, just follow the base class API design.
+> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized; simply follow the base class API design.
 
 ## DeviceGroup and DeviceMesh
 
-DeviceGroup and DeviceMesh are the core of Twinkle's architecture. All code construction is based on these two designs.
+DeviceGroup and DeviceMesh are the core concepts of Twinkle's architecture. All code construction is based on these two designs.
 
 ```python
 import twinkle
@@ -963,7 +963,7 @@ twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_group)
 
 After defining the device_group, you need to use `twinkle.initialize` to initialize resources.
 
-DeviceGroup: Define how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting resource groups:
+DeviceGroup: Defines how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting a resource group:
 
 ```python
 from twinkle.model import TransformersModel
@@ -973,7 +973,7 @@ from twinkle.model import MegatronModel
 model = MegatronModel(model_id='Qwen/Qwen3.5-4B', remote_group='default', device_mesh=device_mesh)
 ```
 
-DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions, such as data acquisition, data consumption, data return, etc.
+DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions such as data acquisition, data consumption, and data return.
 
 ## Usage Example
 
@@ -996,7 +996,7 @@ def train():
     # 1000 samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # Set template to prepare encoding
-    dataset.set_template('Template', model_id='Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='Qwen/Qwen3.5-4B')
     # Preprocess the dataset to standard format
     dataset.map(SelfCognitionProcessor('twinkle LLM', 'ModelScope Community'))
     # Encode dataset

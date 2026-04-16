@@ -13,10 +13,6 @@ class Template:
                  default_system: Optional[str] = None):
         ...
 
-    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        # Encode a single sample
-        ...
-
     def batch_encode(self, trajectories: Union[Dict[str, Any], List[Trajectory]]) -> List[InputFeature]:
         # Batch encode samples
         ...
@@ -50,3 +46,10 @@ class Template:
 
 > Template does not support using functions as replacements because it needs to support many functions internally. If you need to write a new Template, please inherit the `Template` class.
 > Generally speaking, using the Template base class is sufficient for pure text models. In the base class, we use tokenizer.apply_chat_template to encode the model, which is universal for general pure text models.
+
+# Template mapping
+
+Currently, the model-template mapping is simple:
+
+- Template class：Supported in all pure text LLMs.
+- Qwen3_5Template class: For Qwen3.5 MLLMs.

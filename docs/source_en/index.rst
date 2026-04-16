@@ -30,9 +30,12 @@ Twinkle DOCUMENTATION
    Components/Sampler/index.rst
    Components/Reward/index.rst
    Components/Advantage/index.rst
+   Components/Gym/index.rst
+   Components/Hub/index.rst
    Components/Checkpoint Engine/index.rst
    Components/Metrics/index.rst
    Components/Loss/index.rst
+   Components/Loss Scale/index.rst
    Components/LRScheduler/index.rst
    Components/Patch/index.rst
    Components/Plugin/index.rst

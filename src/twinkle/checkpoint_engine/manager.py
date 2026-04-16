@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 import time
-from typing import Optional
+from typing import List, Optional
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
@@ -64,6 +64,7 @@ class CheckpointEngineManager:
         # Cached peft_config dict for LoRA-only sync.
         # Fetched lazily from the model on first LoRA sync.
         self._peft_config: dict | None = None
+        self._model_keys: Optional[List[str]] = None
 
     @staticmethod
     def decide_backend_engine(platform: Optional[str] = None) -> 'CheckpointEngine':
@@ -118,7 +119,39 @@ class CheckpointEngineManager:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
 
-        model_result = self.model.send_weights(base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync)
+        if self._model_keys is None:
+            if hasattr(self.sampler, 'get_state_keys'):
+                self._model_keys = self.sampler.get_state_keys()
+
+            if self._model_keys is None:
+                self._model_keys = []
+
+            # vLLM may have grouped params - use word boundaries to avoid substring matches
+            import re
+            _STACKED_MAPPINGS = [
+                (re.compile(r'\bqkv_proj\b'), ('q_proj', 'k_proj', 'v_proj', 'q', 'k', 'v')),
+                (re.compile(r'\bgate_up_proj\b'), ('gate_proj', 'up_proj')),
+                (re.compile(r'\bin_proj_ba\b'), ('in_proj_b', 'in_proj_a')),
+                (re.compile(r'\blanguage_model\.model\b'), ('model.language_model', )),
+                (re.compile(r'^visual\.'), ('model.visual.', )),
+            ]
+
+            def _expand_keys(keys):
+                result = set(keys)
+                for key in keys:
+                    for pattern, individuals in _STACKED_MAPPINGS:
+                        if pattern.search(key):
+                            for ind in individuals:
+                                result.add(pattern.sub(ind, key))
+                return result
+
+            # Two passes for chain expansion (e.g., language_model.model + qkv_proj)
+            expanded = _expand_keys(self._model_keys)
+            expanded = _expand_keys(expanded)
+            self._model_keys = list(expanded)
+
+        model_result = self.model.send_weights(
+            base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
         sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
         model_result()
         sampler_result()

@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
+from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
@@ -81,7 +82,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         self._replica_registered = False
 
         # Initialize mixins
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config))
+        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Model')
         self._init_adapter_manager(**adapter_config)
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -143,7 +144,7 @@ def build_model_app(model_id: str,
     Supports both Tinker (polling-style) and Twinkle (synchronous) clients.
 
     Args:
-        model_id: Base model identifier (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
+        model_id: Base model identifier (e.g., "Qwen/Qwen3.5-4B")
         nproc_per_node: Number of processes per node for distributed training
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for tensor parallelism
@@ -163,6 +164,8 @@ def build_model_app(model_id: str,
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
+
+    app.middleware('http')(create_metrics_middleware('Model'))
 
     def get_self() -> ModelManagement:
         return serve.get_replica_context().servable_object

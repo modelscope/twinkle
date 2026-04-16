@@ -10,7 +10,7 @@ from .network import find_free_port, find_node_ip, is_valid_ipv6_address
 from .parallel import processing_lock
 from .platforms import GPU, NPU, Platform, ensure_hccl_socket_env, ensure_npu_backend
 from .safetensors import LazyTensor, SafetensorLazyLoader, StreamingSafetensorSaver
-from .torch_utils import (pad_and_stack_tensors, pad_sequence_to_length, selective_log_softmax,
+from .torch_utils import (pad_and_stack_tensors, pad_sequence_to_length, selective_log_softmax, split_cp_inputs,
                           stateless_init_process_group, to_device)
 from .transformers_utils import find_all_linears, find_layers, get_modules_to_not_convert
 from .unsafe import check_unsafe, trust_remote_code

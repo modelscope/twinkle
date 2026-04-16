@@ -13,10 +13,6 @@ class Template:
                  default_system: Optional[str] = None):
         ...
 
-    def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False) -> InputFeature:
-        # 编码单条样本
-        ...
-
     def batch_encode(self, trajectories: Union[Dict[str, Any], List[Trajectory]]) -> List[InputFeature]:
         # 批量编码样本
         ...
@@ -50,3 +46,10 @@ class Template:
 
 > Template 不支持使用函数来代替，因为其内部要支持的功能较多。如果需要编写新的 Template，请继承 `Template` 类。
 > 一般来说，纯文本模型使用 Template 基类就足够了，在基类中我们使用了 tokenizer.apply_chat_template 来编码模型，对一般的纯文本模型是通用的。
+
+# 模板对应关系
+
+目前模板关系较为简单：
+
+- Template类：纯文本模型通用
+- Qwen3_5Template类：Qwen3.5多模态模型使用
