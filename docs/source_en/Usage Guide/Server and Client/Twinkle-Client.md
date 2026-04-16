@@ -148,25 +148,30 @@ logger.info(model.get_train_configs().model_dump())
 
 for epoch in range(3):
     logger.info(f'Starting epoch {epoch}')
-    for _, batch in enumerate(dataloader):
+    for step, batch in enumerate(dataloader):
         # Forward propagation + backward propagation
         model.forward_backward(inputs=batch)
 
-        # Step
+        # Gradient clipping + optimizer update (equivalent to clip_grad_norm / step / zero_grad / lr_step)
         model.clip_grad_and_step()
-        consumed_train_samples += len(batch)
-        global_step += 1
 
-        if global_step % 2 == 0:
-            metric = model.calculate_metric(is_training=True)
-            logger.info(f'Current is step {global_step} of {len(dataloader)}, metric: {metric.result}')
+    if step % 2 == 0:
+        logger.info(f'Step {step // 2}, loss: {output}')
+
+    # Gradient clipping
+    model.clip_grad_norm(1.0)
+
+    # Optimizer update
+    model.step()
+
+    # Zero gradients
+    model.zero_grad()
+
+    # Learning rate scheduling
+    model.lr_step()
 
     # Step 7: Save checkpoint
-    twinkle_path = model.save(
-        name=f'twinkle-epoch-{epoch}',
-        save_optimizer=True,
-        consumed_train_samples=consumed_train_samples,
-    )
+    twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: Upload to ModelScope Hub (optional)
