@@ -400,6 +400,8 @@ class MultiLora:
             def _patch_megatron(_module):
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 _config = deepcopy(config)
+                if _config.target_modules == 'all-linear':
+                    _config.origin_target_modules = 'all-linear'
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config)
                 else:
