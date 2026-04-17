@@ -95,8 +95,10 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2                                # 2-way data parallel
-        pp_size: 2                                # 2-way pipeline parallel (~27GB/GPU)
+        tp_size: 2
+        ep_size: 2
+        pp_size: 2
+        sequence_parallel: True
 
       queue_config:
         rps_limit: 20                               # Max requests per second
