@@ -91,7 +91,7 @@ SYNC_INTERVAL = 1  # Save weights for sampler every N steps
 GRADIENT_ACCUMULATION_STEPS = 1
 DATA_NUM = 2000  # Number of Math samples to use
 
-USE_SWANLAB = True
+USE_SWANLAB = False
 SWANLAB_PROJECT = 'twinkle-grpo'
 SWANLAB_EXPERIMENT_NAME = 'short-math-grpo'
 

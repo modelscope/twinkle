@@ -317,14 +317,15 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
             save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=body.is_sampler)
+            # Must save the checkpoint in the twinkle format before calling model.save()
+            twinkle_path = checkpoint_manager.save(
+                model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
             checkpoint_dir = self.model.save(
                 name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name,
                 save_optimizer=body.save_optimizer,
                 **extra_kwargs)
-            twinkle_path = checkpoint_manager.save(
-                model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
             return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
 
         return await run_task(self.schedule_task_and_wait(_task, task_type='save'))
@@ -384,7 +385,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 async_upload=False,
             )
 
-        future_ref = await self.schedule_task(_task, task_type='upload_to_hub')
+        future_ref = await self.schedule_background_task(_task, task_type='upload_to_hub')
         request_id = future_ref.get('request_id')
         if request_id is None:
             raise HTTPException(status_code=500, detail=f'Upload task scheduling failed: {future_ref}')
