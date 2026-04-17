@@ -59,6 +59,33 @@ def _rebuild_ipc(handle, device_id: Optional[int] = None) -> torch.Tensor:
         return rebuild_cuda_tensor(*list_args)
 
 
+def _ipc_handle_signature(handle) -> Optional[tuple]:
+    """Derive a stable signature for a CUDA IPC handle.
+
+    ``reduce_tensor`` returns ``(func, args)`` where ``args`` contains the
+    CUDA IPC storage handle bytes, storage size, ref-counter handle, etc.
+    Two handles are equivalent (i.e. map the same CUDA memory region) when
+    these inner fields match. We hash only the parts that are picklable and
+    comparable to avoid accidental mismatches due to local objects.
+    """
+    try:
+        _, args = handle
+    except Exception:
+        return None
+    sig = []
+    for v in args:
+        if isinstance(v, (bytes, bytearray)):
+            sig.append(('bytes', bytes(v)))
+        elif isinstance(v, (int, float, bool, str)) or v is None:
+            sig.append(('scalar', v))
+        else:
+            try:
+                sig.append(('repr', repr(v)))
+            except Exception:
+                return None
+    return tuple(sig)
+
+
 def _rebuild_shared_memory(name: str, size: int):
     """Rebuild tensor from shared memory.  Returns (tensor, shm)."""
     from multiprocessing import shared_memory
@@ -184,7 +211,27 @@ class TwinkleWorkerExtension:
             handle = comm_metadata
             # All TP ranks rebuild the IPC buffer from the same handle.
             # CUDA IPC allows any process on the same node to map the memory.
-            buffer = _rebuild_ipc(handle, self.device.index)
+            # Reuse a cached buffer across syncs when the sender reuses the
+            # same IPC handle: this avoids creating a fresh CUDA IPC mapping
+            # per sync, which the driver releases lazily and is the root
+            # cause of the apparent GPU memory growth under frequent syncs.
+            handle_signature = _ipc_handle_signature(handle)
+            cached_buffer = getattr(self, '_twinkle_ipc_buffer', None)
+            cached_signature = getattr(self, '_twinkle_ipc_handle_signature', None)
+            if cached_buffer is not None and cached_signature == handle_signature:
+                buffer = cached_buffer
+            else:
+                # Drop the previous mapping before creating a new one so the
+                # driver can reclaim the old shared memory region.
+                if cached_buffer is not None:
+                    self._twinkle_ipc_buffer = None
+                    self._twinkle_ipc_handle_signature = None
+                    del cached_buffer
+                    gc.collect()
+                    Torch.ipc_collect()
+                buffer = _rebuild_ipc(handle, self.device.index)
+                self._twinkle_ipc_buffer = buffer
+                self._twinkle_ipc_handle_signature = handle_signature
         else:
             from multiprocessing import shared_memory
             buffer, shm = _rebuild_shared_memory(
@@ -331,7 +378,6 @@ class TwinkleWorkerExtension:
         if is_driver and socket is not None:
             socket.close()
         del buffer
-        gc.collect()
         if shm is not None:
             try:
                 shm.close()
@@ -343,8 +389,9 @@ class TwinkleWorkerExtension:
                 except BufferError as e:
                     logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
             del shm
-        Torch.ipc_collect()
-        Torch.empty_cache()
+            gc.collect()
+            Torch.ipc_collect()
+            Torch.empty_cache()
 
     def load_synced_weights(
         self,

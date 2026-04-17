@@ -96,6 +96,18 @@ class VLLMEngine(BaseSamplerEngine):
         # ``list_loras()`` per request.
         self._synced_lora_request: Optional[Any] = None
 
+        # Long-lived CUDA IPC bucket reused across all update_weights()
+        # calls. Allocating a new IPC buffer (and hence a new IPC handle)
+        # per sync forces every worker to create a new CUDA IPC mapping via
+        # ``rebuild_cuda_tensor`` because PyTorch's ``shared_cache`` cannot
+        # hit on unseen storage handles. The driver reclaims those mappings
+        # lazily, which is the root cause of the slow GPU memory drift we
+        # observed under frequent LoRA syncs. By pinning a single buffer
+        # and its handle we guarantee the worker-side cache always hits.
+        self._ipc_buffer: Optional[torch.Tensor] = None
+        self._ipc_handle: Any = None
+        self._ipc_buffer_size: int = 0
+
         # Initialize engine
         self.engine = self._create_engine()
 
@@ -528,8 +540,25 @@ class VLLMEngine(BaseSamplerEngine):
 
         if use_gpu_ipc:
             from torch.multiprocessing.reductions import reduce_tensor
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
-            ipc_handle = reduce_tensor(buffer)
+
+            # Reuse a long-lived IPC bucket whenever the requested size
+            # fits. The handle is produced once and shipped to every
+            # subsequent sync so each worker's ``shared_cache`` stays warm
+            # and no new CUDA IPC mapping is created per sync.
+            need_realloc = (
+                self._ipc_buffer is None or self._ipc_buffer_size < bucket_size
+                or self._ipc_buffer.device != first_tensor.device)
+            if need_realloc:
+                # Drop the old handle/buffer before allocating a bigger one
+                # so we do not briefly hold both and double the peak usage.
+                self._ipc_buffer = None
+                self._ipc_handle = None
+                self._ipc_buffer_size = 0
+                self._ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
+                self._ipc_handle = reduce_tensor(self._ipc_buffer)
+                self._ipc_buffer_size = bucket_size
+            buffer = self._ipc_buffer
+            ipc_handle = self._ipc_handle
         else:
             from multiprocessing import shared_memory
             shm_name = f'twinkle_weights_{uuid.uuid4().hex}'
@@ -669,7 +698,7 @@ class VLLMEngine(BaseSamplerEngine):
             shm.close()
             shm.unlink()
             del shm
-        gc.collect()
+            gc.collect()
 
         elapsed = time.time() - start_time
         mode = 'LoRA' if base_sync_done and peft_config else 'base'
@@ -685,6 +714,10 @@ class VLLMEngine(BaseSamplerEngine):
         import gc
 
         logger.info('Shutting down VLLMEngine...')
+
+        self._ipc_buffer = None
+        self._ipc_handle = None
+        self._ipc_buffer_size = 0
 
         if self.engine is not None:
             try:
