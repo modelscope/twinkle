@@ -9,9 +9,12 @@
 #   2. Run: python client_tools/client_generator.py
 # ============================================================================
 
+from typing import Any, Callable, Dict, Type, Union
 from twinkle_client.http import http_post
 from twinkle.dataset import Dataset
 from twinkle.dataset import DatasetMeta
+from twinkle.preprocessor import DataFilter
+from twinkle.preprocessor import Preprocessor
 from .base import Dataset
 
 class LazyDataset(Dataset):
@@ -33,13 +36,68 @@ class LazyDataset(Dataset):
         self.processor_id = response.json()['processor_id']
 
     
-    def encode(self, **kwargs):
+    def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'map',
+                **{'preprocess_func': preprocess_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
+                **kwargs
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def filter(self, filter_func: Union[Callable, str, Type[DataFilter], DataFilter], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'filter',
+                **{'filter_func': filter_func, 'dataset_meta': dataset_meta, 'init_args': init_args},
+                **kwargs
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def add_dataset(self, dataset_meta: DatasetMeta, **kwargs):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'add_dataset',
+                **{'dataset_meta': dataset_meta},
+                **kwargs
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def mix_dataset(self, interleave = True):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'mix_dataset',
+                **{'interleave': interleave},
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
+    def encode(self, add_generation_prompt: bool = False, **kwargs):
         response = http_post(
             url=f'{self.server_url}/call',
             json_data={
                 'processor_id': self.processor_id,
                 'function': 'encode',
-                **{},
+                **{'add_generation_prompt': add_generation_prompt},
                 **kwargs
             }
         )

@@ -43,6 +43,7 @@ from .model import (
     StepResponse,
     UploadToHubRequest,
     UploadToHubResponse,
+    UploadStatusResponse,
     ZeroGradResponse,
 )
 from .processor import (

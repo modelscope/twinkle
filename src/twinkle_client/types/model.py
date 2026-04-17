@@ -4,8 +4,8 @@ Pydantic request/response models for twinkle model management endpoints.
 
 These models are used by both the server-side handler and the twinkle client.
 """
-from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, field_validator
+from typing import Any, Dict, List, Optional, Union
 
 
 class CreateRequest(BaseModel):
@@ -71,10 +71,17 @@ class SaveRequest(BaseModel):
 
 
 class UploadToHubRequest(BaseModel):
-    checkpoint_dir: str
+    checkpoint_dir: Union[str, Dict]
     hub_model_id: str
     hub_token: Optional[str] = None
     async_upload: bool = False
+
+    @field_validator('checkpoint_dir', mode='before')
+    @classmethod
+    def extract_checkpoint_dir(cls, v):
+        if isinstance(v, dict):
+            return v['twinkle_path']
+        return v
 
     class Config:
         extra = 'allow'
@@ -264,9 +271,16 @@ class SetProcessorResponse(OkResponse):
     pass
 
 
-class UploadToHubResponse(OkResponse):
+class UploadToHubResponse(BaseModel):
     """Response for /upload_to_hub endpoint."""
-    pass
+    request_id: str
+
+
+class UploadStatusResponse(BaseModel):
+    """Response for /upload_status/{request_id} endpoint."""
+    request_id: str
+    status: str  # pending / queued / running / completed / failed
+    error: Optional[str] = None
 
 
 class ClipGradAndStepResponse(OkResponse):
