@@ -87,7 +87,7 @@ applications:
       use_megatron: true                          # Use Megatron-LM backend
       model_id: "ms://Qwen/Qwen3.6-35B-A3B" # ModelScope model identifier
       max_length: 32000                           # model max length
-      max_loras: 5                                # model max loras
+      max_loras: 3                                # model max loras
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
         name: model

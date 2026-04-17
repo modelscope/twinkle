@@ -1337,6 +1337,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        kwargs['model_id'] = self.tokenizer_id
         optimizer_config.template = construct_class(template_cls, Template, twinkle.template, **kwargs)
 
     @remote_function(dispatch='all')
