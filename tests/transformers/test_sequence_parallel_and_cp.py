@@ -35,6 +35,15 @@ def _make_labels(input_ids: torch.Tensor) -> torch.Tensor:
     return labels
 
 
+def _make_padded_labels(input_ids: torch.Tensor, valid_lengths: list[int]) -> torch.Tensor:
+    labels = torch.full_like(input_ids, -100)
+    for row_idx, valid_len in enumerate(valid_lengths):
+        if valid_len <= 1:
+            continue
+        labels[row_idx, :valid_len - 1] = input_ids[row_idx, 1:valid_len]
+    return labels
+
+
 def _make_case(case_name: str) -> dict:
     cases = {
         'sp_only': {
@@ -44,6 +53,25 @@ def _make_case(case_name: str) -> dict:
             'num_attention_heads': 8,
             'hidden_size': 128,
             'seq_len': 769,
+        },
+        'sp_only_multi_sample': {
+            'expected_mode': 'sp_only',
+            'world_size': 2,
+            'ulysses_size': 2,
+            'num_attention_heads': 8,
+            'hidden_size': 128,
+            'seq_len': 769,
+            'batch_size': 3,
+        },
+        'sp_only_multi_sample_masked': {
+            'expected_mode': 'sp_only',
+            'world_size': 2,
+            'ulysses_size': 2,
+            'num_attention_heads': 8,
+            'hidden_size': 128,
+            'seq_len': 769,
+            'batch_size': 3,
+            'valid_lengths': [769, 513, 257],
         },
         'cp_only': {
             'expected_mode': 'cp_only',
@@ -240,6 +268,32 @@ def _prepare_label_inputs(strategy: SequenceParallelStrategy, input_ids: torch.T
     return processed['labels']
 
 
+def _build_precision_inputs(
+        case: dict, vocab_size: int,
+        device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    seq_len = int(case['seq_len'])
+    batch_size = int(case.get('batch_size', 1))
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0).repeat(batch_size, 1)
+    valid_lengths = case.get('valid_lengths')
+    if not valid_lengths:
+        input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
+        labels = _make_labels(input_ids)
+        return input_ids, position_ids, None, labels
+
+    if len(valid_lengths) != batch_size:
+        raise ValueError(f'valid_lengths length ({len(valid_lengths)}) must equal batch_size ({batch_size}).')
+
+    input_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.int64, device=device)
+    for row_idx, valid_len in enumerate(valid_lengths):
+        if valid_len <= 0 or valid_len > seq_len:
+            raise ValueError(f'valid_len must be in [1, seq_len], got valid_len={valid_len}, seq_len={seq_len}')
+        input_ids[row_idx, :valid_len] = torch.randint(low=0, high=vocab_size, size=(valid_len, ), device=device)
+        attention_mask[row_idx, :valid_len] = 1
+    labels = _make_padded_labels(input_ids, [int(length) for length in valid_lengths])
+    return input_ids, position_ids, attention_mask, labels
+
+
 def _compute_training_path_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -303,6 +357,22 @@ def _assert_grad_dict_close(case_name: str, rank: int, baseline_grads: dict[str,
         if not torch.allclose(current, baseline, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (current - baseline).abs().max().item()
             raise AssertionError(f'{case_name} attention grad mismatch on rank {rank} for {key}: max_diff={max_diff}')
+
+
+def _assert_logits_close(case_name: str, rank: int, baseline_logits: torch.Tensor, sp_logits: torch.Tensor,
+                         seq_len: int, attention_mask: torch.Tensor | None):
+    baseline_slice = baseline_logits[:, :seq_len]
+    sp_slice = sp_logits[:, :seq_len]
+    if attention_mask is None:
+        if not torch.allclose(sp_slice, baseline_slice, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+            diff = (sp_slice - baseline_slice).abs().max().item()
+            raise AssertionError(f'{case_name} logits mismatch on rank {rank}: max_diff={diff}')
+        return
+
+    mask = attention_mask.to(dtype=torch.bool).unsqueeze(-1).expand_as(baseline_slice)
+    if not torch.allclose(sp_slice[mask], baseline_slice[mask], rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
+        diff = (sp_slice[mask] - baseline_slice[mask]).abs().max().item()
+        raise AssertionError(f'{case_name} masked logits mismatch on rank {rank}: max_diff={diff}')
 
 
 def _init_dist(rank: int, world_size: int, port: int, backend_config: dict):
@@ -422,15 +492,15 @@ def _run_precision_worker(rank: int,
         sp_model.load_state_dict(base_model.state_dict())
 
         seq_len = int(case['seq_len'])
-        input_ids = torch.randint(low=0, high=int(base_model.config.vocab_size), size=(1, seq_len), device=device)
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-        labels = _make_labels(input_ids)
+        input_ids, position_ids, attention_mask, labels = _build_precision_inputs(case,
+                                                                                  int(base_model.config.vocab_size),
+                                                                                  device)
 
         base_model.zero_grad(set_to_none=True)
         base_outputs = base_model(
             input_ids=input_ids,
             position_ids=position_ids,
-            attention_mask=None,
+            attention_mask=attention_mask,
             use_cache=False,
         )
         base_logits = base_outputs.logits.detach().float()
@@ -457,7 +527,7 @@ def _run_precision_worker(rank: int,
         sp_outputs = sp_model(
             input_ids=input_ids,
             position_ids=position_ids,
-            attention_mask=None,
+            attention_mask=attention_mask,
             use_cache=False,
         )
         local_logits = sp_outputs.logits
@@ -474,9 +544,7 @@ def _run_precision_worker(rank: int,
             raise AssertionError(
                 f'{case_name} num_tokens mismatch on rank {rank}: sp={sp_num_tokens} base={base_num_tokens}')
 
-        if not torch.allclose(sp_logits[:, :seq_len], base_logits, rtol=LOGITS_RTOL, atol=LOGITS_ATOL):
-            diff = (sp_logits[:, :seq_len] - base_logits).abs().max().item()
-            raise AssertionError(f'{case_name} logits mismatch on rank {rank}: max_diff={diff}')
+        _assert_logits_close(case_name, rank, base_logits, sp_logits, seq_len, attention_mask)
         if abs(global_loss.item() - base_loss.item()) > LOSS_ATOL:
             raise AssertionError(
                 f'{case_name} loss mismatch on rank {rank}: sp={global_loss.item()} base={base_loss.item()}')
@@ -609,6 +677,30 @@ class TestDerivedRingPrecision(unittest.TestCase):
         mp.spawn(
             _run_precision_worker,
             args=(world_size, port, 'cp_only', backend, 'flash_attention_2'),
+            nprocs=world_size,
+            join=True)
+
+    def test_sp_only_multi_sample_precision_alignment(self):
+        case = _make_case('sp_only_multi_sample')
+        world_size = int(case['world_size'])
+        backend = self._get_backend_or_skip(world_size)
+        self._require_attn_impl_or_skip(backend, 'flash_attention_2')
+        port = _find_free_port()
+        mp.spawn(
+            _run_precision_worker,
+            args=(world_size, port, 'sp_only_multi_sample', backend, 'flash_attention_2'),
+            nprocs=world_size,
+            join=True)
+
+    def test_sp_only_multi_sample_masked_precision_alignment(self):
+        case = _make_case('sp_only_multi_sample_masked')
+        world_size = int(case['world_size'])
+        backend = self._get_backend_or_skip(world_size)
+        self._require_attn_impl_or_skip(backend, 'flash_attention_2')
+        port = _find_free_port()
+        mp.spawn(
+            _run_precision_worker,
+            args=(world_size, port, 'sp_only_multi_sample_masked', backend, 'flash_attention_2'),
             nprocs=world_size,
             join=True)
 

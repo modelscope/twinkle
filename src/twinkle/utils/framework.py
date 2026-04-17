@@ -41,8 +41,10 @@ class Framework(ABC):
     def gather_object(object: Any, device_mesh: DeviceMesh, process_group=None):
         import torch.distributed as dist
         output_objects = [object]
-        if device_mesh is not None and device_mesh.data_world_size > 1:
+        group_size = 1
+        if dist.is_available() and dist.is_initialized():
             group_size = dist.get_world_size(group=process_group)
+        if group_size > 1:
             output_objects = [None for _ in range(group_size)]
             dist.all_gather_object(output_objects, object, group=process_group)
         _x = []

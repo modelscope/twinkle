@@ -15,6 +15,11 @@ else:
     _FLA_CAUSAL_CONV1D_FN = None
     _FLA_CHUNK_GATED_DELTA_RULE = None
 
+_SP_LINEAR_KERNEL_IMPORT_ERROR = (
+    'Qwen3.5 linear attention sequence parallel requires flash-linear-attention and causal-conv1d. '
+    'Install: https://github.com/fla-org/flash-linear-attention#installation and '
+    'https://github.com/Dao-AILab/causal-conv1d')
+
 
 def _sp_is_enabled(sequence_parallel_context) -> bool:
     return bool(sequence_parallel_context is not None and getattr(sequence_parallel_context, 'world_size', 1) > 1)
@@ -45,12 +50,8 @@ def _get_local_padding_mask(
 def _ensure_linear_attention_kernels(mod: torch.nn.Module):
     mod.causal_conv1d_fn = getattr(mod, 'causal_conv1d_fn', None) or _FLA_CAUSAL_CONV1D_FN
     mod.chunk_gated_delta_rule = getattr(mod, 'chunk_gated_delta_rule', None) or _FLA_CHUNK_GATED_DELTA_RULE
-    if mod.chunk_gated_delta_rule is None:
-        raise ImportError('Qwen3.5 linear attention sequence parallel requires chunk gated delta rule implementations.')
-    if mod.causal_conv1d_fn is None:
-        raise ImportError(
-            'Qwen3.5 linear attention sequence parallel requires fla.modules.convolution.causal_conv1d for '
-            'training/prefill.')
+    if mod.chunk_gated_delta_rule is None or mod.causal_conv1d_fn is None:
+        raise ImportError(_SP_LINEAR_KERNEL_IMPORT_ERROR)
 
 
 def _get_local_conv_weights(

@@ -492,7 +492,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
         #                               / gradient_accumulation_steps
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
-        counts = counts / self.device_mesh.data_world_size
+        raw_dp_fsdp_world_size = _get_raw_dp_fsdp_world_size(self.device_mesh)
+        counts = counts / raw_dp_fsdp_world_size
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.train_status.num_tokens += counts.item()
         optimizer_config.train_status.loss_value += loss_value
