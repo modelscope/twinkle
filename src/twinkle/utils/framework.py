@@ -42,6 +42,16 @@ class Framework(ABC):
         import torch.distributed as dist
         output_objects = [object]
         if device_mesh is not None and device_mesh.data_world_size > 1:
+            if Platform.device_prefix() == 'npu':
+                # On NPU, letting Python object collectives use the default HCCL
+                # group previously hung in 8-card metric collection at
+                # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
+                # DP group instead. When CP is enabled we must pick the DP+CP
+                # variant, otherwise the rank span for metric aggregation is wrong.
+                if importlib.util.find_spec('megatron.core') is not None:
+                    from megatron.core import parallel_state as mpu
+                    process_group = mpu.get_data_parallel_group_gloo(
+                        with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
             group_size = dist.get_world_size(group=process_group)
             output_objects = [None for _ in range(group_size)]
             dist.all_gather_object(output_objects, object, group=process_group)

@@ -134,6 +134,9 @@ class TwinkleModel(ABC):
         else:
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
+    def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
+        return backend in ('nccl', 'hccl')
+
     def _try_init_process_group(self):
         import torch
         import torch.distributed as dist
@@ -154,6 +157,6 @@ class TwinkleModel(ABC):
                 'rank': Platform.get_rank(),
                 'world_size': Platform.get_world_size(),
             }
-            if backend in ('nccl', 'hccl'):
+            if self._should_bind_device_id_for_process_group(backend):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
