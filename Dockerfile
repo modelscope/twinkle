@@ -22,8 +22,7 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
     CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
     pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
 
-# TODO: mcore_bridge use main branch version
-RUN pip install megatron_core git+https://github.com/modelscope/mcore-bridge.git --no-cache-dir
+RUN pip install megatron_core mcore_bridge --no-cache-dir
 
 # Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
