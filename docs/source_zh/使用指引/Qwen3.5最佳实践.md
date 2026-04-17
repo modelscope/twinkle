@@ -48,7 +48,7 @@ logger = get_logger()
 def eval(model):
     # 验证集：100 条样本
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     dataset.encode()
     dataloader = DataLoader(dataset=dataset, batch_size=8)
@@ -63,7 +63,7 @@ def train():
     # 训练集：1000 条样本
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(1000)))
     # 设置模板，准备编码
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B')
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B')
     # 数据预处理：替换自我认知数据中的占位符
     dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     # 编码数据集
@@ -188,7 +188,7 @@ ADAPTER_NAME = 'default'
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=2048)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -222,7 +222,7 @@ def main():
     model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # 采样器部署在 'sampler' 组
     sampler = vLLMSampler(
@@ -236,7 +236,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(Template, model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -393,7 +393,7 @@ for run in runs:
 def train():
     # 准备数据集
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-    dataset.set_template('Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
+    dataset.set_template('Qwen3_5Template', model_id='ms://Qwen/Qwen3.5-4B', max_length=512)
     dataset.map('SelfCognitionProcessor', init_args={'model_name': 'twinkle模型', 'model_author': 'ModelScope社区'})
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=4)
@@ -403,7 +403,7 @@ def train():
 
     lora_config = LoraConfig(target_modules='all-linear')
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
-    model.set_template('Template')
+    model.set_template('Qwen3_5Template')
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('CrossEntropyLoss')
     model.set_optimizer('AdamW', lr=1e-4)
@@ -473,7 +473,7 @@ base_url = 'http://www.modelscope.cn/twinkle'
 def train():
     # 准备数据集
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(500)))
-    dataset.set_template('Template', model_id=f'ms://{base_model}', max_length=256)
+    dataset.set_template('Qwen3_5Template', model_id=f'ms://{base_model}', max_length=256)
     dataset.map(SelfCognitionProcessor('Twinkle模型', 'ModelScope团队'), load_from_cache_file=False)
     dataset.encode(batched=True, load_from_cache_file=False)
     dataloader = DataLoader(dataset=dataset, batch_size=8)
@@ -524,7 +524,7 @@ Twinkle 框架开源的同时，魔搭社区依托自身算力基础设施，提
 
 **使用方式：**
 
-1. 注册魔搭账号并申请加入 [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) 组织
+1. 注册魔搭账号：[modelscope.cn](https://www.modelscope.cn/)
 2. 在 [Token 管理页面](https://www.modelscope.cn/my/access/token) 获取 API Key
 3. 使用上面的 Tinker Client 代码，修改 endpoint：
 

@@ -50,7 +50,7 @@ def eval(model):
 
 def create_dataset(data_slice=None):
     dataset = Dataset(dataset_meta=DatasetMeta(DATASETS, data_slice=range(500)))
-    dataset.set_template('Template', model_id=MODEL_ID)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID)
     dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
     dataset.encode(batched=True)
     return dataset

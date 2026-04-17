@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Deque, Dict, Optional
 
+from twinkle.server.utils.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .rate_limiter import RateLimiter
 
@@ -157,17 +158,22 @@ class TaskQueueMixin:
     # Type hint for state attribute that inheriting classes must provide
     state: ServerStateProxy
 
-    def _init_task_queue(self, config: TaskQueueConfig | None = None) -> None:
+    def _init_task_queue(self, config: TaskQueueConfig | None = None, deployment_name: str = '') -> None:
         """Initialize the task queue system.
 
         Args:
             config: Optional TaskQueueConfig. If None, uses default config.
+            deployment_name: Deployment name for metrics labels (e.g. 'Model', 'Sampler').
         """
         self._task_queue_config = config or TaskQueueConfig()
         # Per-key queues, but executed by a single global worker.
         self._task_queues: dict[str, asyncio.Queue] = {}
         self._queue_order: Deque[str] = deque()
         self._new_task_event: asyncio.Event = asyncio.Event()
+
+        # Metrics initialization
+        self._deployment_name = deployment_name
+        self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
 
         # Initialize rate limiter for RPS/TPS control
         self._rate_limiter = RateLimiter(
@@ -176,6 +182,8 @@ class TaskQueueMixin:
             window_seconds=self._task_queue_config.window_seconds,
             token_cleanup_multiplier=self._task_queue_config.token_cleanup_multiplier,
             token_cleanup_interval=self._task_queue_config.token_cleanup_interval,
+            active_tokens_gauge=self._task_metrics.rate_limiter_active_tokens if self._task_metrics else None,
+            deployment_name=deployment_name,
         )
         # Start the rate limiter cleanup task
         self._rate_limiter.start_cleanup_task()
@@ -247,6 +255,18 @@ class TaskQueueMixin:
                     except asyncio.QueueEmpty:
                         continue
 
+                    # Record queue wait time and update depth gauge
+                    if self._task_metrics:
+                        queue_wait = time.monotonic() - task.created_at
+                        task_type_label = task.task_type or 'unknown'
+                        self._task_metrics.queue_wait_seconds.observe(
+                            queue_wait, tags={
+                                'deployment': self._deployment_name,
+                                'task_type': task_type_label
+                            })
+                        total_depth = sum(qq.qsize() for qq in self._task_queues.values())
+                        self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+
                     now = time.monotonic()
 
                     # Global queue timeout
@@ -263,6 +283,13 @@ class TaskQueueMixin:
                             queue_state=QueueState.PAUSED_CAPACITY.value,
                             queue_state_reason=error_payload['error'],
                         )
+                        if self._task_metrics:
+                            self._task_metrics.tasks_total.inc(
+                                tags={
+                                    'deployment': self._deployment_name,
+                                    'task_type': task.task_type or 'unknown',
+                                    'status': 'timeout'
+                                })
                         q.task_done()
                         continue
 
@@ -273,6 +300,8 @@ class TaskQueueMixin:
                     await self.state.store_future_status(
                         task.request_id, TaskStatus.RUNNING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
 
+                    exec_start = time.monotonic()
+                    task_status = 'completed'
                     try:
                         coro = task.coro_factory()
                         result = await coro
@@ -283,6 +312,7 @@ class TaskQueueMixin:
                             result=result,
                             queue_state=QueueState.ACTIVE.value)
                     except Exception:
+                        task_status = 'failed'
                         error_payload = {'error': traceback.format_exc(), 'category': 'Server'}
                         await self.state.store_future_status(
                             task.request_id,
@@ -292,6 +322,20 @@ class TaskQueueMixin:
                             queue_state=QueueState.ACTIVE.value)
                     finally:
                         q.task_done()
+                        if self._task_metrics:
+                            exec_time = time.monotonic() - exec_start
+                            self._task_metrics.execution_seconds.observe(
+                                exec_time,
+                                tags={
+                                    'deployment': self._deployment_name,
+                                    'task_type': task.task_type or 'unknown'
+                                })
+                            self._task_metrics.tasks_total.inc(
+                                tags={
+                                    'deployment': self._deployment_name,
+                                    'task_type': task.task_type or 'unknown',
+                                    'status': task_status
+                                })
 
                     # Keep serial semantics: execute at most one runnable task per loop
                     break
@@ -409,6 +453,8 @@ class TaskQueueMixin:
         # Check rate limits
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
+            if self._task_metrics:
+                self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
             error_msg = f'Rate limit exceeded: {reason}'
             error_payload = {'error': error_msg, 'category': 'User'}
             await self.state.store_future_status(
@@ -505,6 +551,10 @@ class TaskQueueMixin:
         logger.debug(f'[TaskQueue] Task {request_id} queued, new queue size: {q.qsize()} key={queue_key}')
 
         self._new_task_event.set()
+
+        if self._task_metrics:
+            total_depth = sum(q.qsize() for q in self._task_queues.values())
+            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
 
         return {'request_id': request_id, 'model_id': model_id}
 

@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from twinkle.server.utils.metrics import get_resource_metrics
 from twinkle.utils.logger import get_logger
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
@@ -50,6 +51,11 @@ class ServerState:
         self.cleanup_interval = cleanup_interval
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_running = False
+
+        # Metrics loop state
+        self._metrics_task: asyncio.Task | None = None
+        self._metrics_running = False
+        self._metrics_update_interval: float = float(kwargs.get('metrics_update_interval', 15.0))
 
     # ----- Session Management -----
 
@@ -284,6 +290,22 @@ class ServerState:
                 logger.warning(f'[ServerState Cleanup] Error during cleanup: {e}')
                 continue
 
+    async def _metrics_loop(self) -> None:
+        """Background task that updates resource gauge metrics every N seconds."""
+        resource_metrics = get_resource_metrics()
+        while self._metrics_running:
+            try:
+                await asyncio.sleep(self._metrics_update_interval)
+                resource_metrics.active_sessions.set(self._session_mgr.count())
+                resource_metrics.active_models.set(self._model_mgr.count())
+                resource_metrics.active_sampling_sessions.set(self._sampling_mgr.count())
+                resource_metrics.active_futures.set(self._future_mgr.count())
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f'[ServerState] Error updating metrics: {e}')
+                continue
+
     async def start_cleanup_task(self) -> bool:
         """Start the background cleanup task.
 
@@ -294,6 +316,9 @@ class ServerState:
             return False
         self._cleanup_running = True
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        if not self._metrics_running:
+            self._metrics_running = True
+            self._metrics_task = asyncio.create_task(self._metrics_loop())
         return True
 
     async def stop_cleanup_task(self) -> bool:
@@ -308,6 +333,10 @@ class ServerState:
         if self._cleanup_task:
             self._cleanup_task.cancel()
             self._cleanup_task = None
+        self._metrics_running = False
+        if self._metrics_task:
+            self._metrics_task.cancel()
+            self._metrics_task = None
         return True
 
     async def get_cleanup_stats(self) -> dict[str, Any]:

@@ -40,7 +40,7 @@ SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 50))
 
 def create_gsm8k_dataset():
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Template', model_id=MODEL_ID, max_length=400)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
     dataset.map(GSM8KProcessor())
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -70,6 +70,7 @@ def main():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
     # lora_config = LoraConfig(target_modules='all-linear', r=32, lora_alpha=64, lora_dropout=0.05)
+    # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',
@@ -94,7 +95,7 @@ def main():
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -103,12 +104,15 @@ def main():
             'max_model_len': 4496,
             'max_lora_rank': 32, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(Template, model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -133,6 +137,9 @@ def main():
             break
         metrics.reset()
         global_prompts = batch if isinstance(batch, list) else [batch]
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
         sample_responses = sampler.sample(

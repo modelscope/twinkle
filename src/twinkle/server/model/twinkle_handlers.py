@@ -8,6 +8,7 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 """
 from __future__ import annotations
 
+import asyncio
 import torch
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -347,12 +348,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         await run_task(self.schedule_task_and_wait(_task, task_type='load'))
 
-    @app.post('/twinkle/upload_to_hub')
+    @app.post('/twinkle/upload_to_hub', response_model=types.UploadToHubResponse)
     async def upload_to_hub(
             request: Request,
             body: types.UploadToHubRequest,
             self: ModelManagement = Depends(self_fn),
-    ) -> None:
+    ) -> types.UploadToHubResponse:
         token = await self._on_request_start(request)
 
         async def _task():
@@ -370,13 +371,39 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                     checkpoint_manager.get_ckpt_dir(model_id=model_id_to_load, checkpoint_id=checkpoint_id))
             else:
                 checkpoint_dir = body.checkpoint_dir
-            self.model.upload_to_hub(
+            # Run blocking upload in thread pool so the event loop is not blocked.
+            # async_upload is intentionally ignored here: the task queue + client polling
+            # already provide the fire-and-forget / wait semantics without holding the
+            # HTTP connection open for the full duration of the upload.
+            await asyncio.to_thread(
+                self.model.upload_to_hub,
                 checkpoint_dir=checkpoint_dir,
                 hub_model_id=body.hub_model_id,
                 hub_token=body.hub_token or token,
-                async_upload=body.async_upload)
+                async_upload=False,
+            )
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='upload_to_hub'))
+        future_ref = await self.schedule_task(_task, task_type='upload_to_hub')
+        request_id = future_ref.get('request_id')
+        if request_id is None:
+            raise HTTPException(status_code=500, detail=f'Upload task scheduling failed: {future_ref}')
+        return types.UploadToHubResponse(request_id=request_id)
+
+    @app.get('/twinkle/upload_status/{request_id}', response_model=types.UploadStatusResponse)
+    async def upload_status(
+            request: Request,
+            request_id: str,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.UploadStatusResponse:
+        await self._on_request_start(request)
+        record = await self.state.get_future(request_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f'Upload task not found: {request_id}')
+        status = record.get('status', 'unknown')
+        error = None
+        if status == 'failed':
+            error = record.get('result', {}).get('error', 'Unknown error')
+        return types.UploadStatusResponse(request_id=request_id, status=status, error=error)
 
     @app.post('/twinkle/add_adapter_to_model', response_model=types.AddAdapterResponse)
     async def add_adapter_to_model(
