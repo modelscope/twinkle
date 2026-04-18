@@ -65,6 +65,7 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
+            self.drop_causal_4d_mask,
             self.split_cp,
             self.prepare_outputs,
         ]
@@ -234,6 +235,20 @@ class InputProcessor:
             padding_free = self.padding_free or self._any_packing([_inp])
             if padding_free and self.framework == 'megatron':
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
+        return inputs
+
+    def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        """On NPU, drop the generic 4D dense mask so MindSpeed can build
+        its own compressed causal mask for FlashAttention."""
+        if Platform.device_prefix() != 'npu':
+            return inputs
+        attention_mask_type = kwargs.get('attention_mask_type')
+        if attention_mask_type != 'causal':
+            return inputs
+        for _inp in inputs:
+            attention_mask = _inp.get('attention_mask')
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
+                _inp['attention_mask'] = None
         return inputs
 
     @staticmethod
