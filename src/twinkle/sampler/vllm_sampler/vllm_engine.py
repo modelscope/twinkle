@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import inspect
 import os
 import re
@@ -586,118 +587,133 @@ class VLLMEngine(BaseSamplerEngine):
             except zmq.error.Again as e:
                 raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) during {where} on {zmq_handle}') from e
 
-        # Launch worker side concurrently
-        worker_task = asyncio.ensure_future(
-            self.engine.collective_rpc(
-                'update_weights_from_ipc',
-                kwargs={
-                    'peft_config': peft_config,
-                    'base_sync_done': base_sync_done,
-                    'use_shm': use_shm,
-                    'zmq_handle': zmq_handle,
-                },
-            ))
-
-        # Send IPC/SHM handle, wait for worker ready (non-blocking)
-        handle_payload = ipc_handle if use_gpu_ipc else {'name': shm_name, 'size': bucket_size}
-        await loop.run_in_executor(None, _zmq_send_recv, handle_payload, 'handle handshake')
-
-        # Stream weights into buckets and send to worker
-        async def _chain_first():
-            """Re-inject the peeked first tensor, then yield the rest."""
-            yield first_name, first_tensor
-            async for item in weight_aiter:
-                yield item
-
-        offset = 0
-        bucket_meta: list[dict] = []
         n_weights = 0
-        current_expert_layer: Optional[str] = None
+        worker_task: Optional['asyncio.Future'] = None
+        try:
+            # Launch worker side concurrently
+            worker_task = asyncio.ensure_future(
+                self.engine.collective_rpc(
+                    'update_weights_from_ipc',
+                    kwargs={
+                        'peft_config': peft_config,
+                        'base_sync_done': base_sync_done,
+                        'use_shm': use_shm,
+                        'zmq_handle': zmq_handle,
+                    },
+                ))
 
-        def _get_expert_layer_prefix(weight_name: str) -> Optional[str]:
-            m = re.match(r'^(.*\.mlp\.experts)\.\d+\.', weight_name)
-            return m.group(1) if m else None
+            # Send IPC/SHM handle, wait for worker ready (non-blocking)
+            handle_payload = ipc_handle if use_gpu_ipc else {'name': shm_name, 'size': bucket_size}
+            await loop.run_in_executor(None, _zmq_send_recv, handle_payload, 'handle handshake')
 
-        async def _flush_bucket(is_last: bool) -> None:
-            nonlocal offset, bucket_meta, current_expert_layer
-            if not bucket_meta and not is_last:
-                return
-            if buffer.device.type != 'cpu':
-                Torch.synchronize()
-            await loop.run_in_executor(
-                None,
-                _zmq_send_recv,
-                {
-                    'bucket_meta': bucket_meta,
-                    'is_last': is_last,
-                },
-                'final bucket' if is_last else 'bucket flush',
-            )
+            # Stream weights into buckets and send to worker
+            async def _chain_first():
+                """Re-inject the peeked first tensor, then yield the rest."""
+                yield first_name, first_tensor
+                async for item in weight_aiter:
+                    yield item
+
             offset = 0
-            bucket_meta = []
-            current_expert_layer = None
+            bucket_meta: list[dict] = []
+            current_expert_layer: Optional[str] = None
 
-        async for name, weight in _chain_first():
-            if use_shm and weight.device.type != 'cpu':
-                weight = weight.cpu()
-            if not weight.is_contiguous():
-                weight = weight.contiguous()
+            def _get_expert_layer_prefix(weight_name: str) -> Optional[str]:
+                m = re.match(r'^(.*\.mlp\.experts)\.\d+\.', weight_name)
+                return m.group(1) if m else None
 
-            weight_u8 = weight.view(-1).view(torch.uint8)
-            total_nbytes = int(weight_u8.numel())
-            expert_layer_prefix = _get_expert_layer_prefix(name) if lora_mode else None
-            if lora_mode and offset > 0:
-                # Keep each expert layer in an isolated bucket to avoid sending
-                # partial expert-layer weights.
-                if current_expert_layer != expert_layer_prefix:
-                    await _flush_bucket(is_last=False)
-            if lora_mode:
-                current_expert_layer = expert_layer_prefix
-
-            chunk_offset = 0
-            while chunk_offset < total_nbytes:
-                if offset >= bucket_size:
-                    await _flush_bucket(is_last=False)
-
-                chunk_nbytes = min(bucket_size - offset, total_nbytes - chunk_offset)
-                buffer[offset:offset + chunk_nbytes].copy_(
-                    weight_u8[chunk_offset:chunk_offset + chunk_nbytes],
-                    non_blocking=True,
+            async def _flush_bucket(is_last: bool) -> None:
+                nonlocal offset, bucket_meta, current_expert_layer
+                if not bucket_meta and not is_last:
+                    return
+                if buffer.device.type != 'cpu':
+                    Torch.synchronize()
+                await loop.run_in_executor(
+                    None,
+                    _zmq_send_recv,
+                    {
+                        'bucket_meta': bucket_meta,
+                        'is_last': is_last,
+                    },
+                    'final bucket' if is_last else 'bucket flush',
                 )
-                bucket_meta.append({
-                    'name': name,
-                    'shape': weight.shape,
-                    'dtype': weight.dtype,
-                    'offset': offset,
-                    'nbytes': chunk_nbytes,
-                    'chunk_offset': chunk_offset,
-                    'total_nbytes': total_nbytes,
-                })
-                offset += chunk_nbytes
-                chunk_offset += chunk_nbytes
-            n_weights += 1
+                offset = 0
+                bucket_meta = []
+                current_expert_layer = None
 
-        # Send last bucket
-        await _flush_bucket(is_last=True)
+            async for name, weight in _chain_first():
+                if use_shm and weight.device.type != 'cpu':
+                    weight = weight.cpu()
+                if not weight.is_contiguous():
+                    weight = weight.contiguous()
 
-        # Wait for worker to finish loading
-        await worker_task
+                weight_u8 = weight.view(-1).view(torch.uint8)
+                total_nbytes = int(weight_u8.numel())
+                expert_layer_prefix = _get_expert_layer_prefix(name) if lora_mode else None
+                if lora_mode and offset > 0:
+                    # Keep each expert layer in an isolated bucket to avoid sending
+                    # partial expert-layer weights.
+                    if current_expert_layer != expert_layer_prefix:
+                        await _flush_bucket(is_last=False)
+                if lora_mode:
+                    current_expert_layer = expert_layer_prefix
 
-        # Clean up
-        socket.close()
-        zmq_ctx.term()
-        if zmq_handle.startswith('ipc://'):
-            ipc_path = zmq_handle[len('ipc://'):]
-            try:
-                if os.path.exists(ipc_path):
-                    os.remove(ipc_path)
-            except OSError:
-                pass
-        del buffer
-        if shm is not None:
-            shm.close()
-            shm.unlink()
-            del shm
+                chunk_offset = 0
+                while chunk_offset < total_nbytes:
+                    if offset >= bucket_size:
+                        await _flush_bucket(is_last=False)
+
+                    chunk_nbytes = min(bucket_size - offset, total_nbytes - chunk_offset)
+                    buffer[offset:offset + chunk_nbytes].copy_(
+                        weight_u8[chunk_offset:chunk_offset + chunk_nbytes],
+                        non_blocking=True,
+                    )
+                    bucket_meta.append({
+                        'name': name,
+                        'shape': weight.shape,
+                        'dtype': weight.dtype,
+                        'offset': offset,
+                        'nbytes': chunk_nbytes,
+                        'chunk_offset': chunk_offset,
+                        'total_nbytes': total_nbytes,
+                    })
+                    offset += chunk_nbytes
+                    chunk_offset += chunk_nbytes
+                n_weights += 1
+
+            # Send last bucket
+            await _flush_bucket(is_last=True)
+
+            # Wait for worker to finish loading
+            await worker_task
+        finally:
+            # Always release resources on any exit path (including exceptions).
+            # Note: `buffer` may alias ``self._ipc_buffer`` on the GPU IPC path;
+            # ``del buffer`` only drops the local name, so the persistent IPC
+            # buffer is preserved for reuse across subsequent sync calls.
+            # Best-effort cancel the worker RPC so we don't leave a dangling
+            # ``collective_rpc`` task after an early error (e.g. ZMQ timeout).
+            if worker_task is not None and not worker_task.done():
+                worker_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await worker_task
+            socket.close()
+            zmq_ctx.term()
+            if zmq_handle.startswith('ipc://'):
+                ipc_path = zmq_handle[len('ipc://'):]
+                try:
+                    if os.path.exists(ipc_path):
+                        os.remove(ipc_path)
+                except OSError:
+                    pass
+            del buffer
+            if shm is not None:
+                shm.close()
+                shm.unlink()
+                del shm
+            # Run GC for both SHM and GPU IPC paths so temporary objects
+            # (bucket_meta, shared-memory wrappers, local tensors) are released
+            # promptly; skipping on the IPC path would leave dangling
+            # references across sync calls.
             gc.collect()
 
         elapsed = time.time() - start_time

@@ -383,9 +383,9 @@ class TwinkleWorkerExtension:
                 except BufferError as e:
                     logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
             del shm
-            gc.collect()
-            Torch.ipc_collect()
-            Torch.empty_cache()
+        gc.collect()
+        Torch.ipc_collect()
+        Torch.empty_cache()
 
     def load_synced_weights(
         self,

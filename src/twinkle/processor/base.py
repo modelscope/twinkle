@@ -369,7 +369,7 @@ class InputProcessor:
                 if key == 'position_ids' and is_mm_position_ids(values[0]):
                     # mrope needs to cat the sequence and unsequeeze the middle dim
                     value = torch.cat(values, dim=2).unsqueeze(1)
-                if isinstance(values[0], torch.Tensor):
+                elif isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
                     value = values

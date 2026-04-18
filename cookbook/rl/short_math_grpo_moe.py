@@ -144,7 +144,7 @@ def main():
             remote_group='model',
         )
 
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     if USE_MEGATRON:
         model.set_optimizer('default', lr=LEARNING_RATE)
         model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
