@@ -190,11 +190,17 @@ class MultiLora:
         if target_modules == 'all-linear':
             return True
 
-        if isinstance(target_modules, str):
-            return re.fullmatch(target_modules, module_name) is not None
+        # Strip LoRA-specific suffixes (e.g. ".lora_A.default.weight") so that
+        # a full parameter name like "model.layers.0.attn.proj.lora_A.default.weight"
+        # can be matched against target_modules like ["attn.proj"].
+        if '.lora_' in module_name:
+            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', module_name)
 
-        if isinstance(target_modules, list):
-            return any(module_name.endswith(t) for t in target_modules)
+        if isinstance(target_modules, str):
+            return re.fullmatch(target_modules, cleaned) is not None
+
+        if isinstance(target_modules, (list, set)):
+            return any(cleaned.endswith(t) for t in target_modules)
 
         return False
 
