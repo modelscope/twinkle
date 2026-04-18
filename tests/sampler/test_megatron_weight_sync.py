@@ -41,7 +41,7 @@ os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'
 os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
 # Model configuration — use a small model for testing
-MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2.5-0.5B-Instruct')
+MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3.5-27B')
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +169,15 @@ def test_megatron_weight_sync(
         model_id=model_path,
         device_mesh=model_device_mesh,
         mixed_precision='bf16',
-        sequence_parallel=(tp_size > 1),
         remote_group='model',
     )
+    lora_config = {
+        'target_modules': 'all-linear',
+        'r': 8,
+        'lora_alpha': 32,
+        'lora_dropout': 0.05,
+    }
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
     log('  MegatronModel created successfully')
 
     # ── Create Sampler (dummy weights) ────────────────────────────────
@@ -180,11 +186,11 @@ def test_megatron_weight_sync(
         model_id=model_path,
         engine_args={
             'load_format': 'dummy',
-            'gpu_memory_utilization': 0.3,
-            'max_model_len': 256,
-            'enforce_eager': True,
+            'gpu_memory_utilization': 0.7,
+            'max_model_len': 1024,
+            'enforce_eager': False,
             'enable_sleep_mode': True,
-            'enable_lora': False,
+            'enable_lora': True,
         },
         device_mesh=DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_gpus),
         remote_group='sampler',
@@ -197,9 +203,13 @@ def test_megatron_weight_sync(
     time.sleep(5)
 
     # ── Helper: sample one prompt ─────────────────────────────────────
+    dp = sampler.device_mesh.data_world_size
+
     def do_sample(prompt: str, max_tokens: int = 32) -> str:
-        traj = Trajectory(messages=[{'role': 'user', 'content': prompt}])
-        responses = wait_result(sampler.sample(traj, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
+        one = Trajectory(messages=[{'role': 'user', 'content': prompt}])
+        batch = [one for _ in range(dp)]
+        responses = wait_result(
+            sampler.sample(batch, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
         for response in responses:
             if response and response.sequences:
                 tokens = response.sequences[0].tokens
@@ -221,7 +231,7 @@ def test_megatron_weight_sync(
     )
 
     sync_start = time.time()
-    manager.sync_weights()
+    manager.sync_weights(merge_and_sync=False)
     sampler.reset_prefix_cache()
     sync_time = time.time() - sync_start
     log(f'  Weight sync completed in {sync_time:.2f}s')
@@ -257,10 +267,10 @@ def test_megatron_weight_sync(
 
 def main():
     parser = argparse.ArgumentParser(description='Test Megatron standalone weight synchronization')
-    parser.add_argument('--model-gpus', type=int, default=2, help='Number of GPUs for Megatron model (default: 2)')
+    parser.add_argument('--model-gpus', type=int, default=4, help='Number of GPUs for Megatron model (default: 2)')
     parser.add_argument('--sampler-gpus', type=int, default=2, help='Number of GPUs for vLLM sampler (default: 2)')
     parser.add_argument('--tp-size', type=int, default=2, help='Tensor parallel size (default: 2)')
-    parser.add_argument('--pp-size', type=int, default=1, help='Pipeline parallel size (default: 1)')
+    parser.add_argument('--pp-size', type=int, default=2, help='Pipeline parallel size (default: 1)')
     args = parser.parse_args()
 
     log('Starting Megatron standalone weight sync test...')

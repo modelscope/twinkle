@@ -42,7 +42,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
-LEARNING_RATE = float(os.environ.get('LR', 1e-5))
+LEARNING_RATE = float(os.environ.get('LR', 5e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
@@ -160,8 +160,8 @@ def main():
         model_id=MODEL_ID,
         engine_args={
             'tensor_parallel_size': SAMPLER_TP,
-            'gpu_memory_utilization': 0.6,
-            'max_model_len': 8192,
+            'gpu_memory_utilization': 0.7,
+            'max_model_len': 10000,
             'max_lora_rank': LORA_RANK, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
@@ -213,6 +213,10 @@ def main():
             expand_prompts,
             sampling_params,
         )
+        if sample_responses and sample_responses[0].sequences:
+            first_decoded = sample_responses[0].sequences[0].decoded
+            if isinstance(first_decoded, str):
+                logger.info('[sample_debug] first_generation=%r', first_decoded[:512])
 
         all_input_data: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
