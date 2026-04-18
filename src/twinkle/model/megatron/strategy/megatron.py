@@ -106,14 +106,6 @@ class MegatronStrategy:
         if 'overlap_p2p_comm' not in kwargs:
             kwargs['overlap_p2p_comm'] = True
             kwargs['batch_p2p_comm'] = not kwargs['overlap_p2p_comm']
-        if Platform.device_prefix() == 'npu' and dist.is_initialized():
-            default_pg = dist.distributed_c10d._get_default_group()
-            if getattr(default_pg, 'bound_device_id', None) is not None:
-                # If the default HCCL PG keeps a bound device id, PyTorch may
-                # propagate that binding into later Gloo subgroup creation. That
-                # breaks the metrics/object-gather path on NPU, so clear it
-                # before Megatron creates its Gloo DP groups.
-                default_pg.bound_device_id = None
 
         init_kwargs = {
             'order': self.device_mesh.order,
