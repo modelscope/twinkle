@@ -155,17 +155,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # PG so Megatron's later Gloo DP groups stay decoupled on NPU.
         return backend == 'nccl'
 
-    @staticmethod
-    def _drop_npu_causal_4d_mask(batch, unwrapped_model):
-        """On NPU, drop the generic 4D dense mask so MindSpeed can build
-        its own compressed causal mask for FlashAttention."""
-        if Platform.device_prefix() != 'npu':
-            return
-        attention_mask = batch.get('attention_mask')
-        if (isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
-                and getattr(unwrapped_model.config, 'attention_mask_type', None) == 'causal'):
-            batch['attention_mask'] = None
-
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
             loss_instance=CrossEntropyLoss(reduction='sum'),
@@ -315,7 +304,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if micro_batch_size is None:
             # Compatible with DPO
             micro_batch_size = min(2, len(inputs))
-        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
+        unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+        inputs = processor(
+            inputs,
+            micro_batch_size=micro_batch_size,
+            variable_seq_lengths=self.variable_seq_lengths,
+            config=unwrapped_model.config,
+        )
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -379,7 +374,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
-            self._drop_npu_causal_4d_mask(batch, unwrapped_model)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     output_tensor = model(**batch)
