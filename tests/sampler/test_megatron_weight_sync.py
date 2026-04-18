@@ -208,8 +208,7 @@ def test_megatron_weight_sync(
     def do_sample(prompt: str, max_tokens: int = 32) -> str:
         one = Trajectory(messages=[{'role': 'user', 'content': prompt}])
         batch = [one for _ in range(dp)]
-        responses = wait_result(
-            sampler.sample(batch, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
+        responses = wait_result(sampler.sample(batch, SamplingParams(max_tokens=max_tokens, temperature=0.0)))
         for response in responses:
             if response and response.sequences:
                 tokens = response.sequences[0].tokens
