@@ -191,8 +191,6 @@ class DPOMetric(Metric):
         total_count = sum(r['count'] for r in all_results)
         has_rewards = any(r['has_rewards'] for r in all_results)
 
-        self.reset()
-
         if total_count == 0:
             return {}
 
