@@ -193,6 +193,7 @@ class MultiLora:
         # Strip LoRA-specific suffixes (e.g. ".lora_A.default.weight") so that
         # a full parameter name like "model.layers.0.attn.proj.lora_A.default.weight"
         # can be matched against target_modules like ["attn.proj"].
+        cleaned = module_name
         if '.lora_' in module_name:
             cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', module_name)
 
