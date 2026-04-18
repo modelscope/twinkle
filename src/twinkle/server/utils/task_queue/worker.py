@@ -87,6 +87,41 @@ class ComputeWorker:
         if queue_key not in self.queue_order:
             self.queue_order.append(queue_key)
 
+    # ------------------------------------------------------------------
+    # Metrics helpers
+    # ------------------------------------------------------------------
+
+    def _record_tasks_total(self, task_type: str, status: str) -> None:
+        """Increment the tasks_total counter if metrics are enabled."""
+        if self._task_metrics:
+            self._task_metrics.tasks_total.inc(tags={
+                'deployment': self._deployment_name,
+                'task_type': task_type,
+                'status': status,
+            })
+
+    def _record_execution_time(self, task_type: str, exec_time: float) -> None:
+        """Observe execution duration in the execution_seconds histogram if metrics are enabled."""
+        if self._task_metrics:
+            self._task_metrics.execution_seconds.observe(
+                exec_time, tags={
+                    'deployment': self._deployment_name,
+                    'task_type': task_type,
+                })
+
+    def _record_queue_metrics(self, task_type: str, queue_wait: float) -> None:
+        """Observe queue wait time and update current queue depth if metrics are enabled."""
+        if self._task_metrics:
+            self._task_metrics.queue_wait_seconds.observe(
+                queue_wait, tags={
+                    'deployment': self._deployment_name,
+                    'task_type': task_type,
+                })
+            total_depth = sum(qq.qsize() for qq in self.task_queues.values())
+            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+
+    # ------------------------------------------------------------------
+
     async def _store_task_failed(
         self,
         task: QueuedTask,
@@ -147,12 +182,7 @@ class ComputeWorker:
         """Mark a queue-timed-out task as FAILED and release it from the queue."""
         error = f'Queue timeout exceeded: waited {waited:.2f}s'
         await self._store_task_failed(task, error, QueueState.PAUSED_CAPACITY.value, queue_state_reason=error)
-        if self._task_metrics:
-            self._task_metrics.tasks_total.inc(tags={
-                'deployment': self._deployment_name,
-                'task_type': task.task_type or 'unknown',
-                'status': 'timeout',
-            })
+        self._record_tasks_total(task.task_type or 'unknown', 'timeout')
         q.task_done()
 
     async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
@@ -202,17 +232,8 @@ class ComputeWorker:
             await self._store_task_failed(task, error, QueueState.ACTIVE.value)
         finally:
             q.task_done()
-            if self._task_metrics:
-                self._task_metrics.execution_seconds.observe(
-                    exec_time, tags={
-                        'deployment': self._deployment_name,
-                        'task_type': task_type
-                    })
-                self._task_metrics.tasks_total.inc(tags={
-                    'deployment': self._deployment_name,
-                    'task_type': task_type,
-                    'status': task_status,
-                })
+            self._record_execution_time(task_type, exec_time)
+            self._record_tasks_total(task_type, task_status)
 
     async def _try_run_one(self) -> bool:
         """Round-robin: pick one runnable task and execute it.
@@ -236,15 +257,8 @@ class ComputeWorker:
                 continue
 
             # Record queue-wait metrics
-            if self._task_metrics:
-                queue_wait = time.monotonic() - task.created_at
-                self._task_metrics.queue_wait_seconds.observe(
-                    queue_wait, tags={
-                        'deployment': self._deployment_name,
-                        'task_type': task.task_type or 'unknown'
-                    })
-                total_depth = sum(qq.qsize() for qq in self.task_queues.values())
-                self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+            queue_wait = time.monotonic() - task.created_at
+            self._record_queue_metrics(task.task_type or 'unknown', queue_wait)
 
             # Check queue-level timeout (task waited too long before execution)
             waited = time.monotonic() - task.created_at
