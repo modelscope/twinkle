@@ -337,6 +337,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if num_microbatches <= 1:
             loss_extra_kwargs_per_mb = [kwargs]
         else:
+            # Only support extra kwargs length==total_batch_size
             for mb_idx in range(num_microbatches):
                 mb_start = mb_idx * micro_batch_size
                 mb_end = mb_start + micro_batch_size
