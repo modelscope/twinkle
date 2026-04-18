@@ -444,22 +444,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if self.sp_strategy is not None and labels is None:
                 outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
-        optimizer_config.eval_status.inputs = inputs
-        optimizer_config.eval_status.outputs = outputs
-        optimizer_config.eval_status.forward_kwargs = kwargs
-        optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-        if labels is not None:
-            loss_mask = (labels != -100).bool()
-            masked_labels = labels.clone()
-            masked_labels[~loss_mask] = 0
-            logits = outputs['logits']
-            logits.div_(temperature)
-            outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        outputs = copy(outputs)
-        outputs['past_key_values'] = None
-        if not return_logits:
-            outputs['logits'] = None
-        return outputs
+            optimizer_config.eval_status.inputs = inputs
+            optimizer_config.eval_status.outputs = outputs
+            optimizer_config.eval_status.forward_kwargs = kwargs
+            optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
+            if labels is not None:
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.clone()
+                masked_labels[~loss_mask] = 0
+                logits = outputs['logits']
+                logits.div_(temperature)
+                outputs['logps'] = selective_log_softmax(logits, masked_labels)
+            outputs = copy(outputs)
+            outputs['past_key_values'] = None
+            if not return_logits:
+                outputs['logits'] = None
+            return outputs
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -531,11 +531,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Auto set a grad scaler
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
-        if scaler is not None:
-            scaler.scale(loss_value).backward()
-        else:
-            loss_value.backward()
+
         optimizer_config.cur_step += 1
+        should_sync = optimizer_config.do_grad_sync()
+
+        import contextlib
+        no_sync_ctx = contextlib.nullcontext()
+        if not should_sync and hasattr(self.model, 'no_sync'):
+            no_sync_ctx = self.model.no_sync()
+
+        with no_sync_ctx:
+            if scaler is not None:
+                scaler.scale(loss_value).backward()
+            else:
+                loss_value.backward()
+
         optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)

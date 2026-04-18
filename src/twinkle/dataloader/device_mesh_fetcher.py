@@ -66,6 +66,8 @@ class DeviceMeshIterableFetcher(_BaseDatasetFetcher):
                             continue
                         else:
                             break
+                    if _data is None:
+                        raise RuntimeError(f'No valid data after {self.max_retries} retries')
                     data.append(_data)
                 except StopIteration:
                     self.ended = True

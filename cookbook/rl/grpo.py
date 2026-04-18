@@ -142,8 +142,11 @@ def main():
         # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
+        expand_prompts = []
+        for prompt in global_prompts:
+            expand_prompts.extend([prompt] * NUM_GENERATIONS)
         sample_responses = sampler.sample(
-            global_prompts*NUM_GENERATIONS,
+            expand_prompts,
             sampling_params,
         )
 

@@ -4,6 +4,30 @@ from typing import Any, Dict, List
 from twinkle.reward.base import Reward
 
 
+def _extract_last_boxed(text: str) -> str:
+    """Extract content from the last \\boxed{...}, handling nested braces."""
+    idx = text.rfind('\\boxed{')
+    if idx == -1:
+        return ''
+    start = idx + len('\\boxed{')
+    depth = 1
+    j = start
+    while j < len(text) and depth > 0:
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+        j += 1
+    if depth == 0:
+        return text[start:j - 1].strip()
+    return ''
+
+
+def _has_boxed(text: str) -> bool:
+    """Check whether *text* contains a valid \\boxed{...} (nested-brace aware)."""
+    return bool(_extract_last_boxed(text))
+
+
 class GSM8KAccuracyReward(Reward):
     """Accuracy reward for GSM8K: checks if the model's answer matches ground truth.
 
@@ -15,9 +39,9 @@ class GSM8KAccuracyReward(Reward):
     def extract_answer(completion: str) -> str:
         """Extract the answer from model completion, preferring \\boxed{} over ####."""
         text = completion[-500:] if len(completion) > 500 else completion
-        boxed = re.findall(r'\\boxed\{([^}]+)\}', text)
+        boxed = _extract_last_boxed(text)
         if boxed:
-            return boxed[-1].replace(',', '').replace(' ', '').strip()
+            return boxed.replace(',', '').replace(' ', '').strip()
         matches = re.findall(r'####\s*([\-\d,\.\s]+)', text)
         if matches:
             return matches[-1].replace(',', '').replace(' ', '').strip()
@@ -35,7 +59,8 @@ class GSM8KAccuracyReward(Reward):
                     break
 
             # Get ground truth from user_data
-            user_data = trajectory.get('user_data')
+            user_data = trajectory.get('user_data') or []
+            gt = ''
             for item in user_data:
                 if item[0] == 'ground_truth':
                     gt = item[1]
@@ -70,6 +95,6 @@ class GSM8KFormatReward(Reward):
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
+            has_answer = bool(_has_boxed(completion) or re.search(r'####\s*[\-\d,\.]+', completion))
             rewards.append(1.0 if has_answer else 0.0)
         return rewards

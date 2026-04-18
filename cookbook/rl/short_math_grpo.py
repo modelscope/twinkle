@@ -118,11 +118,7 @@ def main():
 
     # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
-        target_modules=[
-            'q_proj', 'k_proj', 'v_proj', 'o_proj',
-            'gate_proj', 'up_proj', 'down_proj',
-            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
-        ],
+        target_modules='all-linear',
         r=LORA_RANK,
         lora_alpha=LORA_RANK * 2,
         lora_dropout=0.05,
@@ -143,7 +139,7 @@ def main():
             remote_group='model',
         )
 
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     if USE_MEGATRON:
         model.set_optimizer('default', lr=LEARNING_RATE)
         model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
@@ -161,11 +157,8 @@ def main():
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
             'max_lora_rank': 32, # save as lora_config
-            # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
-            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
-            # meaning only sync lora weights, if merge_and_sync=True,
-            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
+            'enable_tower_connector_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',

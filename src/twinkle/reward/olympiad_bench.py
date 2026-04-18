@@ -31,7 +31,11 @@ def _get_completion(trajectory: Dict[str, Any]) -> str:
 
 
 def _extract_boxed_answers(text: str) -> List[str]:
-    """Extract all answers from \\boxed{} in text, handling nested braces."""
+    """Extract all answers from \\boxed{} in text, handling nested braces.
+
+    Correctly skips LaTeX escaped braces (``\\{`` and ``\\}``) so that
+    expressions like ``\\boxed{\\{1, 2, 3\\}}`` are extracted intact.
+    """
     answers = []
     i = 0
     while i < len(text):
@@ -39,11 +43,14 @@ def _extract_boxed_answers(text: str) -> List[str]:
         idx = text.find('\\boxed{', i)
         if idx == -1:
             break
-        # Find matching closing brace
+        # Find matching closing brace, skipping escaped \{ and \}
         start = idx + 7  # len('\\boxed{')
         depth = 1
         j = start
         while j < len(text) and depth > 0:
+            if text[j] == '\\' and j + 1 < len(text) and text[j + 1] in '{}':
+                j += 2  # skip escaped brace
+                continue
             if text[j] == '{':
                 depth += 1
             elif text[j] == '}':
@@ -140,12 +147,17 @@ def _normalize_answer(answer: str) -> str:
 
     # === Phase 4: Unit removal with word boundaries ===
     # Units: only match standalone units, not parts of words
-    answer = re.sub(r'\b(cm|mm|kg|J)\b', '', answer)  # Common units with word boundary
-    # m/g/s after numbers, brackets, or at end of string
-    answer = re.sub(r'(?<=[0-9\])])([mgs])\b', '', answer)
-    # Also remove trailing m/g/s after comma+number pattern (e.g., "3,7m" → "3,7")
-    answer = re.sub(r'([0-9])([mgs])$', r'\1', answer)
-    answer = re.sub(r'(°|度|米|千克|克|秒)', '', answer)  # Chinese units always remove
+    # Covers SI base/derived units and common physics/chemistry units
+    answer = re.sub(
+        r'\b(cm|mm|km|nm|um|kg|mg|Hz|kHz|MHz|GHz|mol|Pa|kPa|MPa|'
+        r'eV|keV|MeV|GeV|cal|kcal|cd|lm|lx|Wb|Bq|Gy|Sv)\b', '', answer)
+    # Single-letter units (N, V, W, A, K, C, T, F, H, L) - only after numbers/brackets
+    answer = re.sub(r'(?<=[0-9\])])\s*([NVWAKCTFHLJmgs])\b', '', answer)
+    # Also remove trailing single-letter units after comma+number pattern
+    answer = re.sub(r'([0-9])([NVWAKCTFHLJmgs])$', r'\1', answer)
+    # Multi-char units that need post-number context to avoid variable-name collisions
+    answer = re.sub(r'(?<=[0-9\])])\s*(m/s|m/s2|km/h|kg/m3|N/m|J/mol|rad|sr)\b', '', answer)
+    answer = re.sub(r'(°|度|米|千克|克|秒|摩尔|帕|瓦|伏|安|赫兹|牛|焦)', '', answer)  # Chinese units always remove
 
     # === Phase 5: Cleanup ===
     # Ratio colon → slash: 3:2 → 3/2
@@ -193,11 +205,17 @@ def _split_answers(gt: str) -> List[str]:
     return answers
 
 
-def _is_numeric_match(pred: str, gt: str, tolerance: float = 0.01) -> bool:
-    """Check if two values match numerically."""
+def _is_numeric_match(pred: str, gt: str, tolerance: float = 0.01, abs_tolerance: float = 1e-4) -> bool:
+    """Check if two values match numerically.
+
+    Uses both relative and absolute tolerance to handle near-zero values
+    robustly.  A match is declared when *either* criterion is satisfied.
+    """
     try:
         pred_val = float(pred)
         gt_val = float(gt)
+        if abs(pred_val - gt_val) < abs_tolerance:
+            return True
         if gt_val == 0:
             return abs(pred_val) < tolerance
         return abs(pred_val - gt_val) / abs(gt_val) < tolerance
@@ -205,11 +223,13 @@ def _is_numeric_match(pred: str, gt: str, tolerance: float = 0.01) -> bool:
         return False
 
 
-def _numeric_similarity(pred: str, gt: str) -> float:
+def _numeric_similarity(pred: str, gt: str, abs_tolerance: float = 1e-4) -> float:
     """Return similarity score [0, 1] for numeric values."""
     try:
         pred_val = float(pred)
         gt_val = float(gt)
+        if abs(pred_val - gt_val) < abs_tolerance:
+            return 1.0
         if gt_val == 0:
             return 1.0 if abs(pred_val) < 0.01 else 0.0
         relative_error = abs(pred_val - gt_val) / abs(gt_val)
@@ -255,7 +275,7 @@ class OlympiadBenchAccuracyReward(Reward):
                     rewards.append(1.0)
                 else:
                     sim = _numeric_similarity(pred, gt_val)
-                    rewards.append(sim * 0.5)
+                    rewards.append(sim * 0.99)
             else:
                 pred_normalized = [_normalize_answer(p) for p in predicted]
                 correct_count = 0

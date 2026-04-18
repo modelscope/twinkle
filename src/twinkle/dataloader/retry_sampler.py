@@ -54,6 +54,7 @@ class RetrySampler(Sampler):
                         continue
                     yield idx
                     total += 1
+                    break
                 except Exception:  # noqa
                     import traceback
                     traceback.print_exc()

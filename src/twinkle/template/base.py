@@ -166,7 +166,7 @@ class Template:
         input_ids = list(prompt_ids) + new_tokens
         labels = labels[-1:] + labels[:-1]  # roll to input order
         labels = labels + new_tokens
-        labels = labels[1:] + labels[:1]  # roll to input-1 order
+        # We don't need to roll back, self._invoke_post_pipeline will do this.
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
@@ -228,10 +228,14 @@ class Template:
             result['input_ids'] = result['input_ids'][-self.max_length:]
             if 'labels' in result:
                 result['labels'] = result['labels'][-self.max_length:]
+            if 'mm_token_type_ids' in result:
+                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., -self.max_length:]
         elif strategy == 'right':
             result['input_ids'] = result['input_ids'][:self.max_length]
             if 'labels' in result:
                 result['labels'] = result['labels'][:self.max_length]
+            if 'mm_token_type_ids' in result:
+                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., :self.max_length]
         return InputFeature(**result)
 
     def set_mm_position_ids(self, input_feature: InputFeature):
@@ -255,6 +259,8 @@ class Template:
                 feat['input_ids'] = feat['input_ids'][start:end]
                 if 'labels' in feat:
                     feat['labels'] = feat['labels'][start:end]
+                if 'mm_token_type_ids' in feat:
+                    feat['mm_token_type_ids'] = feat['mm_token_type_ids'][..., start:end]
                 results.append(InputFeature(**feat))
             return results
 
