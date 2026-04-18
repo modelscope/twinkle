@@ -44,18 +44,6 @@ from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 logger = get_logger()
 
 
-def _get_raw_dp_fsdp_world_size(device_mesh: Optional[DeviceMesh]) -> int:
-    if device_mesh is None:
-        return 1
-    dp_world_size = device_mesh.dp_world_size or 1
-    fsdp_world_size = device_mesh.fsdp_world_size or 1
-    if dp_world_size <= 0:
-        dp_world_size = 1
-    if fsdp_world_size <= 0:
-        fsdp_world_size = 1
-    return dp_world_size * fsdp_world_size
-
-
 @dataclass
 class OptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Transformers training."""
@@ -88,7 +76,7 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _ensure_dp_group(self):
         if self._dp_group is not None or self._device_mesh is None:
             return
-        raw_world_size = _get_raw_dp_fsdp_world_size(self._device_mesh)
+        raw_world_size = self._device_mesh._get_dp_fsdp_world_size()
         if raw_world_size <= 1:
             return
         if not dist.is_available() or not dist.is_initialized():
@@ -383,8 +371,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
-        if self.sp_strategy is not None and labels is None:
-            outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
@@ -444,8 +430,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
-            if self.sp_strategy is not None and labels is None:
-                outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
         optimizer_config.eval_status.inputs = inputs
         optimizer_config.eval_status.outputs = outputs
@@ -486,13 +470,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
-        loss_inputs = inputs
-        loss_outputs = outputs
-        if self.sp_strategy is not None:
-            loss_inputs, loss_outputs = self.sp_strategy.gather_loss_tensors(inputs, outputs)
+        processor: InputProcessor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before calculating loss'
+        loss_inputs, loss_outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
         result = loss_instance(loss_inputs, loss_outputs, **kwargs)
         loss_value = result['loss']
-        counts = result['num_tokens']
+        raw_counts = result['num_tokens']
+        counts = raw_counts
         if not counts:
             counts = torch.tensor(1, device=loss_value.device)
         # Later will gather this value, so it becomes:
@@ -508,12 +492,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
         #                               / gradient_accumulation_steps
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
-        raw_dp_fsdp_world_size = _get_raw_dp_fsdp_world_size(self.device_mesh)
+        raw_dp_fsdp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
         counts = counts / raw_dp_fsdp_world_size
         optimizer_config = self.optimizer_group[adapter_name]
         status.num_tokens += counts.item()
         status.loss_value += loss_value
         outputs['loss'] = status.loss_value
+        outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
         return status.loss_value.item()
 
     @remote_function()

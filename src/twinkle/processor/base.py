@@ -121,6 +121,14 @@ class InputProcessor:
             return inputs
         return [InputFeature(**sp_strategy.preprocess_inputs(dict(_input))) for _input in inputs]
 
+    def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
+                              **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Adjust SP tensors after forward and before loss computation."""
+        sp_strategy = kwargs.get('sp_strategy')
+        if self.framework == 'transformers' and sp_strategy is not None:
+            return sp_strategy.gather_loss_tensors(inputs, outputs)
+        return inputs, outputs
+
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
         if self.device_mesh is None:

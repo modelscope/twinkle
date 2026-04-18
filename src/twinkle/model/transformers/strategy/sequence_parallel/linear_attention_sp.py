@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -15,10 +14,8 @@ else:
     _FLA_CAUSAL_CONV1D_FN = None
     _FLA_CHUNK_GATED_DELTA_RULE = None
 
-_SP_LINEAR_KERNEL_IMPORT_ERROR = (
-    'Qwen3.5 linear attention sequence parallel requires flash-linear-attention and causal-conv1d. '
-    'Install: https://github.com/fla-org/flash-linear-attention#installation and '
-    'https://github.com/Dao-AILab/causal-conv1d')
+_SP_LINEAR_KERNEL_IMPORT_ERROR = ('Qwen3.5 linear attention sequence parallel requires flash-linear-attention. '
+                                  'Install: https://github.com/fla-org/flash-linear-attention#installation')
 
 
 def _sp_is_enabled(sequence_parallel_context) -> bool:
@@ -48,8 +45,8 @@ def _get_local_padding_mask(
 
 
 def _ensure_linear_attention_kernels(mod: torch.nn.Module):
-    mod.causal_conv1d_fn = getattr(mod, 'causal_conv1d_fn', None) or _FLA_CAUSAL_CONV1D_FN
-    mod.chunk_gated_delta_rule = getattr(mod, 'chunk_gated_delta_rule', None) or _FLA_CHUNK_GATED_DELTA_RULE
+    mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
+    mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
     if mod.chunk_gated_delta_rule is None or mod.causal_conv1d_fn is None:
         raise ImportError(_SP_LINEAR_KERNEL_IMPORT_ERROR)
 
@@ -174,7 +171,6 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             raise ValueError(
                 'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '
                 'sequence parallel input preparation.')
-
         if cache_params is not None:
             cache_params.conv_states[mod.layer_idx] = F.pad(
                 mixed_qkv.transpose(1, 2).contiguous(), (mod.conv_kernel_size - mixed_qkv.shape[1], 0))
@@ -237,8 +233,6 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         if int(getattr(sequence_parallel, 'rp_world_size', 1) or 1) > 1:
             raise NotImplementedError('Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
                                       '(derived ring attention).')
-        if os.environ.get('QWEN35_SP_LINEAR_HEAD_PARALLEL', '1') != '1':
-            return
 
         try:
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet

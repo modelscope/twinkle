@@ -10,10 +10,12 @@ import unittest
 from datetime import timedelta
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
 from transformers.utils.import_utils import is_flash_linear_attention_available
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel
+from twinkle.model.transformers.strategy.sequence_parallel.linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
+from twinkle.model.transformers.strategy.sequence_parallel.utils import get_cu_seqlens_from_position_ids
 from twinkle.utils import DeviceMesh, selective_log_softmax
 
 try:
@@ -27,14 +29,75 @@ except Exception:
     hf_qwen35 = None
     _HAS_QWEN35 = False
 
+if is_flash_linear_attention_available():
+    from fla.modules.convolution import causal_conv1d as _FLA_CAUSAL_CONV1D_FN
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _FLA_CHUNK_GATED_DELTA_RULE
+else:
+    _FLA_CAUSAL_CONV1D_FN = None
+    _FLA_CHUNK_GATED_DELTA_RULE = None
+
 WORLD_SIZE = 2
 LOGITS_RTOL = 5e-3
 LOGITS_ATOL = 5e-3
 LOSS_ATOL = 5e-3
 GRAD_RTOL = 5e-3
 GRAD_ATOL = 2e-3
-_HAS_FLA_PREFILL = bool(
-    _HAS_QWEN35 and (getattr(hf_qwen35, 'causal_conv1d_fn', None) is not None or is_flash_linear_attention_available()))
+_HAS_FLA_PREFILL = bool(_HAS_QWEN35 and _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None)
+
+
+def _hf_compatible_fla_causal_conv1d_fn(x, weight, bias=None, activation=None, seq_idx=None):
+    del seq_idx
+    mixed_qkv, _ = _FLA_CAUSAL_CONV1D_FN(
+        x=x.transpose(1, 2).contiguous(),
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        backend='triton',
+    )
+    if mixed_qkv.dim() == 2:
+        mixed_qkv = mixed_qkv.unsqueeze(0)
+    return mixed_qkv.transpose(1, 2).contiguous()
+
+
+def _force_fla_causal_conv(model: Qwen3_5ForCausalLM) -> Qwen3_5ForCausalLM:
+    for layer in model.model.layers:
+        linear_attn = getattr(layer, 'linear_attn', None)
+        if linear_attn is not None:
+            linear_attn.causal_conv1d_fn = _hf_compatible_fla_causal_conv1d_fn
+            linear_attn.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
+    return model
+
+
+def _force_packed_linear_attention(model: Qwen3_5ForCausalLM, position_ids: torch.Tensor) -> Qwen3_5ForCausalLM:
+    packed_cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
+
+    def _make_packed_forward(cu_seqlens: torch.Tensor):
+
+        def _packed_forward(mod, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+            packed_ctx = SimpleNamespace(
+                world_size=1,
+                sp_world_size=1,
+                extra_kwargs={
+                    'is_packed': True,
+                    'cu_seq_lens_q': cu_seqlens.to(dtype=torch.int32, device=hidden_states.device),
+                })
+            return Qwen3_5GatedDeltaNetUlyssesPatch._run_forward(
+                mod,
+                hidden_states,
+                cache_params=cache_params,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                cu_seq_lens_q=packed_ctx.extra_kwargs['cu_seq_lens_q'],
+                sequence_parallel_context=packed_ctx,
+            )
+
+        return _packed_forward
+
+    for layer in model.model.layers:
+        linear_attn = getattr(layer, 'linear_attn', None)
+        if linear_attn is not None:
+            linear_attn.forward = MethodType(_make_packed_forward(packed_cu_seqlens), linear_attn)
+    return model
 
 
 def _find_free_port() -> int:
@@ -108,6 +171,7 @@ def _build_tiny_qwen35(device: torch.device,
     )
     config._attn_implementation = attn_implementation
     model = Qwen3_5ForCausalLM(config)
+    model = _force_fla_causal_conv(model)
     model.to(device=device, dtype=_model_dtype())
     model.eval()
     return model
@@ -162,6 +226,14 @@ def _make_train_batch(device: torch.device):
     return input_ids, attention_mask, position_ids, labels
 
 
+def _make_packed_train_batch(device: torch.device):
+    input_ids = torch.tensor([[11, 12, 13, 21, 22, 23, 24, 25]], device=device, dtype=torch.long)
+    attention_mask = None
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]], device=device, dtype=torch.long)
+    labels = torch.tensor([[12, 13, -100, 22, 23, 24, 25, -100]], device=device, dtype=torch.long)
+    return input_ids, attention_mask, position_ids, labels
+
+
 def _get_qkv_weight(model: Qwen3_5ForCausalLM) -> torch.nn.Parameter:
     for layer in model.model.layers:
         linear_attn = getattr(layer, 'linear_attn', None)
@@ -170,26 +242,55 @@ def _get_qkv_weight(model: Qwen3_5ForCausalLM) -> torch.nn.Parameter:
     raise AssertionError('No linear attention layer found in Qwen3.5 test model.')
 
 
-def _allreduce_sp_grad(grad: torch.Tensor) -> torch.Tensor:
+def _compute_training_path_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    strategy: SequenceParallelStrategy | None = None,
+) -> tuple[torch.Tensor, int]:
+    masked_labels = labels.masked_fill(labels == -100, 0)
+    loss_inputs = {'labels': labels}
+    loss_outputs = {'logps': selective_log_softmax(logits, masked_labels)}
+    if strategy is not None:
+        loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
+    result = CrossEntropyLoss(reduction='sum')(loss_inputs, loss_outputs)
+    num_tokens = result['num_tokens']
+    if torch.is_tensor(num_tokens):
+        num_tokens = int(num_tokens.item())
+    else:
+        num_tokens = int(num_tokens)
+    return result['loss'], num_tokens
+
+
+def _average_qkv_grad_over_group(model: Qwen3_5ForCausalLM, group: dist.ProcessGroup | None) -> torch.Tensor:
+    grad = _get_qkv_weight(model).grad
+    if grad is None:
+        raise AssertionError('No qkv gradient collected from Qwen3.5 linear attention layer.')
     reduced = grad.detach().float().contiguous()
-    if sequence_parallel.world_size is not None and sequence_parallel.world_size > 1:
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=sequence_parallel._sp_group)
-    return reduced
+    if group is None:
+        return reduced.cpu()
+    group_world_size = dist.get_world_size(group)
+    if group_world_size > 1:
+        dist.all_reduce(reduced, group=group)
+        reduced.div_(group_world_size)
+    return reduced.cpu()
 
 
 def _run_prefill_alignment_worker(rank: int,
                                   world_size: int,
                                   port: int,
                                   attn_implementation: str = 'sdpa',
-                                  layer_types: list[str] | None = None):
+                                  layer_types: list[str] | None = None,
+                                  packed: bool = False):
     device = _init_dist(rank, world_size, port)
     try:
         _set_determinism(1234)
-        os.environ['QWEN35_SP_LINEAR_HEAD_PARALLEL'] = '1'
 
         baseline_model = _build_tiny_qwen35(device, attn_implementation=attn_implementation, layer_types=layer_types)
         sp_model = copy.deepcopy(baseline_model)
-        input_ids, attention_mask, position_ids, labels = _make_train_batch(device)
+        input_ids, attention_mask, position_ids, labels = (
+            _make_packed_train_batch(device) if packed else _make_train_batch(device))
+        if packed:
+            baseline_model = _force_packed_linear_attention(baseline_model, position_ids)
 
         baseline_outputs = baseline_model(
             input_ids=input_ids,
@@ -197,15 +298,11 @@ def _run_prefill_alignment_worker(rank: int,
             position_ids=position_ids,
             use_cache=False,
         )
-        baseline_logits = baseline_outputs.logits.float()
-        baseline_loss = F.cross_entropy(
-            baseline_logits.reshape(-1, baseline_logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-            reduction='mean',
-        )
-        baseline_loss.backward()
-        baseline_qkv_grad = _get_qkv_weight(baseline_model).grad.detach().float().cpu()
+        baseline_logits = baseline_outputs.logits.detach().float()
+        baseline_loss_sum, baseline_num_tokens = _compute_training_path_loss(baseline_outputs.logits, labels)
+        baseline_loss_sum.backward()
+        baseline_loss = baseline_loss_sum / max(baseline_num_tokens, 1)
+        baseline_qkv_grad = _get_qkv_weight(baseline_model).grad.detach().float().cpu() / max(baseline_num_tokens, 1)
 
         strategy = _make_strategy(sp_model, world_size)
         processed_inputs = strategy.preprocess_inputs({
@@ -226,21 +323,18 @@ def _run_prefill_alignment_worker(rank: int,
             max_diff = (gathered_logits - baseline_logits).abs().max().item()
             raise AssertionError(f'prefill logits mismatch on rank {rank}: max_diff={max_diff}')
 
-        loss_instance = CrossEntropyLoss(reduction='mean')
         local_logits = sp_outputs.logits
-        masked_local_labels = local_labels.masked_fill(local_labels == -100, 0)
-        local_logps = selective_log_softmax(local_logits, masked_local_labels)
-        loss_inputs = {'labels': local_labels}
-        loss_outputs = {'logits': local_logits, 'logps': local_logps}
-        loss_inputs, loss_outputs = strategy.gather_loss_tensors(loss_inputs, loss_outputs)
-        result = loss_instance(loss_inputs, loss_outputs)
-        sp_loss = result['loss']
+        sp_loss_sum, sp_num_tokens = _compute_training_path_loss(local_logits, local_labels, strategy)
+        sp_loss = sp_loss_sum / max(sp_num_tokens, 1)
         if not torch.allclose(sp_loss.detach(), baseline_loss.detach(), atol=LOSS_ATOL, rtol=0):
             raise AssertionError(
                 f'prefill loss mismatch on rank {rank}: baseline={baseline_loss.item()} sp={sp_loss.item()}')
-        sp_loss.backward()
+        sp_loss_sum.backward()
 
-        sp_qkv_grad = _allreduce_sp_grad(_get_qkv_weight(sp_model).grad).cpu()
+        if sp_num_tokens != baseline_num_tokens:
+            raise AssertionError(
+                f'prefill num_tokens mismatch on rank {rank}: baseline={baseline_num_tokens} sp={sp_num_tokens}')
+        sp_qkv_grad = _average_qkv_grad_over_group(sp_model, sequence_parallel._data_rank_group) / max(sp_num_tokens, 1)
         if not torch.allclose(sp_qkv_grad, baseline_qkv_grad, rtol=GRAD_RTOL, atol=GRAD_ATOL):
             max_diff = (sp_qkv_grad - baseline_qkv_grad).abs().max().item()
             raise AssertionError(f'qkv grad mismatch on rank {rank}: max_diff={max_diff}')
@@ -252,9 +346,7 @@ def _run_prefill_alignment_worker(rank: int,
 
 @unittest.skipUnless(_HAS_QWEN35, 'transformers Qwen3.5 is not available in this environment')
 @unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= WORLD_SIZE, 'requires 2 CUDA devices')
-@unittest.skipUnless(
-    _HAS_FLA_PREFILL,
-    'requires either transformers qwen3.5 causal_conv1d_fn or flash-linear-attention kernels for Qwen3.5 SP patch')
+@unittest.skipUnless(_HAS_FLA_PREFILL, 'requires flash-linear-attention kernels for Qwen3.5 SP linear attention tests')
 class TestQwen35LinearAttentionSP(unittest.TestCase):
 
     def test_qwen35_linear_attention_prefill_logits_and_qkv_grad_alignment(self):
@@ -291,6 +383,16 @@ class TestQwen35LinearAttentionSP(unittest.TestCase):
         mp.spawn(
             _run_prefill_alignment_worker,
             args=(WORLD_SIZE, port, 'flash_attention_2', ['full_attention', 'linear_attention']),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
+    @unittest.skipUnless(is_flash_attn_available(), 'requires flash_attention_2 support in transformers')
+    def test_qwen35_linear_attention_packed_prefill_logits_and_qkv_grad_alignment(self):
+        port = _find_free_port()
+        mp.spawn(
+            _run_prefill_alignment_worker,
+            args=(WORLD_SIZE, port, 'flash_attention_2', ['linear_attention', 'linear_attention'], True),
             nprocs=WORLD_SIZE,
             join=True,
         )
