@@ -242,8 +242,7 @@ class InputProcessor:
         its own compressed causal mask for FlashAttention."""
         if Platform.device_prefix() != 'npu':
             return inputs
-        config = kwargs.get('config')
-        attention_mask_type = getattr(config, 'attention_mask_type', None) if config else None
+        attention_mask_type = kwargs.get('attention_mask_type')
         if attention_mask_type != 'causal':
             return inputs
         for _inp in inputs:

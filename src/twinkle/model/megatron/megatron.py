@@ -309,7 +309,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             inputs,
             micro_batch_size=micro_batch_size,
             variable_seq_lengths=self.variable_seq_lengths,
-            config=unwrapped_model.config,
+            attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
         )
 
         # Get parallelism settings for sequence padding and splitting
