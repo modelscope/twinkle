@@ -40,7 +40,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
             result[key] = pad_and_stack_tensors(values)
 
         elif isinstance(first_value, dict):
-            result[key] = collect_tensor_dict(values)
+            result[key] = collect_tensor_dict(values, device_mesh)
 
         elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')

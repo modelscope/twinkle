@@ -263,8 +263,17 @@ class VLLMEngine(BaseSamplerEngine):
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids):
-                        sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
-                        seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
+                        if logprobs == 1:
+                            # Single logprob mode: return the sampled token's logprob
+                            # in the same [(tid, logprob)] format as multi-logprob mode
+                            tid = token_ids[i]
+                            assert tid in lp, (f'Sampled token {tid} not found in logprobs at position {i}. '
+                                               f'Available tokens: {list(lp.keys())}')
+                            seq_logprobs.append([(tid, lp[tid].logprob)])
+                        else:
+                            # Multiple logprobs mode: return top-k logprobs
+                            sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
+                            seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
 
             # Map finish_reason to StopReason
             stop_reason: StopReason = 'length'

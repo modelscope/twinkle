@@ -154,19 +154,25 @@ class InputProcessor:
                     torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
                 ])
 
-                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
-                    value = _input[key]
+                for key in [
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                ]:
+                    value = _input.get(key)
+                    if value is None:
+                        continue
                     result = []
                     for i in range(cu_seqlens.shape[0]):
                         if i == cu_seqlens.shape[0] - 1:
                             break
-                        _value_slice = value[:, cu_seqlens[i]:cu_seqlens[i + 1]]
-                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map[key]))
-                    value = torch.cat(result, dim=1)
+                        _value_slice = value[..., cu_seqlens[i]:cu_seqlens[i + 1]]
+                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map.get(key, 0)))
+                    value = torch.cat(result, dim=-1)
                     _input[key] = value
             elif self.device_mesh.sequence_parallel and tp_size > 1:
                 # Sequence parallel without CP still requires seq_len % TP == 0
-                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
+                for key in [
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                ]:
                     value = _input.get(key)
                     if value is not None:
                         _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
@@ -221,6 +227,14 @@ class InputProcessor:
                 position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=1)
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
+
+                completion_mask = inputs.get('completion_mask')
+                if completion_mask is not None:
+                    inputs['completion_mask'] = split_cp_inputs(completion_mask, cu_seqlens_q, dim=-1)
+
+                mm_token_type_ids = inputs.get('mm_token_type_ids')
+                if mm_token_type_ids is not None:
+                    inputs['mm_token_type_ids'] = split_cp_inputs(mm_token_type_ids, cu_seqlens_q, dim=-1)
 
             inputs['input_ids'] = input_ids
             inputs['position_ids'] = position_ids

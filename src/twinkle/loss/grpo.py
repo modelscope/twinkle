@@ -206,24 +206,11 @@ class GRPOLoss(Loss):
         mask_flat = loss_mask.squeeze(0)  # [total_tokens]
 
         # ── Find sequence boundaries ─────────────────────────────────────
-        if position_ids is not None:
-            pos_flat = position_ids.squeeze(0)  # [total_tokens]
-            # position_ids resets to 0 at each new sequence
-            boundary_indices = (pos_flat == 0).nonzero(as_tuple=True)[0]
-        else:
-            # Fallback: use loss_mask transitions.  Each sequence has a
-            # prompt region (mask=0) followed by a response region (mask=1).
-            # Detect 0→1 transitions preceded by a 0→0 gap (new prompt).
-            # Simpler: find where mask goes from 1→0→...→0→1 (prompt gap).
-            # We mark boundaries at the start of each prompt (first 0 after 1).
-            shifted = torch.cat([torch.tensor([False], device=mask_flat.device), mask_flat[:-1]])
-            # Start of a new sequence: transition from mask=1 (end of prev response)
-            # to mask=0 (start of next prompt), or position 0 for the first sequence.
-            prompt_starts = ((~mask_flat) & shifted).nonzero(as_tuple=True)[0]
-            boundary_indices = torch.cat([
-                torch.tensor([0], device=mask_flat.device),
-                prompt_starts,
-            ])
+        assert position_ids is not None, ('position_ids is required for unpacking packed sequences. '
+                                          'Ensure the processor passes position_ids in packing mode.')
+        pos_flat = position_ids.squeeze(0)  # [total_tokens]
+        # position_ids resets to 0 at each new sequence
+        boundary_indices = (pos_flat == 0).nonzero(as_tuple=True)[0]
 
         # Deduplicate & sort
         boundary_indices = boundary_indices.unique(sorted=True)
