@@ -266,10 +266,10 @@ def test_megatron_weight_sync(
 
 def main():
     parser = argparse.ArgumentParser(description='Test Megatron standalone weight synchronization')
-    parser.add_argument('--model-gpus', type=int, default=4, help='Number of GPUs for Megatron model (default: 2)')
+    parser.add_argument('--model-gpus', type=int, default=4, help='Number of GPUs for Megatron model (default: 4)')
     parser.add_argument('--sampler-gpus', type=int, default=2, help='Number of GPUs for vLLM sampler (default: 2)')
     parser.add_argument('--tp-size', type=int, default=2, help='Tensor parallel size (default: 2)')
-    parser.add_argument('--pp-size', type=int, default=2, help='Pipeline parallel size (default: 1)')
+    parser.add_argument('--pp-size', type=int, default=2, help='Pipeline parallel size (default: 2)')
     args = parser.parse_args()
 
     log('Starting Megatron standalone weight sync test...')

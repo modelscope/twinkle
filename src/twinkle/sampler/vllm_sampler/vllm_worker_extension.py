@@ -245,7 +245,6 @@ class TwinkleWorkerExtension:
         # ── Step 3: Receive and process weight buckets ──
         partial_tensors: dict = {}
         lora_bucket_accum: list[tuple[str, torch.Tensor]] = []
-        base_bucket_accum: list[tuple[str, torch.Tensor]] = []
         lora_mode = bool(peft_config and base_sync_done)
         while True:
             # Only the driver receives bucket metadata from VLLMEngine.
@@ -292,7 +291,7 @@ class TwinkleWorkerExtension:
                         tensor = cpu_u8.view(dtype=dtype).view(shape)
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape).clone()
-                    if tensor.device.type != 'cpu':
+                    if lora_mode and tensor.device.type != 'cpu':
                         tensor = tensor.cpu()
                     weights.append((name, tensor))
                     continue
@@ -328,7 +327,7 @@ class TwinkleWorkerExtension:
                         tensor = assembled
                     else:
                         tensor = assembled.clone()
-                    if tensor.device.type != 'cpu':
+                    if lora_mode and tensor.device.type != 'cpu':
                         tensor = tensor.cpu()
                     weights.append((name, tensor))
                     del partial_tensors[name]
@@ -346,7 +345,7 @@ class TwinkleWorkerExtension:
             if lora_mode:
                 lora_bucket_accum.extend(weights)
             else:
-                base_bucket_accum.extend(weights)
+                self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
 
             if metadata['is_last']:
@@ -360,17 +359,10 @@ class TwinkleWorkerExtension:
                         peft_config=peft_config,
                         base_sync_done=base_sync_done,
                     )
-                else:
-                    self._load_weights(
-                        base_bucket_accum,
-                        peft_config=peft_config,
-                        base_sync_done=base_sync_done,
-                    )
                 break
 
         partial_tensors.clear()
         lora_bucket_accum.clear()
-        base_bucket_accum.clear()
         metadata = None
         raw_u8 = None
         cpu_u8 = None
