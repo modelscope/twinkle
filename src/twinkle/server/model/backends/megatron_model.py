@@ -108,8 +108,3 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
-
-    # Use last_pp_first collect method
-    @remote_function(collect='last_pp_first', lazy_collect=False)
-    def calculate_metric(self, is_training, **kwargs):
-        return super().calculate_metric(is_training, **kwargs)

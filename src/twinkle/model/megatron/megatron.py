@@ -657,7 +657,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def _accumulate_metric(optimizer_config: MegatronOptimizerGroup, is_training):
         optimizer_config.accumulate_metrics(is_training)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='last_pp_first', lazy_collect=False)
     def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
