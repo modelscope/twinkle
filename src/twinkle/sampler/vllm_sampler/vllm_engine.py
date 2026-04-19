@@ -686,12 +686,6 @@ class VLLMEngine(BaseSamplerEngine):
             # Wait for worker to finish loading
             await worker_task
         finally:
-            # Always release resources on any exit path (including exceptions).
-            # Note: `buffer` may alias ``self._ipc_buffer`` on the GPU IPC path;
-            # ``del buffer`` only drops the local name, so the persistent IPC
-            # buffer is preserved for reuse across subsequent sync calls.
-            # Best-effort cancel the worker RPC so we don't leave a dangling
-            # ``collective_rpc`` task after an early error (e.g. ZMQ timeout).
             if worker_task is not None and not worker_task.done():
                 worker_task.cancel()
                 with contextlib.suppress(BaseException):
@@ -710,10 +704,6 @@ class VLLMEngine(BaseSamplerEngine):
                 shm.close()
                 shm.unlink()
                 del shm
-            # Run GC for both SHM and GPU IPC paths so temporary objects
-            # (bucket_meta, shared-memory wrappers, local tensors) are released
-            # promptly; skipping on the IPC path would leave dangling
-            # references across sync calls.
             gc.collect()
 
         elapsed = time.time() - start_time
