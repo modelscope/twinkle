@@ -50,11 +50,14 @@ def serialize_object(obj) -> str:
         data['_TWINKLE_TYPE_'] = 'DatasetMeta'
         return json.dumps(data, ensure_ascii=False)
     elif isinstance(obj, LoraConfig):
-        filtered_dict = {
-            _subkey: _subvalue
-            for _subkey, _subvalue in obj.__dict__.items()
-            if isinstance(_subvalue, basic_types) and not _subkey.startswith('_')
-        }
+        filtered_dict = {}
+        for _subkey, _subvalue in obj.__dict__.items():
+            if isinstance(_subvalue, basic_types) and not _subkey.startswith('_'):
+                # Convert set/frozenset to list for JSON serialization
+                if isinstance(_subvalue, (set, frozenset)):
+                    filtered_dict[_subkey] = list(_subvalue)
+                else:
+                    filtered_dict[_subkey] = _subvalue
         filtered_dict['_TWINKLE_TYPE_'] = 'LoraConfig'
         return json.dumps(filtered_dict, ensure_ascii=False)
     elif isinstance(obj, BaseModel):

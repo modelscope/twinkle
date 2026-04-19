@@ -261,7 +261,7 @@ class DPOLoss(PreferenceLossBase):
 
         Args:
             inputs: Dict containing 'input_ids' and 'labels' [batch, seq_len].
-                   Batch should be organized as [chosen_1, ..., chosen_n, rejected_1, ..., rejected_n]
+                   Batch should be interleaved as [chosen_1, rejected_1, chosen_2, rejected_2, ...]
             outputs: Dict containing either:
                 - 'logps': [batch, seq_len] pre-computed log probs, OR
                 - 'logits': [batch, seq_len, vocab] from which logps will be computed
@@ -535,11 +535,11 @@ class ORPOLoss(PreferenceLossBase):
 
         # Odds ratio: log(odds_chosen / odds_rejected)
         # log_odds = log(p/(1-p)) = log(p) - log(1-p)
-        # Use numerically stable computation
-        prob_chosen = torch.exp(chosen_avg_logps).clamp(min=1e-7, max=1 - 1e-7)
-        prob_rejected = torch.exp(rejected_avg_logps).clamp(min=1e-7, max=1 - 1e-7)
-        log_odds_chosen = torch.log(prob_chosen) - torch.log(1 - prob_chosen)
-        log_odds_rejected = torch.log(prob_rejected) - torch.log(1 - prob_rejected)
+        # Compute entirely in log-space to avoid exp() underflow:
+        #   log(p)   = avg_logps  (already in log-space)
+        #   log(1-p) = log1p(-exp(avg_logps))  (numerically stable via log1p)
+        log_odds_chosen = chosen_avg_logps - torch.log1p(-torch.exp(chosen_avg_logps))
+        log_odds_rejected = rejected_avg_logps - torch.log1p(-torch.exp(rejected_avg_logps))
 
         # ORPO odds ratio loss
         odds_ratio = log_odds_chosen - log_odds_rejected

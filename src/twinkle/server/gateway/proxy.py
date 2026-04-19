@@ -39,6 +39,10 @@ class ServiceProxy:
         # Disable proxy env vars to avoid external routing
         self.client = httpx.AsyncClient(timeout=None, trust_env=False)
 
+    async def close(self) -> None:
+        """Close the underlying httpx.AsyncClient to release connections."""
+        await self.client.aclose()
+
     def _build_target_url(self, service_type: str, base_model: str, endpoint: str) -> str:
         """Build the target URL for internal service routing.
 

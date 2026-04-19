@@ -10,7 +10,7 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model.megatron import MultiLoraMegatronModel
-from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
+from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
 
@@ -28,11 +28,9 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name=adapter_name)
         input_features = datum_to_input_feature(inputs, template)
-        loss_values = extract_rl_feature(inputs)
+        loss_values = extract_rl_features_for_loss(inputs)
         loss_kwargs = kwargs.copy()
-        # ref_logps → padded tensor; megatron forward_backward auto-stores loss_kwargs in
-        # train_status.forward_kwargs (megatron.py:465), so DPOMetric reads it next step.
-        self._tinker_prepare_ref_outputs(loss_values, loss_kwargs)
+        self._apply_ref_outputs(loss_values, loss_kwargs, adapter_name)
         loss_kwargs.update(loss_values)
 
         outputs = super().forward_backward(inputs=input_features, adapter_name=adapter_name, **loss_kwargs)
@@ -50,7 +48,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        results = self._tinker_build_output(inputs, outputs)
+        results = self._tinker_build_output(inputs, outputs, return_full_logprobs=True)
         return [results, 0.0]
 
     @remote_function(dispatch='all')
@@ -75,7 +73,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         super().step(**kwargs)
         super().zero_grad(**kwargs)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='last_pp_first', lazy_collect=False)
     def tinker_calculate_metric(self, is_training, **kwargs):
         metric = super().calculate_metric(is_training, **kwargs)
         return clean_metrics(metric)

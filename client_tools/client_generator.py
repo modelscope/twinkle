@@ -438,7 +438,8 @@ def generate_models():
     client_module_path.mkdir(parents=True, exist_ok=True)
 
     model_code = AUTO_GEN_WARNING + '''from typing import Any, Dict, Optional
-from twinkle_client.http import http_post
+import time
+from twinkle_client.http import http_get, http_post
 from twinkle_client.types.model import (
     CalculateLossResponse,
     CalculateMetricResponse,
@@ -673,14 +674,20 @@ class MultiLoraTransformersModel:
         hub_model_id: str,
         hub_token: Optional[str] = None,
         async_upload: bool = True,
+        poll_interval: float = 5.0,
     ) -> None:
         """Upload model checkpoint to hub.
+
+        Submits the upload task to the server and polls for completion.
+        Blocks until the upload finishes or raises on failure.
 
         Args:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
-            async_upload: Whether to use async upload (default: True).
+            async_upload: Deprecated, has no effect. The server always runs the
+                upload in the background and the client polls for completion.
+            poll_interval: Seconds between status poll requests (default: 5).
         """
         response = http_post(
             url=f'{self.server_url}/upload_to_hub',
@@ -688,10 +695,28 @@ class MultiLoraTransformersModel:
                 'checkpoint_dir': checkpoint_dir,
                 'hub_model_id': hub_model_id,
                 'hub_token': hub_token,
-                'async_upload': async_upload,
             }
         )
         response.raise_for_status()
+        request_id = response.json().get('request_id')
+        if not request_id:
+            return
+
+        print(f'[upload_to_hub] Upload started (task {request_id}), waiting for completion...')
+        while True:
+            status_resp = http_get(url=f'{self.server_url}/upload_status/{request_id}')
+            status_resp.raise_for_status()
+            data = status_resp.json()
+            status = data.get('status', 'unknown')
+            if status == 'completed':
+                print(f'[upload_to_hub] Upload completed successfully.')
+                return
+            elif status == 'failed':
+                error = data.get('error', 'Unknown error')
+                raise RuntimeError(f'[upload_to_hub] Upload failed: {error}')
+            else:
+                print(f'[upload_to_hub] Status: {status}...')
+                time.sleep(poll_interval)
 '''
 
     # Write the model client file

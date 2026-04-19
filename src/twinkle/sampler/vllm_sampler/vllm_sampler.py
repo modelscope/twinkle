@@ -242,7 +242,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:
                 if len(feat['input_ids']) != len(response.prompt_token_ids):
-                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not'
+                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not '
                                        f'match prompt_token_ids length {len(response.prompt_token_ids)}')
             else:
                 feat['input_ids'] = response.prompt_token_ids

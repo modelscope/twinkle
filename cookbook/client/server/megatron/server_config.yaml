@@ -87,7 +87,7 @@ applications:
       use_megatron: true                          # Use Megatron-LM backend
       model_id: "ms://Qwen/Qwen3.6-35B-A3B" # ModelScope model identifier
       max_length: 32000                           # model max length
-      max_loras: 5                                # model max loras
+      max_loras: 3                                # model max loras
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
         name: model
@@ -95,8 +95,10 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        dp_size: 2                                # 2-way data parallel
-        pp_size: 2                                # 2-way pipeline parallel (~27GB/GPU)
+        tp_size: 2
+        ep_size: 2
+        pp_size: 2
+        sequence_parallel: True
 
       queue_config:
         rps_limit: 20                               # Max requests per second
