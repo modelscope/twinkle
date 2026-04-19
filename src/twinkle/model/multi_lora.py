@@ -509,13 +509,65 @@ class MultiLora:
             parameter.loader = MethodType(_loader, parameter)
             return name, parameter
 
+    @contextmanager
+    def save_hf_key_context(self, adapter_name):
+        """Temporarily mask LoraParallelLinear modules not in target_modules.
+
+        The bridge uses ``isinstance(module, LoraParallelLinear)`` to detect LoRA
+        layers during export.  For MultiLora every linear is pre-wrapped in
+        LoraParallelLinear (pre-allocated slots), but only a subset defined by
+        ``target_modules`` should actually be exported.
+
+        Because the bridge yields HF-format keys while ``target_modules`` uses
+        Megatron-format names, post-hoc key matching in ``save_lora_converter``
+        fails.  This context manager side-steps the problem by temporarily
+        replacing ``__class__`` of non-target modules so that the bridge's
+        ``isinstance`` check returns *False* and skips them entirely.
+        """
+        try:
+            from mcore_bridge import LoraParallelLinear as _LoraParallelLinear
+        except ImportError:
+            yield
+            return
+
+        _lora = self.find_lora(adapter_name)
+        target_modules = _lora.tenant_config.target_modules
+
+        # 'all-linear' matches everything — no patching needed
+        if target_modules == 'all-linear' or (isinstance(target_modules,
+                                                         (list, set)) and 'all-linear' in target_modules):
+            yield
+            return
+
+        # Create a sibling class with compatible memory layout that is NOT
+        # recognised as LoraParallelLinear by isinstance.
+        _ExcludedLinear = type('_ExcludedLinear', _LoraParallelLinear.__bases__, {})
+
+        patched = []  # (module, original_class)
+        modules_list = self.module if isinstance(self.module, list) else [self.module]
+
+        for _module in modules_list:
+            for name, sub_module in _module.named_modules():
+                if isinstance(sub_module, _LoraParallelLinear):
+                    if not self.match_target_modules(name, target_modules):
+                        patched.append((sub_module, sub_module.__class__))
+                        sub_module.__class__ = _ExcludedLinear
+
+        try:
+            yield
+        finally:
+            for sub_module, original_class in patched:
+                sub_module.__class__ = original_class
+
     def save_lora_converter(self, name, parameter, adapter_name):
         _lora = self.find_lora(adapter_name)
         # Skip weights belonging to OTHER adapters
         if re.search(r'\.lora_\w+\.\w+\.', name) and not re.search(rf'\.lora_\w+\.{adapter_name}\.', name):
             return None
-        if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name) and self.match_target_modules(
-                name, _lora.tenant_config.target_modules):
+        # target_modules filtering is handled by save_hf_key_context (class
+        # patching makes the bridge skip non-target modules entirely), so we
+        # only check the adapter-name / weight pattern here.
+        if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name):
             _param = torch_util.to_local_tensor(parameter)
             if _param is None:
                 pass
