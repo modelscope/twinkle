@@ -83,7 +83,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         request_id = body.request_id
         max_wait = float(os.environ.get('TWINKLE_LONG_POLL_TIMEOUT', '30'))
         poll_interval = float(os.environ.get('TWINKLE_POLL_INTERVAL', '0.5'))
-        start = asyncio.get_event_loop().time()
+        start = asyncio.get_running_loop().time()
 
         while True:
             record = await self.state.get_future(request_id)
@@ -95,7 +95,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             if status not in ('pending', 'queued', 'running', 'rate_limited'):
                 break
 
-            if asyncio.get_event_loop().time() - start >= max_wait:
+            if asyncio.get_running_loop().time() - start >= max_wait:
                 response_data = {'type': 'try_again'}
                 if queue_state := record.get('queue_state'):
                     response_data['queue_state'] = queue_state
@@ -104,10 +104,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 return response_data
 
             await asyncio.sleep(poll_interval)
-
-        record = await self.state.get_future(request_id)
-        if not record:
-            return {'type': 'try_again'}
 
         status = record.get('status')
 
@@ -263,6 +259,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             session = await self.state.get_sampling_session(body.sampling_session_id)
             if session:
                 base_model = session.get('base_model')
+        if not base_model:
+            raise HTTPException(status_code=400, detail='base_model is required but could not be resolved')
         return await self.proxy.proxy_to_sampler(request, 'asample', base_model)
 
     @app.post('/save_weights_for_sampler')

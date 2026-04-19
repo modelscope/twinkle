@@ -91,7 +91,7 @@ SYNC_INTERVAL = 1  # Save weights for sampler every N steps
 GRADIENT_ACCUMULATION_STEPS = 1
 DATA_NUM = 2000  # Number of Math samples to use
 
-USE_SWANLAB = True
+USE_SWANLAB = False
 SWANLAB_PROJECT = 'twinkle-grpo'
 SWANLAB_EXPERIMENT_NAME = 'short-math-grpo'
 
@@ -210,11 +210,13 @@ def train():
         # ========== 1. Save weights and update adapter_uri ==========
         # Instead of sync_weights, save the model checkpoint and pass
         # the resulting path to the sampler as adapter_uri
+        # Use is_sampler=True to delete old sampler weights and keep only the latest
         if step % SYNC_INTERVAL == 0:
             logger.info(f'Step {step}: Saving weights for sampler...')
             result = model.save(
-                name=f'grpo-sampler-step-{step}',
+                name='grpo-sampler-weights',
                 save_optimizer=False,
+                is_sampler=True,
             )
             current_adapter_uri = result.twinkle_path
             logger.info(f'Step {step}: Saved weights to {current_adapter_uri}')

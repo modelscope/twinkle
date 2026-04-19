@@ -13,7 +13,7 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
-from twinkle.server.common.datum import datum_to_input_feature, extract_rl_feature
+from twinkle.server.common.datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
 
@@ -36,7 +36,7 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        results = self._tinker_build_output(inputs, outputs)
+        results = self._tinker_build_output(inputs, outputs, return_full_logprobs=True)
         return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
@@ -45,15 +45,9 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel, TwinkleCompatMo
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        loss_values = extract_rl_feature(inputs)
+        loss_values = extract_rl_features_for_loss(inputs)
         loss_kwargs = kwargs.copy()
-        # Convert ref_logps list-of-lists into a padded tensor wrapped in ref_outputs
-        # so that DPOLoss and DPOMetric can consume it via ref_outputs.get('logps').
-        ref_outputs_dict = self._tinker_prepare_ref_outputs(loss_values, loss_kwargs)
-        if ref_outputs_dict is not None:
-            # Propagate to train_status.forward_kwargs so DPOMetric.accumulate
-            # gets ref_outputs on the next forward() call (where accumulate_metrics runs).
-            self.optimizer_group[adapter_name].train_status.forward_kwargs['ref_outputs'] = ref_outputs_dict
+        self._apply_ref_outputs(loss_values, loss_kwargs, adapter_name)
         loss_kwargs.update(loss_values)
         loss = super().calculate_loss(adapter_name=adapter_name, **loss_kwargs)
         super().backward(adapter_name=adapter_name, **kwargs)

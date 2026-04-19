@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-from collections import defaultdict
 from tinker import types
 
 from twinkle.data_format.input_feature import InputFeature
@@ -56,26 +55,34 @@ def datum_to_input_feature(datum: types.Datum | list[types.Datum],
     return input_feature
 
 
-def extract_rl_feature(datum: types.Datum | list[types.Datum]) -> dict:
+def extract_rl_features_for_loss(datum: types.Datum | list[types.Datum]) -> dict:
+    """Extract RL features from datums for use as loss kwargs.
+
+    Converts per-datum feature lists into the format expected by loss functions:
+    - 'logprobs'  -> 'old_logps'   : list of per-datum log-probability lists (for GRPO)
+    - 'advantages'-> 'advantages'  : list of per-datum advantage lists (for GRPO)
+    - 'ref_logps' -> 'ref_outputs' : {'logps': torch.Tensor [B, T]} (for DPO)
+    """
+    import torch
     if not isinstance(datum, list):
         datum = [datum]
 
-    result = defaultdict(list)
+    old_logps, advantages, ref_logps_lists = [], [], []
     for d in datum:
-        # 'logprobs' -> 'old_logps' (for GRPO loss)
         if 'logprobs' in d.loss_fn_inputs:
-            old_logps = d.loss_fn_inputs['logprobs'].to_numpy().tolist()
-            result['old_logps'].append(old_logps)
-
-        # 'advantages' -> 'advantages' (for GRPO loss)
+            old_logps.append(d.loss_fn_inputs['logprobs'].to_numpy().tolist())
         if 'advantages' in d.loss_fn_inputs:
-            advantages = d.loss_fn_inputs['advantages'].to_numpy().tolist()
-            result['advantages'].append(advantages)
-
-        # 'ref_logps' -> 'ref_logps' (for DPO loss)
+            advantages.append(d.loss_fn_inputs['advantages'].to_numpy().tolist())
         if 'ref_logps' in d.loss_fn_inputs:
-            ref_logps = d.loss_fn_inputs['ref_logps'].to_numpy().tolist()
-            result['ref_logps'].append(ref_logps)
+            ref_logps_lists.append(d.loss_fn_inputs['ref_logps'].to_numpy().tolist())
+
+    result = {}
+    if old_logps:
+        result['old_logps'] = old_logps
+    if advantages:
+        result['advantages'] = advantages
+    if ref_logps_lists:
+        result['ref_outputs'] = {'logps': torch.stack([torch.tensor(r, dtype=torch.float32) for r in ref_logps_lists])}
     return result
 
 

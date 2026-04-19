@@ -65,6 +65,7 @@ class SaveRequest(BaseModel):
     adapter_name: str
     save_optimizer: bool = False
     name: Optional[str] = None
+    is_sampler: bool = False  # If True, delete existing sampler weights before saving
 
     class Config:
         extra = 'allow'

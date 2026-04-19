@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from twinkle.utils.logger import get_logger
 
@@ -81,12 +81,7 @@ class RateLimiter:
         self._deployment_name = deployment_name
 
     def _cleanup_old_requests(self, token: str, current_time: float) -> None:
-        """Remove requests outside the sliding window.
-
-        Args:
-            token: User token to clean up.
-            current_time: Current timestamp.
-        """
+        """Remove requests outside the sliding window."""
         if token not in self._token_requests:
             return
         cutoff_time = current_time - self.window_seconds
@@ -99,11 +94,7 @@ class RateLimiter:
                 del self._last_activity[token]
 
     async def _cleanup_inactive_tokens(self) -> None:
-        """Background task that periodically removes inactive tokens.
-
-        This prevents unbounded memory growth by removing tokens that haven't
-        been active for token_cleanup_multiplier * window_seconds.
-        """
+        """Background task that periodically removes inactive tokens."""
         logger.debug(f'[RateLimiter] Cleanup task started (interval={self.token_cleanup_interval}s)')
         while True:
             try:
@@ -111,15 +102,12 @@ class RateLimiter:
 
                 async with self._lock:
                     current_time = time.time()
-                    inactive_threshold = current_time - \
-                        (self.window_seconds * self.token_cleanup_multiplier)
+                    inactive_threshold = current_time - (self.window_seconds * self.token_cleanup_multiplier)
 
-                    # Find tokens that haven't been active recently
                     tokens_to_remove = [
                         token for token, last_time in self._last_activity.items() if last_time < inactive_threshold
                     ]
 
-                    # Remove inactive tokens
                     for token in tokens_to_remove:
                         if token in self._token_requests:
                             del self._token_requests[token]
@@ -142,21 +130,14 @@ class RateLimiter:
                 continue
 
     def start_cleanup_task(self) -> None:
-        """Start the background cleanup task.
-
-        This should be called once when the rate limiter is initialized.
-        It's safe to call multiple times - subsequent calls are ignored.
-        """
+        """Start the background cleanup task. Safe to call multiple times."""
         if not self._cleanup_started:
             self._cleanup_task = asyncio.create_task(self._cleanup_inactive_tokens())
             self._cleanup_started = True
             logger.debug('[RateLimiter] Background cleanup task started')
 
     async def stop_cleanup_task(self) -> None:
-        """Stop the background cleanup task.
-
-        This should be called when shutting down the server.
-        """
+        """Stop the background cleanup task."""
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
             try:
@@ -168,42 +149,27 @@ class RateLimiter:
     async def check_and_record(self, token: str, input_tokens: int) -> tuple[bool, str | None]:
         """Check if request is allowed and record it if so.
 
-        Args:
-            token: User token for rate limiting.
-            input_tokens: Number of input tokens in this request.
-
         Returns:
             Tuple of (allowed: bool, reason: Optional[str]).
-            If allowed is False, reason contains the rate limit explanation.
         """
         async with self._lock:
             current_time = time.time()
-
-            # Clean up old requests
             self._cleanup_old_requests(token, current_time)
 
-            # Initialize if needed
             if token not in self._token_requests:
                 self._token_requests[token] = []
-
-            # Update last activity time
             self._last_activity[token] = current_time
 
             requests = self._token_requests[token]
-
-            # Count current window stats
             request_count = len(requests)
             token_count = sum(count for _, count in requests)
 
-            # Check rps limit
             if request_count >= self.rps_limit:
                 return False, f'RPS limit exceeded: {request_count}/{self.rps_limit} requests/s'
 
-            # Check tps limit
             if token_count + input_tokens > self.tps_limit:
                 return False, f'TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s'
 
-            # Record this request
             self._token_requests[token].append((current_time, input_tokens))
             if self._active_tokens_gauge is not None:
                 tags = {'deployment': self._deployment_name} if self._deployment_name else {}
@@ -211,18 +177,10 @@ class RateLimiter:
             return True, None
 
     def get_stats(self, token: str) -> dict[str, Any]:
-        """Get current rate limiting stats for a token.
-
-        Args:
-            token: User token to get stats for.
-
-        Returns:
-            Dict with current rps, tps, and limits.
-        """
+        """Get current rate limiting stats for a token."""
         current_time = time.time()
         self._cleanup_old_requests(token, current_time)
 
-        # Update last activity time even for stats queries
         if token in self._token_requests:
             self._last_activity[token] = current_time
 
@@ -240,11 +198,7 @@ class RateLimiter:
         }
 
     def get_memory_stats(self) -> dict[str, Any]:
-        """Get memory usage statistics for monitoring.
-
-        Returns:
-            Dict with active token count and cleanup configuration.
-        """
+        """Get memory usage statistics for monitoring."""
         return {
             'active_tokens': len(self._token_requests),
             'tracked_tokens': len(self._last_activity),

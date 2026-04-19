@@ -82,7 +82,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     @app.post('/twinkle/forward', response_model=types.ForwardResponse)
     async def forward(request: Request, body: types.ForwardRequest,
                       self: ModelManagement = Depends(self_fn)) -> types.ForwardResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -92,7 +92,19 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.forward(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='forward'))
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        batch_size = len(inputs_list)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
+                task_type='forward',
+            ))
 
     @app.post('/twinkle/forward_only', response_model=types.ForwardResponse)
     async def forward_only(
@@ -100,7 +112,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ForwardOnlyRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ForwardResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -110,7 +122,16 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='forward_only'))
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='forward_only',
+            ))
 
     @app.post('/twinkle/calculate_loss', response_model=types.CalculateLossResponse)
     async def calculate_loss(
@@ -118,7 +139,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.CalculateLossResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -127,11 +148,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.calculate_loss(adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='calculate_loss'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='calculate_loss'))
 
     @app.post('/twinkle/backward')
     async def backward(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -139,7 +161,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.backward(adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='backward'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='backward'))
 
     @app.post('/twinkle/forward_backward', response_model=types.ForwardBackwardResponse)
     async def forward_backward(
@@ -147,7 +169,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ForwardRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ForwardBackwardResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         def first_element(data):
@@ -168,7 +190,19 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.forward_backward(inputs=all_inputs, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='forward_backward'))
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        batch_size = len(inputs_list)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                input_tokens=input_tokens,
+                batch_size=batch_size,
+                data_world_size=self.device_mesh.data_world_size,
+                task_type='forward_backward',
+            ))
 
     @app.post('/twinkle/clip_grad_norm', response_model=types.ClipGradNormResponse)
     async def clip_grad_norm(
@@ -176,7 +210,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.ClipGradNormResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -185,11 +219,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.clip_grad_norm(adapter_name=adapter_name, **extra_kwargs)
             return {'result': str(ret)}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='clip_grad_norm'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='clip_grad_norm'))
 
     @app.post('/twinkle/step')
     async def step(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -197,11 +232,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.step(adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='step'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='step'))
 
     @app.post('/twinkle/zero_grad')
     async def zero_grad(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -209,11 +244,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.zero_grad(adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='zero_grad'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='zero_grad'))
 
     @app.post('/twinkle/lr_step')
     async def lr_step(request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -221,7 +256,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.lr_step(adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='lr_step'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='lr_step'))
 
     @app.post('/twinkle/clip_grad_and_step')
     async def clip_grad_and_step(
@@ -229,7 +264,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ClipGradAndStepRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -242,7 +277,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 **extra_kwargs,
             )
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='clip_grad_and_step'))
+        await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='clip_grad_and_step'))
 
     @app.post('/twinkle/get_train_configs', response_model=types.GetTrainConfigsResponse)
     async def get_train_configs(
@@ -250,7 +286,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AdapterRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.GetTrainConfigsResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -259,11 +295,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.get_train_configs(adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='get_train_configs'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='get_train_configs'))
 
     @app.post('/twinkle/set_loss')
     async def set_loss(request: Request, body: types.SetLossRequest, self: ModelManagement = Depends(self_fn)) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -271,7 +308,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.set_loss(body.loss_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='set_loss'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_loss'))
 
     @app.post('/twinkle/set_optimizer')
     async def set_optimizer(
@@ -279,7 +316,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetOptimizerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -287,7 +324,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.set_optimizer(body.optimizer_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='set_optimizer'))
+        await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_optimizer'))
 
     @app.post('/twinkle/set_lr_scheduler')
     async def set_lr_scheduler(
@@ -295,7 +333,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetLrSchedulerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -303,7 +341,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.set_lr_scheduler(body.scheduler_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='set_lr_scheduler'))
+        await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_lr_scheduler'))
 
     @app.post('/twinkle/save', response_model=types.SaveResponse)
     async def save(request: Request, body: types.SaveRequest,
@@ -316,17 +355,19 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
-            save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=False)
+            save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=body.is_sampler)
+            # Must save the checkpoint in the twinkle format before calling model.save()
+            twinkle_path = checkpoint_manager.save(
+                model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
             checkpoint_dir = self.model.save(
                 name=checkpoint_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name,
                 save_optimizer=body.save_optimizer,
                 **extra_kwargs)
-            twinkle_path = checkpoint_manager.save(model_id=adapter_name, name=checkpoint_name, is_sampler=False)
             return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='save'))
+        return await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='save'))
 
     @app.post('/twinkle/load')
     async def load(request: Request, body: types.LoadRequest, self: ModelManagement = Depends(self_fn)) -> None:
@@ -346,7 +387,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='load'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='load'))
 
     @app.post('/twinkle/upload_to_hub', response_model=types.UploadToHubResponse)
     async def upload_to_hub(
@@ -383,7 +424,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 async_upload=False,
             )
 
-        future_ref = await self.schedule_task(_task, task_type='upload_to_hub')
+        future_ref = await self.schedule_background_task(_task, task_type='upload_to_hub')
         request_id = future_ref.get('request_id')
         if request_id is None:
             raise HTTPException(status_code=500, detail=f'Upload task scheduling failed: {future_ref}')
@@ -431,7 +472,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             training_run_manager.save(adapter_name, run_config)
             return {'status': 'ok', 'adapter_name': adapter_name}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='add_adapter_to_model'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='add_adapter_to_model'))
 
     @app.post('/twinkle/apply_patch')
     async def apply_patch(
@@ -439,7 +481,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.ApplyPatchRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -448,7 +490,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             patch_cls = deserialize_object(body.patch_cls)
             self.model.apply_patch(patch_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='apply_patch'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='apply_patch'))
 
     @app.post('/twinkle/add_metric')
     async def add_metric(
@@ -456,7 +498,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.AddMetricRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -465,7 +507,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             metric_cls = deserialize_object(body.metric_cls)
             self.model.add_metric(metric_cls, is_training=body.is_training, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='add_metric'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='add_metric'))
 
     @app.post('/twinkle/set_template')
     async def set_template(
@@ -473,7 +515,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetTemplateRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -481,7 +523,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.set_template(body.template_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='set_template'))
+        await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_template'))
 
     @app.post('/twinkle/set_processor')
     async def set_processor(
@@ -489,7 +531,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.SetProcessorRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> None:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -497,7 +539,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             extra_kwargs = body.model_extra or {}
             self.model.set_processor(body.processor_cls, adapter_name=adapter_name, **extra_kwargs)
 
-        await run_task(self.schedule_task_and_wait(_task, task_type='set_processor'))
+        await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='set_processor'))
 
     @app.post('/twinkle/calculate_metric', response_model=types.CalculateMetricResponse)
     async def calculate_metric(
@@ -505,7 +548,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.CalculateMetricRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.CalculateMetricResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -514,7 +557,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.calculate_metric(is_training=body.is_training, adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='calculate_metric'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='calculate_metric'))
 
     @app.post('/twinkle/get_state_dict', response_model=types.GetStateDictResponse)
     async def get_state_dict(
@@ -522,7 +566,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             body: types.GetStateDictRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.GetStateDictResponse:
-        await self._on_request_start(request)
+        token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
         async def _task():
@@ -531,4 +575,5 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             ret = self.model.get_state_dict(adapter_name=adapter_name, **extra_kwargs)
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='get_state_dict'))
+        return await run_task(
+            self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='get_state_dict'))

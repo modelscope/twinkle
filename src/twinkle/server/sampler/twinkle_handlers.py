@@ -56,19 +56,37 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
+    async def run_task(coro):
+        """Await a schedule_task_and_wait coroutine and surface any exception as a
+        structured HTTP 500 response so the client receives the full traceback instead
+        of an opaque connection-level error.
+
+        Note: HTTPException is re-raised directly to preserve its status code and detail.
+        """
+        try:
+            return await coro
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=traceback.format_exc())
+
     @app.post('/twinkle/create', response_model=types.CreateResponse)
-    def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> types.CreateResponse:
+    async def create(request: Request, self: SamplerManagement = Depends(self_fn)) -> types.CreateResponse:
         """Health check / session creation endpoint."""
         return types.CreateResponse()
 
     @app.post('/twinkle/sample', response_model=types.SampleResponseModelList)
-    def sample(request: Request, body: types.SampleRequest,
-               self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
+    async def sample(
+        request: Request, body: types.SampleRequest,
+        self: SamplerManagement = Depends(self_fn)) -> types.SampleResponseModelList:
         """Sample completions from the model.
 
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
         """
-        try:
+        token = await self._on_request_start(request)
+
+        async def _task():
             # Resolve adapter
             adapter_path = None
             adapter_name = body.adapter_name or ''
@@ -76,8 +94,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
             if body.adapter_uri:
                 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
-                from twinkle.server.utils.validation import get_token_from_request
-                token = get_token_from_request(request)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
 
@@ -100,15 +116,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             if body.sampling_params:
                 params = SamplingParams.from_dict(body.sampling_params)
 
-            # Call sampler
             responses = self.sampler.sample(
                 inputs,
                 params,
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-            if callable(responses):
-                responses = responses()
 
             sample_models = []
             for response in responses:
@@ -122,7 +135,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                         if seq.new_input_feature is not None else None,
                     ) for seq in response.sequences
                 ]
-
                 sample_models.append(
                     types.SampleResponseModel(
                         sequences=sequences,
@@ -130,12 +142,20 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                         topk_prompt_logprobs=response.topk_prompt_logprobs,
                     ))
             return types.SampleResponseModelList(samples=sample_models)
-        except Exception:
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+        # Calculate metrics for queue scheduling
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='sample',
+            ))
 
     @app.post('/twinkle/set_template', response_model=types.SetTemplateResponse)
-    def set_template(
+    async def set_template(
             request: Request,
             body: types.SetTemplateRequest,
             self: SamplerManagement = Depends(self_fn),
@@ -146,7 +166,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         return types.SetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
-    def add_adapter_to_sampler(
+    async def add_adapter_to_sampler(
             request: Request,
             body: types.AddAdapterRequest,
             self: SamplerManagement = Depends(self_fn),
