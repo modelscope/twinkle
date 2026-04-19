@@ -1186,13 +1186,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             self.hf_config.save_pretrained(output_dir)
             if isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
-                target_modules = None
-                if getattr(config, 'origin_target_modules', None) == 'all-linear':
-                    target_modules = config.target_modules
-                    config.target_modules = 'all-linear'
+                target_modules = config.target_modules
+                config.target_modules = 'all-linear'
                 model[0].peft_config[adapter_name].save_pretrained(output_dir)
-                if getattr(config, 'origin_target_modules', None) == 'all-linear':
-                    config.target_modules = target_modules
+                config.target_modules = target_modules
 
     def _save_megatron_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in Megatron checkpoint format."""
@@ -1295,9 +1292,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(config_or_dir, dict):
                     config_or_dir = LoraConfig(**config_or_dir)
                 config = config_or_dir
-
-                if config.target_modules == 'all-linear':
-                    config.origin_target_modules = 'all-linear'
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 if config.target_modules:
@@ -1564,7 +1558,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         config = optimizer_config.adapter_config
         if isinstance(config, dict):
             config = config.get(adapter_name, next(iter(config.values())))
-        return config.to_dict() if hasattr(config, 'to_dict') else dict(config)
+        target_modules = config.target_modules
+        config.target_modules = 'all-linear'
+        _peft_config = config.to_dict() if hasattr(config, 'to_dict') else dict(config)
+        _peft_config['target_modules'] = target_modules
+        return _peft_config
 
     @staticmethod
     def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
