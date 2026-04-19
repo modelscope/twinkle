@@ -99,7 +99,6 @@ class MultiLoraMegatronModel(MegatronModel):
         # Active group for compatibility with single adapter
         self.active_group = None
         self.multi_adapter.reset_adapter_status()
-        breakpoint()
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '
