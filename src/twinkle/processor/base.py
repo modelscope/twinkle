@@ -101,6 +101,8 @@ class InputProcessor:
                 elif (isinstance(value, list) and isinstance(value[0],
                                                              (int, float, np.number))) or key == 'position_ids':
                     value = torch.tensor(value)
+                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids'):
+                    value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
                         value = [torch.tensor(v) for v in value]
