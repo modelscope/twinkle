@@ -99,6 +99,7 @@ class MultiLoraMegatronModel(MegatronModel):
         # Active group for compatibility with single adapter
         self.active_group = None
         self.multi_adapter.reset_adapter_status()
+        breakpoint()
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '
@@ -220,10 +221,13 @@ class MultiLoraMegatronModel(MegatronModel):
             save_format = kwargs.pop('save_format', 'hf')  # 'hf' or 'megatron'
             # Use partial to bind adapter_name to save_lora_converter
             lora_converter = partial(self.multi_adapter.save_lora_converter, adapter_name=real_adapter_name)
-            if save_format == 'hf':
-                self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
-            else:
-                self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
+            # Mask non-target LoraParallelLinear modules so the bridge skips them,
+            # avoiding Megatron-vs-HF key format mismatch in save_lora_converter.
+            with self.multi_adapter.save_hf_key_context(real_adapter_name):
+                if save_format == 'hf':
+                    self._save_hf_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
+                else:
+                    self._save_megatron_format(checkpoint_dir, real_adapter_name, lora_converter=lora_converter)
 
             self._save_tokenizer(checkpoint_dir, adapter_name=kwargs.get('adapter_name'))
             # Final synchronization to ensure all ranks complete save
