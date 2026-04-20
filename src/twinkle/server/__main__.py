@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -76,6 +77,11 @@ def main(args: list[str] | None = None) -> int:
 
     try:
         from twinkle.server.launcher import launch_server
+
+        # Apply log level so that all loggers (including those created later)
+        # pick up the user-specified level via the LOG_LEVEL env var that
+        # get_logger() already reads.
+        os.environ['LOG_LEVEL'] = parsed_args.log_level
 
         config_path = Path(parsed_args.config)
         if not config_path.exists():

@@ -298,6 +298,12 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
     elif method == 'last_pp':
         assert device_mesh is not None
         return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
+    elif method == 'last_pp_first':
+        # Return the first result from the last PP stage workers.
+        # Falls back to result[0] when PP = 1 (all workers are the last stage).
+        assert device_mesh is not None
+        last_pp = [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
+        return last_pp[0] if last_pp else result[0]
     elif isinstance(method, Callable):
         # Callable
         return method(result, device_mesh=device_mesh)

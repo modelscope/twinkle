@@ -10,7 +10,7 @@ Before getting started, please ensure your system meets the following requiremen
 |------------------------------|----------------------------|--------------------------------------|
 | Python                       | >= 3.11, < 3.13            | Twinkle framework requirement        |
 | Ascend Firmware Driver (HDK) | Latest version recommended | Hardware driver and firmware         |
-| CANN Toolkit                 | 8.3.RC1 or higher          | Heterogeneous Computing Architecture |
+| CANN Toolkit                 | 8.5.1 or higher            | Heterogeneous Computing Architecture |
 | PyTorch                      | 2.7.1                      | Deep learning framework              |
 | torch_npu                    | 2.7.1                      | Ascend PyTorch adapter plugin        |
 
@@ -44,7 +44,7 @@ This documentation includes:
 - Python: 3.11
 - PyTorch: 2.7.1
 - torch_npu: 2.7.1
-- CANN: 8.3.RC1 or higher
+- CANN: 8.5.1 or higher
 
 ### 2. Install Twinkle
 
@@ -64,16 +64,16 @@ If you need to use vLLMSampler for efficient inference, you can install vLLM and
 
 ```bash
 # Step 1: Install vLLM
-pip install vllm==0.11.0
+pip install vllm==0.14.0
 
 # Step 2: Install vLLM-Ascend
-pip install vllm-ascend==0.11.0rc3
+pip install vllm-ascend==0.14.0rc1
 ```
 
 **Notes**:
 - Install in the above order, ignoring possible dependency conflict warnings
 - Ensure CANN environment is activated before installation: `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
-- Recommended versions are vLLM 0.11.0 and vLLM-Ascend 0.11.0rc3
+- Recommended versions are vLLM 0.14.0 and vLLM-Ascend 0.14.0rc1
 
 ### 4. Verify Installation
 
@@ -109,51 +109,67 @@ If the output shows `NPU available: True` and no errors, installation is success
 
 **Note**: Twinkle does not currently provide NPU Docker images. Manual installation is recommended. For containerized deployment, please refer to official images from the Ascend community.
 
+### 5. Install Megatron Backend Dependencies
+
+**Recommended versions**:
+- Megatron-LM: `v0.15.3`
+- MindSpeed: `core_r0.15.3`
+- mcore-bridge: main branch or the version already validated in your Twinkle checkout
+
+**Installation steps**:
+
+```bash
+# 1. Clone Megatron-LM and pin the compatible version
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+git checkout v0.15.3
+cd ..
+
+# 2. Clone and install MindSpeed
+git clone https://gitcode.com/Ascend/MindSpeed.git
+cd MindSpeed
+git checkout core_r0.15.3
+pip install -e .
+cd ..
+
+# 3. Clone and install mcore-bridge
+git clone https://github.com/modelscope/mcore-bridge.git
+cd mcore-bridge
+pip install -e .
+cd ..
+
+# 4. Install Twinkle if needed
+cd twinkle
+pip install -e ".[transformers,ray]"
+```
+
+**Runtime environment variables**:
+
+```bash
+export PYTHONPATH=$PYTHONPATH:<path/to/Megatron-LM>
+export MEGATRON_LM_PATH=</path/to/Megatron-LM>
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+```
+
+**Verification**:
+
+First run a minimal import check to make sure the current environment can resolve MindSpeed and Megatron-LM:
+
+```bash
+python -c "import mindspeed.megatron_adaptor; from twinkle.model.megatron._mindspeed_runtime import ensure_mindspeed_adaptor_patched; ensure_mindspeed_adaptor_patched(); print('✓ Megatron backend imports are ready')"
+```
+
 ## Quick Start
 
 **Important Notice**: The following examples are from the `cookbook/` directory and have been verified in actual NPU environments. It is recommended to run scripts directly from the cookbook rather than copying and pasting code snippets.
 
 ### SFT LoRA Fine-tuning
 
-Verified 4-card DP+FSDP training example:
-
-**Example Path**: [cookbook/sft/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/sft/lora_npu.py)
-
-**Run Method**:
-```bash
-# Specify using 4 NPU cards
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-
-# Run training
-python cookbook/sft/lora_npu.py
-```
-
-**Example Features**:
-- ✅ Ray distributed mode
-- ✅ DP + FSDP hybrid parallelism (2x2)
-- ✅ LoRA fine-tuning
-- ✅ Complete data loading and training loop
+The NPU document no longer provides this kind of SFT cookbook example; this capability should be described together with an actually available cookbook example or a future NPU script.
 
 ### GRPO Reinforcement Learning Training
 
-Verified multi-card GRPO training example:
-
-**Example Path**: [cookbook/grpo/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/grpo/lora_npu.py)
-
-**Run Method**:
-```bash
-# Specify using 8 NPU cards
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# Run training
-python cookbook/grpo/lora_npu.py
-```
-
-**Example Features**:
-- ✅ Actor-Critic architecture
-- ✅ Supports Reference Model
-- ✅ Optional TorchSampler or vLLMSampler
-- ✅ Complete RL training workflow
+The NPU document no longer provides this kind of GRPO cookbook example; this capability should be described together with an actually available cookbook example or a future NPU script.
 
 ### More Examples
 
@@ -165,12 +181,12 @@ Twinkle currently supports the following **verified** parallelization strategies
 
 | Parallel Type | Description | NPU Support | Verification Status |
 |---------|------|---------|---------|
-| DP (Data Parallel) | Data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
-| FSDP (Fully Sharded Data Parallel) | Fully sharded data parallelism | ✅ | Verified (see cookbook/sft/lora_npu.py) |
-| TP (Tensor Parallel) | Tensor parallelism (Megatron) | 🚧 | To be verified |
-| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | 🚧 | To be verified |
-| CP (Context Parallel) | Context parallelism | 🚧 | To be verified |
-| EP (Expert Parallel) | Expert parallelism (MoE) | 🚧 | To be verified |
+| DP (Data Parallel) | Data parallelism | ✅ | No corresponding cookbook example |
+| FSDP (Fully Sharded Data Parallel) | Fully sharded data parallelism | ✅ | No corresponding cookbook example |
+| TP (Tensor Parallel) | Tensor parallelism (Megatron) | ✅ | Verified (see `cookbook/megatron/ascend/tp_npu.py`) |
+| PP (Pipeline Parallel) | Pipeline parallelism (Megatron) | ✅ | Verified (see `cookbook/megatron/ascend/tp_npu.py`) |
+| CP (Context Parallel) | Context parallelism | ✅ | Verified (see `cookbook/megatron/ascend/tp_moe_cp_npu.py`) |
+| EP (Expert Parallel) | Expert parallelism (MoE) | ✅ | Verified (see `cookbook/megatron/ascend/tp_moe_npu.py`) |
 
 **Legend**:
 - ✅ Verified: Has actual running example code
@@ -179,21 +195,9 @@ Twinkle currently supports the following **verified** parallelization strategies
 
 ### DP + FSDP Example
 
-The following example is from `cookbook/sft/lora_npu.py`, verified in actual NPU environment:
+The NPU document currently does not provide a corresponding cookbook code snippet.
 
-```python
-import numpy as np
-from twinkle import DeviceMesh
-
-# 4 cards: DP=2, FSDP=2
-device_mesh = DeviceMesh(
-    device_type='npu',
-    mesh=np.array([[0, 1], [2, 3]]),
-    mesh_dim_names=('dp', 'fsdp')
-)
-```
-
-**Note**: Megatron backend (TP/PP/EP) support on NPU is under development, with no available examples yet. If you need these advanced parallelization strategies, please verify in GPU environment first or follow project updates.
+**Megatron backend note**: Twinkle now provides runnable NPU smoke scripts for the Megatron backend. Please follow the installation section above before running the cookbook examples, and start with `cookbook/megatron/ascend/tp_npu.py` before moving on to `cookbook/megatron/ascend/tp_moe_npu.py` and `cookbook/megatron/ascend/tp_moe_cp_npu.py`.
 
 ## Common Issues
 
@@ -229,14 +233,14 @@ Feature support matrix based on actual code verification:
 
 | Feature | GPU | NPU | Verification Example | Description |
 |------|-----|-----|---------|------|
-| SFT + LoRA | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified available |
-| GRPO | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified available |
-| DP Parallelism | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified available |
-| FSDP Parallelism | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified available |
-| Ray Distributed | ✅ | ✅ | cookbook/sft/lora_npu.py | Verified available |
-| TorchSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified available |
-| vLLMSampler | ✅ | ✅ | cookbook/grpo/lora_npu.py | Verified available |
-| Full Fine-tuning | ✅ | 🚧 | - | Theoretically supported, to be verified |
+| SFT + LoRA | ✅ | ✅ | - | No corresponding cookbook example |
+| GRPO | ✅ | ✅ | - | No corresponding cookbook example |
+| DP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
+| FSDP Parallelism | ✅ | ✅ | - | No corresponding cookbook example |
+| Ray Distributed | ✅ | ✅ | - | No corresponding cookbook example |
+| TorchSampler | ✅ | ✅ | - | No corresponding cookbook example |
+| vLLMSampler | ✅ | ✅ | - | No corresponding cookbook example |
+| Full Fine-tuning | ✅ | ✅ | - | Verified available |
 | QLoRA | ✅ | ❌ | - | Quantization operators not yet supported |
 | DPO | ✅ | 🚧 | - | Theoretically supported, to be verified |
 | Megatron TP/PP | ✅ | 🚧 | - | To be adapted and verified |
@@ -255,19 +259,7 @@ Feature support matrix based on actual code verification:
 
 ## Example Code
 
-Twinkle provides the following verified NPU training examples:
-
-### SFT Training
-- **4-card DP+FSDP LoRA Fine-tuning**: [cookbook/sft/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/sft/lora_npu.py)
-  - Uses Ray mode for distributed training
-  - Demonstrates DP + FSDP hybrid parallelism
-  - Includes complete data loading and training loop
-
-### GRPO Training
-- **Multi-card GRPO RL Training**: [cookbook/grpo/lora_npu.py](https://github.com/modelscope/twinkle/blob/main/cookbook/grpo/lora_npu.py)
-  - Actor-Critic architecture
-  - Supports Reference Model
-  - Optional TorchSampler or vLLMSampler
+Twinkle's verified NPU examples currently focus on the Megatron smoke path; the SFT and GRPO cookbook examples do not have corresponding files yet.
 
 ### Remote Training (Tinker Protocol)
 - **Server Configuration**: [cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
@@ -276,15 +268,7 @@ Twinkle provides the following verified NPU training examples:
   - Suitable for production environment deployment
 
 **Running Examples**:
-```bash
-# SFT training
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-python cookbook/sft/lora_npu.py
-
-# GRPO training
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-python cookbook/grpo/lora_npu.py
-```
+No corresponding command examples are provided yet.
 
 ## Reference Resources
 
