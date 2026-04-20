@@ -755,10 +755,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Force garbage collection
         gc.collect()
 
-        # Clear CUDA cache if available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, 'ipc_collect'):
-                torch.cuda.ipc_collect()
+        Torch.empty_cache()
+        Torch.ipc_collect()
 
         logger.info('VLLMEngine shutdown complete')

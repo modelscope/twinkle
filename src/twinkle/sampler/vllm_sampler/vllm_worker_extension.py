@@ -291,8 +291,6 @@ class TwinkleWorkerExtension:
                         tensor = cpu_u8.view(dtype=dtype).view(shape)
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape).clone()
-                    if lora_mode and tensor.device.type != 'cpu':
-                        tensor = tensor.cpu()
                     weights.append((name, tensor))
                     continue
 
@@ -327,8 +325,6 @@ class TwinkleWorkerExtension:
                         tensor = assembled
                     else:
                         tensor = assembled.clone()
-                    if lora_mode and tensor.device.type != 'cpu':
-                        tensor = tensor.cpu()
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
