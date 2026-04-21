@@ -17,6 +17,7 @@ twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 logger = get_logger()
 
+
 # npu patch
 if is_torch_npu_available():
     from monkey_patch_npu import apply_hf_moe_grouped_mm_patch
@@ -37,6 +38,7 @@ def eval(model):
         model.calculate_loss()
     metrics = model.calculate_metric(is_training=False)
     return metrics
+
 
 def train():
     # 1000 samples
