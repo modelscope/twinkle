@@ -25,7 +25,6 @@ if is_torch_npu_available():
     import torch_npu
     from torch_npu.contrib import transfer_to_npu
     
-    
 def eval(model):
     # 100 Samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
@@ -74,7 +73,6 @@ def train():
     logger.info(f'Total steps: {len(dataloader)}')
     loss_metric = 99.0
     # lora: 34G * 8
-    rank = dist.get_rank()
     for step, batch in enumerate(dataloader):
         # Do forward and backward
         model.forward_backward(inputs=batch)
