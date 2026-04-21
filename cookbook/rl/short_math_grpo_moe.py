@@ -36,7 +36,7 @@ MODEL_EP = int(os.environ.get('MODEL_EP', 2))
 MODEL_TP = int(os.environ.get('MODEL_TP', 2))
 MODEL_PP = int(os.environ.get('MODEL_PP', 2))
 
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
 SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 2))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 

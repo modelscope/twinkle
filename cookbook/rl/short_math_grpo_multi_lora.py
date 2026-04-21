@@ -35,19 +35,21 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-27B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.6-35B-A3B')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
+SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
+SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 2))
+
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
-LEARNING_RATE = float(os.environ.get('LR', 5e-6))
+LEARNING_RATE = float(os.environ.get('LR', 5e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
-MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
+MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 1))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default_0'
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1000))
@@ -124,23 +126,19 @@ def main():
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU',
-                    gpus_per_worker=2),
+                    gpus_per_worker=SAMPLER_TP),
     ]
 
     # Model mesh: tp=2, ep=2, pp=2, sequence_parallel (ref: server_config.yaml)
     model_mesh = DeviceMesh.from_sizes(
         world_size=MODEL_GPUS,
         tp_size=2,
-        # ep_size=2,
+        ep_size=2,
         pp_size=2,
-        # sequence_parallel=True,
+        sequence_parallel=True,
     )
-    # Sampler mesh: dp=2, tp=2
-    sampler_mesh = DeviceMesh.from_sizes(
-        world_size=SAMPLER_GPUS,
-        dp_size=2,
-        tp_size=2,
-    )
+    sampler_dp_size = SAMPLER_GPUS //  (SAMPLER_TP)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=sampler_dp_size, tp_size=SAMPLER_TP)
 
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
@@ -179,9 +177,10 @@ def main():
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
+            'tensor_parallel_size': SAMPLER_TP,
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
-            'max_lora_rank': 32,
+            'max_lora_rank': LORA_RANK,
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
             'enable_lora': True,
             'enable_tower_connector_lora': True,
@@ -241,6 +240,10 @@ def main():
             sampling_params,
             adapter_path=lora_sync_path,
         )
+        if sample_responses and sample_responses[0].sequences:
+            first_decoded = sample_responses[0].sequences[0].decoded
+            if isinstance(first_decoded, str):
+                logger.info('[sample_debug] first_generation=%r', first_decoded[:512])
 
         all_input_data: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
