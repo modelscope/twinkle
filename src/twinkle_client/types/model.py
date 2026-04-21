@@ -89,20 +89,11 @@ class LoadRequest(BaseModel):
         extra = 'allow'
 
 
-class LoadTrainingStateRequest(BaseModel):
-    adapter_name: str
+class ResumeFromCheckpointRequest(BaseModel):
+    """Request for /resume_from_checkpoint endpoint."""
     name: str
-
-    class Config:
-        extra = 'allow'
-
-
-class ReadTrainingProgressRequest(BaseModel):
-    adapter_name: str
-    name: str
-
-    class Config:
-        extra = 'allow'
+    adapter_name: str = ''
+    resume_only_model: bool = False
 
 
 class AddAdapterRequest(BaseModel):
@@ -229,7 +220,7 @@ class SaveResponse(BaseModel):
 
 
 class TrainingProgressResponse(BaseModel):
-    """Response for /read_training_progress endpoint (returns progress metadata)."""
+    """Response for /resume_from_checkpoint endpoint."""
     result: Dict[str, Any]
 
 
