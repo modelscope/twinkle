@@ -88,7 +88,11 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
-    def resume_from_checkpoint(self, checkpoint_dir: str, *, resume_only_model: bool = False, **kwargs) -> Dict[str, Any]:
+    def resume_from_checkpoint(self,
+                               checkpoint_dir: str,
+                               *,
+                               resume_only_model: bool = False,
+                               **kwargs) -> Dict[str, Any]:
         ...
 
     @abstractmethod

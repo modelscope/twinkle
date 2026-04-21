@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Any, Dict, Literal, Optional
 
-import torch
-
 from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
 

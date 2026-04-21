@@ -42,9 +42,6 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
-from twinkle.utils.logger import get_logger
-
-logger = get_logger()
 
 logger = get_logger()
 
@@ -1054,7 +1051,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
-        with open(trainer_state_path, 'r') as f:
+        with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 
         adapter_name = adapter_name or self._get_default_group()
@@ -1077,8 +1074,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         has_adapter = (
             os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin'))
-        )
+            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
         if has_adapter:
             self.load(checkpoint_dir, adapter_name=adapter_name)
 

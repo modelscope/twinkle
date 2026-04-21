@@ -882,11 +882,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
-        with open(trainer_state_path, 'r') as f:
+        with open(trainer_state_path) as f:
             trainer_state = json.load(f)
 
-        self.load(checkpoint_dir, load_optimizer=not resume_only_model,
-                  adapter_name=adapter_name, **kwargs)
+        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
 
         return {
             'cur_step': trainer_state['cur_step'],
