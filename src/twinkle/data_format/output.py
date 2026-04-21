@@ -19,14 +19,16 @@ class ModelOutput(TypedDict, total=False):
         logits: The logits output by the model.
         loss: The loss calculated by the model.
         logps: The log-probabilities of correct tokens by the model.
+        num_tokens: The token denominator associated with ``loss``.
     """
     logits: Optional[OutputType]
     loss: Optional[OutputType]
     logps: Optional[OutputType]
+    num_tokens: Optional[OutputType]
 
 
 class LossOutput(TypedDict, total=False):
-    """The output structure for the Losses"""
+    """The output structure for the Losses."""
 
     loss: Optional[OutputType]
-    num_tokens: Optional[int]
+    num_tokens: Optional[OutputType]

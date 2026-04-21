@@ -76,12 +76,13 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _ensure_dp_group(self):
         if self._dp_group is not None or self._device_mesh is None:
             return
-        if self._device_mesh.data_world_size <= 1:
+        raw_world_size = self._device_mesh._get_dp_fsdp_world_size()
+        if raw_world_size <= 1:
             return
         if not dist.is_available() or not dist.is_initialized():
             return
-        if dist.get_world_size() < self._device_mesh.data_world_size:
-            # World size is smaller than the requested dp group; skip to avoid crash.
+        if dist.get_world_size() < raw_world_size:
+            # World size is smaller than the requested dp/fsdp group; skip to avoid crash.
             return
         dims = [dim for dim in ('dp', 'fsdp') if self._device_mesh.has_dim(dim)]
         if not dims:
@@ -242,15 +243,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         from .strategy.sequence_parallel import SequenceParallelStrategy
 
-        sp_config = {}
-        # When data-parallel gradient averaging runs across SP shards (native FSDP or
-        # accelerate DDP/FSDP paths), compensate SP loss backward to keep gradient scale.
-        if isinstance(self.strategy, (NativeFSDPStrategy, AccelerateStrategy)) and self.device_mesh is not None:
-            if (self.device_mesh.ulysses_size or 1) > 1 and (self.device_mesh.data_world_size or 1) > 1:
-                sp_config['compensate_fsdp_avg'] = True
         self.sp_strategy = SequenceParallelStrategy(
             self.device_mesh,
-            sp_config,
+            {},
             model=self.model,
             tokenizer_id=self.tokenizer_id,
         )
@@ -372,14 +367,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        inputs: Dict[str, Any] = processor(inputs)
-        if self.sp_strategy is not None:
-            inputs = self.sp_strategy.preprocess_inputs(inputs)
+        inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
-        if self.sp_strategy is not None and labels is None:
-            outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
@@ -430,9 +421,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-            inputs: Dict[str, Any] = processor(inputs)
-            if self.sp_strategy is not None:
-                inputs = self.sp_strategy.preprocess_inputs(inputs)
+            inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
@@ -441,8 +430,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
-            if self.sp_strategy is not None and labels is None:
-                outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = outputs
@@ -483,9 +470,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
-        result = loss_instance(inputs, outputs, **kwargs)
+        processor: InputProcessor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before calculating loss'
+        loss_inputs, loss_outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
+        result = loss_instance(loss_inputs, loss_outputs, **kwargs)
         loss_value = result['loss']
-        counts = result['num_tokens']
+        raw_counts = result['num_tokens']
+        counts = raw_counts
         if not counts:
             counts = torch.tensor(1, device=loss_value.device)
         # Later will gather this value, so it becomes:
@@ -501,16 +492,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
         #                               / gradient_accumulation_steps
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
-        counts = counts / self.device_mesh.data_world_size
+        raw_dp_fsdp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
+        counts = counts / raw_dp_fsdp_world_size
         optimizer_config = self.optimizer_group[adapter_name]
         status.num_tokens += counts.item()
-        if self.sp_strategy is not None and 'labels' in inputs:
-            reduction = getattr(loss_instance, 'reduction', None)
-            if reduction is not None:
-                self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
-            loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         status.loss_value += loss_value
         outputs['loss'] = status.loss_value
+        outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
         return status.loss_value.item()
 
     @remote_function()

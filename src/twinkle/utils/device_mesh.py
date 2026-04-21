@@ -364,6 +364,15 @@ class DeviceMesh:
             f'data_world_size: {data_world_size} cannot be divided by ulysses_size: {ulysses_size}.')
         return data_world_size // ulysses_size
 
+    def _get_dp_fsdp_world_size(self) -> int:
+        dp_world_size = self.dp_world_size or 1
+        fsdp_world_size = self.fsdp_world_size or 1
+        if dp_world_size <= 0:
+            dp_world_size = 1
+        if fsdp_world_size <= 0:
+            fsdp_world_size = 1
+        return dp_world_size * fsdp_world_size
+
     def get_slice(self, total_length: int, rank: Optional[int] = None) -> slice:
         world_size = self.data_world_size
         if world_size == 1:
