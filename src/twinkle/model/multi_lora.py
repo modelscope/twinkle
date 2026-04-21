@@ -336,7 +336,7 @@ class MultiLora:
 
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
-                                    return [t[:_lora.tenant_config.r, :] for t in tensors]
+                                    return [t[:_lora.tenant_config.r, :].contiguous() for t in tensors]
 
                                 lora_A._get_weight_tensors_origin = lora_A._get_weight_tensors
                                 lora_A._get_weight_tensors = MethodType(_get_weight_tensors, lora_A)
@@ -353,7 +353,7 @@ class MultiLora:
 
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
-                                    return [t[:, :_lora.tenant_config.r] for t in tensors]
+                                    return [t[:, :_lora.tenant_config.r].contiguous() for t in tensors]
 
                                 lora_B._get_weight_tensors_origin = lora_B._get_weight_tensors
                                 lora_B._get_weight_tensors = MethodType(_get_weight_tensors, lora_B)
@@ -572,13 +572,13 @@ class MultiLora:
             if _param is None:
                 pass
             elif 'embedding_A' in name:
-                _param = _param[:, :_lora.tenant_config.r]
+                _param = _param[:, :_lora.tenant_config.r].clone()
             elif 'embedding_B' in name:
-                _param = _param[:_lora.tenant_config.r, :]
+                _param = _param[:_lora.tenant_config.r, :].clone()
             elif '_A' in name:
-                _param = _param[:_lora.tenant_config.r, :]
+                _param = _param[:_lora.tenant_config.r, :].clone()
             elif '_B' in name:
-                _param = _param[:, :_lora.tenant_config.r]
+                _param = _param[:, :_lora.tenant_config.r].clone()
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
