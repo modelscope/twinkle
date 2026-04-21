@@ -136,12 +136,11 @@ model.set_optimizer('Adam', lr=1e-4)
 consumed_train_samples = 0
 global_step = 0
 if resume_path:
-    logger.info(f'Resuming model weights from {resume_path}')
-    model.load(resume_path)
-    trainer_state = model.load_training_state(resume_path)
-    dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
-    consumed_train_samples = int(trainer_state['consumed_train_samples'])
-    global_step = int(trainer_state['cur_step'])
+    logger.info(f'Resuming from checkpoint {resume_path}')
+    progress = model.resume_from_checkpoint(resume_path)
+    dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+    consumed_train_samples = int(progress['consumed_train_samples'])
+    global_step = int(progress['cur_step'])
 
 # Step 6: 训练循环
 logger.info(model.get_train_configs().model_dump())
@@ -177,9 +176,8 @@ for epoch in range(3):
 Twinkle Client 场景下，推荐的断点续训流程是：
 
 1. 先通过 `client.list_checkpoints(...)` 或 `client.get_latest_checkpoint_path(...)` 获取已有 checkpoint 路径。
-2. 调用 `model.load(resume_path)` 恢复 adapter 权重。
-3. 调用 `model.load_training_state(resume_path)` 恢复优化器、调度器、随机数状态和训练进度元数据。
-4. 使用返回结果中的 `consumed_train_samples` 调用 `dataloader.skip_consumed_samples(...)`，跳过已经训练过的数据。
+2. 调用 `model.resume_from_checkpoint(resume_path)` 恢复权重、优化器、调度器、随机数状态和训练进度元数据。
+3. 使用返回结果中的 `consumed_train_samples` 调用 `dataloader.resume_from_checkpoint(...)`，跳过已经训练过的数据。
 
 完整示例可直接参考 `cookbook/client/twinkle/self_host/self_congnition.py`。
 

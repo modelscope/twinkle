@@ -136,12 +136,11 @@ model.set_optimizer('Adam', lr=1e-4)
 consumed_train_samples = 0
 global_step = 0
 if resume_path:
-    logger.info(f'Resuming model weights from {resume_path}')
-    model.load(resume_path)
-    trainer_state = model.load_training_state(resume_path)
-    dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
-    consumed_train_samples = int(trainer_state['consumed_train_samples'])
-    global_step = int(trainer_state['cur_step'])
+    logger.info(f'Resuming from checkpoint {resume_path}')
+    progress = model.resume_from_checkpoint(resume_path)
+    dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+    consumed_train_samples = int(progress['consumed_train_samples'])
+    global_step = int(progress['cur_step'])
 
 # Step 6: Training loop
 logger.info(model.get_train_configs().model_dump())
@@ -187,9 +186,8 @@ for epoch in range(3):
 For checkpoint resumption, the recommended client-side flow is:
 
 1. Query the server for an existing checkpoint path with `client.list_checkpoints(...)` or `client.get_latest_checkpoint_path(...)`.
-2. Call `model.load(resume_path)` to restore adapter weights.
-3. Call `model.load_training_state(resume_path)` to restore optimizer, scheduler, RNG, and progress metadata.
-4. Call `dataloader.skip_consumed_samples(...)` with `consumed_train_samples` from the returned trainer state.
+2. Call `model.resume_from_checkpoint(resume_path)` to restore weights, optimizer, scheduler, RNG, and progress metadata.
+3. Call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip already-consumed samples.
 
 This matches the end-to-end example in `cookbook/client/twinkle/self_host/self_congnition.py`.
 

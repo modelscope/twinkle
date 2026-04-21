@@ -286,14 +286,14 @@ The flow above is intended for LoRA / adapter training. For full-parameter train
 ```python
 resume_path = './output/fsdp2/last-checkpoint'
 model = TransformersModel(model_id=resume_path)
-trainer_state = model.load_training_state(resume_path)
-dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
+progress = model.resume_from_checkpoint(resume_path)
+dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 ```
 
 In other words:
 
-- LoRA / adapter resume: create `TransformersModel` from the original base model, then restore via `model.load(...)` or `resume_from_checkpoint(...)`.
-- Full-parameter resume: construct `TransformersModel(...)` with the checkpoint path as `model_id`, then call `load_training_state(...)` to restore optimizer state and training progress.
+- LoRA / adapter resume: create `TransformersModel` from the original base model, then restore via `model.resume_from_checkpoint(...)`.
+- Full-parameter resume: construct `TransformersModel(...)` with the checkpoint path as `model_id`, then call `resume_from_checkpoint(...)` to restore optimizer state and training progress.
 
 ### Ray Training
 
