@@ -349,10 +349,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         await run_task(self.schedule_task_and_wait(_task, task_type='load'))
 
-    @app.post('/twinkle/load_training_state', response_model=types.TrainingProgressResponse)
-    async def load_training_state(
+    @app.post('/twinkle/resume_from_checkpoint', response_model=types.TrainingProgressResponse)
+    async def resume_from_checkpoint(
             request: Request,
-            body: types.LoadTrainingStateRequest,
+            body: types.ResumeFromCheckpointRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.TrainingProgressResponse:
         token = await self._on_request_start(request)
@@ -360,46 +360,19 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _task():
             self.assert_resource_exists(adapter_name)
-            extra_kwargs = body.model_extra or {}
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             resolved = checkpoint_manager.resolve_load_path(body.name)
             checkpoint_dir = (
                 Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
                 if resolved.checkpoint_dir else body.name)
-            ret = self.model.load_training_state(
+            ret = self.model.resume_from_checkpoint(
                 checkpoint_dir,
+                resume_only_model=body.resume_only_model,
                 adapter_name=adapter_name,
-                **extra_kwargs,
             )
             return {'result': ret}
 
-        return await run_task(self.schedule_task_and_wait(_task, task_type='load_training_state'))
-
-    @app.post('/twinkle/read_training_progress', response_model=types.TrainingProgressResponse)
-    async def read_training_progress(
-            request: Request,
-            body: types.ReadTrainingProgressRequest,
-            self: ModelManagement = Depends(self_fn),
-    ) -> types.TrainingProgressResponse:
-        token = await self._on_request_start(request)
-        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
-
-        async def _task():
-            self.assert_resource_exists(adapter_name)
-            extra_kwargs = body.model_extra or {}
-            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            resolved = checkpoint_manager.resolve_load_path(body.name)
-            checkpoint_dir = (
-                Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
-                if resolved.checkpoint_dir else body.name)
-            ret = self.model.read_training_progress(
-                checkpoint_dir,
-                adapter_name=adapter_name,
-                **extra_kwargs,
-            )
-            return {'result': ret}
-
-        return await run_task(self.schedule_task_and_wait(_task, task_type='read_training_progress'))
+        return await run_task(self.schedule_task_and_wait(_task, task_type='resume'))
 
     @app.post('/twinkle/upload_to_hub')
     async def upload_to_hub(
