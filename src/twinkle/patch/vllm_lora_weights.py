@@ -29,6 +29,10 @@ class TensorLoRARequest(LoRARequest):
 class VLLMLoraWeights(Patch):
 
     def __call__(self, sampler, **kwargs):
+        from twinkle.patch.vllm_moe_loader import patch_qwen35_moe_is_3d_moe_weight_false
+
+        patch_qwen35_moe_is_3d_moe_weight_false()
+
         _sampler_ref = sampler
 
         def _get_tokenizer():
