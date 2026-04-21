@@ -25,7 +25,6 @@ if is_torch_npu_available():
     from torch_npu.contrib import transfer_to_npu
     
     
-
 def eval(model):
     # 100 Samples
     dataset = Dataset(dataset_meta=DatasetMeta('ms://swift/self-cognition', data_slice=range(100)))
