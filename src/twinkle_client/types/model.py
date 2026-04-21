@@ -95,6 +95,9 @@ class ResumeFromCheckpointRequest(BaseModel):
     adapter_name: str = ''
     resume_only_model: bool = False
 
+    class Config:
+        extra = 'allow'
+
 
 class AddAdapterRequest(BaseModel):
     adapter_name: str
