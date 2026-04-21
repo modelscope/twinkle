@@ -813,6 +813,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 optimizer_config=optimizer_config,
                 **kwargs,
             )
+            trainer_state = {
+                'checkpoint_version': 1,
+                'cur_step': optimizer_config.cur_step,
+                'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            }
+            state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                with open(state_path, 'w') as f:
+                    json.dump(trainer_state, f, indent=2)
 
         # Final synchronization to ensure all ranks complete save.
         if dist.is_initialized():
@@ -865,6 +876,23 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if dist.is_initialized():
             dist.barrier()
+
+    @remote_function(dispatch='all')
+    def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        with open(trainer_state_path, 'r') as f:
+            trainer_state = json.load(f)
+
+        self.load(checkpoint_dir, load_optimizer=not resume_only_model,
+                  adapter_name=adapter_name, **kwargs)
+
+        return {
+            'cur_step': trainer_state['cur_step'],
+            'consumed_train_samples': trainer_state['consumed_train_samples'],
+            'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
+        }
 
     @staticmethod
     def _get_rng_state() -> 'ShardedObject':
