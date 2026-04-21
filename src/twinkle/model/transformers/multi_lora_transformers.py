@@ -136,7 +136,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
-    @remote_function()
+    @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
@@ -223,7 +223,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().set_processor(processor_cls, **kwargs)
 
-    @remote_function()
+    @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
