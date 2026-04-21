@@ -243,7 +243,7 @@ def main():
         # Logging
         if optim_step % GRADIENT_ACCUMULATION_STEPS == 0:
             metrics = policy_model.calculate_metric(is_training=True)
-            logger.info(f'[Step {optim_step // GRADIENT_ACCUMULATION_STEPS}/{MAX_STEPS}] {metrics}')
+            logger.info(f'[Step {optim_step // GRADIENT_ACCUMULATION_STEPS}/{MAX_STEPS // GRADIENT_ACCUMULATION_STEPS}] {metrics}')
 
         # Checkpointing
         if optim_step % SAVE_STEPS == 0:

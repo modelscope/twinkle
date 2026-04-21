@@ -2,7 +2,7 @@
 import sys
 from typing import Any, Dict, List, Literal, Optional, Union
 
-if sys.version_info <= (3, 11):
+if sys.version_info[:2] <= (3, 11):
     # Pydantic requirements.
     from typing_extensions import TypedDict
 else:

@@ -16,7 +16,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
@@ -35,6 +35,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
+from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -83,7 +84,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def __init__(
         self,
         model_id: str,
-        config: Optional[PretrainedConfig] = None,
+        config: Optional[PreTrainedConfig] = None,
         ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
@@ -95,7 +96,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ):
         requires('megatron_core')
-        requires('mcore_bridge')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         nn.Module.__init__(self)
@@ -111,6 +111,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
         torch_util.set_device()
         self._try_init_process_group()
+        # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
+        # mcore_bridge pulls in megatron.core/TE too early on NPU.
+        ensure_mindspeed_adaptor_patched()
+        requires('mcore_bridge')
 
         kwargs.update({
             'recompute_granularity': recompute_granularity,
@@ -145,6 +149,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
+
+    def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
+        # Keep NCCL's device binding behavior, but avoid binding HCCL's default
+        # PG so Megatron's later Gloo DP groups stay decoupled on NPU.
+        return backend == 'nccl'
 
     def _construct_default_optimizer_group(self):
         return MegatronOptimizerGroup(
@@ -295,7 +304,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if micro_batch_size is None:
             # Compatible with DPO
             micro_batch_size = min(2, len(inputs))
-        inputs = processor(inputs, micro_batch_size=micro_batch_size, variable_seq_lengths=self.variable_seq_lengths)
+        unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+        inputs = processor(
+            inputs,
+            micro_batch_size=micro_batch_size,
+            variable_seq_lengths=self.variable_seq_lengths,
+            attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
+        )
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -322,6 +337,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if num_microbatches <= 1:
             loss_extra_kwargs_per_mb = [kwargs]
         else:
+            # Only support extra kwargs length==total_batch_size
             for mb_idx in range(num_microbatches):
                 mb_start = mb_idx * micro_batch_size
                 mb_end = mb_start + micro_batch_size
@@ -358,7 +374,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         def forward_step_func(data_iterator, model):
             batch = next(data_iterator)
             labels = batch.pop('labels', None)
-            # Handle disable_lora for base model inference (e.g., reference in DPO)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
@@ -642,7 +657,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def _accumulate_metric(optimizer_config: MegatronOptimizerGroup, is_training):
         optimizer_config.accumulate_metrics(is_training)
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='last_pp_first', lazy_collect=False)
     def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1171,13 +1186,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             self.hf_config.save_pretrained(output_dir)
             if isinstance(model[0], PeftModel):
                 config = model[0].peft_config[adapter_name]
-                target_modules = None
-                if getattr(config, 'origin_target_modules', None) == 'all-linear':
-                    target_modules = config.target_modules
-                    config.target_modules = 'all-linear'
+                target_modules = config.target_modules
+                config.target_modules = 'all-linear'
                 model[0].peft_config[adapter_name].save_pretrained(output_dir)
-                if getattr(config, 'origin_target_modules', None) == 'all-linear':
-                    config.target_modules = target_modules
+                config.target_modules = target_modules
 
     def _save_megatron_format(self, output_dir: str, adapter_name: str, lora_converter=None):
         """Save in Megatron checkpoint format."""
@@ -1280,9 +1292,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(config_or_dir, dict):
                     config_or_dir = LoraConfig(**config_or_dir)
                 config = config_or_dir
-
-                if config.target_modules == 'all-linear':
-                    config.origin_target_modules = 'all-linear'
 
                 # Expand target_modules (e.g., 'all-linear' -> actual module names)
                 if config.target_modules:
@@ -1549,7 +1558,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         config = optimizer_config.adapter_config
         if isinstance(config, dict):
             config = config.get(adapter_name, next(iter(config.values())))
-        return config.to_dict() if hasattr(config, 'to_dict') else dict(config)
+        target_modules = config.target_modules
+        config.target_modules = 'all-linear'
+        _peft_config = config.to_dict() if hasattr(config, 'to_dict') else dict(config)
+        _peft_config['target_modules'] = target_modules
+        return _peft_config
 
     @staticmethod
     def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:

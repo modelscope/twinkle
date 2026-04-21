@@ -22,12 +22,22 @@ class MathReward(Reward):
 
     @staticmethod
     def extract_boxed_result(text):
-        pattern = r'\\boxed{([^}]*)}'
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1).strip()
-        else:
+        """Extract content from \\boxed{...}, handling nested braces."""
+        idx = text.rfind('\\boxed{')
+        if idx == -1:
             return text
+        start = idx + len('\\boxed{')
+        depth = 1
+        j = start
+        while j < len(text) and depth > 0:
+            if text[j] == '{':
+                depth += 1
+            elif text[j] == '}':
+                depth -= 1
+            j += 1
+        if depth == 0:
+            return text[start:j - 1].strip()
+        return text
 
     @staticmethod
     def clean_latex(latex_str):
