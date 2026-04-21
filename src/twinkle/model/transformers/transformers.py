@@ -892,10 +892,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         if optimizer is not None:
             optimizer_path = os.path.join(output_dir, 'optimizer.pt')
-            if hasattr(self.strategy, 'save_optimizer_checkpoint'):
-                self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
-            elif Platform.is_master():
-                torch.save(optimizer.state_dict(), optimizer_path)
+            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
         if Platform.is_master():
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
@@ -1007,13 +1004,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
 
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
-            if getattr(self.strategy, 'needs_wrapped_optimizer_state', lambda: False)() and not self._model_wrapped:
+            if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
-            if hasattr(self.strategy, 'load_optimizer_checkpoint'):
-                self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
-            else:
-                state_dict = torch.load(optimizer_path, map_location='cpu', weights_only=True)
-                optimizer_config.optimizer.load_state_dict(state_dict)
+            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
