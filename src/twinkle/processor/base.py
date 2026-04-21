@@ -23,6 +23,7 @@ class PackedSeqParams:
 class InputProcessor:
     padding_map = {
         'input_ids': 0,
+        'mm_token_type_ids': 0,
         'inputs_embeds': 0.0,
         'attention_mask': 0,
         'labels': -100,
@@ -65,7 +66,9 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
+            self.drop_causal_4d_mask,
             self.split_cp,
+            self.apply_transformers_sp,
             self.prepare_outputs,
         ]
 
@@ -100,6 +103,8 @@ class InputProcessor:
                 elif (isinstance(value, list) and isinstance(value[0],
                                                              (int, float, np.number))) or key == 'position_ids':
                     value = torch.tensor(value)
+                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids'):
+                    value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
                         value = [torch.tensor(v) for v in value]
@@ -113,9 +118,25 @@ class InputProcessor:
 
         return [to_tensor(_input) for _input in inputs]
 
+    def apply_transformers_sp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        sp_strategy = kwargs.get('sp_strategy')
+        if self.framework != 'transformers' or sp_strategy is None:
+            return inputs
+        return [InputFeature(**sp_strategy.preprocess_inputs(dict(_input))) for _input in inputs]
+
+    def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
+                              **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Adjust SP tensors after forward and before loss computation."""
+        sp_strategy = kwargs.get('sp_strategy')
+        if self.framework == 'transformers' and sp_strategy is not None:
+            return sp_strategy.gather_loss_tensors(inputs, outputs)
+        return inputs, outputs
+
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
         if self.device_mesh is None:
+            return inputs
+        if self.framework == 'transformers':
             return inputs
 
         def _pad_cp(_input: InputFeature) -> InputFeature:
@@ -153,19 +174,25 @@ class InputProcessor:
                     torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
                 ])
 
-                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
-                    value = _input[key]
+                for key in [
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                ]:
+                    value = _input.get(key)
+                    if value is None:
+                        continue
                     result = []
                     for i in range(cu_seqlens.shape[0]):
                         if i == cu_seqlens.shape[0] - 1:
                             break
-                        _value_slice = value[:, cu_seqlens[i]:cu_seqlens[i + 1]]
-                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map[key]))
-                    value = torch.cat(result, dim=1)
+                        _value_slice = value[..., cu_seqlens[i]:cu_seqlens[i + 1]]
+                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map.get(key, 0)))
+                    value = torch.cat(result, dim=-1)
                     _input[key] = value
             elif self.device_mesh.sequence_parallel and tp_size > 1:
                 # Sequence parallel without CP still requires seq_len % TP == 0
-                for key in ['input_ids', 'position_ids', 'attention_mask', 'labels']:
+                for key in [
+                        'input_ids', 'position_ids', 'attention_mask', 'labels', 'completion_mask', 'mm_token_type_ids'
+                ]:
                     value = _input.get(key)
                     if value is not None:
                         _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
@@ -176,6 +203,8 @@ class InputProcessor:
     def split_cp(self, inputs: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
 
         if self.device_mesh is None:
+            return inputs
+        if self.framework == 'transformers':
             return inputs
 
         def _split_cp(inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -221,6 +250,14 @@ class InputProcessor:
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
+                completion_mask = inputs.get('completion_mask')
+                if completion_mask is not None:
+                    inputs['completion_mask'] = split_cp_inputs(completion_mask, cu_seqlens_q, dim=-1)
+
+                mm_token_type_ids = inputs.get('mm_token_type_ids')
+                if mm_token_type_ids is not None:
+                    inputs['mm_token_type_ids'] = split_cp_inputs(mm_token_type_ids, cu_seqlens_q, dim=-1)
+
             inputs['input_ids'] = input_ids
             inputs['position_ids'] = position_ids
             inputs['attention_mask'] = attention_mask
@@ -234,6 +271,20 @@ class InputProcessor:
             padding_free = self.padding_free or self._any_packing([_inp])
             if padding_free and self.framework == 'megatron':
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
+        return inputs
+
+    def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        """On NPU, drop the generic 4D dense mask so MindSpeed can build
+        its own compressed causal mask for FlashAttention."""
+        if Platform.device_prefix() != 'npu':
+            return inputs
+        attention_mask_type = kwargs.get('attention_mask_type')
+        if attention_mask_type != 'causal':
+            return inputs
+        for _inp in inputs:
+            attention_mask = _inp.get('attention_mask')
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
+                _inp['attention_mask'] = None
         return inputs
 
     @staticmethod
@@ -369,7 +420,7 @@ class InputProcessor:
                 if key == 'position_ids' and is_mm_position_ids(values[0]):
                     # mrope needs to cat the sequence and unsequeeze the middle dim
                     value = torch.cat(values, dim=2).unsqueeze(1)
-                if isinstance(values[0], torch.Tensor):
+                elif isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
                     value = values

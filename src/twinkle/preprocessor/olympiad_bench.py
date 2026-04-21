@@ -61,15 +61,19 @@ class OlympiadBenchProcessor(Preprocessor):
         return images
 
     def _format_final_answer(self, final_answer: Any, unit: str = '') -> str:
-        """Format final answer(s) as string for comparison."""
+        """Format final answer(s) as string for comparison.
+
+        Note: Unit is intentionally NOT appended to the answer string.
+        OlympiadBench stores unit as separate metadata, and models may or may
+        not include it in their output.  Appending it would cause spurious
+        mismatches for unrecognised units (mol, Hz, N, V, W, Pa, …).
+        Unit information is preserved in user_data for optional downstream use.
+        """
         if isinstance(final_answer, list):
             answers = [str(a).strip() for a in final_answer if a]
             answer_str = ', '.join(answers)
         else:
             answer_str = str(final_answer).strip() if final_answer else ''
-
-        if unit and answer_str:
-            answer_str = f'{answer_str} {unit}'
         return answer_str
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:

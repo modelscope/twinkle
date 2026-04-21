@@ -45,6 +45,7 @@ from .model import (
     TrainingProgressResponse,
     UploadToHubRequest,
     UploadToHubResponse,
+    UploadStatusResponse,
     ZeroGradResponse,
 )
 from .processor import (

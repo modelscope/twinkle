@@ -21,6 +21,50 @@ class SamplingParams:
     prompt_logprobs: int = None
     num_samples: int = 1
 
+    def __post_init__(self):
+        if not isinstance(self.temperature, (int, float)):
+            raise ValueError(f'temperature must be a number, got {type(self.temperature)}')
+        if self.temperature < 0:
+            raise ValueError(f'temperature must be >= 0, got {self.temperature}')
+
+        if not isinstance(self.top_p, (int, float)):
+            raise ValueError(f'top_p must be a number, got {type(self.top_p)}')
+        if not 0 < self.top_p <= 1:
+            raise ValueError(f'top_p must be in range (0, 1], got {self.top_p}')
+
+        if not isinstance(self.top_k, int):
+            raise ValueError(f'top_k must be an int, got {type(self.top_k)}')
+        if self.top_k != -1 and self.top_k < 1:
+            raise ValueError(f'top_k must be -1 or >= 1, got {self.top_k}')
+
+        if self.logprobs is not None:
+            if not isinstance(self.logprobs, int):
+                raise ValueError(f'logprobs must be an int or None, got {type(self.logprobs)}')
+            if self.logprobs < 0:
+                raise ValueError(f'logprobs must be >= 0, got {self.logprobs}')
+
+        if self.prompt_logprobs is not None:
+            if not isinstance(self.prompt_logprobs, int):
+                raise ValueError(f'prompt_logprobs must be an int or None, got {type(self.prompt_logprobs)}')
+            if self.prompt_logprobs < 0:
+                raise ValueError(f'prompt_logprobs must be >= 0, got {self.prompt_logprobs}')
+
+        if not isinstance(self.num_samples, int):
+            raise ValueError(f'num_samples must be an int, got {type(self.num_samples)}')
+        if self.num_samples < 1:
+            raise ValueError(f'num_samples must be >= 1, got {self.num_samples}')
+
+        if self.max_tokens is not None:
+            if not isinstance(self.max_tokens, int):
+                raise ValueError(f'max_tokens must be an int or None, got {type(self.max_tokens)}')
+            if self.max_tokens < 1:
+                raise ValueError(f'max_tokens must be >= 1, got {self.max_tokens}')
+
+        if not isinstance(self.repetition_penalty, (int, float)):
+            raise ValueError(f'repetition_penalty must be a number, got {type(self.repetition_penalty)}')
+        if self.repetition_penalty <= 0:
+            raise ValueError(f'repetition_penalty must be > 0, got {self.repetition_penalty}')
+
     def to_vllm(self, **kwargs):
         """Convert to vLLM SamplingParams.
         """

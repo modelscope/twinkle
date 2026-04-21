@@ -150,12 +150,15 @@ class GKDLoss(Loss):
             temperature = 1.0
         elif topk is not None and teacher_logits is not None:
             # Local teacher: select top-k from teacher, gather corresponding student logits
-            teacher_logits = teacher_logits.to(student_logits.device())
+            teacher_logits = teacher_logits.to(student_logits.device)
             teacher_logits, topk_idx = torch.topk(teacher_logits, k=topk, dim=-1)
             teacher_logits.div_(temperature)
             student_logits = torch.gather(student_logits, dim=-1, index=topk_idx)
             student_logits.div_(temperature)
             temperature = 1.0
+
+        if teacher_logits is not None and teacher_logits.device != student_logits.device:
+            teacher_logits = teacher_logits.to(student_logits.device)
 
         # ── Mask valid (response) tokens ──────────────────────────────────────
         if labels is not None:

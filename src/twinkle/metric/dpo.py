@@ -115,6 +115,11 @@ class DPOMetric(Metric):
         # Compute sequence-level logps
         seq_logps = self._compute_sequence_logps(logps, labels)
 
+        # DPO requires interleaved [chosen, rejected, ...] pairs → batch must be even
+        assert seq_logps.shape[0] % 2 == 0, (
+            f'DPO metric requires an even batch size (interleaved chosen/rejected pairs), '
+            f'but got batch_size={seq_logps.shape[0]}.')
+
         # Split into chosen and rejected (interleaved format)
         chosen_logps, rejected_logps = self._split_chosen_rejected(seq_logps)
         chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
@@ -190,8 +195,6 @@ class DPOMetric(Metric):
         total_reward_correct = sum(r['reward_correct'] for r in all_results)
         total_count = sum(r['count'] for r in all_results)
         has_rewards = any(r['has_rewards'] for r in all_results)
-
-        self.reset()
 
         if total_count == 0:
             return {}
