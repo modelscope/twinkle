@@ -161,4 +161,5 @@ class CheckpointEngineManager:
 
         if not self.base_sync_done:
             self.base_sync_done = True
-            logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+            if not merge_and_sync:
+                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')

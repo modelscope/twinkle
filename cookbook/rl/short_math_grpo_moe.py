@@ -1,14 +1,6 @@
-"""GRPO training script for GSM8K dataset — MultiLoRA Megatron version.
+"""GRPO training script for GSM8K dataset.
 
-Uses MultiLoraMegatronModel with filesystem-based LoRA sync to vLLM sampler
-(no CheckpointEngineManager / GPU memory sync). Each training step saves LoRA
-weights to a local directory, then passes the path to vLLMSampler via
-`adapter_path` so vLLM loads the latest adapter from disk.
-
-Model: Qwen/Qwen3.6-35B-A3B (MoE, 35B total / 3B active)
-Model mesh: tp=2, ep=2, pp=2, sequence_parallel=True  (8 GPUs)
-Sampler mesh: dp=2, tp=2, gpus_per_worker=2            (4 GPUs)
-
+Converted from the Tinker client version to Ray-based training.
 Uses short reasoning format: shorter thinking gets higher format reward.
 Answer extracted from \\boxed{} or #### format.
 """
@@ -21,11 +13,12 @@ from peft import LoraConfig
 import twinkle
 from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
+from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
-from twinkle.model import MultiLoraMegatronModel
+from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
@@ -36,11 +29,15 @@ logger = get_logger()
 
 # ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.6-35B-A3B')
+USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
+MODEL_EP = int(os.environ.get('MODEL_EP', 2))
+MODEL_TP = int(os.environ.get('MODEL_TP', 2))
+MODEL_PP = int(os.environ.get('MODEL_PP', 2))
+
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
 SAMPLER_TP = int(os.environ.get('SAMPLER_TP', 2))
-
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
@@ -51,19 +48,12 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 1))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
-ADAPTER_NAME = 'default_0'
+ADAPTER_NAME = 'default'
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1000))
 LORA_RANK = int(os.environ.get('LORA_RANK', 16))
-LORA_SYNC_DIR = os.environ.get('LORA_SYNC_DIR', 'output/lora_sync')
 
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
-
-import swanlab
-swanlab.init(
-    project='twinkle',
-)
-
 
 # ========== Reward Functions ==========
 class GSM8KBrevityReward(Reward):
@@ -122,66 +112,61 @@ def compute_rewards(
 
 # ========== Main ==========
 def main():
-    # Device groups: 8 GPUs for model (tp=2 x ep=2 x pp=2), 4 GPUs for sampler (dp=2 x tp=2)
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU',
-                    gpus_per_worker=SAMPLER_TP),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=SAMPLER_TP),
     ]
-
-    # Model mesh: tp=2, ep=2, pp=2, sequence_parallel (ref: server_config.yaml)
-    model_mesh = DeviceMesh.from_sizes(
-        world_size=MODEL_GPUS,
-        tp_size=2,
-        ep_size=2,
-        pp_size=2,
-        sequence_parallel=True,
-    )
+    dp_size = MODEL_GPUS //  (MODEL_TP * MODEL_PP)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=dp_size, tp_size=MODEL_TP, pp_size=MODEL_PP, ep_size=MODEL_EP, sequence_parallel=True)
     sampler_dp_size = SAMPLER_GPUS //  (SAMPLER_TP)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=sampler_dp_size, tp_size=SAMPLER_TP)
-
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
-    # MoE model: use explicit target_modules to avoid fused expert weight issues with 'all-linear'
     lora_config = LoraConfig(
-        target_modules='all-linear',
-        # target_modules=[
-        #     "self_attention.in_proj",
-        #     "self_attention.out_proj",
-        #     "self_attention.linear_qkv",
-        #     "self_attention.linear_proj",
-        #     "shared_experts.linear_fc1",
-        #     "shared_experts.linear_fc2",
-        #     "mlp.linear_fc1",
-        #     "mlp.linear_fc2",
-        # ],
+        target_modules=['all-linear'],
         r=LORA_RANK,
         lora_alpha=LORA_RANK * 2,
         lora_dropout=0.05,
     )
 
-    model = MultiLoraMegatronModel(
-        model_id=MODEL_ID,
-        device_mesh=model_mesh,
-        remote_group='model',
-        mixed_precision='bf16',
-    )
+    if USE_MEGATRON:
+        from twinkle.model.megatron import MegatronModel
+        model = MegatronModel(
+            model_id=MODEL_ID,
+            device_mesh=model_mesh,
+            remote_group='model',
+            mixed_precision='bf16',
+        )
+    else:
+        model = TransformersModel(
+            model_id=MODEL_ID,
+            device_mesh=model_mesh,
+            remote_group='model',
+        )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    model.set_optimizer('default', lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
-    model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE, adapter_name=ADAPTER_NAME)
-    model.set_loss('GRPOLoss', epsilon=0.2, adapter_name=ADAPTER_NAME)
-    model.set_processor(InputProcessor, adapter_name=ADAPTER_NAME)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, adapter_name=ADAPTER_NAME)
+    if USE_MEGATRON:
+        model.set_optimizer('default', lr=LEARNING_RATE)
+        model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
+    else:
+        model.set_optimizer('AdamW', lr=LEARNING_RATE)
+        model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
+
+    model.set_loss('GRPOLoss', epsilon=0.2)
+    model.set_processor(InputProcessor)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'tensor_parallel_size': SAMPLER_TP,
-            'gpu_memory_utilization': 0.8,
-            'max_model_len': 8192,
-            'max_lora_rank': LORA_RANK,
+            'gpu_memory_utilization': 0.7,
+            'max_model_len': 10000,
+            'max_lora_rank': LORA_RANK, # save as lora_config
             # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
+            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+            # meaning only sync lora weights, if merge_and_sync=True,
+            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
             'enable_tower_connector_lora': True,
         },
@@ -190,11 +175,7 @@ def main():
     )
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
-    # No CheckpointEngineManager — we sync via filesystem:
-    #   1. model.save() writes LoRA weights to a local directory (returns checkpoint_dir)
-    #   2. sampler.sample(adapter_path=...) tells vLLM to load from that directory
-    # NOTE: vLLM caches LoRA by path, so each save must use a unique directory name
-    #       to force vLLM to reload the updated weights.
+    ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
     GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     dataloader = DataLoader(
@@ -210,9 +191,7 @@ def main():
     sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95)
 
     optim_step = 0
-    lora_sync_path = None  # path of latest LoRA snapshot for vLLM
-
-    logger.info('Starting GSM8K GRPO training (MultiLoraMegatron, filesystem LoRA sync)')
+    logger.info('Starting GSM8K GRPO training (short reasoning)')
     logger.info(get_device_placement())
 
     for batch in dataloader:
@@ -224,21 +203,15 @@ def main():
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
 
-        # Save current LoRA weights to a unique directory for vLLM to load.
-        # Use a step-stamped path so vLLM cache doesn't serve stale weights.
-        lora_sync_path = model.save(
-            f'lora-sync-step-{optim_step}',
-            output_dir=LORA_SYNC_DIR,
-            adapter_name=ADAPTER_NAME,
-        )
-
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
+        ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
-        # Pass adapter_path so vLLM loads the LoRA from the local filesystem
         sample_responses = sampler.sample(
             expand_prompts,
             sampling_params,
-            adapter_path=lora_sync_path,
         )
         if sample_responses and sample_responses[0].sequences:
             first_decoded = sample_responses[0].sequences[0].decoded
@@ -280,24 +253,22 @@ def main():
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
                 micro_batch_size=MICRO_BATCH_SIZE,
-                adapter_name=ADAPTER_NAME,
             )
-            model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
+            model.clip_grad_and_step()
             optim_step += 1
 
             if optim_step >= MAX_STEPS:
                 break
             if optim_step % SAVE_STEPS == 0:
-                model.save(f'math-grpo-checkpoint-{optim_step}', adapter_name=ADAPTER_NAME)
+                model.save(f'math-grpo-checkpoint-{optim_step}')
 
         log_dict = metrics.calculate()
-        log_dict.update(model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME))
-        swanlab.log(log_dict)
+        log_dict.update(model.calculate_metric(is_training=True))
         metrics.reset()
         logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
-    model.save('math-grpo-final', adapter_name=ADAPTER_NAME)
+    model.save('math-grpo-final')
 
 
 if __name__ == '__main__':
