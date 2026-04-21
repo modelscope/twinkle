@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Any, Dict, Literal, Optional
 
+import torch
+
 from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
 
@@ -147,9 +149,9 @@ class AccelerateStrategy:
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+        import torch
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
-            import torch
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
             optim_state = get_optimizer_state_dict(model, optimizer, options=self._prepare_fsdp2_sd_options())
@@ -157,14 +159,13 @@ class AccelerateStrategy:
                 torch.save(optim_state, output_path)
             return
 
-        import torch
         if self.accelerator.process_index == 0:
             torch.save(optimizer.state_dict(), output_path)
 
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+        import torch
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
-            import torch
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
             optim_state = None
@@ -174,7 +175,6 @@ class AccelerateStrategy:
             set_optimizer_state_dict(model, optimizer, optim_state, options=self._prepare_fsdp2_sd_options())
             return
 
-        import torch
         optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
 
     def get_full_state_dict(self, model) -> dict:
