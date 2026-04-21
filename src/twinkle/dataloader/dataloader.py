@@ -151,6 +151,10 @@ class DataLoader:
             self._rebuild_sampler_stack()
             self.dataloader.__initialized = True
 
+    @remote_function()
+    def resume_from_checkpoint(self, consumed_train_samples, **kwargs):
+        self.skip_consumed_samples(consumed_train_samples)
+
     def _rebuild_sampler_stack(self):
         if self._base_batch_sampler is not None and hasattr(self._base_batch_sampler, 'sampler'):
             batch_sampler = copy.copy(self._base_batch_sampler)
