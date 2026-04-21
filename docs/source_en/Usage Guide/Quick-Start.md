@@ -232,7 +232,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train.py
 
 ### Resume from Checkpoint
 
-The local and `torchrun` training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py` together with `cookbook/transformers/resume_utils.py`.
+The local and `torchrun` training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py`.
 
 When saving a checkpoint intended for resumption, save both model weights and training progress:
 
@@ -256,28 +256,23 @@ To resume training, restore the checkpoint before entering the main loop:
 ```python
 from pathlib import Path
 
-from resume_utils import resume_from_checkpoint
-
 RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
 RESUME_ONLY_MODEL = False
 IGNORE_DATA_SKIP = False
 
 consumed_train_samples = 0
 if RESUME_FROM_CHECKPOINT:
-    consumed_train_samples = resume_from_checkpoint(
-        model=model,
-        dataloader=dataloader,
-        checkpoint_path=Path(RESUME_FROM_CHECKPOINT).expanduser().resolve(),
-        resume_only_model=RESUME_ONLY_MODEL,
-        ignore_data_skip=IGNORE_DATA_SKIP,
-        adapter_name='default',
-    )
+    checkpoint_path = str(Path(RESUME_FROM_CHECKPOINT).expanduser().resolve())
+    progress = model.resume_from_checkpoint(checkpoint_path, resume_only_model=RESUME_ONLY_MODEL)
+    consumed_train_samples = int(progress.get('consumed_train_samples', 0))
+    if not IGNORE_DATA_SKIP and consumed_train_samples > 0:
+        dataloader.resume_from_checkpoint(consumed_train_samples)
 ```
 
-This helper provides two common resume modes:
+This covers two common resume modes:
 
-- Full resume: restore weights, optimizer, scheduler, scaler, RNG state, and training progress, then skip consumed samples in the dataloader.
-- Weights-only resume: restore only model weights. This is useful when you want to continue with fresh optimizer state or intentionally restart the schedule.
+- Full resume (default): restore weights, optimizer, scheduler, scaler, RNG state, and training progress, then skip consumed samples in the dataloader.
+- Weights-only resume (`resume_only_model=True`): restore only model weights. This is useful when you want to continue with fresh optimizer state or intentionally restart the schedule.
 
 When `RESUME_ONLY_MODEL=True`, `IGNORE_DATA_SKIP=False` still skips already consumed samples based on `trainer_state.json`. If you want to reload weights but restart the dataset from the beginning, set `IGNORE_DATA_SKIP=True`.
 

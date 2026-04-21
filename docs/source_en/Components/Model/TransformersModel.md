@@ -62,4 +62,4 @@ for data in dataloader:
 
 For full-parameter training, restore model weights by constructing `TransformersModel` with the checkpoint path as `model_id`, for example `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`, and then call `resume_from_checkpoint(...)` to restore optimizer state and training progress.
 
-For end-to-end resume logic, including dataloader skipping, refer to `cookbook/transformers/fsdp2.py` and `cookbook/transformers/resume_utils.py`.
+For end-to-end resume logic, including dataloader skipping, refer to `cookbook/transformers/fsdp2.py`.

@@ -10,8 +10,6 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
-from resume_utils import resume_from_checkpoint
-
 logger = get_logger()
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
@@ -88,14 +86,14 @@ def train():
     consumed_train_samples = 0
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
-        consumed_train_samples = resume_from_checkpoint(
-            model=model,
-            dataloader=dataloader,
-            checkpoint_path=checkpoint_path,
-            resume_only_model=RESUME_ONLY_MODEL,
-            ignore_data_skip=IGNORE_DATA_SKIP,
-            adapter_name=ADAPTER_NAME,
-        )
+        kwargs = {}
+        if ADAPTER_NAME:
+            kwargs['adapter_name'] = ADAPTER_NAME
+        progress = model.resume_from_checkpoint(
+            str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
+        consumed_train_samples = int(progress.get('consumed_train_samples', 0))
+        if not IGNORE_DATA_SKIP and consumed_train_samples > 0:
+            dataloader.resume_from_checkpoint(consumed_train_samples)
 
     logger.info(get_device_placement())
     # Print the training config

@@ -62,4 +62,4 @@ for data in dataloader:
 
 对于全参训练，恢复模型权重时需要在创建 `TransformersModel` 时直接把 checkpoint 路径传给 `model_id`，例如 `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`，随后再调用 `resume_from_checkpoint(...)` 恢复优化器和训练进度。
 
-如果需要完整的断点续训流程，包括 dataloader 跳过已消费数据的逻辑，建议直接参考 `cookbook/transformers/fsdp2.py` 和 `cookbook/transformers/resume_utils.py`。
+如果需要完整的断点续训流程，包括 dataloader 跳过已消费数据的逻辑，建议直接参考 `cookbook/transformers/fsdp2.py`。
