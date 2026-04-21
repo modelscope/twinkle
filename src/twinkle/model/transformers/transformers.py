@@ -1060,44 +1060,34 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 device_module.set_rng_state(device_rng_state)
 
     @remote_function()
-    def read_training_progress(self, checkpoint_dir, **kwargs):
-        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
-        if not os.path.exists(trainer_state_path):
-            raise FileNotFoundError(trainer_state_path)
+    def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
+        adapter_name = kwargs.get('adapter_name', '')
 
-        with open(trainer_state_path, encoding='utf-8') as f:
+        has_adapter = (
+            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin'))
+        )
+        if has_adapter:
+            self.load(checkpoint_dir, adapter_name=adapter_name)
+
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        with open(trainer_state_path, 'r') as f:
             trainer_state = json.load(f)
 
-        required_keys = {'checkpoint_version', 'cur_step', 'gradient_accumulation_steps', 'consumed_train_samples'}
-        missing_keys = required_keys - trainer_state.keys()
-        if missing_keys:
-            raise ValueError(f'Missing trainer_state keys: {sorted(missing_keys)}')
-        return trainer_state
+        if not resume_only_model:
+            adapter_name = adapter_name or self._get_default_group()
+            optimizer_config = self.optimizer_group[adapter_name]
+            self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+            self._load_scaler_state(checkpoint_dir)
+            self._load_rng_state(checkpoint_dir)
+            optimizer_config.cur_step = trainer_state['cur_step']
+            optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
 
-    @remote_function()
-    def load_training_state(self, checkpoint_dir, **kwargs):
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-
-        required_paths = {
-            'trainer_state': os.path.join(checkpoint_dir, 'trainer_state.json'),
-            'optimizer': os.path.join(checkpoint_dir, 'optimizer.pt'),
-            'rng': os.path.join(checkpoint_dir, 'rng_state.pt'),
+        return {
+            'cur_step': trainer_state['cur_step'],
+            'consumed_train_samples': trainer_state['consumed_train_samples'],
+            'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
-        for path in required_paths.values():
-            if not os.path.exists(path):
-                raise FileNotFoundError(path)
-
-        trainer_state = self.read_training_progress(checkpoint_dir)
-        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name, strict=True)
-        scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
-        if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
-            self._load_scaler_state(scaler_path, adapter_name=adapter_name)
-        self._load_rng_state(required_paths['rng'])
-
-        optimizer_config.cur_step = trainer_state['cur_step']
-        optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
-        return trainer_state
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
