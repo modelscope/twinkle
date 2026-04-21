@@ -1078,8 +1078,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             adapter_name = adapter_name or self._get_default_group()
             optimizer_config = self.optimizer_group[adapter_name]
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
-            self._load_scaler_state(checkpoint_dir)
-            self._load_rng_state(checkpoint_dir)
+            scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
+            if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
+                self._load_scaler_state(scaler_path, adapter_name=adapter_name)
+            self._load_rng_state(os.path.join(checkpoint_dir, 'rng_state.pt'))
             optimizer_config.cur_step = trainer_state['cur_step']
             optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
 
