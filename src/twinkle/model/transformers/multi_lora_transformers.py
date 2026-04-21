@@ -251,7 +251,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
 
             if load_optimizer:
-                self.load_training_state(checkpoint_dir, adapter_name=adapter_name)
+                self.resume_from_checkpoint(checkpoint_dir, adapter_name=adapter_name)
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):
