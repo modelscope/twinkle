@@ -102,12 +102,11 @@ def train():
     consumed_train_samples = 0
     global_step = 0
     if resume_path:
-        logger.info(f'Resuming model weights from {resume_path}')
-        model.load(resume_path)
-        trainer_state = model.load_training_state(resume_path)
-        dataloader.skip_consumed_samples(trainer_state['consumed_train_samples'])
-        consumed_train_samples = int(trainer_state['consumed_train_samples'])
-        global_step = int(trainer_state['cur_step'])
+        logger.info(f'Resuming from checkpoint {resume_path}')
+        progress = model.resume_from_checkpoint(resume_path)
+        dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+        consumed_train_samples = int(progress['consumed_train_samples'])
+        global_step = int(progress['cur_step'])
 
     # Step 7: Run the training loop
     logger.info(model.get_train_configs().model_dump())
