@@ -55,28 +55,18 @@ class SamplerManagement(TaskQueueMixin):
         replica_context = serve.get_replica_context()
         replica_id = replica_context.replica_id.unique_id
 
-        # Initialize sampler based on type
-        if sampler_type == 'vllm':
-            from twinkle.sampler import vLLMSampler
-            sampler_kwargs = engine_args or {}
-            self.sampler = vLLMSampler(
-                model_id=model_id,
-                engine_args=sampler_kwargs,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=replica_id,
-                **{
-                    k: v
-                    for k, v in kwargs.items() if k not in ['engine_args']
-                })
-        else:
-            from twinkle.sampler import TorchSampler
-            self.sampler = TorchSampler(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                instance_id=replica_id,
-                remote_group=self.device_group.name,
-                **kwargs)
+        from twinkle.sampler import vLLMSampler
+        sampler_kwargs = engine_args or {}
+        self.sampler = vLLMSampler(
+            model_id=model_id,
+            engine_args=sampler_kwargs,
+            device_mesh=self.device_mesh,
+            remote_group=self.device_group.name,
+            instance_id=replica_id,
+            **{
+                k: v
+                for k, v in kwargs.items() if k not in ['engine_args']
+            })
 
         self.state: ServerStateProxy = get_server_state()
 

@@ -52,6 +52,8 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 # Set template for sampler based on model type
                 template = get_template_for_model(self.model_id)
                 self.sampler.set_template(template, model_id=self.model_id)
+                # Reset prefix cache for new weights
+                self.sampler.reset_prefix_cache()
 
                 # Get model_path from body or sampling session
                 model_path = body.model_path

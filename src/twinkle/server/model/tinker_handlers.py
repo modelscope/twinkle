@@ -261,8 +261,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 # Must save the checkpoint in the twinkle format before calling model.save()
                 tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=True)
                 logger.info(f'Saving weights to {save_dir}')
-                self.model.save(
-                    name=checkpoint_name, output_dir=save_dir, adapter_name=adapter_name, save_optimizer=False)
+                self.model.save(name='latest', output_dir=save_dir, adapter_name=adapter_name, save_optimizer=False)
                 payload = body.model_dump()
                 payload['model_path'] = tinker_path
                 metadata = await self.state.get_model_metadata(body.model_id) or {}
