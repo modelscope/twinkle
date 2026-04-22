@@ -345,6 +345,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         lora_request = None
         if adapter_path is not None:
+            logger.info(f'Loading LoRA from {adapter_path}')
             lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
             if lora_request is None:
                 logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '

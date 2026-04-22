@@ -388,6 +388,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         # Fast path: return cached request for this path.
         if lora_path in self._lora_request_cache:
+            logger.info(f'Using cached LoRA request for {lora_path}')
             return self._lora_request_cache[lora_path]
 
         if not os.path.exists(lora_path):

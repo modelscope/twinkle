@@ -359,8 +359,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             # Must save the checkpoint in the twinkle format before calling model.save()
             twinkle_path = checkpoint_manager.save(
                 model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
+            # For sampler weights the actual data is always written to 'latest/'.
+            model_save_name = 'latest' if body.is_sampler else checkpoint_name
             checkpoint_dir = self.model.save(
-                name=checkpoint_name,
+                name=model_save_name,
                 output_dir=save_dir,
                 adapter_name=adapter_name,
                 save_optimizer=body.save_optimizer,
