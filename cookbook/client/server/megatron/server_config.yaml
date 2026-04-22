@@ -39,15 +39,15 @@ applications:
   #    Used for generating text from the model (e.g., evaluating LoRA results).
   #    Config: TP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, ~37GB for KV cache + LoRA
   - name: sampler-Qwen3.6-35B-A3B
-    route_prefix: /api/v1/sampler/Qwen/Qwen3.6-35B-A3B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.6-27B
     import_path: sampler
     args:
-      model_id: "ms://Qwen/Qwen3.6-35B-A3B"  # ModelScope model identifier
+      model_id: "ms://Qwen/Qwen3.6-27B"  # ModelScope model identifier
       nproc_per_node: 4               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
-        max_model_len: 32000           # Maximum sequence length the engine supports
-        gpu_memory_utilization: 0.80   # 80% utilization, ~64GB/GPU, leaves buffer for safety
+        max_model_len: 65536           # Maximum sequence length the engine supports
+        gpu_memory_utilization: 0.75   # 80% utilization, ~64GB/GPU, leaves buffer for safety
         enable_lora: true             # Allow loading LoRA adapters during inference
         max_loras: 5                  # Max allowed loras working on vLLM at the same time
         max_lora_rank: 32             # Support up to rank 64 LoRA adapters
@@ -63,8 +63,8 @@ applications:
         tp_size: 2                  # 2 TP replicas for multi-tenant throughput
       queue_config:
         rps_limit: 20                               # Max requests per second
-        tps_limit: 32000                            # Max tokens per second
-        max_input_tokens: 32000
+        tps_limit: 131072                            # Max tokens per second
+        max_input_tokens: 65536
     deployments:
       - name: SamplerManagement
         autoscaling_config:
@@ -81,12 +81,12 @@ applications:
   # 2. Model Service - Hosts the base model for training.
   #    Config: PP=2 x DP=2 on 4 GPUs, ~27GB weights/GPU, comfortable for LoRA training
   - name: models-Qwen3.6-35B-A3B
-    route_prefix: /api/v1/model/Qwen/Qwen3.6-35B-A3B
+    route_prefix: /api/v1/model/Qwen/Qwen3.6-27B
     import_path: model
     args:
       use_megatron: true                          # Use Megatron-LM backend
-      model_id: "ms://Qwen/Qwen3.6-35B-A3B" # ModelScope model identifier
-      max_length: 32000                           # model max length
+      model_id: "ms://Qwen/Qwen3.6-27B" # ModelScope model identifier
+      max_length: 65536                           # model max length
       max_loras: 3                                # model max loras
       nproc_per_node: 4                           # Number of GPU processes per node
       device_group:
@@ -95,15 +95,13 @@ applications:
         device_type: cuda
       device_mesh:
         device_type: cuda
-        tp_size: 2
-        ep_size: 2
+        dp_size: 2
         pp_size: 2
-        sequence_parallel: True
 
       queue_config:
         rps_limit: 20                               # Max requests per second
-        tps_limit: 32000                            # Max tokens per second
-        max_input_tokens: 32000
+        tps_limit: 131072                            # Max tokens per second
+        max_input_tokens: 65536
       adapter_config:
         adapter_timeout: 120                       # Seconds before idle adapter unload
         adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)

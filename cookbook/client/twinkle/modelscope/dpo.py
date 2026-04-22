@@ -24,7 +24,7 @@ from twinkle.preprocessor import EmojiDPOProcessor
 logger = get_logger()
 
 # Configuration (direct values, not from env)
-base_model = 'Qwen/Qwen3.6-35B-A3B'
+base_model = 'Qwen/Qwen3.6-27B'
 base_url = 'http://www.modelscope.cn/twinkle'
 dataset_id = 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji'
 

@@ -16,7 +16,7 @@ init_tinker_client()
 
 from tinker import ServiceClient
 
-base_model = 'Qwen/Qwen3.6-35B-A3B'
+base_model = 'Qwen/Qwen3.6-27B'
 base_url = 'http://www.modelscope.cn/twinkle'
 
 # Step 2: Define the base model and connect to the server
