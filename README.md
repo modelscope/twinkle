@@ -144,7 +144,7 @@ supported on Twinkle✨ framework.
 > For serverless training service accessed via `base_url=https://www.modelscope.cn/twinkle`, it
 > is currently provided via the Tinker-compatible APIs. We will be rolling out services that support
 > both Tinker APIs, as well as the full-fledged Twinkle✨ native APIs. The serverless endpoint is backed
-> by one training base at a time, and currently it is [Qwen3.6-35B-A3B](https://modelscope.cn/models/Qwen/Qwen3.6-27B).
+> by one training base at a time, and currently it is [Qwen3.6-27B](https://modelscope.cn/models/Qwen/Qwen3.6-27B).
 
 | Model Type          | Model ID on [ModelScope](https://modelscope.cn)                                                                 |               Model Size                | Requires             | Support Megatron |                                                HF Model ID                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------------------|:---------------------------------------:|----------------------|:----------------:|:---------------------------------------------------------------------------------------------------------:|
