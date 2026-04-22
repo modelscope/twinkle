@@ -5,7 +5,7 @@ Uses MultiLoraMegatronModel with filesystem-based LoRA sync to vLLM sampler
 weights to a local directory, then passes the path to vLLMSampler via
 `adapter_path` so vLLM loads the latest adapter from disk.
 
-Model: Qwen/Qwen3.6-35B-A3B (MoE, 35B total / 3B active)
+Model: Qwen/Qwen3.6-27B (MoE, 35B total / 3B active)
 Model mesh: tp=2, ep=2, pp=2, sequence_parallel=True  (8 GPUs)
 Sampler mesh: dp=2, tp=2, gpus_per_worker=2            (4 GPUs)
 
@@ -35,7 +35,7 @@ from twinkle.preprocessor.llm import GSM8KProcessor
 logger = get_logger()
 
 # ========== Configuration ==========
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.6-35B-A3B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.6-27B')
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 2))
