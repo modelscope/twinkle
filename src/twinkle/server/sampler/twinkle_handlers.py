@@ -96,6 +96,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+                # Reset prefix cache only when new weights are loaded
+                self.sampler.reset_prefix_cache()
 
             # Parse inputs
             inputs = body.inputs
@@ -116,6 +118,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             if body.sampling_params:
                 params = SamplingParams.from_dict(body.sampling_params)
 
+            # Sample
             responses = self.sampler.sample(
                 inputs,
                 params,
