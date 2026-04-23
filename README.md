@@ -66,7 +66,7 @@ pip install -e .
 ### Use our docker image：
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.0
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
 ```
 
 If you need to use Twinkle's Client, you can use our one-click installation script:
