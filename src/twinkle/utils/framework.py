@@ -43,7 +43,7 @@ class Framework(ABC):
         output_objects = [object]
         group_size = 1
         if dist.is_available() and dist.is_initialized():
-            if Platform.device_prefix() == 'npu':
+            if Platform.device_prefix() == 'npu' and 'fsdp' not in device_mesh.mesh_dim_names:
                 # On NPU, letting Python object collectives use the default HCCL
                 # group previously hung in 8-card metric collection at
                 # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
