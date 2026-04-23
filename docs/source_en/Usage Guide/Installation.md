@@ -21,7 +21,7 @@ pip install -e .
 You can also use our pre-built Docker image:
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.0
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
 ```
 
 ## Client Installation
