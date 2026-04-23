@@ -778,22 +778,11 @@ class SequenceParallel:
     def _is_packed_position_ids(position_ids: Optional[torch.Tensor]) -> bool:
         """Heuristic: detect packed samples by multiple (0,1,...) resets in position_ids.
 
-        PackingDataset packs multiple sequences into one row by resetting position_ids to 0/1/... at each boundary.
+        Delegates to InputProcessor._is_packed_position_ids for a single
+        canonical implementation that also handles mrope (3D) position_ids.
         """
-        if position_ids is None or not torch.is_tensor(position_ids):
-            return False
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        if position_ids.dim() != 2:
-            return False
-        # A batch may contain multiple packed samples; consider it "packed" if any row is packed.
-        for i in range(position_ids.size(0)):
-            row = position_ids[i]
-            zero_count = int((row == 0).sum().item())
-            one_count = int((row == 1).sum().item())
-            if zero_count > 1 and one_count > 1:
-                return True
-        return False
+        from twinkle.processor.base import InputProcessor
+        return InputProcessor._is_packed_position_ids(position_ids)
 
     def prepare_inputs(self, inputs):
         """Prepare inputs
@@ -941,6 +930,18 @@ class SequenceParallelStrategy:
         gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
+        # Restore full-length position_ids so downstream unpack_packed_sequences
+        # can detect sequence boundaries.  Use sequence_parallel.pad() instead
+        # of simple end-padding: for ring attention (rp_world_size > 1), pad()
+        # pads each sub-sequence independently to match the per-sequence
+        # padding that gather() applies, keeping boundaries aligned.
+        if real_position_ids is not None:
+            pos = sequence_parallel.pad(
+                real_position_ids, padding_value=-1, position_ids=real_position_ids)
+            gathered_len = gathered_logps.shape[1]
+            if pos.shape[-1] < gathered_len:
+                pos = torch.nn.functional.pad(pos, (0, gathered_len - pos.shape[-1]), value=-1)
+            inputs['position_ids'] = pos
         return inputs, outputs
 
     def wrap_model(self, model, optimizer=None):

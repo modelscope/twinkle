@@ -388,8 +388,21 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 masked_labels[~loss_mask] = 0
                 output_tensor.div_(temperature)
                 logps = selective_log_softmax(output_tensor, masked_labels)
+                # Reconstruct full-length tensors from CP-split shards
                 logps = processor.postprocess_tensor_cp(logps)
                 batch['labels'] = processor.postprocess_tensor_cp(labels)
+                if 'position_ids' in batch:
+                    pos = batch['position_ids']
+                    # mrope position_ids may be [2, 1, seq] or [3, 1, seq];
+                    # postprocess_tensor_cp expects [batch, seq], so extract
+                    # the first spatial dimension for boundary detection.
+                    if pos.dim() == 3:
+                        pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                    batch['position_ids'] = processor.postprocess_tensor_cp(pos)
+                # Unpack packed sequences into per-sequence batch format
+                _outputs = {'logps': logps}
+                batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                logps = _outputs['logps']
             return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
 
         # Get Megatron's forward-backward function

@@ -169,78 +169,6 @@ class GRPOLoss(Loss):
 
         return result
 
-    @staticmethod
-    def _unpack_packed_logps(
-        logps: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-        position_ids: 'Optional[torch.Tensor]',
-        num_sequences: int,
-    ) -> 'tuple':
-        """Unpack packed (padding_free) tensors into per-sequence batch format.
-
-        In padding_free / packing mode, the processor concatenates all
-        sequences into a single row: ``[1, total_tokens]``.  This method
-        splits them back into ``[num_sequences, max_seq_len]`` so that
-        per-sequence operations (advantages broadcast, loss aggregation)
-        work correctly.
-
-        Sequence boundaries are detected from ``position_ids`` (which
-        resets to 0 at each boundary).  If ``position_ids`` is unavailable,
-        the method falls back to detecting contiguous non-masked (prompt)
-        gaps in the packed ``loss_mask``.
-
-        Args:
-            logps: ``[1, total_tokens]`` packed log-probabilities.
-            loss_mask: ``[1, total_tokens]`` packed loss mask.
-            position_ids: ``[1, total_tokens]`` packed position ids, or None.
-            num_sequences: Expected number of sequences in the pack.
-
-        Returns:
-            ``(logps, loss_mask)`` each of shape
-            ``[num_sequences, max_seq_len]``, right-padded with 0.
-        """
-        import torch
-
-        total_len = logps.shape[1]
-        logps_flat = logps.squeeze(0)  # [total_tokens]
-        mask_flat = loss_mask.squeeze(0)  # [total_tokens]
-
-        # ── Find sequence boundaries ─────────────────────────────────────
-        assert position_ids is not None, ('position_ids is required for unpacking packed sequences. '
-                                          'Ensure the processor passes position_ids in packing mode.')
-        pos_flat = position_ids.squeeze(0)  # [total_tokens]
-        # position_ids resets to 0 at each new sequence
-        boundary_indices = (pos_flat == 0).nonzero(as_tuple=True)[0]
-
-        # Deduplicate & sort
-        boundary_indices = boundary_indices.unique(sorted=True)
-
-        # Add end sentinel
-        boundaries = torch.cat([
-            boundary_indices,
-            torch.tensor([total_len], device=boundary_indices.device),
-        ])
-
-        # ── Split and pad ────────────────────────────────────────────────
-        seq_logps = []
-        seq_masks = []
-        n_seqs = min(boundaries.shape[0] - 1, num_sequences)
-        for i in range(n_seqs):
-            start = boundaries[i].item()
-            end = boundaries[i + 1].item()
-            seq_logps.append(logps_flat[start:end])
-            seq_masks.append(mask_flat[start:end])
-
-        max_len = max(s.shape[0] for s in seq_logps)
-        padded_logps = torch.zeros(n_seqs, max_len, dtype=logps.dtype, device=logps.device)
-        padded_masks = torch.zeros(n_seqs, max_len, dtype=loss_mask.dtype, device=loss_mask.device)
-        for i in range(n_seqs):
-            L = seq_logps[i].shape[0]
-            padded_logps[i, :L] = seq_logps[i]
-            padded_masks[i, :L] = seq_masks[i]
-
-        return padded_logps, padded_masks
-
     def __call__(
         self,
         inputs: Dict,
@@ -255,10 +183,11 @@ class GRPOLoss(Loss):
         Compute GRPO loss.
 
         Args:
-            inputs: Dict containing 'input_ids' and 'labels' [batch, seq_len].
-                In packing mode, also expects 'position_ids' [1, total_tokens].
+            inputs: Dict containing 'labels' [batch, seq_len].
+                In packing mode, the processor has already unpacked
+                logps and labels to [num_sequences, max_seq_len].
             outputs: Dict containing either:
-                - 'logps'/'log_probs': [batch, seq_len] pre-computed log probs, OR
+                - 'logps': [batch, seq_len] pre-computed log probs, OR
                 - 'logits': [batch, seq_len, vocab] from which logps will be computed
             old_logps: [batch, seq_len] or List[List[float]] log probs from old/sampling policy.
                       Can have ragged per-sample lengths — will be padded and aligned
@@ -283,28 +212,11 @@ class GRPOLoss(Loss):
             if logits.shape[1] != labels.shape[1]:
                 # some mllm return logits with image tokens, exclude here
                 logits = logits[:, -labels.shape[1]:]
-            # labels = torch.roll(labels, shifts=-1, dims=1)
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
             logps = selective_log_softmax(logits, masked_labels)
 
         device = logps.device
-
-        # ── Detect and handle packing mode ──────────────────────────────
-        # In padding_free / packing mode the processor concatenates all
-        # sequences into a single row [1, total_tokens].  We detect this
-        # by checking: batch_size == 1 but the actual number of sequences
-        # is greater than 1.
-        num_sequences = len(advantages) if isinstance(advantages, (list, tuple)) else advantages.shape[0]
-        is_packed = (logps.shape[0] == 1 and num_sequences > 1)
-        if is_packed:
-            position_ids = inputs.get('position_ids')
-            logps, loss_mask = self._unpack_packed_logps(
-                logps,
-                loss_mask,
-                position_ids,
-                num_sequences,
-            )
 
         # ── Prepare old_logps ────────────────────────────────────────────
         # old_logps may be ragged (List[List[float]]) containing only
