@@ -99,14 +99,10 @@ def train():
     # model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
-    consumed_train_samples = 0
-    global_step = 0
     if resume_path:
         logger.info(f'Resuming from checkpoint {resume_path}')
         progress = model.resume_from_checkpoint(resume_path)
         dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
-        consumed_train_samples = int(progress['consumed_train_samples'])
-        global_step = int(progress['cur_step'])
 
     # Step 7: Run the training loop
     logger.info(model.get_train_configs().model_dump())
@@ -119,8 +115,6 @@ def train():
 
             # Step
             model.clip_grad_and_step()
-            consumed_train_samples += len(batch)
-            global_step += 1
             # Equal to the following steps:
             # # Clip gradients to prevent exploding gradients (max norm = 1.0)
             # model.clip_grad_norm(1.0)
@@ -132,16 +126,17 @@ def train():
             # model.lr_step()
 
             # Log the loss every 2 steps (aligned with gradient accumulation)
-            if global_step % 2 == 0:
+            cur_step = dataloader.get_state()['consumed_train_samples'] // 4
+            if cur_step % 2 == 0:
                 # Print metric
                 metric = model.calculate_metric(is_training=True)
-                logger.info(f'Current is step {global_step} of {len(dataloader)}, metric: {metric.result}')
+                logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric.result}')
 
         # Step 8: Save the trained checkpoint
         twinkle_path = model.save(
             name=f'twinkle-epoch-{epoch}',
             save_optimizer=True,
-            consumed_train_samples=consumed_train_samples,
+            consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
         )
         logger.info(f'Saved checkpoint: {twinkle_path}')
 

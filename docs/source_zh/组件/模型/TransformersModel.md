@@ -59,6 +59,7 @@ for data in dataloader:
 - `model.resume_from_checkpoint(checkpoint_dir)` 恢复完整训练状态（权重、优化器、调度器、scaler、RNG），返回 `{'cur_step', 'consumed_train_samples', 'gradient_accumulation_steps'}`。
 - `model.resume_from_checkpoint(checkpoint_dir, resume_only_model=True)` 仅加载权重并返回进度元数据，不恢复优化器状态。
 - `dataloader.resume_from_checkpoint(consumed_train_samples)` 跳过已消费的样本。
+- `dataloader.get_state()` 返回 `{'consumed_train_samples': int}` — DataLoader 会自动追踪已消费样本数，无需手动维护计数器。
 
 对于全参训练，恢复模型权重时需要在创建 `TransformersModel` 时直接把 checkpoint 路径传给 `model_id`，例如 `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`，随后再调用 `resume_from_checkpoint(...)` 恢复优化器和训练进度。
 

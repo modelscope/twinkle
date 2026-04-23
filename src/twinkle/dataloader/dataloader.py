@@ -55,6 +55,7 @@ class DataLoader:
         self.device_mesh = device_mesh
         self.processor: Optional[InputProcessor] = None
         self._skip_samples = 0
+        self._consumed_train_samples = 0
         self._base_batch_sampler = None
         self._base_sampler = None
         self._retry_sampler_seed = self._resolve_retry_sampler_seed()
@@ -134,7 +135,12 @@ class DataLoader:
                 self.batch_size,
                 self.device_mesh,
                 max_retries=self.max_retries)
-        return _iter
+        return self._tracking_iter(_iter)
+
+    def _tracking_iter(self, inner):
+        for batch in inner:
+            self._consumed_train_samples += self.batch_size
+            yield batch
 
     @remote_function()
     def skip_consumed_samples(self, consumed_train_samples: int) -> None:
@@ -146,6 +152,7 @@ class DataLoader:
             return
 
         self._skip_samples = max(int(consumed_train_samples), 0)
+        self._consumed_train_samples = self._skip_samples
         if self.dataloader is not None:
             self.dataloader.__initialized = False
             self._rebuild_sampler_stack()
@@ -154,6 +161,10 @@ class DataLoader:
     @remote_function()
     def resume_from_checkpoint(self, consumed_train_samples, **kwargs):
         self.skip_consumed_samples(consumed_train_samples)
+
+    @remote_function()
+    def get_state(self) -> dict:
+        return {'consumed_train_samples': self._consumed_train_samples}
 
     def _rebuild_sampler_stack(self):
         if self._base_batch_sampler is not None and hasattr(self._base_batch_sampler, 'sampler'):

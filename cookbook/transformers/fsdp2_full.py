@@ -1,6 +1,5 @@
 from pathlib import Path
 
-from peft import LoraConfig
 from tqdm import tqdm
 
 import twinkle
@@ -18,24 +17,23 @@ TEMPLATE_NAME = 'Qwen3_5Template'
 MODEL_NAME = 'twinkle大模型'
 MODEL_AUTHOR = 'ModelScope社区'
 FSDP_SIZE = 2
-DP_SIZE = 4
+DP_SIZE = 1
 BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
-GRADIENT_ACCUMULATION_STEPS = 2
-LOG_INTERVAL = 20
-EVAL_INTERVAL = 40
+LEARNING_RATE = 1e-5
+WEIGHT_DECAY = 0.01
+GRADIENT_ACCUMULATION_STEPS = 1
+LOG_INTERVAL = 1
+EVAL_INTERVAL = 20
 EVAL_SAMPLES = 100
 TRAIN_SAMPLES = 1000
 
-OUTPUT_DIR = './output/fsdp2'
+import time
+OUTPUT_DIR = f'./output/fsdp2_full_{int(time.time())}'
 RESUME_FROM_CHECKPOINT = None
 RESUME_ONLY_MODEL = False
 IGNORE_DATA_SKIP = False
-ADAPTER_NAME = 'default'
 
-# Construct a device_mesh
 device_mesh = DeviceMesh.from_sizes(fsdp_size=FSDP_SIZE, dp_size=DP_SIZE)
-# use torchrun mode
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 
@@ -51,7 +49,6 @@ def save_checkpoint(model: TransformersModel, checkpoint_name: str, dataloader: 
     model.save(
         checkpoint_name,
         output_dir=OUTPUT_DIR,
-        adapter_name=ADAPTER_NAME,
         save_optimizer=True,
         consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
@@ -67,48 +64,37 @@ def evaluate(model):
 
 def train():
     dataset = build_dataset(TRAIN_SAMPLES)
-    # Global batch size = 8, for GPUs, so 1 sample per GPU
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
-    # Use a TransformersModel
+
     model = TransformersModel(model_id=MODEL_ID)
     model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
 
-    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
-
-    # Add a lora to model, with name `default`
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    # Add Optimizer for lora `default`
-    model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
-    # Add LRScheduler for lora `default`
-    model.set_lr_scheduler(
-        scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
+    model.set_optimizer(
+        optimizer_cls='AdamW',
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    )
+    model.set_lr_scheduler(scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
 
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
-        kwargs = {}
-        if ADAPTER_NAME:
-            kwargs['adapter_name'] = ADAPTER_NAME
-        progress = model.resume_from_checkpoint(
-            str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
+        progress = model.resume_from_checkpoint(str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL)
         if not IGNORE_DATA_SKIP:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 
     logger.info(get_device_placement())
-    # Print the training config
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
+
+    optimizer_group = model.optimizer_group['']
     best_loss = float('inf')
-    # lora: 8G * 8
-    # full: 18G * 8
+
     for batch in dataloader:
-        # Do forward and backward
         model.forward_backward(inputs=batch)
-        # Step
         model.clip_grad_and_step()
         cur_step = optimizer_group.cur_step
         if cur_step % LOG_INTERVAL == 0:
-            # Print metric
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric}')
         if cur_step > 0 and cur_step % EVAL_INTERVAL == 0:

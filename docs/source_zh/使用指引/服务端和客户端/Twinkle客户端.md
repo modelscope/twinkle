@@ -133,14 +133,10 @@ model.set_optimizer('Adam', lr=1e-4)
 # model.set_lr_scheduler('LinearLR')
 
 # Step 5: 恢复训练（可选）
-consumed_train_samples = 0
-global_step = 0
 if resume_path:
     logger.info(f'Resuming from checkpoint {resume_path}')
     progress = model.resume_from_checkpoint(resume_path)
     dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
-    consumed_train_samples = int(progress['consumed_train_samples'])
-    global_step = int(progress['cur_step'])
 
 # Step 6: 训练循环
 logger.info(model.get_train_configs().model_dump())

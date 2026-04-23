@@ -110,3 +110,16 @@ class DataLoader(object):
         response.raise_for_status()
         return response.json()["result"]
     
+
+    def get_state(self):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'get_state',
+                **{},
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    

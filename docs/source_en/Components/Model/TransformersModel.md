@@ -59,6 +59,7 @@ for data in dataloader:
 - `model.resume_from_checkpoint(checkpoint_dir)` restores full training state (weights, optimizer, scheduler, scaler, RNG) and returns `{'cur_step', 'consumed_train_samples', 'gradient_accumulation_steps'}`.
 - `model.resume_from_checkpoint(checkpoint_dir, resume_only_model=True)` loads weights only and returns progress metadata without restoring optimizer state.
 - `dataloader.resume_from_checkpoint(consumed_train_samples)` skips already-consumed samples.
+- `dataloader.get_state()` returns `{'consumed_train_samples': int}` — the dataloader automatically tracks consumed samples, so you don't need to maintain a counter manually.
 
 For full-parameter training, restore model weights by constructing `TransformersModel` with the checkpoint path as `model_id`, for example `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`, and then call `resume_from_checkpoint(...)` to restore optimizer state and training progress.
 

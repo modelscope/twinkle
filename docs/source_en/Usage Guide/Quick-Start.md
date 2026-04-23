@@ -237,19 +237,17 @@ The local and `torchrun` training loops above can be extended to support checkpo
 When saving a checkpoint intended for resumption, save both model weights and training progress:
 
 ```python
-consumed_train_samples = 0
-
-def save_checkpoint(model, checkpoint_name):
+def save_checkpoint(model, checkpoint_name, dataloader):
     model.save(
         checkpoint_name,
         output_dir='./output/fsdp2',
         adapter_name='default',
         save_optimizer=True,
-        consumed_train_samples=consumed_train_samples,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
 ```
 
-`save_optimizer=True` stores optimizer-related state, and `consumed_train_samples` is written into `trainer_state.json` so the dataloader can skip samples that have already been consumed.
+`save_optimizer=True` stores optimizer-related state, and `consumed_train_samples` is written into `trainer_state.json` so the dataloader can skip samples that have already been consumed. The `DataLoader` automatically tracks consumed samples internally — call `dataloader.get_state()` to retrieve the current count.
 
 To resume training, restore the checkpoint before entering the main loop:
 
@@ -260,13 +258,11 @@ RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
 RESUME_ONLY_MODEL = False
 IGNORE_DATA_SKIP = False
 
-consumed_train_samples = 0
 if RESUME_FROM_CHECKPOINT:
     checkpoint_path = str(Path(RESUME_FROM_CHECKPOINT).expanduser().resolve())
     progress = model.resume_from_checkpoint(checkpoint_path, resume_only_model=RESUME_ONLY_MODEL)
-    consumed_train_samples = int(progress.get('consumed_train_samples', 0))
-    if not IGNORE_DATA_SKIP and consumed_train_samples > 0:
-        dataloader.resume_from_checkpoint(consumed_train_samples)
+    if not IGNORE_DATA_SKIP:
+        dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 ```
 
 This covers two common resume modes:
