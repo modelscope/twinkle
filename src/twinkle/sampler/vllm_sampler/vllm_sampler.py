@@ -345,6 +345,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         lora_request = None
         if adapter_path is not None:
+            logger.info(f'Loading LoRA from {adapter_path}')
             lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
             if lora_request is None:
                 logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '
@@ -435,6 +436,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         self._run_in_loop(_receive_and_load())
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):
         """Gracefully shutdown the vLLM engine and background event loop.
 

@@ -39,7 +39,7 @@ class GatewayServer:
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models) or [
-            types.SupportedModel(model_name='Qwen/Qwen3.6-35B-A3B'),
+            types.SupportedModel(model_name='Qwen/Qwen3.6-27B'),
         ]
         self._modelscope_config_lock = asyncio.Lock()
 
