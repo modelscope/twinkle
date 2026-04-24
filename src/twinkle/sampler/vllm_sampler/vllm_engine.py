@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import inspect
 import os
+import re
 import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -94,6 +96,18 @@ class VLLMEngine(BaseSamplerEngine):
         # finishes a LoRA sync, so ``sample()`` never needs to call
         # ``list_loras()`` per request.
         self._synced_lora_request: Optional[Any] = None
+
+        # Long-lived CUDA IPC bucket reused across all update_weights()
+        # calls. Allocating a new IPC buffer (and hence a new IPC handle)
+        # per sync forces every worker to create a new CUDA IPC mapping via
+        # ``rebuild_cuda_tensor`` because PyTorch's ``shared_cache`` cannot
+        # hit on unseen storage handles. The driver reclaims those mappings
+        # lazily, which is the root cause of the slow GPU memory drift we
+        # observed under frequent LoRA syncs. By pinning a single buffer
+        # and its handle we guarantee the worker-side cache always hits.
+        self._ipc_buffer: Optional[torch.Tensor] = None
+        self._ipc_handle: Any = None
+        self._ipc_buffer_size: int = 0
 
         # Initialize engine
         self.engine = self._create_engine()
@@ -374,6 +388,7 @@ class VLLMEngine(BaseSamplerEngine):
 
         # Fast path: return cached request for this path.
         if lora_path in self._lora_request_cache:
+            logger.info(f'Using cached LoRA request for {lora_path}')
             return self._lora_request_cache[lora_path]
 
         if not os.path.exists(lora_path):
@@ -521,7 +536,14 @@ class VLLMEngine(BaseSamplerEngine):
         sync_id = uuid.uuid4().hex
         zmq_handle = f'ipc:///tmp/twinkle-ipc-{device_uuid}-{os.getpid()}-{sync_id}.sock'
 
+        env_bucket_mb = os.environ.get('TWINKLE_VLLM_BUCKET_SIZE_MB')
+        if env_bucket_mb is not None:
+            bucket_size_mb = int(env_bucket_mb)
+        if bucket_size_mb <= 0:
+            raise ValueError(f'bucket_size_mb must be > 0, got {bucket_size_mb}')
+
         bucket_size = bucket_size_mb << 20
+        lora_mode = bool(base_sync_done and peft_config)
 
         # Create transfer buffer
         buffer = None
@@ -529,8 +551,25 @@ class VLLMEngine(BaseSamplerEngine):
 
         if use_gpu_ipc:
             from torch.multiprocessing.reductions import reduce_tensor
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
-            ipc_handle = reduce_tensor(buffer)
+
+            # Reuse a long-lived IPC bucket whenever the requested size
+            # fits. The handle is produced once and shipped to every
+            # subsequent sync so each worker's ``shared_cache`` stays warm
+            # and no new CUDA IPC mapping is created per sync.
+            need_realloc = (
+                self._ipc_buffer is None or self._ipc_buffer_size < bucket_size
+                or self._ipc_buffer.device != first_tensor.device)
+            if need_realloc:
+                # Drop the old handle/buffer before allocating a bigger one
+                # so we do not briefly hold both and double the peak usage.
+                self._ipc_buffer = None
+                self._ipc_handle = None
+                self._ipc_buffer_size = 0
+                self._ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=first_tensor.device)
+                self._ipc_handle = reduce_tensor(self._ipc_buffer)
+                self._ipc_buffer_size = bucket_size
+            buffer = self._ipc_buffer
+            ipc_handle = self._ipc_handle
         else:
             from multiprocessing import shared_memory
             shm_name = f'twinkle_weights_{uuid.uuid4().hex}'
@@ -558,6 +597,8 @@ class VLLMEngine(BaseSamplerEngine):
             except zmq.error.Again as e:
                 raise RuntimeError(f'IPC timeout ({zmq_timeout_s}s) during {where} on {zmq_handle}') from e
 
+        n_weights = 0
+        worker_task: Optional['asyncio.Future'] = None
         try:
             # Launch worker side concurrently
             worker_task = asyncio.ensure_future(
@@ -584,10 +625,14 @@ class VLLMEngine(BaseSamplerEngine):
 
             offset = 0
             bucket_meta: list[dict] = []
-            n_weights = 0
+            current_expert_layer: Optional[str] = None
+
+            def _get_expert_layer_prefix(weight_name: str) -> Optional[str]:
+                m = re.match(r'^(.*\.mlp\.experts)\.\d+\.', weight_name)
+                return m.group(1) if m else None
 
             async def _flush_bucket(is_last: bool) -> None:
-                nonlocal offset, bucket_meta
+                nonlocal offset, bucket_meta, current_expert_layer
                 if not bucket_meta and not is_last:
                     return
                 if buffer.device.type != 'cpu':
@@ -603,6 +648,7 @@ class VLLMEngine(BaseSamplerEngine):
                 )
                 offset = 0
                 bucket_meta = []
+                current_expert_layer = None
 
             async for name, weight in _chain_first():
                 if use_shm and weight.device.type != 'cpu':
@@ -612,6 +658,15 @@ class VLLMEngine(BaseSamplerEngine):
 
                 weight_u8 = weight.view(-1).view(torch.uint8)
                 total_nbytes = int(weight_u8.numel())
+                expert_layer_prefix = _get_expert_layer_prefix(name) if lora_mode else None
+                if lora_mode and offset > 0:
+                    # Keep each expert layer in an isolated bucket to avoid sending
+                    # partial expert-layer weights.
+                    if current_expert_layer != expert_layer_prefix:
+                        await _flush_bucket(is_last=False)
+                if lora_mode:
+                    current_expert_layer = expert_layer_prefix
+
                 chunk_offset = 0
                 while chunk_offset < total_nbytes:
                     if offset >= bucket_size:
@@ -642,6 +697,10 @@ class VLLMEngine(BaseSamplerEngine):
             await worker_task
         finally:
             # Clean up — always release resources regardless of exceptions
+            if worker_task is not None and not worker_task.done():
+                worker_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await worker_task
             socket.close()
             zmq_ctx.term()
             if zmq_handle.startswith('ipc://'):
@@ -673,6 +732,10 @@ class VLLMEngine(BaseSamplerEngine):
 
         logger.info('Shutting down VLLMEngine...')
 
+        self._ipc_buffer = None
+        self._ipc_handle = None
+        self._ipc_buffer_size = 0
+
         if self.engine is not None:
             try:
                 # vLLM v1 AsyncLLM has shutdown() method
@@ -693,10 +756,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Force garbage collection
         gc.collect()
 
-        # Clear CUDA cache if available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, 'ipc_collect'):
-                torch.cuda.ipc_collect()
+        Torch.empty_cache()
+        Torch.ipc_collect()
 
         logger.info('VLLMEngine shutdown complete')

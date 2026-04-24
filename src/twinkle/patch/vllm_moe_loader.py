@@ -58,6 +58,16 @@ except ImportError:
     pass
 
 
+def patch_qwen35_moe_is_3d_moe_weight_false() -> None:
+    # expected_lora_modules : up_proj -> experts.0.up_proj
+    try:
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+
+        Qwen3_5MoeForConditionalGeneration.is_3d_moe_weight = False
+    except ImportError:
+        pass
+
+
 class VLLMMoEWeights(Patch):
 
     def __call__(self, model, **kwargs):

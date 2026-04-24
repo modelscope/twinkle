@@ -1007,6 +1007,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
+    def _ensure_lora_dtype(self, model):
+        """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
+        base_dtype = None
+        for param in model.parameters():
+            if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                base_dtype = param.dtype
+                break
+        if base_dtype is None:
+            return
+
+        # Convert all LoRA parameters to the base model dtype
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if 'lora_' in name.lower() and param.dtype != base_dtype:
+                    param.data = param.data.to(base_dtype)
+
     def _load_scaler_state(self, scaler_path, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1144,6 +1160,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
+        self._ensure_lora_dtype(self.model)
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config
