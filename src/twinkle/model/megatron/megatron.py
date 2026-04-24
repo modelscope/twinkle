@@ -412,6 +412,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         forward_backward_func = get_forward_backward_func()
         vpp_size = self.device_mesh.vpp_size
 
+        micro_batch_size = inputs[0]['input_ids'].shape[0]
         if vpp_size is None or vpp_size == 1:
             data_iter = iter(inputs)
         else:
@@ -475,9 +476,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
-        if logps and len({_logps.shape[1] for _logps in logps}) == 1:
+        if logps and not self.variable_seq_lengths:
             logps = torch.cat(logps, dim=0)
-        if logits and len({_logits.shape[1] for _logits in logits}) == 1:
+        if logits and not self.variable_seq_lengths:
             logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()
@@ -1375,7 +1376,13 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         kwargs['framework'] = 'megatron'
         # processor/base.py: self.device_mesh.cp_world_size
         kwargs['device_mesh'] = kwargs.get('device_mesh', self.device_mesh)
-        optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
+        processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
+        if processor.padding_free and not self.variable_seq_lengths:
+            raise ValueError('padding_free=True requires variable_seq_lengths=True in MegatronModel. '
+                             'Padding-free packing merges sequences into batch=1, making fixed-length '
+                             'microbatch slicing impossible. Set variable_seq_lengths=True when '
+                             'initializing MegatronModel to enable per-microbatch length communication.')
+        optimizer_config.processor = processor
 
     @remote_function(execute='first', lazy_collect=False)
     def get_train_configs(self, **kwargs):

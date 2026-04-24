@@ -17,6 +17,9 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: torch.Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Fields required by newer megatron-core TE attention (dynamic CP)
+    cp_group: object = None
+    local_cp_size: int = None
 
 
 @remote_class()
@@ -508,7 +511,7 @@ class InputProcessor:
                     continue
                 if key == 'position_ids' and is_mm_position_ids(values[0]):
                     # mrope needs to cat the sequence and unsequeeze the middle dim
-                    value = torch.cat(values, dim=2).unsqueeze(1)
+                    value = torch.cat(values, dim=-1).unsqueeze(1)
                 elif isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
@@ -555,8 +558,9 @@ class InputProcessor:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
             return [outputs]
-        elif variable_seq_lengths:
-            # each macro batch has its own length
+        padding_free = self.padding_free or self._any_packing(inputs)
+        if variable_seq_lengths or padding_free:
+            # each micro batch has its own packed length
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):

@@ -8,7 +8,32 @@ from typing import Optional
 
 from .platforms import Platform
 
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+def _parse_log_level(level) -> int:
+    """Parse log level from string or int.
+
+    Accepts:
+      - Standard names: 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+      - Numeric strings: '10', '20'
+      - Integers: 10, 20
+    """
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        level = level.strip().upper()
+        # Try numeric first
+        try:
+            return int(level)
+        except ValueError:
+            pass
+        # Try standard name
+        numeric = getattr(logging, level, None)
+        if isinstance(numeric, int):
+            return numeric
+    return logging.INFO
+
+
+log_level = _parse_log_level(os.getenv('LOG_LEVEL', 'INFO'))
 
 
 # Avoid circular reference
@@ -25,6 +50,44 @@ logger_format = logging.Formatter('[%(asctime)s][%(levelname)s:%(name)s] %(messa
 
 info_set = set()
 warning_set = set()
+
+
+def _rank_info(self, msg, *args, ranks='master', **kwargs):
+    """Log at INFO level with rank control.
+
+    Args:
+        ranks: 'master' (default) - only local rank 0;
+               'all' - every rank (prefixed with rank id).
+    """
+    if ranks == 'all':
+        rank = Platform.get_local_rank()
+        tagged = f'[rank{rank}] {msg}'
+        if _is_local_master():
+            self._original_info(tagged, *args, **kwargs)
+        else:
+            with logger_context(self, logging.INFO):
+                self._original_info(tagged, *args, **kwargs)
+    else:
+        self._original_info(msg, *args, **kwargs)
+
+
+def _rank_warning(self, msg, *args, ranks='master', **kwargs):
+    """Log at WARNING level with rank control.
+
+    Args:
+        ranks: 'master' (default) - only local rank 0;
+               'all' - every rank (prefixed with rank id).
+    """
+    if ranks == 'all':
+        rank = Platform.get_local_rank()
+        tagged = f'[rank{rank}] {msg}'
+        if _is_local_master():
+            self._original_warning(tagged, *args, **kwargs)
+        else:
+            with logger_context(self, logging.WARNING):
+                self._original_warning(tagged, *args, **kwargs)
+    else:
+        self._original_warning(msg, *args, **kwargs)
 
 
 def info_if(self, msg, cond, *args, **kwargs):
@@ -70,8 +133,9 @@ def get_logger(log_file: Optional[str] = None,
         only_local_master: Output log only when it's local master, default True.
     """
     if log_level is None:
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-        log_level = getattr(logging, log_level, logging.INFO)
+        log_level = _parse_log_level(os.getenv('LOG_LEVEL', 'INFO'))
+    elif isinstance(log_level, str):
+        log_level = _parse_log_level(log_level)
     logger_name = __name__.split('.')[0]
     logger = logging.getLogger(logger_name)
     logger.propagate = False
@@ -111,6 +175,11 @@ def get_logger(log_file: Optional[str] = None,
 
     init_loggers[logger_name] = True
 
+    # Preserve originals before overriding, for rank-aware wrappers
+    logger._original_info = logger.info
+    logger._original_warning = logger.warning
+    logger.info = MethodType(_rank_info, logger)
+    logger.warning = MethodType(_rank_warning, logger)
     logger.info_once = MethodType(info_once, logger)
     logger.warning_once = MethodType(warning_once, logger)
     logger.info_if = MethodType(info_if, logger)
@@ -119,8 +188,6 @@ def get_logger(log_file: Optional[str] = None,
 
 
 logger = get_logger(log_level=log_level)
-
-logger.handlers[0].setFormatter(logger_format)
 
 
 @contextmanager

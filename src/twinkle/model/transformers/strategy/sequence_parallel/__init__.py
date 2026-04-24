@@ -936,8 +936,7 @@ class SequenceParallelStrategy:
         # pads each sub-sequence independently to match the per-sequence
         # padding that gather() applies, keeping boundaries aligned.
         if real_position_ids is not None:
-            pos = sequence_parallel.pad(
-                real_position_ids, padding_value=-1, position_ids=real_position_ids)
+            pos = sequence_parallel.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
             gathered_len = gathered_logps.shape[1]
             if pos.shape[-1] < gathered_len:
                 pos = torch.nn.functional.pad(pos, (0, gathered_len - pos.shape[-1]), value=-1)
