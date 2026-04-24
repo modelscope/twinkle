@@ -43,7 +43,7 @@ class Framework(ABC):
         output_objects = [object]
         group_size = 1
         if dist.is_available() and dist.is_initialized():
-            if Platform.device_prefix() == 'npu':
+            if Platform.device_prefix() == 'npu' and not device_mesh.has_dim('fsdp'):
                 # On NPU, letting Python object collectives use the default HCCL
                 # group previously hung in 8-card metric collection at
                 # ``dist.all_gather_object(...)``. Reuse Megatron's dedicated Gloo
@@ -51,8 +51,9 @@ class Framework(ABC):
                 # variant, otherwise the rank span for metric aggregation is wrong.
                 if importlib.util.find_spec('megatron.core') is not None:
                     from megatron.core import parallel_state as mpu
-                    process_group = mpu.get_data_parallel_group_gloo(
-                        with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
+                    if mpu.model_parallel_is_initialized():
+                        process_group = mpu.get_data_parallel_group_gloo(
+                            with_context_parallel=getattr(device_mesh, 'cp_world_size', 1) > 1)
             group_size = dist.get_world_size(group=process_group)
         if group_size > 1:
             output_objects = [None for _ in range(group_size)]
