@@ -8,7 +8,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.utils import is_torch_npu_available
+from twinkle.utils.framework import Torch
 from twinkle.kernel import apply_npu_patch
 
 # Construct a device_mesh, fsdp=4, dp=2
@@ -20,7 +20,7 @@ logger = get_logger()
 
 
 # npu patch
-if is_torch_npu_available():
+if Torch.is_npu_available():
     apply_npu_patch()
 
 

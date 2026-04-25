@@ -78,11 +78,3 @@ def copy_files_by_pattern(source_dir, dest_dir, patterns, exclude_patterns=None)
                     if not os.path.exists(destination):
                         shutil.copy2(file_path, destination)
 
-
-def is_torch_npu_available():
-    try:
-        import torch
-        import torch_npu  # noqa: F401
-        return hasattr(torch, 'npu') and torch.npu.is_available()
-    except Exception:
-        return False

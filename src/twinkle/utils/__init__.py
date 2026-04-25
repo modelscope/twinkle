@@ -14,5 +14,5 @@ from .torch_utils import (pad_and_stack_tensors, pad_sequence_to_length, selecti
                           stateless_init_process_group, to_device)
 from .transformers_utils import find_all_linears, find_layers, get_modules_to_not_convert
 from .unsafe import check_unsafe, trust_remote_code
-from .utils import copy_files_by_pattern, deep_getattr, is_torch_npu_available
+from .utils import copy_files_by_pattern, deep_getattr
 from .vision_tools import load_image, load_mm_file
