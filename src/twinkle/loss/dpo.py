@@ -312,7 +312,6 @@ class DPOLoss(PreferenceLossBase):
             # Per-token reference log probs provided, need to align and sum
             if not torch.is_tensor(ref_logps):
                 ref_logps = torch.as_tensor(ref_logps)
-            breakpoint()
             ref_logps_aligned = self._align_logps(ref_logps, labels.shape, device, dtype)
             ref_chosen, ref_rejected = self._split_chosen_rejected(ref_logps_aligned)
             reference_chosen_logps = self._compute_sequence_logps(ref_chosen, chosen_labels)
