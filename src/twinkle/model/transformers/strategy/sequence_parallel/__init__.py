@@ -930,11 +930,6 @@ class SequenceParallelStrategy:
         gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
-        # Restore full-length position_ids so downstream unpack_packed_sequences
-        # can detect sequence boundaries.  Use sequence_parallel.pad() instead
-        # of simple end-padding: for ring attention (rp_world_size > 1), pad()
-        # pads each sub-sequence independently to match the per-sequence
-        # padding that gather() applies, keeping boundaries aligned.
         if real_position_ids is not None:
             pos = sequence_parallel.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
             gathered_len = gathered_logps.shape[1]

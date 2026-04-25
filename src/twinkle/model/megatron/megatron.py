@@ -393,9 +393,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 batch['labels'] = processor.postprocess_tensor_cp(labels)
                 if 'position_ids' in batch:
                     pos = batch['position_ids']
-                    # mrope position_ids may be [2, 1, seq] or [3, 1, seq];
-                    # postprocess_tensor_cp expects [batch, seq], so extract
-                    # the first spatial dimension for boundary detection.
                     if pos.dim() == 3:
                         pos = pos[0]  # [2/3, 1, seq] → [1, seq]
                     batch['position_ids'] = processor.postprocess_tensor_cp(pos)
@@ -1381,8 +1378,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if processor.padding_free and not self.variable_seq_lengths:
             raise ValueError('padding_free=True requires variable_seq_lengths=True in MegatronModel. '
                              'Padding-free packing merges sequences into batch=1, making fixed-length '
-                             'microbatch slicing impossible. Set variable_seq_lengths=True when '
-                             'initializing MegatronModel to enable per-microbatch length communication.')
+                             'microbatch slicing impossible.')
         optimizer_config.processor = processor
 
     @remote_function(execute='first', lazy_collect=False)
