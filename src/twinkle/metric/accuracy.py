@@ -23,8 +23,6 @@ class Accuracy(Metric):
         assert not isinstance(inputs, list), 'Accuracy does not support list InputFeature yet.'
         labels = inputs['labels']
         logits = outputs['logits']
-        if logits is None:
-            return
         output_token_ids = logits.argmax(dim=-1)
         mask = inputs.get('completion_mask')
         if mask is not None:
@@ -35,11 +33,6 @@ class Accuracy(Metric):
             labels = labels[..., -output_token_ids.shape[-1]:]
             if mask is not None and mask.shape != output_token_ids.shape:
                 mask = mask[..., -output_token_ids.shape[-1]:]
-
-        # After alignment, if shapes still mismatch (e.g. SP-split logits vs
-        # gathered labels), skip this step rather than crashing.
-        if labels.shape != output_token_ids.shape:
-            return
 
         if mask is None:
             mask = labels != -100

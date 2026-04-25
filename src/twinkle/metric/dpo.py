@@ -114,7 +114,7 @@ class DPOMetric(Metric):
 
         # Compute sequence-level logps
         seq_logps = self._compute_sequence_logps(logps, labels)
-
+        breakpoint()
         # DPO requires interleaved [chosen, rejected, ...] pairs → batch must be even
         assert seq_logps.shape[0] % 2 == 0, (
             f'DPO metric requires an even batch size (interleaved chosen/rejected pairs), '

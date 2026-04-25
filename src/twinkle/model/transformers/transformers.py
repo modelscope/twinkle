@@ -53,7 +53,6 @@ class OptimizerGroup(BaseOptimizerGroup):
     scaler_has_nan: bool = False
     checkpoint_engine: CheckpointEngine = None
     _handler: Any = None
-    _sp_strategy: Any = None
 
     def __post_init__(self):
         self._ensure_dp_group()
@@ -104,18 +103,10 @@ class OptimizerGroup(BaseOptimizerGroup):
         self._ensure_dp_group()
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
-            inputs = status.inputs
-            outputs = status.outputs
-            # When sequence-parallel is active, the raw status tensors are
-            # still SP-split and packed.  Gather + unpack them so that
-            # metrics (Accuracy, DPO, …) always see per-sequence batches.
-            if self._sp_strategy is not None and self.processor is not None:
-                inputs, outputs = self.processor.postprocess_tensor_sp(
-                    inputs, outputs, sp_strategy=self._sp_strategy)
             for metric in status.metrics:
                 metric.accumulate(
-                    inputs,
-                    outputs,
+                    status.inputs,
+                    status.outputs,
                     lr=self._get_lr(),
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -378,7 +369,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
         labels: torch.Tensor = inputs.pop('labels', None)
-        optimizer_config._sp_strategy = self.sp_strategy
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
         inputs['labels'] = labels
@@ -433,12 +423,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
             labels = inputs.pop('labels', None)
-            optimizer_config._sp_strategy = self.sp_strategy
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
-                    # disable_adapter does not support fsdp2
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
@@ -458,15 +446,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             outputs['past_key_values'] = None
             if not return_logits:
                 outputs['logits'] = None
-            # When SP is active, gather + unpack logps in the *return* value
-            # so that callers (e.g. DPO loss using ref_outputs) receive
-            # full-length per-sequence logps matching the unpacked labels.
-            # The raw SP-split data stored in eval_status is kept as-is;
-            # accumulate_metrics handles its own postprocess.
-            if self.sp_strategy is not None and outputs.get('logps') is not None:
-                _pp_inputs, _pp_outputs = processor.postprocess_tensor_sp(
-                    inputs, outputs, sp_strategy=self.sp_strategy)
-                outputs['logps'] = _pp_outputs['logps']
             return outputs
 
     @remote_function(collect='mean')
@@ -984,6 +963,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = torch.load(scheduler_path, map_location='cpu')
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
+    def _ensure_lora_dtype(self, model):
+        """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
+        base_dtype = None
+        for param in model.parameters():
+            if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                base_dtype = param.dtype
+                break
+        if base_dtype is None:
+            return
+
+        # Convert all LoRA parameters to the base model dtype
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if 'lora_' in name.lower() and param.dtype != base_dtype:
+                    param.data = param.data.to(base_dtype)
+
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
@@ -1040,6 +1035,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
+        self._ensure_lora_dtype(self.model)
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config

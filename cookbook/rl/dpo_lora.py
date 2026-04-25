@@ -195,7 +195,7 @@ def main():
 
     policy_model.set_loss(loss_fn)
     policy_model.add_metric(DPOMetric, beta=DPO_BETA)
-    policy_model.set_processor(InputProcessor, padding_free=False)
+    policy_model.set_processor(InputProcessor, padding_free=True)
     policy_model.set_template('Template', model_id=MODEL_ID)
 
     optim_step = 0
