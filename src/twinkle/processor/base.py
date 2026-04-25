@@ -138,8 +138,8 @@ class InputProcessor:
         """
         sp_strategy = kwargs.get('sp_strategy')
         if self.framework == 'transformers' and sp_strategy is not None:
-            inputs, outputs = sp_strategy.gather_loss_tensors(inputs, outputs)
-        return self.unpack_packed_sequences(inputs, outputs)
+            return sp_strategy.gather_loss_tensors(inputs, outputs)
+        return inputs, outputs
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
 
@@ -384,17 +384,19 @@ class InputProcessor:
         *tensors: 'torch.Tensor',
         padding_values: Optional[List] = None,
     ) -> 'List[torch.Tensor]':
-        """Split packed ``[1, total_tokens]`` tensors into ``[num_seqs, max_seq_len]``.
+        """Split packed tensors into ``[num_seqs, max_seq_len, ...]``.
 
         Sequence boundaries are detected where ``position_ids`` resets to 0.
+        Each tensor may have arbitrary trailing dimensions (e.g. ``[1, T]``
+        for labels/logps or ``[1, T, V]`` for logits).
 
         Args:
             position_ids: ``[1, T]`` or ``[3, 1, T]`` (mrope) packed position ids.
-            *tensors: Tensors to unpack, each ``[1, T]`` or broadcastable.
+            *tensors: Tensors to unpack; leading dims are squeezed to ``[T, ...]``.
             padding_values: Per-tensor fill value for right-padding (default 0).
 
         Returns:
-            List of unpacked tensors, each ``[num_seqs, max_seq_len]``.
+            List of unpacked tensors, each ``[num_seqs, max_seq_len, ...]``.
         """
         pos = position_ids
         if pos.dim() == 3:
@@ -411,10 +413,12 @@ class InputProcessor:
 
         results = []
         for tensor, pad_val in zip(tensors, padding_values):
-            flat = tensor.view(-1)
-            seqs = [flat[boundaries[i]:boundaries[i + 1]] for i in range(n_seqs)]
+            # Normalize to [T, ...] (squeeze batch-1 dim if present)
+            t = tensor.squeeze(0) if tensor.dim() >= 2 and tensor.shape[0] == 1 else tensor
+            trailing = t.shape[1:]
+            seqs = [t[boundaries[i]:boundaries[i + 1]] for i in range(n_seqs)]
             max_len = max(s.shape[0] for s in seqs)
-            out = flat.new_full((n_seqs, max_len), pad_val)
+            out = t.new_full((n_seqs, max_len, *trailing), pad_val)
             for i, s in enumerate(seqs):
                 out[i, :s.shape[0]] = s
             results.append(out)
@@ -428,9 +432,9 @@ class InputProcessor:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
-        When the batch is packed (detected from ``position_ids``), unpacks
-        ``labels`` from ``[1, total_tokens]`` to ``[num_sequences, max_seq_len]``.
-        If *outputs* is provided and contains ``logps``, those are unpacked too.
+        Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
+        from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
+        Keys that are ``None`` are silently skipped.
         """
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')
@@ -441,18 +445,24 @@ class InputProcessor:
             return inputs, outputs
 
         from copy import copy
-        logps = outputs.get('logps') if outputs else None
-        if logps is not None:
-            unpacked_logps, unpacked_labels = self._unpack_by_position_ids(
-                position_ids, logps, labels, padding_values=[0, -100])
-            outputs = copy(outputs)
-            outputs['logps'] = unpacked_logps
-        else:
-            (unpacked_labels,) = self._unpack_by_position_ids(
-                position_ids, labels, padding_values=[-100])
+        # Collect output keys to unpack: (key, pad_value)
+        output_keys = []
+        for key, pad_val in [('logps', 0), ('logits', 0)]:
+            if outputs and outputs.get(key) is not None:
+                output_keys.append((key, pad_val))
+
+        all_tensors = [labels] + [outputs[k] for k, _ in output_keys]
+        all_pads = [-100] + [p for _, p in output_keys]
+        unpacked = self._unpack_by_position_ids(position_ids, *all_tensors, padding_values=all_pads)
 
         inputs = copy(inputs)
-        inputs['labels'] = unpacked_labels
+        inputs['labels'] = unpacked[0]
+
+        if output_keys:
+            outputs = copy(outputs)
+            for i, (key, _) in enumerate(output_keys):
+                outputs[key] = unpacked[i + 1]
+
         return inputs, outputs
 
     def unpack_inputs(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

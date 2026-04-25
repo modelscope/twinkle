@@ -22,7 +22,9 @@ class Accuracy(Metric):
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         assert not isinstance(inputs, list), 'Accuracy does not support list InputFeature yet.'
         labels = inputs['labels']
-        logits = outputs['logits']
+        logits = outputs.get('logits')
+        if logits is None:
+            return
         output_token_ids = logits.argmax(dim=-1)
         mask = inputs.get('completion_mask')
         if mask is not None:
@@ -56,10 +58,13 @@ class Accuracy(Metric):
 
         total_correct = sum(r['correct'] for r in all_results)
         total_count = sum(r['total'] for r in all_results)
-        accuracy = total_correct / total_count if total_count > 0 else np.nan
         self.reset()
-        return {
-            'accuracy': f'{accuracy:.2f}',
-            'correct_tokens': total_correct,
-            'total_tokens': total_count,
-        }
+        if total_count > 0:
+            accuracy = total_correct / total_count
+            return {
+                'accuracy': f'{accuracy:.2f}',
+                'correct_tokens': total_correct,
+                'total_tokens': total_count,
+            }
+        else:
+            return {}
