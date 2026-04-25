@@ -423,36 +423,41 @@ class InputProcessor:
     def unpack_packed_sequences(
         self,
         inputs: Dict[str, Any],
-        outputs: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        outputs: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
         When the batch is packed (detected from ``position_ids``), unpacks
-        ``logps`` and ``labels`` from ``[1, total_tokens]`` to
-        ``[num_sequences, max_seq_len]``.
-
-        Losses that use ``logits`` directly (GKD, CE-from-logits) are
-        unaffected because they never read ``logps``.
+        ``labels`` from ``[1, total_tokens]`` to ``[num_sequences, max_seq_len]``.
+        If *outputs* is provided and contains ``logps``, those are unpacked too.
         """
-        logps = outputs.get('logps')
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')
 
-        if logps is None or labels is None or position_ids is None:
+        if labels is None or position_ids is None:
             return inputs, outputs
         if not self._is_packed_position_ids(position_ids):
             return inputs, outputs
 
         from copy import copy
-        unpacked_logps, unpacked_labels = self._unpack_by_position_ids(
-            position_ids, logps, labels, padding_values=[0, -100])
+        logps = outputs.get('logps') if outputs else None
+        if logps is not None:
+            unpacked_logps, unpacked_labels = self._unpack_by_position_ids(
+                position_ids, logps, labels, padding_values=[0, -100])
+            outputs = copy(outputs)
+            outputs['logps'] = unpacked_logps
+        else:
+            (unpacked_labels,) = self._unpack_by_position_ids(
+                position_ids, labels, padding_values=[-100])
 
         inputs = copy(inputs)
-        outputs = copy(outputs)
-        outputs['logps'] = unpacked_logps
         inputs['labels'] = unpacked_labels
         return inputs, outputs
+
+    def unpack_inputs(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Unpack a list of packed microbatch inputs into per-sequence format."""
+        return [self.unpack_packed_sequences(inp)[0] for inp in inputs]
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
