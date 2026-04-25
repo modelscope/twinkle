@@ -438,6 +438,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             unwrapped_model = self.strategy.unwrap_model(self.model)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
+                    # disable_adapter does not support fsdp2
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
