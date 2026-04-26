@@ -410,7 +410,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 logps = _outputs['logps']
                 unpacked_logits = _outputs.get('logits', None)
             return output_tensor, partial(
-                post_loss_function, inputs=batch, logps=logps,
+                post_loss_function,
+                inputs=batch,
+                logps=logps,
                 unpacked_logits=unpacked_logits,
             )
 

@@ -445,6 +445,7 @@ class InputProcessor:
             return inputs, outputs
 
         from copy import copy
+
         # Collect output keys to unpack: (key, pad_value)
         output_keys = []
         for key, pad_val in [('logps', 0), ('logits', 0)]:
