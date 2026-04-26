@@ -57,7 +57,7 @@ class SamplingParams:
         if self.max_tokens is not None:
             if not isinstance(self.max_tokens, int):
                 raise ValueError(f'max_tokens must be an int or None, got {type(self.max_tokens)}')
-            if self.max_tokens < 1:
+            if self.max_tokens < 0:
                 raise ValueError(f'max_tokens must be >= 1, got {self.max_tokens}')
 
         if not isinstance(self.repetition_penalty, (int, float)):

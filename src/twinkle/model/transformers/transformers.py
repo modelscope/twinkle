@@ -366,6 +366,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
+        loss_instance = optimizer_config.loss_instance
+        loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
         labels: torch.Tensor = inputs.pop('labels', None)
@@ -379,17 +381,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        outputs = copy(outputs)
         outputs['past_key_values'] = None
-        if not return_logits:
+        _outputs = copy(outputs)
+        logits = outputs['logits']
+        if not loss_require_logits:
             outputs['logits'] = None
-        loss_inputs, loss_outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
+        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
         inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
         optimizer_config.train_status.inputs = inputs
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
         optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
-        return outputs
+        if return_logits:
+            _outputs['logits'] = logits
+        else:
+            _outputs['logits'] = None
+        if not return_logits and not loss_require_logits:
+            del logits
+        return _outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -423,6 +432,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
+            loss_instance = optimizer_config.loss_instance
+            loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
             inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
@@ -440,9 +451,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 logits = outputs['logits']
                 logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
-            outputs = copy(outputs)
             outputs['past_key_values'] = None
-            if not return_logits:
+            _outputs = copy(outputs)
+            logits = outputs['logits']
+            if not loss_require_logits:
                 outputs['logits'] = None
             inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
             inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
@@ -450,7 +462,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
             optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-            return outputs
+            if return_logits:
+                _outputs['logits'] = logits
+            else:
+                _outputs['logits'] = None
+            if not return_logits and not loss_require_logits:
+                del logits
+            return _outputs
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):

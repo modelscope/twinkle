@@ -317,7 +317,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Check actual sequence_parallel setting from model config
         # Bridge may auto-enable sequence_parallel for MoE models
         if self.variable_seq_lengths:
-            seq_length = 4096
+            seq_length = max(inp['input_ids'].shape[-1] for inp in inputs)
         else:
             original_seq_length = inputs[0]['input_ids'].shape[1] * (cp_size or 1)
             if cp_size > 1:
@@ -349,12 +349,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs, logps):
+        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
-            outputs = ModelOutput(logits=output_tensor, logps=logps)
+            logits = unpacked_logits if unpacked_logits is not None else output_tensor
+            outputs = ModelOutput(logits=logits, logps=logps)
             result = loss_instance(inputs, outputs, **current_kwargs)
+            if unpacked_logits is not None:
+                outputs.pop('logits', None)
+                del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
@@ -382,6 +386,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**batch)
             batch['labels'] = labels
             logps = None
+            unpacked_logits = None
+            _loss_instance = loss_instance
             if labels is not None and mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
@@ -398,9 +404,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     batch['position_ids'] = processor.postprocess_tensor_cp(pos)
                 # Unpack packed sequences into per-sequence batch format
                 _outputs = {'logps': logps}
+                if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                    _outputs['logits'] = output_tensor
                 batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
                 logps = _outputs['logps']
-            return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
+                unpacked_logits = _outputs.get('logits', None)
+            return output_tensor, partial(
+                post_loss_function, inputs=batch, logps=logps,
+                unpacked_logits=unpacked_logits,
+            )
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
