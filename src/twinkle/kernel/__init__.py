@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union
 from .base import DeviceType, ModeType, is_kernels_enabled
 from .function import apply_function_kernel, register_function_kernel
 from .layer import apply_layer_kernel, register_layer_batch, register_layer_kernel
+from .monkey_patch_npu import apply_npu_patch
 from .registry import register_external_layer as _register_external_layer
 
 logger = getLogger(__name__)
