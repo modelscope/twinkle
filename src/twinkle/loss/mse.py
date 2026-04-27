@@ -5,6 +5,8 @@ from .base import Loss
 
 class MSELoss(Loss):
 
+    require_logits = True
+
     def __call__(self, inputs, outputs, **kwargs):
         import torch
         preds = outputs['logits']
