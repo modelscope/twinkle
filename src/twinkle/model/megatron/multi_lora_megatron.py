@@ -1,20 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
+import numpy as np
 import os
 import random
 import re
-from contextlib import contextmanager
-from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
-
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from contextlib import contextmanager
+from functools import partial
 from peft import LoraConfig
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoConfig, PretrainedConfig
+from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function, requires, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
