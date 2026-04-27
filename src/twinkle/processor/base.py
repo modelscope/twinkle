@@ -403,7 +403,7 @@ class InputProcessor:
             pos = pos[0]  # mrope
         pos_flat = pos.view(-1)
 
-        boundaries = (pos_flat == 0).nonzero(as_tuple=True)[0].unique(sorted=True)
+        boundaries = (pos_flat == 0).nonzero(as_tuple=True)[0]
         total_len = pos_flat.shape[0]
         boundaries = torch.cat([boundaries, pos_flat.new_tensor([total_len])])
         n_seqs = boundaries.shape[0] - 1
