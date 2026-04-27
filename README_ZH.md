@@ -105,7 +105,7 @@ sh INSTALL_MEGATRON.sh
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](docs/source_zh/使用指引/快速开始.md)
 
 ## 更新日志
-- 🎉2026-04-27 支持sft/dpo/grpo/gkd的padding_free方法。
+- 🎉2026-04-27 支持sft/dpo/grpo/gkd的padding_free方法, 使用`set_processor('InputProcessor', padding_free=True)`来开启训练。
 - 🎉2026-04-22 ModelScope的训练服务部署为[Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B)，并发布了0.2.1版本。
 - 🎉2026-04-16 ModelScope的训练服务部署为[Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B)，并发布了0.2.0版本。
 - 🎉2026-03-28 支持 DPO 训练，同时支持 Transformers 和 Megatron 后端。参考 [dpo_full.py](cookbook/rl/dpo_full.py) 和 [dpo_lora.py](cookbook/rl/dpo_lora.py)。
