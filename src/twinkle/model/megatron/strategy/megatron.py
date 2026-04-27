@@ -43,7 +43,7 @@ class MegatronStrategy:
         use_distributed_optimizer: bool = True,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         seed: int = 42,
-        variable_seq_lengths: bool = False,
+        variable_seq_lengths: bool = True,
         config: PreTrainedConfig = None,
         ddp_config: Dict[str, Any] = None,
         **kwargs,

@@ -31,6 +31,8 @@ class GKDLoss(Loss):
         chunk_size: Number of valid tokens processed per chunk to reduce peak memory (default: 512).
     """
 
+    require_logits = True
+
     def __init__(
         self,
         beta: float = 0.5,

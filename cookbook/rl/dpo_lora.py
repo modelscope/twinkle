@@ -65,7 +65,7 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
 
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))  # Number of preference pairs
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))    # Number of preference pairs
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))  # LoRA DPO requires higher LR (1e-4 to 3e-4)
 DPO_BETA = float(os.environ.get('DPO_BETA', 0.1))
@@ -133,9 +133,9 @@ def main():
 
     # Configure device mesh based on backend
     if USE_MEGATRON:
-        # Megatron: dp=4, pp=2
+        # Megatron: dp=cp=pp=vpp=2
         from twinkle.model import MegatronModel
-        policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=4, pp_size=2)
+        policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, cp_size=2, pp_size=2, vpp_size=2)
         ModelClass = MegatronModel
     else:
         # Transformers: dp_size=8
@@ -162,10 +162,17 @@ def main():
         lora_dropout=0.05,
     )
 
+    model_kwargs = {}
+    if not USE_MEGATRON:
+        model_kwargs['attn_implementation'] = 'flash_attention_2'
+    else:
+        model_kwargs['variable_seq_lengths'] = True
+
     policy_model = ModelClass(
         model_id=MODEL_ID,
         device_mesh=policy_mesh,
         remote_group='policy',
+        **model_kwargs,
     )
     MAX_STEPS = len(dataloader)
     policy_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
@@ -188,7 +195,7 @@ def main():
 
     policy_model.set_loss(loss_fn)
     policy_model.add_metric(DPOMetric, beta=DPO_BETA)
-    policy_model.set_processor(InputProcessor)
+    policy_model.set_processor(InputProcessor, padding_free=True)
     policy_model.set_template('Template', model_id=MODEL_ID)
 
     optim_step = 0

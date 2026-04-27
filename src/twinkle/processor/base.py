@@ -17,6 +17,9 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: torch.Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Fields required by newer megatron-core TE attention (dynamic CP)
+    cp_group: object = None
+    local_cp_size: int = None
 
 
 @remote_class()
@@ -126,7 +129,13 @@ class InputProcessor:
 
     def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
                               **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """Adjust SP tensors after forward and before loss computation."""
+        """Adjust SP tensors after forward and before loss computation.
+
+        Pipeline: SP gather → packed-sequence unpack.
+        After this call, logps and labels are in per-sequence batch format
+        ``[num_sequences, max_seq_len]`` when the input was packed, or left
+        unchanged for normal (non-packed) batches.
+        """
         sp_strategy = kwargs.get('sp_strategy')
         if self.framework == 'transformers' and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
@@ -345,22 +354,121 @@ class InputProcessor:
         return packed
 
     @staticmethod
+    def _is_packed_position_ids(position_ids: 'torch.Tensor') -> bool:
+        """Detect packed sequences by multiple (0, 1, ...) resets in position_ids."""
+        if position_ids is None or not isinstance(position_ids, torch.Tensor):
+            return False
+        pos = position_ids
+        if pos.dim() == 3:
+            pos = pos[0]  # mrope: [3, batch, seq]
+        if pos.dim() == 1:
+            pos = pos.unsqueeze(0)
+        if pos.dim() != 2:
+            return False
+        for i in range(pos.shape[0]):
+            row = pos[i]
+            if int((row == 0).sum()) > 1 and int((row == 1).sum()) > 1:
+                return True
+        return False
+
+    @staticmethod
     def _any_packing(inputs: List[InputFeature]):
-        is_padding_free = False
         for _input in inputs:
-            position_ids = _input['position_ids']
-            if position_ids.dim() == 3:
-                position_ids = position_ids[0]
-            if position_ids.dim() == 1:
-                position_ids = position_ids.unsqueeze(0)
-            # Each row may contains multiple sequences
-            for i in range(position_ids.shape[0]):
-                _position_ids = position_ids[i]
-                # multiple 0/1, multiple sequences
-                zero_count = torch.sum(_position_ids == 0).item()
-                ten_count = torch.sum(_position_ids == 10).item()
-                is_padding_free = is_padding_free or (zero_count > 1 and ten_count > 1)
-        return is_padding_free
+            if InputProcessor._is_packed_position_ids(_input.get('position_ids')):
+                return True
+        return False
+
+    @staticmethod
+    def _unpack_by_position_ids(
+        position_ids: 'torch.Tensor',
+        *tensors: 'torch.Tensor',
+        padding_values: Optional[List] = None,
+    ) -> 'List[torch.Tensor]':
+        """Split packed tensors into ``[num_seqs, max_seq_len, ...]``.
+
+        Sequence boundaries are detected where ``position_ids`` resets to 0.
+        Each tensor may have arbitrary trailing dimensions (e.g. ``[1, T]``
+        for labels/logps or ``[1, T, V]`` for logits).
+
+        Args:
+            position_ids: ``[1, T]`` or ``[3, 1, T]`` (mrope) packed position ids.
+            *tensors: Tensors to unpack; leading dims are squeezed to ``[T, ...]``.
+            padding_values: Per-tensor fill value for right-padding (default 0).
+
+        Returns:
+            List of unpacked tensors, each ``[num_seqs, max_seq_len, ...]``.
+        """
+        pos = position_ids
+        if pos.dim() == 3:
+            pos = pos[0]  # mrope
+        pos_flat = pos.view(-1)
+
+        boundaries = (pos_flat == 0).nonzero(as_tuple=True)[0]
+        total_len = pos_flat.shape[0]
+        boundaries = torch.cat([boundaries, pos_flat.new_tensor([total_len])])
+        n_seqs = boundaries.shape[0] - 1
+
+        if padding_values is None:
+            padding_values = [0] * len(tensors)
+
+        results = []
+        for tensor, pad_val in zip(tensors, padding_values):
+            # Normalize to [T, ...] (squeeze batch-1 dim if present)
+            t = tensor.squeeze(0) if tensor.dim() >= 2 and tensor.shape[0] == 1 else tensor
+            trailing = t.shape[1:]
+            seqs = [t[boundaries[i]:boundaries[i + 1]] for i in range(n_seqs)]
+            max_len = max(s.shape[0] for s in seqs)
+            out = t.new_full((n_seqs, max_len, *trailing), pad_val)
+            for i, s in enumerate(seqs):
+                out[i, :s.shape[0]] = s
+            results.append(out)
+        return results
+
+    def unpack_packed_sequences(
+        self,
+        inputs: Dict[str, Any],
+        outputs: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Unpack packed (padding_free) sequences into per-sequence batch format.
+
+        Called after SP gather / CP gather, before loss computation.
+        Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
+        from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
+        Keys that are ``None`` are silently skipped.
+        """
+        labels = inputs.get('labels')
+        position_ids = inputs.get('position_ids')
+
+        if labels is None or position_ids is None:
+            return inputs, outputs
+        if not self._is_packed_position_ids(position_ids):
+            return inputs, outputs
+
+        from copy import copy
+
+        # Collect output keys to unpack: (key, pad_value)
+        output_keys = []
+        for key, pad_val in [('logps', 0), ('logits', 0)]:
+            if outputs and outputs.get(key) is not None:
+                output_keys.append((key, pad_val))
+
+        all_tensors = [labels] + [outputs[k] for k, _ in output_keys]
+        all_pads = [-100] + [p for _, p in output_keys]
+        unpacked = self._unpack_by_position_ids(position_ids, *all_tensors, padding_values=all_pads)
+
+        inputs = copy(inputs)
+        inputs['labels'] = unpacked[0]
+
+        if output_keys:
+            outputs = copy(outputs)
+            for i, (key, _) in enumerate(output_keys):
+                outputs[key] = unpacked[i + 1]
+
+        return inputs, outputs
+
+    def unpack_inputs(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Unpack a list of packed microbatch inputs into per-sequence format."""
+        return [self.unpack_packed_sequences(inp)[0] for inp in inputs]
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
@@ -419,7 +527,7 @@ class InputProcessor:
                     continue
                 if key == 'position_ids' and is_mm_position_ids(values[0]):
                     # mrope needs to cat the sequence and unsequeeze the middle dim
-                    value = torch.cat(values, dim=2).unsqueeze(1)
+                    value = torch.cat(values, dim=-1).unsqueeze(1)
                 elif isinstance(values[0], torch.Tensor):
                     value = torch.cat(values, dim=0).unsqueeze(0)
                 else:
@@ -466,8 +574,9 @@ class InputProcessor:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
             return [outputs]
-        elif variable_seq_lengths:
-            # each macro batch has its own length
+        padding_free = self.padding_free or self._any_packing(inputs)
+        if variable_seq_lengths or padding_free:
+            # each micro batch has its own packed length
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):

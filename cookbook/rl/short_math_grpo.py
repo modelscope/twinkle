@@ -39,8 +39,8 @@ NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
-MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
+MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
@@ -77,17 +77,18 @@ class GSM8KBrevityReward(Reward):
                 rewards.append(0.0)
             else:
                 length = len(completion)
-                if length <= 200:
+                if length <= 300:
                     rewards.append(1.0)
                 else:
-                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
+                    rewards.append(max(0.0, 1.0 - (length - 300) / 3000))
         return rewards
 
 
 # ========== Dataset ==========
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=True)
+    dataset = Dataset()
+    dataset.add_dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -131,6 +132,7 @@ def main():
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
+            variable_seq_lengths=True,
         )
     else:
         model = TransformersModel(
@@ -148,8 +150,8 @@ def main():
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
 
     model.set_loss('GRPOLoss', epsilon=0.2)
-    model.set_processor(InputProcessor)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    model.set_processor(InputProcessor, padding_free=True)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -163,7 +165,7 @@ def main():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

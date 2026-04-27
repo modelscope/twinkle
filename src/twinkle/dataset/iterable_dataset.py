@@ -9,8 +9,9 @@ from .base import Dataset, DatasetMeta
 class IterableDataset(IterableDataset, Dataset):
     """An Iterable dataset wrapper."""
 
-    def __init__(self, dataset_meta: DatasetMeta, **kwargs):
-        kwargs['streaming'] = True
+    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
+        if dataset_meta is not None:
+            kwargs['streaming'] = True
         super().__init__(dataset_meta, **kwargs)
 
     @remote_function()
