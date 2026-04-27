@@ -133,7 +133,7 @@ def main():
 
     # Configure device mesh based on backend
     if USE_MEGATRON:
-        # Megatron: dp=4, pp=2
+        # Megatron: dp=cp=pp=vpp=2
         from twinkle.model import MegatronModel
         policy_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, cp_size=2, pp_size=2, vpp_size=2)
         ModelClass = MegatronModel
