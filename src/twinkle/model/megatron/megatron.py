@@ -872,7 +872,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_dir = 'output'
             checkpoint_dir = os.path.join(output_dir, name)
 
-        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if resume:
             self._load_mcore_optimizer(
@@ -894,7 +894,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     @remote_function(dispatch='all')
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
-        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         with open(trainer_state_path) as f:
