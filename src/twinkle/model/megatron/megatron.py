@@ -108,7 +108,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         torch_util.set_device()
         self._try_init_process_group()
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
@@ -222,7 +222,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -317,7 +317,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         # Check actual sequence_parallel setting from model config
         # Bridge may auto-enable sequence_parallel for MoE models
         if self.variable_seq_lengths:
-            seq_length = 4096
+            seq_length = max(inp['input_ids'].shape[-1] for inp in inputs)
         else:
             original_seq_length = inputs[0]['input_ids'].shape[1] * (cp_size or 1)
             if cp_size > 1:
@@ -349,12 +349,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs, logps):
+        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
-            outputs = ModelOutput(logits=output_tensor, logps=logps)
+            logits = unpacked_logits if unpacked_logits is not None else output_tensor
+            outputs = ModelOutput(logits=logits, logps=logps)
             result = loss_instance(inputs, outputs, **current_kwargs)
+            if unpacked_logits is not None:
+                outputs.pop('logits', None)
+                del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
             if not counts:
@@ -382,15 +386,35 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 output_tensor = model(**batch)
             batch['labels'] = labels
             logps = None
+            unpacked_logits = None
+            _loss_instance = loss_instance
             if labels is not None and mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
                 output_tensor.div_(temperature)
                 logps = selective_log_softmax(output_tensor, masked_labels)
+                # Reconstruct full-length tensors from CP-split shards
                 logps = processor.postprocess_tensor_cp(logps)
                 batch['labels'] = processor.postprocess_tensor_cp(labels)
-            return output_tensor, partial(post_loss_function, inputs=batch, logps=logps)
+                if 'position_ids' in batch:
+                    pos = batch['position_ids']
+                    if pos.dim() == 3:
+                        pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                    batch['position_ids'] = processor.postprocess_tensor_cp(pos)
+                # Unpack packed sequences into per-sequence batch format
+                _outputs = {'logps': logps}
+                if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                    _outputs['logits'] = output_tensor
+                batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                logps = _outputs['logps']
+                unpacked_logits = _outputs.get('logits', None)
+            return output_tensor, partial(
+                post_loss_function,
+                inputs=batch,
+                logps=logps,
+                unpacked_logits=unpacked_logits,
+            )
 
         # Get Megatron's forward-backward function
         # This automatically selects the right scheduler based on PP config:
@@ -399,6 +423,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         forward_backward_func = get_forward_backward_func()
         vpp_size = self.device_mesh.vpp_size
 
+        micro_batch_size = inputs[0]['input_ids'].shape[0]
         if vpp_size is None or vpp_size == 1:
             data_iter = iter(inputs)
         else:
@@ -462,14 +487,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
-        if logps and len({_logps.shape[1] for _logps in logps}) == 1:
+        if logps and not self.variable_seq_lengths:
             logps = torch.cat(logps, dim=0)
-        if logits and len({_logits.shape[1] for _logits in logits}) == 1:
+        if logits and not self.variable_seq_lengths:
             logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().cpu().float().numpy()
         if not return_logits:
             logits = None
+        inputs = processor.unpack_inputs(inputs)
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
@@ -1362,7 +1388,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         kwargs['framework'] = 'megatron'
         # processor/base.py: self.device_mesh.cp_world_size
         kwargs['device_mesh'] = kwargs.get('device_mesh', self.device_mesh)
-        optimizer_config.processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
+        processor = construct_class(processor_cls, InputProcessor, twinkle.processor, **kwargs)
+        if processor.padding_free and not self.variable_seq_lengths:
+            raise ValueError('padding_free=True requires variable_seq_lengths=True in MegatronModel. '
+                             'Padding-free packing merges sequences into batch=1, making fixed-length '
+                             'microbatch slicing impossible.')
+        optimizer_config.processor = processor
 
     @remote_function(execute='first', lazy_collect=False)
     def get_train_configs(self, **kwargs):

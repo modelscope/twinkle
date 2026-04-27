@@ -77,7 +77,7 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
         if mpu.get_tensor_model_parallel_world_size() > 1:
             # clone to avoid modifying the original logits
             return _vocab_parallel_selective_log_softmax(logits.clone(), index)
-    except (ImportError, AssertionError):
+    except (ImportError, AssertionError, OSError):
         pass
 
     if logits.dtype in [torch.float32, torch.float64]:

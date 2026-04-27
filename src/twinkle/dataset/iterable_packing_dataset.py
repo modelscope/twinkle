@@ -26,14 +26,15 @@ class IterablePackingDataset(IterableDataset):
     """
 
     def __init__(self,
-                 dataset_meta: DatasetMeta,
+                 dataset_meta: DatasetMeta = None,
                  packing_interval: int = 128,
                  packing_num_proc: int = 1,
                  cyclic: bool = False,
                  **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self.packing_num_proc = packing_num_proc
-        kwargs['streaming'] = True
+        if dataset_meta is not None:
+            kwargs['streaming'] = True
         super().__init__(dataset_meta, **kwargs)
         self._out_queue = mp.Queue()
         self.packed_idx = []

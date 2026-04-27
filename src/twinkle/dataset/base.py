@@ -50,14 +50,18 @@ class Dataset(TorchDataset):
             Any other kwargs supported by `datasets.load_dataset`.
     """
 
-    def __init__(self, dataset_meta: DatasetMeta, **kwargs):
+    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
+        self.template = None
+        if dataset_meta is None:
+            self.datasets = {}
+            self.dataset = None
+            return
         trust_remote_code = bool(os.environ.get('TWINKLE_TRUST_REMOTE_CODE', '1'))
         if not trust_remote_code:
             kwargs['trust_remote_code'] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets = {dataset_meta.get_id(): dataset}
         self.dataset = dataset
-        self.template = None
 
     @remote_function()
     def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
@@ -255,6 +259,8 @@ class Dataset(TorchDataset):
             kwargs['trust_remote_code'] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets[dataset_meta.get_id()] = dataset
+        if len(self.datasets) == 1:
+            self.dataset = dataset
 
     @remote_function()
     def mix_dataset(self, interleave=True):

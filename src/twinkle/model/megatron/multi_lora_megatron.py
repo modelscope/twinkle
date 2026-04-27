@@ -59,7 +59,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self.use_distributed_optimizer = False
-        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', False)
+        self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
         torch_util.set_device()
         self._try_init_process_group()
