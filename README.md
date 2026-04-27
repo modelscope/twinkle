@@ -113,6 +113,7 @@ sh INSTALL_MEGATRON.sh
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog
+- 🎉2026-04-27 Support the `padding_free` argument for sft/dpo/grpo/gkd.
 - 🎉2026-04-22 The ModelScope service has been deployed to [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) with a new release 0.2.1.
 - 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) with a new release 0.2.0.
 - 🎉2026-03-28 Support DPO training with both Transformers and Megatron backends. See [dpo_full.py](cookbook/rl/dpo_full.py) and [dpo_lora.py](cookbook/rl/dpo_lora.py).
