@@ -232,31 +232,30 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train.py
 
 ### Resume from Checkpoint
 
-The local and `torchrun` training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py`.
+The training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py`.
 
-When saving a checkpoint intended for resumption, save both model weights and training progress:
+**Saving a Checkpoint**
 
 ```python
-def save_checkpoint(model, checkpoint_name, dataloader):
-    model.save(
-        checkpoint_name,
-        output_dir='./output/fsdp2',
-        adapter_name='default',
-        save_optimizer=True,
-        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
-    )
+model.save(
+    checkpoint_name,
+    output_dir='./output/fsdp2',
+    adapter_name=ADAPTER_NAME,
+    save_optimizer=True,                                    # Store optimizer state
+    consumed_train_samples=dataloader.get_state()['consumed_train_samples'],  # Persist training progress
+)
 ```
 
-`save_optimizer=True` stores optimizer-related state, and `consumed_train_samples` is written into `trainer_state.json` so the dataloader can skip samples that have already been consumed. The `DataLoader` automatically tracks consumed samples internally — call `dataloader.get_state()` to retrieve the current count.
+> `DataLoader` automatically tracks consumed samples internally — call `dataloader.get_state()` to retrieve the current count.
 
-To resume training, restore the checkpoint before entering the main loop:
+**Resuming Training**
 
 ```python
 from pathlib import Path
 
 RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
-RESUME_ONLY_MODEL = False
-IGNORE_DATA_SKIP = False
+RESUME_ONLY_MODEL = False   # True: weights only, skip optimizer/scheduler restoration
+IGNORE_DATA_SKIP = False    # True: do not skip consumed samples from trainer_state.json
 
 if RESUME_FROM_CHECKPOINT:
     checkpoint_path = str(Path(RESUME_FROM_CHECKPOINT).expanduser().resolve())
@@ -265,26 +264,29 @@ if RESUME_FROM_CHECKPOINT:
         dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 ```
 
-This covers two common resume modes:
+How the two flags combine:
 
-- Full resume (default): restore weights, optimizer, scheduler, scaler, RNG state, and training progress, then skip consumed samples in the dataloader.
-- Weights-only resume (`resume_only_model=True`): restore only model weights. This is useful when you want to continue with fresh optimizer state or intentionally restart the schedule.
+| `RESUME_ONLY_MODEL` | `IGNORE_DATA_SKIP` | Effect |
+|---|---|---|
+| `False` (default) | `False` (default) | Full resume: restore weights + optimizer + scheduler + RNG, skip consumed data |
+| `True` | `False` | Weights only, but still skip consumed data (restart optimization from fresh) |
+| `True` | `True` | Weights only, restart dataset from the beginning |
 
-When `RESUME_ONLY_MODEL=True`, `IGNORE_DATA_SKIP=False` still skips already consumed samples based on `trainer_state.json`. If you want to reload weights but restart the dataset from the beginning, set `IGNORE_DATA_SKIP=True`.
+**LoRA / Adapter vs Full-Parameter Training**
 
-The flow above is intended for LoRA / adapter training. For full-parameter training, restore model weights by passing the checkpoint path as `model_id` when constructing `TransformersModel`, instead of calling `model.load(...)`. For example:
+The flow above uses LoRA as the default example. For full-parameter training, the only difference is in `TransformersModel` initialization — use the checkpoint path as `model_id` instead of the base model ID:
 
 ```python
-resume_path = './output/fsdp2/last-checkpoint'
+# LoRA / adapter: base model loaded from hub, checkpoint contains only adapter weights + training state
+model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+progress = model.resume_from_checkpoint(resume_path)
+
+# Full-parameter: model weights are saved entirely in the checkpoint — use it directly as model_id
 model = TransformersModel(model_id=resume_path)
 progress = model.resume_from_checkpoint(resume_path)
-dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 ```
 
-In other words:
-
-- LoRA / adapter resume: create `TransformersModel` from the original base model, then restore via `model.resume_from_checkpoint(...)`.
-- Full-parameter resume: construct `TransformersModel(...)` with the checkpoint path as `model_id`, then call `resume_from_checkpoint(...)` to restore optimizer state and training progress.
+> All subsequent calls to `resume_from_checkpoint` and `dataloader.resume_from_checkpoint` are identical in both cases.
 
 ### Ray Training
 
