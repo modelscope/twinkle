@@ -99,17 +99,19 @@ def train():
     # model.set_lr_scheduler('LinearLR')
 
     # Step 6: Optionally resume from a previous checkpoint
+    start_step = 0
     if resume_path:
         logger.info(f'Resuming from checkpoint {resume_path}')
         progress = model.resume_from_checkpoint(resume_path)
         dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+        start_step = progress['cur_step']
 
     # Step 7: Run the training loop
     logger.info(model.get_train_configs().model_dump())
 
     for epoch in range(3):
         logger.info(f'Starting epoch {epoch}')
-        for _, batch in enumerate(dataloader):
+        for cur_step, batch in enumerate(dataloader, start=start_step + 1):
             # Forward pass + backward pass (computes gradients)
             model.forward_backward(inputs=batch)
 
@@ -126,7 +128,6 @@ def train():
             # model.lr_step()
 
             # Log the loss every 2 steps (aligned with gradient accumulation)
-            cur_step = dataloader.get_state()['consumed_train_samples'] // 4
             if cur_step % 2 == 0:
                 # Print metric
                 metric = model.calculate_metric(is_training=True)
