@@ -870,7 +870,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         if kwargs.get('save_optimizer', False):
-            self._save_optimizer(checkpoint_dir, adapter_name=adapter_name)
             self._save_training_state(
                 checkpoint_dir,
                 adapter_name=adapter_name,
@@ -894,6 +893,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _save_training_state(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        self._save_optimizer(output_dir, adapter_name=adapter_name)
+
         optimizer_config = self.optimizer_group[adapter_name]
 
         if not Platform.is_master():
