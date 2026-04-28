@@ -52,4 +52,5 @@ class Template:
 目前模板关系较为简单：
 
 - Template类：纯文本模型通用
+- DeepseekV4Template类：DeepSeek V4 使用，重写了 chat template 编码逻辑，`encode_messages` 已内置在 twinkle 中
 - Qwen3_5Template类：Qwen3.5多模态模型使用

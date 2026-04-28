@@ -1,0 +1,124 @@
+import os
+
+import twinkle
+from peft import LoraConfig
+from transformers import AutoConfig
+from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.model import TransformersModel
+from twinkle.preprocessor import SelfCognitionProcessor
+
+logger = get_logger()
+
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-flash-bfa16')
+DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
+TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
+
+_num_layers_env = os.environ.get('NUM_LAYERS')
+NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
+
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '2'))
+GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '2'))
+LR = float(os.environ.get('LR', '1e-4'))
+MAX_STEPS = int(os.environ.get('MAX_STEPS', '0'))
+SAVE_STEPS = int(os.environ.get('SAVE_STEPS', '50'))
+USE_LORA = os.environ.get('USE_LORA', '1') == '1'
+IGNORE_MISMATCHED_SIZES = os.environ.get('IGNORE_MISMATCHED_SIZES', '1') == '1'
+LORA_TARGET_MODULES = os.environ.get(
+    'LORA_TARGET_MODULES',
+    'wq_a,wq_b,wkv,wgate,gate_proj,up_proj,down_proj',
+)
+
+device_mesh = DeviceMesh.from_sizes(fsdp_size=2)
+
+twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+
+
+def create_dataset(data_slice=None):
+    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=data_slice or range(1000)))
+    dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)
+    dataset.map(SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
+    dataset.encode(batched=True)
+    return dataset
+
+
+def eval(model):
+    dataset = create_dataset(data_slice=range(100))
+    dataloader = DataLoader(dataset=dataset, batch_size=max(1, BATCH_SIZE // 2))
+    for _, batch in enumerate(dataloader):
+        model.forward_only(inputs=batch, adapter_name='default')
+        model.calculate_loss(adapter_name='default')
+    return model.calculate_metric(is_training=False, adapter_name='default')
+
+
+def train():
+    dataset = create_dataset()
+    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
+
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if NUM_LAYERS is not None and hasattr(config, 'num_hidden_layers'):
+        config.num_hidden_layers = NUM_LAYERS
+    if hasattr(config, 'use_cache'):
+        config.use_cache = False
+
+    model = TransformersModel(
+        model_id=MODEL_ID,
+        config=config,
+        device_mesh=device_mesh,
+        ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
+    )
+
+    if USE_LORA:
+        lora_target_modules = [name.strip() for name in LORA_TARGET_MODULES.split(',') if name.strip()]
+        lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=lora_target_modules)
+        model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
+
+    model.set_template(TEMPLATE_ID, model_id=MODEL_ID, adapter_name='default')
+    model.set_optimizer('AdamW', lr=LR, adapter_name='default')
+    model.set_lr_scheduler(
+        scheduler_cls='CosineWarmupScheduler',
+        num_warmup_steps=5,
+        num_training_steps=len(dataloader),
+        adapter_name='default',
+    )
+
+    logger.info(get_device_placement())
+    logger.info(model.get_train_configs(adapter_name='default'))
+    logger.info(
+        f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, '
+        f'grad_accum={GRAD_ACCUM_STEPS}, lr={LR:.2e}, use_lora={USE_LORA}, '
+        f'num_layers={NUM_LAYERS}, ignore_mismatched_sizes={IGNORE_MISMATCHED_SIZES}, '
+        f'lora_target_modules={LORA_TARGET_MODULES}')
+
+    best_loss = float('inf')
+    for step, batch in enumerate(dataloader):
+        if MAX_STEPS and step >= MAX_STEPS:
+            break
+        model.forward_backward(
+            inputs=batch,
+            adapter_name='default',
+        )
+        model.clip_grad_and_step(
+            adapter_name='default',
+            gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+        )
+
+        if step % 20 == 0:
+            metric = model.calculate_metric(is_training=True, adapter_name='default')
+            logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
+
+        if step > 0 and step % SAVE_STEPS == 0:
+            metrics = eval(model)
+            logger.info(f'Eval metric: {metrics}')
+            loss = float(metrics['loss'])
+            if loss < best_loss:
+                model.save(name=f'checkpoint-{step}', output_dir=OUTPUT_DIR, adapter_name='default')
+                best_loss = loss
+
+    model.save(name='last-checkpoint', output_dir=OUTPUT_DIR, adapter_name='default')
+
+
+if __name__ == '__main__':
+    train()
