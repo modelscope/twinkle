@@ -213,7 +213,7 @@ class MultiLoraMegatronModel(MegatronModel):
         return os.path.join(checkpoint_dir, f'optimizer_rank_{rank}.pt')
 
     @staticmethod
-    def _get_local_training_rng_state():
+    def _save_local_training_rng_state():
         from megatron.core import tensor_parallel
 
         rng_state = {
@@ -227,7 +227,7 @@ class MultiLoraMegatronModel(MegatronModel):
         return rng_state
 
     @staticmethod
-    def _restore_local_training_rng_state(rng_state):
+    def _load_local_training_rng_state(rng_state):
         from megatron.core import tensor_parallel
 
         random.setstate(rng_state['random_rng_state'])
@@ -242,7 +242,7 @@ class MultiLoraMegatronModel(MegatronModel):
         state_dict = {
             'checkpoint_version': 1,
             'iteration': optimizer_config.cur_step,
-            'rng_state': self._get_local_training_rng_state(),
+            'rng_state': self._save_local_training_rng_state(),
         }
         if optimizer_config.optimizer is not None:
             state_dict['optimizer'] = optimizer_config.optimizer.state_dict()
@@ -263,7 +263,7 @@ class MultiLoraMegatronModel(MegatronModel):
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
         if not no_load_rng and 'rng_state' in state_dict:
-            self._restore_local_training_rng_state(state_dict['rng_state'])
+            self._load_local_training_rng_state(state_dict['rng_state'])
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
