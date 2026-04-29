@@ -556,7 +556,7 @@ def _run_router(
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_kwargs = {}
-    if 'input_ids' in kwargs:
+    if 'input_ids' in kwargs and _module_forward_accepts_kwarg(gate, 'input_ids'):
         gate_kwargs['input_ids'] = kwargs['input_ids']
     gate_out = gate(hidden_states, **gate_kwargs)
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
@@ -569,3 +569,11 @@ def _run_router(
     if norm_topk_prob:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     return router_logits, routing_weights, selected_experts
+
+
+def _module_forward_accepts_kwarg(module: nn.Module, kwarg: str) -> bool:
+    signature = inspect.signature(module.forward)
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return kwarg in signature.parameters

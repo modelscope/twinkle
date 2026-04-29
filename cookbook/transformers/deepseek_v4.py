@@ -16,10 +16,10 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
 
-_num_layers_env = os.environ.get('NUM_LAYERS')
+_num_layers_env = os.environ.get('NUM_LAYERS','4')
 NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
 
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '2'))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
 GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '2'))
 LR = float(os.environ.get('LR', '1e-4'))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', '0'))
@@ -34,9 +34,9 @@ LORA_TARGET_MODULES = os.environ.get(
 )
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=2,
+    fsdp_size=4,
     dp_size=1,
-    ep_size=2,
+    ep_size=4,
     device_type=Platform.get_platform().device_prefix(),
 )
 
@@ -77,7 +77,7 @@ def create_dataset(data_slice=None):
 
 def eval(model):
     dataset = create_dataset(data_slice=range(100))
-    dataloader = DataLoader(dataset=dataset, batch_size=max(1, BATCH_SIZE // 2))
+    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
     for _, batch in enumerate(dataloader):
         model.forward_only(inputs=batch, adapter_name='default')
         model.calculate_loss(adapter_name='default')
