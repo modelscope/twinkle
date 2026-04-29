@@ -96,7 +96,7 @@ class NativeFSDPStrategy:
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
 
-                if experts_mod is not None and ep_fsdp_mesh_1d is not None:
+                if experts_mod is not None and ep_fsdp_mesh_1d is not None and ep_fsdp_mesh_1d.size() > 1:
                     from torch.distributed.tensor import Shard
 
                     ep_mp_policy = _build_ep_mp_policy(mp_policy)
@@ -140,7 +140,7 @@ class NativeFSDPStrategy:
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
-            if ep_enabled and layer_pairs:
+            if ep_enabled and layer_pairs and self.fsdp_config.get('manual_prefetch', False):
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
             if ep_enabled:

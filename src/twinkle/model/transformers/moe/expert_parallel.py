@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import inspect
+import os
+import time
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -18,6 +21,7 @@ class ExpertParallelConfig:
     router_dtype: str = 'fp32'
     keep_router_logits: bool = True
     ignore_shared_experts: bool = False
+    sync_after_backward: bool = True  # consumed by TransformersModel to keep EP/FSDP collectives ordered
     ep_size: int | None = None  # consumed by TransformersModel, not used in expert_parallel logic
 
 
@@ -62,7 +66,8 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for block in find_moe_blocks(model):
+    for block_name, block in iter_moe_blocks(model):
+        block._ep_debug_name = block_name
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
         patch_forward(block, ep_group, ep_world_size, cfg)
         specs.append(spec)
@@ -82,8 +87,12 @@ def _merge_config(config: dict[str, Any] | None) -> ExpertParallelConfig:
 
 
 def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
+    return [block for _, block in iter_moe_blocks(model)]
+
+
+def iter_moe_blocks(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     blocks = []
-    for module in model.modules():
+    for name, module in model.named_modules():
         experts = getattr(module, 'experts', None)
         if experts is None:
             continue
@@ -91,7 +100,7 @@ def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
             continue
         if not _get_gate(module):
             continue
-        blocks.append(module)
+        blocks.append((name, module))
     return blocks
 
 
@@ -187,6 +196,8 @@ def patch_forward(
         raise ValueError('MoE block must define top_k/num_experts_per_tok.')
 
     orig_forward = block.forward
+    return_annotation = inspect.signature(orig_forward).return_annotation
+    returns_router_logits = return_annotation in (tuple, Tuple[torch.Tensor, torch.Tensor | None],)
     num_experts = block._ep_num_experts
     experts_per_rank = block._ep_experts_per_rank
     is_tensor_experts = block._ep_tensor_experts
@@ -198,8 +209,10 @@ def patch_forward(
         _install_ep_forward(block.experts, experts_per_rank)
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
-        if args or kwargs:
-            raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
+        if args:
+            raise RuntimeError('Expert parallel patch only supports keyword-only extra args for MoE blocks.')
+
+        _ep_debug(block, ep_group, 'enter', hidden_states_shape=tuple(hidden_states.shape))
 
         orig_shape = hidden_states.shape
         if hidden_states.ndim == 3:
@@ -218,6 +231,7 @@ def patch_forward(
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
             norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            **kwargs,
         )
         # Keep routing weights in activation dtype before unpermute weighting.
         if routing_weights.dtype != hidden_states_2d.dtype:
@@ -228,27 +242,51 @@ def patch_forward(
             selected_experts, num_classes=num_experts).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
 
         # 1. preprocess: compute splits and token counts
+        _ep_debug(
+            block,
+            ep_group,
+            'before_preprocess',
+            num_tokens=hidden_states_2d.shape[0],
+            selected_shape=tuple(selected_experts.shape),
+            expert_mask_sum=int(expert_mask.sum().item()),
+        )
         (
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
             num_global_sum_tokens_per_local_expert,
         ) = preprocess(expert_mask, num_experts, ep_group)
+        _ep_debug(
+            block,
+            ep_group,
+            'after_preprocess',
+            input_splits=input_splits,
+            output_splits=output_splits,
+            local_expert_tokens=num_global_sum_tokens_per_local_expert.tolist(),
+        )
 
         # 2. token_pre_all2all: permute → all_to_all → sort_chunks
+        _ep_debug(block, ep_group, 'before_token_pre_all2all')
         (
             global_permuted_hidden_states,
-            routing_map,
             local_input_permutation_mapping,
+            local_assignment_weights,
             org_hidden_states_shape,
         ) = token_pre_all2all(
             hidden_states_2d,
             expert_mask,
+            routing_weights,
             num_experts,
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
             ep_group,
+        )
+        _ep_debug(
+            block,
+            ep_group,
+            'after_token_pre_all2all',
+            permuted_shape=tuple(global_permuted_hidden_states.shape),
         )
 
         # 3. expert_compute: call experts via nn.Module.__call__ so FSDP2 hooks fire.
@@ -270,34 +308,60 @@ def patch_forward(
             )
 
         # 4. tokens_post_all2all: sort_chunks → all_to_all → unpermute (with routing weight)
+        _ep_debug(block, ep_group, 'before_tokens_post_all2all', expert_outputs_shape=tuple(expert_outputs.shape))
         final_hidden = tokens_post_all2all(
             expert_outputs,
-            routing_weights,
-            selected_experts,
+            local_assignment_weights,
             num_experts,
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
-            routing_map,
             local_input_permutation_mapping,
             org_hidden_states_shape,
             ep_group,
         )
+        _ep_debug(block, ep_group, 'after_tokens_post_all2all', final_shape=tuple(final_hidden.shape))
 
+        _ep_debug(block, ep_group, 'before_shared_expert')
+        shared_start = time.perf_counter()
         shared_out = _maybe_run_shared_expert(block, hidden_states_2d, cfg)
         if shared_out is not None:
             final_hidden = final_hidden + shared_out
+        _ep_debug(
+            block,
+            ep_group,
+            'after_shared_expert',
+            has_shared=shared_out is not None,
+            elapsed=f'{time.perf_counter() - shared_start:.3f}s',
+        )
 
         if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
 
-        if cfg.keep_router_logits:
+        _ep_debug(block, ep_group, 'exit', output_shape=tuple(final_hidden.shape))
+        if cfg.keep_router_logits and returns_router_logits:
             return final_hidden, router_logits
         return final_hidden
 
     block._ep_original_forward = orig_forward
     block.forward = forward
     block._ep_patched = True
+
+
+def _ep_debug(block: nn.Module, ep_group: dist.ProcessGroup, event: str, **kwargs) -> None:
+    if os.environ.get('TWINKLE_EP_DEBUG', '0') != '1':
+        return
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    ep_rank = dist.get_rank(ep_group) if dist.is_initialized() else -1
+    ep_world_size = dist.get_world_size(ep_group) if dist.is_initialized() else -1
+    block_name = getattr(block, '_ep_debug_name', block.__class__.__name__)
+    ts = f'{time.time():.3f}'
+    extras = ' '.join(f'{key}={value}' for key, value in kwargs.items())
+    print(
+        f'[twinkle-ep-debug] ts={ts} rank={rank} ep_rank={ep_rank}/{ep_world_size} '
+        f'block={block_name} event={event} {extras}',
+        flush=True,
+    )
 
 
 def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
@@ -400,6 +464,8 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
         return None
     shared = getattr(block, 'shared_expert', None)
     if shared is None:
+        shared = getattr(block, 'shared_experts', None)
+    if shared is None:
         return None
     return _run_module_with_casting(shared, hidden_states_2d)
 
@@ -487,8 +553,12 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    gate_out = gate(hidden_states)
+    gate_kwargs = {}
+    if 'input_ids' in kwargs:
+        gate_kwargs['input_ids'] = kwargs['input_ids']
+    gate_out = gate(hidden_states, **gate_kwargs)
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
         router_logits, routing_weights, selected_experts = gate_out[:3]
         return router_logits, routing_weights, selected_experts

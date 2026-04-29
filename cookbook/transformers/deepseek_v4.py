@@ -3,7 +3,7 @@ import os
 import twinkle
 from peft import LoraConfig
 from transformers import AutoConfig
-from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -26,14 +26,45 @@ MAX_STEPS = int(os.environ.get('MAX_STEPS', '0'))
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', '50'))
 USE_LORA = os.environ.get('USE_LORA', '1') == '1'
 IGNORE_MISMATCHED_SIZES = os.environ.get('IGNORE_MISMATCHED_SIZES', '1') == '1'
+GRADIENT_CHECKPOINTING = os.environ.get('GRADIENT_CHECKPOINTING', '1') == '1'
+RESHARD_AFTER_FORWARD = os.environ.get('RESHARD_AFTER_FORWARD', '1') == '1'
 LORA_TARGET_MODULES = os.environ.get(
     'LORA_TARGET_MODULES',
     'wq_a,wq_b,wkv,wgate,gate_proj,up_proj,down_proj',
 )
 
-device_mesh = DeviceMesh.from_sizes(fsdp_size=2)
+device_mesh = DeviceMesh.from_sizes(
+    fsdp_size=2,
+    dp_size=1,
+    ep_size=2,
+    device_type=Platform.get_platform().device_prefix(),
+)
 
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+
+
+def log_expert_parallel_status(model):
+    logger.info(
+        f'EP flags: enabled={getattr(model, "_enable_expert_parallel", None)}, '
+        f'applied={getattr(model, "_expert_parallel_applied", None)}')
+    raw_model = model.strategy.unwrap_model(model.model)
+    found = False
+    for name, module in raw_model.named_modules():
+        if not hasattr(module, '_ep_patched'):
+            continue
+        found = True
+        logger.info(
+            'EP block %s: patched=%s rank=%s/%s local_experts=[%s, %s) experts_per_rank=%s',
+            name,
+            getattr(module, '_ep_patched', None),
+            getattr(module, '_ep_rank', None),
+            getattr(module, '_ep_world_size', None),
+            getattr(module, '_ep_local_start', None),
+            getattr(module, '_ep_local_end', None),
+            getattr(module, '_ep_experts_per_rank', None),
+        )
+    if not found:
+        logger.info('No EP-patched MoE blocks found on the wrapped model.')
 
 
 def create_dataset(data_slice=None):
@@ -67,7 +98,16 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
+        strategy="native_fsdp",
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
+        fsdp_config={
+            'reshard_after_forward': RESHARD_AFTER_FORWARD,
+            'expert_parallel': {
+                'enabled': True,
+                'router_dtype': 'fp32',
+                'keep_router_logits': False,
+            }
+        },
     )
 
     if USE_LORA:
@@ -75,8 +115,11 @@ def train():
         lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=lora_target_modules)
         model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
 
+    if not GRADIENT_CHECKPOINTING:
+        model.model.gradient_checkpointing_disable()
+
     model.set_template(TEMPLATE_ID, model_id=MODEL_ID, adapter_name='default')
-    model.set_optimizer('AdamW', lr=LR, adapter_name='default')
+    model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name='default')
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
         num_warmup_steps=5,
@@ -90,6 +133,8 @@ def train():
         f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, '
         f'grad_accum={GRAD_ACCUM_STEPS}, lr={LR:.2e}, use_lora={USE_LORA}, '
         f'num_layers={NUM_LAYERS}, ignore_mismatched_sizes={IGNORE_MISMATCHED_SIZES}, '
+        f'gradient_checkpointing={GRADIENT_CHECKPOINTING}, '
+        f'reshard_after_forward={RESHARD_AFTER_FORWARD}, '
         f'lora_target_modules={LORA_TARGET_MODULES}')
 
     best_loss = float('inf')
@@ -104,6 +149,8 @@ def train():
             adapter_name='default',
             gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         )
+        if step == 0:
+            log_expert_parallel_status(model)
 
         if step % 20 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
