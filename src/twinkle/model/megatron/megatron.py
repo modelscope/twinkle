@@ -1117,7 +1117,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Restore optimizer + LR scheduler.
         if not no_load_optim and optimizer is not None and 'optimizer' in state_dict:
-            optimizer.load_state_dict(state_dict['optimizer'])
+            with torch.no_grad():
+                optimizer.load_state_dict(state_dict['optimizer'])
             if (opt_param_scheduler is not None and 'opt_param_scheduler' in state_dict):
                 opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'], )
 

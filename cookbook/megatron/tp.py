@@ -75,6 +75,7 @@ def train():
     model.set_optimizer(optimizer_cls='default', lr=LEARNING_RATE)
     model.set_lr_scheduler(scheduler_cls='default', lr_warmup_steps=5, lr_decay_steps=len(dataloader))
 
+    start_step = 0
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
         kwargs = {}
@@ -84,6 +85,7 @@ def train():
             str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
         if not IGNORE_DATA_SKIP:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+            start_step = progress['cur_step']
 
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
@@ -91,7 +93,7 @@ def train():
 
     best_loss = float('inf')
 
-    for step, batch in enumerate(dataloader):
+    for step, batch in enumerate(dataloader, start=start_step):
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
         if step % LOG_INTERVAL == 0:
