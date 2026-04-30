@@ -387,10 +387,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
+            del logits
         outputs['past_key_values'] = None
-        _outputs = copy(outputs)
-        logits = outputs['logits']
-        if not loss_require_logits:
+        if not (return_logits or loss_require_logits):
             outputs['logits'] = None
         inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
         inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
@@ -398,13 +397,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
         optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
-        if return_logits:
-            _outputs['logits'] = logits
-        else:
-            _outputs['logits'] = None
-        if not return_logits and not loss_require_logits:
-            del logits
-        return _outputs
+        return_outputs = copy(outputs)
+        if not return_logits:
+            return_outputs['logits'] = None
+        return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -463,10 +459,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 logits = outputs['logits']
                 logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                del logits
             outputs['past_key_values'] = None
-            _outputs = copy(outputs)
-            logits = outputs['logits']
-            if not loss_require_logits:
+            if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
             inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
             inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
@@ -474,13 +469,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
             optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-            if return_logits:
-                _outputs['logits'] = logits
-            else:
-                _outputs['logits'] = None
-            if not return_logits and not loss_require_logits:
-                del logits
-            return _outputs
+            return_outputs = copy(outputs)
+            if not return_logits:
+                return_outputs['logits'] = None
+            return return_outputs
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):

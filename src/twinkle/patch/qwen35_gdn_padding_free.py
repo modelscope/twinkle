@@ -1,7 +1,6 @@
-from typing import Optional
-
 import torch
 from transformers.utils.import_utils import is_flash_linear_attention_available
+from typing import Optional
 
 from twinkle.patch import Patch
 
@@ -181,7 +180,7 @@ class Qwen35GatedDeltaNetPaddingFreePatch(Patch):
                     mod,
                     cu_seqlens=cu_seq_lens_q,
                     origin_forward=origin_forward,
-                    forward_args=(hidden_states,),
+                    forward_args=(hidden_states, ),
                     forward_kwargs={
                         'cache_params': cache_params,
                         'cache_position': cache_position,

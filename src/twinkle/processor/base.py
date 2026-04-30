@@ -299,8 +299,8 @@ class InputProcessor:
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
 
-        from twinkle.patch.qwen35_gdn_padding_free import Qwen35GatedDeltaNetPaddingFreePatch
         from twinkle.patch import apply_patch
+        from twinkle.patch.qwen35_gdn_padding_free import Qwen35GatedDeltaNetPaddingFreePatch
 
         apply_patch(
             model,
