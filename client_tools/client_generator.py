@@ -449,6 +449,7 @@ from twinkle_client.types.model import (
     GetStateDictResponse,
     GetTrainConfigsResponse,
     SaveResponse,
+    TrainingProgressResponse,
 )
 
 
@@ -617,6 +618,15 @@ class MultiLoraTransformersModel:
             json_data={'name': name, 'adapter_name': self.adapter_name, **kwargs}
         )
         response.raise_for_status()
+
+    def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> Dict[str, Any]:
+        response = http_post(
+            url=f'{self.server_url}/resume_from_checkpoint',
+            json_data={'name': name, 'adapter_name': self.adapter_name,
+                       'resume_only_model': resume_only_model, **kwargs}
+        )
+        response.raise_for_status()
+        return TrainingProgressResponse(**response.json()).result
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""

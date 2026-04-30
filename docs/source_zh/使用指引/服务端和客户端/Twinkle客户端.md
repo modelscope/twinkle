@@ -133,16 +133,19 @@ model.set_optimizer('Adam', lr=1e-4)
 # model.set_lr_scheduler('LinearLR')
 
 # Step 5: 恢复训练（可选）
+start_step = 0
 if resume_path:
-    logger.info(f'Resuming training from {resume_path}')
-    model.load(resume_path, load_optimizer=True)
+    logger.info(f'Resuming from checkpoint {resume_path}')
+    progress = model.resume_from_checkpoint(resume_path)
+    dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+    start_step = progress['cur_step']
 
 # Step 6: 训练循环
 logger.info(model.get_train_configs().model_dump())
 
 for epoch in range(3):
     logger.info(f'Starting epoch {epoch}')
-    for step, batch in enumerate(dataloader):
+    for cur_step, batch in enumerate(dataloader, start=start_step + 1):
         # 前向传播 + 反向传播
         model.forward_backward(inputs=batch)
 
@@ -150,12 +153,16 @@ for epoch in range(3):
         model.clip_grad_and_step()
 
         # 每 2 步打印一次指标（与 gradient_accumulation_steps 对齐）
-        if step % 2 == 0:
+        if cur_step % 2 == 0:
             metric = model.calculate_metric(is_training=True)
-            logger.info(f'Epoch {epoch}, step {step}/{len(dataloader)}, metric: {metric.result}')
+            logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric.result}')
 
     # Step 7: 保存检查点
-    twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+    twinkle_path = model.save(
+        name=f'twinkle-epoch-{epoch}',
+        save_optimizer=True,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    )
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: 上传到 ModelScope Hub（可选）
@@ -167,6 +174,14 @@ for epoch in range(3):
 #     async_upload=False
 # )
 ```
+
+Twinkle Client 场景下，推荐的断点续训流程是：
+
+1. 先通过 `client.list_checkpoints(...)` 或 `client.get_latest_checkpoint_path(...)` 获取已有 checkpoint 路径。
+2. 调用 `model.resume_from_checkpoint(resume_path)` 恢复权重、优化器、调度器、随机数状态和训练进度元数据。
+3. 使用返回结果中的 `consumed_train_samples` 调用 `dataloader.resume_from_checkpoint(...)`，跳过已经训练过的数据。
+
+完整示例可直接参考 `cookbook/client/twinkle/self_host/self_cognition.py`。
 
 ## Megatron 后端的差异
 

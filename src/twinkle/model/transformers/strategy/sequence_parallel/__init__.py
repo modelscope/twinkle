@@ -949,3 +949,14 @@ class SequenceParallelStrategy:
 
     def unwrap_model(self, model):
         return model
+
+    def needs_wrapped_optimizer_state(self) -> bool:
+        return False
+
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+        from twinkle.utils.platforms import Platform
+        if Platform.is_master():
+            torch.save(optimizer.state_dict(), output_path)
+
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))

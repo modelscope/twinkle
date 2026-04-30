@@ -124,6 +124,57 @@ class AccelerateStrategy:
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
 
+    def _get_fsdp_plugin(self):
+        state = self.accelerator.state
+        return state.fsdp_plugin if hasattr(state, 'fsdp_plugin') else None
+
+    def _prepare_fsdp2_sd_options(self):
+        fsdp_plugin = self._get_fsdp_plugin()
+        if fsdp_plugin is None or fsdp_plugin.fsdp_version != 2:
+            return None
+
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+        from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
+        return StateDictOptions(
+            full_state_dict=fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT,
+            cpu_offload=getattr(fsdp_plugin.state_dict_config, 'offload_to_cpu', False),
+            broadcast_from_rank0=getattr(fsdp_plugin.state_dict_config, 'rank0_only', False),
+        )
+
+    def needs_wrapped_optimizer_state(self) -> bool:
+        fsdp_plugin = self._get_fsdp_plugin()
+        return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
+
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+        import torch
+        fsdp_plugin = self._get_fsdp_plugin()
+        if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
+            from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+            optim_state = get_optimizer_state_dict(model, optimizer, options=self._prepare_fsdp2_sd_options())
+            if self.accelerator.process_index == 0:
+                torch.save(optim_state, output_path)
+            return
+
+        if self.accelerator.process_index == 0:
+            torch.save(optimizer.state_dict(), output_path)
+
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+        import torch
+        fsdp_plugin = self._get_fsdp_plugin()
+        if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
+            from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+            optim_state = None
+            rank0_only = getattr(fsdp_plugin.optim_state_dict_config, 'rank0_only', False)
+            if self.accelerator.process_index == 0 or not rank0_only:
+                optim_state = torch.load(input_path, weights_only=True)
+            set_optimizer_state_dict(model, optimizer, optim_state, options=self._prepare_fsdp2_sd_options())
+            return
+
+        optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict."""
         from twinkle.utils import torch_util

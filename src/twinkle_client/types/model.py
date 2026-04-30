@@ -97,6 +97,16 @@ class LoadRequest(BaseModel):
         extra = 'allow'
 
 
+class ResumeFromCheckpointRequest(BaseModel):
+    """Request for /resume_from_checkpoint endpoint."""
+    name: str
+    adapter_name: str = ''
+    resume_only_model: bool = False
+
+    class Config:
+        extra = 'allow'
+
+
 class AddAdapterRequest(BaseModel):
     adapter_name: str
     config: str
@@ -218,6 +228,11 @@ class SaveResponse(BaseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
     twinkle_path: str
     checkpoint_dir: Optional[str] = None
+
+
+class TrainingProgressResponse(BaseModel):
+    """Response for /resume_from_checkpoint endpoint."""
+    result: Dict[str, Any]
 
 
 # --- Void responses (return None → OkResponse) ---

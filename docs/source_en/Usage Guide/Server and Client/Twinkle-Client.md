@@ -133,29 +133,36 @@ model.set_optimizer('Adam', lr=1e-4)
 # model.set_lr_scheduler('LinearLR')
 
 # Step 5: Resume training (optional)
+start_step = 0
 if resume_path:
-    logger.info(f'Resuming training from {resume_path}')
-    model.load(resume_path, load_optimizer=True)
+    logger.info(f'Resuming from checkpoint {resume_path}')
+    progress = model.resume_from_checkpoint(resume_path)
+    dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+    start_step = progress['cur_step']
 
 # Step 6: Training loop
 logger.info(model.get_train_configs().model_dump())
 
 for epoch in range(3):
     logger.info(f'Starting epoch {epoch}')
-    for step, batch in enumerate(dataloader):
+    for cur_step, batch in enumerate(dataloader, start=start_step + 1):
         # Forward propagation + backward propagation
         model.forward_backward(inputs=batch)
 
-        # Gradient clipping + optimizer update (equivalent to clip_grad_norm / step / zero_grad / lr_step)
+        # Gradient clipping + optimizer update (equivalent to calling clip_grad_norm / step / zero_grad / lr_step in sequence)
         model.clip_grad_and_step()
 
-        # Log metrics every 2 steps (aligned with gradient_accumulation_steps)
-        if step % 2 == 0:
+        # Print metric every 2 steps (aligned with gradient_accumulation_steps)
+        if cur_step % 2 == 0:
             metric = model.calculate_metric(is_training=True)
-            logger.info(f'Epoch {epoch}, step {step}/{len(dataloader)}, metric: {metric.result}')
+            logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric.result}')
 
     # Step 7: Save checkpoint
-    twinkle_path = model.save(name=f'twinkle-epoch-{epoch}', save_optimizer=True)
+    twinkle_path = model.save(
+        name=f'twinkle-epoch-{epoch}',
+        save_optimizer=True,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    )
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: Upload to ModelScope Hub (optional)
@@ -167,6 +174,14 @@ for epoch in range(3):
 #     async_upload=False
 # )
 ```
+
+For checkpoint resumption, the recommended client-side flow is:
+
+1. Query the server for an existing checkpoint path with `client.list_checkpoints(...)` or `client.get_latest_checkpoint_path(...)`.
+2. Call `model.resume_from_checkpoint(resume_path)` to restore weights, optimizer, scheduler, RNG, and progress metadata.
+3. Call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip already-consumed samples.
+
+This matches the end-to-end example in `cookbook/client/twinkle/self_host/self_cognition.py`.
 
 ## Differences with Megatron Backend
 

@@ -230,6 +230,64 @@ When running, you need to launch training like this:
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train.py
 ```
 
+### Resume from Checkpoint
+
+The training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py`.
+
+**Saving a Checkpoint**
+
+```python
+model.save(
+    checkpoint_name,
+    output_dir='./output/fsdp2',
+    adapter_name=ADAPTER_NAME,
+    save_optimizer=True,                                    # Store optimizer state
+    consumed_train_samples=dataloader.get_state()['consumed_train_samples'],  # Persist training progress
+)
+```
+
+> `DataLoader` automatically tracks consumed samples internally — call `dataloader.get_state()` to retrieve the current count.
+
+**Resuming Training**
+
+```python
+from pathlib import Path
+
+RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
+RESUME_ONLY_MODEL = False   # True: weights only, skip optimizer/scheduler restoration
+IGNORE_DATA_SKIP = False    # True: do not skip consumed samples from trainer_state.json
+
+if RESUME_FROM_CHECKPOINT:
+    checkpoint_path = str(Path(RESUME_FROM_CHECKPOINT).expanduser().resolve())
+    progress = model.resume_from_checkpoint(checkpoint_path, resume_only_model=RESUME_ONLY_MODEL)
+    if not IGNORE_DATA_SKIP:
+        dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+```
+
+How the two flags combine:
+
+| `RESUME_ONLY_MODEL` | `IGNORE_DATA_SKIP` | Effect |
+|---|---|---|
+| `False` (default) | `False` (default) | Full resume: restore weights + optimizer + scheduler + RNG, skip consumed data |
+| `True` | `False` | Weights only, but still skip consumed data (restart optimization from fresh) |
+| `True` | `True` | Weights only, restart dataset from the beginning |
+
+**LoRA / Adapter vs Full-Parameter Training**
+
+The flow above uses LoRA as the default example. For full-parameter training, the only difference is in `TransformersModel` initialization — use the checkpoint path as `model_id` instead of the base model ID:
+
+```python
+# LoRA / adapter: base model loaded from hub, checkpoint contains only adapter weights + training state
+model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+progress = model.resume_from_checkpoint(resume_path)
+
+# Full-parameter: model weights are saved entirely in the checkpoint — use it directly as model_id
+model = TransformersModel(model_id=resume_path)
+progress = model.resume_from_checkpoint(resume_path)
+```
+
+> All subsequent calls to `resume_from_checkpoint` and `dataloader.resume_from_checkpoint` are identical in both cases.
+
 ### Ray Training
 
 [Ray](https://github.com/ray-project/ray) is a commonly used scheduling middleware framework for multi-machine model training and inference scenarios. It provides additional optimizations for multi-model, multi-device execution and resource management, and supports integration with Kubernetes systems for production deployment. These characteristics make it particularly suitable for complex training scenarios such as RL and GKD.
@@ -412,6 +470,8 @@ python train.py
 ### Remote Training
 
 A major feature of Twinkle is support for multi-tenant mixed training. Specifically, multiple users can use a single base model for LoRA training, which can greatly reduce server-side deployment costs.
+
+Checkpoint resumption is also supported in client-server training. The recommended flow is to call `model.resume_from_checkpoint(resume_path)` to restore weights and optimizer state, then call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip consumed data. See [Twinkle-Client](./Server%20and%20Client/Twinkle-Client.md) and [self_cognition.py](../../../cookbook/client/twinkle/self_host/self_cognition.py).
 
 Suppose we start a service using eight GPUs. First, we need to start the Ray cluster:
 

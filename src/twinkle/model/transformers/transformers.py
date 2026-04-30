@@ -2,7 +2,9 @@
 import asyncio
 import contextlib
 import json
+import numpy as np
 import os
+import random
 import re
 import threading
 import torch
@@ -887,21 +889,55 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         if kwargs.get('save_optimizer', False):
-            self._save_optimizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_training_state(
+                checkpoint_dir,
+                adapter_name=adapter_name,
+                consumed_train_samples=kwargs.get('consumed_train_samples', 0),
+            )
 
         return checkpoint_dir
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer = optimizer_config.optimizer
+        lr_scheduler = optimizer_config.lr_scheduler
 
+        if optimizer is not None:
+            optimizer_path = os.path.join(output_dir, 'optimizer.pt')
+            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
         if Platform.is_master():
-            optimizer = optimizer_config.optimizer
-            lr_scheduler = optimizer_config.lr_scheduler
-            if optimizer is not None:
-                torch.save(optimizer.state_dict(), os.path.join(output_dir, 'optimizer.pt'))
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
+
+    def _save_training_state(self, output_dir, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        self._save_optimizer(output_dir, adapter_name=adapter_name)
+
+        optimizer_config = self.optimizer_group[adapter_name]
+
+        if not Platform.is_master():
+            return
+
+        trainer_state = {
+            'checkpoint_version': 1,
+            'cur_step': optimizer_config.cur_step,
+            'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+        }
+        with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
+            json.dump(trainer_state, f)
+
+        if optimizer_config.scaler is not None:
+            torch.save(
+                {
+                    'scaler_state_dict': optimizer_config.scaler.state_dict(),
+                    'scaler_has_nan': optimizer_config.scaler_has_nan,
+                },
+                os.path.join(output_dir, 'scaler.pt'),
+            )
+
+        torch.save(self._get_training_rng_state(), os.path.join(output_dir, 'rng_state.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -946,10 +982,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 model_sd = model.state_dict()
                 converted_weights = {}
                 for key, value in adapter_weights.items():
-                    if f'.{adapter_name}.weight' not in key:
-                        key = key.replace('.weight', f'.{adapter_name}.weight')
-                    if key in model_sd:
-                        param = model_sd[key]
+                    model_key = key
+                    if f'.{adapter_name}.weight' not in model_key:
+                        model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
+                    if model_key in model_sd:
+                        param = model_sd[model_key]
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                     converted_weights[key] = value
@@ -968,18 +1005,26 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        strict = kwargs.pop('strict', False)
         # assume optimizer and lr_scheduler are created
         optimizer_config = self.optimizer_group[adapter_name]
 
         optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
+        if strict and not os.path.exists(optimizer_path):
+            raise FileNotFoundError(optimizer_path)
+        if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
+            logger.warning(
+                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
+
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
-            state_dict = torch.load(optimizer_path, map_location='cpu')
-            optimizer_config.optimizer.load_state_dict(state_dict)
+            if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
+                self._lazy_wrap_model()
+            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
-            state_dict = torch.load(scheduler_path, map_location='cpu')
+            state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
     def _ensure_lora_dtype(self, model):
@@ -997,6 +1042,87 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             for name, param in model.named_parameters():
                 if 'lora_' in name.lower() and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
+
+    def _load_scaler_state(self, scaler_path, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.scaler is None:
+            raise ValueError(f'Grad scaler is not configured for adapter {adapter_name!r}')
+
+        scaler_state = torch.load(scaler_path, map_location='cpu', weights_only=True)
+        optimizer_config.scaler.load_state_dict(scaler_state['scaler_state_dict'])
+        optimizer_config.scaler_has_nan = scaler_state.get('scaler_has_nan', False)
+
+    def _get_training_rng_state(self):
+        state = {
+            'python_rng_state': random.getstate(),
+            'numpy_rng_state': np.random.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+        }
+
+        device_prefix = Platform.device_prefix()
+        device_module = getattr(torch, device_prefix, None)
+        if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+            state['device_type'] = device_prefix
+            state['device_rng_state'] = device_module.get_rng_state()
+        else:
+            state['device_type'] = 'cpu'
+            state['device_rng_state'] = None
+        return state
+
+    def _load_rng_state(self, rng_path):
+        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        random.setstate(rng_state['python_rng_state'])
+        np.random.set_state(rng_state['numpy_rng_state'])
+        torch.set_rng_state(rng_state['torch_rng_state'])
+
+        device_type = rng_state.get('device_type')
+        device_rng_state = rng_state.get('device_rng_state')
+        if device_type != 'cpu' and device_rng_state is not None:
+            device_module = getattr(torch, device_type, None)
+            if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+                device_module.set_rng_state(device_rng_state)
+
+    def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        with open(trainer_state_path) as f:
+            trainer_state = json.load(f)
+
+        adapter_name = adapter_name or self._get_default_group()
+        optimizer_config = self.optimizer_group[adapter_name]
+        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+        scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
+        if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
+            self._load_scaler_state(scaler_path, adapter_name=adapter_name)
+        rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+        if os.path.exists(rng_path):
+            self._load_rng_state(rng_path)
+        optimizer_config.cur_step = trainer_state['cur_step']
+        optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
+
+        return trainer_state
+
+    @remote_function()
+    def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
+        adapter_name = kwargs.get('adapter_name', '')
+
+        has_adapter = (
+            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
+        if has_adapter:
+            self.load(checkpoint_dir, adapter_name=adapter_name)
+
+        if not resume_only_model:
+            trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        else:
+            with open(os.path.join(checkpoint_dir, 'trainer_state.json')) as f:
+                trainer_state = json.load(f)
+
+        return {
+            'cur_step': trainer_state['cur_step'],
+            'consumed_train_samples': trainer_state['consumed_train_samples'],
+            'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
+        }
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):

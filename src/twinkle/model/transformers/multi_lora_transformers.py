@@ -235,15 +235,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             return super().save(name, output_dir, interval, **kwargs)
 
     @remote_function()
-    def load(self, name: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
-                # load from hub
-                token = kwargs.pop('token', None)
-                checkpoint_dir = HubOperation.download_model(name, token=token)
+                if os.path.exists(name):
+                    checkpoint_dir = name
+                else:
+                    token = kwargs.pop('token', None)
+                    checkpoint_dir = HubOperation.download_model(name, token=token)
             else:
                 checkpoint_dir = os.path.join(output_dir, name)
             model = self.strategy.unwrap_model(self.model)
@@ -253,7 +255,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
 
             if load_optimizer:
-                self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+                self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):
