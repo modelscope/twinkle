@@ -25,6 +25,7 @@ def _disable_process_pool(monkeypatch):
     mock_executor.submit.side_effect = RuntimeError('Process pool is disabled in this test environment.')
     monkeypatch.setattr(_hub_module, '_executor', mock_executor)
 
+
 TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 
