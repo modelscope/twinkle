@@ -860,17 +860,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 ``no_load_rng``, etc.).
         """
         resume = kwargs.pop('load_optimizer', False)
-        if output_dir is None and not resume:
-            if os.path.exists(name):
-                checkpoint_dir = name
-            else:
-                # load from hub
-                token = kwargs.pop('token', None)
-                checkpoint_dir = HubOperation.download_model(name, token=token)
-        else:
-            if output_dir is None:
-                output_dir = 'output'
+        if output_dir is not None:
             checkpoint_dir = os.path.join(output_dir, name)
+        elif os.path.exists(name):
+            checkpoint_dir = name
+        elif not resume:
+            # load from hub
+            token = kwargs.pop('token', None)
+            checkpoint_dir = HubOperation.download_model(name, token=token)
+        else:
+            checkpoint_dir = os.path.join('output', name)
 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 

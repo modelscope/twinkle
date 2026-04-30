@@ -9,7 +9,6 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 from __future__ import annotations
 
 import asyncio
-import os
 import torch
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request

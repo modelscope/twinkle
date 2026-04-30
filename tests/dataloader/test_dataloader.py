@@ -6,27 +6,24 @@ import pytest
 from pathlib import Path
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import IterableDataset as TorchIterableDataset
+from unittest.mock import MagicMock
 
 import twinkle
+import twinkle.hub.hub as _hub_module
 from twinkle import DeviceMesh
 from twinkle.data_format import Message
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
 from twinkle.processor import InputProcessor
 
-
-class _NoOpProcessPoolExecutor:
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def submit(self, fn, *args, **kwargs):
-        raise RuntimeError('Process pool is disabled in this test environment.')
-
-
-concurrent.futures.ProcessPoolExecutor = _NoOpProcessPoolExecutor
-
 twinkle.initialize(mode='local')
+
+
+@pytest.fixture(autouse=True)
+def _disable_process_pool(monkeypatch):
+    mock_executor = MagicMock()
+    mock_executor.submit.side_effect = RuntimeError('Process pool is disabled in this test environment.')
+    monkeypatch.setattr(_hub_module, '_executor', mock_executor)
 
 TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
