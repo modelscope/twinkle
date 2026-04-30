@@ -369,7 +369,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_instance = optimizer_config.loss_instance
         loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
+        inputs: Dict[str, Any] = processor(
+            inputs,
+            sp_strategy=self.sp_strategy,
+            model=self.model,
+            hf_config=self.hf_config,
+            enable_sp=getattr(self, '_enable_sp', False),
+        )
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
@@ -434,7 +440,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.loss_instance
             loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
-            inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
+            inputs: Dict[str, Any] = processor(
+                inputs,
+                sp_strategy=self.sp_strategy,
+                model=self.model,
+                hf_config=self.hf_config,
+                enable_sp=getattr(self, '_enable_sp', False),
+            )
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
