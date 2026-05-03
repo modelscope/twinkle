@@ -24,7 +24,6 @@ else:
 _SP_LINEAR_KERNEL_FALLBACK_WARNING = (
     'flash-linear-attention is not available; falling back to torch implementations for Qwen3.5 linear attention '
     'sequence parallel. This fallback only supports non-packed sequences.')
-_SP_LINEAR_KERNEL_FALLBACK_WARNED = False
 
 
 def _sp_is_enabled(sequence_parallel_context) -> bool:
@@ -53,6 +52,19 @@ def _get_local_padding_mask(
     )
 
 
+def _apply_conv_activation(x: torch.Tensor, activation) -> torch.Tensor:
+    if activation is None:
+        return x
+    if activation in ('silu', 'swish'):
+        return F.silu(x)
+    if callable(activation):
+        return activation(x)
+    from transformers.activations import ACT2FN
+    if activation in ACT2FN:
+        return ACT2FN[activation](x)
+    raise ValueError(f'Unsupported causal conv activation: {activation!r}')
+
+
 def _ensure_linear_attention_kernels(mod: torch.nn.Module):
     if _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None:
         mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
@@ -60,13 +72,6 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         return False
 
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
-    origin_causal_conv1d_fn = _CAUSAL_CONV1D_FN or getattr(mod, '_twinkle_origin_causal_conv1d_fn', None)
-    if origin_causal_conv1d_fn is None:
-        origin_causal_conv1d_fn = getattr(mod, 'causal_conv1d_fn', None)
-        if getattr(origin_causal_conv1d_fn, '_twinkle_torch_fallback', False):
-            origin_causal_conv1d_fn = None
-        mod._twinkle_origin_causal_conv1d_fn = origin_causal_conv1d_fn
-
     def _torch_causal_conv1d_fn(
         *,
         x,
@@ -87,34 +92,27 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
                 'Qwen3.5 linear attention sequence parallel with padding_free/packed inputs requires '
                 'flash-linear-attention. The torch fallback only supports non-packed sequences. '
                 'Please install flash-linear-attention or disable padding_free/packing.')
-        if origin_causal_conv1d_fn is not None:
-            out = origin_causal_conv1d_fn(
+        if _CAUSAL_CONV1D_FN is not None:
+            out = _CAUSAL_CONV1D_FN(
                 x=x.transpose(1, 2).contiguous(),
                 weight=weight,
                 bias=bias,
                 activation=activation,
                 seq_idx=seq_idx,
             )
+            if isinstance(out, tuple):
+                out = out[0]
             return out.transpose(1, 2).contiguous()
         seq_len = x.shape[1]
         x = x.transpose(1, 2).contiguous()
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=weight.shape[-1] - 1, groups=x.shape[1])
-        out = F.silu(out[:, :, :seq_len]).transpose(1, 2).contiguous()
-        return out, None
+        out = _apply_conv_activation(out[:, :, :seq_len], activation)
+        return out.transpose(1, 2).contiguous()
 
-    _torch_causal_conv1d_fn._twinkle_torch_fallback = True
     mod.causal_conv1d_fn = _torch_causal_conv1d_fn
     mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-    _warn_linear_attention_kernel_fallback_once()
-    return True
-
-
-def _warn_linear_attention_kernel_fallback_once():
-    global _SP_LINEAR_KERNEL_FALLBACK_WARNED
-    if _SP_LINEAR_KERNEL_FALLBACK_WARNED:
-        return
     warnings.warn(_SP_LINEAR_KERNEL_FALLBACK_WARNING, stacklevel=2)
-    _SP_LINEAR_KERNEL_FALLBACK_WARNED = True
+    return True
 
 
 def _get_local_conv_weights(
