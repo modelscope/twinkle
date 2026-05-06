@@ -9,25 +9,6 @@ def _is_qwen35_model(hf_config) -> bool:
     return 'qwen3_5' in getattr(hf_config, 'model_type', '')
 
 
-def _get_real_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
-    return position_ids[0] if position_ids.dim() == 3 else position_ids
-
-
-def _is_packed_position_ids(position_ids: torch.Tensor) -> bool:
-    if position_ids is None or not torch.is_tensor(position_ids):
-        return False
-    position_ids = _get_real_position_ids(position_ids)
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-    if position_ids.dim() != 2:
-        return False
-    for i in range(position_ids.shape[0]):
-        row = position_ids[i]
-        if int((row == 0).sum()) > 1 and int((row == 1).sum()) > 1:
-            return True
-    return False
-
-
 def _find_qwen35_classes(module: Optional[torch.nn.Module], hf_config, enable_sp: bool):
     if module is None or enable_sp or not _is_qwen35_model(hf_config):
         return None, None
@@ -40,24 +21,19 @@ def _find_qwen35_classes(module: Optional[torch.nn.Module], hf_config, enable_sp
     return None, None
 
 
-def _ensure_flash_linear_attention_available() -> None:
-    if is_flash_linear_attention_available():
-        return
-    raise NotImplementedError(
-        'Qwen3.5 padding_free/packed inputs require flash-linear-attention for GatedDeltaNet. '
-        'The native torch GatedDeltaNet implementation does not reset linear-attention state at packed '
-        'sequence boundaries. Please install flash-linear-attention or disable padding_free/packing.')
-
-
 def _get_flash_linear_attention_kernels():
-    _ensure_flash_linear_attention_available()
+    if not is_flash_linear_attention_available():
+        raise NotImplementedError(
+            'Qwen3.5 padding_free/packed inputs require flash-linear-attention for GatedDeltaNet. '
+            'The native torch GatedDeltaNet implementation does not reset linear-attention state at packed '
+            'sequence boundaries. Please install flash-linear-attention or disable padding_free/packing.')
     from fla.modules.convolution import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     return causal_conv1d, chunk_gated_delta_rule
 
 
-def _run_with_gdn_conv_and_delta_rule_cu_seqlens(
+def _patch_gdn_kernels_for_cu_seqlens(
     mod: torch.nn.Module,
     *,
     cu_seqlens: torch.Tensor,
@@ -176,7 +152,7 @@ class Qwen35GatedDeltaNetPaddingFreePatch(Patch):
                         attention_mask=attention_mask,
                         **extra_kwargs,
                     )
-                return _run_with_gdn_conv_and_delta_rule_cu_seqlens(
+                return _patch_gdn_kernels_for_cu_seqlens(
                     mod,
                     cu_seqlens=cu_seq_lens_q,
                     origin_forward=origin_forward,
