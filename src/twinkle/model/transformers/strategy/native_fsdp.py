@@ -151,6 +151,53 @@ class NativeFSDPStrategy:
 
         return model, optimizer
 
+    def _prepare_optimizer_state_dict_options(self, *, for_load: bool):
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+        return StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=not for_load,
+            broadcast_from_rank0=for_load,
+        )
+
+    def needs_wrapped_optimizer_state(self) -> bool:
+        return self.device_mesh is not None
+
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str):
+        import torch
+        if not self.needs_wrapped_optimizer_state():
+            if Platform.is_master():
+                torch.save(optimizer.state_dict(), output_path)
+            return
+
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+        optim_state = get_optimizer_state_dict(
+            model,
+            optimizer,
+            options=self._prepare_optimizer_state_dict_options(for_load=False),
+        )
+        if Platform.is_master():
+            torch.save(optim_state, output_path)
+
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str):
+        import torch
+        if not self.needs_wrapped_optimizer_state():
+            optimizer.load_state_dict(torch.load(input_path, map_location='cpu', weights_only=False))
+            return
+
+        from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+        optim_state = {}
+        if Platform.is_master():
+            optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
+        set_optimizer_state_dict(
+            model,
+            optimizer,
+            optim_state,
+            options=self._prepare_optimizer_state_dict_options(for_load=True),
+        )
+
     def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
         """Return EP-aware kwargs for normalize_and_clip_grad_norm."""
         model = self.unwrap_model(model)

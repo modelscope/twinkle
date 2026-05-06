@@ -88,6 +88,14 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
+    def resume_from_checkpoint(self,
+                               checkpoint_dir: str,
+                               *,
+                               resume_only_model: bool = False,
+                               **kwargs) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         ...
 

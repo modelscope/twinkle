@@ -1,17 +1,30 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import concurrent.futures
 import numpy as np
 import os
 import pytest
 from pathlib import Path
+from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import IterableDataset as TorchIterableDataset
+from unittest.mock import MagicMock
 
 import twinkle
+import twinkle.hub.hub as _hub_module
 from twinkle import DeviceMesh
 from twinkle.data_format import Message
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
 from twinkle.processor import InputProcessor
 
 twinkle.initialize(mode='local')
+
+
+@pytest.fixture(autouse=True)
+def _disable_process_pool(monkeypatch):
+    mock_executor = MagicMock()
+    mock_executor.submit.side_effect = RuntimeError('Process pool is disabled in this test environment.')
+    monkeypatch.setattr(_hub_module, '_executor', mock_executor)
+
 
 TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
@@ -20,6 +33,44 @@ SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true
 def convert_to_messages(example):
     text = example.get('text', '')
     return {'messages': [Message(role='user', content=text), Message(role='assistant', content='Response')]}
+
+
+def _build_resume_rows():
+    return [
+        {
+            'text': 'Hello world'
+        },
+        {
+            'text': 'Test data'
+        },
+        {
+            'text': 'Another example'
+        },
+        {
+            'text': 'Sample text'
+        },
+    ]
+
+
+class _InMemoryDataset(TorchDataset):
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        return self.rows[idx]
+
+
+class _InMemoryIterableDataset(TorchIterableDataset):
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
 
 
 class TestDataLoaderBasic:
@@ -157,3 +208,25 @@ class TestRetrySampler:
 
         total_samples = sum(len(batch) for batch in dataloader)
         assert total_samples == original_len
+
+
+class TestResumeSkip:
+
+    def test_dataloader_skip_consumed_samples_for_map_style_dataset(self):
+        dataset = _InMemoryDataset(_build_resume_rows())
+        dataloader = DataLoader(dataset=dataset, batch_size=2, num_workers=0)
+
+        dataloader.skip_consumed_samples(2)
+        batches = list(dataloader)
+
+        texts = [item['text'] for batch in batches for item in batch]
+        assert texts[0] == 'Another example'
+
+    def test_dataloader_warns_when_skip_requested_for_iterable_dataset(self, recwarn):
+        dataset = _InMemoryIterableDataset(_build_resume_rows())
+        dataloader = DataLoader(dataset=dataset, batch_size=2, num_workers=0)
+
+        dataloader.skip_consumed_samples(2)
+        next(iter(dataloader))
+
+        assert 'does not support consumed-data skipping' in str(recwarn.pop(UserWarning).message)

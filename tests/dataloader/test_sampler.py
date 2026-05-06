@@ -1,14 +1,27 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import numpy as np
 import os
 import pytest
 from pathlib import Path
+from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import RandomSampler, SequentialSampler
+from unittest.mock import MagicMock
 
 import twinkle
+import twinkle.hub.hub as _hub_module
+from twinkle import DeviceMesh
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 
 twinkle.initialize(mode='local')
+
+
+@pytest.fixture(autouse=True)
+def _disable_process_pool(monkeypatch):
+    mock_executor = MagicMock()
+    mock_executor.submit.side_effect = RuntimeError('Process pool is disabled in this test environment.')
+    monkeypatch.setattr(_hub_module, '_executor', mock_executor)
+
 
 TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 
@@ -162,3 +175,42 @@ class TestSamplerComparison:
 
         different = seq_texts != rand_texts
         assert different or len(seq_texts) == 1
+
+
+class TestResumeSkipSamplerOrdering:
+
+    def test_sequential_sampler_skip_happens_before_device_mesh_slice(self):
+
+        class _InMemoryDataset(TorchDataset):
+
+            def __init__(self, rows):
+                self.rows = rows
+
+            def __len__(self):
+                return len(self.rows)
+
+            def __getitem__(self, idx):
+                return self.rows[idx]
+
+        dataset = _InMemoryDataset([
+            {
+                'text': 'Hello world'
+            },
+            {
+                'text': 'Test data'
+            },
+            {
+                'text': 'Another example'
+            },
+            {
+                'text': 'Sample text'
+            },
+        ])
+        sampler = SequentialSampler(dataset)
+        device_mesh = DeviceMesh(device_type='cpu', mesh=np.array([0, 1]), mesh_dim_names=('dp', ))
+        dataloader = DataLoader(dataset=dataset, batch_size=4, sampler=sampler, device_mesh=device_mesh, num_workers=0)
+
+        dataloader.skip_consumed_samples(2)
+        first_batch = list(dataloader)[0]
+
+        assert first_batch[0]['text'] == 'Another example'

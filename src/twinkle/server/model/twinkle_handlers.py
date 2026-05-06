@@ -12,6 +12,7 @@ import asyncio
 import torch
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
+from pathlib import Path
 from peft import LoraConfig
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -390,6 +391,31 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 **extra_kwargs)
 
         await run_task(self.schedule_task_and_wait(_task, model_id=adapter_name, token=token, task_type='load'))
+
+    @app.post('/twinkle/resume_from_checkpoint', response_model=types.TrainingProgressResponse)
+    async def resume_from_checkpoint(
+            request: Request,
+            body: types.ResumeFromCheckpointRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> types.TrainingProgressResponse:
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            resolved = checkpoint_manager.resolve_load_path(body.name)
+            checkpoint_dir = (
+                Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
+                if resolved.checkpoint_dir else body.name)
+            ret = self.model.resume_from_checkpoint(
+                checkpoint_dir,
+                resume_only_model=body.resume_only_model,
+                adapter_name=adapter_name,
+            )
+            return {'result': ret}
+
+        return await run_task(self.schedule_task_and_wait(_task, task_type='resume'))
 
     @app.post('/twinkle/upload_to_hub', response_model=types.UploadToHubResponse)
     async def upload_to_hub(

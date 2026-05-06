@@ -854,6 +854,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 optimizer_config=optimizer_config,
                 **kwargs,
             )
+            trainer_state = {
+                'checkpoint_version': 1,
+                'cur_step': optimizer_config.cur_step,
+                'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            }
+            state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                with open(state_path, 'w') as f:
+                    json.dump(trainer_state, f, indent=2)
 
         # Final synchronization to ensure all ranks complete save.
         if dist.is_initialized():
@@ -875,19 +886,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 ``no_load_rng``, etc.).
         """
         resume = kwargs.pop('load_optimizer', False)
-        if output_dir is None and not resume:
-            if os.path.exists(name):
-                checkpoint_dir = name
-            else:
-                # load from hub
-                token = kwargs.pop('token', None)
-                checkpoint_dir = HubOperation.download_model(name, token=token)
-        else:
-            if output_dir is None:
-                output_dir = 'output'
+        if output_dir is not None:
             checkpoint_dir = os.path.join(output_dir, name)
+        elif os.path.exists(name):
+            checkpoint_dir = name
+        elif not resume:
+            # load from hub
+            token = kwargs.pop('token', None)
+            checkpoint_dir = HubOperation.download_model(name, token=token)
+        else:
+            checkpoint_dir = os.path.join('output', name)
 
-        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if resume:
             self._load_mcore_optimizer(
@@ -906,6 +916,22 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if dist.is_initialized():
             dist.barrier()
+
+    @remote_function(dispatch='all')
+    def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        with open(trainer_state_path) as f:
+            trainer_state = json.load(f)
+
+        self.load(checkpoint_dir, load_optimizer=not resume_only_model, adapter_name=adapter_name, **kwargs)
+
+        return {
+            'cur_step': trainer_state['cur_step'],
+            'consumed_train_samples': trainer_state['consumed_train_samples'],
+            'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
+        }
 
     @staticmethod
     def _get_rng_state() -> 'ShardedObject':
@@ -1117,7 +1143,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Restore optimizer + LR scheduler.
         if not no_load_optim and optimizer is not None and 'optimizer' in state_dict:
-            optimizer.load_state_dict(state_dict['optimizer'])
+            with torch.no_grad():
+                optimizer.load_state_dict(state_dict['optimizer'])
             if (opt_param_scheduler is not None and 'opt_param_scheduler' in state_dict):
                 opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'], )
 
