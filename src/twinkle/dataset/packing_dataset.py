@@ -24,7 +24,7 @@ class PackingDataset(Dataset):
 
     PACKING_BATCH_SIZE = 1000
 
-    def __init__(self, dataset_meta: DatasetMeta, packing_num_proc: int = 1, **kwargs):
+    def __init__(self, dataset_meta: DatasetMeta = None, packing_num_proc: int = 1, **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self.packing_num_proc = packing_num_proc
         super().__init__(dataset_meta, **kwargs)

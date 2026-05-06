@@ -89,6 +89,14 @@ class MultiLora:
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
+    def reset_adapter_status(self):
+        """Force lora_0 require_grad, disable others"""
+        if isinstance(self.module, list):
+            for _module in self.module:
+                _module.set_adapter('lora_0')
+        else:
+            self.module.set_adapter('lora_0')
+
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
             raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
@@ -226,11 +234,18 @@ class MultiLora:
         if target_modules == 'all-linear':
             return True
 
-        if isinstance(target_modules, str):
-            return re.fullmatch(target_modules, module_name) is not None
+        # Strip LoRA-specific suffixes (e.g. ".lora_A.default.weight") so that
+        # a full parameter name like "model.layers.0.attn.proj.lora_A.default.weight"
+        # can be matched against target_modules like ["attn.proj"].
+        cleaned = module_name
+        if '.lora_' in module_name:
+            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', module_name)
 
-        if isinstance(target_modules, list):
-            return any(module_name.endswith(t) for t in target_modules)
+        if isinstance(target_modules, str):
+            return re.fullmatch(target_modules, cleaned) is not None
+
+        if isinstance(target_modules, (list, set)):
+            return any(cleaned.endswith(t) for t in target_modules)
 
         return False
 
@@ -365,7 +380,7 @@ class MultiLora:
 
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
-                                    return [t[:_lora.tenant_config.r, :] for t in tensors]
+                                    return [t[:_lora.tenant_config.r, :].contiguous() for t in tensors]
 
                                 lora_A._get_weight_tensors_origin = lora_A._get_weight_tensors
                                 lora_A._get_weight_tensors = MethodType(_get_weight_tensors, lora_A)
@@ -382,7 +397,7 @@ class MultiLora:
 
                                 def _get_weight_tensors(self):
                                     tensors = self._get_weight_tensors_origin()
-                                    return [t[:, :_lora.tenant_config.r] for t in tensors]
+                                    return [t[:, :_lora.tenant_config.r].contiguous() for t in tensors]
 
                                 lora_B._get_weight_tensors_origin = lora_B._get_weight_tensors
                                 lora_B._get_weight_tensors = MethodType(_get_weight_tensors, lora_B)
@@ -418,11 +433,15 @@ class MultiLora:
             base_layer.forward = MethodType(_megatron_forward, base_layer)
             base_layer.layer_name = name
 
-    def patch(self, module: Union[torch.nn.Module, List[torch.nn.Module]], *args, **kwargs):
+    def patch(self,
+              module: Union[torch.nn.Module, List[torch.nn.Module]],
+              target_modules='all-linear',
+              *args,
+              **kwargs):
         for i in range(self.max_loras):
             config = LoraConfig(
                 r=self.max_r,
-                target_modules='all-linear',
+                target_modules=target_modules,
                 lora_alpha=32,
             )
             lora_tenant = LoraTenant(index=i, adapter_name=f'lora_{i}', config=config)
@@ -467,6 +486,20 @@ class MultiLora:
                 module = [_patch_megatron(_m) for _m in module]
             else:
                 module = _patch_peft(module)
+
+        # PEFT's add_adapter calls set_adapter(active_adapters) which only keeps the
+        # first adapter's requires_grad=True.  We need ALL LoRA params to be trainable
+        # so that MegatronDDP registers them all in its gradient buffers (main_grad).
+        def _enable_all_lora_grad(_module):
+            for name, param in _module.named_parameters():
+                if 'lora_' in name and not param.requires_grad:
+                    param.requires_grad_(True)
+
+        if isinstance(module, list):
+            for _m in module:
+                _enable_all_lora_grad(_m)
+        else:
+            _enable_all_lora_grad(module)
 
         self.module = module
         return module
@@ -520,14 +553,68 @@ class MultiLora:
             parameter.loader = MethodType(_loader, parameter)
             return name, parameter
 
+    @contextmanager
+    def save_hf_key_context(self, adapter_name):
+        """Temporarily mask LoraParallelLinear modules not in target_modules.
+
+        The bridge uses ``isinstance(module, LoraParallelLinear)`` to detect LoRA
+        layers during export.  For MultiLora every linear is pre-wrapped in
+        LoraParallelLinear (pre-allocated slots), but only a subset defined by
+        ``target_modules`` should actually be exported.
+
+        Because the bridge yields HF-format keys while ``target_modules`` uses
+        Megatron-format names, post-hoc key matching in ``save_lora_converter``
+        fails.  This context manager side-steps the problem by temporarily
+        replacing ``__class__`` of non-target modules so that the bridge's
+        ``isinstance`` check returns *False* and skips them entirely.
+        """
+        try:
+            from mcore_bridge import LoraParallelLinear as _LoraParallelLinear
+        except ImportError:
+            yield
+            return
+
+        _lora = self.find_lora(adapter_name)
+        target_modules = _lora.tenant_config.target_modules
+
+        # 'all-linear' matches everything — no patching needed
+        if target_modules == 'all-linear' or (isinstance(target_modules,
+                                                         (list, set)) and 'all-linear' in target_modules):
+            yield
+            return
+
+        # Create a sibling class with compatible memory layout that is NOT
+        # recognised as LoraParallelLinear by isinstance.
+        _ExcludedLinear = type('_ExcludedLinear', _LoraParallelLinear.__bases__, {})
+
+        patched = []  # (module, original_class)
+        modules_list = self.module if isinstance(self.module, list) else [self.module]
+
+        for _module in modules_list:
+            for name, sub_module in _module.named_modules():
+                if isinstance(sub_module, _LoraParallelLinear):
+                    if not self.match_target_modules(name, target_modules):
+                        patched.append((sub_module, sub_module.__class__))
+                        sub_module.__class__ = _ExcludedLinear
+
+        try:
+            yield
+        finally:
+            for sub_module, original_class in patched:
+                sub_module.__class__ = original_class
+
     def save_lora_converter(self, name, parameter, adapter_name):
         _lora = self.find_lora(adapter_name)
         # Skip weights belonging to OTHER adapters
         if re.search(r'\.lora_\w+\.\w+\.', name) and not re.search(rf'\.lora_\w+\.{adapter_name}\.', name):
             return None
-        if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name) and self.match_target_modules(
-                name, _lora.tenant_config.target_modules):
+        # target_modules filtering is handled by save_hf_key_context (class
+        # patching makes the bridge skip non-target modules entirely), so we
+        # only check the adapter-name / weight pattern here.
+        if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name):
             _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
+            if _param is not None:
+                _param = _param.clone()
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:

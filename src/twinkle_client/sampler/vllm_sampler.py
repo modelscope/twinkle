@@ -68,7 +68,7 @@ class vLLMSampler(Sampler):
             num_samples: Number of completions to generate per prompt.
 
         Returns:
-            A list of sampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
+            SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
         json_data = {
             'inputs': inputs,
@@ -94,7 +94,7 @@ class vLLMSampler(Sampler):
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())
-
+    
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
         response = http_post(

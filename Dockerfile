@@ -37,7 +37,7 @@ RUN pip install flash-linear-attention -U --no-cache-dir
 RUN pip install numpy==2.2 --no-cache-dir
 
 # Install tinker, ray, and other deps
-RUN pip install --no-cache-dir tinker==0.16.1 "ray[serve]" transformers peft accelerate -U
+RUN pip install --no-cache-dir tinker==0.16.1 "ray[serve]" transformers peft<=0.18 accelerate -U
 
 # Clone and install twinkle, checkout to latest v-tag
 RUN git clone https://github.com/modelscope/twinkle.git

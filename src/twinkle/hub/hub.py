@@ -374,17 +374,23 @@ class MSHub(HubOperation):
             ignore_patterns = []
         if revision is None or revision == 'main':
             revision = 'master'
-        result = push_to_hub(
-            repo_id,
-            folder_path,
-            token or cls.ms_token,
-            private,
-            commit_message=commit_message,
-            ignore_file_pattern=ignore_patterns,
-            revision=revision,
-            tag=path_in_repo)
+        try:
+            result = push_to_hub(
+                repo_id,
+                folder_path,
+                token or cls.ms_token,
+                private,
+                commit_message=commit_message,
+                ignore_file_pattern=ignore_patterns,
+                revision=revision,
+                tag=path_in_repo)
+        except Exception as exc:
+            raise RuntimeError(f'ModelScope push_to_hub raised an exception '
+                               f'(repo_id={repo_id!r}, folder_path={folder_path!r}): {exc}') from exc
         if not result:
-            raise Exception('Failed to push to hub')
+            raise RuntimeError(f'ModelScope push_to_hub returned a falsy result '
+                               f'(repo_id={repo_id!r}, folder_path={folder_path!r}). '
+                               f'This usually indicates an invalid/expired token or insufficient write permission.')
 
     @classmethod
     def load_dataset(cls,

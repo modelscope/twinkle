@@ -608,12 +608,16 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
         Args:
             model_id: The model identifier
-            name: Checkpoint name
+            name: Checkpoint name. For sampler checkpoints this is ignored; weights are
+                always stored under the fixed name ``'latest'`` and a per-save timestamp
+                symlink is created in the same ``sampler_weights/`` directory.
             is_sampler: Whether this is a sampler checkpoint
             public: Whether the checkpoint is public
 
         Returns:
-            The path for the checkpoint
+            The ``twinkle://`` path for the checkpoint. For sampler checkpoints this
+            points to the timestamp symlink so callers always receive a unique path
+            and bypass any filesystem-path-based weight cache.
         """
         # Validate path safety
         if not validate_user_path(self.token, name):
@@ -621,7 +625,10 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
         weights_type = 'sampler_weights' if is_sampler else 'weights'
         checkpoint_type = 'sampler' if is_sampler else 'training'
-        checkpoint_id = f'{weights_type}/{name}'
+        # Sampler weights are always stored under the fixed name 'latest' so only one
+        # version exists on disk at a time; cleanup is handled by _delete_existing_sampler_weights.
+        effective_name = 'latest' if is_sampler else name
+        checkpoint_id = f'{weights_type}/{effective_name}'
         path = f'{self.path_prefix}{model_id}/{checkpoint_id}'
         checkpoint_path = self.get_ckpt_dir(model_id, checkpoint_id)
 
@@ -649,6 +656,19 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
         # Update last_checkpoint in run info
         self.training_run_manager.update(model_id, {'last_checkpoint': ckpt_data})
+
+        if is_sampler:
+            # Create a per-save timestamp symlink in sampler_weights/ so callers always
+            # receive a unique twinkle:// path and bypass any filesystem-path-based cache.
+            save_dir = self.get_save_dir(model_id, is_sampler=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            fixed_path = os.path.join(save_dir, 'latest')
+            symlink_path = os.path.join(save_dir, timestamp)
+            if os.path.islink(symlink_path):
+                os.unlink(symlink_path)
+            os.symlink(fixed_path, symlink_path)
+            return f'{self.path_prefix}{model_id}/sampler_weights/{timestamp}'
+
         return path
 
     def _delete_existing_sampler_weights(self, model_id: str):
@@ -662,14 +682,15 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         sampler_weights_dir = run_dir / 'sampler_weights'
 
         if sampler_weights_dir.exists() and sampler_weights_dir.is_dir():
-            # Delete all subdirectories in sampler_weights
             for item in sampler_weights_dir.iterdir():
-                if item.is_dir():
-                    # Delete checkpoint metadata file first
+                if item.is_symlink():
+                    # Unlink symlinks explicitly; shutil.rmtree on a symlink-to-directory
+                    # can follow the link and unexpectedly delete the target contents.
+                    item.unlink()
+                elif item.is_dir():
                     meta_path = item / CHECKPOINT_INFO_FILENAME
                     if meta_path.exists():
                         meta_path.unlink()
-                    # Delete the directory
                     shutil.rmtree(item)
             logger.info(f'Deleted existing sampler weights for model_id: {model_id}')
 

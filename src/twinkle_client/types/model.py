@@ -4,8 +4,8 @@ Pydantic request/response models for twinkle model management endpoints.
 
 These models are used by both the server-side handler and the twinkle client.
 """
-from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, field_validator
+from typing import Any, Dict, List, Optional, Union
 
 
 class CreateRequest(BaseModel):
@@ -65,16 +65,24 @@ class SaveRequest(BaseModel):
     adapter_name: str
     save_optimizer: bool = False
     name: Optional[str] = None
+    is_sampler: bool = False  # If True, delete existing sampler weights before saving
 
     class Config:
         extra = 'allow'
 
 
 class UploadToHubRequest(BaseModel):
-    checkpoint_dir: str
+    checkpoint_dir: Union[str, Dict]
     hub_model_id: str
     hub_token: Optional[str] = None
     async_upload: bool = False
+
+    @field_validator('checkpoint_dir', mode='before')
+    @classmethod
+    def extract_checkpoint_dir(cls, v):
+        if isinstance(v, dict):
+            return v['twinkle_path']
+        return v
 
     class Config:
         extra = 'allow'
@@ -84,6 +92,16 @@ class LoadRequest(BaseModel):
     adapter_name: str
     load_optimizer: bool = False
     name: str
+
+    class Config:
+        extra = 'allow'
+
+
+class ResumeFromCheckpointRequest(BaseModel):
+    """Request for /resume_from_checkpoint endpoint."""
+    name: str
+    adapter_name: str = ''
+    resume_only_model: bool = False
 
     class Config:
         extra = 'allow'
@@ -212,6 +230,11 @@ class SaveResponse(BaseModel):
     checkpoint_dir: Optional[str] = None
 
 
+class TrainingProgressResponse(BaseModel):
+    """Response for /resume_from_checkpoint endpoint."""
+    result: Dict[str, Any]
+
+
 # --- Void responses (return None → OkResponse) ---
 
 class BackwardResponse(OkResponse):
@@ -264,9 +287,16 @@ class SetProcessorResponse(OkResponse):
     pass
 
 
-class UploadToHubResponse(OkResponse):
+class UploadToHubResponse(BaseModel):
     """Response for /upload_to_hub endpoint."""
-    pass
+    request_id: str
+
+
+class UploadStatusResponse(BaseModel):
+    """Response for /upload_status/{request_id} endpoint."""
+    request_id: str
+    status: str  # pending / queued / running / completed / failed
+    error: Optional[str] = None
 
 
 class ClipGradAndStepResponse(OkResponse):

@@ -77,7 +77,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             return getattr(processor_module, class_type)(
                 remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
 
-        processor = await asyncio.get_event_loop().run_in_executor(None, _do_create)
+        processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
         self.resource_dict[processor_id] = processor
         return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
 
@@ -117,7 +117,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             except StopIteration:
                 return True, None
 
-        is_exhausted, result = await asyncio.get_event_loop().run_in_executor(None, _do_call)
+        is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
 
         if function_name == '__next__':
             if is_exhausted:

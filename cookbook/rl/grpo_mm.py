@@ -223,9 +223,15 @@ def main():
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
+        # Expand prompts: each prompt repeated NUM_GENERATIONS times consecutively
+        # so that GRPOAdvantage groups rewards correctly per prompt
+        expand_prompts = []
+        for prompt in batch:
+            expand_prompts.extend([prompt] * NUM_GENERATIONS)
+
         # Sample multiple completions per prompt
         sample_responses = sampler.sample(
-            batch * NUM_GENERATIONS,
+            expand_prompts,
             sampling_params,
         )
 

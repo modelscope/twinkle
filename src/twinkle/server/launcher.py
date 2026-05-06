@@ -21,9 +21,10 @@ Usage:
 """
 from __future__ import annotations
 
-import time
+import signal
+import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, NoReturn, Optional, Union
 
 from twinkle import get_logger
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
@@ -146,9 +147,12 @@ class ServerLauncher:
         from ray import serve
 
         try:
+            from ray.serve.context import _get_global_client
+            _get_global_client()
+            # Serve is running, shut it down before re-starting
             serve.shutdown()
-            time.sleep(2)
         except Exception:
+            # Serve not running — nothing to shut down
             pass
 
         http_options = self.config.get('http_options', {})
@@ -182,6 +186,9 @@ class ServerLauncher:
 
         deploy_options = {}
         if deployments:
+            if len(deployments) > 1:
+                logger.warning(f'Application "{name}" has {len(deployments)} deployments configured, '
+                               f'but only the first deployment will be used.')
             deploy_config = deployments[0]
             if isinstance(deploy_config, dict):
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
@@ -197,7 +204,12 @@ class ServerLauncher:
         logger.info(f'Deployed {name} at {route_prefix}')
 
     def launch(self) -> None:
-        """Launch the server with all configured applications."""
+        """Launch the server with all configured applications.
+
+        Blocks the calling thread to keep the server running. Installs signal
+        handlers for SIGINT/SIGTERM so that ``serve.shutdown()`` is called on
+        termination instead of leaving orphaned deployments.
+        """
         # Apply Ray Serve patches before initializing Ray
         apply_ray_serve_patches()
 
@@ -226,8 +238,26 @@ class ServerLauncher:
                                                                              dict) else app_config.route_prefix
             print(f'  - http://{host}:{port}{route_prefix}')
 
-        while True:
-            time.sleep(3600)
+        # Graceful shutdown via signal handling
+        shutdown_event = threading.Event()
+
+        def _handle_signal(signum, frame):
+            sig_name = signal.Signals(signum).name
+            logger.info(f'Received {sig_name}, shutting down gracefully...')
+            shutdown_event.set()
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+
+        # Block until a termination signal is received
+        shutdown_event.wait()
+
+        from ray import serve
+        try:
+            serve.shutdown()
+            logger.info('Ray Serve shut down successfully')
+        except Exception:
+            logger.warning('Error during Ray Serve shutdown', exc_info=True)
 
     @classmethod
     def from_yaml(
@@ -264,19 +294,17 @@ def launch_server(
     config: dict[str, Any] | None = None,
     config_path: str | Path | None = None,
     ray_namespace: str | None = None,
-) -> ServerLauncher:
+) -> None:
     """
     Launch a twinkle server with flexible configuration options.
 
     This is the main entry point for launching servers programmatically.
+    The call blocks until a SIGINT/SIGTERM signal is received.
 
     Args:
         config: Configuration dictionary (takes precedence over config_path)
         config_path: Path to YAML config file
         ray_namespace: Ray namespace
-
-    Returns:
-        The ServerLauncher instance
 
     Raises:
         ValueError: If neither config nor config_path is provided
@@ -306,4 +334,3 @@ def launch_server(
         )
 
     launcher.launch()
-    return launcher

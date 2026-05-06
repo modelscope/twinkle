@@ -34,13 +34,15 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
                     merged.extend(v)
                 else:
                     merged.append(v)
+            if isinstance(merged[0], torch.Tensor):
+                merged = pad_and_stack_tensors(merged)
             result[key] = merged
 
         elif isinstance(first_value, torch.Tensor):
             result[key] = pad_and_stack_tensors(values)
 
         elif isinstance(first_value, dict):
-            result[key] = collect_tensor_dict(values)
+            result[key] = collect_tensor_dict(values, device_mesh)
 
         elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')

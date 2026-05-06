@@ -59,6 +59,33 @@ def _rebuild_ipc(handle, device_id: Optional[int] = None) -> torch.Tensor:
         return rebuild_cuda_tensor(*list_args)
 
 
+def _ipc_handle_signature(handle) -> Optional[tuple]:
+    """Derive a stable signature for a CUDA IPC handle.
+
+    ``reduce_tensor`` returns ``(func, args)`` where ``args`` contains the
+    CUDA IPC storage handle bytes, storage size, ref-counter handle, etc.
+    Two handles are equivalent (i.e. map the same CUDA memory region) when
+    these inner fields match. We hash only the parts that are picklable and
+    comparable to avoid accidental mismatches due to local objects.
+    """
+    try:
+        _, args = handle
+    except Exception:
+        return None
+    sig = []
+    for v in args:
+        if isinstance(v, (bytes, bytearray)):
+            sig.append(('bytes', bytes(v)))
+        elif isinstance(v, (int, float, bool, str)) or v is None:
+            sig.append(('scalar', v))
+        else:
+            try:
+                sig.append(('repr', repr(v)))
+            except Exception:
+                return None
+    return tuple(sig)
+
+
 def _rebuild_shared_memory(name: str, size: int):
     """Rebuild tensor from shared memory.  Returns (tensor, shm)."""
     from multiprocessing import shared_memory
@@ -129,9 +156,6 @@ class TwinkleWorkerExtension:
             logger.info(f'vLLM worker bind device: local_rank={local_rank}, device={device_str}')
             self.device = torch.device(device_str)
 
-        if peft_config and base_sync_done:
-            self.remove_lora(VLLM_LORA_INT_ID)
-
         # Detect TP rank — vLLM sets self.rank on each worker.
         tp_rank = getattr(self, 'rank', 0)
         tp_size = 1
@@ -187,7 +211,27 @@ class TwinkleWorkerExtension:
             handle = comm_metadata
             # All TP ranks rebuild the IPC buffer from the same handle.
             # CUDA IPC allows any process on the same node to map the memory.
-            buffer = _rebuild_ipc(handle, self.device.index)
+            # Reuse a cached buffer across syncs when the sender reuses the
+            # same IPC handle: this avoids creating a fresh CUDA IPC mapping
+            # per sync, which the driver releases lazily and is the root
+            # cause of the apparent GPU memory growth under frequent syncs.
+            handle_signature = _ipc_handle_signature(handle)
+            cached_buffer = getattr(self, '_twinkle_ipc_buffer', None)
+            cached_signature = getattr(self, '_twinkle_ipc_handle_signature', None)
+            if cached_buffer is not None and cached_signature == handle_signature:
+                buffer = cached_buffer
+            else:
+                # Drop the previous mapping before creating a new one so the
+                # driver can reclaim the old shared memory region.
+                if cached_buffer is not None:
+                    self._twinkle_ipc_buffer = None
+                    self._twinkle_ipc_handle_signature = None
+                    del cached_buffer
+                    gc.collect()
+                    Torch.ipc_collect()
+                buffer = _rebuild_ipc(handle, self.device.index)
+                self._twinkle_ipc_buffer = buffer
+                self._twinkle_ipc_handle_signature = handle_signature
         else:
             from multiprocessing import shared_memory
             buffer, shm = _rebuild_shared_memory(
@@ -200,6 +244,8 @@ class TwinkleWorkerExtension:
 
         # ── Step 3: Receive and process weight buckets ──
         partial_tensors: dict = {}
+        lora_bucket_accum: list[tuple[str, torch.Tensor]] = []
+        lora_mode = bool(peft_config and base_sync_done)
         while True:
             # Only the driver receives bucket metadata from VLLMEngine.
             if is_driver:
@@ -292,7 +338,10 @@ class TwinkleWorkerExtension:
             if tp_size > 1:
                 dist.barrier(group=cpu_group)
 
-            self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            if lora_mode:
+                lora_bucket_accum.extend(weights)
+            else:
+                self._load_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
 
             if metadata['is_last']:
@@ -300,9 +349,16 @@ class TwinkleWorkerExtension:
                     pending = ', '.join(sorted(partial_tensors.keys())[:8])
                     raise RuntimeError(
                         f'Incomplete chunked weights at stream end: pending {len(partial_tensors)} ({pending})')
+                if lora_mode:
+                    self._load_weights(
+                        lora_bucket_accum,
+                        peft_config=peft_config,
+                        base_sync_done=base_sync_done,
+                    )
                 break
 
         partial_tensors.clear()
+        lora_bucket_accum.clear()
         metadata = None
         raw_u8 = None
         cpu_u8 = None
@@ -312,7 +368,6 @@ class TwinkleWorkerExtension:
         if is_driver and socket is not None:
             socket.close()
         del buffer
-        gc.collect()
         if shm is not None:
             try:
                 shm.close()
@@ -324,6 +379,7 @@ class TwinkleWorkerExtension:
                 except BufferError as e:
                     logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
             del shm
+        gc.collect()
         Torch.ipc_collect()
         Torch.empty_cache()
 
@@ -403,9 +459,6 @@ class TwinkleWorkerExtension:
         here.
         """
         if peft_config and base_sync_done:
-            # Remove existing LoRA before replacing
-            self.remove_lora(VLLM_LORA_INT_ID)
-
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 
             converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}
@@ -415,6 +468,7 @@ class TwinkleWorkerExtension:
                 lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=converted,
+                load_inplace=True,
             )
             self.add_lora(lora_request)
         else:

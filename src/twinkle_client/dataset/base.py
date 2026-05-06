@@ -78,6 +78,19 @@ class Dataset(object):
         return response.json()["result"]
     
 
+    def cast_column(self, column: str, decode: bool = True):
+        response = http_post(
+            url=f'{self.server_url}/call',
+            json_data={
+                'processor_id': self.processor_id,
+                'function': 'cast_column',
+                **{'column': column, 'decode': decode},
+            }
+        )
+        response.raise_for_status()
+        return response.json()["result"]
+    
+
     def map(self, preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]], dataset_meta: DatasetMeta = None, init_args: Dict[str, Any] = None, **kwargs):
         response = http_post(
             url=f'{self.server_url}/call',

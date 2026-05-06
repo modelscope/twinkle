@@ -2,7 +2,9 @@
 import asyncio
 import contextlib
 import json
+import numpy as np
 import os
+import random
 import re
 import threading
 import torch
@@ -76,12 +78,13 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _ensure_dp_group(self):
         if self._dp_group is not None or self._device_mesh is None:
             return
-        if self._device_mesh.data_world_size <= 1:
+        raw_world_size = self._device_mesh._get_dp_fsdp_world_size()
+        if raw_world_size <= 1:
             return
         if not dist.is_available() or not dist.is_initialized():
             return
-        if dist.get_world_size() < self._device_mesh.data_world_size:
-            # World size is smaller than the requested dp group; skip to avoid crash.
+        if dist.get_world_size() < raw_world_size:
+            # World size is smaller than the requested dp/fsdp group; skip to avoid crash.
             return
         dims = [dim for dim in ('dp', 'fsdp') if self._device_mesh.has_dim(dim)]
         if not dims:
@@ -242,15 +245,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return
         from .strategy.sequence_parallel import SequenceParallelStrategy
 
-        sp_config = {}
-        # When data-parallel gradient averaging runs across SP shards (native FSDP or
-        # accelerate DDP/FSDP paths), compensate SP loss backward to keep gradient scale.
-        if isinstance(self.strategy, (NativeFSDPStrategy, AccelerateStrategy)) and self.device_mesh is not None:
-            if (self.device_mesh.ulysses_size or 1) > 1 and (self.device_mesh.data_world_size or 1) > 1:
-                sp_config['compensate_fsdp_avg'] = True
         self.sp_strategy = SequenceParallelStrategy(
             self.device_mesh,
-            sp_config,
+            {},
             model=self.model,
             tokenizer_id=self.tokenizer_id,
         )
@@ -371,20 +368,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
+        loss_instance = optimizer_config.loss_instance
+        loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        inputs: Dict[str, Any] = processor(inputs)
-        if self.sp_strategy is not None:
-            inputs = self.sp_strategy.preprocess_inputs(inputs)
+        inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
         outputs = self.model(**inputs)
-        if self.sp_strategy is not None and labels is None:
-            outputs = self.sp_strategy.postprocess_outputs(outputs)
         inputs['labels'] = labels
-        optimizer_config.train_status.inputs = inputs
-        optimizer_config.train_status.outputs = outputs
-        optimizer_config.train_status.forward_kwargs = kwargs
-        optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
         if labels is not None:
             loss_mask = (labels != -100).bool()
             masked_labels = labels.clone()
@@ -392,11 +383,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        outputs = copy(outputs)
         outputs['past_key_values'] = None
-        if not return_logits:
+        _outputs = copy(outputs)
+        logits = outputs['logits']
+        if not loss_require_logits:
             outputs['logits'] = None
-        return outputs
+        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
+        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
+        optimizer_config.train_status.inputs = inputs
+        optimizer_config.train_status.outputs = outputs
+        optimizer_config.train_status.forward_kwargs = kwargs
+        optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
+        if return_logits:
+            _outputs['logits'] = logits
+        else:
+            _outputs['logits'] = None
+        if not return_logits and not loss_require_logits:
+            del logits
+        return _outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -430,9 +434,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-            inputs: Dict[str, Any] = processor(inputs)
-            if self.sp_strategy is not None:
-                inputs = self.sp_strategy.preprocess_inputs(inputs)
+            loss_instance = optimizer_config.loss_instance
+            loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
+            inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
@@ -441,25 +445,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
-            if self.sp_strategy is not None and labels is None:
-                outputs = self.sp_strategy.postprocess_outputs(outputs)
             inputs['labels'] = labels
-        optimizer_config.eval_status.inputs = inputs
-        optimizer_config.eval_status.outputs = outputs
-        optimizer_config.eval_status.forward_kwargs = kwargs
-        optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-        if labels is not None:
-            loss_mask = (labels != -100).bool()
-            masked_labels = labels.clone()
-            masked_labels[~loss_mask] = 0
+            if labels is not None:
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.clone()
+                masked_labels[~loss_mask] = 0
+                logits = outputs['logits']
+                logits.div_(temperature)
+                outputs['logps'] = selective_log_softmax(logits, masked_labels)
+            outputs['past_key_values'] = None
+            _outputs = copy(outputs)
             logits = outputs['logits']
-            logits.div_(temperature)
-            outputs['logps'] = selective_log_softmax(logits, masked_labels)
-        outputs = copy(outputs)
-        outputs['past_key_values'] = None
-        if not return_logits:
-            outputs['logits'] = None
-        return outputs
+            if not loss_require_logits:
+                outputs['logits'] = None
+            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
+            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
+            optimizer_config.eval_status.inputs = inputs
+            optimizer_config.eval_status.outputs = outputs
+            optimizer_config.eval_status.forward_kwargs = kwargs
+            optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
+            if return_logits:
+                _outputs['logits'] = logits
+            else:
+                _outputs['logits'] = None
+            if not return_logits and not loss_require_logits:
+                del logits
+            return _outputs
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -485,7 +496,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
         result = loss_instance(inputs, outputs, **kwargs)
         loss_value = result['loss']
-        counts = result['num_tokens']
+        raw_counts = result['num_tokens']
+        counts = raw_counts
         if not counts:
             counts = torch.tensor(1, device=loss_value.device)
         # Later will gather this value, so it becomes:
@@ -501,16 +513,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         #                         = (global_per_token_grad * gradient_accumulation_steps / dp_world_size )
         #                               / gradient_accumulation_steps
         #                         = global_per_token_grad / dp_world_size = avg_per_token_grad
-        counts = counts / self.device_mesh.data_world_size
+        raw_dp_fsdp_world_size = self.device_mesh._get_dp_fsdp_world_size() if self.device_mesh is not None else 1
+        counts = counts / raw_dp_fsdp_world_size
         optimizer_config = self.optimizer_group[adapter_name]
         status.num_tokens += counts.item()
-        if self.sp_strategy is not None and 'labels' in inputs:
-            reduction = getattr(loss_instance, 'reduction', None)
-            if reduction is not None:
-                self.sp_strategy.sp_config['loss_reduction'] = str(reduction)
-            loss_value = self.sp_strategy.reduce_loss(loss_value, inputs['labels'])
         status.loss_value += loss_value
         outputs['loss'] = status.loss_value
+        outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
         return status.loss_value.item()
 
     @remote_function()
@@ -531,11 +540,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Auto set a grad scaler
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
-        if scaler is not None:
-            scaler.scale(loss_value).backward()
-        else:
-            loss_value.backward()
+
         optimizer_config.cur_step += 1
+        should_sync = optimizer_config.do_grad_sync()
+
+        import contextlib
+        no_sync_ctx = contextlib.nullcontext()
+        if not should_sync and hasattr(self.model, 'no_sync'):
+            no_sync_ctx = self.model.no_sync()
+
+        with no_sync_ctx:
+            if scaler is not None:
+                scaler.scale(loss_value).backward()
+            else:
+                loss_value.backward()
+
         optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -870,21 +889,55 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         if kwargs.get('save_optimizer', False):
-            self._save_optimizer(checkpoint_dir, adapter_name=adapter_name)
+            self._save_training_state(
+                checkpoint_dir,
+                adapter_name=adapter_name,
+                consumed_train_samples=kwargs.get('consumed_train_samples', 0),
+            )
 
         return checkpoint_dir
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer = optimizer_config.optimizer
+        lr_scheduler = optimizer_config.lr_scheduler
 
+        if optimizer is not None:
+            optimizer_path = os.path.join(output_dir, 'optimizer.pt')
+            self.strategy.save_optimizer_checkpoint(self.model, optimizer, optimizer_path)
         if Platform.is_master():
-            optimizer = optimizer_config.optimizer
-            lr_scheduler = optimizer_config.lr_scheduler
-            if optimizer is not None:
-                torch.save(optimizer.state_dict(), os.path.join(output_dir, 'optimizer.pt'))
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
+
+    def _save_training_state(self, output_dir, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        self._save_optimizer(output_dir, adapter_name=adapter_name)
+
+        optimizer_config = self.optimizer_group[adapter_name]
+
+        if not Platform.is_master():
+            return
+
+        trainer_state = {
+            'checkpoint_version': 1,
+            'cur_step': optimizer_config.cur_step,
+            'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+        }
+        with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
+            json.dump(trainer_state, f)
+
+        if optimizer_config.scaler is not None:
+            torch.save(
+                {
+                    'scaler_state_dict': optimizer_config.scaler.state_dict(),
+                    'scaler_has_nan': optimizer_config.scaler_has_nan,
+                },
+                os.path.join(output_dir, 'scaler.pt'),
+            )
+
+        torch.save(self._get_training_rng_state(), os.path.join(output_dir, 'rng_state.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -929,10 +982,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 model_sd = model.state_dict()
                 converted_weights = {}
                 for key, value in adapter_weights.items():
-                    if f'.{adapter_name}.weight' not in key:
-                        key = key.replace('.weight', f'.{adapter_name}.weight')
-                    if key in model_sd:
-                        param = model_sd[key]
+                    model_key = key
+                    if f'.{adapter_name}.weight' not in model_key:
+                        model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
+                    if model_key in model_sd:
+                        param = model_sd[model_key]
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                     converted_weights[key] = value
@@ -951,19 +1005,124 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _load_optimizer(self, checkpoint_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        strict = kwargs.pop('strict', False)
         # assume optimizer and lr_scheduler are created
         optimizer_config = self.optimizer_group[adapter_name]
 
         optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
+        if strict and not os.path.exists(optimizer_path):
+            raise FileNotFoundError(optimizer_path)
+        if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
+            logger.warning(
+                f'Missing scheduler checkpoint {scheduler_path}; resuming without restoring lr scheduler state.', )
+
         if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
-            state_dict = torch.load(optimizer_path, map_location='cpu')
-            optimizer_config.optimizer.load_state_dict(state_dict)
+            if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
+                self._lazy_wrap_model()
+            self.strategy.load_optimizer_checkpoint(self.model, optimizer_config.optimizer, optimizer_path)
 
         if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
-            state_dict = torch.load(scheduler_path, map_location='cpu')
+            state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
+
+    def _ensure_lora_dtype(self, model):
+        """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
+        base_dtype = None
+        for param in model.parameters():
+            if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                base_dtype = param.dtype
+                break
+        if base_dtype is None:
+            return
+
+        # Convert all LoRA parameters to the base model dtype
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if 'lora_' in name.lower() and param.dtype != base_dtype:
+                    param.data = param.data.to(base_dtype)
+
+    def _load_scaler_state(self, scaler_path, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.scaler is None:
+            raise ValueError(f'Grad scaler is not configured for adapter {adapter_name!r}')
+
+        scaler_state = torch.load(scaler_path, map_location='cpu', weights_only=True)
+        optimizer_config.scaler.load_state_dict(scaler_state['scaler_state_dict'])
+        optimizer_config.scaler_has_nan = scaler_state.get('scaler_has_nan', False)
+
+    def _get_training_rng_state(self):
+        state = {
+            'python_rng_state': random.getstate(),
+            'numpy_rng_state': np.random.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+        }
+
+        device_prefix = Platform.device_prefix()
+        device_module = getattr(torch, device_prefix, None)
+        if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+            state['device_type'] = device_prefix
+            state['device_rng_state'] = device_module.get_rng_state()
+        else:
+            state['device_type'] = 'cpu'
+            state['device_rng_state'] = None
+        return state
+
+    def _load_rng_state(self, rng_path):
+        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        random.setstate(rng_state['python_rng_state'])
+        np.random.set_state(rng_state['numpy_rng_state'])
+        torch.set_rng_state(rng_state['torch_rng_state'])
+
+        device_type = rng_state.get('device_type')
+        device_rng_state = rng_state.get('device_rng_state')
+        if device_type != 'cpu' and device_rng_state is not None:
+            device_module = getattr(torch, device_type, None)
+            if device_module and hasattr(device_module, 'is_available') and device_module.is_available():
+                device_module.set_rng_state(device_rng_state)
+
+    def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        with open(trainer_state_path) as f:
+            trainer_state = json.load(f)
+
+        adapter_name = adapter_name or self._get_default_group()
+        optimizer_config = self.optimizer_group[adapter_name]
+        self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+        scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
+        if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
+            self._load_scaler_state(scaler_path, adapter_name=adapter_name)
+        rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+        if os.path.exists(rng_path):
+            self._load_rng_state(rng_path)
+        optimizer_config.cur_step = trainer_state['cur_step']
+        optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
+
+        return trainer_state
+
+    @remote_function()
+    def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
+        adapter_name = kwargs.get('adapter_name', '')
+
+        has_adapter = (
+            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
+        if has_adapter:
+            self.load(checkpoint_dir, adapter_name=adapter_name)
+
+        if not resume_only_model:
+            trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        else:
+            with open(os.path.join(checkpoint_dir, 'trainer_state.json')) as f:
+                trainer_state = json.load(f)
+
+        return {
+            'cur_step': trainer_state['cur_step'],
+            'consumed_train_samples': trainer_state['consumed_train_samples'],
+            'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
+        }
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
@@ -1021,6 +1180,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 unwrapped_model.add_adapter(adapter_name, config)
 
+        self._ensure_lora_dtype(self.model)
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
         self.optimizer_group[adapter_name].adapter_config = config

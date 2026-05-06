@@ -150,15 +150,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         """Encode trajectory for vLLM.
 
         Messages should already use transformers standard format (content is List[Dict]).
-        ``batch_encode`` preprocesses media refs in-place (to PIL objects).
+        ``encode`` preprocesses media refs in-place (to PIL objects).
         """
         template = self.template
         if template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
-        encoded = template.batch_encode(
-            [trajectory],
+        encoded = template.encode(
+            trajectory,
             add_generation_prompt=add_generation_prompt,
-        )[0]
+        )
         for key in encoded:
             if isinstance(encoded[key], np.ndarray):
                 encoded[key] = encoded[key].tolist()
@@ -242,7 +242,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:
                 if len(feat['input_ids']) != len(response.prompt_token_ids):
-                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not'
+                    raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not '
                                        f'match prompt_token_ids length {len(response.prompt_token_ids)}')
             else:
                 feat['input_ids'] = response.prompt_token_ids
@@ -345,6 +345,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         lora_request = None
         if adapter_path is not None:
+            logger.info(f'Loading LoRA from {adapter_path}')
             lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
             if lora_request is None:
                 logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '
@@ -435,6 +436,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         self._run_in_loop(_receive_and_load())
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):
         """Gracefully shutdown the vLLM engine and background event loop.
 

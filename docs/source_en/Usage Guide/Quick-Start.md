@@ -2,12 +2,12 @@
 
 ## ✨ What is Twinkle?
 
-A component library for large model training. Based on PyTorch, simpler, more flexible, production-ready.
+A component library for large model training. Based on PyTorch, it is simpler, more flexible, and production-ready.
 
 🧩 <b>Loosely Coupled Architecture</b> · Standardized Interfaces<br>
 🚀 <b>Multiple Runtime Modes</b> · torchrun / Ray / HTTP<br>
 🔌 <b>Multi-Framework Compatible</b> · Transformers / Megatron<br>
-👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment
+👥 <b>Multi-Tenant Support</b> · Single Base Model Deployment<br>
 
 ## Twinkle Compatibility
 
@@ -230,6 +230,64 @@ When running, you need to launch training like this:
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train.py
 ```
 
+### Resume from Checkpoint
+
+The training loops above can be extended to support checkpoint resumption. For a complete example, refer to `cookbook/transformers/fsdp2.py`.
+
+**Saving a Checkpoint**
+
+```python
+model.save(
+    checkpoint_name,
+    output_dir='./output/fsdp2',
+    adapter_name=ADAPTER_NAME,
+    save_optimizer=True,                                    # Store optimizer state
+    consumed_train_samples=dataloader.get_state()['consumed_train_samples'],  # Persist training progress
+)
+```
+
+> `DataLoader` automatically tracks consumed samples internally — call `dataloader.get_state()` to retrieve the current count.
+
+**Resuming Training**
+
+```python
+from pathlib import Path
+
+RESUME_FROM_CHECKPOINT = './output/fsdp2/last-checkpoint'
+RESUME_ONLY_MODEL = False   # True: weights only, skip optimizer/scheduler restoration
+IGNORE_DATA_SKIP = False    # True: do not skip consumed samples from trainer_state.json
+
+if RESUME_FROM_CHECKPOINT:
+    checkpoint_path = str(Path(RESUME_FROM_CHECKPOINT).expanduser().resolve())
+    progress = model.resume_from_checkpoint(checkpoint_path, resume_only_model=RESUME_ONLY_MODEL)
+    if not IGNORE_DATA_SKIP:
+        dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
+```
+
+How the two flags combine:
+
+| `RESUME_ONLY_MODEL` | `IGNORE_DATA_SKIP` | Effect |
+|---|---|---|
+| `False` (default) | `False` (default) | Full resume: restore weights + optimizer + scheduler + RNG, skip consumed data |
+| `True` | `False` | Weights only, but still skip consumed data (restart optimization from fresh) |
+| `True` | `True` | Weights only, restart dataset from the beginning |
+
+**LoRA / Adapter vs Full-Parameter Training**
+
+The flow above uses LoRA as the default example. For full-parameter training, the only difference is in `TransformersModel` initialization — use the checkpoint path as `model_id` instead of the base model ID:
+
+```python
+# LoRA / adapter: base model loaded from hub, checkpoint contains only adapter weights + training state
+model = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
+progress = model.resume_from_checkpoint(resume_path)
+
+# Full-parameter: model weights are saved entirely in the checkpoint — use it directly as model_id
+model = TransformersModel(model_id=resume_path)
+progress = model.resume_from_checkpoint(resume_path)
+```
+
+> All subsequent calls to `resume_from_checkpoint` and `dataloader.resume_from_checkpoint` are identical in both cases.
+
 ### Ray Training
 
 [Ray](https://github.com/ray-project/ray) is a commonly used scheduling middleware framework for multi-machine model training and inference scenarios. It provides additional optimizations for multi-model, multi-device execution and resource management, and supports integration with Kubernetes systems for production deployment. These characteristics make it particularly suitable for complex training scenarios such as RL and GKD.
@@ -412,6 +470,8 @@ python train.py
 ### Remote Training
 
 A major feature of Twinkle is support for multi-tenant mixed training. Specifically, multiple users can use a single base model for LoRA training, which can greatly reduce server-side deployment costs.
+
+Checkpoint resumption is also supported in client-server training. The recommended flow is to call `model.resume_from_checkpoint(resume_path)` to restore weights and optimizer state, then call `dataloader.resume_from_checkpoint(progress['consumed_train_samples'])` to skip consumed data. See [Twinkle-Client](./Server%20and%20Client/Twinkle-Client.md) and [self_cognition.py](../../../cookbook/client/twinkle/self_host/self_cognition.py).
 
 Suppose we start a service using eight GPUs. First, we need to start the Ray cluster:
 
@@ -764,13 +824,17 @@ This service shares the same code as the Tinker API section described above. The
 
 Twinkle provides a sampling API that can be used to control the sampling process more flexibly for result validation, or to participate in the sampling workflow of RL algorithms.
 
-## Using Hugging Face models
+> For complete examples of all supported training modes, please refer to the [cookbook](https://github.com/modelscope/twinkle/tree/main/cookbook) directory.
 
-Switch the prefix.
+## Using Hugging Face Models
+
+To load models from Hugging Face instead of ModelScope, simply switch the prefix:
 
 ```text
 ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 ```
+
+All components that accept a `model_id` parameter support this prefix-based routing.
 
 ## 🛠️ Twinkle✨ Modular Ecosystem
 
@@ -849,7 +913,7 @@ ms://Qwen/Qwen3.5-4B -> hf://Qwen/Qwen3.5-4B
 
 ## Twinkle's Customizable Components
 
-In Twinkle's design, training using torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithm development.
+In Twinkle's design, training via torchrun, Ray, and HTTP uses the same API and shares the same components and input/output structures. Therefore, many of its components can be customized by developers to implement new algorithms.
 
 Below is a list of recommended components for customization:
 
@@ -869,11 +933,11 @@ Below is a list of recommended components for customization:
 | Template              | twinkle.template.Template                  | Used to process standard inputs and convert them to tokens required by the model |
 | Weight Synchronization | twinkle.checkpoint_engine.CheckpointEngine | Used for weight synchronization in RL training                 |
 
-> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized, just follow the base class API design.
+> Components not listed in the above table, such as Dataset, DataLoader, etc., can also be customized; simply follow the base class API design.
 
 ## DeviceGroup and DeviceMesh
 
-DeviceGroup and DeviceMesh are the core of Twinkle's architecture. All code construction is based on these two designs.
+DeviceGroup and DeviceMesh are the core concepts of Twinkle's architecture. All code construction is based on these two designs.
 
 ```python
 import twinkle
@@ -892,7 +956,7 @@ twinkle.initialize(mode='ray', nproc_per_node=8, groups=device_group)
 
 After defining the device_group, you need to use `twinkle.initialize` to initialize resources.
 
-DeviceGroup: Define how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting resource groups:
+DeviceGroup: Defines how many resource groups are needed for this training session. Once defined, components can run themselves remotely by selecting a resource group:
 
 ```python
 from twinkle.model import TransformersModel
@@ -902,7 +966,7 @@ from twinkle.model import MegatronModel
 model = MegatronModel(model_id='Qwen/Qwen3.5-4B', remote_group='default', device_mesh=device_mesh)
 ```
 
-DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions, such as data acquisition, data consumption, data return, etc.
+DeviceMesh specifies the topology of components like models within the resource group. It can be understood as how to perform parallelization. This affects a series of framework decisions such as data acquisition, data consumption, and data return.
 
 ## Usage Example
 

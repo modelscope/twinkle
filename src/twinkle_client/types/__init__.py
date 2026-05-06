@@ -28,6 +28,7 @@ from .model import (
     LrStepResponse,
     ModelResult,
     OkResponse,
+    ResumeFromCheckpointRequest,
     SaveRequest,
     SaveResponse,
     SetLossRequest,
@@ -41,8 +42,10 @@ from .model import (
     SetTemplateRequest,
     SetTemplateResponse,
     StepResponse,
+    TrainingProgressResponse,
     UploadToHubRequest,
     UploadToHubResponse,
+    UploadStatusResponse,
     ZeroGradResponse,
 )
 from .processor import (

@@ -37,6 +37,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_loras: int = 5,
             max_r: int = 32,
             max_length: int = 8192,
+            target_modules: Union[List[str], str] = 'all-linear',
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -75,11 +76,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
-        self.model = self.multi_adapter.patch(self.model)
+        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
         self.handler = self.register_global_mm_forward_hook()
+        self.multi_adapter.reset_adapter_status()
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '
@@ -141,7 +143,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
-    @remote_function()
+    @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
@@ -228,7 +230,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         super().set_processor(processor_cls, **kwargs)
 
-    @remote_function()
+    @remote_function(collect='first')
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
@@ -243,15 +245,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return checkpoint_dir
 
     @remote_function()
-    def load(self, name: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
-                # load from hub
-                token = kwargs.pop('token', None)
-                checkpoint_dir = HubOperation.download_model(name, token=token)
+                if os.path.exists(name):
+                    checkpoint_dir = name
+                else:
+                    token = kwargs.pop('token', None)
+                    checkpoint_dir = HubOperation.download_model(name, token=token)
             else:
                 checkpoint_dir = os.path.join(output_dir, name)
             model = self.strategy.unwrap_model(self.model)
@@ -261,7 +265,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 self.multi_adapter.set_state_dict(adapter_name, adapter_weights)
 
             if load_optimizer:
-                self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
+                self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
         if dist.is_initialized():
             dist.barrier()
 

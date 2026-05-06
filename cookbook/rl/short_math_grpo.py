@@ -39,8 +39,8 @@ NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
-MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 4))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
+MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
 MICRO_BATCH_SIZE = int(os.environ.get('MICRO_BATCH_SIZE', 2))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
 ADAPTER_NAME = 'default'
@@ -77,17 +77,18 @@ class GSM8KBrevityReward(Reward):
                 rewards.append(0.0)
             else:
                 length = len(completion)
-                if length <= 200:
+                if length <= 300:
                     rewards.append(1.0)
                 else:
-                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
+                    rewards.append(max(0.0, 1.0 - (length - 300) / 3000))
         return rewards
 
 
 # ========== Dataset ==========
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=True)
+    dataset = Dataset()
+    dataset.add_dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -118,11 +119,7 @@ def main():
 
     # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
-        target_modules=[
-            'q_proj', 'k_proj', 'v_proj', 'o_proj',
-            'gate_proj', 'up_proj', 'down_proj',
-            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
-        ],
+        target_modules='all-linear',
         r=LORA_RANK,
         lora_alpha=LORA_RANK * 2,
         lora_dropout=0.05,
@@ -135,6 +132,7 @@ def main():
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
+            variable_seq_lengths=True,
         )
     else:
         model = TransformersModel(
@@ -143,7 +141,7 @@ def main():
             remote_group='model',
         )
 
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     if USE_MEGATRON:
         model.set_optimizer('default', lr=LEARNING_RATE)
         model.set_lr_scheduler('default', lr_decay_steps=MAX_STEPS, max_lr=LEARNING_RATE)
@@ -152,8 +150,8 @@ def main():
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
 
     model.set_loss('GRPOLoss', epsilon=0.2)
-    model.set_processor(InputProcessor)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    model.set_processor(InputProcessor, padding_free=True)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -161,16 +159,13 @@ def main():
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
             'max_lora_rank': 32, # save as lora_config
-            # NOTE: To use enable_lora with qwen3.5, ensure vLLM includes PR https://github.com/vllm-project/vllm/pull/36976
-            # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
-            # meaning only sync lora weights, if merge_and_sync=True,
-            # lora will be merged into the base model and sync all weights to vLLM
             'enable_lora': True,
+            'enable_tower_connector_lora': True,
         },
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=True)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 

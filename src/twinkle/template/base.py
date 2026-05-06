@@ -162,11 +162,11 @@ class Template:
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
-        labels = list(result['labels'])
+        labels = list(result.get('labels', []))
         input_ids = list(prompt_ids) + new_tokens
         labels = labels[-1:] + labels[:-1]  # roll to input order
         labels = labels + new_tokens
-        labels = labels[1:] + labels[:1]  # roll to input-1 order
+        # We don't need to roll back, self._invoke_post_pipeline will do this.
         result['input_ids'] = input_ids
         result['labels'] = labels
         if 'mm_token_type_ids' in result:
@@ -228,10 +228,14 @@ class Template:
             result['input_ids'] = result['input_ids'][-self.max_length:]
             if 'labels' in result:
                 result['labels'] = result['labels'][-self.max_length:]
+            if 'mm_token_type_ids' in result:
+                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., -self.max_length:]
         elif strategy == 'right':
             result['input_ids'] = result['input_ids'][:self.max_length]
             if 'labels' in result:
                 result['labels'] = result['labels'][:self.max_length]
+            if 'mm_token_type_ids' in result:
+                result['mm_token_type_ids'] = result['mm_token_type_ids'][..., :self.max_length]
         return InputFeature(**result)
 
     def set_mm_position_ids(self, input_feature: InputFeature):
@@ -255,6 +259,8 @@ class Template:
                 feat['input_ids'] = feat['input_ids'][start:end]
                 if 'labels' in feat:
                     feat['labels'] = feat['labels'][start:end]
+                if 'mm_token_type_ids' in feat:
+                    feat['mm_token_type_ids'] = feat['mm_token_type_ids'][..., start:end]
                 results.append(InputFeature(**feat))
             return results
 
@@ -549,7 +555,22 @@ class Template:
         return trajectory
 
     def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
-        return self._encode_messages(trajectory, add_generation_prompt, **kwargs)
+        """Encode a single trajectory into an InputFeature.
+
+        This is a convenience wrapper around :meth:`batch_encode` for encoding
+        a single trajectory.
+
+        Args:
+            trajectory: The trajectory to encode.
+            add_generation_prompt: Whether to add generation prompt.
+
+        Returns:
+            The encoded InputFeature.
+        """
+        assert self.truncation_strategy != 'split', (
+            'encode() does not support truncation_strategy=="split" because it may produce multiple outputs. '
+            'Use batch_encode() instead.')
+        return self.batch_encode([trajectory], add_generation_prompt=add_generation_prompt, **kwargs)[0]
 
     @staticmethod
     def map_col_to_row(trajectories: Dict[str, Any]):
@@ -645,7 +666,7 @@ class Template:
         from concurrent.futures import ThreadPoolExecutor
         from functools import partial
         encode_fn = partial(
-            self.encode,
+            self._encode_messages,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
@@ -661,7 +682,7 @@ class Template:
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None
         try:
-            encoded = self.batch_encode([trajectory])
+            encoded = self.encode(trajectory)
             if not encoded:
                 return None
             else:

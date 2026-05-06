@@ -5,6 +5,33 @@ from transformers import PreTrainedConfig
 from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
+from twinkle.utils import get_logger
+from .._mindspeed_runtime import configure_mindspeed_runtime_args
+
+logger = get_logger()
+
+
+def finalize_model_grads_for_lora(model, *args, **kwargs):
+    """Only enter Megatron native finalize when the wrapped model has sync capability.
+
+    In single-rank/no-op wrap cases Twinkle attaches ``ddp_config`` to the bare
+    module for optimizer compatibility, but that does not mean the model really
+    implements ``finish_grad_sync()``. Native Megatron finalize ultimately calls
+    that method, so we gate by runtime capability instead of config metadata.
+    """
+    from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+    from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
+    from peft import PeftModel as _PeftModel
+
+    def _get_base_model(m):
+        if isinstance(m, _PeftModel):
+            return _get_base_model(m.base_model.model)
+        return m
+
+    base_model = _get_base_model(model[0])
+    if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
+        return _native_finalize_model_grads(model, *args, **kwargs)
+    return None
 
 
 class MegatronStrategy:
@@ -16,11 +43,12 @@ class MegatronStrategy:
         use_distributed_optimizer: bool = True,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         seed: int = 42,
-        variable_seq_lengths: bool = False,
+        variable_seq_lengths: bool = True,
         config: PreTrainedConfig = None,
         ddp_config: Dict[str, Any] = None,
         **kwargs,
     ):
+        import torch.distributed as dist
         from megatron.core import mpu
         self.device_mesh = device_mesh
         self.use_distributed_optimizer = use_distributed_optimizer
@@ -34,6 +62,15 @@ class MegatronStrategy:
             self.hf_config = AutoConfig.from_pretrained(self.model_dir, trust_remote_code=True)
         else:
             self.hf_config = config
+        num_experts = getattr(self.hf_config, 'num_experts', getattr(self.hf_config, 'num_local_experts', None))
+        if (num_experts not in (None, 0, 1) and (self.device_mesh.tp_world_size or 1) > 1
+                and not getattr(self.device_mesh, 'sequence_parallel', False)):
+            # Megatron 0.15.3 requires sequence parallelism for MoE training when
+            # tensor parallelism is enabled. Keep this policy in the framework so
+            # cookbook scripts do not need to know a model-family-specific
+            # runtime constraint just to launch a valid MoE run.
+            self.device_mesh.sequence_parallel = True
+            logger.info('Auto-enabled sequence_parallel for MoE model with tensor parallelism.')
         if 'overlap_grad_reduce' not in self.ddp_config:
             self.ddp_config['overlap_grad_reduce'] = False
         if 'overlap_param_gather' not in self.ddp_config:
@@ -69,10 +106,14 @@ class MegatronStrategy:
         if 'overlap_p2p_comm' not in kwargs:
             kwargs['overlap_p2p_comm'] = True
             kwargs['batch_p2p_comm'] = not kwargs['overlap_p2p_comm']
-        mpu.initialize_model_parallel(
-            order=self.device_mesh.order,
+
+        init_kwargs = {
+            'order': self.device_mesh.order,
             **parallel_kwargs,
-        )
+        }
+        if Platform.device_prefix() == 'npu':
+            init_kwargs['create_gloo_process_groups'] = True
+        mpu.initialize_model_parallel(**init_kwargs)
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(self.seed)
         self.config = self.get_model_config(self.hf_config, parallel_kwargs, **kwargs)
@@ -187,6 +228,7 @@ class MegatronStrategy:
 
         wrapped_models = []
         for _model in model:
+            _model = MegatronStrategy._move_model_to_gpu(_model)
             config: TransformerConfig = _model.config  # noqa
 
             if not isinstance(model, Float16Module) and (config.fp16 or config.bf16):
@@ -225,7 +267,6 @@ class MegatronStrategy:
         **kwargs,
     ):
         from mcore_bridge import ModelConfig, hf_to_mcore_config
-        from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
         config_kwargs = hf_to_mcore_config(hf_config)
         config_kwargs.update(kwargs)
         if 'calculate_per_token_loss' not in config_kwargs:
@@ -233,24 +274,7 @@ class MegatronStrategy:
 
         if 'moe_token_dispatcher_type' not in config_kwargs:
             config_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
-
-        def finalize_model_grads_for_lora(model, *args, **kwargs):
-            from megatron.core.distributed import DistributedDataParallel as MegatronDDP
-            from peft import PeftModel as _PeftModel
-
-            # Check if model is DDP-wrapped (has ddp_config)
-            # Need to unwrap PeftModel to check the underlying model
-            def _get_base_model(m):
-                if isinstance(m, _PeftModel):
-                    return _get_base_model(m.base_model.model)
-                return m
-
-            base_model = _get_base_model(model[0])
-            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'ddp_config'):
-                # Use native implementation for DDP models
-                return _native_finalize_model_grads(model, *args, **kwargs)
-
-        return ModelConfig(
+        model_config = ModelConfig(
             use_cpu_initialization=True,
             params_dtype=self.params_type,
             sequence_parallel=self.sequence_parallel,
@@ -259,6 +283,18 @@ class MegatronStrategy:
             **parallel_kwargs,
             **config_kwargs,
         )
+        if Platform.device_prefix() == 'npu':
+            # After Twinkle stops feeding the dense 4D causal mask, MindSpeed's
+            # patched TE attention should generate its own compressed causal
+            # mask. In 0.15.3 that path is gated by ``use_flash_attn`` on the
+            # model config itself. If we leave it unset, MindSpeed falls back to
+            # the non-flash mask generator and aborts the first 8-card forward
+            # with: "Please set micro_batch_size or set use_flash_attn=True in
+            # config." Keep the TE flash path enabled and let it synthesize the
+            # mask it expects.
+            model_config.use_flash_attn = True
+        configure_mindspeed_runtime_args(model_config)
+        return model_config
 
     def create_megatron_model(
         self,

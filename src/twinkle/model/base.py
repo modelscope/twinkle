@@ -88,6 +88,14 @@ class TwinkleModel(ABC):
         ...
 
     @abstractmethod
+    def resume_from_checkpoint(self,
+                               checkpoint_dir: str,
+                               *,
+                               resume_only_model: bool = False,
+                               **kwargs) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         ...
 
@@ -134,6 +142,9 @@ class TwinkleModel(ABC):
         else:
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
+    def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
+        return backend in ('nccl', 'hccl')
+
     def _try_init_process_group(self):
         import torch
         import torch.distributed as dist
@@ -154,6 +165,14 @@ class TwinkleModel(ABC):
                 'rank': Platform.get_rank(),
                 'world_size': Platform.get_world_size(),
             }
-            if backend in ('nccl', 'hccl'):
+            if self._should_bind_device_id_for_process_group(backend):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
+            if backend == 'hccl':
+                default_pg = dist.distributed_c10d._get_default_group()
+                if getattr(default_pg, 'bound_device_id', None) is not None:
+                    # If the default HCCL PG keeps a bound device id, PyTorch may
+                    # propagate that binding into later Gloo subgroup creation. That
+                    # breaks the metrics/object-gather path on NPU, so clear it
+                    # before Megatron creates its Gloo DP groups.
+                    default_pg.bound_device_id = None
