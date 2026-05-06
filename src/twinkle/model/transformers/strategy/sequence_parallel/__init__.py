@@ -65,22 +65,6 @@ class SequenceParallel:
             return position_ids[0]
         return position_ids
 
-    def _update_packed_varlen_metadata(self, real_position_ids: Optional[torch.Tensor]) -> None:
-        self.extra_kwargs.pop('cu_seq_lens_q', None)
-        if not self.extra_kwargs.get('padding_free', False) or real_position_ids is None:
-            return
-        position_ids = self._extract_real_position_ids(real_position_ids)
-        if position_ids is None or not torch.is_tensor(position_ids):
-            return
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        if position_ids.shape[0] != 1:
-            raise ValueError('Packed sequence-parallel inputs require batch_size == 1 when deriving cu_seq_lens_q from '
-                             'position_ids. Please populate cu_seq_lens_q explicitly for batched packed inputs.')
-        safe_position_ids = position_ids.clone()
-        safe_position_ids[safe_position_ids < 0] = 0
-        self.extra_kwargs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
-
     @property
     def sp_rank(self) -> int:
         return self._sp_rank
@@ -690,7 +674,6 @@ class SequenceParallel:
         """
         tokenizer = self.tokenizer
         real_position_ids = real_position_ids if real_position_ids is not None else position_ids
-        self._update_packed_varlen_metadata(real_position_ids)
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -799,8 +782,7 @@ class SequenceParallel:
         """Prepare inputs
 
         1. set extra_kwargs['position_ids']
-        2. cache packed/varlen metadata
-        3. split labels
+        2. split labels
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
@@ -814,7 +796,6 @@ class SequenceParallel:
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
             self.extra_kwargs['position_ids'] = real_position_ids.clone()
         self.extra_kwargs['padding_free'] = padding_free
-        self._update_packed_varlen_metadata(real_position_ids)
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:

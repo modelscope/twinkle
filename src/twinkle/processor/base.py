@@ -315,10 +315,11 @@ class InputProcessor:
             position_ids = _inp.get('position_ids')
             if position_ids is None or not torch.is_tensor(position_ids):
                 continue
-            _inp['cu_seq_lens_q'] = self._get_packed_seq_params(position_ids).cu_seqlens_q.to(
-                dtype=torch.int32,
-                device=position_ids.device,
-            )
+            packed_seq_params = self._get_packed_seq_params(position_ids)
+            _inp['cu_seq_lens_q'] = packed_seq_params.cu_seqlens_q.to(dtype=torch.int32, device=position_ids.device)
+            _inp['cu_seq_lens_k'] = packed_seq_params.cu_seqlens_kv.to(dtype=torch.int32, device=position_ids.device)
+            _inp['max_length_q'] = int(packed_seq_params.max_seqlen_q)
+            _inp['max_length_k'] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
     def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:

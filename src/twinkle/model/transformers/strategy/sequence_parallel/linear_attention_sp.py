@@ -229,7 +229,9 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         )
         extra_kwargs = getattr(sequence_parallel_context, 'extra_kwargs', {})
         if bool(extra_kwargs.get('padding_free', False)) and packed_cu_seqlens is None:
-            raise ValueError('Qwen3.5 sequence parallel with padding_free/packed inputs requires cu_seq_lens_q.')
+            raise ValueError(
+                'Qwen3.5 sequence parallel with padding_free/packed inputs requires packed sequence metadata '
+                '(for example valid position_ids).')
         if using_torch_fallback and packed_cu_seqlens is not None:
             raise NotImplementedError(
                 'Qwen3.5 linear attention sequence parallel with padding_free/packed inputs requires '

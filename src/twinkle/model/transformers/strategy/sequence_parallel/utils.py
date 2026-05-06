@@ -49,9 +49,7 @@ def get_packed_cu_seqlens_from_sequence_parallel_context(
             position_ids = sequence_parallel_context._extract_real_position_ids(position_ids)
             position_ids = sequence_parallel_context.pad(position_ids, padding_value=-1, position_ids=position_ids)
             return get_cu_seqlens_from_position_ids(position_ids).to(dtype=torch.int32, device=device)
-
-    cu_seqlens = extra_kwargs.get('cu_seq_lens_q')
-    return cu_seqlens.to(dtype=torch.int32, device=device) if cu_seqlens is not None else None
+    return None
 
 
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:

@@ -110,6 +110,9 @@ class Qwen35GatedDeltaNetPaddingFreePatch(Patch):
                         **extra_kwargs,
                     )
                 cu_seq_lens_q = extra_kwargs.pop('cu_seq_lens_q', None)
+                extra_kwargs.pop('cu_seq_lens_k', None)
+                extra_kwargs.pop('max_length_q', None)
+                extra_kwargs.pop('max_length_k', None)
 
                 residual = hidden_states
                 hidden_states = layer.input_layernorm(hidden_states)
