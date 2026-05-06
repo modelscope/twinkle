@@ -72,6 +72,7 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         return False
 
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
     def _torch_causal_conv1d_fn(
         *,
         x,
