@@ -24,7 +24,7 @@ def _find_qwen35_classes(module: Optional[torch.nn.Module], hf_config, enable_sp
 def _get_flash_linear_attention_kernels():
     if not is_flash_linear_attention_available():
         raise NotImplementedError(
-            'Qwen3.5 padding_free/packed inputs require flash-linear-attention for GatedDeltaNet. '
+            'padding_free/packed inputs require flash-linear-attention for GatedDeltaNet. '
             'The native torch GatedDeltaNet implementation does not reset linear-attention state at packed '
             'sequence boundaries. Please install flash-linear-attention or disable padding_free/packing.')
     from fla.modules.convolution import causal_conv1d
@@ -70,7 +70,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
         mod.chunk_gated_delta_rule = old_chunk_rule
 
 
-class Qwen35GatedDeltaNetPaddingFreePatch(Patch):
+class GatedDeltaNetPaddingFreePatch(Patch):
 
     def __call__(self, module, *args, **kwargs):
         del args
@@ -83,7 +83,7 @@ class Qwen35GatedDeltaNetPaddingFreePatch(Patch):
             return
         if getattr(Qwen3_5GatedDeltaNet, '_twinkle_sp_linear_patched', False):
             return
-        module._twinkle_qwen35_padding_free_patched = True
+        module._twinkle_gdn_padding_free_patched = True
 
         if not getattr(Qwen3_5DecoderLayer, '_twinkle_padding_free_cu_seqlens_patched', False):
             origin_decoder_forward = Qwen3_5DecoderLayer.forward

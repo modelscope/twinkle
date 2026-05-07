@@ -300,15 +300,15 @@ class InputProcessor:
             return inputs
 
         from twinkle.patch import apply_patch
-        from twinkle.patch.qwen35_gdn_padding_free import Qwen35GatedDeltaNetPaddingFreePatch
+        from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
 
         apply_patch(
             model,
-            Qwen35GatedDeltaNetPaddingFreePatch,
+            GatedDeltaNetPaddingFreePatch,
             hf_config=kwargs.get('hf_config'),
             enable_sp=False,
         )
-        if not getattr(model, '_twinkle_qwen35_padding_free_patched', False):
+        if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
             return inputs
 
         for _inp in inputs:
