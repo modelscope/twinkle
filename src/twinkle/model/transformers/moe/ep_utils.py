@@ -106,7 +106,6 @@ def permute(tokens: torch.Tensor, expert_mask: torch.Tensor):
 
     """
     num_tokens, _ = tokens.shape
-    num_experts = expert_mask.shape[0]
     expert_mask = expert_mask.bool()
 
     # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
@@ -234,7 +233,6 @@ def token_pre_all2all(
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
     org_hidden_states_shape = hidden_states.shape
-    routing_map = expert_mask.sum(dim=1).bool()
 
     local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, expert_mask)
     local_assignment_weights = routing_weights.T.contiguous().masked_select(expert_mask.bool())

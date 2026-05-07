@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
-from typing import Any, Literal, Optional
-
 import torch
 from transformers import AutoConfig, PreTrainedTokenizerFast
+from typing import Any, Literal, Optional
 
 from twinkle.hub import HubOperation
-
 from .base import Template
 from .deepseek_v4_encoding import encode_messages
 
@@ -56,11 +54,7 @@ def get_deepseek_v4_tokenizer(tokenizer):
             if not tokenize:
                 return {'prompt': prompt_str} if return_dict else prompt_str
 
-            tokenizer_kwargs = {
-                key: kwargs[key]
-                for key in ('truncation', 'max_length')
-                if key in kwargs
-            }
+            tokenizer_kwargs = {key: kwargs[key] for key in ('truncation', 'max_length') if key in kwargs}
             input_ids = self.encode(
                 prompt_str,
                 add_special_tokens=False,

@@ -98,7 +98,7 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
-        strategy="native_fsdp",
+        strategy='native_fsdp',
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
         fsdp_config={
             'reshard_after_forward': RESHARD_AFTER_FORWARD,

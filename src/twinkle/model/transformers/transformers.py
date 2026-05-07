@@ -7,7 +7,6 @@ import os
 import random
 import re
 import threading
-import time
 import torch
 import torch.distributed as dist
 import transformers
@@ -45,15 +44,6 @@ from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
 logger = get_logger()
-
-
-def _ep_debug_event(event: str, **kwargs) -> None:
-    if os.environ.get('TWINKLE_EP_DEBUG', '0') != '1':
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
-    ts = f'{time.time():.3f}'
-    extras = ' '.join(f'{key}={value}' for key, value in kwargs.items())
-    print(f'[twinkle-ep-debug] ts={ts} rank={rank} model_event={event} {extras}', flush=True)
 
 
 @dataclass
@@ -549,7 +539,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
-        _ep_debug_event('backward_enter', adapter_name=adapter_name)
         scaler = optimizer_config.scaler
         if scaler is None and self.mixed_precision == 'fp16':
             # Auto set a grad scaler
@@ -570,9 +559,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 loss_value.backward()
 
-        _ep_debug_event('backward_after_loss_backward', adapter_name=adapter_name)
         self._sync_after_backward_if_needed()
-        _ep_debug_event('backward_exit', adapter_name=adapter_name)
         optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -590,12 +577,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         outputs = self.forward(inputs=inputs, **kwargs)
-        _ep_debug_event('forward_backward_after_forward')
         loss = self.calculate_loss(**kwargs)
-        _ep_debug_event('forward_backward_after_calculate_loss', loss=loss)
         outputs['loss'] = loss
         self.backward(**kwargs)
-        _ep_debug_event('forward_backward_exit')
         return outputs
 
     def _sync_after_backward_if_needed(self) -> None:
@@ -622,9 +606,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        _ep_debug_event('clip_grad_norm_enter', adapter_name=adapter_name)
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
-            _ep_debug_event('clip_grad_norm_skip_no_sync', adapter_name=adapter_name)
             return
 
         optimizer = optimizer_config.optimizer
@@ -657,20 +639,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             )
             optimizer_config._last_grad_norm = grad_norm
             optimizer_config.train_status.num_tokens = 0
-            _ep_debug_event('clip_grad_norm_exit', adapter_name=adapter_name, grad_norm=grad_norm)
             return grad_norm
 
     @remote_function(dispatch='all')
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
-        _ep_debug_event('clip_grad_and_step_enter')
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
-        _ep_debug_event('clip_grad_and_step_after_clip')
         self.step(**kwargs)
-        _ep_debug_event('clip_grad_and_step_after_step')
         self.zero_grad(**kwargs)
-        _ep_debug_event('clip_grad_and_step_after_zero_grad')
         self.lr_step(**kwargs)
-        _ep_debug_event('clip_grad_and_step_exit')
 
     def _create_param_group(self,
                             adapter_name: str,

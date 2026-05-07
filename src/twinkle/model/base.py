@@ -143,7 +143,7 @@ class TwinkleModel(ABC):
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
-        return backend =="hccl"
+        return backend == 'hccl'
 
     def _try_init_process_group(self):
         import torch
