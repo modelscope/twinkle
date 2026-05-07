@@ -34,6 +34,24 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
+def get_packed_cu_seqlens_from_sequence_parallel_context(
+    sequence_parallel_context,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if sequence_parallel_context is None:
+        return None
+
+    extra_kwargs = getattr(sequence_parallel_context, 'extra_kwargs', {})
+    if extra_kwargs.get('padding_free', False):
+        position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
+        if position_ids is not None:
+            position_ids = sequence_parallel_context._extract_real_position_ids(position_ids)
+            position_ids = sequence_parallel_context.pad(position_ids, padding_value=-1, position_ids=position_ids)
+            return get_cu_seqlens_from_position_ids(position_ids).to(dtype=torch.int32, device=device)
+    return None
+
+
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
     dp_world_size = device_mesh.dp_world_size or 1
     fsdp_world_size = device_mesh.fsdp_world_size or 1

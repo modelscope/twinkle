@@ -69,6 +69,7 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
+            self.prepare_transformers_padding_free_patch,
             self.drop_causal_4d_mask,
             self.split_cp,
             self.apply_transformers_sp,
@@ -125,7 +126,13 @@ class InputProcessor:
         sp_strategy = kwargs.get('sp_strategy')
         if self.framework != 'transformers' or sp_strategy is None:
             return inputs
-        return [InputFeature(**sp_strategy.preprocess_inputs(dict(_input))) for _input in inputs]
+        padding_free = bool(self.padding_free or self._any_packing(inputs))
+        results = []
+        for _input in inputs:
+            payload = dict(_input)
+            payload['padding_free'] = padding_free
+            results.append(InputFeature(**sp_strategy.preprocess_inputs(payload)))
+        return results
 
     def postprocess_tensor_sp(self, inputs: Dict[str, Any], outputs: Dict[str, Any],
                               **kwargs) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -277,9 +284,42 @@ class InputProcessor:
 
     def add_extra_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
         for _inp in inputs:
-            padding_free = self.padding_free or self._any_packing([_inp])
+            padding_free = bool(self.padding_free or self._any_packing([_inp]))
             if padding_free and self.framework == 'megatron':
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
+        return inputs
+
+    def prepare_transformers_padding_free_patch(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        if self.framework != 'transformers':
+            return inputs
+        model = kwargs.get('model')
+        if model is None:
+            return inputs
+        padding_free = bool(self.padding_free or self._any_packing(inputs))
+        if not padding_free or bool(kwargs.get('enable_sp', False)):
+            return inputs
+
+        from twinkle.patch import apply_patch
+        from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+        apply_patch(
+            model,
+            GatedDeltaNetPaddingFreePatch,
+            hf_config=kwargs.get('hf_config'),
+            enable_sp=False,
+        )
+        if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
+            return inputs
+
+        for _inp in inputs:
+            position_ids = _inp.get('position_ids')
+            if position_ids is None or not torch.is_tensor(position_ids):
+                continue
+            packed_seq_params = self._get_packed_seq_params(position_ids)
+            _inp['cu_seq_lens_q'] = packed_seq_params.cu_seqlens_q.to(dtype=torch.int32, device=position_ids.device)
+            _inp['cu_seq_lens_k'] = packed_seq_params.cu_seqlens_kv.to(dtype=torch.int32, device=position_ids.device)
+            _inp['max_length_q'] = int(packed_seq_params.max_seqlen_q)
+            _inp['max_length_k'] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
     def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:

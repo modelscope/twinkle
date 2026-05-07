@@ -65,22 +65,6 @@ class SequenceParallel:
             return position_ids[0]
         return position_ids
 
-    def _update_packed_varlen_metadata(self, real_position_ids: Optional[torch.Tensor]) -> None:
-        self.extra_kwargs.pop('cu_seq_lens_q', None)
-        if real_position_ids is None or not self._is_packed_position_ids(real_position_ids):
-            return
-        position_ids = self._extract_real_position_ids(real_position_ids)
-        if position_ids is None or not torch.is_tensor(position_ids):
-            return
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        if position_ids.shape[0] != 1:
-            raise ValueError('Packed sequence-parallel inputs require batch_size == 1 when deriving cu_seq_lens_q from '
-                             'position_ids. Please populate cu_seq_lens_q explicitly for batched packed inputs.')
-        safe_position_ids = position_ids.clone()
-        safe_position_ids[safe_position_ids < 0] = 0
-        self.extra_kwargs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
-
     @property
     def sp_rank(self) -> int:
         return self._sp_rank
@@ -220,17 +204,19 @@ class SequenceParallel:
                             window_size=kwargs.get('sliding_window') or (-1, -1),
                             group=self._rp_group,
                         )
-                    elif self.extra_kwargs.get('is_packed', False) or 'cu_seq_lens_q' in kwargs:
-                        cu_seqlens = kwargs.get('cu_seq_lens_q')
-                        if cu_seqlens is None:
-                            position_ids = kwargs.get('position_ids')
-                            if position_ids is None:
-                                position_ids = self.real_position_ids
-                            position_ids = self._extract_real_position_ids(position_ids)
-                            position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
-                            cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
-                        else:
-                            cu_seqlens = cu_seqlens.to(dtype=torch.int32, device=query.device)
+                    elif self.extra_kwargs.get('padding_free', False) or 'cu_seq_lens_q' in kwargs:
+                        position_ids = kwargs.get('position_ids')
+                        if position_ids is None:
+                            position_ids = self.real_position_ids
+                        if position_ids is None:
+                            raise ValueError('Packed/varlen flash_attention_2 requires position_ids to derive '
+                                             'cu_seq_lens_q.')
+                        position_ids = self._extract_real_position_ids(position_ids)
+                        position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
+                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(
+                            dtype=torch.int32,
+                            device=query.device,
+                        )
                         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                         total_tokens = int(cu_seqlens[-1].item())
                         if query.shape[2] != total_tokens:
@@ -241,7 +227,7 @@ class SequenceParallel:
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
-                        if self.extra_kwargs.get('is_packed', False) and len(args) > 0:
+                        if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
                             args = (None, *args[1:])
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
@@ -261,10 +247,10 @@ class SequenceParallel:
             # Policy: packed (PackingDataset/padding-free) batches require FlashAttention2 varlen/packed semantics.
             # SDPA does not have a native packed/varlen interface; supporting packed batches would require building a
             # large block-diagonal causal mask (slow / memory heavy).
-            if self.extra_kwargs.get('is_packed', False):
+            if self.extra_kwargs.get('padding_free', False):
                 raise RuntimeError(
-                    'SequenceParallel: detected packed batch (position_ids contains multiple sequences). '
-                    'SDPA backend is not supported for packed batches; please use flash_attention_2.')
+                    'SequenceParallel: detected padding_free/packed batch. '
+                    'SDPA backend is not supported for padding_free/packed batches; please use flash_attention_2.')
             if dist_attn.local_attn is None:
 
                 def _attention(query, key, value, *args, **kwargs):
@@ -688,9 +674,6 @@ class SequenceParallel:
         """
         tokenizer = self.tokenizer
         real_position_ids = real_position_ids if real_position_ids is not None else position_ids
-        # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
-        self._update_packed_varlen_metadata(real_position_ids)
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -799,16 +782,20 @@ class SequenceParallel:
         """Prepare inputs
 
         1. set extra_kwargs['position_ids']
-        2. cache packed/varlen metadata
-        3. split labels
+        2. split labels
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
+        padding_free = bool(inputs.pop('padding_free', False))
+        if padding_free and self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+            raise RuntimeError('Transformers SequenceParallel does not support padding_free/packed inputs with '
+                               f'attn_implementation={self.attn_implementation!r}. '
+                               'Use flash_attention_2 or flash_attention_3, or disable padding_free/packing. '
+                               'SDPA/eager attention cannot safely preserve packed sequence boundaries in this path.')
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
             self.extra_kwargs['position_ids'] = real_position_ids.clone()
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
-        self._update_packed_varlen_metadata(real_position_ids)
+        self.extra_kwargs['padding_free'] = padding_free
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
@@ -919,6 +906,23 @@ class SequenceParallelStrategy:
         outputs['logits'] = gathered
         return outputs
 
+    @staticmethod
+    def _trim_gathered_sequence_padding(tensor: torch.Tensor, real_position_ids: torch.Tensor) -> torch.Tensor:
+        if real_position_ids is None or not torch.is_tensor(real_position_ids) or real_position_ids.dim() < 2:
+            return tensor
+        if sequence_parallel.rp_world_size > 1:
+            cu_seqlens = get_cu_seqlens_from_position_ids(real_position_ids)
+            pieces = []
+            padded_offset = 0
+            divisor = sequence_parallel.world_size * 2
+            for i in range(len(cu_seqlens) - 1):
+                real_len = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
+                padded_len = math.ceil(real_len / divisor) * divisor
+                pieces.append(tensor[:, padded_offset:padded_offset + real_len])
+                padded_offset += padded_len
+            return torch.cat(pieces, dim=1).contiguous() if pieces else tensor[:, :0].contiguous()
+        return tensor[:, :real_position_ids.shape[-1]].contiguous()
+
     def gather_loss_tensors(
         self,
         inputs: Dict[str, Any],
@@ -939,6 +943,8 @@ class SequenceParallelStrategy:
         outputs = copy(outputs)
         real_position_ids = sequence_parallel.real_position_ids
         gathered_logps, gathered_labels = GatherLoss.apply(logps, labels, 1, real_position_ids)
+        gathered_logps = self._trim_gathered_sequence_padding(gathered_logps, real_position_ids)
+        gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
         return inputs, outputs
