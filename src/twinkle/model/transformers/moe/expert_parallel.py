@@ -19,7 +19,7 @@ class ExpertParallelConfig:
     router_dtype: str = 'fp32'
     keep_router_logits: bool = True
     ignore_shared_experts: bool = False
-    sync_after_backward: bool = True  # consumed by TransformersModel to keep EP/FSDP collectives ordered
+    # sync_after_backward: bool = True  # consumed by TransformersModel to keep EP/FSDP collectives ordered
     ep_size: int | None = None  # consumed by TransformersModel, not used in expert_parallel logic
 
 

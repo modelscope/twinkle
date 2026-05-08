@@ -559,7 +559,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 loss_value.backward()
 
-        self._sync_after_backward_if_needed()
+        # self._sync_after_backward_if_needed()
         optimizer_config.train_status.loss_value = None
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -582,15 +582,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.backward(**kwargs)
         return outputs
 
-    def _sync_after_backward_if_needed(self) -> None:
-        if not getattr(self, '_enable_expert_parallel', False):
-            return
-        expert_parallel_config = getattr(self, '_expert_parallel_config', None) or {}
-        if not expert_parallel_config.get('sync_after_backward', True):
-            return
-        torch_util.synchronize()
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+    # def _sync_after_backward_if_needed(self) -> None:
+    #     if not getattr(self, '_enable_expert_parallel', False):
+    #         return
+    #     expert_parallel_config = getattr(self, '_expert_parallel_config', None) or {}
+    #     if not expert_parallel_config.get('sync_after_backward', True):
+    #         return
+    #     torch_util.synchronize()
+    #     if dist.is_available() and dist.is_initialized():
+    #         dist.barrier()
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
