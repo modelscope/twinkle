@@ -234,7 +234,8 @@ class MultiLora:
                     lora_A = self.lora_A[active_adapter]
                     lora_B = self.lora_B[active_adapter]
                     dropout = self.lora_dropout[_lora.adapter_name]
-                    scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
+                    scaling = _lora.tenant_config.lora_alpha / (
+                        _lora.tenant_config.r**0.5 if _lora.tenant_config.use_rslora else _lora.tenant_config.r)
                     x = self._cast_input_dtype(x, lora_A.weight.dtype)
                     dropout_x = dropout(x)
                     lora_A_out = torch.nn.functional.linear(
@@ -266,7 +267,9 @@ class MultiLora:
 
                     embedding_A = self.lora_embedding_A[active_adapter]
                     embedding_B = self.lora_embedding_B[active_adapter]
-                    scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
+
+                    scaling = _lora.tenant_config.lora_alpha / (
+                        _lora.tenant_config.r**0.5 if _lora.tenant_config.use_rslora else _lora.tenant_config.r)
 
                     embedding_A_T = embedding_A.T[:, :_lora.tenant_config.r]
                     embedding_B_T = embedding_B.T[:_lora.tenant_config.r, :]
@@ -329,7 +332,8 @@ class MultiLora:
                         lora_A = self.lora_A[active_adapter]
                         lora_B = self.lora_B[active_adapter]
                         dropout = self.lora_dropout[_lora.adapter_name]
-                        scaling = _lora.tenant_config.lora_alpha / _lora.tenant_config.r
+                        scaling = _lora.tenant_config.lora_alpha / (
+                            _lora.tenant_config.r**0.5 if _lora.tenant_config.use_rslora else _lora.tenant_config.r)
 
                         def _lora_A(x, *args, **kwargs):
                             if isinstance(lora_A, TEGroupedLinear):
