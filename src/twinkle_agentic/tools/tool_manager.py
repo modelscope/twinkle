@@ -1,16 +1,36 @@
 import json
-from typing import List, Optional, Dict, Union, Any
-
-from fastmcp.utilities.inspect import ToolInfo
-
+from typing import List, Optional, Dict, Union, Any, Iterable
 from twinkle.data_format import ToolCall
+from twinkle.data_format.message import Tool as ToolInfo
 from twinkle_agentic.tools.base import Tool
 
 
 class ToolManager:
 
-    def __init__(self, tools: Dict[str, Tool]):
-        self._tools = tools
+    def __init__(
+        self,
+        tools: Optional[Union[Dict[str, Tool], Iterable[Tool]]] = None,
+    ):
+        if tools is None:
+            self._tools: Dict[str, Tool] = {}
+            return
+        if isinstance(tools, dict):
+            self._tools = dict(tools)
+            return
+        if isinstance(tools, (list, tuple)):
+            self._tools = {}
+            for t in tools:
+                info = t.tool_info() if hasattr(t, 'tool_info') else None
+                name = info.get('tool_name') if isinstance(info, dict) else None
+                if not name:
+                    raise ValueError(
+                        f'tool {type(t).__name__} must expose a non-empty '
+                        f'tool_info()["tool_name"]')
+                self._tools[name] = t
+            return
+        raise TypeError(
+            f'ToolManager expects dict | Iterable[Tool] | None; '
+            f'got {type(tools).__name__}')
 
     def register(self, tool: Tool):
         info = tool.tool_info()
@@ -26,6 +46,9 @@ class ToolManager:
 
     def names(self) -> List[str]:
         return list(self._tools)
+
+    def copy(self) -> 'ToolManager':
+        return ToolManager(dict(self._tools))
 
     def tool_infos(self) -> List[ToolInfo]:
         return [t.tool_info() for t in self._tools.values()]

@@ -19,6 +19,7 @@ class Chunk(TypedDict, total=False):
     content: Union[str, Any]
     raw: Union[str, Any]
     role: str
+    round: int
 
 
 @dataclass
