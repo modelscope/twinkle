@@ -25,7 +25,7 @@ import numpy as np
 import os
 import threading
 from typing import Any, Dict, List, Optional, Type, Union
-
+from copy import copy
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
@@ -216,6 +216,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         *,
         multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
+        disable_lora: bool = False,
     ) -> SampleResponse:
         """Sample a single input asynchronously.
 
@@ -237,6 +238,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
+            disable_lora=disable_lora,
         )
 
         if 'input_ids' not in feat or multi_modal_data:
@@ -288,6 +290,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         adapter_path: Optional[str] = None,
         *,
         return_encoded: bool = False,
+        use_base_model: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -325,6 +328,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         is_trajectory = 'input_ids' not in inputs_list[0]
         logprobs_only = False
         if sampling_params.max_tokens == 0:
+            sampling_params = copy(sampling_params)
             sampling_params.max_tokens = 1
             logprobs_only = True
             assert not is_trajectory, 'Logprobs only not supported for Trajectory inputs'
@@ -360,6 +364,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     lora_request=lora_request,
                     multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
                 ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
             ]
             return await asyncio.gather(*tasks)

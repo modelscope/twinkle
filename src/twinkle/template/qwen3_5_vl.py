@@ -3,17 +3,37 @@ import numpy as np
 import torch
 from copy import copy
 from PIL import Image
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable
 
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
-from twinkle.template import Template
 from twinkle.template.base import ImageInput, VideoInput
+from twinkle.template.qwen import QwenTemplate
 from twinkle.template.utils import get_inputs_embeds_hf
 
 
+_ROPE_INDEX_CACHE: Dict[str, Callable] = {}
+
+
+def _build_rope_index_func(config) -> Callable:
+    arch = config.architectures[0]
+    fn = _ROPE_INDEX_CACHE.get(arch)
+    if fn is not None:
+        return fn
+    import transformers
+    with torch.device('meta'):
+        model_cls = getattr(transformers, arch)
+        dummy_model = model_cls(config)
+    for _, sub_module in dummy_model.named_modules():
+        if hasattr(sub_module, 'get_rope_index'):
+            _ROPE_INDEX_CACHE[arch] = sub_module.get_rope_index
+            return sub_module.get_rope_index
+    raise NotImplementedError(
+        f'Module {dummy_model.__class__.__name__} has no get_rope_index method!')
+
+
 @remote_class()
-class Qwen3_5Template(Template):
+class Qwen3_5Template(QwenTemplate):
     """
     Processor for Qwen VL series.
 
@@ -26,18 +46,16 @@ class Qwen3_5Template(Template):
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()
-        with torch.device('meta'):
-            import transformers
-            model_cls = self.config.architectures[0]
-            model_cls = getattr(transformers, model_cls)
-            self.dummy_model = model_cls(self.config)
-            self.rope_index_func = self.get_rope_index()
 
-    def get_rope_index(self):
-        for _, sub_module in self.dummy_model.named_modules():
-            if hasattr(sub_module, 'get_rope_index'):
-                return sub_module.get_rope_index
-        raise NotImplementedError(f'Module {self.dummy_model.__class__.__name__} has no get_rope_index method!')
+    @property
+    def rope_index_func(self) -> Callable:
+        """Lazily resolve the rope-index function via a module-level cache.
+
+        Kept off ``self`` so the template's ``__dict__`` stays free of
+        ``nn.Module`` state, which in turn keeps ``dill.dumps(template)``
+        deterministic for HF datasets fingerprinting.
+        """
+        return _build_rope_index_func(self.config)
 
     def _init_vision_config(self):
         """Initialize vision config from processor."""
