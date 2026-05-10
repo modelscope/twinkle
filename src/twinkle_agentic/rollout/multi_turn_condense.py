@@ -111,12 +111,6 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             canonical[uidx] = Chunks(chunks=merged.chunks[start:end])
             start = end
 
-        # Broadcast: every trajectory (duplicates included) gets the
-        # canonical Chunks of its signature group. Sharing the Chunks
-        # object across duplicates is safe because nothing mutates it
-        # post-condensation; each trajectory still gets its own message
-        # dict (to preserve trajectory-local metadata beyond ``messages``)
-        # and its own ToolManager clone.
         compressed_list: List[Trajectory] = []
         tool_managers: List[ToolManager] = []
         for i, traj in enumerate(trajectories):

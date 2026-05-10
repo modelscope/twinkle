@@ -69,6 +69,31 @@ class MultiTurnRollout(Rollout):
     The class intentionally has no knowledge of condensers/chunkers; they are
     applied upstream (on the trajectory before rollout) or downstream
     (on the returned messages).
+
+    Output contract (per trajectory):
+        ``out['logprobs']`` is the raw per-token logprob payload emitted by
+        the sampler, concatenated across all assistant turns in chronological
+        order. Its shape is
+
+            ``List[List[Tuple[int, float]]]``
+
+        where each outer entry corresponds to one newly sampled assistant
+        token and contains a single ``(token_id, logprob)`` pair
+        (see ``vllm_engine.py`` which emits ``[(tid, lp[tid].logprob)]``
+        per position). Bridge / tool / system tokens contribute ZERO
+        entries, so the invariant
+
+            ``len(out['logprobs']) == sum(l != -100 for l in out['labels'])``
+
+        holds across all termination paths (length / no-tool / max_turns).
+        This invariant is asserted at the end of ``__call__`` so any future
+        regression fails loudly instead of silently misaligning GRPO
+        ``old_logps`` inside ``grpo._pad_and_align_to_batch``.
+
+        Consumers that want a flat ``List[float]`` of logprobs (e.g. GRPO
+        cookbook scripts) must extract ``lp[0][1]`` from each entry; do NOT
+        pass ``out['logprobs']`` straight into ``forward_backward(
+        old_logps=...)``.
     """
 
     def __init__(
@@ -142,6 +167,10 @@ class MultiTurnRollout(Rollout):
             pif.setdefault('messages', list(traj.get('messages', [])))
             pifs.append(pif)
 
+        # ``all_logprobs[i]`` accumulates the raw per-token logprob entries
+        # returned by the sampler for trajectory ``i`` (one entry per newly
+        # sampled assistant token, shape ``[(token_id, logprob)]``; see the
+        # class docstring for the full contract).
         all_logprobs: List[List[Any]] = [[] for _ in range(n)]
         stop_reasons: List[Optional[str]] = [None] * n
         turns: List[int] = [0] * n
@@ -260,6 +289,19 @@ class MultiTurnRollout(Rollout):
             # the final pif length for the turn.
             if self.trace_path and trace_rows:
                 self._write_trace(trace_rows)
+
+        for i in range(n):
+            if not all_logprobs[i]:
+                continue
+            labels_i = pifs[i].get('labels') or []
+            trainable_i = sum(1 for l in labels_i if l != -100)
+            if len(all_logprobs[i]) != trainable_i:
+                raise RuntimeError(
+                    f'logprobs/labels misaligned for trajectory {i}: '
+                    f'{len(all_logprobs[i])} logprobs vs {trainable_i} '
+                    f'trainable labels (labels != -100). This invariant is '
+                    f'required by grpo._pad_and_align_to_batch; a mismatch '
+                    f'would silently corrupt GRPO old_logps alignment.')
 
         # 5. Merge pif fields into each trajectory dict at TOP LEVEL so
         #    downstream consumers (VLLMSampler with ``'input_ids' in inputs``)
