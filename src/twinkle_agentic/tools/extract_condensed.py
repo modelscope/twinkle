@@ -124,7 +124,7 @@ class ExtractCondensed(Tool):
         parts: List[str] = []
         for n in parsed:
             value = self._lookup_one(n)
-            parts.append(f'<block_{n}>\n{value}\n</block_{n}>')
+            parts.append(f'Block_{n}:\n{value}\n\n')
         return '\n\n'.join(parts)
 
     def _lookup_one(self, n: int) -> str:

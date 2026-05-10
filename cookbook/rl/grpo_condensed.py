@@ -355,7 +355,7 @@ def main():
     metrics = CompletionRewardMetric()
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
-        temperature=1.0, top_p=0.95, stop=['</tool_call>'])
+        temperature=1.0, top_p=0.95)
     rollout = MultiTurnCondenseRollout(
         sampler=sampler,
         template=rollout_template,

@@ -6,6 +6,7 @@ from twinkle.template.base import Template
 
 from twinkle_agentic.chunker.base import Chunker
 from twinkle_agentic.condenser.base import Condenser
+from twinkle_agentic.data_format import Chunks
 from twinkle_agentic.tools.extract_condensed import ExtractCondensed, TOOL_NAME as EXTRACT_TOOL_NAME
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .multi_turn import MultiTurnRollout
@@ -14,13 +15,16 @@ from .multi_turn import MultiTurnRollout
 class MultiTurnCondenseRollout(MultiTurnRollout):
     """Multi-turn rollout with trajectory compression + on-demand recovery.
 
-    Pipeline per trajectory in the batch:
-        1. ``chunker(trajectory)`` splits the incoming trajectory into chunks.
-        2. ``condenser(chunks, **condenser_kwargs)`` rewrites selected text
-           chunks with compressed stand-ins, marking them ``raw.condensed=True``
-           and stashing the original under ``raw.original``.
-        3. ``chunks.to_trajectory()`` rebuilds a trajectory where every
-           condensed chunk is wrapped in ``<block_N>...</block_N>`` markers.
+    Pipeline for a batch of trajectories:
+        1. ``chunker(trajectory)`` splits each incoming trajectory into chunks.
+        2. All per-trajectory :class:`Chunks` are concatenated into a single
+           :class:`Chunks` and passed through ``condenser`` in ONE call, so
+           the underlying sampler (e.g. vLLM) sees a maximally-packed batch
+           spanning the whole rollout batch instead of a per-trajectory
+           sequence. Remembered trajectory boundaries are used to slice the
+           condensed chunks back into per-trajectory :class:`Chunks`.
+        3. ``chunks.to_trajectory()`` rebuilds each trajectory, wrapping every
+           condensed chunk in ``<block_N>...</block_N>`` markers.
         4. A trajectory-scoped :class:`ExtractCondensed` tool is registered on
            a per-trajectory clone of :attr:`tool_manager`, so the model can
            recover the original text of any block by its number.
@@ -65,9 +69,6 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             raise ValueError(
                 'MultiTurnCondenseRollout requires a Condenser instance')
         if EXTRACT_TOOL_NAME in tool_manager.names():
-            # We reserve the name because we register a trajectory-bound
-            # ExtractCondensed per trajectory; a pre-existing registration
-            # would be silently overwritten on the clone, which is confusing.
             raise ValueError(
                 f'tool_manager already registers {EXTRACT_TOOL_NAME!r}; '
                 f'MultiTurnCondenseRollout registers a trajectory-bound '
@@ -88,22 +89,45 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         if not trajectories:
             return []
 
+        per_traj_chunks: List[Chunks] = [self.chunker(t) for t in trajectories]
+        signatures = [self._chunk_signature(ck) for ck in per_traj_chunks]
+        group_first: Dict[int, int] = {}
+        for i, sig in enumerate(signatures):
+            group_first.setdefault(sig, i)
+        unique_indices: List[int] = list(group_first.values())
+
+        merged_list = []
+        boundaries: List[int] = []
+        for idx in unique_indices:
+            merged_list.extend(per_traj_chunks[idx].chunks)
+            boundaries.append(len(merged_list))
+        merged = Chunks(chunks=merged_list)
+        merged = self.condenser(merged, **self.condenser_kwargs)
+
+        # Split the merged result back into per-unique-trajectory Chunks.
+        canonical: Dict[int, Chunks] = {}
+        start = 0
+        for uidx, end in zip(unique_indices, boundaries):
+            canonical[uidx] = Chunks(chunks=merged.chunks[start:end])
+            start = end
+
+        # Broadcast: every trajectory (duplicates included) gets the
+        # canonical Chunks of its signature group. Sharing the Chunks
+        # object across duplicates is safe because nothing mutates it
+        # post-condensation; each trajectory still gets its own message
+        # dict (to preserve trajectory-local metadata beyond ``messages``)
+        # and its own ToolManager clone.
         compressed_list: List[Trajectory] = []
         tool_managers: List[ToolManager] = []
-        for traj in trajectories:
-            # 1-2. Chunk + condense this trajectory.
-            chunks = self.chunker(traj)
-            chunks = self.condenser(chunks, **self.condenser_kwargs)
-            compressed = chunks.to_trajectory()
+        for i, traj in enumerate(trajectories):
+            traj_chunks = canonical[group_first[signatures[i]]]
+            compressed = traj_chunks.to_trajectory()
             for k, v in traj.items():
                 compressed.setdefault(k, v)
             compressed_list.append(compressed)
 
-            # 4. Per-trajectory tool manager: clone + inject ExtractCondensed
-            #    bound to THIS trajectory's chunks. Never mutate
-            #    self.tool_manager.
             call_tm = self.tool_manager.copy()
-            call_tm.register(ExtractCondensed(chunks))
+            call_tm.register(ExtractCondensed(traj_chunks))
             tool_managers.append(call_tm)
 
         # 5. Delegate to the parent batch loop. A caller-supplied
@@ -112,3 +136,49 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         kwargs.pop('tool_manager', None)
         return super().__call__(
             compressed_list, tool_manager=tool_managers, **kwargs)
+
+    @staticmethod
+    def _chunk_signature(chunks: Chunks) -> int:
+        """Cheap content-based signature of a :class:`Chunks` for dedup.
+
+        Walks the chunk list once, dispatches on content type:
+
+        * ``str`` / ``bytes``: hash with Python's built-in ``hash`` --
+          SipHash, ~1 GB/s in C, and CPython caches the result on the
+          string object so GRPO duplicates that share the same string
+          are re-hashed for free.
+        * Multimodal (PIL image, numpy array, tensor, dict, ...): if
+          the object exposes ``tobytes``, hash its byte payload (stable
+          across identity-distinct but pixel-identical images); else
+          fall back to ``id(content)`` so duplicates referencing the
+          SAME object still dedup, while distinct-but-equal payloads
+          safely under-dedup (never over-dedup).
+
+        Avoids ``json.dumps`` / ``repr``: both are 10-100x slower on
+        long text, and either crash on non-serializable multimodal
+        payloads or produce unstable output (e.g. PIL ``repr`` embeds
+        a memory address).
+        """
+        parts: List[Any] = []
+        for c in chunks.chunks:
+            content = c.get('content')
+            if isinstance(content, (str, bytes)):
+                chash = hash(content)
+            elif content is None:
+                chash = 0
+            else:
+                tobytes = getattr(content, 'tobytes', None)
+                if callable(tobytes):
+                    try:
+                        chash = hash(tobytes())
+                    except Exception:
+                        chash = id(content)
+                else:
+                    chash = id(content)
+            parts.append((
+                c.get('type'),
+                c.get('role'),
+                c.get('round'),
+                chash,
+            ))
+        return hash(tuple(parts))

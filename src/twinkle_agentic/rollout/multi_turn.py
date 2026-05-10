@@ -80,6 +80,7 @@ class MultiTurnRollout(Rollout):
         max_turns: int = 6,
         trace_path: Optional[str] = None,
     ):
+        super().__init__()
         if template is None:
             raise ValueError('MultiTurnRollout requires a local Template instance')
         if tool_manager is None:
@@ -154,8 +155,15 @@ class MultiTurnRollout(Rollout):
 
             # 2. One batched sample call for all currently-live trajectories.
             batch_pifs = [pifs[i] for i in active]
+            actual = len(batch_pifs)
+            device_mesh = getattr(self.sampler, 'device_mesh', None)
+            min_batch_size = (
+                device_mesh.data_world_size if device_mesh is not None else 1)
+            if actual < min_batch_size:
+                batch_pifs = batch_pifs + (
+                    [batch_pifs[-1]] * (min_batch_size - actual))
             resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
-            resps = self._unwrap_response_list(resps, len(active))
+            resps = self._unwrap_response_list(resps, len(batch_pifs))[:actual]
 
             pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
             trace_rows: List[Dict[str, Any]] = []  # buffered per-turn records
@@ -377,7 +385,8 @@ class MultiTurnRollout(Rollout):
 
         current_text = tokenizer.decode(pif['input_ids'], skip_special_tokens=False)
         s_after = tokenizer.apply_chat_template(
-            messages_after, tokenize=False, add_generation_prompt=True)
+            messages_after, tokenize=False, add_generation_prompt=True,
+            enable_thinking=getattr(self.template, 'enable_thinking', False))
 
         bridge_text = self._compute_bridge_text(current_text, s_after)
         if not bridge_text:

@@ -241,7 +241,7 @@ class ModelCondenser(Condenser):
         template: Optional[Any] = None,
         skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
         rounds: Optional[Sequence[int]] = None,
-        batch_size: int = 8,
+        batch_size: int = None,
         use_base_model: bool = False,
     ):
         if sampler is None:
@@ -254,7 +254,7 @@ class ModelCondenser(Condenser):
         if min_budget_chars < 1:
             raise ValueError(
                 f'min_budget_chars must be >= 1, got {min_budget_chars}')
-        if batch_size <= 0:
+        if batch_size is not None and batch_size <= 0:
             raise ValueError(f'batch_size must be >= 1, got {batch_size}')
 
         tpl = user_prompt_template or self.DEFAULT_USER_PROMPT_TEMPLATE
@@ -285,11 +285,11 @@ class ModelCondenser(Condenser):
         if not jobs:
             return Chunks(chunks=out)
 
-        for start in range(0, len(jobs), self.batch_size):
-            batch = jobs[start:start + self.batch_size]
+        batch_size = self.batch_size or len(jobs)
+        for start in range(0, len(jobs), batch_size):
+            batch = jobs[start:start + batch_size]
             responses = self._sample_batch(batch)
             for (idx, chunk, budget), resp in zip(batch, responses):
-                print(_decoded(resp))
                 text = self._postprocess(
                     _decoded(resp), budget, chunk['content'])
                 out[idx] = _mark_condensed(chunk, text)
@@ -346,9 +346,12 @@ class ModelCondenser(Condenser):
             for _, chunk, budget in batch
         ]
         actual = len(trajectories)
-        if actual < self.batch_size:
+        device_mesh = getattr(self.sampler, 'device_mesh', None)
+        min_batch_size = (
+            device_mesh.data_world_size if device_mesh is not None else 1)
+        if actual < min_batch_size:
             trajectories.extend(
-                [trajectories[-1]] * (self.batch_size - actual))
+                [trajectories[-1]] * (min_batch_size - actual))
 
         sp = self._sampling_params_for(max(b for _, _, b in batch))
         kwargs: Dict[str, Any] = {'sampling_params': sp}
