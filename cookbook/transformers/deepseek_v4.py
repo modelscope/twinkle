@@ -62,6 +62,14 @@ def train_debug(message: str):
     print(f'[twinkle-train-debug][rank{rank} local_rank={local_rank}] {message}', flush=True)
 
 
+def describe_batch(batch):
+    if isinstance(batch, dict):
+        return f'dict_keys={list(batch.keys())}'
+    if isinstance(batch, (list, tuple)):
+        return f'{type(batch).__name__}[len={len(batch)}]'
+    return type(batch).__name__
+
+
 def log_expert_parallel_status(model):
     logger.info(
         f'EP flags: enabled={getattr(model, "_enable_expert_parallel", None)}, '
@@ -164,7 +172,7 @@ def train():
         if MAX_STEPS and step >= MAX_STEPS:
             break
         if step < 2:
-            train_debug(f'step={step} before forward_backward batch_keys={list(batch.keys())}')
+            train_debug(f'step={step} before forward_backward batch={describe_batch(batch)}')
         model.forward_backward(
             inputs=batch,
             adapter_name='default',
