@@ -299,6 +299,7 @@ def patch_forward(
             output_splits,
             num_global_tokens_per_local_expert,
             ep_group,
+            debug_tag=getattr(block, '_ep_debug_name', block.__class__.__name__),
         )
         _ep_block_trace(block, f'after token_pre_all2all global_shape={tuple(global_permuted_hidden_states.shape)}')
 
@@ -336,6 +337,7 @@ def patch_forward(
             local_input_permutation_mapping,
             org_hidden_states_shape,
             ep_group,
+            debug_tag=getattr(block, '_ep_debug_name', block.__class__.__name__),
         )
         _ep_block_trace(block, f'after tokens_post_all2all final_2d_shape={tuple(final_hidden.shape)}')
 

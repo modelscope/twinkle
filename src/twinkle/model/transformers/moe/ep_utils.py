@@ -43,10 +43,11 @@ def _ep_trace(message: str, group: Optional[dist.ProcessGroup] = None) -> None:
 class _AllToAll(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, tag):
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        ctx.tag = tag
 
         world_size = dist.get_world_size(group=group)
 
@@ -60,7 +61,7 @@ class _AllToAll(torch.autograd.Function):
         else:
             output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
         _ep_trace(
-            f'all_to_all forward before input_shape={tuple(input.shape)} output_shape={tuple(output.shape)} '
+            f'all_to_all forward before tag={tag} input_shape={tuple(input.shape)} output_shape={tuple(output.shape)} '
             f'input_splits={input_split_sizes} output_splits={output_split_sizes}',
             group,
         )
@@ -71,19 +72,26 @@ class _AllToAll(torch.autograd.Function):
             input_split_sizes=input_split_sizes,
             group=group,
         )
-        _ep_trace('all_to_all forward after', group)
+        _ep_trace(f'all_to_all forward after tag={tag}', group)
         return output
 
     @staticmethod
     def backward(ctx, *grad_output):
         _ep_trace(
-            f'all_to_all backward before grad_shape={tuple(grad_output[0].shape)} '
+            f'all_to_all backward before tag={ctx.tag} grad_shape={tuple(grad_output[0].shape)} '
             f'input_splits={ctx.output_split_sizes} output_splits={ctx.input_split_sizes}',
             ctx.group,
         )
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(
+                ctx.group,
+                *grad_output,
+                ctx.input_split_sizes,
+                ctx.output_split_sizes,
+                f'{ctx.tag}.backward',
+            ),
+            None,
             None,
             None,
         )
@@ -128,8 +136,8 @@ class _AllToAll_Async(torch.autograd.Function):
         )
 
 
-def all_to_all(group, input, output_split_size=None, input_split_size=None):
-    return _AllToAll.apply(group, input, output_split_size, input_split_size)
+def all_to_all(group, input, output_split_size=None, input_split_size=None, tag: str = ''):
+    return _AllToAll.apply(group, input, output_split_size, input_split_size, tag)
 
 
 def all_to_all_async(group, input, output_split_size, input_split_size):
@@ -279,6 +287,7 @@ def token_pre_all2all(
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
+    debug_tag: str = '',
 ) -> torch.Tensor:
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
@@ -288,13 +297,21 @@ def token_pre_all2all(
     local_assignment_weights = routing_weights.T.contiguous().masked_select(expert_mask.bool())
 
     _ep_trace(
-        f'token_pre_all2all before all_to_all local_permuted_shape={tuple(local_permuted_hidden_states.shape)} '
+        f'token_pre_all2all before all_to_all tag={debug_tag} '
+        f'local_permuted_shape={tuple(local_permuted_hidden_states.shape)} '
         f'input_splits={input_splits} output_splits={output_splits}',
         ep_group,
     )
-    global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
+    global_permuted_hidden_states = all_to_all(
+        ep_group,
+        local_permuted_hidden_states,
+        output_splits,
+        input_splits,
+        tag=f'{debug_tag}.token_pre_all2all',
+    )
     _ep_trace(
-        f'token_pre_all2all after all_to_all global_permuted_shape={tuple(global_permuted_hidden_states.shape)}',
+        f'token_pre_all2all after all_to_all tag={debug_tag} '
+        f'global_permuted_shape={tuple(global_permuted_hidden_states.shape)}',
         ep_group,
     )
 
@@ -325,6 +342,7 @@ def tokens_post_all2all(
     local_input_permutation_mapping: torch.Tensor,
     org_hidden_states_shape: torch.Size,
     ep_group: Optional[dist.ProcessGroup] = None,
+    debug_tag: str = '',
 ) -> torch.Tensor:
     # group tokens together by expert
     num_local_experts = num_experts // ep_group.size()
@@ -336,13 +354,21 @@ def tokens_post_all2all(
     )
 
     _ep_trace(
-        f'tokens_post_all2all before all_to_all expert_outputs_shape={tuple(expert_outputs.shape)} '
+        f'tokens_post_all2all before all_to_all tag={debug_tag} '
+        f'expert_outputs_shape={tuple(expert_outputs.shape)} '
         f'input_splits={input_splits} output_splits={output_splits}',
         ep_group,
     )
-    unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
+    unpermute_outputs = all_to_all(
+        ep_group,
+        expert_outputs,
+        input_splits,
+        output_splits,
+        tag=f'{debug_tag}.tokens_post_all2all',
+    )
     _ep_trace(
-        f'tokens_post_all2all after all_to_all unpermute_outputs_shape={tuple(unpermute_outputs.shape)}',
+        f'tokens_post_all2all after all_to_all tag={debug_tag} '
+        f'unpermute_outputs_shape={tuple(unpermute_outputs.shape)}',
         ep_group,
     )
     weighted_outputs = unpermute_outputs * local_assignment_weights.unsqueeze(-1)
