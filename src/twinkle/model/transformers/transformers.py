@@ -658,28 +658,42 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
+        _twinkle_fsdp_debug(
+            f'backward enter adapter={adapter_name} loss_shape={tuple(loss_value.shape)} '
+            f'loss_dtype={loss_value.dtype} loss_device={loss_value.device}')
         scaler = optimizer_config.scaler
         if scaler is None and self.mixed_precision == 'fp16':
             # Auto set a grad scaler
+            _twinkle_fsdp_debug('backward before set_grad_scaler')
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
+            _twinkle_fsdp_debug('backward after set_grad_scaler')
 
         optimizer_config.cur_step += 1
         should_sync = optimizer_config.do_grad_sync()
+        _twinkle_fsdp_debug(f'backward cur_step={optimizer_config.cur_step} should_sync={should_sync}')
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
         if not should_sync and hasattr(self.model, 'no_sync'):
+            _twinkle_fsdp_debug('backward using model.no_sync')
             no_sync_ctx = self.model.no_sync()
 
+        _twinkle_fsdp_debug('backward before no_sync_ctx')
         with no_sync_ctx:
             if scaler is not None:
+                _twinkle_fsdp_debug('backward before scaler backward')
                 scaler.scale(loss_value).backward()
+                _twinkle_fsdp_debug('backward after scaler backward')
             else:
+                _twinkle_fsdp_debug('backward before loss.backward')
                 loss_value.backward()
+                _twinkle_fsdp_debug('backward after loss.backward')
+        _twinkle_fsdp_debug('backward after no_sync_ctx')
 
         # self._sync_after_backward_if_needed()
         optimizer_config.train_status.loss_value = None
+        _twinkle_fsdp_debug('backward exit')
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],

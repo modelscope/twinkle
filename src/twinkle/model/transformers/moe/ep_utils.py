@@ -6,7 +6,37 @@
 
 import torch
 import torch.distributed as dist
+import os
+import time
 from typing import Optional
+
+
+def _ep_trace(message: str, group: Optional[dist.ProcessGroup] = None) -> None:
+    if os.environ.get('TWINKLE_EP_DEBUG', os.environ.get('TWINKLE_FSDP_DEBUG', '0')) != '1':
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    if group is not None:
+        try:
+            ep_rank = dist.get_rank(group)
+            ep_world_size = dist.get_world_size(group)
+        except Exception:
+            ep_rank = '?'
+            ep_world_size = '?'
+    else:
+        ep_rank = '?'
+        ep_world_size = '?'
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    text = (
+        f'[twinkle-ep-trace][time={time.time():.6f} rank{rank}/{world_size} '
+        f'local_rank={local_rank} ep_rank={ep_rank}/{ep_world_size}] {message}'
+    )
+    print(text, flush=True)
+    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, f'ep_rank{rank}.log'), 'a', encoding='utf-8') as f:
+            f.write(text + '\n')
 
 
 # ========================== comm ==========================
@@ -29,6 +59,11 @@ class _AllToAll(torch.autograd.Function):
             output = torch.empty_like(input)
         else:
             output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
+        _ep_trace(
+            f'all_to_all forward before input_shape={tuple(input.shape)} output_shape={tuple(output.shape)} '
+            f'input_splits={input_split_sizes} output_splits={output_split_sizes}',
+            group,
+        )
         dist.all_to_all_single(
             output,
             input,
@@ -36,10 +71,16 @@ class _AllToAll(torch.autograd.Function):
             input_split_sizes=input_split_sizes,
             group=group,
         )
+        _ep_trace('all_to_all forward after', group)
         return output
 
     @staticmethod
     def backward(ctx, *grad_output):
+        _ep_trace(
+            f'all_to_all backward before grad_shape={tuple(grad_output[0].shape)} '
+            f'input_splits={ctx.output_split_sizes} output_splits={ctx.input_split_sizes}',
+            ctx.group,
+        )
         return (
             None,
             _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
@@ -201,7 +242,16 @@ def preprocess(
         dtype=num_local_tokens_per_expert.dtype,
         device=num_local_tokens_per_expert.device,
     )
+    _ep_trace(
+        f'preprocess before all_gather local_tokens_shape={tuple(num_local_tokens_per_expert.shape)} '
+        f'input_splits={input_splits}',
+        ep_group,
+    )
     dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
+    _ep_trace(
+        f'preprocess after all_gather global_tokens_shape={tuple(num_global_tokens_per_expert.shape)}',
+        ep_group,
+    )
 
     # [ep_size, num_local_experts]
     start_idx, end_idx = rank * num_local_experts, (rank + 1) * num_local_experts
@@ -237,7 +287,16 @@ def token_pre_all2all(
     local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, expert_mask)
     local_assignment_weights = routing_weights.T.contiguous().masked_select(expert_mask.bool())
 
+    _ep_trace(
+        f'token_pre_all2all before all_to_all local_permuted_shape={tuple(local_permuted_hidden_states.shape)} '
+        f'input_splits={input_splits} output_splits={output_splits}',
+        ep_group,
+    )
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
+    _ep_trace(
+        f'token_pre_all2all after all_to_all global_permuted_shape={tuple(global_permuted_hidden_states.shape)}',
+        ep_group,
+    )
 
     # group tokens together by expert
     num_local_experts = num_experts // ep_group.size()
@@ -276,7 +335,16 @@ def tokens_post_all2all(
         unpermute_order,
     )
 
+    _ep_trace(
+        f'tokens_post_all2all before all_to_all expert_outputs_shape={tuple(expert_outputs.shape)} '
+        f'input_splits={input_splits} output_splits={output_splits}',
+        ep_group,
+    )
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
+    _ep_trace(
+        f'tokens_post_all2all after all_to_all unpermute_outputs_shape={tuple(unpermute_outputs.shape)}',
+        ep_group,
+    )
     weighted_outputs = unpermute_outputs * local_assignment_weights.unsqueeze(-1)
     hidden_dim = org_hidden_states_shape[-1]
     final_outputs = torch.zeros(org_hidden_states_shape, device=weighted_outputs.device, dtype=weighted_outputs.dtype)
