@@ -18,7 +18,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     import torch
     import torch.distributed as dist
     import accelerate.utils.fsdp_utils as fsdp_utils
-    from torch.distributed.tensor import DTensor, distribute_tensor
+    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
     if getattr(fsdp_utils.fsdp2_load_full_state_dict, '_twinkle_patched', False):
         return
@@ -29,42 +29,93 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
 
+        def _infer_parameter_dtype(model, param_name, empty_param):
+            try:
+                old_param = model.get_parameter_or_buffer(param_name)
+            except AttributeError:
+                # Need this for LoRA, as some params are not registered as
+                # parameters/buffers but still appear in the state dict.
+                base_param_name, local_param_name = param_name.rsplit('.', 1)
+                submodule = model.get_submodule(base_param_name)
+                old_param = getattr(submodule, local_param_name)
+
+            is_torch_e4m3fn_available = hasattr(torch, 'float8_e4m3fn')
+            is_param_float8_e4m3fn = is_torch_e4m3fn_available and empty_param.dtype == torch.float8_e4m3fn
+            casting_dtype = None
+            if empty_param.dtype.is_floating_point and not is_param_float8_e4m3fn:
+                casting_dtype = old_param.dtype
+            return old_param is not None and old_param.is_contiguous(), casting_dtype
+
+        def _cast_and_contiguous(tensor, to_contiguous, dtype):
+            if dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+            if to_contiguous:
+                tensor = tensor.contiguous()
+            return tensor
+
+        def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
+            local_tensor = full_tensor
+            for mesh_dim, placement in enumerate(placements):
+                if isinstance(placement, Shard):
+                    # All ranks already received the full tensor via broadcast.
+                    # Split locally to avoid distribute_tensor's scatter path,
+                    # which is fragile on some torch_npu/HCCL versions.
+                    local_tensor = placement._shard_tensor(
+                        local_tensor,
+                        device_mesh,
+                        mesh_dim,
+                        src_data_rank=None,
+                    )
+                elif isinstance(placement, Replicate):
+                    continue
+                elif isinstance(placement, Partial):
+                    raise NotImplementedError('FSDP2 full-state loading does not support Partial placements.')
+                else:
+                    raise NotImplementedError(f'Unsupported DTensor placement: {placement}')
+            return DTensor.from_local(
+                local_tensor,
+                device_mesh=device_mesh,
+                placements=placements,
+                run_check=False,
+                shape=full_tensor.shape,
+                stride=full_tensor.stride(),
+            )
+
+        def _load_full_value(param_name, sharded_param):
+            if param_name not in full_sd:
+                raise KeyError(
+                    f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict. "
+                    f'Full state dict has {len(full_sd)} keys, sharded has {len(meta_sharded_sd)} keys.')
+            full_value = full_sd[param_name].detach()
+            if isinstance(full_value, DTensor):
+                full_value = full_value.to_local()
+            device = sharded_param.device_mesh.device_type if isinstance(sharded_param, DTensor) else accelerator.device
+            return full_value.to(device).contiguous()
+
         for param_name, sharded_param in meta_sharded_sd.items():
             if isinstance(sharded_param, DTensor):
                 device_mesh = sharded_param.device_mesh
-                current_placement = sharded_param.placements
-
+                placements = sharded_param.placements
                 if accelerator.is_main_process:
-                    full_param = full_sd[param_name].detach().to(accelerator.device)
-                    if full_param.is_floating_point():
-                        full_param = full_param.to(sharded_param.dtype)
-                        try:
-                            old_param = model.get_parameter_or_buffer(param_name)
-                        except AttributeError:
-                            old_param = None
-                        if old_param is not None and old_param.is_contiguous():
-                            full_param = full_param.contiguous()
+                    full_param = _load_full_value(param_name, sharded_param)
                 else:
                     full_param = torch.empty(
                         sharded_param.size(),
-                        device=accelerator.device,
+                        device=device_mesh.device_type,
                         dtype=sharded_param.dtype,
                     )
 
-                dist.broadcast(full_param, src=0)
-                sharded_param = distribute_tensor(full_param, device_mesh, current_placement)
+                dist.broadcast(full_param, src=0, group=dist.group.WORLD)
+                sharded_tensor = _dtensor_from_replicated_full_tensor(full_param, device_mesh, placements)
+                to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_param)
+                sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
                 if cpu_offload:
-                    sharded_param = sharded_param.cpu()
-                sharded_sd[param_name] = sharded_param
+                    sharded_tensor = sharded_tensor.to('cpu')
+                sharded_sd[param_name] = sharded_tensor
                 continue
 
             if accelerator.is_main_process:
-                full_value = full_sd[param_name]
-                if isinstance(full_value, DTensor):
-                    full_value = full_value.to_local()
-                full_value = full_value.detach().to(accelerator.device)
-                if full_value.is_floating_point():
-                    full_value = full_value.to(sharded_param.dtype)
+                full_value = _load_full_value(param_name, sharded_param)
             else:
                 full_value = torch.empty(
                     sharded_param.size(),
@@ -72,12 +123,15 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                     dtype=sharded_param.dtype,
                 )
 
-            dist.broadcast(full_value, src=0)
+            dist.broadcast(full_value, src=0, group=dist.group.WORLD)
+            to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_value)
+            full_value = _cast_and_contiguous(full_value, to_contiguous, casting_dtype)
             if cpu_offload:
-                full_value = full_value.cpu()
+                full_value = full_value.to('cpu')
             sharded_sd[param_name] = full_value
 
         model.load_state_dict(sharded_sd, assign=True)
+        return model
 
     patched_fsdp2_load_full_state_dict._twinkle_patched = True
     patched_fsdp2_load_full_state_dict._twinkle_original = original
