@@ -362,47 +362,32 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            _twinkle_fsdp_debug('enter _lazy_wrap_model')
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
-            _twinkle_fsdp_debug(f'_lazy_wrap_model optimizer_groups={len(optimizer_groups)}')
             use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
             set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
             if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
                 is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
-                _twinkle_fsdp_debug('before capture pre-EP full state_dict for rank0 broadcast')
                 set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
-                _twinkle_fsdp_debug('after capture pre-EP full state_dict for rank0 broadcast')
-            _twinkle_fsdp_debug('before _maybe_apply_expert_parallel')
             self._maybe_apply_expert_parallel()
-            _twinkle_fsdp_debug('after _maybe_apply_expert_parallel')
-            _twinkle_fsdp_debug('before _ensure_sp_strategy')
             self._ensure_sp_strategy()
-            _twinkle_fsdp_debug('after _ensure_sp_strategy')
             if self.sp_strategy is not None:
-                _twinkle_fsdp_debug('before sp_strategy.initialize')
                 self.sp_strategy.initialize()
-                _twinkle_fsdp_debug('after sp_strategy.initialize')
 
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
                 assert optimizer is not None
-                _twinkle_fsdp_debug('before strategy.wrap_model with optimizer')
                 self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                _twinkle_fsdp_debug('after strategy.wrap_model with optimizer')
                 optimizer_group.optimizer = optimizer
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
-                _twinkle_fsdp_debug('before strategy.wrap_model without optimizer')
                 result = self.strategy.wrap_model(self.model)
-                _twinkle_fsdp_debug('after strategy.wrap_model without optimizer')
                 if isinstance(result, tuple):
                     self.model = result[0]
                 else:
                     self.model = result
             self._model_wrapped = True
-            _twinkle_fsdp_debug('exit _lazy_wrap_model')
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
