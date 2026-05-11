@@ -37,9 +37,12 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                 if accelerator.is_main_process:
                     full_param = full_sd[param_name].detach().to(accelerator.device)
                     if full_param.is_floating_point():
-                        old_param = model.get_parameter_or_buffer(param_name)
-                        full_param = full_param.to(old_param.dtype)
-                        if old_param.is_contiguous():
+                        full_param = full_param.to(sharded_param.dtype)
+                        try:
+                            old_param = model.get_parameter_or_buffer(param_name)
+                        except AttributeError:
+                            old_param = None
+                        if old_param is not None and old_param.is_contiguous():
                             full_param = full_param.contiguous()
                 else:
                     full_param = torch.empty(
