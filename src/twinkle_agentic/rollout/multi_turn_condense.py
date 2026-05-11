@@ -51,6 +51,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         condenser: Condenser,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
+        max_trajectory_tokens: Optional[int] = None,
         condenser_kwargs: Optional[Dict[str, Any]] = None,
         trace_path: Optional[str] = None,
     ):
@@ -60,6 +61,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             tool_manager=tool_manager,
             sampling_params=sampling_params,
             max_turns=max_turns,
+            max_trajectory_tokens=max_trajectory_tokens,
             trace_path=trace_path,
         )
         if chunker is None:

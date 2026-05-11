@@ -197,12 +197,64 @@ def create_hotpotqa_dataset() -> Dataset:
 # a logging heuristic; a non-greedy ``[^}]*`` is good enough.
 _BOXED_RE = re.compile(r'\\boxed\{[^}]*\}')
 
+# Pulls the leading number out of pre-formatted metric strings such as
+# ``'0.03 iters/s'`` / ``'1.000000e-05'`` / ``'30 seconds'`` emitted by
+# ``TrainMetric`` and ``GRPOMetric``. We use this in ``_coerce_for_swanlab``
+# so swanlab can build line charts instead of dropping those keys with a
+# ``failed to create chart for key '...': invalid value type`` warning.
+_LEADING_NUMBER_RE = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+
+
+def _coerce_for_swanlab(log_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Cast string-valued metrics to float for swanlab line charts.
+
+    ``TrainMetric.calculate()`` and ``GRPOMetric.calculate()`` return
+    pre-formatted strings (``'0.03 iters/s'``, ``'1.000000e-05'``,
+    ``'30 seconds'``, ``'0.8321'``). swanlab cannot build a line chart
+    from a string value and emits one warning per key per step. We extract
+    the leading number where possible; keys whose value can't be parsed
+    as a scalar are left as-is so they still show up in the text log.
+    """
+    coerced: Dict[str, Any] = {}
+    for k, v in log_dict.items():
+        if isinstance(v, bool) or isinstance(v, (int, float)):
+            coerced[k] = v
+            continue
+        if isinstance(v, str):
+            m = _LEADING_NUMBER_RE.search(v)
+            if m:
+                try:
+                    coerced[k] = float(m.group())
+                    continue
+                except ValueError:
+                    pass
+        coerced[k] = v
+    return coerced
+
 
 def _last_assistant_text(trajectory: Dict[str, Any]) -> Optional[str]:
-    """Return the text of the last ``assistant`` message, or ``None``."""
+    """Return the text of the last ``assistant`` message, or ``None``.
+
+    ``content`` can be ``str`` | ``None`` | ``dict`` (single multimodal
+    part) | ``list[dict]`` (multiple parts). The downstream caller feeds
+    this into ``_BOXED_RE.search(...)``, so we collapse the visible text
+    into a single string and ignore non-text parts (images etc.).
+    """
     for m in reversed(trajectory.get('messages', [])):
-        if m.get('role') == 'assistant':
-            return m.get('content')
+        if m.get('role') != 'assistant':
+            continue
+        c = m.get('content')
+        if c is None:
+            return None
+        if isinstance(c, str):
+            return c
+        if isinstance(c, dict):
+            return c.get('text') if c.get('type') == 'text' else None
+        if isinstance(c, list):
+            parts = [p.get('text') or '' for p in c
+                     if isinstance(p, dict) and p.get('type') == 'text']
+            return '\n'.join(parts) if parts else None
+        return str(c)
     return None
 
 
@@ -237,21 +289,35 @@ def _compute_rollout_diagnostics(
             for t in trajectories)
         out['no_boxed_rate'] = n_no_boxed / len(trajectories)
 
-        # Character lengths of messages split by role, EXCLUDING system.
-        # System prompts differ between baseline and condensed variants
-        # (different instructions / tool syntax), so dropping them keeps
-        # the three buckets directly comparable across the A/B runs.
-        # ``len(content)`` is a template-agnostic proxy for information
-        # volume — ``<tool_call>`` XML inside assistant content is counted
-        # as part of the assistant reply (same convention on both sides).
+        def _content_chars(c: Any) -> int:
+            if not c:
+                return 0
+            if isinstance(c, str):
+                return len(c)
+            if isinstance(c, dict):
+                if c.get('type') == 'text':
+                    return len(c.get('text') or '')
+                return 0
+            if isinstance(c, list):
+                total = 0
+                for part in c:
+                    if isinstance(part, dict) and part.get('type') == 'text':
+                        total += len(part.get('text') or '')
+                    elif isinstance(part, str):
+                        total += len(part)
+                return total
+            # Unknown shape -- fall back to ``str()`` length rather than
+            # crashing, so a template quirk never breaks metric logging.
+            return len(str(c))
+
         msg_chars_total, prompt_chars, asst_chars = [], [], []
         for t in trajectories:
             total_i = prompt_i = asst_i = 0
             for m in (t.get('messages') or []):
                 role = m.get('role')
-                n = len(m.get('content') or '')
                 if role == 'system':
                     continue
+                n = _content_chars(m.get('content'))
                 total_i += n
                 if role in ('user', 'tool'):
                     prompt_i += n
@@ -427,7 +493,7 @@ def main():
         log_dict.update(model.calculate_metric(is_training=True))
         log_dict.update(_compute_rollout_diagnostics(
             all_trajectories, n_turns_per_rollout, per_rollout_completion_length))
-        swanlab.log(log_dict)
+        swanlab.log(_coerce_for_swanlab(log_dict))
         metrics.reset()
         logger.info(f'[Step {optim_step}/{total_steps}] {log_dict}')
 

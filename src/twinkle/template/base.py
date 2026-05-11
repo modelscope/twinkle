@@ -210,7 +210,11 @@ class Template:
         messages: List[Message] = result.get('messages')
         if messages is not None:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            messages.append(Message(role='assistant', content=response_text))
+            asst_msg = Message(role='assistant', content=response_text)
+            parsed = self.parse_tool_call(response_text) or []
+            if parsed:
+                asst_msg['tool_calls'] = parsed
+            messages.append(asst_msg)
             result['messages'] = messages
         return result
 

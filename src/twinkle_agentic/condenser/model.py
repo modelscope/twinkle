@@ -199,6 +199,13 @@ class ModelCondenser(Condenser):
             ...) from leaking into the compressed output. When
             omitted, falls back to ``sampler.template`` if available.
         skip_roles: Roles whose chunks are never compressed.
+        skip_pattern: Optional regex (compiled with ``re.MULTILINE``).
+            Any chunk whose ``content`` has a match for this pattern
+            is passed through unchanged, regardless of length / ratio.
+            Uses :func:`re.search` semantics, so anchor with ``^`` /
+            start-of-string if you want boundary-matching only (e.g.
+            ``r'^Question:'`` to preserve the question prefix in a
+            HotpotQA-style user message). ``None`` disables the filter.
         rounds: Optional set of conversation turn indices to compress.
             ``None`` = no round-based filter; chunks lacking a ``round``
             field are skipped when this filter is active.
@@ -240,6 +247,7 @@ class ModelCondenser(Condenser):
         min_budget_chars: int = 250,
         template: Optional[Any] = None,
         skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
+        skip_pattern: Optional[str] = None,
         rounds: Optional[Sequence[int]] = None,
         batch_size: int = None,
         use_base_model: bool = False,
@@ -271,6 +279,11 @@ class ModelCondenser(Condenser):
         self.min_budget_chars = int(min_budget_chars)
         self.template = template
         self.skip_roles = tuple(skip_roles)
+        # Pre-compile the skip-regex once; store ``None`` when disabled so
+        # ``_should_condense`` can short-circuit without a re-check.
+        self.skip_re: Optional[re.Pattern] = (
+            re.compile(skip_pattern, re.MULTILINE)
+            if skip_pattern else None)
         self.rounds = set(rounds) if rounds is not None else None
         self.batch_size = batch_size
         self.use_base_model = bool(use_base_model)
@@ -319,6 +332,8 @@ class ModelCondenser(Condenser):
             return False
         content = chunk.get('content')
         if not isinstance(content, str) or len(content) < self.min_chars:
+            return False
+        if self.skip_re is not None and self.skip_re.search(content):
             return False
         raw = chunk.get('raw') or {}
         if isinstance(raw, dict):

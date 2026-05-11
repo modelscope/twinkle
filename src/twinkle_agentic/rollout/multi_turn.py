@@ -69,31 +69,6 @@ class MultiTurnRollout(Rollout):
     The class intentionally has no knowledge of condensers/chunkers; they are
     applied upstream (on the trajectory before rollout) or downstream
     (on the returned messages).
-
-    Output contract (per trajectory):
-        ``out['logprobs']`` is the raw per-token logprob payload emitted by
-        the sampler, concatenated across all assistant turns in chronological
-        order. Its shape is
-
-            ``List[List[Tuple[int, float]]]``
-
-        where each outer entry corresponds to one newly sampled assistant
-        token and contains a single ``(token_id, logprob)`` pair
-        (see ``vllm_engine.py`` which emits ``[(tid, lp[tid].logprob)]``
-        per position). Bridge / tool / system tokens contribute ZERO
-        entries, so the invariant
-
-            ``len(out['logprobs']) == sum(l != -100 for l in out['labels'])``
-
-        holds across all termination paths (length / no-tool / max_turns).
-        This invariant is asserted at the end of ``__call__`` so any future
-        regression fails loudly instead of silently misaligning GRPO
-        ``old_logps`` inside ``grpo._pad_and_align_to_batch``.
-
-        Consumers that want a flat ``List[float]`` of logprobs (e.g. GRPO
-        cookbook scripts) must extract ``lp[0][1]`` from each entry; do NOT
-        pass ``out['logprobs']`` straight into ``forward_backward(
-        old_logps=...)``.
     """
 
     def __init__(
@@ -103,6 +78,7 @@ class MultiTurnRollout(Rollout):
         tool_manager: ToolManager,
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
+        max_trajectory_tokens: Optional[int] = None,
         trace_path: Optional[str] = None,
     ):
         super().__init__()
@@ -112,17 +88,16 @@ class MultiTurnRollout(Rollout):
             raise ValueError('MultiTurnRollout requires a ToolManager')
         if max_turns < 1:
             raise ValueError(f'max_turns must be >= 1, got {max_turns}')
+        if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
+            raise ValueError(
+                f'max_trajectory_tokens must be >= 1 or None, got '
+                f'{max_trajectory_tokens}')
         self.sampler = sampler
         self.template = template
         self.tool_manager = tool_manager
         self.sampling_params = sampling_params or SamplingParams()
         self.max_turns = max_turns
-        # When set, every turn writes one JSONL record per active
-        # trajectory to ``trace_path``. The file is truncated at
-        # construction time (matching the behaviour of the legacy
-        # ``_make_dump_rollout_trace`` hook); subsequent writes append.
-        # Errors during trace writing are swallowed on purpose so
-        # observability can never break a training step.
+        self.max_trajectory_tokens = max_trajectory_tokens
         self.trace_path = trace_path
         if self.trace_path:
             try:
@@ -167,10 +142,6 @@ class MultiTurnRollout(Rollout):
             pif.setdefault('messages', list(traj.get('messages', [])))
             pifs.append(pif)
 
-        # ``all_logprobs[i]`` accumulates the raw per-token logprob entries
-        # returned by the sampler for trajectory ``i`` (one entry per newly
-        # sampled assistant token, shape ``[(token_id, logprob)]``; see the
-        # class docstring for the full contract).
         all_logprobs: List[List[Any]] = [[] for _ in range(n)]
         stop_reasons: List[Optional[str]] = [None] * n
         turns: List[int] = [0] * n
@@ -232,7 +203,29 @@ class MultiTurnRollout(Rollout):
                         pif=pifs[global_idx]))
                     continue
 
-                tool_calls = self.template.parse_tool_call(seq.decoded or '')
+                # 3a. Sequence-length cap. 
+                if (self.max_trajectory_tokens is not None and
+                        len(pifs[global_idx].get('input_ids') or [])
+                        >= self.max_trajectory_tokens):
+                    truncated[global_idx] = True
+                    done[global_idx] = True
+                    trace_rows.append(self._trace_row(
+                        turn=turns[global_idx],
+                        global_idx=global_idx,
+                        n=n,
+                        seq=seq,
+                        tool_calls=None,
+                        done=True,
+                        truncated=True,
+                        pif=pifs[global_idx]))
+                    continue
+
+                _msgs = pifs[global_idx].get('messages') or []
+                _last_msg = _msgs[-1] if _msgs else None
+                tool_calls = (_last_msg.get('tool_calls')
+                              if isinstance(_last_msg, dict) else None)
+                if not tool_calls:
+                    tool_calls = self.template.parse_tool_call(seq.decoded or '')
                 if not tool_calls:
                     done[global_idx] = True
                     trace_rows.append(self._trace_row(

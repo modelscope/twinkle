@@ -170,22 +170,29 @@ class ToolExploreReward(Reward):
         for t in trajectories:
             msgs = t.get('messages', []) or []
             n_msgs = len(msgs)
-            success = False
+            n_success = 0
             for i, m in enumerate(msgs):
                 if m.get('role') != 'assistant' or not m.get('tool_calls'):
                     continue
-                # Scan subsequent consecutive ``tool`` messages and keep
-                # the first non-ERROR one.
+                # Scan subsequent consecutive ``tool`` messages; this
+                # assistant turn counts as successful if any of them
+                # came back non-empty and non-ERROR.
                 j = i + 1
+                turn_ok = False
                 while j < n_msgs and msgs[j].get('role') == 'tool':
                     content = msgs[j].get('content') or ''
                     text = content if isinstance(content, str) else str(content)
                     if text.strip() and not text.lstrip().startswith('ERROR'):
-                        success = True
+                        turn_ok = True
                         break
                     j += 1
-                if success:
-                    break
-            rewards.append(1.0 if success else 0.0)
+                if turn_ok:
+                    n_success += 1
+            if n_success == 0:
+                rewards.append(0.0)
+            elif n_success <= 3:
+                rewards.append(1.0)
+            else:
+                rewards.append(0.5)
         return rewards
 
