@@ -66,6 +66,33 @@ def _twinkle_fsdp_debug(message: str) -> None:
             f.write(text + '\n')
 
 
+def _filter_from_config_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    load_only_keys = {
+        'cache_dir',
+        'device_map',
+        'force_download',
+        'ignore_mismatched_sizes',
+        'local_files_only',
+        'low_cpu_mem_usage',
+        'max_memory',
+        'offload_buffers',
+        'offload_folder',
+        'offload_state_dict',
+        'output_loading_info',
+        'proxies',
+        'resume_download',
+        'revision',
+        'state_dict',
+        'subfolder',
+        'token',
+        'tokenizer_id',
+        'trust_remote_code',
+        'use_safetensors',
+        'weights_only',
+    }
+    return {key: value for key, value in kwargs.items() if key not in load_only_keys}
+
+
 @dataclass
 class OptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Transformers training."""
@@ -220,6 +247,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             _twinkle_fsdp_debug('before model_cls.from_config')
             self.model = model_cls.from_config(self.hf_config, **kwargs)
             _twinkle_fsdp_debug('after model_cls.from_config')
+        elif self._should_init_empty_pretrained_model_on_this_rank():
+            _twinkle_fsdp_debug('before empty model_cls.from_config for rank0 broadcast')
+            self.model = self._init_empty_model_from_config(model_cls, **kwargs)
+            _twinkle_fsdp_debug('after empty model_cls.from_config for rank0 broadcast')
         else:
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             _twinkle_fsdp_debug('before pretrained_load_context')
@@ -238,6 +269,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
+        use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+        return bool(
+            use_rank0_broadcast()
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_rank() != 0)
+
+    def _init_empty_model_from_config(self, model_cls, **kwargs):
+        from accelerate import init_empty_weights
+
+        config_kwargs = _filter_from_config_kwargs(kwargs)
+        with init_empty_weights(include_buffers=False):
+            model = model_cls.from_config(self.hf_config, **config_kwargs)
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        return model
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)

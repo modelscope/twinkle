@@ -123,17 +123,17 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
-        strategy="accelerate",
+        strategy='native_fsdp',
         memory_efficient_init=True,
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
-        # fsdp_config={
-        #     'reshard_after_forward': RESHARD_AFTER_FORWARD,
-        #     'expert_parallel': {
-        #         'enabled': True,
-        #         'router_dtype': 'fp32',
-        #         'keep_router_logits': False,
-        #     }
-        # },
+        fsdp_config={
+            'reshard_after_forward': RESHARD_AFTER_FORWARD,
+            'expert_parallel': {
+                'enabled': True,
+                'router_dtype': 'fp32',
+                'keep_router_logits': False,
+            },
+        },
     )
 
     if USE_LORA:

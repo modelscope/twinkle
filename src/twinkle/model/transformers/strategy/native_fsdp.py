@@ -30,7 +30,13 @@ class NativeFSDPStrategy:
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
 
     def pretrained_load_context(self):
-        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
+        # Native FSDP handles rank0-load itself. Do not enable Transformers'
+        # FSDP efficient-loading env here, because some versions have an
+        # unmatched non-rank0 barrier in from_pretrained().
+        return fsdp_pretrained_load_context(False)
+
+    def use_rank0_pretrained_broadcast(self) -> bool:
+        return self._memory_efficient_init and self.device_mesh is not None
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -60,16 +66,18 @@ class NativeFSDPStrategy:
                 _unbind_optimizer_params(optimizer)
 
             # EP path requires experts on a real device, incompatible with meta-device flow.
-            use_meta = self._memory_efficient_init and not ep_enabled
+            use_meta = self.use_rank0_pretrained_broadcast()
 
             original_sd = None
             saved_buffers = None
             if use_meta:
-                original_sd = model.state_dict()
-                saved_buffers = _get_non_persistent_buffers(model)
-                model = model.to(torch.device('meta'))
-                if hasattr(model, 'tie_weights'):
-                    model.tie_weights()
+                is_rank0 = (dist.get_rank() == 0)
+                original_sd = model.state_dict() if is_rank0 else {}
+                saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
+                if is_rank0:
+                    model = model.to(torch.device('meta'))
+                    if hasattr(model, 'tie_weights'):
+                        model.tie_weights()
 
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
@@ -129,14 +137,17 @@ class NativeFSDPStrategy:
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
-                is_rank0 = (dist.get_rank() == 0)
+                expert_shard_specs = _collect_ep_expert_shard_specs(model) if ep_enabled else {}
+                rank_to_ep_rank = _build_rank_to_ep_rank(self.ep_fsdp_device_mesh) if ep_enabled else {}
                 _broadcast_sharded_state_dict(
                     model,
-                    original_sd if is_rank0 else {},
+                    original_sd,
                     device_type=device_type,
+                    expert_shard_specs=expert_shard_specs,
+                    rank_to_ep_rank=rank_to_ep_rank,
                 )
                 target_device = torch.device(device_type)
-                _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
+                _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
@@ -383,6 +394,37 @@ def _collect_ep_experts_map(model: nn.Module) -> Dict[str, nn.Module]:
     return experts_map
 
 
+def _collect_ep_expert_shard_specs(model: nn.Module) -> Dict[str, Dict[str, int]]:
+    """Collect state-dict names that are sharded by EP and their local expert range."""
+    specs = {}
+    for fqn, module in model.named_modules():
+        if not getattr(module, '_ep_patched', False):
+            continue
+        experts = getattr(module, 'experts', None)
+        if experts is None:
+            continue
+        experts_prefix = f'{fqn}.experts.' if fqn else 'experts.'
+        for pname, _ in experts.named_parameters():
+            specs[experts_prefix + pname] = {
+                'num_experts': int(module._ep_num_experts),
+                'experts_per_rank': int(module._ep_experts_per_rank),
+            }
+    return specs
+
+
+def _build_rank_to_ep_rank(ep_fsdp_device_mesh: Optional[TorchDeviceMesh]) -> Dict[int, int]:
+    if ep_fsdp_device_mesh is None:
+        return {}
+    mesh = ep_fsdp_device_mesh.mesh
+    if hasattr(mesh, 'detach'):
+        mesh = mesh.detach().cpu().numpy()
+    rank_to_ep_rank = {}
+    for ep_rank in range(mesh.shape[0]):
+        for rank in mesh[ep_rank].flatten().tolist():
+            rank_to_ep_rank[int(rank)] = int(ep_rank)
+    return rank_to_ep_rank
+
+
 def _find_experts_in_layer(layer_mod: nn.Module, experts_map: Dict[str, nn.Module]) -> Optional[nn.Module]:
     """Find the experts module inside a decoder layer, if any."""
     for module in layer_mod.modules():
@@ -416,11 +458,18 @@ def _place_ep_experts_on_local_device(model: nn.Module, ep_fsdp_device_mesh: Opt
             continue
         experts = getattr(module, 'experts', None)
         if experts is not None:
-            experts.to(local_device)
+            _move_module_to_device_or_empty(experts, local_device)
         if getattr(module, '_ep_ignore_shared_experts', False):
             shared = getattr(module, 'shared_expert', None)
             if shared is not None:
-                shared.to(local_device)
+                _move_module_to_device_or_empty(shared, local_device)
+
+
+def _move_module_to_device_or_empty(module: nn.Module, device: torch.device) -> None:
+    if any(param.is_meta for param in module.parameters(recurse=True)):
+        module.to_empty(device=device)
+    else:
+        module.to(device)
 
 
 def _ensure_moe_patched_if_needed(model: nn.Module, ep_fsdp_device_mesh: Optional[TorchDeviceMesh]) -> None:
@@ -477,32 +526,99 @@ def _broadcast_sharded_state_dict(
     model: nn.Module,
     full_sd: dict,
     device_type: str = 'cuda',
+    expert_shard_specs: Optional[Dict[str, Dict[str, int]]] = None,
+    rank_to_ep_rank: Optional[Dict[int, int]] = None,
 ) -> None:
-    """Broadcast full state dict from rank 0 and materialise local shards via distribute_tensor."""
-    from torch.distributed.tensor import DTensor, distribute_tensor
+    """Broadcast full state dict from rank 0 and materialize local FSDP2 shards."""
+    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
     is_rank0 = (dist.get_rank() == 0)
+    expert_shard_specs = expert_shard_specs or {}
+    rank_to_ep_rank = rank_to_ep_rank or {}
+
+    def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
+        local_tensor = full_tensor
+        for mesh_dim, placement in enumerate(placements):
+            if isinstance(placement, Shard):
+                local_tensor = placement._shard_tensor(
+                    local_tensor,
+                    device_mesh,
+                    mesh_dim,
+                    src_data_rank=None,
+                )
+            elif isinstance(placement, Replicate):
+                continue
+            elif isinstance(placement, Partial):
+                raise NotImplementedError('Native FSDP2 full-state loading does not support Partial placements.')
+            else:
+                raise NotImplementedError(f'Unsupported DTensor placement: {placement}')
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=device_mesh,
+            placements=placements,
+            run_check=False,
+            shape=full_tensor.shape,
+            stride=full_tensor.stride(),
+        )
+
+    def _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param):
+        spec = expert_shard_specs[param_name]
+        experts_per_rank = spec['experts_per_rank']
+        num_experts = spec['num_experts']
+        local_shape = tuple(sharded_param.size())
+        local_tensor = torch.empty(local_shape, device=device_type, dtype=sharded_param.dtype)
+
+        scatter_list = None
+        if is_rank0:
+            if full_tensor.size(0) != num_experts:
+                raise RuntimeError(
+                    f"EP expert parameter '{param_name}' expects {num_experts} experts, "
+                    f'but full state has shape {tuple(full_tensor.shape)}.')
+            scatter_list = []
+            world_size = dist.get_world_size()
+            for rank in range(world_size):
+                if rank not in rank_to_ep_rank:
+                    raise RuntimeError(f'Missing EP rank mapping for global rank {rank}.')
+                ep_rank = rank_to_ep_rank[rank]
+                start = ep_rank * experts_per_rank
+                end = start + experts_per_rank
+                scatter_list.append(full_tensor[start:end].contiguous())
+
+        dist.scatter(local_tensor, scatter_list=scatter_list, src=0)
+        return local_tensor
 
     for param_name, sharded_param in meta_sharded_sd.items():
         shape = sharded_param.size()
         dtype = sharded_param.dtype
+        is_ep_expert_param = param_name in expert_shard_specs
 
         if is_rank0:
+            if param_name not in full_sd:
+                raise KeyError(
+                    f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict.")
             full_param = full_sd[param_name]
             full_tensor = full_param.detach().to(device_type)
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
         else:
-            full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
+            full_tensor = None if is_ep_expert_param else torch.empty(shape, device=device_type, dtype=dtype)
 
-        dist.broadcast(full_tensor, src=0)
+        if is_ep_expert_param:
+            full_tensor = _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param)
+        else:
+            dist.broadcast(full_tensor, src=0)
         torch_util.synchronize()
 
-        device_mesh = sharded_param.device_mesh
-        placements = sharded_param.placements
-        sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
+        if isinstance(sharded_param, DTensor):
+            sharded_tensor = _dtensor_from_replicated_full_tensor(
+                full_tensor,
+                sharded_param.device_mesh,
+                sharded_param.placements,
+            )
+        else:
+            sharded_tensor = full_tensor
         del full_tensor
 
         sharded_sd[param_name] = sharded_tensor
@@ -529,14 +645,26 @@ def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
             group['params'][i] = torch.empty(1, dtype=param.dtype, device=param.device)
 
 
-def _restore_non_persistent_buffers(
+def _broadcast_non_persistent_buffers(
     model: nn.Module,
     saved_buffers: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> None:
-    """Re-register non-persistent buffers saved before to('meta')."""
-    for fqn, buf_tensor in saved_buffers.items():
-        buf_tensor = buf_tensor.to(device)
+    """Broadcast rank0 non-persistent buffers and re-register them on all ranks."""
+    is_rank0 = (dist.get_rank() == 0)
+    metadata = None
+    if is_rank0:
+        metadata = [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in saved_buffers.items()]
+    metadata_holder = [metadata]
+    dist.broadcast_object_list(metadata_holder, src=0)
+    metadata = metadata_holder[0] or []
+
+    for fqn, shape, dtype in metadata:
+        if is_rank0:
+            buf_tensor = saved_buffers[fqn].to(device)
+        else:
+            buf_tensor = torch.empty(shape, device=device, dtype=dtype)
+        dist.broadcast(buf_tensor, src=0)
         if '.' in fqn:
             parent_fqn, local_name = fqn.rsplit('.', 1)
             parent = model.get_submodule(parent_fqn)

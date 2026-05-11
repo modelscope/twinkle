@@ -168,7 +168,7 @@ class TwinkleModel(ABC):
                 'timeout': timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))),
             }
             if self._should_bind_device_id_for_process_group(backend):
-                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+                 ['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
             if backend == 'hccl':
                 default_pg = dist.distributed_c10d._get_default_group()

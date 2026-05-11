@@ -19,7 +19,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     import torch
     import torch.distributed as dist
     import accelerate.utils.fsdp_utils as fsdp_utils
-    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 
     if getattr(fsdp_utils.fsdp2_load_full_state_dict, '_twinkle_patched', False):
         return
@@ -60,6 +60,9 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
             return tensor
 
         def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
+            if device_mesh.device_type == 'cuda':
+                return distribute_tensor(full_tensor, device_mesh, placements)
+
             local_tensor = full_tensor
             for mesh_dim, placement in enumerate(placements):
                 if isinstance(placement, Shard):
