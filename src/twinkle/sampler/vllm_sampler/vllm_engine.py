@@ -462,6 +462,15 @@ class VLLMEngine(BaseSamplerEngine):
     async def reset_prefix_cache(self) -> None:
         await self.engine.reset_prefix_cache()
 
+    async def reset_mm_cache(self) -> None:
+        await self.engine.reset_mm_cache()
+
+    async def reset_encoder_cache(self) -> None:
+        # introduced in vllm 0.16
+        if not hasattr(self.engine, 'reset_encoder_cache'):
+            return
+        await self.engine.reset_encoder_cache()
+
     async def get_state_keys(self) -> List[str]:
         results = await self.engine.collective_rpc('get_state_keys')
         all_keys = set()

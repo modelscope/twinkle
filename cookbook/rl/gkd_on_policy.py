@@ -222,6 +222,8 @@ def main():
     )
     student_sampler.set_template('Qwen3_5Template', model_id=STUDENT_MODEL_ID, enable_thinking=False)
 
+    student_sampler.reset_mm_cache()
+
     # ── Teacher vLLM sampler (for prompt logprobs) ───────────────────────────────
     teacher_sampler = vLLMSampler(
         model_id=TEACHER_MODEL_ID,
@@ -236,6 +238,7 @@ def main():
         remote_group='teacher_sampler',
     )
     teacher_sampler.set_template('Qwen3_5Template', model_id=TEACHER_MODEL_ID, enable_thinking=False)
+    teacher_sampler.reset_mm_cache()
 
     # ── DataLoader (prompt-only) ───────────────────────────────────────────────
     dataloader = DataLoader(
@@ -264,6 +267,7 @@ def main():
         # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         student_sampler.reset_prefix_cache()
+        student_sampler.reset_encoder_cache()
 
         # 2. Student vLLM generates completions
         sample_response = student_sampler.sample(batch, SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=N_SAMPLES))

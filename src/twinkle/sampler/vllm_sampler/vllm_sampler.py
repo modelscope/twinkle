@@ -383,6 +383,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._run_in_loop(self.engine.reset_prefix_cache())
 
     @remote_function(dispatch='all', collect='first')
+    def reset_mm_cache(self):
+        self._run_in_loop(self.engine.reset_mm_cache())
+
+    @remote_function(dispatch='all', collect='first')
+    def reset_encoder_cache(self):
+        self._run_in_loop(self.engine.reset_encoder_cache())
+
+    @remote_function(dispatch='all', collect='first')
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())
 
