@@ -46,11 +46,31 @@ class MultiLora:
     def _read_param_tensor(self, parameter):
         return torch_util.to_local_tensor(parameter)
 
+    @staticmethod
+    def _is_distributed_param(parameter):
+        return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
+
     def _write_param_tensor(self, parameter, value):
         if value is None:
             return
         value = value.detach().to(dtype=parameter.dtype)
-        if hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements'):
+        if self._is_distributed_param(parameter):
+            if self._is_distributed_param(value):
+                parameter.data.copy_(value.to(parameter.device))
+                return
+
+            local_param = parameter.to_local() if hasattr(parameter, 'to_local') else None
+            parameter_shape = tuple(parameter.shape)
+            value_shape = tuple(value.shape)
+            if local_param is not None:
+                local_shape = tuple(local_param.shape)
+                if value_shape == local_shape and value_shape != parameter_shape:
+                    local_param.copy_(value.to(local_param.device))
+                    return
+                if value_shape != parameter_shape:
+                    raise ValueError(
+                        f'Cannot write tensor with shape {value_shape} to distributed parameter with global shape '
+                        f'{parameter_shape} and local shape {local_shape}')
             value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
         else:
             value = value.to(parameter.device)
