@@ -564,6 +564,16 @@ def _broadcast_sharded_state_dict(
     is_rank0 = (dist.get_rank() == 0)
     expert_shard_specs = expert_shard_specs or {}
     rank_to_ep_rank = rank_to_ep_rank or {}
+    source_metadata = None
+    if is_rank0:
+        source_metadata = {
+            name: (tuple(tensor.shape), tensor.dtype)
+            for name, tensor in full_sd.items()
+            if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+        }
+    metadata_holder = [source_metadata]
+    dist.broadcast_object_list(metadata_holder, src=0)
+    source_metadata = metadata_holder[0] or {}
 
     def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
         local_tensor = full_tensor
@@ -595,7 +605,10 @@ def _broadcast_sharded_state_dict(
         experts_per_rank = spec['experts_per_rank']
         num_experts = spec['num_experts']
         local_shape = tuple(sharded_param.size())
-        local_tensor = torch.empty(local_shape, device=device_type, dtype=sharded_param.dtype)
+        if param_name not in source_metadata:
+            raise KeyError(f"Missing source metadata for EP expert parameter '{param_name}'.")
+        _, source_dtype = source_metadata[param_name]
+        local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
         _native_fsdp_debug(
             f'EP expert scatter start name={param_name} local_shape={local_shape} '
             f'num_experts={num_experts} experts_per_rank={experts_per_rank}')
@@ -626,8 +639,10 @@ def _broadcast_sharded_state_dict(
 
     for param_name, sharded_param in meta_sharded_sd.items():
         shape = sharded_param.size()
-        dtype = sharded_param.dtype
         is_ep_expert_param = param_name in expert_shard_specs
+        if param_name not in source_metadata:
+            raise KeyError(f"Missing source metadata for parameter '{param_name}'.")
+        source_shape, source_dtype = source_metadata[param_name]
 
         if is_rank0:
             if param_name not in full_sd:
@@ -637,12 +652,21 @@ def _broadcast_sharded_state_dict(
             full_tensor = full_param.detach().to(device_type)
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
+            if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
+                raise RuntimeError(
+                    f"Source metadata mismatch for '{param_name}': "
+                    f'actual shape={tuple(full_tensor.shape)} dtype={full_tensor.dtype}, '
+                    f'expected shape={source_shape} dtype={source_dtype}.')
         else:
-            full_tensor = None if is_ep_expert_param else torch.empty(shape, device=device_type, dtype=dtype)
+            full_tensor = None if is_ep_expert_param else torch.empty(source_shape, device=device_type, dtype=source_dtype)
 
         if is_ep_expert_param:
             full_tensor = _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param)
         else:
+            if tuple(shape) != tuple(source_shape):
+                raise RuntimeError(
+                    f"Parameter '{param_name}' shape mismatch before broadcast: "
+                    f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
             dist.broadcast(full_tensor, src=0)
         torch_util.synchronize()
 

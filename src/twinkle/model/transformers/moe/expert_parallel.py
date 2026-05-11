@@ -371,7 +371,10 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
         experts_per_rank: int,
     ) -> torch.Tensor:
         if permuted_tokens.numel() == 0:
-            return torch.empty_like(permuted_tokens)
+            # Preserve the autograd edge to token_pre_all2all. Returning a new
+            # empty tensor can make this rank skip the matching backward
+            # all-to-all, causing EP collective order divergence.
+            return permuted_tokens
 
         input_dtype = permuted_tokens.dtype
 
@@ -393,8 +396,12 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
             compute_dtype = gate_up.dtype
             if expert_in.dtype != compute_dtype:
                 expert_in = expert_in.to(compute_dtype)
-            gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
-            out = self.act_fn(gate) * up
+            gate_up_out = F.linear(expert_in, gate_up)
+            if hasattr(self, '_apply_gate'):
+                out = self._apply_gate(gate_up_out)
+            else:
+                gate, up = gate_up_out.chunk(2, dim=-1)
+                out = self.act_fn(gate) * up
             out = F.linear(out, down)
 
             if out.dtype != input_dtype:
@@ -493,7 +500,9 @@ def _run_local_experts(
     that happens in unpermute.
     """
     if permuted_tokens.numel() == 0:
-        return torch.empty_like(permuted_tokens)
+        # Keep the backward path through token_pre_all2all even when this EP
+        # rank owns no routed tokens for the current block.
+        return permuted_tokens
 
     input_dtype = permuted_tokens.dtype
     experts = block.experts
