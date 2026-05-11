@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch.distributed as dist
 import twinkle
@@ -48,21 +49,28 @@ def barrier_if_distributed(stage: str):
     if not (dist.is_available() and dist.is_initialized()):
         return
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        print(f'[twinkle-train-debug][rank{dist.get_rank()}] before barrier: {stage}', flush=True)
+        debug_print(f'before barrier: {stage}')
     if dist.get_backend() == 'nccl':
         dist.barrier(device_ids=[Platform.get_local_rank()])
     else:
         dist.barrier()
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        print(f'[twinkle-train-debug][rank{dist.get_rank()}] after barrier: {stage}', flush=True)
+        debug_print(f'after barrier: {stage}')
 
 
-def train_debug(message: str):
+def debug_print(message: str):
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
         return
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else Platform.get_rank()
     local_rank = Platform.get_local_rank()
-    print(f'[twinkle-train-debug][rank{rank} local_rank={local_rank}] {message}', flush=True)
+    timestamp = time.time()
+    text = f'[twinkle-train-debug][time={timestamp:.6f} rank{rank} local_rank={local_rank}] {message}'
+    print(text, flush=True)
+    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, f'train_rank{rank}.log'), 'a', encoding='utf-8') as f:
+            f.write(text + '\n')
 
 
 def describe_batch(batch):
@@ -175,19 +183,19 @@ def train():
         if MAX_STEPS and step >= MAX_STEPS:
             break
         if step < 2:
-            train_debug(f'step={step} before forward_backward batch={describe_batch(batch)}')
+            debug_print(f'step={step} before forward_backward batch={describe_batch(batch)}')
         model.forward_backward(
             inputs=batch,
             adapter_name='default',
         )
         if step < 2:
-            train_debug(f'step={step} after forward_backward')
+            debug_print(f'step={step} after forward_backward')
         model.clip_grad_and_step(
             adapter_name='default',
             gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         )
         if step < 2:
-            train_debug(f'step={step} after clip_grad_and_step')
+            debug_print(f'step={step} after clip_grad_and_step')
         if step == 0:
             log_expert_parallel_status(model)
 

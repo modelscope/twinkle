@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Literal, Optional
 
@@ -29,11 +30,6 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
         _fsdp_debug(
             f'enter fsdp2_load_full_state_dict device={accelerator.device} '
             f'full_sd_keys={len(full_sd) if full_sd is not None else "None"}')
-        if accelerator.device.type == 'cuda':
-            _fsdp_debug('delegating to original accelerate fsdp2_load_full_state_dict')
-            result = original(accelerator, model, full_sd, cpu_offload=cpu_offload)
-            _fsdp_debug('exit original fsdp2_load_full_state_dict')
-            return result
 
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
@@ -102,8 +98,23 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
             device = sharded_param.device_mesh.device_type if isinstance(sharded_param, DTensor) else accelerator.device
             return full_value.to(device).contiguous()
 
+        def _tensor_debug(tensor):
+            if isinstance(tensor, DTensor):
+                return (
+                    f'type=DTensor shape={tuple(tensor.size())} dtype={tensor.dtype} '
+                    f'placements={tensor.placements} mesh={tensor.device_mesh}')
+            if hasattr(tensor, 'size') and hasattr(tensor, 'dtype'):
+                return f'type={type(tensor).__name__} shape={tuple(tensor.size())} dtype={tensor.dtype}'
+            return f'type={type(tensor).__name__}'
+
         for param_name, sharded_param in meta_sharded_sd.items():
-            _fsdp_debug(f'load state entry start: {param_name}')
+            _fsdp_debug(f'load state entry start: {param_name} {_tensor_debug(sharded_param)}')
+            if accelerator.is_main_process:
+                full_value = full_sd.get(param_name)
+                if full_value is None:
+                    _fsdp_debug(f'full state entry missing: {param_name}')
+                else:
+                    _fsdp_debug(f'full state entry: {param_name} {_tensor_debug(full_value)}')
             if isinstance(sharded_param, DTensor):
                 device_mesh = sharded_param.device_mesh
                 placements = sharded_param.placements
@@ -164,7 +175,14 @@ def _fsdp_debug(message: str) -> None:
         rank = 0
         world_size = 1
     local_rank = os.environ.get('LOCAL_RANK', '?')
-    print(f'[twinkle-fsdp-debug][rank{rank}/{world_size} local_rank={local_rank}] {message}', flush=True)
+    timestamp = time.time()
+    text = f'[twinkle-fsdp-debug][time={timestamp:.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
+    print(text, flush=True)
+    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, f'fsdp_rank{rank}.log'), 'a', encoding='utf-8') as f:
+            f.write(text + '\n')
 
 
 class AccelerateStrategy:
