@@ -7,6 +7,80 @@ from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
 
 
+def _patch_accelerate_fsdp2_load_full_state_dict():
+    """Allow Accelerate FSDP2 state-dict loading to handle unsharded buffers.
+
+    Some Transformers models keep persistent buffers in `state_dict`. FSDP2
+    shards parameters as DTensors, but those buffers can remain ordinary
+    tensors; older Accelerate versions assume every state-dict entry has
+    `device_mesh` and fail on such buffers.
+    """
+    import torch
+    import torch.distributed as dist
+    import accelerate.utils.fsdp_utils as fsdp_utils
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    if getattr(fsdp_utils.fsdp2_load_full_state_dict, '_twinkle_patched', False):
+        return
+
+    original = fsdp_utils.fsdp2_load_full_state_dict
+
+    def patched_fsdp2_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
+        meta_sharded_sd = model.state_dict()
+        sharded_sd = {}
+
+        for param_name, sharded_param in meta_sharded_sd.items():
+            if isinstance(sharded_param, DTensor):
+                device_mesh = sharded_param.device_mesh
+                current_placement = sharded_param.placements
+
+                if accelerator.is_main_process:
+                    full_param = full_sd[param_name].detach().to(accelerator.device)
+                    if full_param.is_floating_point():
+                        old_param = model.get_parameter_or_buffer(param_name)
+                        full_param = full_param.to(old_param.dtype)
+                        if old_param.is_contiguous():
+                            full_param = full_param.contiguous()
+                else:
+                    full_param = torch.empty(
+                        sharded_param.size(),
+                        device=accelerator.device,
+                        dtype=sharded_param.dtype,
+                    )
+
+                dist.broadcast(full_param, src=0)
+                sharded_param = distribute_tensor(full_param, device_mesh, current_placement)
+                if cpu_offload:
+                    sharded_param = sharded_param.cpu()
+                sharded_sd[param_name] = sharded_param
+                continue
+
+            if accelerator.is_main_process:
+                full_value = full_sd[param_name]
+                if isinstance(full_value, DTensor):
+                    full_value = full_value.to_local()
+                full_value = full_value.detach().to(accelerator.device)
+                if full_value.is_floating_point():
+                    full_value = full_value.to(sharded_param.dtype)
+            else:
+                full_value = torch.empty(
+                    sharded_param.size(),
+                    device=accelerator.device,
+                    dtype=sharded_param.dtype,
+                )
+
+            dist.broadcast(full_value, src=0)
+            if cpu_offload:
+                full_value = full_value.cpu()
+            sharded_sd[param_name] = full_value
+
+        model.load_state_dict(sharded_sd, assign=True)
+
+    patched_fsdp2_load_full_state_dict._twinkle_patched = True
+    patched_fsdp2_load_full_state_dict._twinkle_original = original
+    fsdp_utils.fsdp2_load_full_state_dict = patched_fsdp2_load_full_state_dict
+
+
 class AccelerateStrategy:
     """A training strategy that uses `accelerate` to wrap models.
 
@@ -27,6 +101,8 @@ class AccelerateStrategy:
     ):
         from accelerate import Accelerator
         from accelerate.utils import InitProcessGroupKwargs
+
+        _patch_accelerate_fsdp2_load_full_state_dict()
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
