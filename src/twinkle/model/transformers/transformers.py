@@ -1106,7 +1106,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         return trainer_state
 
-    @remote_function()
+    @remote_function(dispatch='all', collect='first', sync=True)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
@@ -1286,7 +1286,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         trainable_param_names = '\n'.join(trainable_param_names)
         return trainable_param_names
 
-    @remote_function(execute='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def get_train_configs(self, **kwargs) -> str:
         expr = ''
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
