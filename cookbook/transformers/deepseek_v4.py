@@ -49,7 +49,10 @@ def barrier_if_distributed(stage: str):
         return
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
         print(f'[twinkle-train-debug][rank{dist.get_rank()}] before barrier: {stage}', flush=True)
-    dist.barrier()
+    if dist.get_backend() == 'nccl':
+        dist.barrier(device_ids=[Platform.get_local_rank()])
+    else:
+        dist.barrier()
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
         print(f'[twinkle-train-debug][rank{dist.get_rank()}] after barrier: {stage}', flush=True)
 
