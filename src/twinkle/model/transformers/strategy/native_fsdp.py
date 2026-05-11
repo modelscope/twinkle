@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 import torch.distributed as dist
+import os
+import time
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
@@ -11,6 +13,21 @@ from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
+
+
+def _native_fsdp_debug(message: str) -> None:
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    text = f'[twinkle-native-fsdp-debug][time={time.time():.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
+    print(text, flush=True)
+    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, f'native_fsdp_rank{rank}.log'), 'a', encoding='utf-8') as f:
+            f.write(text + '\n')
 
 
 class NativeFSDPStrategy:
@@ -28,6 +45,7 @@ class NativeFSDPStrategy:
         self._memory_efficient_init = memory_efficient_init
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
+        self._rank0_pre_ep_full_state_dict = None
 
     def pretrained_load_context(self):
         # Native FSDP handles rank0-load itself. Do not enable Transformers'
@@ -37,6 +55,9 @@ class NativeFSDPStrategy:
 
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
+
+    def set_rank0_pre_ep_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
+        self._rank0_pre_ep_full_state_dict = state_dict
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -72,7 +93,13 @@ class NativeFSDPStrategy:
             saved_buffers = None
             if use_meta:
                 is_rank0 = (dist.get_rank() == 0)
-                original_sd = model.state_dict() if is_rank0 else {}
+                if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
+                    _native_fsdp_debug(
+                        f'use captured pre-EP full state_dict keys={len(self._rank0_pre_ep_full_state_dict)}')
+                    original_sd = self._rank0_pre_ep_full_state_dict if is_rank0 else {}
+                else:
+                    _native_fsdp_debug('use current model state_dict as rank0 broadcast source')
+                    original_sd = model.state_dict() if is_rank0 else {}
                 saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
                 if is_rank0:
                     model = model.to(torch.device('meta'))
@@ -569,13 +596,20 @@ def _broadcast_sharded_state_dict(
         num_experts = spec['num_experts']
         local_shape = tuple(sharded_param.size())
         local_tensor = torch.empty(local_shape, device=device_type, dtype=sharded_param.dtype)
+        _native_fsdp_debug(
+            f'EP expert scatter start name={param_name} local_shape={local_shape} '
+            f'num_experts={num_experts} experts_per_rank={experts_per_rank}')
 
         scatter_list = None
         if is_rank0:
+            _native_fsdp_debug(
+                f'EP expert scatter source name={param_name} source_shape={tuple(full_tensor.shape)} '
+                f'source_dtype={full_tensor.dtype}')
             if full_tensor.size(0) != num_experts:
                 raise RuntimeError(
                     f"EP expert parameter '{param_name}' expects {num_experts} experts, "
-                    f'but full state has shape {tuple(full_tensor.shape)}.')
+                    f'but source state has shape {tuple(full_tensor.shape)}. '
+                    'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
             scatter_list = []
             world_size = dist.get_world_size()
             for rank in range(world_size):
@@ -587,6 +621,7 @@ def _broadcast_sharded_state_dict(
                 scatter_list.append(full_tensor[start:end].contiguous())
 
         dist.scatter(local_tensor, scatter_list=scatter_list, src=0)
+        _native_fsdp_debug(f'EP expert scatter done name={param_name}')
         return local_tensor
 
     for param_name, sharded_param in meta_sharded_sd.items():
