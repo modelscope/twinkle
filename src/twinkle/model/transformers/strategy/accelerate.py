@@ -26,14 +26,18 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     original = fsdp_utils.fsdp2_load_full_state_dict
 
     def patched_fsdp2_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
-        _fsdp_debug(f'enter fsdp2_load_full_state_dict device={accelerator.device}')
+        _fsdp_debug(
+            f'enter fsdp2_load_full_state_dict device={accelerator.device} '
+            f'full_sd_keys={len(full_sd) if full_sd is not None else "None"}')
         if accelerator.device.type == 'cuda':
+            _fsdp_debug('delegating to original accelerate fsdp2_load_full_state_dict')
             result = original(accelerator, model, full_sd, cpu_offload=cpu_offload)
             _fsdp_debug('exit original fsdp2_load_full_state_dict')
             return result
 
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
+        _fsdp_debug(f'patched fsdp2 meta_sharded_keys={len(meta_sharded_sd)}')
 
         def _infer_parameter_dtype(model, param_name, empty_param):
             try:
@@ -99,6 +103,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
             return full_value.to(device).contiguous()
 
         for param_name, sharded_param in meta_sharded_sd.items():
+            _fsdp_debug(f'load state entry start: {param_name}')
             if isinstance(sharded_param, DTensor):
                 device_mesh = sharded_param.device_mesh
                 placements = sharded_param.placements
@@ -112,7 +117,9 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                     )
 
                 dist.broadcast(full_param, src=0, group=dist.group.WORLD)
+                _fsdp_debug(f'broadcast done: {param_name}')
                 sharded_tensor = _dtensor_from_replicated_full_tensor(full_param, device_mesh, placements)
+                _fsdp_debug(f'local shard done: {param_name}')
                 to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_param)
                 sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
                 if cpu_offload:
@@ -130,6 +137,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                 )
 
             dist.broadcast(full_value, src=0, group=dist.group.WORLD)
+            _fsdp_debug(f'broadcast done: {param_name}')
             to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_value)
             full_value = _cast_and_contiguous(full_value, to_contiguous, casting_dtype)
             if cpu_offload:
@@ -151,9 +159,12 @@ def _fsdp_debug(message: str) -> None:
     try:
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     except Exception:
         rank = 0
-    print(f'[twinkle-fsdp-debug][rank{rank}] {message}', flush=True)
+        world_size = 1
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    print(f'[twinkle-fsdp-debug][rank{rank}/{world_size} local_rank={local_rank}] {message}', flush=True)
 
 
 class AccelerateStrategy:

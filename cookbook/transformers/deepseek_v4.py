@@ -48,10 +48,18 @@ def barrier_if_distributed(stage: str):
     if not (dist.is_available() and dist.is_initialized()):
         return
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        logger.info(f'[rank{dist.get_rank()}] before barrier: {stage}')
+        print(f'[twinkle-train-debug][rank{dist.get_rank()}] before barrier: {stage}', flush=True)
     dist.barrier()
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        logger.info(f'[rank{dist.get_rank()}] after barrier: {stage}')
+        print(f'[twinkle-train-debug][rank{dist.get_rank()}] after barrier: {stage}', flush=True)
+
+
+def train_debug(message: str):
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else Platform.get_rank()
+    local_rank = Platform.get_local_rank()
+    print(f'[twinkle-train-debug][rank{rank} local_rank={local_rank}] {message}', flush=True)
 
 
 def log_expert_parallel_status(model):
@@ -155,14 +163,20 @@ def train():
     for step, batch in enumerate(dataloader):
         if MAX_STEPS and step >= MAX_STEPS:
             break
+        if step < 2:
+            train_debug(f'step={step} before forward_backward batch_keys={list(batch.keys())}')
         model.forward_backward(
             inputs=batch,
             adapter_name='default',
         )
+        if step < 2:
+            train_debug(f'step={step} after forward_backward')
         model.clip_grad_and_step(
             adapter_name='default',
             gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         )
+        if step < 2:
+            train_debug(f'step={step} after clip_grad_and_step')
         if step == 0:
             log_expert_parallel_status(model)
 
