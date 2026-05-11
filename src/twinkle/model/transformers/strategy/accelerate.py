@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
+from datetime import timedelta
 from typing import Any, Dict, Literal, Optional
 
 from twinkle import DeviceMesh
@@ -24,6 +26,7 @@ class AccelerateStrategy:
         memory_efficient_init: bool = False,
     ):
         from accelerate import Accelerator
+        from accelerate.utils import InitProcessGroupKwargs
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
@@ -32,6 +35,9 @@ class AccelerateStrategy:
         fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
         kwargs_handlers = []
+        kwargs_handlers.append(
+            InitProcessGroupKwargs(timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))))
+        )
         if ddp_config is not None:
             from accelerate import DistributedDataParallelKwargs
             ddp_config = DistributedDataParallelKwargs(**ddp_config)
