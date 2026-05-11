@@ -306,10 +306,18 @@ def test_prefers_blocks_over_legacy_block_when_both_present():
 def test_tool_info_shape_and_serializability():
     tool = ExtractCondensed(Chunks(chunks=[]))
     info = tool.tool_info()
-    assert info['tool_name'] == TOOL_NAME == 'extract_condensed'
-    assert 'description' in info and info['description']
-    # parameters must be a JSON string that loads back cleanly.
-    params = json.loads(info['parameters'])
+    # OpenAI-shape: {type: 'function', function: {name, description, parameters}}
+    assert info['type'] == 'function'
+    fn = info['function']
+    assert fn['name'] == TOOL_NAME == 'extract_condensed'
+    assert 'description' in fn and fn['description']
+    # parameters is a plain mapping (not a JSON string): the jinja chat
+    # template consumes it directly.
+    params = fn['parameters']
+    assert isinstance(params, dict)
+    # The whole info dict must still be JSON-serializable so it can be
+    # embedded inside a trace / logged safely.
+    json.dumps(info)
     # Preferred parameter name is ``blocks`` (single int per call; no list).
     assert 'blocks' in params
     assert 'int' in params['blocks']
@@ -333,11 +341,13 @@ def test_register_with_tool_manager_and_dispatch():
     assert TOOL_NAME in mgr.names()
 
     # dict-form arguments
-    out = mgr({'tool_name': TOOL_NAME, 'arguments': {'block': 2}})
+    out = mgr({'type': 'function',
+               'function': {'name': TOOL_NAME, 'arguments': {'block': 2}}})
     assert out == 'orig two'
 
     # JSON-string-form arguments (OpenAI-style)
-    out = mgr({'tool_name': TOOL_NAME, 'arguments': '{"block": 1}'})
+    out = mgr({'type': 'function',
+               'function': {'name': TOOL_NAME, 'arguments': '{"block": 1}'}})
     assert out == 'orig one'
 
 
@@ -346,7 +356,9 @@ def test_manager_reports_error_on_unknown_block_without_raising():
         _condensed('cmp1', original='orig one')]))
     mgr = ToolManager({})
     mgr.register(tool)
-    out = mgr({'tool_name': TOOL_NAME, 'arguments': '{"block": 999}'})
+    out = mgr({'type': 'function',
+               'function': {'name': TOOL_NAME,
+                            'arguments': '{"block": 999}'}})
     assert out.startswith('Error:')
 
 

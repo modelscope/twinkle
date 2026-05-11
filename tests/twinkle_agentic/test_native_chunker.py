@@ -202,15 +202,17 @@ def test_tool_calls_become_empty_text_chunks_with_kind():
         _u('hi'),
         {'role': 'assistant', 'content': 'calling',
          'tool_calls': [
-             {'tool_name': 'foo', 'arguments': '{}'},
-             {'tool_name': 'bar', 'arguments': '{"x":1}'},
+             {'type': 'function',
+              'function': {'name': 'foo', 'arguments': {}}},
+             {'type': 'function',
+              'function': {'name': 'bar', 'arguments': {'x': 1}}},
          ]},
     ]}
     out = ch(traj).chunks
     tc_chunks = [c for c in out if c.get('raw', {}).get('kind') == 'tool_call']
     assert len(tc_chunks) == 2
-    assert tc_chunks[0]['raw']['tool_call']['tool_name'] == 'foo'
-    assert tc_chunks[1]['raw']['tool_call']['tool_name'] == 'bar'
+    assert tc_chunks[0]['raw']['tool_call']['function']['name'] == 'foo'
+    assert tc_chunks[1]['raw']['tool_call']['function']['name'] == 'bar'
     # Empty content on tool_call chunks.
     assert all(c['content'] == '' for c in tc_chunks)
 
@@ -309,11 +311,13 @@ def test_hotpotqa_like_passage_layout():
 # ---------------------------------------------------------------------------
 def test_non_split_messages_roundtrip_through_to_trajectory():
     ch = NativeChunker(chunk_size=1024)
+    tc = {'type': 'function',
+          'function': {'name': 'foo', 'arguments': {}}}
     traj = {'messages': [
         {'role': 'system',    'content': 'sys'},
         {'role': 'user',      'content': 'short question'},
         {'role': 'assistant', 'content': 'answer',
-         'tool_calls': [{'tool_name': 'foo', 'arguments': '{}'}]},
+         'tool_calls': [tc]},
         {'role': 'tool',      'content': 'result', 'tool_call_id': 'c1'},
     ]}
     chunks = ch(traj)
@@ -324,7 +328,7 @@ def test_non_split_messages_roundtrip_through_to_trajectory():
     assert msgs[1]['content'] == 'short question'
     assert msgs[2]['role'] == 'assistant'
     assert msgs[2]['content'] == 'answer'
-    assert msgs[2]['tool_calls'] == [{'tool_name': 'foo', 'arguments': '{}'}]
+    assert msgs[2]['tool_calls'] == [tc]
     assert msgs[3]['role'] == 'tool'
     assert msgs[3]['content'] == 'result'
     assert msgs[3]['tool_call_id'] == 'c1'

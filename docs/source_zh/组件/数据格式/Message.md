@@ -4,15 +4,21 @@
 
 ```python
 
+class FunctionCall(TypedDict, total=False):
+    name: str
+    arguments: Union[str, Dict[str, Any]]
+
 class ToolCall(TypedDict, total=False):
-    tool_name: str
-    arguments: str
+    id: str
+    type: Literal['function']
+    function: FunctionCall
 
 class Message(TypedDict, total=False):
     role: Literal['system', 'user', 'assistant', 'tool']
     type: str
     content: Union[str, List[Dict[str, str]]]
     tool_calls: List[ToolCall]
+    tool_call_id: str
     reasoning_content: str
     images: Optional[List[Union[str, Any]]]
     videos: Optional[List[Union[str, Any]]]
@@ -36,7 +42,7 @@ class Message(TypedDict, total=False):
 ```
 
 - tool_calls: 工具调用列表，为模型输出给用户的信息，通常在assistant对应的content中解析出来。
-  - ToolCall 的结构中包含tool_name和arguments两个字段，分别是工具名称和参数。arguments是一个json-string，可以被解析为合法json字符串。
+  - ToolCall 与 OpenAI chat-completion 协议对齐：外层是 `{type: "function", function: {...}}`，`function` 中的 `name` 是工具名，`arguments` 在 chat template 渲染时应为 dict（dispatch 时也接受 JSON 字符串）。
 
 - images: 消息中包含的原图片信息
 - videos: 消息中包含的原视频信息

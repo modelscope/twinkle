@@ -32,8 +32,11 @@ class QwenTemplate(Template):
                     except (json.JSONDecodeError, ValueError):
                         args[key] = val
                 calls.append({
-                    'tool_name': func_m.group(1).strip(),
-                    'arguments': args,
+                    'type': 'function',
+                    'function': {
+                        'name': func_m.group(1).strip(),
+                        'arguments': args,
+                    },
                 })
                 continue
             # JSON fallback: ``{"name": ..., "arguments": ...}`` inside the block.
@@ -51,8 +54,11 @@ class QwenTemplate(Template):
                 except json.JSONDecodeError:
                     args = {}
             calls.append({
-                'tool_name': name,
-                'arguments': args if isinstance(args, dict) else {},
+                'type': 'function',
+                'function': {
+                    'name': name,
+                    'arguments': args if isinstance(args, dict) else {},
+                },
             })
         return calls
 

@@ -154,8 +154,11 @@ class FakeTemplate:
             if not name:
                 continue
             results.append({
-                'tool_name': name,
-                'arguments': d.get('arguments', {}),
+                'type': 'function',
+                'function': {
+                    'name': name,
+                    'arguments': d.get('arguments', {}),
+                },
             })
         return results
 
@@ -246,9 +249,12 @@ class EchoTool(Tool):
 
     def tool_info(self):
         return {
-            'tool_name': self._name,
-            'description': 'echo test tool',
-            'parameters': '{}',
+            'type': 'function',
+            'function': {
+                'name': self._name,
+                'description': 'echo test tool',
+                'parameters': {},
+            },
         }
 
 
@@ -499,7 +505,10 @@ def test_extra_trajectory_fields_pass_through(make_rollout, sampler):
     """
     traj = _user_traj()
     traj['images'] = ['/path/to/img.png']
-    traj['tools'] = [{'tool_name': 'search', 'description': '', 'parameters': '{}'}]
+    traj['tools'] = [{
+        'type': 'function',
+        'function': {'name': 'search', 'description': '', 'parameters': {}},
+    }]
 
     sampler.queue('ok', stop_reason='stop')
     rollout = make_rollout(max_turns=2)
@@ -646,7 +655,14 @@ def test_batch_per_trajectory_tool_manager(make_rollout, sampler, template):
         def __call__(self, tool_name, arguments):
             return f'tagged[{self._tag}]:{json.dumps(arguments, sort_keys=True)}'
         def tool_info(self):
-            return {'tool_name': 'search', 'description': '', 'parameters': '{}'}
+            return {
+                'type': 'function',
+                'function': {
+                    'name': 'search',
+                    'description': '',
+                    'parameters': {},
+                },
+            }
 
     tm_b = ToolManager({})
     tm_b.register(TagTool('B'))

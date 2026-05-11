@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
-import json
 
 import numpy as np
 import os
@@ -490,16 +489,9 @@ class Template:
                 k: v
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
-
-            tool_calls = msg.get('tool_calls')
-            if isinstance(tool_calls, list) and tool_calls:
-                msg['tool_calls'] = [
-                    Template._normalize_tool_call_for_template(tool_call) for tool_call in tool_calls
-                ]
-        tools = [
-            Template._normalize_tool_for_template(tool)
-            for tool in trajectory.get('tools', [])
-        ]
+        # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
+        # :mod:`twinkle.data_format.message`); pass them through verbatim.
+        tools = list(trajectory.get('tools') or [])
 
         # Use inspect to get apply_chat_template signature params
         sig = inspect.signature(self.processor.apply_chat_template)
@@ -551,65 +543,6 @@ class Template:
                 return_tensors='pt',
                 **kwargs)
         return inputs
-
-    @staticmethod
-    def _parse_arguments(args: Any) -> Any:
-        if isinstance(args, str):
-            try:
-                parsed = json.loads(args)
-                return parsed
-            except (TypeError, ValueError):
-                return {}
-        return args
-
-    @staticmethod
-    def _normalize_tool_call_for_template(tc: Any) -> Any:
-        if not isinstance(tc, dict):
-            return tc
-        # Already OpenAI-nested: ensure arguments is a mapping.
-        if isinstance(tc.get('function'), dict) and 'name' in tc['function']:
-            fn = dict(tc['function'])
-            if 'arguments' in fn:
-                fn['arguments'] = Template._parse_arguments(fn['arguments'])
-            out = dict(tc)
-            out['function'] = fn
-            out.setdefault('type', 'function')
-            return out
-        # Already flat OpenAI (``name`` at top-level): just normalize arguments.
-        if 'name' in tc and 'tool_name' not in tc:
-            out = dict(tc)
-            if 'arguments' in out:
-                out['arguments'] = Template._parse_arguments(out['arguments'])
-            return out
-        # Twinkle shape: lift ``tool_name`` to ``function.name``.
-        name = tc.get('tool_name')
-        if not name:
-            return tc
-        return {
-            'type': 'function',
-            'function': {
-                'name': name,
-                'arguments': Template._parse_arguments(tc.get('arguments', {})),
-            },
-        }
-
-    @staticmethod
-    def _normalize_tool_for_template(tool: Any) -> Any:
-        if not isinstance(tool, dict):
-            return tool
-        if isinstance(tool.get('function'), dict) and 'name' in tool['function']:
-            return tool
-        if 'name' in tool and 'tool_name' not in tool:
-            return tool
-        name = tool.get('tool_name')
-        if not name:
-            return tool
-        fn: Dict[str, Any] = {'name': name}
-        if 'description' in tool:
-            fn['description'] = tool['description']
-        if 'parameters' in tool:
-            fn['parameters'] = Template._parse_arguments(tool['parameters'])
-        return {'type': 'function', 'function': fn}
 
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""

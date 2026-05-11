@@ -380,7 +380,9 @@ def test_reasoning_and_tool_call_kind_chunks_pass_through():
     # hold even if role is user.
     tool_call = {
         'type': 'text', 'role': 'user', 'content': LONG_PASSAGE,
-        'raw': {'kind': 'tool_call', 'tool_call': {'tool_name': 'x', 'arguments': '{}'}},
+        'raw': {'kind': 'tool_call',
+                'tool_call': {'type': 'function',
+                              'function': {'name': 'x', 'arguments': {}}}},
     }
     out = cond(_wrap(reasoning, tool_call)).chunks
     assert (out[0].get('raw') or {}).get('condensed') is not True

@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
 from typing import Any, Dict, List, Optional
 
 from twinkle.data_format.message import Tool as ToolInfo
@@ -56,19 +55,22 @@ class ExtractCondensed(Tool):
     # ------------------------------------------------------------------
     def tool_info(self) -> ToolInfo:
         return {
-            'tool_name': TOOL_NAME,
-            'description': (
-                'Recover the full, uncompressed text of ONE previously '
-                'condensed passage, identified by its <block_N> tag. Use '
-                'this tool whenever you need to re-read the original '
-                'detail of a compressed block. Each call expands exactly '
-                'one block; issue separate calls for additional blocks, '
-                'and do not request the same block twice.'),
-            'parameters': json.dumps({
-                'blocks': ('int, the 1-indexed block number N appearing '
-                           'inside <block_N>...</block_N>. Exactly one '
-                           'block per call (e.g. 3); lists are rejected.'),
-            }),
+            'type': 'function',
+            'function': {
+                'name': TOOL_NAME,
+                'description': (
+                    'Recover the full, uncompressed text of ONE previously '
+                    'condensed passage, identified by its <block_N> tag. Use '
+                    'this tool whenever you need to re-read the original '
+                    'detail of a compressed block. Each call expands exactly '
+                    'one block; issue separate calls for additional blocks, '
+                    'and do not request the same block twice.'),
+                'parameters': {
+                    'blocks': ('int, the 1-indexed block number N appearing '
+                               'inside <block_N>...</block_N>. Exactly one '
+                               'block per call (e.g. 3); lists are rejected.'),
+                },
+            },
         }
 
     def __call__(self, tool_name: str, arguments: Dict[str, Any]) -> str:
