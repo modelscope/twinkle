@@ -1,5 +1,6 @@
 import os
 
+import torch.distributed as dist
 import twinkle
 from peft import LoraConfig
 from transformers import AutoConfig
@@ -16,7 +17,7 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
 
-_num_layers_env = os.environ.get('NUM_LAYERS','4')
+_num_layers_env = os.environ.get('NUM_LAYERS','1')
 NUM_LAYERS = int(_num_layers_env) if _num_layers_env is not None else None
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
@@ -41,6 +42,16 @@ device_mesh = DeviceMesh.from_sizes(
 )
 
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+
+
+def barrier_if_distributed(stage: str):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
+        logger.info(f'[rank{dist.get_rank()}] before barrier: {stage}')
+    dist.barrier()
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
+        logger.info(f'[rank{dist.get_rank()}] after barrier: {stage}')
 
 
 def log_expert_parallel_status(model):
@@ -98,16 +109,17 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
-        strategy='native_fsdp',
+        strategy="accelerate",
+        memory_efficient_init=True,
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
-        fsdp_config={
-            'reshard_after_forward': RESHARD_AFTER_FORWARD,
-            'expert_parallel': {
-                'enabled': True,
-                'router_dtype': 'fp32',
-                'keep_router_logits': False,
-            }
-        },
+        # fsdp_config={
+        #     'reshard_after_forward': RESHARD_AFTER_FORWARD,
+        #     'expert_parallel': {
+        #         'enabled': True,
+        #         'router_dtype': 'fp32',
+        #         'keep_router_logits': False,
+        #     }
+        # },
     )
 
     if USE_LORA:
@@ -136,6 +148,8 @@ def train():
         f'gradient_checkpointing={GRADIENT_CHECKPOINTING}, '
         f'reshard_after_forward={RESHARD_AFTER_FORWARD}, '
         f'lora_target_modules={LORA_TARGET_MODULES}')
+
+    barrier_if_distributed('before first train step')
 
     best_loss = float('inf')
     for step, batch in enumerate(dataloader):
