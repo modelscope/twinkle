@@ -26,6 +26,12 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     original = fsdp_utils.fsdp2_load_full_state_dict
 
     def patched_fsdp2_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
+        _fsdp_debug(f'enter fsdp2_load_full_state_dict device={accelerator.device}')
+        if accelerator.device.type == 'cuda':
+            result = original(accelerator, model, full_sd, cpu_offload=cpu_offload)
+            _fsdp_debug('exit original fsdp2_load_full_state_dict')
+            return result
+
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
 
@@ -131,11 +137,23 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
             sharded_sd[param_name] = full_value
 
         model.load_state_dict(sharded_sd, assign=True)
+        _fsdp_debug('exit patched fsdp2_load_full_state_dict')
         return model
 
     patched_fsdp2_load_full_state_dict._twinkle_patched = True
     patched_fsdp2_load_full_state_dict._twinkle_original = original
     fsdp_utils.fsdp2_load_full_state_dict = patched_fsdp2_load_full_state_dict
+
+
+def _fsdp_debug(message: str) -> None:
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
+        return
+    try:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    print(f'[twinkle-fsdp-debug][rank{rank}] {message}', flush=True)
 
 
 class AccelerateStrategy:
@@ -258,7 +276,10 @@ class AccelerateStrategy:
         return fsdp_plugin
 
     def wrap_model(self, model, *args):
-        return self.accelerator.prepare(model, *args)
+        _fsdp_debug('enter accelerator.prepare')
+        result = self.accelerator.prepare(model, *args)
+        _fsdp_debug('exit accelerator.prepare')
+        return result
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
