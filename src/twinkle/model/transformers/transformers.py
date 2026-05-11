@@ -7,6 +7,7 @@ import os
 import random
 import re
 import threading
+import time
 import torch
 import torch.distributed as dist
 import transformers
@@ -44,6 +45,25 @@ from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
 logger = get_logger()
+
+
+def _twinkle_fsdp_debug(message: str) -> None:
+    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
+        return
+    try:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    except Exception:
+        rank = int(os.environ.get('RANK', 0))
+        world_size = 1
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    text = f'[twinkle-model-debug][time={time.time():.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
+    print(text, flush=True)
+    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, f'model_rank{rank}.log'), 'a', encoding='utf-8') as f:
+            f.write(text + '\n')
 
 
 @dataclass
@@ -163,7 +183,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+        _twinkle_fsdp_debug('TransformersModel init before process_group')
         self._try_init_process_group()
+        _twinkle_fsdp_debug('TransformersModel init after process_group')
         super(PreTrainedModel, self).__init__()
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
@@ -173,9 +195,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
+        _twinkle_fsdp_debug(
+            f'TransformersModel strategy decided strategy={strategy} '
+            f'memory_efficient_init={memory_efficient_init}')
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
+            _twinkle_fsdp_debug(f'before HubOperation.download_model model_id={model_id}')
             model_id = HubOperation.download_model(model_id)
+            _twinkle_fsdp_debug(f'after HubOperation.download_model model_id={model_id}')
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         if config is None:
@@ -190,12 +217,20 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
+            _twinkle_fsdp_debug('before model_cls.from_config')
             self.model = model_cls.from_config(self.hf_config, **kwargs)
+            _twinkle_fsdp_debug('after model_cls.from_config')
         else:
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
+            _twinkle_fsdp_debug('before pretrained_load_context')
             with self.strategy.pretrained_load_context():
+                _twinkle_fsdp_debug('before model_cls.from_pretrained')
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
+                _twinkle_fsdp_debug('after model_cls.from_pretrained')
+            _twinkle_fsdp_debug('after pretrained_load_context')
+        _twinkle_fsdp_debug('before gradient_checkpointing_enable')
         self.model.gradient_checkpointing_enable()
+        _twinkle_fsdp_debug('after gradient_checkpointing_enable')
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {
@@ -265,27 +300,40 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
+            _twinkle_fsdp_debug('enter _lazy_wrap_model')
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
+            _twinkle_fsdp_debug(f'_lazy_wrap_model optimizer_groups={len(optimizer_groups)}')
+            _twinkle_fsdp_debug('before _maybe_apply_expert_parallel')
             self._maybe_apply_expert_parallel()
+            _twinkle_fsdp_debug('after _maybe_apply_expert_parallel')
+            _twinkle_fsdp_debug('before _ensure_sp_strategy')
             self._ensure_sp_strategy()
+            _twinkle_fsdp_debug('after _ensure_sp_strategy')
             if self.sp_strategy is not None:
+                _twinkle_fsdp_debug('before sp_strategy.initialize')
                 self.sp_strategy.initialize()
+                _twinkle_fsdp_debug('after sp_strategy.initialize')
 
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
                 assert optimizer is not None
+                _twinkle_fsdp_debug('before strategy.wrap_model with optimizer')
                 self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
+                _twinkle_fsdp_debug('after strategy.wrap_model with optimizer')
                 optimizer_group.optimizer = optimizer
                 self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
+                _twinkle_fsdp_debug('before strategy.wrap_model without optimizer')
                 result = self.strategy.wrap_model(self.model)
+                _twinkle_fsdp_debug('after strategy.wrap_model without optimizer')
                 if isinstance(result, tuple):
                     self.model = result[0]
                 else:
                     self.model = result
             self._model_wrapped = True
+            _twinkle_fsdp_debug('exit _lazy_wrap_model')
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
@@ -355,7 +403,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         temperature = float(kwargs.pop('temperature', 1.0))
         return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
+        _twinkle_fsdp_debug('forward before _lazy_wrap_model')
         self._lazy_wrap_model()
+        _twinkle_fsdp_debug('forward after _lazy_wrap_model')
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.train()
@@ -576,10 +626,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             The output of the model forward.
         """
+        _twinkle_fsdp_debug('forward_backward enter')
         outputs = self.forward(inputs=inputs, **kwargs)
+        _twinkle_fsdp_debug('forward_backward after forward')
         loss = self.calculate_loss(**kwargs)
+        _twinkle_fsdp_debug('forward_backward after calculate_loss')
         outputs['loss'] = loss
         self.backward(**kwargs)
+        _twinkle_fsdp_debug('forward_backward after backward')
         return outputs
 
     # def _sync_after_backward_if_needed(self) -> None:

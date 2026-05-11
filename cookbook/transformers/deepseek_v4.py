@@ -45,19 +45,6 @@ device_mesh = DeviceMesh.from_sizes(
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 
-def barrier_if_distributed(stage: str):
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        debug_print(f'before barrier: {stage}')
-    if dist.get_backend() == 'nccl':
-        dist.barrier(device_ids=[Platform.get_local_rank()])
-    else:
-        dist.barrier()
-    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') == '1':
-        debug_print(f'after barrier: {stage}')
-
-
 def debug_print(message: str):
     if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
         return
@@ -175,8 +162,6 @@ def train():
         f'gradient_checkpointing={GRADIENT_CHECKPOINTING}, '
         f'reshard_after_forward={RESHARD_AFTER_FORWARD}, '
         f'lora_target_modules={LORA_TARGET_MODULES}')
-
-    barrier_if_distributed('before first train step')
 
     best_loss = float('inf')
     for step, batch in enumerate(dataloader):
