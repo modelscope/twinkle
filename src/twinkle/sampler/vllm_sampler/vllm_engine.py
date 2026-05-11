@@ -463,10 +463,24 @@ class VLLMEngine(BaseSamplerEngine):
         await self.engine.reset_prefix_cache()
 
     async def reset_mm_cache(self) -> None:
+        """Clear the multimodal processor cache and profiling dummy data.
+
+        Should be called once after engine initialization to free memory
+        used by dummy inputs during vLLM profiling (dummy run).  Also
+        clears the mm_processor_cache so that subsequent requests are
+        processed fresh.
+        """
         await self.engine.reset_mm_cache()
 
     async def reset_encoder_cache(self) -> None:
-        # introduced in vllm 0.16
+        """Clear the GPU-side vision encoder embedding cache.
+
+        Must be called after model weights are updated (e.g. via
+        ``receive_weights``) to ensure stale embeddings computed with
+        old weights are not reused for the same images.
+
+        Requires vLLM >= 0.16.
+        """
         if not hasattr(self.engine, 'reset_encoder_cache'):
             return
         await self.engine.reset_encoder_cache()
