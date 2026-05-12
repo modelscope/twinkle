@@ -327,6 +327,27 @@ class MultiTurnRollout(Rollout):
                         return safe
         return f'{int(time.time() * 1000)}-{fallback_idx}'
 
+    def _build_trace_record(
+        self,
+        traj: Dict[str, Any],
+        *,
+        idx: int,
+        success: bool,
+    ) -> Dict[str, Any]:
+        """Assemble one trace record. Subclasses override to add fields.
+
+        ``idx`` is the trajectory's position in the rollout output list,
+        so subclasses can correlate the record with any per-call state
+        they stashed on ``self`` during ``__call__``.
+        """
+        return {
+            'trajectory': self._serialize_for_trace(traj),
+            'ground_truth': self._extract_ground_truth(traj),
+            'stop_reason': traj.get('stop_reason'),
+            'truncated': bool(traj.get('truncated')),
+            'success': success,
+        }
+
     def _write_rollout_traces(self, outs: List[Dict[str, Any]]) -> None:
         """Dump one pretty-printed JSON file per selected trajectory.
 
@@ -358,13 +379,8 @@ class MultiTurnRollout(Rollout):
                     except Exception:
                         success = False
 
-                record = {
-                    'trajectory': self._serialize_for_trace(traj),
-                    'ground_truth': self._extract_ground_truth(traj),
-                    'stop_reason': traj.get('stop_reason'),
-                    'truncated': bool(traj.get('truncated')),
-                    'success': success,
-                }
+                record = self._build_trace_record(
+                    traj, idx=idx, success=success)
                 prefix = 'ok' if success else 'fail'
                 fname = f'{prefix}-{self._resolve_traj_id(traj, idx)}.json'
                 path = os.path.join(self.trace_dir, fname)

@@ -8,7 +8,8 @@ from twinkle_agentic.chunker.base import Chunker
 from twinkle_agentic.condenser.base import Condenser
 from twinkle_agentic.data_format import Chunks
 from twinkle.infra import remote_class, remote_function
-from twinkle_agentic.tools.extract_condensed import ExtractCondensed, TOOL_NAME as EXTRACT_TOOL_NAME
+from twinkle_agentic.tools.extract_condensed import (
+    ExtractCondensed, TOOL_NAME as EXTRACT_TOOL_NAME)
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .multi_turn import MultiTurnRollout
 
@@ -87,6 +88,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         if getattr(self.condenser, 'template', None) is None:
             self.condenser.template = template
         self.condenser_kwargs = dict(condenser_kwargs or {})
+        self._trace_block_chunks: Optional[List[Optional[Chunks]]] = None
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
@@ -137,8 +139,18 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         #    ``tool_manager`` would be surprising here (we already built
         #    the list) -- drop it to avoid ambiguity.
         kwargs.pop('tool_manager', None)
-        return super().__call__(
-            compressed_list, tool_manager=tool_managers, **kwargs)
+        if self.trace_dir:
+            self._trace_block_chunks = [
+                canonical[group_first[signatures[i]]]
+                for i in range(len(trajectories))
+            ]
+        else:
+            self._trace_block_chunks = None
+        try:
+            return super().__call__(
+                compressed_list, tool_manager=tool_managers, **kwargs)
+        finally:
+            self._trace_block_chunks = None
 
     @staticmethod
     def _chunk_signature(chunks: Chunks) -> int:
@@ -185,3 +197,63 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
                 chash,
             ))
         return hash(tuple(parts))
+
+    def _build_trace_record(
+        self,
+        traj: Dict[str, Any],
+        *,
+        idx: int,
+        success: bool,
+    ) -> Dict[str, Any]:
+        """Attach a per-block ``{original, compressed}`` map to the record.
+
+        Block enumeration mirrors :meth:`Chunks.to_trajectory` and
+        :class:`ExtractCondensed` -- text chunks with ``raw.condensed=True``,
+        non-empty content and ``role != 'tool'``, numbered from 1. Both
+        the pre-compression text (``original``, from ``raw.original``)
+        and the post-compression text (``compressed``, the chunk content
+        the model saw inside ``<block_N>...</block_N>``) are dumped so
+        the trace alone is enough to audit compression quality.
+        """
+        record = super()._build_trace_record(
+            traj, idx=idx, success=success)
+
+        all_chunks = self._trace_block_chunks
+        if all_chunks is None or idx >= len(all_chunks):
+            return record
+        chunks = all_chunks[idx]
+        if chunks is None:
+            return record
+        record['blocks'] = self._enumerate_blocks(chunks)
+        return record
+
+    @staticmethod
+    def _enumerate_blocks(chunks: Chunks) -> Dict[str, Dict[str, Any]]:
+        """Walk ``chunks`` and emit ``{block_N: {original, compressed}}``.
+
+        ``original`` is ``None`` when the condenser did not attach a
+        ``raw.original`` snapshot; ``compressed`` is always present
+        since it is simply the chunk's post-compression content.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        counter = 0
+        for c in chunks.chunks:
+            if c.get('type') != 'text':
+                continue
+            content = c.get('content')
+            if not isinstance(content, str) or not content:
+                continue
+            if c.get('role') == 'tool':
+                continue
+            raw = c.get('raw')
+            if not (isinstance(raw, dict) and raw.get('condensed')):
+                continue
+            counter += 1
+            original = raw.get('original')
+            out[f'block_{counter}'] = {
+                'original': (
+                    original if isinstance(original, str) and original
+                    else None),
+                'compressed': content,
+            }
+        return out
