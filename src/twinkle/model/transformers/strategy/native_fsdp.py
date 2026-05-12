@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
 from .load_context import fsdp_pretrained_load_context
@@ -30,7 +30,13 @@ class NativeFSDPStrategy:
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
 
     def pretrained_load_context(self):
-        return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
+        # Native FSDP loads pretrained weights via rank0 broadcast during wrap_model().
+        # Avoid Transformers' FSDP loading env here; some versions can hang non-rank0
+        # ranks in from_pretrained barriers.
+        return fsdp_pretrained_load_context(False)
+
+    def use_rank0_pretrained_broadcast(self) -> bool:
+        return self._memory_efficient_init and self.device_mesh is not None
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -59,17 +65,18 @@ class NativeFSDPStrategy:
             if optimizer is not None:
                 _unbind_optimizer_params(optimizer)
 
-            # EP path requires experts on a real device, incompatible with meta-device flow.
-            use_meta = self._memory_efficient_init and not ep_enabled
+            use_meta = self.use_rank0_pretrained_broadcast() and not ep_enabled
 
             original_sd = None
             saved_buffers = None
             if use_meta:
-                original_sd = model.state_dict()
-                saved_buffers = _get_non_persistent_buffers(model)
-                model = model.to(torch.device('meta'))
-                if hasattr(model, 'tie_weights'):
-                    model.tie_weights()
+                is_rank0 = (dist.get_rank() == 0)
+                original_sd = model.state_dict() if is_rank0 else {}
+                saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
+                if is_rank0:
+                    model = model.to(torch.device('meta'))
+                    if hasattr(model, 'tie_weights'):
+                        model.tie_weights()
 
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
@@ -129,14 +136,13 @@ class NativeFSDPStrategy:
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
-                is_rank0 = (dist.get_rank() == 0)
                 _broadcast_sharded_state_dict(
                     model,
-                    original_sd if is_rank0 else {},
+                    original_sd,
                     device_type=device_type,
                 )
                 target_device = torch.device(device_type)
-                _restore_non_persistent_buffers(model, saved_buffers, device=target_device)
+                _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
@@ -322,14 +328,41 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
     return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=('fsdp', ))
 
 
-def _get_decoder_layers(model: nn.Module) -> Optional[nn.ModuleList]:
+def _get_decoder_layers(model: nn.Module) -> Optional[List[nn.Module]]:
+    no_split_modules = _get_no_split_module_names(model)
+    if no_split_modules:
+        layers = [
+            module for module in model.modules()
+            if module is not model and module.__class__.__name__ in no_split_modules
+        ]
+        if layers:
+            return layers
+
     inner_model = getattr(model, 'model', None)
     if inner_model is not None:
         inner_layers = getattr(inner_model, 'layers', None)
         if isinstance(inner_layers, nn.ModuleList):
-            return inner_layers
+            return list(inner_layers)
 
     return None
+
+
+def _get_no_split_module_names(model: nn.Module) -> Set[str]:
+    names = _normalize_no_split_modules(getattr(model, '_no_split_modules', None))
+    if names:
+        return names
+
+    for module in model.modules():
+        names.update(_normalize_no_split_modules(getattr(module, '_no_split_modules', None)))
+    return names
+
+
+def _normalize_no_split_modules(value) -> Set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    return set(value)
 
 
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
