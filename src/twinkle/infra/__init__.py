@@ -63,6 +63,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     if seed is not None:
         _seed = seed
         framework_util.seed_everything(seed, full_determinism)
+
+    # Inform the tracker module of the current distributed rank
+    from twinkle.tracker import set_rank as _set_tracker_rank
+    _set_tracker_rank(Platform.get_rank())
+
     if _mode == 'local':
         if groups is not None:
             _device_group = groups

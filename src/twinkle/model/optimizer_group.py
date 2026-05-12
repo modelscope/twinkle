@@ -80,6 +80,24 @@ class BaseOptimizerGroup:
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())
+
+        # Enrich results with training-loop metrics
+        if self._last_grad_norm:
+            results['grad_norm'] = self._last_grad_norm
+        if status.num_tokens:
+            results['num_tokens'] = status.num_tokens
+
         status.inputs = None
         status.outputs = None
+
+        # Dispatch to registered experiment trackers
+        if is_training:
+            from twinkle.tracker import dispatch, dispatch_hyperparams
+            dispatch(results, step=self.cur_step)
+            # Lazily log hyperparams on the first training metrics call
+            dispatch_hyperparams(
+                {'adapter_name': self.adapter_name,
+                 'gradient_accumulation_steps': self.gradient_accumulation_steps},
+                adapter_name=self.adapter_name)
+
         return results
