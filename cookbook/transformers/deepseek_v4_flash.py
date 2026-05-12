@@ -10,8 +10,11 @@ from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
-
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-flash-bfa16')
+# `deepseek-ai/DeepSeek-V4-Flash` uses mixed FP4/FP8 weights.
+# Convert the checkpoint before training by following:
+# https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md#%E6%A8%A1%E5%9E%8B%E6%9D%83%E9%87%8D%E5%87%86%E5%A4%87
+# Install `transformers==5.8.0` before running this cookbook.
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-Flash')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
@@ -27,10 +30,10 @@ RESHARD_AFTER_FORWARD = os.environ.get('RESHARD_AFTER_FORWARD', '1') == '1'
 GRADIENT_CHECKPOINTING = True
 IGNORE_MISMATCHED_SIZES = False
 LORA_TARGET_MODULES = [
-    'wq_a',
-    'wq_b',
-    'wkv',
-    'wgate',
+    'q_a_proj',
+    'q_b_proj',
+    'kv_proj',
+    'o_b_proj',
     'gate_proj',
     'up_proj',
     'down_proj',
