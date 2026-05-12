@@ -608,10 +608,11 @@ def _broadcast_sharded_state_dict(
                 start = ep_rank * experts_per_rank
                 end = start + experts_per_rank
                 chunk = full_tensor[start:end].contiguous()
+                chunk_gpu = chunk.to(device_type)
                 if rank == 0:
-                    local_tensor.copy_(chunk)
+                    local_tensor.copy_(chunk_gpu)
                 else:
-                    dist.send(chunk, dst=rank)
+                    dist.send(chunk_gpu, dst=rank)
         else:
             dist.recv(local_tensor, src=0)
 
@@ -629,9 +630,12 @@ def _broadcast_sharded_state_dict(
                 raise KeyError(
                     f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict.")
             full_param = full_sd[param_name]
-            full_tensor = full_param.detach().to(device_type)
+            full_tensor = full_param.detach()
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
+            # EP expert params: keep on CPU to avoid OOM; move chunks lazily in _scatter_ep_expert_tensor.
+            if not is_ep_expert_param:
+                full_tensor = full_tensor.to(device_type)
             if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
                 raise RuntimeError(
                     f"Source metadata mismatch for '{param_name}': "
