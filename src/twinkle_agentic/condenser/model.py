@@ -4,18 +4,23 @@
 Pipeline
 --------
 ``Chunks`` → filter eligible chunks → batched ``Sampler.sample(...)`` →
-strip code fences → boundary-aware character-budget clamp → ``Chunks``
-with ``raw.condensed=True`` (so :meth:`Chunks.to_trajectory` later
-wraps them in ``<block_N>``).
+strip code fences → length-vs-original guard → ``Chunks`` with
+``raw.condensed=True`` (so :meth:`Chunks.to_trajectory` later wraps
+them in ``<block_N>``). When the decoded output is empty, degenerate,
+or **not strictly shorter than the original passage**, the chunk is
+left untouched and is NOT marked ``raw.condensed`` — so downstream
+bookkeeping (and the rollout trace) can tell compressed vs.
+passthrough chunks apart.
 
 The compression prompt asks for up to three markdown sections
-(``## Summary / ## Key Facts / ## More``) written in **telegraphic
+(``## Summary / ## More / ## Key Facts``) written in **telegraphic
 style** (no articles / copulas / filler) with per-section length
 hints. Telegraphic output is ~2–3× denser than natural-prose summaries
 and is critical under tight compression ratios. The output is **not**
-parsed — sections pass through verbatim. The character budget is a
-safety net only; the prompt encourages the model to self-shorten and
-drop ``## More`` first, so truncation rarely needs to fire.
+parsed — sections pass through verbatim. The character budget the
+prompt exposes is a soft target only; we never hard-clip the model
+output, we simply discard it (fall back to the original) when it
+fails to compress.
 """
 from __future__ import annotations
 
@@ -31,128 +36,79 @@ if TYPE_CHECKING:  # only used for type hints, keep runtime deps minimal
     from twinkle.sampler.base import Sampler  # noqa: F401
 
 
-_SECTION_SCHEMA = (
-    'Purpose: produce a compact retrieval index. The reader skims it to'
-    ' decide whether — and on what topic — to fetch the full text.'
-    ' Every token must carry unique, non-recoverable information.\n\n'
-    'Output EXACTLY this skeleton — never rename, merge, or add sections;'
-    ' stop immediately after the Topics line:\n\n'
-    '## Summary\n'
-    '<≤{summary_words} words. Subject + full naming hierarchy'
-    ' (family→genus→species; person→role→era; org→function→head).'
-    ' Identity and classification ONLY.\n'
-    ' PROHIBITED in Summary: any number, rank ("7th largest",'
-    ' "most populous", "oldest"), size, area, range, or border fact.'
-    ' Every such item must move to Key Facts, no exceptions.>\n\n'
-    '## Key Facts\n'
-    '<0–{max_bullets} bullets, ≤{bullet_words} words each,'
-    ' non-redundant with Summary. Priority:\n'
-    ' (1) Verbatim numbers copied from the passage'
-    '     ("3287263 km² area", "7516.6 km coastline").\n'
-    ' (2) "N <label>" counts when passage enumerates ≥3 same-kind items.\n'
-    '     COUNTING RULE: before writing N, re-read the passage and count'
-    '     listed entities one by one; write only the verified integer.\n'
-    '     LISTING RULE: never name the entities — write'
-    '     "6 land-border countries", never "borders: Pakistan, China...".\n'
-    ' (3) Short categorical facts not inferable from identity alone.\n'
-    ' DISTINCT-FACT RULE: if the passage states two rankings or counts'
-    ' with different scopes (e.g. "2nd-most populous country" globally vs.'
-    ' "most populous democracy"), emit a separate bullet for each —'
-    ' never conflate or drop either one.\n'
-    ' Skip the bullet rather than pad. Never restate Summary.>\n\n'
-    '## More\n'
-    'Topics: <tag>, <tag>, <tag>, <tag>.\n'
-    'Each tag is a categorical theme answering "what query would send a'
-    ' reader to this source?" (e.g. "demographic scale", "moth taxonomy").'
-    ' Never use entity names as tags. Always emit this line.'
-)
+_SECTION_SCHEMA = """
+你是一个文本压缩助手。你的使用场景是针对一大段文字进行压缩，以便后续模型在需要更多信息的时候展开并阅读原始文字。
 
-_STYLE_TELEGRAPHIC = (
-    'Telegraphic style — maximize signal per character.\n'
-    'Drop: articles (a/an/the), copulas (is/are/was/were),'
-    ' prepositions inferable from context, filler phrases'
-    ' ("it is notable that", "which is", "there are").\n'
-    'Keep: entities, numbers, dates, locations, relations.\n'
-    'Compress: colon for "is/has", comma for "and/which",'
-    ' "~" for approximations, standard SI units.\n'
-    'Never invent facts; copy every number verbatim.'
-    ' End on a complete token.'
-)
+后续模型工作流程：
+阅读你的压缩结果 -> 确定需要的信息是否包含在本block中 -> 是 -> 阅读原文
 
-_WORKED_EXAMPLE = (
-    'Worked examples — replicate this exact format.'
-    ' All outputs end immediately after the Topics line.\n\n'
-    'Example 1 (enumeration → counts):\n'
-    'Input: "Germany is a Central European country. It shares land'
-    ' borders with France, Belgium, Netherlands, Denmark, Poland,'
-    ' Czech Republic, Austria, and Switzerland. Its four largest cities'
-    ' are Berlin, Hamburg, Munich, and Cologne. Berlin, the capital,'
-    ' has about 3.7 million inhabitants."\n'
-    'Output:\n'
-    '## Summary\n'
-    'Germany: Central European country, Berlin capital.\n\n'
-    '## Key Facts\n'
-    '- 8 land-border countries.\n'
-    '- 4 largest cities.\n'
-    '- Capital pop.: ~3.7M.\n\n'
-    '## More\n'
-    'Topics: central-European geography, international borders,'
-    ' major cities, capital demographics.\n\n'
-    'Example 2 (single-species taxonomy → minimal Key Facts):\n'
-    'Input: "Eutrapela is a genus of moth in the Geometridae family.'
-    ' It contains only one species, Eutrapela clemataria, the'
-    ' curve-toothed geometer moth, found in North America from'
-    ' Nova Scotia to Florida, west to Texas and north to Saskatchewan.'
-    ' Habitat: deciduous and mixed woodlands."\n'
-    'Output:\n'
-    '## Summary\n'
-    'Eutrapela: Geometridae moth genus, E. clemataria species.\n\n'
-    '## Key Facts\n'
-    '- 4 range-endpoint regions.\n'
-    '- Deciduous + mixed woodland habitat.\n\n'
-    '## More\n'
-    'Topics: moth taxonomy, species distribution, habitat classification,'
-    ' North American biogeography.\n\n'
-    'Example 3 (scope-distinct rankings + mixed border types'
-    ' — demonstrates COUNTING RULE, LISTING RULE, DISTINCT-FACT RULE):\n'
-    'Input: "Brazil is the largest country in South America and the'
-    ' fifth-largest in the world. It is the most populous'
-    ' Portuguese-speaking country, with 215 million people. Brazil'
-    ' shares land borders with Argentina, Bolivia, Colombia, Guyana,'
-    ' Paraguay, Peru, Suriname, Uruguay, and Venezuela.'
-    ' It has an Atlantic coastline of 7491 km."\n'
-    '-- Counting check: Argentina, Bolivia, Colombia, Guyana, Paraguay,'
-    ' Peru, Suriname, Uruguay, Venezuela = 9. --\n'
-    'Output:\n'
-    '## Summary\n'
-    'Brazil: South American republic, Brasília capital.\n\n'
-    '## Key Facts\n'
-    '- Largest in South America; 5th-largest globally.\n'
-    '- 215M people; most populous Portuguese-speaking country.\n'
-    '- 9 land-border countries.\n'
-    '- 7491 km Atlantic coastline.\n\n'
-    '## More\n'
-    'Topics: South American geography, area rankings,'
-    ' population scale, coastal extent.'
-)
+因此你需要保证你的压缩不会损失原文中的主要信息。
 
-_LENGTH_CONTRACT = (
-    'Length: aim for ~{soft_budget} chars; hard cap {budget} chars.'
-    ' Shorter is better — stop once all signal is captured; never pad.'
-)
+你输出的格式：
 
-DEFAULT_SYSTEM_PROMPT = '\n\n'.join([
-    'You are a precise text compression assistant.',
-    _SECTION_SCHEMA,
-    _STYLE_TELEGRAPHIC,
-])
+```text
+## Summary
+概述在，以及和Query强相关的事实显式给出
 
-DEFAULT_USER_PROMPT_TEMPLATE = '\n\n'.join([
-    'Compress the passage below per the schema.',
-    _WORKED_EXAMPLE,
-    _LENGTH_CONTRACT,
-    'Passage:\n{text}',
-])
+## More
+折叠的目录，需要展开才能看到具体信息
+```
+
+你需要注意：
+1. 使用电报式格式，省略无用文字输出，例如“the”，“always”， “呢”等
+2. 概述部分的事实应当和Query强相关，More中的目录应当能体现出其他信息的目录结构，保证模型阅读More后可以了解有哪些信息可以还原
+3. 压缩后的语种和压缩前的文本应当相同
+
+例子：
+
+原文：
+
+```text
+玛丽·居里（Marie Curie，1867年11月7日—1934年7月4日），原名玛丽亚·斯克沃多夫斯卡，出生于俄属波兰华沙，父母均为教师。因当时波兰女性被禁止接受高等教育，她与姐姐约定轮流资助对方赴海外求学。
+
+1891年，玛丽前往巴黎，入读巴黎大学（索邦大学）。1893年获物理学学士学位，1894年再获数学学士学位，成为该校首位女性物理学讲师。1895年与法国物理学家皮埃尔·居里结婚，两人此后长期共同开展放射性研究。
+
+1898年7月，居里夫人发现新元素钋（Polonium），以其故乡波兰命名；同年12月与皮埃尔共同宣布发现镭（Radium）。她创造了"放射性（radioactivity）"一词，率先证明放射性是原子的固有属性，而非化学反应产物，从根本上重构了人类对物质结构的认识。
+
+1903年，她与皮埃尔·居里及亨利·贝可勒尔共同获得诺贝尔物理学奖，以表彰放射性研究。1911年，她再度单独摘得诺贝尔化学奖，以表彰发现钋与镭。她是史上第一位诺贝尔奖女性得主，也是迄今唯一在两个不同科学领域均获诺贝尔奖的人。1906年皮埃尔因马车事故遇难后，玛丽接任其职位，成为巴黎大学首位女教授。
+
+第一次世界大战期间，居里夫人研发了移动式X射线车，法文称"小居里（Petites Curies）"，共装备约20辆，部署于战场前线。据估计，该装备共为超过100万名伤兵提供了检查服务。
+
+她因长期接触放射性物质导致再生障碍性贫血，于1934年7月4日在法国上萨瓦省帕西逝世，享年66岁。其研究笔记至今仍具高度放射性，存放于铅盒中，研究人员查阅时须穿戴防护服。
+```
+
+压缩后：
+```text
+## Summary
+玛丽·居里（Marie Curie）：法籍波兰裔物理/化学家，放射性研究奠基人，巴黎大学首位女教授。
+- 诺贝尔奖×2（物理+化学）首位女性得主，唯一双领域得主
+- 发现钋+镭；创"放射性"概念；证其为原子固有属性
+
+## More
+- 出生地·逝世地·享年·死因
+- 学位年份·校内首位记录×2
+- 元素命名来源·合作者·完整时间线
+- 诺奖各届年份·联颁合作者·颁奖背景
+- 装备名·部署规模·救治数量
+- 笔记放射性·保存方式·查阅条件
+```
+
+现在开始：
+"""
+
+
+DEFAULT_SYSTEM_PROMPT = _SECTION_SCHEMA
+
+DEFAULT_USER_PROMPT_TEMPLATE = (
+    '下游模型将基于压缩块回答以下问题。禁止为迎合 Query 而编造原文中不存在的事实。\n\n'
+    '禁止编造原文中不存在的信息。\n\n'
+    '## Query\n'
+    '{query}\n\n'
+    '注意：你不需要回答上述问题，你的任务是忠实地压缩\n\n'
+    '## 长度目标\n'
+    '约 {soft_budget} 字符，上限 {budget}。\n\n'
+    '## 原文（Passage）\n'
+    '{text}')
 
 
 # A (chunk_index, chunk, char_budget) triple marking one compression job.
@@ -167,8 +123,12 @@ class ModelCondenser(Condenser):
 
     Args:
         sampler: Configured :class:`Sampler` with a template set.
-        compression_ratio: Target factor (> 1). Output length is clamped
-            to ``ceil(len(input) / compression_ratio)`` per chunk.
+        compression_ratio: Target factor (> 1). Used only to derive a
+            soft character budget passed into the prompt and to size
+            ``SamplingParams.max_tokens``. Model output is NOT hard
+            truncated; a chunk whose decoded output is not strictly
+            shorter than the original passage is left unchanged (and
+            not flagged ``raw.condensed``).
         sampling_params: Override for per-call sampling; when ``None`` a
             greedy config is derived from the max budget in the batch.
         system_prompt: Override for the system prompt. May contain
@@ -176,22 +136,25 @@ class ModelCondenser(Condenser):
             (all substituted per-chunk with budget-scaled word/bullet
             caps).
         user_prompt_template: Override the user prompt. Must contain
-            ``{budget}`` and ``{text}``. ``{soft_budget}``,
-            ``{summary_words}``, ``{max_bullets}`` and
-            ``{bullet_words}`` are optional. Scaling formulas:
+            ``{budget}`` and ``{text}``. ``{query}``,
+            ``{soft_budget}``, ``{summary_words}``, ``{max_bullets}``
+            and ``{bullet_words}`` are optional. ``{query}`` is
+            replaced with the trajectory's question (matched via
+            ``skip_pattern``) so the model knows which facts to keep
+            verbatim; jobs without a detected query get a neutral
+            placeholder. Scaling formulas:
             ``soft_budget = int(budget*0.85)``;
             ``summary_words = clamp(budget // 15, 8, 25)``;
             ``max_bullets = clamp(budget // 75, 2, 5)``;
             ``bullet_words = clamp(budget // 25, 6, 12)``.
         min_chars: Pre-filter; chunks shorter than this pass through.
-        min_budget_chars: Minimum character budget for any compression.
-            When ``ceil(len / compression_ratio)`` falls below this,
-            the budget is raised to this floor so short-but-eligible
-            passages keep room for all three sections. Default ``250``
-            is large enough that ~200-char passages pass through
-            almost unclamped, preserving Summary + Key Facts + More;
-            for longer passages the ratio still dominates. Pass ``1``
-            to disable the floor and enforce strict ratio everywhere.
+        min_budget_chars: Floor for the soft character budget exposed
+            to the prompt. When ``ceil(len / compression_ratio)`` falls
+            below this, the budget is raised to this floor so short
+            passages keep room for all three sections in the model's
+            plan. Since the condenser no longer hard-clips output,
+            this only influences prompt wording and sampling token
+            limits; pass ``1`` to use the raw ratio everywhere.
         template: Optional :class:`Template`. When provided, its
             ``tokenizer.all_special_tokens`` are stripped from every
             decoded response before length-clamping, preventing
@@ -230,11 +193,6 @@ class ModelCondenser(Condenser):
         >>> compressed = cond(chunks)
     """
 
-    # Back-compat aliases so external callers can still override at the
-    # class level.
-    DEFAULT_SYSTEM_PROMPT: str = DEFAULT_SYSTEM_PROMPT
-    DEFAULT_USER_PROMPT_TEMPLATE: str = DEFAULT_USER_PROMPT_TEMPLATE
-
     def __init__(
         self,
         sampler: 'Sampler',
@@ -265,7 +223,7 @@ class ModelCondenser(Condenser):
         if batch_size is not None and batch_size <= 0:
             raise ValueError(f'batch_size must be >= 1, got {batch_size}')
 
-        tpl = user_prompt_template or self.DEFAULT_USER_PROMPT_TEMPLATE
+        tpl = user_prompt_template or DEFAULT_USER_PROMPT_TEMPLATE
         if '{budget}' not in tpl or '{text}' not in tpl:
             raise ValueError(
                 'user_prompt_template must contain both {budget} and {text}')
@@ -273,7 +231,7 @@ class ModelCondenser(Condenser):
         self.sampler = sampler
         self.compression_ratio = float(compression_ratio)
         self.sampling_params = sampling_params
-        self.system_prompt = system_prompt or self.DEFAULT_SYSTEM_PROMPT
+        self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.user_prompt_template = tpl
         self.min_chars = min_chars
         self.min_budget_chars = int(min_budget_chars)
@@ -294,34 +252,59 @@ class ModelCondenser(Condenser):
     # ------------------------------------------------------------------
     def __call__(self, chunks: Chunks, **_kwargs: Any) -> Chunks:
         out: List[Chunk] = list(chunks.chunks)
-        jobs = self._collect_jobs(out)
-        if not jobs:
+        items = self._collect_jobs(out)
+        if not items:
             return Chunks(chunks=out)
 
-        batch_size = self.batch_size or len(jobs)
-        for start in range(0, len(jobs), batch_size):
-            batch = jobs[start:start + batch_size]
-            responses = self._sample_batch(batch)
-            for (idx, chunk, budget), resp in zip(batch, responses):
+        batch_size = self.batch_size or len(items)
+        for start in range(0, len(items), batch_size):
+            sub = items[start:start + batch_size]
+            batch = [job for job, _q in sub]
+            queries = [q for _job, q in sub]
+            responses = self._sample_batch(batch, queries=queries)
+            for (idx, chunk, _budget), resp in zip(batch, responses):
                 text = self._postprocess(
-                    _decoded(resp), budget, chunk['content'])
+                    _decoded(resp), chunk['content'])
+                if text is None:
+                    continue
                 out[idx] = _mark_condensed(chunk, text)
         return Chunks(chunks=out)
 
     # ------------------------------------------------------------------
     # eligibility + job collection
     # ------------------------------------------------------------------
-    def _collect_jobs(self, chunks: Sequence[Chunk]) -> List[_Job]:
-        jobs: List[_Job] = []
+    def _collect_jobs(
+        self, chunks: Sequence[Chunk],
+    ) -> List[Tuple[_Job, Optional[str]]]:
+        """Collect compression jobs, tagging each with its trajectory's query.
+
+        Walks ``chunks`` in order and maintains a rolling
+        ``current_query`` state. Every chunk whose content matches
+        ``skip_re`` (typically the ``Question:`` line) updates the
+        state; every subsequent condense-eligible chunk picks up the
+        most recent query. Because the chunker emits each
+        trajectory's question chunk before its passages, this walk
+        correctly partitions queries per-trajectory even when
+        ``MultiTurnCondenseRollout`` merges multiple trajectories
+        into a single chunk list — A's passages only ever see A's
+        question, B's only B's.
+        """
+        items: List[Tuple[_Job, Optional[str]]] = []
+        current_query: Optional[str] = None
         for i, c in enumerate(chunks):
+            content = c.get('content')
+            if (self.skip_re is not None
+                    and c.get('type') == 'text'
+                    and isinstance(content, str)
+                    and self.skip_re.search(content)):
+                current_query = content
             if not self._should_condense(c):
                 continue
-            content = c['content']
             budget = max(
                 self.min_budget_chars,
                 math.ceil(len(content) / self.compression_ratio))
-            jobs.append((i, c, max(1, budget)))
-        return jobs
+            items.append(((i, c, max(1, budget)), current_query))
+        return items
 
     def _should_condense(self, chunk: Chunk) -> bool:
         if chunk.get('type') != 'text':
@@ -348,17 +331,31 @@ class ModelCondenser(Condenser):
     # ------------------------------------------------------------------
     # batched sampling
     # ------------------------------------------------------------------
-    def _sample_batch(self, batch: Sequence[_Job]) -> List[Any]:
+    def _sample_batch(
+        self,
+        batch: Sequence[_Job],
+        *,
+        queries: Sequence[Optional[str]] = (),
+    ) -> List[Any]:
         """Dispatch one batch to the sampler, padded to ``batch_size``.
 
         Distributed samplers slice inputs across DP workers and can
         mis-behave when the final batch is smaller than ``batch_size``;
         we pad with a duplicate of the last trajectory and trim the
         matching extra responses here.
+
+        ``queries`` is aligned 1:1 with ``batch``; each per-job query
+        is injected into the user prompt's ``{query}`` slot. When
+        empty or ``None`` at an index, a neutral placeholder is used.
         """
+        qs: List[Optional[str]] = list(queries) if queries else [None] * len(batch)
+        if len(qs) != len(batch):
+            raise ValueError(
+                f'queries length ({len(qs)}) must match batch length '
+                f'({len(batch)})')
         trajectories = [
-            self._build_trajectory(chunk['content'], budget)
-            for _, chunk, budget in batch
+            self._build_trajectory(chunk['content'], budget, query=q)
+            for (_, chunk, budget), q in zip(batch, qs)
         ]
         actual = len(trajectories)
         device_mesh = getattr(self.sampler, 'device_mesh', None)
@@ -377,7 +374,9 @@ class ModelCondenser(Condenser):
         # padding responses so downstream ``zip`` aligns with ``batch``.
         return list(responses)[:actual]
 
-    def _build_trajectory(self, text: str, budget: int) -> 'Trajectory':
+    def _build_trajectory(
+        self, text: str, budget: int, *, query: Optional[str] = None,
+    ) -> 'Trajectory':
         soft_budget = max(1, int(budget * 0.85))
         summary_words = max(8, min(25, budget // 15))
         max_bullets = max(2, min(5, budget // 75))
@@ -395,6 +394,15 @@ class ModelCondenser(Condenser):
             system = system.replace(k, v)
             user = user.replace(k, v)
         user = user.replace('{text}', text)
+        # Query broadcast: each job gets its own trajectory's question
+        # (collected via ``_collect_jobs`` walking state). Empty/None
+        # collapses to a neutral placeholder so the prompt stays
+        # well-formed and we never leak another trajectory's query.
+        q_text = (
+            query.strip()
+            if isinstance(query, str) and query and query.strip()
+            else '(no explicit query; compress by general salience)')
+        user = user.replace('{query}', q_text)
         return {  # type: ignore[return-value]
             'messages': [
                 {'role': 'system', 'content': system},
@@ -413,22 +421,23 @@ class ModelCondenser(Condenser):
     # ------------------------------------------------------------------
     # postprocess
     # ------------------------------------------------------------------
-    def _postprocess(self, raw: str, budget: int, original: str) -> str:
-        """Strip code fences + tokenizer special tokens, clamp to
-        ``budget``, guard against degenerate output.
+    def _postprocess(self, raw: str, original: str) -> Optional[str]:
+        """Return compressed text, or ``None`` to signal passthrough.
 
-        When the clamp leaves only markdown markers (e.g. ``'##'`` at an
-        extreme budget), fall back to clamping the original passage so
-        callers never see empty or meaningless markers.
+        ``None`` is returned when the decoded output is empty,
+        degenerate (markdown markers only, no alphanumerics), or its
+        character length is **not strictly shorter** than ``original``
+        — in which case the model failed to produce a useful
+        compression and the caller should keep the original passage
+        verbatim (no ``<block_N>`` wrap, not marked ``raw.condensed``).
         """
         text = _strip_special_tokens(
             _strip_code_fences(raw), self._get_special_tokens()).strip()
-        if not text:
-            return _clamp_to_budget(original, budget)
-        clamped = _clamp_to_budget(text, budget) if len(text) > budget else text
-        if not _has_alnum(clamped):
-            return _clamp_to_budget(original, budget)
-        return clamped
+        if not text or not _has_alnum(text):
+            return None
+        if len(text) >= len(original):
+            return None
+        return text
 
     def _get_special_tokens(self) -> Tuple[str, ...]:
         """Return protocol tokens to strip from decoded output (cached).
@@ -474,8 +483,6 @@ class ModelCondenser(Condenser):
 # pure helpers
 # ---------------------------------------------------------------------------
 _CODE_FENCE_RE = re.compile(r'^```[a-zA-Z]*\s*\n(.*?)\n```\s*$', re.DOTALL)
-_SENT_PUNCT = ('.', '!', '?', '。', '！', '？')
-_WS_TAILS = (' ', '\n', '\t')
 
 
 def _decoded(response: Any) -> str:
@@ -526,71 +533,7 @@ def _strip_special_tokens(text: str, tokens: Sequence[str]) -> str:
 def _has_alnum(text: str) -> bool:
     """True iff ``text`` contains at least one alphanumeric character.
 
-    Used to detect degenerate clamp outputs like ``'##'`` or ``'- '``
+    Used to detect degenerate model outputs like ``'##'`` or ``'- '``
     that are pure markdown markers with no actual words.
     """
     return any(ch.isalnum() for ch in text)
-
-
-def _clamp_to_budget(text: str, budget: int) -> str:
-    """Clamp ``text`` to at most ``budget`` chars on the cleanest boundary.
-
-    Preference order (each candidate must land past ``budget // 2``):
-
-      1. Sentence punctuation (``. ! ? 。 ！ ？``) followed by whitespace
-         — either inside the cut, OR at the very end of the cut when
-         the next char in the full text is whitespace / EOT. This
-         excludes mid-token cuts like the ``.`` in ``1.2`` / ``e.g.``.
-      2. Newline — paragraph / bullet boundary.
-      3. Plain space — word boundary fallback.
-      4. Hard cut when none of the above fire far enough in.
-    """
-    if budget <= 0:
-        return ''
-    if len(text) <= budget:
-        return text
-    cut = text[:budget]
-    min_keep = budget // 2
-
-    sent_end = _find_sentence_end(cut, text, budget, min_keep)
-    if sent_end >= 0:
-        return cut[:sent_end].rstrip()
-
-    nl = cut.rfind('\n')
-    if nl >= min_keep:
-        return cut[:nl].rstrip()
-
-    sp = cut.rfind(' ')
-    if sp >= min_keep:
-        return cut[:sp].rstrip()
-
-    return cut.rstrip() or cut
-
-
-def _find_sentence_end(
-        cut: str, text: str, budget: int, min_keep: int) -> int:
-    """Position just past a sentence-ending punct, or ``-1`` if none.
-
-    A sentence end is a ``_SENT_PUNCT`` char followed by whitespace. The
-    whitespace may be inside ``cut`` OR be the first char after the cut
-    (``text[budget]``), so a period at the very end of ``cut`` is
-    accepted only when the text continues with whitespace / EOT and
-    never mid-token.
-    """
-    best = -1
-    # Case 1: "<punct><ws>" inside cut.
-    for punct in _SENT_PUNCT:
-        for ws in _WS_TAILS:
-            idx = cut.rfind(punct + ws)
-            if idx >= min_keep and idx + len(punct) > best:
-                best = idx + len(punct)
-    # Case 2: "<punct>" at end of cut, next char is ws or EOT.
-    next_char = text[budget:budget + 1]
-    if next_char == '' or next_char in _WS_TAILS:
-        for punct in _SENT_PUNCT:
-            if cut.endswith(punct):
-                pos = len(cut) - len(punct)
-                if pos >= min_keep and pos + len(punct) > best:
-                    best = pos + len(punct)
-                break
-    return best

@@ -427,7 +427,7 @@ def main():
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     chunker = NativeChunker(
         chunk_size=CHUNK_SIZE,
-        passage_boundary_re=r'Context:',
+        passage_boundary_re=r'\[\d+\]',
     )
     condenser = ModelCondenser(
         sampler=sampler,

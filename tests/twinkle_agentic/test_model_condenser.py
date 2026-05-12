@@ -26,7 +26,6 @@ from twinkle.data_format.sampling import (
 
 from twinkle_agentic.condenser.model import (
     ModelCondenser,
-    _clamp_to_budget,
     _strip_code_fences,
 )
 from twinkle_agentic.data_format import Chunks
@@ -142,56 +141,50 @@ def test_strip_code_fences():
     assert _strip_code_fences(plain) == plain
 
 
-def test_clamp_to_budget_word_boundary():
-    assert _clamp_to_budget('hello world foo', 12) == 'hello world'
-    # Budget larger than text → untouched.
-    assert _clamp_to_budget('short', 100) == 'short'
-    # Budget 0 → empty.
-    assert _clamp_to_budget('anything', 0) == ''
-
-
 # ---------------------------------------------------------------------------
-# strict compression-ratio enforcement
+# compression-vs-passthrough semantics (no hard clamp anymore)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize('ratio', [2.0, 3.0, 4.0, 6.0, 10.0])
-def test_compression_ratio_is_strictly_enforced(ratio):
+def test_compressed_output_is_strictly_shorter_than_original(ratio):
     cond = ModelCondenser(
         _MockSampler(_well_formed_markdown),
         compression_ratio=ratio,
         min_chars=50,
-        min_budget_chars=1,  # opt out of floor to test pure ratio invariant
+        min_budget_chars=1,
     )
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / ratio)
-    assert len(out) <= budget, (
-        f'ratio={ratio}: got len={len(out)} > budget={budget}')
-    assert out, 'output must be non-empty'
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    if chunk.get('raw', {}).get('condensed'):
+        # When accepted, output MUST be strictly shorter than the input.
+        assert len(chunk['content']) < len(LONG_PASSAGE), (
+            f'ratio={ratio}: condensed output len={len(chunk["content"])}'
+            f' must be < original len={len(LONG_PASSAGE)}')
+    else:
+        # Passthrough: chunk must be byte-identical to the input.
+        assert chunk['content'] == LONG_PASSAGE
 
 
-def test_misbehaving_model_output_is_still_clamped():
-    """Even when the LLM exceeds the budget, output must fit."""
+def test_overlong_model_output_falls_back_to_original():
+    """When the LLM output is not strictly shorter than the input,
+    the original passage is kept verbatim and NOT marked condensed."""
     overflow = lambda _p: _well_formed_markdown('') * 5  # noqa: E731
     cond = ModelCondenser(
         _MockSampler(overflow), compression_ratio=3.0, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 3.0)
-    assert len(out) <= budget
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    assert chunk['content'] == LONG_PASSAGE
+    assert not (chunk.get('raw') or {}).get('condensed')
 
 
-def test_extreme_ratio_still_bounded_and_non_empty():
+def test_equal_length_model_output_falls_back_to_original():
+    """Output equal in length to the input is treated as non-useful
+    compression and triggers passthrough."""
+    same_length = lambda p: 'X' * len(p)  # noqa: E731
     cond = ModelCondenser(
-        _MockSampler(_well_formed_markdown),
-        compression_ratio=200.0, min_chars=50,
+        _MockSampler(same_length), compression_ratio=4.0, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 200.0)
-    assert 0 < len(out) <= budget
-    # Regression: at a budget too small to hold even "## Summary\n", the
-    # condenser must fall back to a non-empty *body* substring instead of
-    # returning dangling hash marks like "##" or "## ".
-    assert out.strip('#').strip(), (
-        f'extreme-ratio output degenerated to markdown markers: {out!r}')
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    assert chunk['content'] == LONG_PASSAGE
+    assert not (chunk.get('raw') or {}).get('condensed')
 
 
 # ---------------------------------------------------------------------------
@@ -209,55 +202,47 @@ def test_well_formed_output_keeps_three_sections_at_generous_budget():
     assert 'Nolan' in out or 'Inception' in out
 
 
-def test_tight_budget_drops_more_first():
-    # Craft a response where dropping 'More' yields <=130 chars but keeping
-    # all three is over budget.
+def test_tight_ratio_still_accepts_shorter_output():
+    """At a tight ratio, whatever the LLM produces is accepted as long
+    as it is strictly shorter than the input; we no longer clamp it."""
     def responder(_p):
         return (
             '## Summary\nA short sentence.\n\n'
-            '## Key Facts\n- Fact one here.\n- Fact two here.\n\n'
-            '## More\n' + ('x, ' * 60)  # ~180 chars
+            '## More\nTopics: x, y, z.\n\n'
+            '## Key Facts\n- Fact one here.\n- Fact two here.'
         )
     cond = ModelCondenser(
         _MockSampler(responder), compression_ratio=3.5, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 3.5)
-    assert len(out) <= budget
-    assert '## Summary' in out
-    assert '## More' not in out
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    assert chunk['raw']['condensed'] is True
+    assert len(chunk['content']) < len(LONG_PASSAGE)
+    assert '## Summary' in chunk['content']
 
 
-def test_very_tight_budget_keeps_only_summary():
-    def responder(_p):
-        return (
-            '## Summary\nA short sentence.\n\n'
-            '## Key Facts\n- Fact one.\n- Fact two.\n- Fact three.\n\n'
-            '## More\n' + ('kw, ' * 80)
-        )
+def test_degenerate_output_falls_back_to_original():
+    """When model output has NO alphanumerics (pure markdown markers),
+    the condenser falls back to the original passage verbatim."""
+    markers_only = lambda _p: '## \n- \n##'  # noqa: E731
     cond = ModelCondenser(
-        _MockSampler(responder), compression_ratio=10.0, min_chars=50,
+        _MockSampler(markers_only), compression_ratio=4.0, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 10.0)
-    assert len(out) <= budget
-    # Summary should survive, the other two slots must not.
-    assert '## Summary' in out
-    assert '## Key Facts' not in out
-    assert '## More' not in out
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    assert chunk['content'] == LONG_PASSAGE
+    assert not (chunk.get('raw') or {}).get('condensed')
 
 
-def test_garbled_model_output_fallback_is_clamped():
-    """When the model response has NO recognizable sections, fall back
-    to clamped raw text (never empty)."""
-    garbled = lambda _p: 'this is some unstructured blob ' * 10  # noqa: E731
+def test_garbled_but_shorter_output_is_accepted():
+    """If the model emits unstructured but strictly shorter text, we
+    take it verbatim — the condenser is not a format validator."""
+    garbled = lambda _p: 'this is some unstructured blob'  # noqa: E731
     cond = ModelCondenser(
         _MockSampler(garbled), compression_ratio=4.0, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 4.0)
-    assert 0 < len(out) <= budget
-    assert 'unstructured' in out
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    assert chunk['raw']['condensed'] is True
+    assert 'unstructured' in chunk['content']
+    assert len(chunk['content']) < len(LONG_PASSAGE)
 
 
 def test_code_fenced_output_is_unwrapped():
@@ -446,20 +431,23 @@ def test_custom_sampling_params_is_forwarded():
 # ---------------------------------------------------------------------------
 # semantic preservation (mock-level sanity)
 # ---------------------------------------------------------------------------
-def test_semantic_preservation_against_budget():
-    """Under a moderate ratio, important entities appear in the output."""
+def test_semantic_preservation_when_compressed():
+    """When the condenser accepts the model output, important entities
+    survive in some form."""
     cond = ModelCondenser(
         _MockSampler(_well_formed_markdown),
         compression_ratio=2.0, min_chars=50,
         min_budget_chars=1)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 2.0)
-    assert len(out) <= budget
-    # At ratio=2.0 we should still carry key entities.
-    hits = sum(1 for ent in (
-        'Nolan', 'Inception', 'Leonardo DiCaprio', 'London'
-    ) if ent in out)
-    assert hits >= 2
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    out = chunk['content']
+    if chunk.get('raw', {}).get('condensed'):
+        hits = sum(1 for ent in (
+            'Nolan', 'Inception', 'Leonardo DiCaprio', 'London'
+        ) if ent in out)
+        assert hits >= 2
+    else:
+        # Passthrough branch: the original must be returned verbatim.
+        assert out == LONG_PASSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -496,14 +484,17 @@ def test_integration_real_qwen_sampler_end_to_end():
         sampler.set_template('default')
 
     cond = ModelCondenser(sampler, compression_ratio=4.0, min_chars=50)
-    out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
-    budget = math.ceil(len(LONG_PASSAGE) / 4.0)
+    chunk = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]
+    out = chunk['content']
 
-    # Strict compression ratio holds end-to-end.
-    assert 0 < len(out) <= budget, f'len(out)={len(out)} budget={budget}'
-    # At least one key entity should survive.
-    assert any(
-        ent in out for ent in ('Nolan', 'Inception', 'London', 'Leonardo'))
+    # Either the model produced a strictly shorter compression (most
+    # common), or the chunk is passed through verbatim.
+    if chunk.get('raw', {}).get('condensed'):
+        assert 0 < len(out) < len(LONG_PASSAGE)
+        assert any(
+            ent in out for ent in ('Nolan', 'Inception', 'London', 'Leonardo'))
+    else:
+        assert out == LONG_PASSAGE
 
 
 # ---------------------------------------------------------------------------

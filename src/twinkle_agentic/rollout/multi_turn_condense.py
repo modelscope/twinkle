@@ -205,15 +205,27 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         idx: int,
         success: bool,
     ) -> Dict[str, Any]:
-        """Attach a per-block ``{original, compressed}`` map to the record.
+        """Attach per-block and per-passthrough-passage maps to the record.
 
-        Block enumeration mirrors :meth:`Chunks.to_trajectory` and
-        :class:`ExtractCondensed` -- text chunks with ``raw.condensed=True``,
-        non-empty content and ``role != 'tool'``, numbered from 1. Both
-        the pre-compression text (``original``, from ``raw.original``)
-        and the post-compression text (``compressed``, the chunk content
-        the model saw inside ``<block_N>...</block_N>``) are dumped so
-        the trace alone is enough to audit compression quality.
+        Two complementary maps are dumped so the trace alone is enough
+        to audit compression quality and compression coverage:
+
+        * ``blocks`` — numbered ``block_N`` entries mirror
+          :meth:`Chunks.to_trajectory` and :class:`ExtractCondensed`:
+          text chunks with ``raw.condensed=True``, non-empty content
+          and ``role != 'tool'``, numbered from 1. Each entry carries
+          the pre-compression text (``original``, from
+          ``raw.original``) and the post-compression text
+          (``compressed``, the chunk content the model saw inside
+          ``<block_N>...</block_N>``).
+        * ``passages`` — numbered ``passage_M`` entries for text chunks
+          from the first user message (role neither ``'system'`` nor
+          ``'tool'``) that were NOT compressed — either because they
+          failed the eligibility filter (too short, wrong role,
+          ``skip_pattern`` matched, ...) or because the condenser's
+          output was not strictly shorter than the original and fell
+          back to passthrough. This lets the trace show the compressed
+          vs. passthrough ratio per rollout.
         """
         record = super()._build_trace_record(
             traj, idx=idx, success=success)
@@ -224,36 +236,58 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         chunks = all_chunks[idx]
         if chunks is None:
             return record
-        record['blocks'] = self._enumerate_blocks(chunks)
+        blocks, passages = self._enumerate_blocks(chunks)
+        record['blocks'] = blocks
+        record['passages'] = passages
         return record
 
     @staticmethod
-    def _enumerate_blocks(chunks: Chunks) -> Dict[str, Dict[str, Any]]:
-        """Walk ``chunks`` and emit ``{block_N: {original, compressed}}``.
+    def _enumerate_blocks(
+        chunks: Chunks,
+    ) -> 'tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]':
+        """Walk ``chunks`` and emit ``(blocks, passages)`` maps.
 
-        ``original`` is ``None`` when the condenser did not attach a
-        ``raw.original`` snapshot; ``compressed`` is always present
-        since it is simply the chunk's post-compression content.
+        * ``blocks`` → ``{block_N: {original, compressed}}`` for every
+          text chunk flagged ``raw.condensed=True`` (``role != 'tool'``).
+          ``original`` is ``None`` when the condenser did not attach a
+          ``raw.original`` snapshot; ``compressed`` is always present
+          since it is simply the chunk's post-compression content.
+        * ``passages`` → ``{passage_M: {content}}`` for every text chunk
+          from the first user message (``role not in {'system', 'tool'}``)
+          that was NOT flagged ``raw.condensed`` — i.e. chunks that
+          were either filtered out before compression or fell back to
+          passthrough because the model output was not strictly shorter.
+          Lets a reader of the trace see the compressed / passthrough
+          split without having to diff the raw trajectory.
         """
-        out: Dict[str, Dict[str, Any]] = {}
-        counter = 0
+        blocks: Dict[str, Dict[str, Any]] = {}
+        passages: Dict[str, Dict[str, Any]] = {}
+        block_counter = 0
+        passage_counter = 0
         for c in chunks.chunks:
             if c.get('type') != 'text':
                 continue
             content = c.get('content')
             if not isinstance(content, str) or not content:
                 continue
-            if c.get('role') == 'tool':
+            role = c.get('role')
+            if role == 'tool':
                 continue
             raw = c.get('raw')
-            if not (isinstance(raw, dict) and raw.get('condensed')):
-                continue
-            counter += 1
-            original = raw.get('original')
-            out[f'block_{counter}'] = {
-                'original': (
-                    original if isinstance(original, str) and original
-                    else None),
-                'compressed': content,
-            }
-        return out
+            is_condensed = (
+                isinstance(raw, dict) and bool(raw.get('condensed')))
+            if is_condensed:
+                block_counter += 1
+                original = raw.get('original') if isinstance(raw, dict) else None
+                blocks[f'block_{block_counter}'] = {
+                    'original': (
+                        original if isinstance(original, str) and original
+                        else None),
+                    'compressed': content,
+                }
+            elif role != 'system':
+                passage_counter += 1
+                passages[f'passage_{passage_counter}'] = {
+                    'content': content,
+                }
+        return blocks, passages
