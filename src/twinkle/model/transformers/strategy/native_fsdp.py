@@ -135,11 +135,7 @@ class NativeFSDPStrategy:
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
-                _broadcast_sharded_state_dict(
-                    model,
-                    original_sd,
-                    device_type=device_type,
-                )
+                _load_rank0_full_state_dict(model, original_sd or {})
                 target_device = torch.device(device_type)
                 _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
                 if hasattr(model, 'tie_weights'):
@@ -505,67 +501,18 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
     return optimizer
 
 
-def _broadcast_sharded_state_dict(
-    model: nn.Module,
-    full_sd: dict,
-    device_type: str = 'cuda',
-) -> None:
-    """Distribute rank0 full state dict into local FSDP2 shards."""
-    from torch.distributed.tensor import DTensor, distribute_tensor
+def _load_rank0_full_state_dict(model: nn.Module, full_sd: dict) -> None:
+    """Load rank0 full weights into a sharded FSDP2 model via DCP broadcast."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    meta_sharded_sd = model.state_dict()
-    sharded_sd = {}
-    is_rank0 = (dist.get_rank() == 0)
-    source_metadata = None
-    if is_rank0:
-        source_metadata = {
-            name: (tuple(tensor.shape), tensor.dtype)
-            for name, tensor in full_sd.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
-        }
-    metadata_holder = [source_metadata]
-    dist.broadcast_object_list(metadata_holder, src=0)
-    source_metadata = metadata_holder[0] or {}
-
-    for param_name, sharded_param in meta_sharded_sd.items():
-        shape = sharded_param.size()
-        if param_name not in source_metadata:
-            raise KeyError(f"Missing source metadata for parameter '{param_name}'.")
-        source_shape, source_dtype = source_metadata[param_name]
-
-        if is_rank0:
-            if param_name not in full_sd:
-                raise KeyError(
-                    f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict.")
-            full_param = full_sd[param_name]
-            full_tensor = full_param.detach()
-            if isinstance(full_tensor, DTensor):
-                full_tensor = full_tensor.to_local()
-            full_tensor = full_tensor.to(device_type)
-            if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
-                raise RuntimeError(f"Source metadata mismatch for '{param_name}': "
-                                   f'actual shape={tuple(full_tensor.shape)} dtype={full_tensor.dtype}, '
-                                   f'expected shape={source_shape} dtype={source_dtype}.')
-        else:
-            full_tensor = torch.empty(source_shape, device=device_type, dtype=source_dtype)
-
-        if tuple(shape) != tuple(source_shape):
-            raise RuntimeError(f"Parameter '{param_name}' shape mismatch before broadcast: "
-                               f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
-        if isinstance(sharded_param, DTensor):
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                sharded_param.device_mesh,
-                sharded_param.placements,
-            )
-        else:
-            dist.broadcast(full_tensor, src=0)
-            sharded_tensor = full_tensor
-        torch_util.synchronize()
-        del full_tensor
-
-        sharded_sd[param_name] = sharded_tensor
-
-    model.load_state_dict(sharded_sd, assign=True)
+    set_model_state_dict(
+        model=model,
+        model_state_dict=full_sd,
+        options=StateDictOptions(
+            full_state_dict=True,
+            broadcast_from_rank0=True,
+        ),
+    )
 
 
 def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
