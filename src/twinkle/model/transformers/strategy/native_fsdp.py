@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 import torch.distributed as dist
-import os
-import time
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
@@ -13,21 +11,6 @@ from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
-
-
-def _native_fsdp_debug(message: str) -> None:
-    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    local_rank = os.environ.get('LOCAL_RANK', '?')
-    text = f'[twinkle-native-fsdp-debug][time={time.time():.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
-    print(text, flush=True)
-    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        with open(os.path.join(debug_dir, f'native_fsdp_rank{rank}.log'), 'a', encoding='utf-8') as f:
-            f.write(text + '\n')
 
 
 class NativeFSDPStrategy:
@@ -94,11 +77,8 @@ class NativeFSDPStrategy:
             if use_meta:
                 is_rank0 = (dist.get_rank() == 0)
                 if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
-                    _native_fsdp_debug(
-                        f'use captured pre-EP full state_dict keys={len(self._rank0_pre_ep_full_state_dict)}')
                     original_sd = self._rank0_pre_ep_full_state_dict if is_rank0 else {}
                 else:
-                    _native_fsdp_debug('use current model state_dict as rank0 broadcast source')
                     original_sd = model.state_dict() if is_rank0 else {}
                 saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
                 if is_rank0:
@@ -585,6 +565,10 @@ def _broadcast_sharded_state_dict(
                     mesh_dim,
                     src_data_rank=None,
                 )
+                # _shard_tensor may return a view into the replicated full
+                # tensor. Clone it so the final DTensor shard does not keep
+                # the full parameter storage alive after loading.
+                local_tensor = local_tensor.contiguous().clone()
             elif isinstance(placement, Replicate):
                 continue
             elif isinstance(placement, Partial):
@@ -609,15 +593,9 @@ def _broadcast_sharded_state_dict(
             raise KeyError(f"Missing source metadata for EP expert parameter '{param_name}'.")
         _, source_dtype = source_metadata[param_name]
         local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
-        _native_fsdp_debug(
-            f'EP expert scatter start name={param_name} local_shape={local_shape} '
-            f'num_experts={num_experts} experts_per_rank={experts_per_rank}')
 
         scatter_list = None
         if is_rank0:
-            _native_fsdp_debug(
-                f'EP expert scatter source name={param_name} source_shape={tuple(full_tensor.shape)} '
-                f'source_dtype={full_tensor.dtype}')
             if full_tensor.size(0) != num_experts:
                 raise RuntimeError(
                     f"EP expert parameter '{param_name}' expects {num_experts} experts, "
@@ -634,7 +612,6 @@ def _broadcast_sharded_state_dict(
                 scatter_list.append(full_tensor[start:end].contiguous())
 
         dist.scatter(local_tensor, scatter_list=scatter_list, src=0)
-        _native_fsdp_debug(f'EP expert scatter done name={param_name}')
         return local_tensor
 
     for param_name, sharded_param in meta_sharded_sd.items():

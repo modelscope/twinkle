@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import inspect
-import os
-import time
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -13,27 +11,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
-
-
-def _ep_block_trace(block: nn.Module, message: str) -> None:
-    if os.environ.get('TWINKLE_EP_DEBUG', os.environ.get('TWINKLE_FSDP_DEBUG', '0')) != '1':
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    local_rank = os.environ.get('LOCAL_RANK', '?')
-    block_name = getattr(block, '_ep_debug_name', type(block).__name__)
-    ep_rank = getattr(block, '_ep_rank', '?')
-    ep_world_size = getattr(block, '_ep_world_size', '?')
-    text = (
-        f'[twinkle-ep-block][time={time.time():.6f} rank{rank}/{world_size} local_rank={local_rank} '
-        f'ep_rank={ep_rank}/{ep_world_size} block={block_name}] {message}'
-    )
-    print(text, flush=True)
-    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        with open(os.path.join(debug_dir, f'ep_block_rank{rank}.log'), 'a', encoding='utf-8') as f:
-            f.write(text + '\n')
 
 
 @dataclass
@@ -87,8 +64,7 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for block_name, block in find_moe_blocks_with_names(model):
-        block._ep_debug_name = block_name
+    for _, block in find_moe_blocks_with_names(model):
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
         patch_forward(block, ep_group, ep_world_size, cfg)
         specs.append(spec)
@@ -233,7 +209,6 @@ def patch_forward(
         _install_ep_forward(block.experts, experts_per_rank)
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
-        _ep_block_trace(block, f'forward enter hidden_shape={tuple(hidden_states.shape)}')
         if args:
             raise RuntimeError('Expert parallel patch only supports keyword-only extra args for MoE blocks.')
 
@@ -259,32 +234,19 @@ def patch_forward(
         # Keep routing weights in activation dtype before unpermute weighting.
         if routing_weights.dtype != hidden_states_2d.dtype:
             routing_weights = routing_weights.to(hidden_states_2d.dtype)
-        _ep_block_trace(
-            block,
-            f'after router hidden_2d_shape={tuple(hidden_states_2d.shape)} '
-            f'routing_shape={tuple(routing_weights.shape)} selected_shape={tuple(selected_experts.shape)}',
-        )
-
         # Build expert_mask: [num_experts, top_k, num_tokens]
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=num_experts).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
 
         # 1. preprocess: compute splits and token counts
-        _ep_block_trace(block, f'before preprocess expert_mask_sum={int(expert_mask.sum().item())}')
         (
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
             num_global_sum_tokens_per_local_expert,
         ) = preprocess(expert_mask, num_experts, ep_group)
-        _ep_block_trace(
-            block,
-            f'after preprocess input_splits={input_splits} output_splits={output_splits} '
-            f'local_expert_tokens={num_global_sum_tokens_per_local_expert.tolist()}',
-        )
 
         # 2. token_pre_all2all: permute → all_to_all → sort_chunks
-        _ep_block_trace(block, 'before token_pre_all2all')
         (
             global_permuted_hidden_states,
             local_input_permutation_mapping,
@@ -299,34 +261,27 @@ def patch_forward(
             output_splits,
             num_global_tokens_per_local_expert,
             ep_group,
-            debug_tag=getattr(block, '_ep_debug_name', block.__class__.__name__),
         )
-        _ep_block_trace(block, f'after token_pre_all2all global_shape={tuple(global_permuted_hidden_states.shape)}')
 
         # 3. expert_compute: call experts via nn.Module.__call__ so FSDP2 hooks fire.
         # For tensor experts: block.experts(permuted_tokens, counts, experts_per_rank)
         #   → FSDP2 pre-forward unshard → ep_forward → FSDP2 post-forward reshard
         # For ModuleList experts: _run_local_experts calls each expert[i](...) via __call__.
         if is_tensor_experts:
-            _ep_block_trace(block, 'before tensor expert compute')
             expert_outputs = block.experts(
                 global_permuted_hidden_states,
                 num_global_sum_tokens_per_local_expert,
                 experts_per_rank,
             )
-            _ep_block_trace(block, f'after tensor expert compute output_shape={tuple(expert_outputs.shape)}')
         else:
-            _ep_block_trace(block, 'before modulelist expert compute')
             expert_outputs = _run_local_experts(
                 block,
                 global_permuted_hidden_states,
                 num_global_sum_tokens_per_local_expert,
                 experts_per_rank,
             )
-            _ep_block_trace(block, f'after modulelist expert compute output_shape={tuple(expert_outputs.shape)}')
 
         # 4. tokens_post_all2all: sort_chunks → all_to_all → unpermute (with routing weight)
-        _ep_block_trace(block, 'before tokens_post_all2all')
         final_hidden = tokens_post_all2all(
             expert_outputs,
             local_assignment_weights,
@@ -337,22 +292,17 @@ def patch_forward(
             local_input_permutation_mapping,
             org_hidden_states_shape,
             ep_group,
-            debug_tag=getattr(block, '_ep_debug_name', block.__class__.__name__),
         )
-        _ep_block_trace(block, f'after tokens_post_all2all final_2d_shape={tuple(final_hidden.shape)}')
 
         shared_out = _maybe_run_shared_expert(block, hidden_states_2d, cfg)
         if shared_out is not None:
             final_hidden = final_hidden + shared_out
-            _ep_block_trace(block, 'after shared expert')
 
         if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
 
         if cfg.keep_router_logits and returns_router_logits:
-            _ep_block_trace(block, 'forward exit with router logits')
             return final_hidden, router_logits
-        _ep_block_trace(block, f'forward exit final_shape={tuple(final_hidden.shape)}')
         return final_hidden
 
     block._ep_original_forward = orig_forward
