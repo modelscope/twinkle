@@ -26,7 +26,15 @@ SAVE_STEPS = int(os.environ.get('SAVE_STEPS', '50'))
 RESHARD_AFTER_FORWARD = os.environ.get('RESHARD_AFTER_FORWARD', '1') == '1'
 GRADIENT_CHECKPOINTING = True
 IGNORE_MISMATCHED_SIZES = False
-LORA_TARGET_MODULES = 'all-linear'
+LORA_TARGET_MODULES = [
+    'wq_a',
+    'wq_b',
+    'wkv',
+    'wgate',
+    'gate_proj',
+    'up_proj',
+    'down_proj',
+]
 ADAPTER_NAME = 'default'
 
 device_mesh = DeviceMesh.from_sizes(
@@ -113,7 +121,6 @@ def train():
         model.forward_backward(
             inputs=batch,
             adapter_name=ADAPTER_NAME,
-            gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         )
         model.clip_grad_and_step(
             adapter_name=ADAPTER_NAME,
