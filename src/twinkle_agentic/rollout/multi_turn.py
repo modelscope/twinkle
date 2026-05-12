@@ -1,6 +1,8 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import json
+import os
+import re
 import time
 
 import numpy as np
@@ -79,7 +81,9 @@ class MultiTurnRollout(Rollout):
         sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
-        trace_path: Optional[str] = None,
+        trace_dir: Optional[str] = None,
+        trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         super().__init__()
         if template is None:
@@ -98,18 +102,16 @@ class MultiTurnRollout(Rollout):
         self.sampling_params = sampling_params or SamplingParams()
         self.max_turns = max_turns
         self.max_trajectory_tokens = max_trajectory_tokens
-        self.trace_path = trace_path
-        if self.trace_path:
+        self.trace_dir = trace_dir
+        self.trace_callback = trace_callback
+        self.success_callback = success_callback
+        if self.trace_dir:
             try:
-                # Truncate up front so repeated rollouts start from an
-                # empty file. Using a context manager here would be
-                # equivalent; explicit ``close()`` is clearer.
-                f = open(self.trace_path, 'w', encoding='utf-8')
-                f.close()
+                os.makedirs(self.trace_dir, exist_ok=True)
             except OSError:
-                # If we can't even create the file, disable tracing
+                # If we can't even create the directory, disable tracing
                 # silently rather than crashing the training job.
-                self.trace_path = None
+                self.trace_dir = None
 
         if self.sampling_params.num_samples != 1:
             raise ValueError(
@@ -167,7 +169,6 @@ class MultiTurnRollout(Rollout):
             resps = self._unwrap_response_list(resps, len(batch_pifs))[:actual]
 
             pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
-            trace_rows: List[Dict[str, Any]] = []  # buffered per-turn records
             for local_idx, global_idx in enumerate(active):
                 turns[global_idx] += 1
                 seq = resps[local_idx].sequences[0]
@@ -193,15 +194,6 @@ class MultiTurnRollout(Rollout):
                 # 3. Termination conditions
                 if seq.stop_reason == 'length':
                     done[global_idx] = True
-                    trace_rows.append(self._trace_row(
-                        turn=turns[global_idx],
-                        global_idx=global_idx,
-                        n=n,
-                        seq=seq,
-                        tool_calls=None,
-                        done=True,
-                        truncated=False,
-                        pif=pifs[global_idx]))
                     continue
 
                 # 3a. Sequence-length cap. 
@@ -210,15 +202,6 @@ class MultiTurnRollout(Rollout):
                         >= self.max_trajectory_tokens):
                     truncated[global_idx] = True
                     done[global_idx] = True
-                    trace_rows.append(self._trace_row(
-                        turn=turns[global_idx],
-                        global_idx=global_idx,
-                        n=n,
-                        seq=seq,
-                        tool_calls=None,
-                        done=True,
-                        truncated=True,
-                        pif=pifs[global_idx]))
                     continue
 
                 _msgs = pifs[global_idx].get('messages') or []
@@ -229,29 +212,11 @@ class MultiTurnRollout(Rollout):
                     tool_calls = self.template.parse_tool_call(seq.decoded or '')
                 if not tool_calls:
                     done[global_idx] = True
-                    trace_rows.append(self._trace_row(
-                        turn=turns[global_idx],
-                        global_idx=global_idx,
-                        n=n,
-                        seq=seq,
-                        tool_calls=tool_calls,
-                        done=True,
-                        truncated=False,
-                        pif=pifs[global_idx]))
                     continue
 
                 if turns[global_idx] >= self.max_turns:
                     truncated[global_idx] = True
                     done[global_idx] = True
-                    trace_rows.append(self._trace_row(
-                        turn=turns[global_idx],
-                        global_idx=global_idx,
-                        n=n,
-                        seq=seq,
-                        tool_calls=tool_calls,
-                        done=True,
-                        truncated=True,
-                        pif=pifs[global_idx]))
                     continue
 
                 # 4. Dispatch tools per trajectory (uses this trajectory's
@@ -261,15 +226,6 @@ class MultiTurnRollout(Rollout):
                     'content': tool_managers[global_idx](tc),
                 } for tc in tool_calls]
                 pending_bridges.append((global_idx, tool_messages))
-                trace_rows.append(self._trace_row(
-                    turn=turns[global_idx],
-                    global_idx=global_idx,
-                    n=n,
-                    seq=seq,
-                    tool_calls=tool_calls,
-                    done=False,
-                    truncated=False,
-                    pif=pifs[global_idx]))
 
             # Extend pif with bridge tokens for every trajectory that has
             # outstanding tool turns. Done serially: bridge computation is
@@ -277,12 +233,6 @@ class MultiTurnRollout(Rollout):
             for global_idx, tool_messages in pending_bridges:
                 pifs[global_idx] = self._extend_with_bridge(
                     pifs[global_idx], tool_messages)
-
-            # Flush this turn's trace records (one JSONL line each). This
-            # happens AFTER bridge extension so a post-turn consumer sees
-            # the final pif length for the turn.
-            if self.trace_path and trace_rows:
-                self._write_trace(trace_rows)
 
         for i in range(n):
             if not all_logprobs[i]:
@@ -310,6 +260,13 @@ class MultiTurnRollout(Rollout):
             out['stop_reason'] = stop_reasons[i]
             out['truncated'] = truncated[i]
             outs.append(out)
+
+        # Per-rollout trace dump: one JSON file per selected trajectory.
+        # ``trace_callback`` decides whether to store; ``success_callback``
+        # decides the filename prefix. Observability only -- any failure
+        # is swallowed inside ``_write_rollout_traces``.
+        if self.trace_dir:
+            self._write_rollout_traces(outs)
         return outs
 
     # ------------------------------------------------------------------ private
@@ -325,57 +282,98 @@ class MultiTurnRollout(Rollout):
             return list(arg)
         return [arg] * n
 
-    @staticmethod
-    def _trace_row(
-        *,
-        turn: int,
-        global_idx: int,
-        n: int,
-        seq,
-        tool_calls,
-        done: bool,
-        truncated: bool,
-        pif: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Build one per-trajectory trace record for the current turn.
+    _TRACE_SKIP_KEYS = (
+        'input_ids', 'labels', 'attention_mask', 'position_ids',
+        'logprobs', 'pixel_values', 'image_grid_thw', 'mm_token_type_ids',
+    )
 
-        Deliberately flat + JSON-friendly. ``decoded`` is truncated-safe
-        (it's just a string). ``trainable_tokens`` is the count of labels
-        not equal to -100 so far, i.e. GRPO-loss-eligible positions.
+    @classmethod
+    def _serialize_for_trace(cls, traj: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop tensor-like / oversized fields; keep messages + metadata.
+
+        Trace files are for human forensics; raw token ids, labels and
+        image buffers would bloat the file by orders of magnitude without
+        adding diagnostic value (the chat-template rendering of
+        ``messages`` already captures the textual content).
         """
-        labels = pif.get('labels') or []
-        trainable = sum(1 for l in labels if l != -100)
-        return {
-            'ts': time.time(),
-            'turn': int(turn),
-            'batch_size': int(n),
-            'trajectory_idx': int(global_idx),
-            'stop_reason': getattr(seq, 'stop_reason', None),
-            'decoded': getattr(seq, 'decoded', '') or '',
-            'tool_call_count': 0 if not tool_calls else len(tool_calls),
-            'done': bool(done),
-            'truncated': bool(truncated),
-            'input_ids_len': len(pif.get('input_ids') or []),
-            'trainable_tokens': trainable,
-        }
+        slim = {k: v for k, v in traj.items() if k not in cls._TRACE_SKIP_KEYS}
+        return _to_plain(slim)
 
-    def _write_trace(self, rows: List[Dict[str, Any]]) -> None:
-        """Append trace rows as JSONL. Errors are swallowed by design.
+    @staticmethod
+    def _extract_ground_truth(traj: Dict[str, Any]) -> str:
+        """Pull ``ground_truth`` out of ``user_data`` (list of kv pairs)."""
+        for kv in (traj.get('user_data') or []):
+            if (isinstance(kv, (list, tuple)) and len(kv) >= 2
+                    and kv[0] == 'ground_truth'):
+                return kv[1] or ''
+        return ''
+
+    @staticmethod
+    def _resolve_traj_id(traj: Dict[str, Any], fallback_idx: int) -> str:
+        """Stable-ish trajectory id for filenames.
+
+        Prefers an explicit ``id`` / ``prompt_id`` key in ``user_data``
+        (sanitised for filesystem safety); else falls back to
+        ``{timestamp_ms}-{fallback_idx}`` so concurrent rollouts do not
+        overwrite each other's files.
+        """
+        for kv in (traj.get('user_data') or []):
+            if (isinstance(kv, (list, tuple)) and len(kv) >= 2
+                    and kv[0] in ('id', 'prompt_id')):
+                val = kv[1]
+                if val not in (None, ''):
+                    safe = re.sub(r'[^A-Za-z0-9_\-.]+', '_', str(val))[:64]
+                    if safe:
+                        return safe
+        return f'{int(time.time() * 1000)}-{fallback_idx}'
+
+    def _write_rollout_traces(self, outs: List[Dict[str, Any]]) -> None:
+        """Dump one pretty-printed JSON file per selected trajectory.
+
+        ``trace_callback`` (if set) decides WHETHER to store;
+        ``success_callback`` (if set) decides the filename prefix
+        (``ok-`` vs ``fail-``). Defaults: store-all / mark-fail.
 
         Observability must never break training -- any I/O or encoding
-        problem is silently ignored so a disk-full / permission issue
-        doesn't take down the optimisation loop.
+        problem on a single trajectory is swallowed so the remaining
+        dumps and the optimisation loop continue unaffected.
         """
-        if not self.trace_path or not rows:
+        if not self.trace_dir:
             return
-        try:
-            lines = [
-                json.dumps(r, ensure_ascii=False, default=str)
-                for r in rows]
-            with open(self.trace_path, 'a', encoding='utf-8') as f:
-                f.write('\n'.join(lines) + '\n')
-        except Exception:
-            pass
+        for idx, traj in enumerate(outs):
+            try:
+                should_store = True
+                if self.trace_callback is not None:
+                    try:
+                        should_store = bool(self.trace_callback(traj))
+                    except Exception:
+                        should_store = False
+                if not should_store:
+                    continue
+
+                success = False
+                if self.success_callback is not None:
+                    try:
+                        success = bool(self.success_callback(traj))
+                    except Exception:
+                        success = False
+
+                record = {
+                    'trajectory': self._serialize_for_trace(traj),
+                    'ground_truth': self._extract_ground_truth(traj),
+                    'stop_reason': traj.get('stop_reason'),
+                    'truncated': bool(traj.get('truncated')),
+                    'success': success,
+                }
+                prefix = 'ok' if success else 'fail'
+                fname = f'{prefix}-{self._resolve_traj_id(traj, idx)}.json'
+                path = os.path.join(self.trace_dir, fname)
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(record, f, ensure_ascii=False,
+                              indent=2, default=str)
+            except Exception:
+                # Per-trajectory failure never aborts the loop.
+                pass
 
     @staticmethod
     def _unwrap_response_list(resps, expected: int) -> List[SampleResponse]:

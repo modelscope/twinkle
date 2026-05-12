@@ -79,8 +79,8 @@ COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0.2))
 
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 
-_ROLLOUT_TRACE_PATH = os.environ.get(
-    'ROLLOUT_TRACE_BASELINE_PATH', 'rollout_trace_baseline.jsonl')
+_ROLLOUT_TRACE_DIR = os.environ.get(
+    'ROLLOUT_TRACE_BASELINE_DIR', 'rollout_trace_baseline')
 
 SYSTEM_PROMPT = """You are a careful multi-hop QA assistant.
 
@@ -411,16 +411,22 @@ def main():
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
         temperature=1.0, top_p=0.95)
-    # Empty ToolManager: with ``max_turns=1`` the rollout sample exactly
-    # once per trajectory and exits via the ``not tool_calls`` /
-    # ``turns >= max_turns`` branches without ever dispatching a tool.
+
+    def _trace_should_store(traj):
+        return _F1_REWARD([traj])[0] == 0.0
+
+    def _trace_is_success(traj):
+        return _F1_REWARD([traj])[0] > 0.0
+
     rollout = MultiTurnRollout(
         sampler=sampler,
         template=rollout_template,
         tool_manager=ToolManager(),
         sampling_params=sampling_params,
         max_turns=MAX_TURNS,
-        trace_path=_ROLLOUT_TRACE_PATH or None,
+        trace_dir=_ROLLOUT_TRACE_DIR or None,
+        trace_callback=_trace_should_store,
+        success_callback=_trace_is_success,
     )
 
     optim_step = 0

@@ -62,7 +62,7 @@ TOOL_BONUS_F1_THRESHOLD = float(
 
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 
-_ROLLOUT_TRACE_PATH = os.environ.get('ROLLOUT_TRACE_PATH', 'rollout_trace.jsonl')
+_ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
 
 SYSTEM_PROMPT = """You are a careful multi-hop QA assistant.
 
@@ -425,15 +425,10 @@ def main():
         MODEL_ID, max_length=HOTPOTQA_MAX_LENGTH, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
-    # ``passage_boundary_re`` keeps each HotpotQA passage (``[N] Title: ...``)
-    # atomic inside a single chunk — short passages are emitted as-is
-    # and are NEVER merged across boundaries, so every ``<block_N>``
-    # after condensation corresponds to exactly one passage.
     chunker = NativeChunker(
         chunk_size=CHUNK_SIZE,
-        # passage_boundary_re=r'^\[\d+\]\s+'
-        passage_boundary_re=r'Context:'
-        )
+        passage_boundary_re=r'Context:',
+    )
     condenser = ModelCondenser(
         sampler=sampler,
         compression_ratio=4.0,
@@ -455,6 +450,13 @@ def main():
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
         temperature=1.0, top_p=0.95,
         stop=['</tool_call>'])
+
+    def _trace_should_store(traj):
+        return _F1_REWARD([traj])[0] == 0.0
+
+    def _trace_is_success(traj):
+        return _F1_REWARD([traj])[0] > 0.0
+
     rollout = MultiTurnCondenseRollout(
         sampler=sampler,
         template=rollout_template,
@@ -464,7 +466,9 @@ def main():
         sampling_params=sampling_params,
         max_turns=MAX_TURNS,
         max_trajectory_tokens=MAX_TRAJECTORY_TOKENS,
-        trace_path=_ROLLOUT_TRACE_PATH or None,
+        trace_dir=_ROLLOUT_TRACE_DIR or None,
+        trace_callback=_trace_should_store,
+        success_callback=_trace_is_success,
     )
 
     optim_step = 0

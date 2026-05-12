@@ -698,119 +698,144 @@ def test_single_trajectory_dict_rejected(make_rollout):
 
 
 # =============================================================================
-# Tests: trace_path (JSONL per-turn observability)
+# Tests: trace_dir (per-rollout JSON dump + callback filtering)
 # =============================================================================
-def test_trace_path_writes_one_record_per_turn_natural_stop(
+def _list_trace_files(trace_dir):
+    return sorted(p.name for p in trace_dir.iterdir() if p.suffix == '.json')
+
+
+def test_trace_dir_is_created_and_empty_by_default(
         tmp_path, sampler, template, tool_manager):
-    """Single-turn natural stop: trace file has exactly one JSON line."""
-    trace = tmp_path / 'trace.jsonl'
+    """Constructor creates the directory eagerly; no files until a rollout runs."""
+    trace_dir = tmp_path / 'trace'
+    assert not trace_dir.exists()
+
+    MultiTurnRollout(
+        sampler=sampler, template=template,
+        tool_manager=tool_manager,
+        max_turns=2, trace_dir=str(trace_dir))
+    assert trace_dir.is_dir()
+    assert _list_trace_files(trace_dir) == []
+
+
+def test_trace_dir_writes_one_file_per_rollout(
+        tmp_path, sampler, template, tool_manager):
+    """Single trajectory -> single JSON file (regardless of turn count)."""
+    trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
         tool_manager=tool_manager,
-        max_turns=4, trace_path=str(trace))
+        max_turns=4, trace_dir=str(trace_dir))
+    sampler.queue(_tool_call_text('search', {'q': 'x'}))
     sampler.queue('final answer', stop_reason='stop')
 
     outs = rollout([_user_traj('hello')])
     assert len(outs) == 1
 
-    lines = [l for l in trace.read_text().splitlines() if l]
-    assert len(lines) == 1
-    rec = json.loads(lines[0])
-    assert rec['turn'] == 1
-    assert rec['batch_size'] == 1
-    assert rec['trajectory_idx'] == 0
-    assert rec['stop_reason'] == 'stop'
-    assert rec['decoded'] == 'final answer'
-    assert rec['tool_call_count'] == 0
-    assert rec['done'] is True
-    assert rec['truncated'] is False
-    assert rec['trainable_tokens'] > 0
+    files = _list_trace_files(trace_dir)
+    assert len(files) == 1
+    # No callbacks supplied -> default prefix is ``fail-``.
+    assert files[0].startswith('fail-')
+    assert files[0].endswith('.json')
 
 
-def test_trace_path_captures_tool_turn_and_completion(
+def test_trace_dir_json_is_pretty_printed_and_well_formed(
         tmp_path, sampler, template, tool_manager):
-    """Two-turn rollout: one tool turn (done=False) then completion."""
-    trace = tmp_path / 'trace.jsonl'
+    """Dumped JSON is multi-line (indent=2) and carries the documented keys."""
+    trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
         tool_manager=tool_manager,
-        max_turns=4, trace_path=str(trace))
-    sampler.queue(_tool_call_text('search', {'q': 'x'}))
-    sampler.queue('done', stop_reason='stop')
+        max_turns=2, trace_dir=str(trace_dir))
+    sampler.queue('final answer', stop_reason='stop')
 
     rollout([_user_traj('hello')])
 
-    lines = [l for l in trace.read_text().splitlines() if l]
-    assert len(lines) == 2
-    turn1 = json.loads(lines[0])
-    turn2 = json.loads(lines[1])
+    files = list((trace_dir).glob('*.json'))
+    assert len(files) == 1
+    raw = files[0].read_text()
+    assert '\n' in raw, 'pretty-printed JSON must span multiple lines'
 
-    assert turn1['turn'] == 1
-    assert turn1['tool_call_count'] == 1
-    assert turn1['done'] is False
-    assert turn1['truncated'] is False
+    rec = json.loads(raw)
+    assert set(rec.keys()) >= {
+        'trajectory', 'ground_truth', 'stop_reason', 'truncated', 'success'}
+    assert rec['stop_reason'] == 'stop'
+    assert rec['truncated'] is False
+    assert rec['success'] is False  # no callback => default False
+    # Heavy tensor-like fields are stripped from the dumped trajectory.
+    for k in ('input_ids', 'labels', 'attention_mask', 'logprobs'):
+        assert k not in rec['trajectory']
+    assert isinstance(rec['trajectory'].get('messages'), list)
 
-    assert turn2['turn'] == 2
-    assert turn2['tool_call_count'] == 0
-    assert turn2['done'] is True
-    # input_ids length must monotonically increase across turns.
-    assert turn2['input_ids_len'] > turn1['input_ids_len']
 
-
-def test_trace_path_truncates_file_on_construction(
+def test_trace_dir_trace_callback_filters_storage(
         tmp_path, sampler, template, tool_manager):
-    """Constructor opens the file in 'w' mode — stale data is wiped."""
-    trace = tmp_path / 'trace.jsonl'
-    trace.write_text('STALE CONTENT SHOULD BE GONE\n')
-    assert trace.read_text() == 'STALE CONTENT SHOULD BE GONE\n'
-
-    sampler.queue('ok', stop_reason='stop')
+    """``trace_callback`` returning False suppresses the dump entirely."""
+    trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=2, trace_path=str(trace))
-    # After construction the file is empty (we truncate eagerly).
-    assert trace.read_text() == ''
+        tool_manager=tool_manager, max_turns=2,
+        trace_dir=str(trace_dir),
+        trace_callback=lambda traj: False)
+    sampler.queue('ok', stop_reason='stop')
 
     rollout([_user_traj('hi')])
-    content = trace.read_text()
-    assert 'STALE' not in content
-    assert content.strip()  # at least one record written
+    assert _list_trace_files(trace_dir) == []
 
 
-def test_trace_path_batch_emits_one_record_per_active_trajectory(
+def test_trace_dir_success_callback_drives_filename_prefix(
         tmp_path, sampler, template, tool_manager):
-    """Batched rollout: each turn emits N active records (not N_total)."""
-    trace = tmp_path / 'trace.jsonl'
+    """True -> ``ok-*.json``, False -> ``fail-*.json``, split across batch."""
+    trace_dir = tmp_path / 'trace'
+    # Success is decided by a cheap rule on the last assistant message
+    # content; ``store`` accepts everything.
+    def _is_success(traj):
+        for msg in reversed(traj.get('messages', []) or []):
+            if msg.get('role') == 'assistant':
+                return 'good' in (msg.get('content') or '')
+        return False
+
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=4, trace_path=str(trace))
-    # Traj 0: stops turn 1. Traj 1: tool-calls turn 1, stops turn 2.
-    # Responses are consumed in batch order per turn.
-    sampler.queue('done0', stop_reason='stop')                        # t1-A
-    sampler.queue(_tool_call_text('search', {'q': 'y'}))              # t1-B
-    sampler.queue('done1', stop_reason='stop')                        # t2-B (B only)
+        tool_manager=tool_manager, max_turns=2,
+        trace_dir=str(trace_dir),
+        success_callback=_is_success)
+    sampler.queue('good answer', stop_reason='stop')
+    sampler.queue('bad answer', stop_reason='stop')
 
     rollout([_user_traj('A'), _user_traj('B')])
 
-    lines = [json.loads(l) for l in trace.read_text().splitlines() if l]
-    assert len(lines) == 3
-    # Turn 1 has both trajectories.
-    turn1 = [r for r in lines if r['turn'] == 1]
-    turn2 = [r for r in lines if r['turn'] == 2]
-    assert sorted(r['trajectory_idx'] for r in turn1) == [0, 1]
-    # Turn 2 has only trajectory 1 (trajectory 0 already done).
-    assert [r['trajectory_idx'] for r in turn2] == [1]
-    # batch_size is the ORIGINAL batch count (2), not active count.
-    assert all(r['batch_size'] == 2 for r in lines)
+    files = _list_trace_files(trace_dir)
+    assert len(files) == 2
+    assert any(f.startswith('ok-') for f in files)
+    assert any(f.startswith('fail-') for f in files)
 
 
-def test_trace_path_none_disables_tracing(
+def test_trace_dir_batch_writes_one_file_per_trajectory(
         tmp_path, sampler, template, tool_manager):
-    """Default ``trace_path=None`` never touches the filesystem."""
-    trace = tmp_path / 'never.jsonl'
-    assert not trace.exists()
+    """Batch of N trajectories -> N files (never per-turn records)."""
+    trace_dir = tmp_path / 'trace'
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template,
+        tool_manager=tool_manager,
+        max_turns=4, trace_dir=str(trace_dir))
+    # Traj 0: stops turn 1. Traj 1: tool-calls turn 1, stops turn 2.
+    sampler.queue('done0', stop_reason='stop')
+    sampler.queue(_tool_call_text('search', {'q': 'y'}))
+    sampler.queue('done1', stop_reason='stop')
+
+    rollout([_user_traj('A'), _user_traj('B')])
+
+    files = _list_trace_files(trace_dir)
+    # Exactly one file per input trajectory, not one per turn.
+    assert len(files) == 2
+
+
+def test_trace_dir_none_disables_tracing(
+        tmp_path, sampler, template, tool_manager):
+    """Default ``trace_dir=None`` never touches the filesystem."""
+    trace_dir = tmp_path / 'never'
+    assert not trace_dir.exists()
 
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
@@ -818,25 +843,46 @@ def test_trace_path_none_disables_tracing(
     sampler.queue('ok', stop_reason='stop')
     rollout([_user_traj('hi')])
 
-    assert rollout.trace_path is None
-    assert not trace.exists()
+    assert rollout.trace_dir is None
+    assert not trace_dir.exists()
 
 
-def test_trace_path_truncation_marked_on_max_turns(
+def test_trace_dir_truncation_marked_on_max_turns(
         tmp_path, sampler, template, tool_manager):
-    """The final record of a max-turns truncation has truncated=True."""
-    trace = tmp_path / 'trunc.jsonl'
+    """A rollout hitting ``max_turns`` records ``truncated=True``."""
+    trace_dir = tmp_path / 'trunc'
     rollout = MultiTurnRollout(
         sampler=sampler, template=template,
         tool_manager=tool_manager,
-        max_turns=2, trace_path=str(trace))
+        max_turns=2, trace_dir=str(trace_dir))
     # Two tool-call turns -> the second hits max_turns cap.
     sampler.queue(_tool_call_text('search', {'q': 'a'}))
     sampler.queue(_tool_call_text('search', {'q': 'b'}))
 
     rollout([_user_traj('hi')])
 
-    lines = [json.loads(l) for l in trace.read_text().splitlines() if l]
-    assert len(lines) == 2
-    assert lines[0]['truncated'] is False and lines[0]['done'] is False
-    assert lines[1]['truncated'] is True and lines[1]['done'] is True
+    files = list((trace_dir).glob('*.json'))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec['truncated'] is True
+
+
+def test_trace_dir_uses_user_data_id_in_filename(
+        tmp_path, sampler, template, tool_manager):
+    """Filenames prefer ``user_data['id']`` (sanitised) over the fallback."""
+    trace_dir = tmp_path / 'trace'
+    rollout = MultiTurnRollout(
+        sampler=sampler, template=template,
+        tool_manager=tool_manager,
+        max_turns=2, trace_dir=str(trace_dir))
+    sampler.queue('ok', stop_reason='stop')
+
+    traj = _user_traj('hi')
+    traj['user_data'] = [('id', 'hotpotqa/42')]
+    rollout([traj])
+
+    files = _list_trace_files(trace_dir)
+    assert len(files) == 1
+    # Slashes are sanitised away; the id still drives the filename.
+    assert 'hotpotqa_42' in files[0]
+    assert files[0].startswith('fail-')

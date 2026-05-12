@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
@@ -55,7 +55,9 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         max_turns: int = 6,
         max_trajectory_tokens: Optional[int] = None,
         condenser_kwargs: Optional[Dict[str, Any]] = None,
-        trace_path: Optional[str] = None,
+        trace_dir: Optional[str] = None,
+        trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         super().__init__(
             sampler=sampler,
@@ -64,7 +66,9 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             sampling_params=sampling_params,
             max_turns=max_turns,
             max_trajectory_tokens=max_trajectory_tokens,
-            trace_path=trace_path,
+            trace_dir=trace_dir,
+            trace_callback=trace_callback,
+            success_callback=success_callback,
         )
         if chunker is None:
             raise ValueError(
