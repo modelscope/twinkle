@@ -13,7 +13,7 @@ logger = get_logger()
 
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-flash-bfa16')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
-TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'Template')
+TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
 
 NUM_LAYERS = int(os.environ.get('NUM_LAYERS', '4'))
