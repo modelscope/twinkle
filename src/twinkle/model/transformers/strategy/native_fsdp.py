@@ -73,10 +73,9 @@ class NativeFSDPStrategy:
                 is_rank0 = (dist.get_rank() == 0)
                 original_sd = model.state_dict() if is_rank0 else {}
                 saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
-                if is_rank0:
-                    model = model.to(torch.device('meta'))
-                    if hasattr(model, 'tie_weights'):
-                        model.tie_weights()
+                model = model.to(torch.device('meta'))
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights()
 
             if ep_enabled:
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
@@ -511,31 +510,57 @@ def _broadcast_sharded_state_dict(
     full_sd: dict,
     device_type: str = 'cuda',
 ) -> None:
-    """Broadcast full state dict from rank 0 and materialise local shards via distribute_tensor."""
+    """Distribute rank0 full state dict into local FSDP2 shards."""
     from torch.distributed.tensor import DTensor, distribute_tensor
 
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
     is_rank0 = (dist.get_rank() == 0)
+    source_metadata = None
+    if is_rank0:
+        source_metadata = {
+            name: (tuple(tensor.shape), tensor.dtype)
+            for name, tensor in full_sd.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+        }
+    metadata_holder = [source_metadata]
+    dist.broadcast_object_list(metadata_holder, src=0)
+    source_metadata = metadata_holder[0] or {}
 
     for param_name, sharded_param in meta_sharded_sd.items():
         shape = sharded_param.size()
-        dtype = sharded_param.dtype
+        if param_name not in source_metadata:
+            raise KeyError(f"Missing source metadata for parameter '{param_name}'.")
+        source_shape, source_dtype = source_metadata[param_name]
 
         if is_rank0:
+            if param_name not in full_sd:
+                raise KeyError(
+                    f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict.")
             full_param = full_sd[param_name]
-            full_tensor = full_param.detach().to(device_type)
+            full_tensor = full_param.detach()
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
+            full_tensor = full_tensor.to(device_type)
+            if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
+                raise RuntimeError(f"Source metadata mismatch for '{param_name}': "
+                                   f'actual shape={tuple(full_tensor.shape)} dtype={full_tensor.dtype}, '
+                                   f'expected shape={source_shape} dtype={source_dtype}.')
         else:
-            full_tensor = torch.empty(shape, device=device_type, dtype=dtype)
+            full_tensor = torch.empty(source_shape, device=device_type, dtype=source_dtype)
 
-        dist.broadcast(full_tensor, src=0)
+        if tuple(shape) != tuple(source_shape):
+            raise RuntimeError(f"Parameter '{param_name}' shape mismatch before broadcast: "
+                               f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
+        if isinstance(sharded_param, DTensor):
+            sharded_tensor = distribute_tensor(
+                full_tensor,
+                sharded_param.device_mesh,
+                sharded_param.placements,
+            )
+        else:
+            dist.broadcast(full_tensor, src=0)
+            sharded_tensor = full_tensor
         torch_util.synchronize()
-
-        device_mesh = sharded_param.device_mesh
-        placements = sharded_param.placements
-        sharded_tensor = distribute_tensor(full_tensor, device_mesh, placements)
         del full_tensor
 
         sharded_sd[param_name] = sharded_tensor
@@ -562,14 +587,26 @@ def _unbind_optimizer_params(optimizer: torch.optim.Optimizer) -> None:
             group['params'][i] = torch.empty(1, dtype=param.dtype, device=param.device)
 
 
-def _restore_non_persistent_buffers(
+def _broadcast_non_persistent_buffers(
     model: nn.Module,
     saved_buffers: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> None:
-    """Re-register non-persistent buffers saved before to('meta')."""
-    for fqn, buf_tensor in saved_buffers.items():
-        buf_tensor = buf_tensor.to(device)
+    """Broadcast rank0 non-persistent buffers and re-register them on all ranks."""
+    is_rank0 = (dist.get_rank() == 0)
+    metadata = None
+    if is_rank0:
+        metadata = [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in saved_buffers.items()]
+    metadata_holder = [metadata]
+    dist.broadcast_object_list(metadata_holder, src=0)
+    metadata = metadata_holder[0] or []
+
+    for fqn, shape, dtype in metadata:
+        if is_rank0:
+            buf_tensor = saved_buffers[fqn].to(device)
+        else:
+            buf_tensor = torch.empty(shape, device=device, dtype=dtype)
+        dist.broadcast(buf_tensor, src=0)
         if '.' in fqn:
             parent_fqn, local_name = fqn.rsplit('.', 1)
             parent = model.get_submodule(parent_fqn)

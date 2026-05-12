@@ -3,12 +3,12 @@ import inspect
 import json
 import re
 from copy import copy, deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.utils import to_device
 
-from dataclasses import dataclass
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 

@@ -42,6 +42,7 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
@@ -191,6 +192,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
+        elif self._should_init_empty_pretrained_model_on_this_rank():
+            self.model = self._init_empty_model_from_config(model_cls, **kwargs)
         else:
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
@@ -203,6 +206,23 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
+        use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+        return bool(use_rank0_broadcast() and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+
+    def _init_empty_model_from_config(self, model_cls, **kwargs):
+        from accelerate import init_empty_weights
+
+        config_kwargs = filter_from_config_kwargs(kwargs)
+        with init_empty_weights(include_buffers=False):
+            if hasattr(model_cls, 'from_config'):
+                model = model_cls.from_config(self.hf_config, **config_kwargs)
+            else:
+                model = model_cls._from_config(self.hf_config, **config_kwargs)
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        return model
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)

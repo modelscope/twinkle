@@ -3,9 +3,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .utils import Function
-from .utils import Prompt
 from .base import BaseAgentTemplate
+from .utils import Function, Prompt
 
 DSML_TOKEN = '｜DSML｜'
 
