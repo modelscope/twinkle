@@ -594,14 +594,12 @@ def _broadcast_sharded_state_dict(
         _, source_dtype = source_metadata[param_name]
         local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
 
-        scatter_list = None
         if is_rank0:
             if full_tensor.size(0) != num_experts:
                 raise RuntimeError(
                     f"EP expert parameter '{param_name}' expects {num_experts} experts, "
                     f'but source state has shape {tuple(full_tensor.shape)}. '
                     'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
-            scatter_list = []
             world_size = dist.get_world_size()
             for rank in range(world_size):
                 if rank not in rank_to_ep_rank:
@@ -609,9 +607,14 @@ def _broadcast_sharded_state_dict(
                 ep_rank = rank_to_ep_rank[rank]
                 start = ep_rank * experts_per_rank
                 end = start + experts_per_rank
-                scatter_list.append(full_tensor[start:end].contiguous())
+                chunk = full_tensor[start:end].contiguous()
+                if rank == 0:
+                    local_tensor.copy_(chunk)
+                else:
+                    dist.send(chunk, dst=rank)
+        else:
+            dist.recv(local_tensor, src=0)
 
-        dist.scatter(local_tensor, scatter_list=scatter_list, src=0)
         return local_tensor
 
     for param_name, sharded_param in meta_sharded_sd.items():
