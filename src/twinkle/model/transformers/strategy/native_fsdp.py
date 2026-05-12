@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
 from .load_context import fsdp_pretrained_load_context
@@ -340,14 +340,41 @@ def _build_fsdp_mesh(device_mesh: DeviceMesh) -> Optional[TorchDeviceMesh]:
     return TorchDeviceMesh(device_mesh.device_type, flat_mesh, mesh_dim_names=('fsdp', ))
 
 
-def _get_decoder_layers(model: nn.Module) -> Optional[nn.ModuleList]:
+def _get_decoder_layers(model: nn.Module) -> Optional[List[nn.Module]]:
+    no_split_modules = _get_no_split_module_names(model)
+    if no_split_modules:
+        layers = [
+            module for module in model.modules()
+            if module is not model and module.__class__.__name__ in no_split_modules
+        ]
+        if layers:
+            return layers
+
     inner_model = getattr(model, 'model', None)
     if inner_model is not None:
         inner_layers = getattr(inner_model, 'layers', None)
         if isinstance(inner_layers, nn.ModuleList):
-            return inner_layers
+            return list(inner_layers)
 
     return None
+
+
+def _get_no_split_module_names(model: nn.Module) -> Set[str]:
+    names = _normalize_no_split_modules(getattr(model, '_no_split_modules', None))
+    if names:
+        return names
+
+    for module in model.modules():
+        names.update(_normalize_no_split_modules(getattr(module, '_no_split_modules', None)))
+    return names
+
+
+def _normalize_no_split_modules(value) -> Set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    return set(value)
 
 
 def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
@@ -548,8 +575,7 @@ def _broadcast_sharded_state_dict(
     if is_rank0:
         source_metadata = {
             name: (tuple(tensor.shape), tensor.dtype)
-            for name, tensor in full_sd.items()
-            if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+            for name, tensor in full_sd.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
         }
     metadata_holder = [source_metadata]
     dist.broadcast_object_list(metadata_holder, src=0)
@@ -596,10 +622,9 @@ def _broadcast_sharded_state_dict(
 
         if is_rank0:
             if full_tensor.size(0) != num_experts:
-                raise RuntimeError(
-                    f"EP expert parameter '{param_name}' expects {num_experts} experts, "
-                    f'but source state has shape {tuple(full_tensor.shape)}. '
-                    'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
+                raise RuntimeError(f"EP expert parameter '{param_name}' expects {num_experts} experts, "
+                                   f'but source state has shape {tuple(full_tensor.shape)}. '
+                                   'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
             world_size = dist.get_world_size()
             for rank in range(world_size):
                 if rank not in rank_to_ep_rank:
@@ -637,20 +662,19 @@ def _broadcast_sharded_state_dict(
             if not is_ep_expert_param:
                 full_tensor = full_tensor.to(device_type)
             if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
-                raise RuntimeError(
-                    f"Source metadata mismatch for '{param_name}': "
-                    f'actual shape={tuple(full_tensor.shape)} dtype={full_tensor.dtype}, '
-                    f'expected shape={source_shape} dtype={source_dtype}.')
+                raise RuntimeError(f"Source metadata mismatch for '{param_name}': "
+                                   f'actual shape={tuple(full_tensor.shape)} dtype={full_tensor.dtype}, '
+                                   f'expected shape={source_shape} dtype={source_dtype}.')
         else:
-            full_tensor = None if is_ep_expert_param else torch.empty(source_shape, device=device_type, dtype=source_dtype)
+            full_tensor = None if is_ep_expert_param else torch.empty(
+                source_shape, device=device_type, dtype=source_dtype)
 
         if is_ep_expert_param:
             full_tensor = _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param)
         else:
             if tuple(shape) != tuple(source_shape):
-                raise RuntimeError(
-                    f"Parameter '{param_name}' shape mismatch before broadcast: "
-                    f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
+                raise RuntimeError(f"Parameter '{param_name}' shape mismatch before broadcast: "
+                                   f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
             dist.broadcast(full_tensor, src=0)
         torch_util.synchronize()
 
