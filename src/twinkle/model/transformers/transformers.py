@@ -1054,10 +1054,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _ensure_lora_dtype(self, model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
-        is_npu_device = False
+        is_npu_device = Platform.device_prefix() == 'npu'
         for param in model.parameters():
-            if param.device.type == 'npu':
-                is_npu_device = True
             if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
             if base_dtype is not None and is_npu_device:
