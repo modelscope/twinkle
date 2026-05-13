@@ -56,7 +56,7 @@ HOTPOTQA_MAX_LENGTH = int(os.environ.get('HOTPOTQA_MAX_LENGTH', 64000))
 
 F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0))
-TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0))
+TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.05))
 TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
@@ -429,6 +429,16 @@ def main():
         chunk_size=CHUNK_SIZE,
         passage_boundary_re=r'\[\d+\]',
     )
+    # ``\A`` anchor: prevents a ``Question:`` line inside a passage from being misread as the query.
+    _question_re = re.compile(r'\AQuestion:\s*(.+)')
+
+    def _extract_question(chunk):
+        content = chunk.get('content')
+        if chunk.get('type') != 'text' or not isinstance(content, str):
+            return None
+        m = _question_re.search(content)
+        return m.group(1).strip() if m else None
+
     condenser = ModelCondenser(
         sampler=sampler,
         compression_ratio=4.0,
@@ -438,6 +448,7 @@ def main():
         template=rollout_template,
         use_base_model=True,
         skip_pattern=r'^Question:',
+        related_query=_extract_question,
     )
 
     dataloader = DataLoader(

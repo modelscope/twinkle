@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple)
 
 from twinkle_agentic.condenser.base import Condenser
 from twinkle_agentic.data_format import Chunk, Chunks
@@ -139,10 +139,9 @@ class ModelCondenser(Condenser):
             ``{budget}`` and ``{text}``. ``{query}``,
             ``{soft_budget}``, ``{summary_words}``, ``{max_bullets}``
             and ``{bullet_words}`` are optional. ``{query}`` is
-            replaced with the trajectory's question (matched via
-            ``skip_pattern``) so the model knows which facts to keep
-            verbatim; jobs without a detected query get a neutral
-            placeholder. Scaling formulas:
+            replaced with the trajectory's question extracted by the
+            ``related_query`` callback (see below); jobs without a
+            detected query get a neutral placeholder. Scaling formulas:
             ``soft_budget = int(budget*0.85)``;
             ``summary_words = clamp(budget // 15, 8, 25)``;
             ``max_bullets = clamp(budget // 75, 2, 5)``;
@@ -169,6 +168,20 @@ class ModelCondenser(Condenser):
             start-of-string if you want boundary-matching only (e.g.
             ``r'^Question:'`` to preserve the question prefix in a
             HotpotQA-style user message). ``None`` disables the filter.
+            This flag is purely a compression-skip filter; query
+            extraction is the orthogonal job of ``related_query``.
+        related_query: Optional ``(chunk) -> Optional[str]`` callback
+            that returns the query string carried by ``chunk`` (e.g.
+            the user's HotpotQA question), or ``None`` if the chunk
+            is not a query carrier. Walked in chunk order; the most
+            recently returned non-``None`` query is broadcast to all
+            subsequent condense-eligible chunks until the next hit.
+            Because :class:`MultiTurnCondenseRollout` may merge
+            multiple trajectories into one chunk list, each
+            trajectory's question chunk must precede its passages so
+            this rolling state correctly partitions queries
+            per-trajectory. ``None`` disables query injection (the
+            ``{query}`` slot collapses to a neutral placeholder).
         rounds: Optional set of conversation turn indices to compress.
             ``None`` = no round-based filter; chunks lacking a ``round``
             field are skipped when this filter is active.
@@ -206,6 +219,7 @@ class ModelCondenser(Condenser):
         template: Optional[Any] = None,
         skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
         skip_pattern: Optional[str] = None,
+        related_query: Optional[Callable[[Chunk], Optional[str]]] = None,
         rounds: Optional[Sequence[int]] = None,
         batch_size: int = None,
         use_base_model: bool = False,
@@ -242,6 +256,7 @@ class ModelCondenser(Condenser):
         self.skip_re: Optional[re.Pattern] = (
             re.compile(skip_pattern, re.MULTILINE)
             if skip_pattern else None)
+        self.related_query = related_query
         self.rounds = set(rounds) if rounds is not None else None
         self.batch_size = batch_size
         self.use_base_model = bool(use_base_model)
@@ -279,25 +294,25 @@ class ModelCondenser(Condenser):
         """Collect compression jobs, tagging each with its trajectory's query.
 
         Walks ``chunks`` in order and maintains a rolling
-        ``current_query`` state. Every chunk whose content matches
-        ``skip_re`` (typically the ``Question:`` line) updates the
-        state; every subsequent condense-eligible chunk picks up the
-        most recent query. Because the chunker emits each
-        trajectory's question chunk before its passages, this walk
-        correctly partitions queries per-trajectory even when
-        ``MultiTurnCondenseRollout`` merges multiple trajectories
-        into a single chunk list — A's passages only ever see A's
-        question, B's only B's.
+        ``current_query`` state driven by the ``related_query``
+        callback: every chunk for which the callback returns a
+        non-``None`` string updates the state, and every subsequent
+        condense-eligible chunk picks up the most recent query.
+        Because the chunker emits each trajectory's question chunk
+        before its passages, this walk correctly partitions queries
+        per-trajectory even when ``MultiTurnCondenseRollout`` merges
+        multiple trajectories into a single chunk list — A's
+        passages only ever see A's question, B's only B's.
         """
         items: List[Tuple[_Job, Optional[str]]] = []
         current_query: Optional[str] = None
+        extract = self.related_query
         for i, c in enumerate(chunks):
             content = c.get('content')
-            if (self.skip_re is not None
-                    and c.get('type') == 'text'
-                    and isinstance(content, str)
-                    and self.skip_re.search(content)):
-                current_query = content
+            if extract is not None:
+                q = extract(c)
+                if isinstance(q, str) and q:
+                    current_query = q
             if not self._should_condense(c):
                 continue
             budget = max(
