@@ -29,6 +29,7 @@ from copy import copy
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
+from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
@@ -350,6 +351,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         lora_request = None
         if adapter_path is not None:
             logger.info(f'Loading LoRA from {adapter_path}')
+            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
             lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
             if lora_request is None:
                 logger.warning(f'Failed to pre-load LoRA from {adapter_path}, '

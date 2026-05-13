@@ -36,79 +36,82 @@ if TYPE_CHECKING:  # only used for type hints, keep runtime deps minimal
     from twinkle.sampler.base import Sampler  # noqa: F401
 
 
-_SECTION_SCHEMA = """
-你是一个文本压缩助手。你的使用场景是针对一大段文字进行压缩，以便后续模型在需要更多信息的时候展开并阅读原始文字。
+_SECTION_SCHEMA = """You are a text compression assistant. A downstream model will read your compressed output to decide whether the detail it needs is inside this block; if yes, it will fetch and read the original passage.
 
-后续模型工作流程：
-阅读你的压缩结果 -> 确定需要的信息是否包含在本block中 -> 是 -> 阅读原文
+Downstream model workflow:
+Read your compressed output -> Decide whether needed info is in this block -> If yes -> Fetch original.
 
-因此你需要保证你的压缩不会损失原文中的主要信息。
+Therefore your compression MUST NOT lose major information from the source.
 
-你输出的格式：
+Output format:
 
 ```text
 ## Summary
-概述在，以及和Query强相关的事实显式给出
+Overview plus facts STRONGLY RELATED to the Query, stated explicitly.
 
 ## More
-折叠的目录，需要展开才能看到具体信息
+A collapsed index; expansion required to see specific information.
 ```
 
-你需要注意：
-1. 使用电报式格式，省略无用文字输出，例如“the”，“always”， “呢”等
-2. 概述部分的事实应当和Query强相关，More中的目录应当能体现出其他信息的目录结构，保证模型阅读More后可以了解有哪些信息可以还原
-3. 压缩后的语种和压缩前的文本应当相同
+Rules:
+1. Telegraphic style — drop function words ("the", "a", "is", "are", "of", ...); colons and commas mean "is" / "has".
+2. Summary MUST contain the passage's primary topic + 2–4 concrete core facts drawn from the source (entities, numbers, dates, relations). If a Query is given, order Query-relevant facts first, but STILL include other core facts within the budget. A Query is an ORDERING HINT, NOT a filter.
+3. Summary MUST NOT be meta-commentary about the Query. Forbidden patterns: "no X mention", "Query info: absent", "passage covers Y only", "does not contain ...", "no relevant info", or summaries that are only abstract category words like "structure/order/usage" with no facts. If the passage is unrelated to the Query, you still summarize the passage normally.
+4. More is an INDEX of category keywords, NOT inline data. Enumerate what CAN be recovered from the source (e.g. "birthplace, death place, age"); do NOT paste dates/numbers/names inline. Make sure all category of useful facts are introduced here.
+5. Output language MUST match the source language.
+6. Do NOT fabricate. Do NOT omit major information. Any fact not in the source MUST NOT appear in your output.
 
-例子：
+Example:
 
-原文：
-
+Source:
 ```text
-玛丽·居里（Marie Curie，1867年11月7日—1934年7月4日），原名玛丽亚·斯克沃多夫斯卡，出生于俄属波兰华沙，父母均为教师。因当时波兰女性被禁止接受高等教育，她与姐姐约定轮流资助对方赴海外求学。
+Marie Curie (7 Nov 1867 – 4 Jul 1934), born Maria Sklodowska in Warsaw (then Russian Poland); parents were teachers. Barred from Polish universities, she and her sister agreed to take turns funding each other's overseas study.
 
-1891年，玛丽前往巴黎，入读巴黎大学（索邦大学）。1893年获物理学学士学位，1894年再获数学学士学位，成为该校首位女性物理学讲师。1895年与法国物理学家皮埃尔·居里结婚，两人此后长期共同开展放射性研究。
+In 1891 Marie reached Paris and enrolled at the Sorbonne, earning a physics degree (1893) and a mathematics degree (1894), becoming the school's first female physics lecturer. In 1895 she married French physicist Pierre Curie; they spent the rest of their lives on radioactivity research.
 
-1898年7月，居里夫人发现新元素钋（Polonium），以其故乡波兰命名；同年12月与皮埃尔共同宣布发现镭（Radium）。她创造了"放射性（radioactivity）"一词，率先证明放射性是原子的固有属性，而非化学反应产物，从根本上重构了人类对物质结构的认识。
+In July 1898 she discovered polonium, named after her homeland Poland; in December she and Pierre announced the discovery of radium. She coined "radioactivity" and showed it is an atomic property, not a chemical reaction.
 
-1903年，她与皮埃尔·居里及亨利·贝可勒尔共同获得诺贝尔物理学奖，以表彰放射性研究。1911年，她再度单独摘得诺贝尔化学奖，以表彰发现钋与镭。她是史上第一位诺贝尔奖女性得主，也是迄今唯一在两个不同科学领域均获诺贝尔奖的人。1906年皮埃尔因马车事故遇难后，玛丽接任其职位，成为巴黎大学首位女教授。
+In 1903 she shared the Nobel Prize in Physics with Pierre and Henri Becquerel. In 1911 she alone won the Nobel Prize in Chemistry for polonium and radium. She is the first woman to win a Nobel, and the only person to win Nobels in two different sciences. After Pierre died in a carriage accident in 1906, Marie took his chair and became the first female professor at the Sorbonne.
 
-第一次世界大战期间，居里夫人研发了移动式X射线车，法文称"小居里（Petites Curies）"，共装备约20辆，部署于战场前线。据估计，该装备共为超过100万名伤兵提供了检查服务。
+During World War I she developed mobile X-ray units, called "Petites Curies" in French; about 20 were deployed to the front, examining over 1,000,000 wounded soldiers.
 
-她因长期接触放射性物质导致再生障碍性贫血，于1934年7月4日在法国上萨瓦省帕西逝世，享年66岁。其研究笔记至今仍具高度放射性，存放于铅盒中，研究人员查阅时须穿戴防护服。
+She died of aplastic anaemia from radiation exposure on 4 July 1934 in Passy, Haute-Savoie, France, aged 66. Her notebooks remain highly radioactive, kept in lead boxes; researchers must wear protective gear to consult them.
 ```
 
-压缩后：
+Compressed:
 ```text
 ## Summary
-玛丽·居里（Marie Curie）：法籍波兰裔物理/化学家，放射性研究奠基人，巴黎大学首位女教授。
-- 诺贝尔奖×2（物理+化学）首位女性得主，唯一双领域得主
-- 发现钋+镭；创"放射性"概念；证其为原子固有属性
+Marie Curie: French-Polish physicist/chemist, founder of radioactivity research, first female Sorbonne professor.
+- Nobel x2 (Physics + Chemistry); first woman Nobel laureate; only person with Nobels in two sciences.
+- Discovered polonium + radium; coined "radioactivity"; proved it is an atomic property.
 
 ## More
-- 出生地·逝世地·享年·死因
-- 学位年份·校内首位记录×2
-- 元素命名来源·合作者·完整时间线
-- 诺奖各届年份·联颁合作者·颁奖背景
-- 装备名·部署规模·救治数量
-- 笔记放射性·保存方式·查阅条件
+- birthplace, death place, age, cause of death
+- degree years, in-school firsts x2
+- element naming origin, collaborators, full timeline
+- Nobel year per prize, co-laureates, citation
+- device name, deployment scale, patients treated
+- notebook radioactivity, storage, access conditions
 ```
 
-现在开始：
+Now begin.
 """
 
 
 DEFAULT_SYSTEM_PROMPT = _SECTION_SCHEMA
 
 DEFAULT_USER_PROMPT_TEMPLATE = (
-    '下游模型将基于压缩块回答以下问题。禁止为迎合 Query 而编造原文中不存在的事实。\n\n'
-    '禁止编造原文中不存在的信息。\n\n'
-    '## Query\n'
-    '{query}\n\n'
-    '注意：你不需要回答上述问题，你的任务是忠实地压缩\n\n'
-    '## 长度目标\n'
-    '约 {soft_budget} 字符，上限 {budget}。\n\n'
-    '## 原文（Passage）\n'
-    '{text}')
+    'Downstream model will read your compressed block to decide whether to '
+    'expand it. Compress faithfully: preserve the passage topic + core facts. '
+    'Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary '
+    'about the Query (never write "Query info: absent", "no X mention", etc.); '
+    'if the passage does not address the Query, still summarize the passage.\n\n'
+    '## Query (ordering hint only — still summarize the whole passage)\n{query}\n\n'
+    '## Target length\n'
+    'Compress AS MUCH AS faithfully possible. HARD CEILING: {budget} chars. '
+    'If core facts fit in far fewer chars, output fewer. '
+    'Never exceed the ceiling.\n\n'
+    '## Passage\n{text}')
 
 
 # A (chunk_index, chunk, char_budget) triple marking one compression job.
@@ -251,11 +254,10 @@ class ModelCondenser(Condenser):
         self.min_budget_chars = int(min_budget_chars)
         self.template = template
         self.skip_roles = tuple(skip_roles)
-        # Pre-compile the skip-regex once; store ``None`` when disabled so
-        # ``_should_condense`` can short-circuit without a re-check.
+        # ``^`` must anchor to start-of-string, not start-of-line: a passage
+        # whose body contains a ``Question:`` line would otherwise skip compression.
         self.skip_re: Optional[re.Pattern] = (
-            re.compile(skip_pattern, re.MULTILINE)
-            if skip_pattern else None)
+            re.compile(skip_pattern) if skip_pattern else None)
         self.related_query = related_query
         self.rounds = set(rounds) if rounds is not None else None
         self.batch_size = batch_size
@@ -318,6 +320,8 @@ class ModelCondenser(Condenser):
             budget = max(
                 self.min_budget_chars,
                 math.ceil(len(content) / self.compression_ratio))
+            if budget >= len(content):
+                continue
             items.append(((i, c, max(1, budget)), current_query))
         return items
 

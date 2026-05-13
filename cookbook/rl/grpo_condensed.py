@@ -72,25 +72,26 @@ The context you receive is a **mix of two forms**:
 1. **Compressed blocks** — long passages wrapped in `<block_N>...</block_N>`, \
    displayed as a Markdown digest in **telegraphic style** (no \
    articles / "is" / "are"; colons and commas mean "is" / "has") \
-   with up to three sections:
-   - **Summary**: one short phrase (≤ 15 words), NOT a full sentence
-   - **Key Facts**: up to 4 short bullets (each ≤ 10 words)
-   - **More**: 5–8 comma-separated keywords hinting at details hidden in the full text
+   with two sections:
+   - **Summary**: overview plus facts strongly related to the question, stated explicitly.
+   - **More**: a collapsed INDEX of category keywords hinting at extra details hidden in the full text (call `extract_condensed` to see them).
    Reading example: `India: 7th largest by area. Borders: Pakistan, \
    China.` means "India is the 7th largest country by area and \
    shares borders with Pakistan and China."
-2. **Raw passages** — short passages shown inline as plain text (e.g. \
-   `[K] Title: ...`) **without** any `<block_N>` wrapping. These are already \
-   the full text; nothing is hidden.
+2. **Raw passages** — short passages shown inline as plain text (`Title: \
+   body`) **without** any `<block_N>` wrapping. These are already the full \
+   text; nothing is hidden.
 
 Only the `<block_N>`-wrapped blocks are compressed and can be expanded. \
-Do **not** try to extract raw passages — they have no block id and are \
-already complete.
+Block ids `N` are 1-based and assigned in the order compressed blocks \
+appear in the context, so they are always contiguous (`<block_1>`, \
+`<block_2>`, `<block_3>`, ...). Raw passages have no block id and cannot \
+be extracted — they are already complete.
 
 ## Workflow
 
 ### Phase 1 — Scan and Decide
-Step 1: Read each compressed block's Summary and Key Facts, and read raw \
+Step 1: Read each compressed block's Summary, and read raw \
 passages directly, to get an overview.
 Step 2: For compressed blocks, check the More keywords to judge whether \
 hidden details are needed.
@@ -99,7 +100,7 @@ Step 3: Decide which compressed blocks to expand, then call \
 
 ### Phase 2 — Reason and Answer
 After the tool returns the full text, continue stepping through the evidence:
-Step N:   From block X (or raw passage [K]), I learn that [fact A].
+Step N:   From block X (or the raw passage titled "..."), I learn that [fact A].
 Step N+1: From block Y, I need to call `extract_condensed` to get more information, because this block is related to...
 Step N+2: Combining these, the answer is ...
 \\boxed{answer}
@@ -156,12 +157,12 @@ class HotpotQAProcessor(Preprocessor):
         titles = context.get('title', []) or []
         sentences = context.get('sentences', []) or []
         lines = []
-        for i, (title, sents) in enumerate(zip(titles, sentences), start=1):
+        for title, sents in zip(titles, sentences):
             if isinstance(sents, list):
                 body = ' '.join(s.strip() for s in sents if s and s.strip())
             else:
                 body = str(sents).strip()
-            lines.append(f'[{i}] {title}: {body}')
+            lines.append(f'{title}: {body}')
         return '\n\n'.join(lines)
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Trajectory]:
@@ -427,7 +428,7 @@ def main():
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     chunker = NativeChunker(
         chunk_size=CHUNK_SIZE,
-        passage_boundary_re=r'\[\d+\]',
+        passage_boundary_re=r'(?<=\n\n)',
     )
     # ``\A`` anchor: prevents a ``Question:`` line inside a passage from being misread as the query.
     _question_re = re.compile(r'\AQuestion:\s*(.+)')

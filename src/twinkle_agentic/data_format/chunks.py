@@ -38,12 +38,12 @@ class Chunks:
             if c.get('type') in _MULTIMODAL_TYPES and not isinstance(c.get('raw'), dict):
                 media[c['type']].append(c.get('content'))
                 continue
-            if block_wrapper and c.get('type') == 'text':
+            if (block_wrapper and c.get('type') == 'text'
+                    and c.get('role') != 'tool'):
                 raw = c.get('raw')
                 is_condensed = isinstance(raw, dict) and raw.get('condensed')
                 content = c.get('content')
-                if (is_condensed and isinstance(content, str) and content
-                        and c.get('role') != 'tool'):
+                if is_condensed and isinstance(content, str) and content:
                     wrap_counter += 1
                     prefix = block_wrapper[0].format(n=wrap_counter)
                     suffix = block_wrapper[1].format(n=wrap_counter)

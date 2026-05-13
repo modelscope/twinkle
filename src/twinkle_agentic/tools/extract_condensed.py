@@ -24,9 +24,10 @@ class ExtractCondensed(Tool):
 
     The block enumeration rule mirrors :meth:`Chunks.to_trajectory`
     exactly: only text chunks with ``raw.condensed=True``,
-    ``role != 'tool'`` and non-empty content are indexed, in chunk
-    order, starting from ``1``. This guarantees the block numbers this
-    tool accepts match the ``<block_N>`` tags the model actually sees.
+    ``role != 'tool'`` and non-empty content are indexed via a
+    1-based monotonic counter in chunk order. The block ids this
+    tool accepts therefore match the ``<block_N>`` tags the model
+    actually sees.
     """
 
     def __init__(self, chunks: Chunks):
@@ -110,11 +111,11 @@ class ExtractCondensed(Tool):
         # id -- when the policy hallucinates a large range, echoing the
         # full list back multiplies the error into thousands of tokens.
         if n not in self._blocks:
-            count = len(self._blocks)
-            if count == 0:
+            if not self._blocks:
                 return f'Error: block {n} not found; no blocks available.'
+            ids = sorted(self._blocks)
             return (f'Error: block {n} not found; valid block ids are '
-                    f'1..{count}.')
+                    f'{ids}.')
 
         # Trajectory-bound idempotency. The raw text is already in the
         # conversation as a prior tool response -- returning it again would

@@ -285,7 +285,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
                         else None),
                     'compressed': content,
                 }
-            elif role != 'system':
+            elif role == 'user':
                 passage_counter += 1
                 passages[f'passage_{passage_counter}'] = {
                     'content': content,

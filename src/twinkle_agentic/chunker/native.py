@@ -162,7 +162,7 @@ class NativeChunker(Chunker):
         # merged with sibling passages) when it exceeds ``chunk_size``.
         out: List[str] = []
         for piece in self._force_split(text):
-            if not piece:
+            if not piece or not piece.strip():
                 continue
             if len(piece) <= self.chunk_size:
                 out.append(piece)
