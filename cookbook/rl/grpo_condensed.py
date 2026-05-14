@@ -60,6 +60,9 @@ TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.05))
 TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
+# KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
+KL_BETA = float(os.environ.get('KL_BETA', 0.01))
+
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 
 _ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
@@ -407,7 +410,7 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=total_steps, eta_min=0)
 
-    model.set_loss('GRPOLoss', epsilon=0.2)
+    model.set_loss('GRPOLoss', epsilon=0.2, beta=KL_BETA)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, max_length=HOTPOTQA_MAX_LENGTH)
 
@@ -541,10 +544,18 @@ def main():
                 total_completions, aligned_completions, MODEL_GPUS)
         for mb_start in range(0, aligned_completions, MINI_BATCH_SIZE):
             mb_end = min(mb_start + MINI_BATCH_SIZE, aligned_completions)
+            mb_inputs = all_input_data[mb_start:mb_end]
+            # Reference log-probs for KL: same policy model with LoRA adapter disabled (= base model).
+            # Skipped when KL_BETA == 0 to save one extra forward per mini-batch.
+            ref_logps = None
+            if KL_BETA > 0.0:
+                ref_outputs = model.forward_only(inputs=mb_inputs, disable_lora=True)
+                ref_logps = ref_outputs.get('logps') if isinstance(ref_outputs, dict) else getattr(ref_outputs, 'logps', None)
             model.forward_backward(
-                inputs=all_input_data[mb_start:mb_end],
+                inputs=mb_inputs,
                 old_logps=all_old_logps[mb_start:mb_end],
                 advantages=advantages[mb_start:mb_end],
+                ref_logps=ref_logps,
                 micro_batch_size=MICRO_BATCH_SIZE)
             model.clip_grad_and_step()
             optim_step += 1
