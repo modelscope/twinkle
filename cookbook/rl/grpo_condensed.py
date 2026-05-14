@@ -63,6 +63,10 @@ TOOL_BONUS_F1_THRESHOLD = float(
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
 KL_BETA = float(os.environ.get('KL_BETA', 0.01))
 
+# Entropy bonus coefficient; 0 disables the entropy compute path entirely.
+# Typical GRPO values: 0.001–0.01. Loss is: L = L_PPO + beta*KL - entropy_coef*H.
+ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
+
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 
 _ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
@@ -410,7 +414,7 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=total_steps, eta_min=0)
 
-    model.set_loss('GRPOLoss', epsilon=0.2, beta=KL_BETA)
+    model.set_loss('GRPOLoss', epsilon=0.2, beta=KL_BETA, entropy_coef=ENTROPY_COEF)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, max_length=HOTPOTQA_MAX_LENGTH)
 

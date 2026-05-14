@@ -18,6 +18,10 @@ class GRPOLoss(Loss):
         epsilon: Clipping epsilon for PPO objective (lower bound)
         epsilon_high: Clipping epsilon for high importance sampling ratio (upper bound)
         beta: KL penalty coefficient (0.0 = no KL penalty)
+        entropy_coef: Entropy bonus coefficient (0.0 = disabled). When > 0, the loss
+            subtracts ``entropy_coef * H(pi)`` per token to encourage exploration and
+            prevent mode-collapse / repetition. Requires the model forward to supply
+            ``outputs['entropies']`` — enabled automatically via ``require_entropy``.
         ignore_index: Index to ignore in labels (default: -100)
     """
 
@@ -26,12 +30,16 @@ class GRPOLoss(Loss):
         epsilon: float = 0.2,
         epsilon_high: Optional[float] = None,
         beta: float = 0.0,
+        entropy_coef: float = 0.0,
         ignore_index: int = -100,
         **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
+        self.entropy_coef = entropy_coef
+        # Gate the expensive entropy compute path in the model forward.
+        self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
 
     def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
@@ -261,6 +269,19 @@ class GRPOLoss(Loss):
         if self.beta > 0.0 and ref_logps is not None:
             per_token_kl = (torch.exp(ref_logps - logps) - (ref_logps - logps) - 1)
             per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        # Entropy bonus: subtract entropy_coef * H(pi) to encourage exploration.
+        # The model forward is gated by self.require_entropy to actually materialize
+        # outputs['entropies']; if a caller set entropy_coef>0 but the forward did
+        # not populate it, we fail loudly so mis-wiring is caught early.
+        if self.entropy_coef > 0.0:
+            entropies = outputs.get('entropies')
+            assert entropies is not None, (
+                'entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
+                "loss instance's require_entropy flag was set before the forward call.")
+            # entropies may come in fp32 from the kernel; cast to match logps dtype
+            # so the final per_token_loss stays consistent (bf16 under amp).
+            per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
