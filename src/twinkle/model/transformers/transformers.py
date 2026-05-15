@@ -360,14 +360,22 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         assert isinstance(inputs, dict)
         return 'input_ids' not in inputs and 'input_embedding' not in inputs
 
+    def _capture_rank0_pre_ep_state_if_needed(self):
+        """Capture rank0 pre-EP full state_dict for memory_efficient_init broadcast."""
+        if getattr(self, '_pre_ep_state_captured', False):
+            return
+        use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+        set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
+        if not (self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None):
+            return
+        is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
+        set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
+        self._pre_ep_state_captured = True
+
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
-            use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
-            set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
-            if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
-                is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
-                set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
+            self._capture_rank0_pre_ep_state_if_needed()
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
@@ -1293,9 +1301,58 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         return optimizer_config.calculate_metrics(is_training)
 
+    @staticmethod
+    def _validate_ep_lora_config(self, lora_config) -> None:
+        from peft import LoraConfig
+
+        if not getattr(self, '_enable_expert_parallel', False):
+            return
+        if not isinstance(self.strategy, NativeFSDPStrategy):
+            raise RuntimeError(
+                'EP + LoRA requires strategy=native_fsdp; '
+                f'got {type(self.strategy).__name__}.')
+        if not isinstance(lora_config, LoraConfig):
+            return
+        target_params = getattr(lora_config, 'target_parameters', None) or []
+        if target_params:
+            if getattr(lora_config, 'use_dora', False):
+                raise ValueError(
+                    'PEFT ParamWrapper does not support use_dora=True with target_parameters; '
+                    'disable DoRA when training expert parameters.')
+            if getattr(lora_config, 'lora_bias', False):
+                raise ValueError(
+                    'PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
+            if float(getattr(lora_config, 'lora_dropout', 0.0)) > 0.0:
+                raise ValueError(
+                    'PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
+
+    @staticmethod
+    def _maybe_autofill_target_parameters(lora_config, enable_ep: bool):
+        from peft import LoraConfig
+
+        if not enable_ep or not isinstance(lora_config, LoraConfig):
+            return lora_config
+        target_params = getattr(lora_config, 'target_parameters', None) or []
+        if not target_params:
+            lora_config.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
+            logger.info(
+                "EP+LoRA auto-filled target_parameters with "
+                "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
+        return lora_config
+
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
         unwrapped_model = self.strategy.unwrap_model(self.model)
+        if not isinstance(config_or_dir, str):
+            self._validate_ep_lora_config(self, config_or_dir)
+            config_or_dir = self._maybe_autofill_target_parameters(
+                config_or_dir, enable_ep=getattr(self, '_enable_expert_parallel', False))
+
+        if getattr(self, '_enable_expert_parallel', False):
+            self._capture_rank0_pre_ep_state_if_needed()
+            self._maybe_apply_expert_parallel()
+            unwrapped_model = self.strategy.unwrap_model(self.model)
+
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
             _adapted_model = PeftModel.from_pretrained(
