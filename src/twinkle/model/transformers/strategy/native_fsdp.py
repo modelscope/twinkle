@@ -393,6 +393,8 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
         if getattr(module, '_ep_ignore_shared_experts', False) and getattr(module, '_ep_patched', False):
             ep_patched = True
             shared = getattr(module, 'shared_expert', None)
+            if shared is None:
+                shared = getattr(module, 'shared_experts', None)
             if shared is not None:
                 ignored.update(shared.parameters())
 
@@ -495,6 +497,8 @@ def _place_ep_experts_on_local_device(model: nn.Module, ep_fsdp_device_mesh: Opt
             _move_module_to_device_or_empty(experts, local_device)
         if getattr(module, '_ep_ignore_shared_experts', False):
             shared = getattr(module, 'shared_expert', None)
+            if shared is None:
+                shared = getattr(module, 'shared_experts', None)
             if shared is not None:
                 _move_module_to_device_or_empty(shared, local_device)
 
