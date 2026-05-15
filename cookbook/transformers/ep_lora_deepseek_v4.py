@@ -39,11 +39,16 @@ device_mesh = DeviceMesh.from_sizes(
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 
+def _get_text_config(config):
+    return getattr(config, 'text_config', config)
+
+
 def train():
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = NUM_LAYERS
-    if hasattr(config, 'use_cache'):
-        config.use_cache = False
+    text_config = _get_text_config(config)
+    text_config.num_hidden_layers = NUM_LAYERS
+    if hasattr(text_config, 'use_cache'):
+        text_config.use_cache = False
 
     dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=range(500)))
     dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)

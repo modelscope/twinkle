@@ -16,6 +16,8 @@ import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.model import TransformersModel
 
+from ep_lora_config_helpers import get_vocab_size, set_text_config_attrs
+
 logger = get_logger()
 MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 TOL = float(os.environ.get('TOL', '1e-3'))
@@ -23,8 +25,7 @@ TOL = float(os.environ.get('TOL', '1e-3'))
 
 def build_model():
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 2
-    config.use_cache = False
+    set_text_config_attrs(config, num_hidden_layers=2, use_cache=False)
     device_mesh = DeviceMesh.current()
     model = TransformersModel(
         model_id=MODEL_ID,
@@ -45,9 +46,10 @@ def build_model():
 
 def fixed_batch(config):
     torch.manual_seed(0)
+    vocab_size = get_vocab_size(config)
     return {
-        'input_ids': torch.randint(0, config.vocab_size, (2, 32), device=Platform.get_local_device()),
-        'labels': torch.randint(0, config.vocab_size, (2, 32), device=Platform.get_local_device()),
+        'input_ids': torch.randint(0, vocab_size, (2, 32), device=Platform.get_local_device()),
+        'labels': torch.randint(0, vocab_size, (2, 32), device=Platform.get_local_device()),
         'attention_mask': torch.ones(2, 32, dtype=torch.long, device=Platform.get_local_device()),
     }
 

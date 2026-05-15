@@ -16,6 +16,8 @@ import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.model import TransformersModel
 
+from ep_lora_config_helpers import get_vocab_size, set_text_config_attrs
+
 logger = get_logger()
 MODEL_ID = os.environ.get('DSV4_MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4')
 TOL = float(os.environ.get('TOL', '1e-3'))
@@ -23,12 +25,13 @@ TOL = float(os.environ.get('TOL', '1e-3'))
 
 def build_model():
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 2
-    if hasattr(config, 'n_routed_experts'):
-        config.n_routed_experts = 4
-    if hasattr(config, 'num_experts_per_tok'):
-        config.num_experts_per_tok = 2
-    config.use_cache = False
+    text_config = getattr(config, 'text_config', config)
+    attrs = {'num_hidden_layers': 2, 'use_cache': False}
+    if hasattr(text_config, 'n_routed_experts'):
+        attrs['n_routed_experts'] = 4
+    if hasattr(text_config, 'num_experts_per_tok'):
+        attrs['num_experts_per_tok'] = 2
+    set_text_config_attrs(config, **attrs)
     device_mesh = DeviceMesh.current()
     model = TransformersModel(
         model_id=MODEL_ID,
@@ -49,9 +52,10 @@ def build_model():
 
 def fixed_batch(config):
     torch.manual_seed(0)
+    vocab_size = get_vocab_size(config)
     return {
-        'input_ids': torch.randint(0, config.vocab_size, (2, 32), device=Platform.get_local_device()),
-        'labels': torch.randint(0, config.vocab_size, (2, 32), device=Platform.get_local_device()),
+        'input_ids': torch.randint(0, vocab_size, (2, 32), device=Platform.get_local_device()),
+        'labels': torch.randint(0, vocab_size, (2, 32), device=Platform.get_local_device()),
         'attention_mask': torch.ones(2, 32, dtype=torch.long, device=Platform.get_local_device()),
     }
 

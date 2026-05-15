@@ -16,6 +16,8 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 
+from ep_lora_config_helpers import set_text_config_attrs
+
 logger = get_logger()
 MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
@@ -32,8 +34,7 @@ def main():
     )
     twinkle.initialize(mode='local', global_device_mesh=device_mesh)
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 4
-    config.use_cache = False
+    set_text_config_attrs(config, num_hidden_layers=4, use_cache=False)
 
     dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=range(1000)))
     dataset.set_template('Qwen3_5Template', model_id=MODEL_ID)

@@ -12,6 +12,8 @@ import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.model import TransformersModel
 
+from ep_lora_config_helpers import set_text_config_attrs
+
 logger = get_logger()
 MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 
@@ -25,9 +27,7 @@ def main():
     )
     twinkle.initialize(mode='local', global_device_mesh=device_mesh)
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 2
-    config.num_experts = 4
-    config.use_cache = False
+    set_text_config_attrs(config, num_hidden_layers=2, num_experts=4, use_cache=False)
 
     model = TransformersModel(
         model_id=MODEL_ID,

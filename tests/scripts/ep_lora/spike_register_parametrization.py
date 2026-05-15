@@ -14,6 +14,8 @@ import twinkle
 from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.model import TransformersModel
 
+from ep_lora_config_helpers import get_vocab_size, set_text_config_attrs
+
 logger = get_logger()
 
 MODEL_ID = os.environ.get('QWEN3_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
@@ -29,13 +31,16 @@ def main():
     twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 2
-    config.hidden_size = 128
-    config.intermediate_size = 256
-    config.moe_intermediate_size = 64
-    config.num_experts = 4
-    config.num_experts_per_tok = 2
-    config.use_cache = False
+    set_text_config_attrs(
+        config,
+        num_hidden_layers=2,
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        use_cache=False,
+    )
 
     model = TransformersModel(
         model_id=MODEL_ID,
@@ -55,9 +60,10 @@ def main():
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     torch.manual_seed(42 + rank)
+    vocab_size = get_vocab_size(config)
     batch = {
-        'input_ids': torch.randint(0, config.vocab_size, (2, 16), device=Platform.get_local_device()),
-        'labels': torch.randint(0, config.vocab_size, (2, 16), device=Platform.get_local_device()),
+        'input_ids': torch.randint(0, vocab_size, (2, 16), device=Platform.get_local_device()),
+        'labels': torch.randint(0, vocab_size, (2, 16), device=Platform.get_local_device()),
         'attention_mask': torch.ones(2, 16, dtype=torch.long, device=Platform.get_local_device()),
     }
 
