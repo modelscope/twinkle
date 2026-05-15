@@ -103,6 +103,45 @@ def _clone_state_dict_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     return cloned
 
 
+def _get_named_child(module, name: str):
+    if hasattr(module, name):
+        return getattr(module, name)
+    if name.isdigit() and hasattr(module, '__getitem__'):
+        try:
+            return module[int(name)]
+        except (IndexError, TypeError, KeyError):
+            return None
+    return None
+
+
+def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_world_size: int,
+                                 ep_rank: int) -> torch.Tensor:
+    """Slice saved LoRA expert weights by EP rank before DTensor/FSDP placement."""
+    if ep_world_size <= 1:
+        return value
+
+    parts = model_key.split('.')
+    parent = model
+    matched = False
+    for i, part in enumerate(parts[:-1]):
+        parent = _get_named_child(parent, part)
+        if parent is None:
+            return value
+        next_seg = parts[i + 1] if i + 1 < len(parts) else None
+        if getattr(parent, '_ep_patched', False) and next_seg == 'experts':
+            matched = True
+
+    if not matched:
+        return value
+    if 'lora_A' in model_key:
+        chunk = value.size(0) // ep_world_size
+        return value.narrow(0, ep_rank * chunk, chunk).contiguous()
+    if 'lora_B' in model_key:
+        chunk = value.size(1) // ep_world_size
+        return value.narrow(1, ep_rank * chunk, chunk).contiguous()
+    return value
+
+
 @dataclass
 class OptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Transformers training."""
@@ -1017,11 +1056,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save
-            state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
-            for key, value in state_dict.items():
-                key = key.replace(f'.{adapter_name}.', '.')
-                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
+            # LoRA adapter save (EP-aware via strategy.get_full_state_dict)
+            full_state = self.strategy.get_full_state_dict(self.model)
+            adapter_marker = '.lora_'
+            adapter_suffix = f'.{adapter_name}.'
+            for key, value in full_state.items():
+                if adapter_marker not in key:
+                    continue
+                if adapter_suffix not in key:
+                    continue
+                normalized = key.replace(adapter_suffix, '.')
+                processed_state_dict[normalized] = value
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
@@ -1124,6 +1169,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             def load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name='default'):
                 from torch.distributed.tensor import DTensor, distribute_tensor
 
+                ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
+                ep_world_size = ep_fsdp_mesh['ep'].size() if ep_fsdp_mesh is not None else 1
+                ep_rank = ep_fsdp_mesh['ep'].get_local_rank() if ep_world_size > 1 else 0
+
                 model_sd = model.state_dict()
                 converted_weights = {}
                 for key, value in adapter_weights.items():
@@ -1132,6 +1181,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
                     if model_key in model_sd:
                         param = model_sd[model_key]
+                        value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                     converted_weights[key] = value
