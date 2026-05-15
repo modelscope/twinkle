@@ -140,15 +140,21 @@ class Qwen3_5Template(QwenTemplate):
         input_feature = self.to_tensor(input_feature)
         attention_mask = input_feature.get('attention_mask').unsqueeze(0)
         input_ids = input_feature['input_ids'].unsqueeze(0)
+        image_grid_thw = input_feature.get('image_grid_thw')
+        video_grid_thw = input_feature.get('video_grid_thw')
+        has_image_grid = image_grid_thw is not None and (torch.is_tensor(image_grid_thw) and image_grid_thw.numel() > 0)
+        has_video_grid = video_grid_thw is not None and (torch.is_tensor(video_grid_thw) and video_grid_thw.numel() > 0)
         if 'mm_token_type_ids' in inspect.signature(self.rope_index_func).parameters:
             mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == self.processor.image_token_id] = 1
-            mm_token_type_ids[input_ids == self.processor.video_token_id] = 2
+            if has_image_grid:
+                mm_token_type_ids[input_ids == self.processor.image_token_id] = 1
+            if has_video_grid:
+                mm_token_type_ids[input_ids == self.processor.video_token_id] = 2
             kwargs['mm_token_type_ids'] = mm_token_type_ids
         position_ids, _ = self.rope_index_func(
             input_ids,
-            image_grid_thw=input_feature.get('image_grid_thw'),
-            video_grid_thw=input_feature.get('video_grid_thw'),
+            image_grid_thw=image_grid_thw if has_image_grid else None,
+            video_grid_thw=video_grid_thw if has_video_grid else None,
             attention_mask=attention_mask,
             **kwargs)
         return self._concat_text_position_ids(position_ids)

@@ -61,7 +61,7 @@ TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
-KL_BETA = float(os.environ.get('KL_BETA', 0.01))
+KL_BETA = float(os.environ.get('KL_BETA', 0.05))
 
 # Entropy bonus coefficient; 0 disables the entropy compute path entirely.
 # Typical GRPO values: 0.001–0.01. Loss is: L = L_PPO + beta*KL - entropy_coef*H.

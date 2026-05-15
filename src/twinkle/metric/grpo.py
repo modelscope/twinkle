@@ -70,6 +70,9 @@ class GRPOMetric(Metric):
         self.sum_old: float = 0.0
         self.sum_diff: float = 0.0
         self.sum_approx_kl: float = 0.0
+        self.max_token_kl: float = 0.0
+        self.max_token_ratio: float = 0.0
+        self.kl_values: list = []
         self.n_tokens: int = 0
         self.has_old: bool = False
 
@@ -156,7 +159,22 @@ class GRPOMetric(Metric):
         #   samples x ~ old,  r(x) = new(x) / old(x),
         #   k3 = r - 1 - log(r) = exp(new - old) - (new - old) - 1.
         kl = torch.exp(d) - d - 1.0
-        self.sum_approx_kl += float((kl * mask_f).sum().item())
+        kl_masked = kl * mask_f
+        self.sum_approx_kl += float(kl_masked.sum().item())
+        # Per-token extremes for collapse detection
+        if kl_masked.numel() > 0:
+            cur_max_kl = float(kl_masked.max().item())
+            if cur_max_kl > self.max_token_kl:
+                self.max_token_kl = cur_max_kl
+            # Track ratio extremes
+            ratio_masked = torch.exp(d) * mask_f
+            cur_max_ratio = float(ratio_masked.max().item())
+            if cur_max_ratio > self.max_token_ratio:
+                self.max_token_ratio = cur_max_ratio
+            # Collect valid KL values for percentile computation
+            valid_kl = kl[mask.bool()]
+            if valid_kl.numel() > 0:
+                self.kl_values.append(valid_kl.detach().cpu())
         self.has_old = True
         return num_seq
 
@@ -219,12 +237,15 @@ class GRPOMetric(Metric):
             cursor += advanced
 
     def calculate(self) -> Dict[str, Any]:
+        import torch
         local = [{
             'sum_new': self.sum_new,
             'sum_new_sq': self.sum_new_sq,
             'sum_old': self.sum_old,
             'sum_diff': self.sum_diff,
             'sum_kl': self.sum_approx_kl,
+            'max_token_kl': self.max_token_kl,
+            'max_token_ratio': self.max_token_ratio,
             'n': self.n_tokens,
             'has_old': self.has_old,
         }]
@@ -241,17 +262,27 @@ class GRPOMetric(Metric):
         var_new = max(0.0, sum_new_sq / n_total - mean_new * mean_new)
 
         results: Dict[str, Any] = {
-            'train/policy_confidence': f'{math.exp(mean_new):.4f}',
-            'train/mean_new_logp': f'{mean_new:.4f}',
-            'train/logp_std': f'{math.sqrt(var_new):.4f}',
+            'train/policy_confidence': math.exp(mean_new),
+            'train/mean_new_logp': mean_new,
+            'train/logp_std': math.sqrt(var_new),
         }
         if any(r['has_old'] for r in all_results):
             mean_old = sum(r['sum_old'] for r in all_results) / n_total
             mean_diff = sum(r['sum_diff'] for r in all_results) / n_total
             mean_kl = sum(r['sum_kl'] for r in all_results) / n_total
-            results['train/mean_old_logp'] = f'{mean_old:.4f}'
-            results['train/logp_diff_mean'] = f'{mean_diff:+.4f}'
-            results['train/approx_kl'] = f'{mean_kl:.6f}'
+            global_max_kl = max(r['max_token_kl'] for r in all_results)
+            global_max_ratio = max(r['max_token_ratio'] for r in all_results)
+            results['train/mean_old_logp'] = mean_old
+            results['train/logp_diff_mean'] = mean_diff
+            results['train/approx_kl'] = mean_kl
+            results['train/token_kl_max'] = global_max_kl
+            results['train/token_ratio_max'] = global_max_ratio
+            # Compute KL percentiles from collected values (local rank only)
+            if self.kl_values:
+                all_kl = torch.cat(self.kl_values)
+                if all_kl.numel() >= 10:
+                    results['train/token_kl_p95'] = float(torch.quantile(all_kl.float(), 0.95).item())
+                    results['train/token_kl_p99'] = float(torch.quantile(all_kl.float(), 0.99).item())
 
         self.reset()
         return results

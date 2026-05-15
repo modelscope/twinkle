@@ -250,8 +250,11 @@ class GRPOLoss(Loss):
                 logps.dtype,
             )
 
-        assert advantages is not None, \
-            'advantages must be provided (pass as kwarg to forward_backward)'
+        # GRPO loss is ill-defined without advantages (e.g. ref-logps-only forward,
+        # or eval/validation forwards). Return a zero loss so the forward still
+        # flows through cleanly and callers can harvest outputs['logps'] freely.
+        if advantages is None:
+            return LossOutput(loss=torch.zeros((), device=device, dtype=logps.dtype), num_tokens=0)
 
         advantages = self._pad_and_align_to_batch(
             advantages,
