@@ -37,7 +37,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
-LEARNING_RATE = float(os.environ.get('LR', 5e-6))
+LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 NUM_EPOCHS = int(os.environ.get('NUM_EPOCHS', 10))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 0))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
@@ -57,16 +57,24 @@ HOTPOTQA_MAX_LENGTH = int(os.environ.get('HOTPOTQA_MAX_LENGTH', 64000))
 
 F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0))
-TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.00))
+TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.05))
 TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
-KL_BETA = float(os.environ.get('KL_BETA', 0.02))
+# CISPO is token-level and DOES support per-token KL — small positive value (e.g. 0.005) recommended as anchor.
+KL_BETA = float(os.environ.get('KL_BETA', 0.0))
 
 # Entropy bonus coefficient; 0 disables the entropy compute path entirely.
 # Typical GRPO values: 0.001–0.01. Loss is: L = L_PPO + beta*KL - entropy_coef*H.
 ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
+
+# CISPO token-level IS clamp thresholds (MiniMax CISPO defaults: 0.2 / 0.28 asymmetric).
+CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
+CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.28))
+
+# High-KL token capture: top-K per microbatch dumped into log_dict['_high_kl_records']. 0 = disabled.
+HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
 
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
@@ -437,11 +445,14 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=total_steps, eta_min=0)
 
-    model.set_loss('GRPOLoss', epsilon=0.2, beta=KL_BETA, entropy_coef=ENTROPY_COEF)
+    model.set_loss('CISPOLoss', epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
+                   beta=KL_BETA, entropy_coef=ENTROPY_COEF)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, max_length=HOTPOTQA_MAX_LENGTH)
 
-    model.add_metric('GRPOMetric', is_training=True)
+    model.add_metric('CISPOMetric', is_training=True,
+                     epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
+                     top_k_kl=HIGH_KL_TOPK)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -629,6 +640,21 @@ def main():
         log_dict['neg_pos_adv_rate'] = neg_with_pos_adv / n_neg if n_neg else 0.0
         log_dict['adv_max'] = max(rollout_advantages) if rollout_advantages else 0.0
         log_dict['adv_min'] = min(rollout_advantages) if rollout_advantages else 0.0
+        # Pop high-KL token records before swanlab.log: list-of-dict won't render as a chart.
+        _hk = log_dict.pop('_high_kl_records', None)
+        if _hk:
+            _tok = rollout_template.tokenizer
+            for r in _hk:
+                gsi = r.get('gsi')
+                tid = all_trajectories[gsi].get('id') if gsi is not None and 0 <= gsi < len(all_trajectories) else None
+                try:
+                    tok_text = _tok.decode([r['token_id']])
+                except Exception:
+                    tok_text = None
+                logger.info(
+                    '[high-kl] step=%d gsi=%s tid=%s pos=%s tok=%r kl=%.4f r=%.4f lp_new=%.4f lp_old=%.4f',
+                    optim_step, gsi, tid, r.get('pos'), tok_text,
+                    r.get('kl'), r.get('ratio'), r.get('logp_new'), r.get('logp_old'))
         swanlab.log(_coerce_for_swanlab(log_dict))
         metrics.reset()
         logger.info(f'[Step {optim_step}/{total_steps}] {log_dict}')

@@ -290,58 +290,6 @@ class GRPOLoss(Loss):
 
         return LossOutput(loss=loss, num_tokens=0)
 
-    def compute_metrics(
-        self,
-        per_token_logps: 'torch.Tensor',
-        per_token_old_logps: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        labels: 'torch.Tensor',
-        ref_logps: Optional['torch.Tensor'] = None,
-    ) -> Dict[str, float]:
-        """Compute training metrics."""
-        import torch
-
-        # Ensure labels are shifted for loss_mask
-        shift_labels = labels[:, 1:] if labels.shape[1] > per_token_logps.shape[1] else labels
-        loss_mask = self._compute_loss_mask(shift_labels)
-
-        # Align shapes
-        seq_len = min(per_token_logps.shape[1], per_token_old_logps.shape[1], loss_mask.shape[1])
-        per_token_logps = per_token_logps[:, -seq_len:]
-        per_token_old_logps = per_token_old_logps[:, -seq_len:]
-        loss_mask = loss_mask[:, -seq_len:]
-
-        token_count = loss_mask.sum().clamp(min=1.0)
-
-        def masked_mean(x):
-            if x.shape[-1] == 1:
-                return x.mean()
-            return (x * loss_mask).sum() / token_count
-
-        log_ratio = torch.clamp(per_token_logps - per_token_old_logps, min=-20.0, max=20.0)
-        ratio = torch.exp(log_ratio)
-
-        # Ensure advantages is 2D
-        if advantages.dim() == 1:
-            advantages = advantages.unsqueeze(1)
-
-        metrics = {}
-
-        # KL divergence
-        metrics['kl'] = masked_mean(-log_ratio).item()
-
-        # Clipping metrics
-        is_low_clipped = (ratio < 1 - self.epsilon) & (advantages < 0)
-        is_high_clipped = (ratio > 1 + self.epsilon_high) & (advantages > 0)
-        metrics['clip_ratio_low'] = masked_mean(is_low_clipped.float()).item()
-        metrics['clip_ratio_high'] = masked_mean(is_high_clipped.float()).item()
-        metrics['clip_ratio'] = masked_mean((is_low_clipped | is_high_clipped).float()).item()
-
-        # Ratio statistics
-        metrics['ratio_mean'] = masked_mean(ratio).item()
-
-        return metrics
-
 
 class GSPOLoss(GRPOLoss):
     """
@@ -414,7 +362,8 @@ class CISPOLoss(GRPOLoss):
     ) -> 'torch.Tensor':
         """Clamped ratio * advantage * log_prob."""
         import torch
-        clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
+        # Two-sided IS clamp with asymmetric epsilon, matching MiniMax CISPO spec.
+        clamped_ratios = torch.clamp(ratio, min=1 - self.epsilon, max=1 + self.epsilon_high).detach()
         return -clamped_ratios * advantages * per_token_logps
 
     def _aggregate_loss(

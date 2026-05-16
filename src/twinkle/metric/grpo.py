@@ -50,6 +50,9 @@ class GRPOMetric(Metric):
         process_group=None,
         ignore_index: int = -100,
         temperature: float = 1.0,
+        epsilon: float = 0.2,
+        epsilon_high: Optional[float] = None,
+        top_k_kl: int = 0,
         **kwargs,
     ):
         super().__init__(device_mesh, process_group, **kwargs)
@@ -62,6 +65,9 @@ class GRPOMetric(Metric):
         self.sum_new = None
         self.ignore_index = ignore_index
         self.temperature = float(temperature)
+        self.epsilon = float(epsilon)
+        self.epsilon_high = float(epsilon_high) if epsilon_high is not None else float(epsilon)
+        self.top_k_kl = int(top_k_kl)
         self.reset()
 
     def reset(self):
@@ -81,6 +87,13 @@ class GRPOMetric(Metric):
         self.sum_diff_f1_zero: float = 0.0
         self.n_tokens_f1_pos: int = 0
         self.n_tokens_f1_zero: int = 0
+        self.sum_entropy: float = 0.0
+        self.n_entropy_tokens: int = 0
+        self.sum_clip_low: float = 0.0
+        self.sum_clip_high: float = 0.0
+        self.clip_n_total: float = 0.0
+        self.high_kl_records: list = []
+        self._gsi_cursor: int = 0
 
     @staticmethod
     def _as_mb_list(logps_val) -> Optional[List]:
@@ -95,12 +108,51 @@ class GRPOMetric(Metric):
             return [logps_val]
         return None
 
+    def _collect_high_kl(
+        self,
+        d: 'torch.Tensor',
+        kl_masked: 'torch.Tensor',
+        labels: 'torch.Tensor',
+        logps_f: 'torch.Tensor',
+        old_f: 'torch.Tensor',
+        gsi_base: int,
+    ) -> None:
+        import torch
+        if kl_masked.numel() == 0:
+            return
+        flat = kl_masked.flatten()
+        n_pos = int((flat > 0).sum().item())
+        k = min(self.top_k_kl, n_pos)
+        if k <= 0:
+            return
+        topk_vals, topk_idx = torch.topk(flat, k)
+        seq_len = kl_masked.shape[-1]
+        for j in range(k):
+            kl_v = float(topk_vals[j].item())
+            if kl_v <= 0:
+                continue
+            idx = int(topk_idx[j].item())
+            i = idx // seq_len
+            pos = idx % seq_len
+            self.high_kl_records.append({
+                'gsi': gsi_base + i,
+                'pos': pos,
+                'token_id': int(labels[i, pos].item()),
+                'kl': kl_v,
+                'ratio': float(torch.exp(d[i, pos]).item()),
+                'logp_new': float(logps_f[i, pos].item()),
+                'logp_old': float(old_f[i, pos].item()),
+            })
+
     def _accumulate_mb(
         self,
         labels: 'torch.Tensor',
         logps: 'torch.Tensor',
         old_slice: Any,
         f1_slice: Optional[List[float]] = None,
+        entropies: Optional['torch.Tensor'] = None,
+        adv_slice: Any = None,
+        gsi_base: int = 0,
     ) -> int:
         """Reduce one microbatch into ``self.sum_*`` counters.
 
@@ -148,6 +200,22 @@ class GRPOMetric(Metric):
         self.n_tokens += n_tok
         self.sum_new += float((logps_f * mask_f).sum().item())
         self.sum_new_sq += float(((logps_f ** 2) * mask_f).sum().item())
+
+        # Entropy is loss-type-agnostic; aligned to logps shape by the model forward.
+        if entropies is not None and torch.is_tensor(entropies) and entropies.numel() > 0:
+            ent_f = entropies.float()
+            if ent_f.shape[-1] != mask_f.shape[-1]:
+                m_ent = min(ent_f.shape[-1], mask_f.shape[-1])
+                ent_f = ent_f[..., :m_ent]
+                ent_mask = mask_f[..., :m_ent]
+            else:
+                ent_mask = mask_f
+            if ent_f.shape[0] != ent_mask.shape[0]:
+                n_ent = min(ent_f.shape[0], ent_mask.shape[0])
+                ent_f = ent_f[:n_ent]
+                ent_mask = ent_mask[:n_ent]
+            self.sum_entropy += float((ent_f * ent_mask).sum().item())
+            self.n_entropy_tokens += int(ent_mask.sum().item())
 
         if f1_slice is not None and len(f1_slice) >= logps_f.shape[0]:
             for i in range(logps_f.shape[0]):
@@ -207,7 +275,31 @@ class GRPOMetric(Metric):
             if valid_kl.numel() > 0:
                 self.kl_values.append(valid_kl.detach().cpu())
         self.has_old = True
+
+        # Clip stats: gated by subclass (token-level / seq-level / unconditional).
+        if adv_slice is not None:
+            adv_aligned = _align_logps_to_mask(adv_slice, mask, logps_f.dtype)
+            if adv_aligned is not None:
+                self._accumulate_clip(d, adv_aligned, mask, mask_f)
+        if self.top_k_kl > 0:
+            self._collect_high_kl(d, kl_masked, labels, logps_f, old_f, gsi_base)
         return num_seq
+
+    def _accumulate_clip(
+        self,
+        log_ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        mask: 'torch.Tensor',
+        mask_f: 'torch.Tensor',
+    ) -> None:
+        """Token-level PPO clip rate, gated by advantage sign (default GRPO)."""
+        import torch
+        ratio = torch.exp(log_ratio)
+        is_low = (ratio < 1 - self.epsilon) & (advantages < 0)
+        is_high = (ratio > 1 + self.epsilon_high) & (advantages > 0)
+        self.sum_clip_low += float((is_low.float() * mask_f).sum().item())
+        self.sum_clip_high += float((is_high.float() * mask_f).sum().item())
+        self.clip_n_total += float(mask_f.sum().item())
 
     def accumulate(
         self,
@@ -216,6 +308,7 @@ class GRPOMetric(Metric):
         *,
         old_logps: Any = None,
         positive_mask: Any = None,
+        advantages: Any = None,
         **kwargs,
     ):
         import torch
@@ -224,6 +317,8 @@ class GRPOMetric(Metric):
         assert 'logps' in outputs
         logps_val = outputs.get('logps')
         logps_list = self._as_mb_list(logps_val)
+        ent_val = outputs.get('entropies') if isinstance(outputs, dict) else None
+        ent_list = self._as_mb_list(ent_val)
         inputs_list = inputs if isinstance(inputs, list) else [inputs]
 
         if (torch.is_tensor(logps_val) and len(inputs_list) > 1
@@ -241,6 +336,9 @@ class GRPOMetric(Metric):
         flat_pos: Optional[List[bool]] = None
         if positive_mask is not None and isinstance(positive_mask, (list, tuple)):
             flat_pos = list(positive_mask)
+        flat_adv: Optional[List] = None
+        if advantages is not None and isinstance(advantages, (list, tuple)):
+            flat_adv = list(advantages)
 
         cursor = 0
         n_mb = min(len(inputs_list), len(logps_list))
@@ -255,9 +353,10 @@ class GRPOMetric(Metric):
             labels = torch.as_tensor(labels)
 
             logps_mb = logps_list[mb_idx]
+            ent_mb = ent_list[mb_idx] if ent_list is not None and mb_idx < len(ent_list) else None
 
+            num_seq_est = (labels.shape[0] if labels.dim() >= 2 else 1)
             if flat_old is not None:
-                num_seq_est = (labels.shape[0] if labels.dim() >= 2 else 1)
                 old_slice = flat_old[cursor:cursor + num_seq_est]
             elif old_logps is not None and hasattr(old_logps, 'shape'):
                 # Uncommon: aligned global tensor. Only honour when it
@@ -269,7 +368,11 @@ class GRPOMetric(Metric):
                 old_slice = None
 
             f1_mb = flat_pos[cursor:cursor + num_seq_est] if flat_pos is not None else None
-            advanced = self._accumulate_mb(labels, logps_mb, old_slice, f1_mb)
+            adv_mb = flat_adv[cursor:cursor + num_seq_est] if flat_adv is not None else None
+            gsi_base = self._gsi_cursor
+            advanced = self._accumulate_mb(
+                labels, logps_mb, old_slice, f1_mb, ent_mb, adv_mb, gsi_base=gsi_base)
+            self._gsi_cursor += advanced
             cursor += advanced
 
     def calculate(self) -> Dict[str, Any]:
@@ -290,6 +393,11 @@ class GRPOMetric(Metric):
             'sum_diff_f1_zero': self.sum_diff_f1_zero,
             'n_f1_pos': self.n_tokens_f1_pos,
             'n_f1_zero': self.n_tokens_f1_zero,
+            'sum_entropy': self.sum_entropy,
+            'n_entropy_tokens': self.n_entropy_tokens,
+            'sum_clip_low': self.sum_clip_low,
+            'sum_clip_high': self.sum_clip_high,
+            'clip_n_total': self.clip_n_total,
         }]
         all_results = self.gather_results(local)
 
@@ -335,5 +443,65 @@ class GRPOMetric(Metric):
             results['train/mean_new_logp_neg'] = sum(r.get('sum_new_f1_zero', 0) for r in all_results) / n_f1_zero
             results['train/logp_diff_neg'] = sum(r.get('sum_diff_f1_zero', 0) for r in all_results) / n_f1_zero
 
+        n_ent = sum(r.get('n_entropy_tokens', 0) for r in all_results)
+        if n_ent > 0:
+            results['train/entropy'] = sum(r.get('sum_entropy', 0.0) for r in all_results) / n_ent
+
+        clip_n = sum(r.get('clip_n_total', 0.0) for r in all_results)
+        if clip_n > 0:
+            sum_low = sum(r.get('sum_clip_low', 0.0) for r in all_results)
+            sum_high = sum(r.get('sum_clip_high', 0.0) for r in all_results)
+            results['train/clip_ratio_low'] = sum_low / clip_n
+            results['train/clip_ratio_high'] = sum_high / clip_n
+            results['train/clip_ratio'] = (sum_low + sum_high) / clip_n
+
+        # Underscore-prefixed key bypasses swanlab numeric coercion; script can pop and consume.
+        if self.high_kl_records:
+            results['_high_kl_records'] = list(self.high_kl_records)
+
         self.reset()
         return results
+
+
+class GSPOMetric(GRPOMetric):
+    """GRPOMetric variant for GSPO: clip applies to per-sequence geometric-mean ratio."""
+
+    def _accumulate_clip(
+        self,
+        log_ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        mask: 'torch.Tensor',
+        mask_f: 'torch.Tensor',
+    ) -> None:
+        import torch
+        seq_tok = mask_f.sum(-1).clamp(min=1.0)
+        seq_log_ratio = (log_ratio * mask_f).sum(-1) / seq_tok
+        seq_ratio = torch.exp(seq_log_ratio)
+        # Recover per-sample scalar from the scattered [B,L] tensor: value lives only
+        # at mask positions, so masked-mean reproduces the original advantage exactly.
+        seq_adv = (advantages * mask_f).sum(-1) / seq_tok
+        is_low = (seq_ratio < 1 - self.epsilon) & (seq_adv < 0)
+        is_high = (seq_ratio > 1 + self.epsilon_high) & (seq_adv > 0)
+        valid = (mask_f.sum(-1) > 0).float()
+        self.sum_clip_low += float((is_low.float() * valid).sum().item())
+        self.sum_clip_high += float((is_high.float() * valid).sum().item())
+        self.clip_n_total += float(valid.sum().item())
+
+
+class CISPOMetric(GRPOMetric):
+    """GRPOMetric variant for CISPO: clip rate is unconditional on advantage sign."""
+
+    def _accumulate_clip(
+        self,
+        log_ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        mask: 'torch.Tensor',
+        mask_f: 'torch.Tensor',
+    ) -> None:
+        import torch
+        ratio = torch.exp(log_ratio)
+        is_low = ratio < 1 - self.epsilon
+        is_high = ratio > 1 + self.epsilon_high
+        self.sum_clip_low += float((is_low.float() * mask_f).sum().item())
+        self.sum_clip_high += float((is_high.float() * mask_f).sum().item())
+        self.clip_n_total += float(mask_f.sum().item())
