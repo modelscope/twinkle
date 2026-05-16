@@ -538,6 +538,10 @@ def main():
         if optim_step >= total_steps:
             break
 
+        # Single source of truth for the step shown in swanlab / logger / rollout-trace filename.
+        # Equals the number of optimizer updates already completed when this rollout was sampled.
+        batch_step = optim_step
+
         metrics.reset()
         expand_prompts = [p for prompt in batch for p in [prompt] * NUM_GENERATIONS]
 
@@ -548,7 +552,7 @@ def main():
         # Each returned trajectory is a flat dict containing ``messages``,
         # ``input_ids``, ``labels``, ``attention_mask``, ``position_ids``,
         # ``turns``, ``logprobs``, ``stop_reason``, ``truncated``.
-        all_trajectories: List[Dict[str, Any]] = rollout(expand_prompts, global_step=optim_step)
+        all_trajectories: List[Dict[str, Any]] = rollout(expand_prompts, global_step=batch_step)
         n_turns_per_rollout = [int(t.get('turns') or 0) for t in all_trajectories]
         per_rollout_completion_length = [
             sum(1 for l in (t.get('labels') or []) if l != -100)
@@ -583,9 +587,9 @@ def main():
             log_dict['neg_pos_adv_rate'] = neg_with_pos_adv / n_neg if n_neg else 0.0
             log_dict['adv_max'] = max(rollout_advantages) if rollout_advantages else 0.0
             log_dict['adv_min'] = min(rollout_advantages) if rollout_advantages else 0.0
-            swanlab.log(_coerce_for_swanlab(log_dict))
+            swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
             metrics.reset()
-            logger.info(f'[Step {optim_step}/{total_steps}] [SKIPPED] {log_dict}')
+            logger.info(f'[Step {batch_step}/{total_steps}] [SKIPPED] {log_dict}')
             continue
 
         metrics.accumulate(
@@ -653,11 +657,11 @@ def main():
                     tok_text = None
                 logger.info(
                     '[high-kl] step=%d gsi=%s tid=%s pos=%s tok=%r kl=%.4f r=%.4f lp_new=%.4f lp_old=%.4f',
-                    optim_step, gsi, tid, r.get('pos'), tok_text,
+                    batch_step, gsi, tid, r.get('pos'), tok_text,
                     r.get('kl'), r.get('ratio'), r.get('logp_new'), r.get('logp_old'))
-        swanlab.log(_coerce_for_swanlab(log_dict))
+        swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
         metrics.reset()
-        logger.info(f'[Step {optim_step}/{total_steps}] {log_dict}')
+        logger.info(f'[Step {batch_step}/{total_steps}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('hotpotqa-grpo-tools-llmcondense-final')
