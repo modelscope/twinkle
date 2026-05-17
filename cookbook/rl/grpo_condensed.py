@@ -57,13 +57,13 @@ HOTPOTQA_MAX_LENGTH = int(os.environ.get('HOTPOTQA_MAX_LENGTH', 64000))
 
 F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0))
-TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.05))
+TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.00))
 TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
 # CISPO is token-level and DOES support per-token KL — small positive value (e.g. 0.005) recommended as anchor.
-KL_BETA = float(os.environ.get('KL_BETA', 0.0))
+KL_BETA = float(os.environ.get('KL_BETA', 0.02))
 
 # Entropy bonus coefficient; 0 disables the entropy compute path entirely.
 # Typical GRPO values: 0.001–0.01. Loss is: L = L_PPO + beta*KL - entropy_coef*H.
@@ -71,7 +71,7 @@ ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
 
 # CISPO token-level IS clamp thresholds (MiniMax CISPO defaults: 0.2 / 0.28 asymmetric).
 CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
-CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.28))
+CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
 
 # High-KL token capture: top-K per microbatch dumped into log_dict['_high_kl_records']. 0 = disabled.
 HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
@@ -445,12 +445,12 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=total_steps, eta_min=0)
 
-    model.set_loss('CISPOLoss', epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
+    model.set_loss('GRPOLoss', epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
                    beta=KL_BETA, entropy_coef=ENTROPY_COEF)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, max_length=HOTPOTQA_MAX_LENGTH)
 
-    model.add_metric('CISPOMetric', is_training=True,
+    model.add_metric('GRPOMetric', is_training=True,
                      epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
                      top_k_kl=HIGH_KL_TOPK)
 
@@ -621,6 +621,9 @@ def main():
             if KL_BETA > 0.0:
                 ref_outputs = model.forward_only(inputs=mb_inputs, disable_lora=True)
                 ref_logps = ref_outputs.get('logps') if isinstance(ref_outputs, dict) else getattr(ref_outputs, 'logps', None)
+            # for input in mb_inputs:
+            #     if len(input['messages']) > 4:
+            #         print()
             model.forward_backward(
                 inputs=mb_inputs,
                 old_logps=all_old_logps[mb_start:mb_end],

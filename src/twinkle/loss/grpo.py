@@ -137,7 +137,21 @@ class GRPOLoss(Loss):
         dtype: 'torch.dtype',
         fill_value: float = 0.0,
     ) -> 'torch.Tensor':
-        """Align data to mask: scalars broadcast, sequences scatter."""
+        """Align data to mask: scalars broadcast, sequences scatter.
+
+        Two valid per-sample sequence forms are supported and disambiguated
+        by length:
+          * Response-only form (e.g. ``old_logps`` from vLLM): length equals
+            the number of trainable positions in ``mask[i]`` and is scattered
+            directly onto those positions.
+          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward,
+            right-padded to ``mask.shape[1]``): length ``>= mask.shape[1]``;
+            we slice to ``seq_len`` and index by ``mask[i]`` to extract the
+            trainable positions, then scatter.
+
+        Any other length is a real bug and triggers a hard assert — never
+        silently truncate, since that misaligns IS ratios to the wrong tokens.
+        """
         import torch
 
         batch_size, seq_len = mask.shape
@@ -169,11 +183,23 @@ class GRPOLoss(Loss):
         for i, sample in enumerate(data):
             sample = sample.flatten()
             pos = mask[i].nonzero(as_tuple=True)[0]
-            if sample.numel() == 1:
+            n_pos = len(pos)
+            n_sample = sample.numel()
+
+            if n_sample == 1:
                 result[i, pos] = sample.item()
+            elif n_sample == n_pos:
+                # Response-only form (e.g. old_logps from vLLM).
+                result[i, pos] = sample
+            elif n_sample >= seq_len:
+                # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
+                result[i, pos] = sample[:seq_len][mask[i]]
             else:
-                n = min(len(pos), len(sample))
-                result[i, pos[:n]] = sample[:n]
+                raise AssertionError(
+                    f'data/mask length mismatch at sample {i}: '
+                    f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
+                    '(expected n_sample == n_pos for response-only form, '
+                    'or n_sample >= seq_len for full-sequence form)')
 
         return result
 

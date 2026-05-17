@@ -20,6 +20,7 @@ training-loop-level discrepancy between the two runs is attributable to
 the chunk+condense pipeline, not to differences in rollout plumbing.
 """
 
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -77,7 +78,21 @@ HOTPOTQA_MAX_LENGTH = int(os.environ.get('HOTPOTQA_MAX_LENGTH', 64000))
 F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0.2))
 
+# KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
+KL_BETA = float(os.environ.get('KL_BETA', 0.00))
+
+# Entropy bonus coefficient; 0 disables entropy compute path.
+ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
+
+# CISPO token-level IS clamp thresholds (asymmetric: 0.2 / 0.28).
+CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
+CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
+
+# High-KL token capture: top-K per microbatch dumped into log_dict['_high_kl_records']. 0 = disabled.
+HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
+
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
+F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
 
 _ROLLOUT_TRACE_DIR = os.environ.get(
     'ROLLOUT_TRACE_BASELINE_DIR', 'rollout_trace_baseline')
@@ -111,7 +126,8 @@ _COT_REWARD: Optional[CoTReward] = CoTReward()
 
 
 def compute_rewards(trajectories: List[Dict[str, Any]]):
-    f1 = _F1_REWARD(trajectories)
+    f1_raw = _F1_REWARD(trajectories)
+    f1 = [1.0 if v >= F1_BINARY_THRESHOLD else 0.0 for v in f1_raw] if F1_BINARY_THRESHOLD > 0 else f1_raw
     cot = _COT_REWARD(trajectories)
     total = [
         F1_REWARD_WEIGHT * a + COT_REWARD_WEIGHT * c
@@ -265,6 +281,8 @@ def _compute_rollout_diagnostics(
     trajectories: List[Dict[str, Any]],
     n_turns_per_rollout: List[int],
     per_rollout_completion_length: List[int],
+    f1_rewards: Optional[List[float]] = None,
+    old_logps: Optional[List[List[float]]] = None,
 ) -> Dict[str, float]:
     """Aggregate rollout diagnostics for swanlab logging.
 
@@ -332,6 +350,17 @@ def _compute_rollout_diagnostics(
         out['avg_chars_total_no_sys'] = sum(msg_chars_total) / len(msg_chars_total)
         out['avg_chars_prompt_no_sys'] = sum(prompt_chars) / len(prompt_chars)
         out['avg_chars_assistant'] = sum(asst_chars) / len(asst_chars)
+
+    if f1_rewards is not None and old_logps is not None and f1_rewards:
+        per_traj_mean = [(sum(lp) / len(lp)) if lp else 0.0 for lp in old_logps]
+        pos_logp = [m for m, f1 in zip(per_traj_mean, f1_rewards) if f1 > 0]
+        zero_logp = [m for m, f1 in zip(per_traj_mean, f1_rewards) if f1 <= 0]
+        out['f1_correct_rate'] = len(pos_logp) / len(f1_rewards)
+        out['f1_zero_rate'] = len(zero_logp) / len(f1_rewards)
+        out['mean_old_logp_f1_pos'] = (sum(pos_logp) / len(pos_logp)) if pos_logp else 0.0
+        out['mean_old_logp_f1_zero'] = (sum(zero_logp) / len(zero_logp)) if zero_logp else 0.0
+        out['policy_confidence_f1_pos'] = math.exp(out['mean_old_logp_f1_pos'])
+        out['policy_confidence_f1_zero'] = math.exp(out['mean_old_logp_f1_zero'])
     return out
 
 
@@ -386,11 +415,14 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=total_steps, eta_min=0)
 
-    model.set_loss('GRPOLoss', epsilon=0.2)
+    model.set_loss('GRPOLoss', epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
+                   beta=KL_BETA, entropy_coef=ENTROPY_COEF)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, max_length=HOTPOTQA_MAX_LENGTH)
 
-    model.add_metric('GRPOMetric', is_training=True)
+    model.add_metric('GRPOMetric', is_training=True,
+                     epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
+                     top_k_kl=HIGH_KL_TOPK)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -414,7 +446,8 @@ def main():
     metrics = CompletionRewardMetric()
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
-        temperature=1.0, top_p=0.95)
+        temperature=1.0, top_p=0.95,
+        include_stop_str_in_output=True)
 
     def _trace_should_store(traj):
         return _F1_REWARD([traj])[0] == 0.0
@@ -446,6 +479,9 @@ def main():
         if optim_step >= total_steps:
             break
 
+        # Single source of truth for the step shown in swanlab / logger / rollout-trace filename.
+        batch_step = optim_step
+
         metrics.reset()
         expand_prompts = [p for prompt in batch for p in [prompt] * NUM_GENERATIONS]
 
@@ -462,20 +498,45 @@ def main():
 
         total_rewards, f1_rewards, cot_rewards = compute_rewards(all_trajectories)
 
+        rollout_advantages = advantage_fn(
+            total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
+
+        all_f1_labels: List[bool] = [f > 0 for f in f1_rewards]
+        n_pos = sum(1 for p in all_f1_labels if p)
+        n_neg = sum(1 for p in all_f1_labels if not p)
+        pos_with_neg_adv = sum(1 for p, a in zip(all_f1_labels, rollout_advantages) if p and a < 0)
+        neg_with_pos_adv = sum(1 for p, a in zip(all_f1_labels, rollout_advantages) if not p and a > 0)
+
+        all_old_logps: List[List[float]] = [
+            [lp[0][1] for lp in (t.get('logprobs') or [])] for t in all_trajectories]
+
+        # Skip homogeneous groups where gradient signal is meaningless
+        f1_pos_rate = n_pos / len(f1_rewards) if f1_rewards else 0.5
+        if f1_pos_rate > 0.9 or f1_pos_rate < 0.1:
+            logger.info('[skip-homogeneous] f1_pos_rate=%.3f, skipping training update', f1_pos_rate)
+            metrics.accumulate(
+                completion_lengths=per_rollout_completion_length,
+                rewards={'total': total_rewards, 'f1': f1_rewards, 'cot': cot_rewards})
+            log_dict = metrics.calculate()
+            log_dict.update(_compute_rollout_diagnostics(
+                all_trajectories, n_turns_per_rollout, per_rollout_completion_length,
+                f1_rewards=f1_rewards, old_logps=all_old_logps))
+            log_dict['skipped'] = True
+            log_dict['pos_neg_adv_rate'] = pos_with_neg_adv / n_pos if n_pos else 0.0
+            log_dict['neg_pos_adv_rate'] = neg_with_pos_adv / n_neg if n_neg else 0.0
+            log_dict['adv_max'] = max(rollout_advantages) if rollout_advantages else 0.0
+            log_dict['adv_min'] = min(rollout_advantages) if rollout_advantages else 0.0
+            swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
+            metrics.reset()
+            logger.info(f'[Step {batch_step}/{total_steps}] [SKIPPED] {log_dict}')
+            continue
+
         metrics.accumulate(
             completion_lengths=per_rollout_completion_length,
             rewards={'total': total_rewards, 'f1': f1_rewards, 'cot': cot_rewards})
 
-        rollout_advantages = advantage_fn(
-            total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-        all_input_data: List[Any] = []
-        all_old_logps: List[List[float]] = []
-        advantages: List[float] = []
-        for t, adv in zip(all_trajectories, rollout_advantages):
-            all_input_data.append(t)
-            all_old_logps.append([lp[0][1] for lp in (t.get('logprobs') or [])])
-            advantages.append(adv)
+        all_input_data: List[Any] = list(all_trajectories)
+        advantages: List[float] = list(rollout_advantages)
 
         total_completions = len(all_input_data)
         aligned_completions = (total_completions // MODEL_GPUS) * MODEL_GPUS
@@ -486,10 +547,18 @@ def main():
                 total_completions, aligned_completions, MODEL_GPUS)
         for mb_start in range(0, aligned_completions, MINI_BATCH_SIZE):
             mb_end = min(mb_start + MINI_BATCH_SIZE, aligned_completions)
+            mb_inputs = all_input_data[mb_start:mb_end]
+            # Reference log-probs for KL: same policy with LoRA disabled (= base model).
+            ref_logps = None
+            if KL_BETA > 0.0:
+                ref_outputs = model.forward_only(inputs=mb_inputs, disable_lora=True)
+                ref_logps = ref_outputs.get('logps') if isinstance(ref_outputs, dict) else getattr(ref_outputs, 'logps', None)
             model.forward_backward(
-                inputs=all_input_data[mb_start:mb_end],
+                inputs=mb_inputs,
                 old_logps=all_old_logps[mb_start:mb_end],
                 advantages=advantages[mb_start:mb_end],
+                ref_logps=ref_logps,
+                positive_mask=all_f1_labels[mb_start:mb_end],
                 micro_batch_size=MICRO_BATCH_SIZE)
             model.clip_grad_and_step()
             optim_step += 1
@@ -501,10 +570,30 @@ def main():
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
         log_dict.update(_compute_rollout_diagnostics(
-            all_trajectories, n_turns_per_rollout, per_rollout_completion_length))
-        swanlab.log(_coerce_for_swanlab(log_dict))
+            all_trajectories, n_turns_per_rollout, per_rollout_completion_length,
+            f1_rewards=f1_rewards, old_logps=all_old_logps))
+        log_dict['pos_neg_adv_rate'] = pos_with_neg_adv / n_pos if n_pos else 0.0
+        log_dict['neg_pos_adv_rate'] = neg_with_pos_adv / n_neg if n_neg else 0.0
+        log_dict['adv_max'] = max(rollout_advantages) if rollout_advantages else 0.0
+        log_dict['adv_min'] = min(rollout_advantages) if rollout_advantages else 0.0
+        # Pop high-KL token records before swanlab.log: list-of-dict won't render as a chart.
+        _hk = log_dict.pop('_high_kl_records', None)
+        if _hk:
+            _tok = rollout_template.tokenizer
+            for r in _hk:
+                gsi = r.get('gsi')
+                tid = all_trajectories[gsi].get('id') if gsi is not None and 0 <= gsi < len(all_trajectories) else None
+                try:
+                    tok_text = _tok.decode([r['token_id']])
+                except Exception:
+                    tok_text = None
+                logger.info(
+                    '[high-kl] step=%d gsi=%s tid=%s pos=%s tok=%r kl=%.4f r=%.4f lp_new=%.4f lp_old=%.4f',
+                    batch_step, gsi, tid, r.get('pos'), tok_text,
+                    r.get('kl'), r.get('ratio'), r.get('logp_new'), r.get('logp_old'))
+        swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
         metrics.reset()
-        logger.info(f'[Step {optim_step}/{total_steps}] {log_dict}')
+        logger.info(f'[Step {batch_step}/{total_steps}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('hotpotqa-grpo-baseline-final')
