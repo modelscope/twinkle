@@ -121,12 +121,12 @@ def _apply_oracle_hints(prompts: List[Any], stage: int) -> List[Any]:
             titles_str = ', '.join(f'"{t}"' for t in sf_unique)
             hint = (f'\n[Oracle Hint] The passage(s) titled {titles_str} contain the '
                     'supporting facts. After compression, find the block whose Summary '
-                    'heading matches these titles, then call the tool to expand if compressed.')
+                    'heading matches these titles, then call the `extract_condensed` tool to expand if compressed.')
         else:
             n = len(sf_unique)
             word = {1: 'One', 2: 'Two', 3: 'Three'}.get(n, str(n))
             hint = (f'\n[Oracle Hint] {word} block(s) contain the supporting facts; '
-                    'call the tool to expand them if compressed.')
+                    'call the `extract_condensed` tool to expand them if compressed.')
         for m in (p.get('messages') or []):
             if m.get('role') != 'user':
                 continue
