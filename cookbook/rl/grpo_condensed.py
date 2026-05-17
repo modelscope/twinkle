@@ -5,6 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import torch
 import swanlab
 from peft import LoraConfig
 
@@ -72,7 +73,7 @@ ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
 
 # Per-token oracle bonus coefficient; 0 disables. Typical: 0.05–0.2.
 # Loss becomes: L = L_PPO + beta*KL - entropy_coef*H - token_bonus_coef*(oracle_logps - rollout_logps)
-ORACLE_BONUS_COEF = float(os.environ.get('ORACLE_BONUS_COEF', 0.0))
+ORACLE_BONUS_COEF = float(os.environ.get('ORACLE_BONUS_COEF', 0.1))
 
 # CISPO token-level IS clamp thresholds (MiniMax CISPO defaults: 0.2 / 0.28 asymmetric).
 CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
@@ -85,6 +86,7 @@ WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
 F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
 
 _ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
+ORACLE_HINT = bool(int(os.environ.get('ORACLE_HINT', '1')))
 
 
 # [EXP-ORACLE] staged hint injection — appended to the Question line so skip_pattern keeps it uncompressed.
@@ -100,49 +102,87 @@ def _oracle_hint_stage(step: int, total_steps: int) -> int:
     return 2
 
 
-def _apply_oracle_hints(prompts: List[Any], stage: int) -> List[Any]:
-    """Return a (possibly deep-copied) prompt list with per-stage oracle hints in the Question line.
 
-    The hint is appended directly after 'Question: ...' and before '\\n\\nContext:' so it
-    lands in the same chunk as the question — which skip_pattern=r'^Question:' preserves.
+def _make_oracle_hint_callback(total_steps: int):
+    """Return a post_compress_callback that injects oracle hints with actual block IDs.
+
+    Called by MultiTurnCondenseRollout after compression + metadata merge, so
+    ``compressed['user_data']`` carries sf_titles and ``chunks`` carries the
+    condensed/raw status of each passage.
+
+    Stages (determined by global_step / total_steps):
+      0 — explicit block IDs for supporting-fact passages
+      1 — block count only (no IDs)
+      2 — no hint
     """
-    if stage == 2:
-        return prompts
-    out = []
     _q_split = re.compile(r'(Question:\s*.+?)(\n\nContext:)', re.DOTALL)
-    for p in prompts:
-        sf_titles = [v for (k, v) in (p.get('user_data') or []) if k == 'sf_title' and v]
+
+    def _callback(compressed, chunks, **kwargs):
+        step = kwargs.get('global_step', 0)
+        stage = _oracle_hint_stage(step, total_steps)
+        if stage == 2:
+            return compressed
+
+        user_data = compressed.get('user_data') or []
+        sf_titles = [v for k, v in user_data if k == 'sf_title' and v]
         if not sf_titles:
-            out.append(p)
-            continue
-        p = copy.deepcopy(p)
-        sf_unique = list(dict.fromkeys(sf_titles))
+            return compressed
+        sf_set = set(sf_titles)
+
+        # Map sf_titles → block IDs by walking condensed chunks
+        block_id = 0
+        sf_block_ids = []
+        for c in chunks.chunks:
+            if c.get('type') != 'text':
+                continue
+            content = c.get('content')
+            if not isinstance(content, str) or not content:
+                continue
+            if c.get('role') == 'tool':
+                continue
+            raw = c.get('raw')
+            if not (isinstance(raw, dict) and raw.get('condensed')):
+                continue
+            block_id += 1
+            original = raw.get('original', '')
+            if isinstance(original, str):
+                for title in sf_set:
+                    if original.startswith(f'{title}: ') or original.startswith(f'{title}:'):
+                        sf_block_ids.append(block_id)
+                        break
+
         if stage == 0:
-            titles_str = ', '.join(f'"{t}"' for t in sf_unique)
-            hint = (f'\n[Oracle Hint] The passage(s) titled {titles_str} contain the '
-                    'supporting facts. After compression, find the block whose Summary '
-                    'heading matches these titles, then call the `extract_condensed` tool to expand if compressed.')
+            if sf_block_ids:
+                ids_str = ', '.join(str(b) for b in sf_block_ids)
+                hint = (f'\n[Oracle Hint] Block {ids_str} contain(s) the supporting facts. '
+                        'Call `extract_condensed` to expand them if you need more detail information.')
+            else:
+                n = len(sf_set)
+                word = {1: 'One', 2: 'Two', 3: 'Three'}.get(n, str(n))
+                hint = (f'\n[Oracle Hint] {word} short passage(s) contain the supporting facts; '
+                        'they are uncompressed — read them directly.')
         else:
-            n = len(sf_unique)
-            word = {1: 'One', 2: 'Two', 3: 'Three'}.get(n, str(n))
-            hint = (f'\n[Oracle Hint] {word} block(s) contain the supporting facts; '
-                    'call the `extract_condensed` tool to expand them if compressed.')
-        for m in (p.get('messages') or []):
+            hint = (f'\n[Oracle Hint] Some compressed block(s) contain the supporting facts; '
+                    'call `extract_condensed` to expand them if you need more detail information.')
+
+        for m in (compressed.get('messages') or []):
             if m.get('role') != 'user':
                 continue
             c = m.get('content')
             if isinstance(c, str):
-                # Insert hint between Question line and Context separator
-                m['content'] = _q_split.sub(lambda g: g.group(1) + hint + g.group(2), c, count=1)
+                m['content'] = _q_split.sub(
+                    lambda g: g.group(1) + hint + g.group(2), c, count=1)
             elif isinstance(c, list):
                 for part in c:
                     if isinstance(part, dict) and part.get('type') == 'text':
                         part['text'] = _q_split.sub(
-                            lambda g: g.group(1) + hint + g.group(2), part.get('text') or '', count=1)
+                            lambda g: g.group(1) + hint + g.group(2),
+                            part.get('text') or '', count=1)
                         break
             break
-        out.append(p)
-    return out
+        return compressed
+
+    return _callback
 
 SYSTEM_PROMPT = """You are a careful multi-hop QA assistant.
 
@@ -512,9 +552,8 @@ def _build_oracle_inputs(
             if l != -100:
                 first_trainable = i
                 break
-        if first_trainable is None or first_trainable + 1 >= len(input_ids):
-            oracle_inputs.append(inp)
-            continue
+        
+        assert first_trainable is not None
 
         # 2. Extract question from first user message
         question = None
@@ -541,7 +580,7 @@ def _build_oracle_inputs(
             hint_parts.append('Supporting passages: ' + ', '.join(f'"{t}"' for t in sf_titles))
         if gts:
             hint_parts.append('Answer: ' + '; '.join(gts))
-        hint_parts += '\nYou must call `extract_condensed` to read the right original passage from by the condensed block with thinking steps, and give the final correct answer.\n'
+        hint_parts.append('You must call `extract_condensed` to read the right original passage from the condensed block with thinking steps, and give the final correct answer')
         oracle_suffix = '\n[Oracle Context] ' + '. '.join(hint_parts) + '.'
         oracle_user_content = f'Question: {question}{oracle_suffix}'
 
@@ -569,8 +608,19 @@ def _build_oracle_inputs(
             'input_ids': oracle_input_ids,
             'labels': oracle_labels,
             'attention_mask': [1] * seq_len,
-            'position_ids': list(range(seq_len)),
+            'messages': None,
         }
+        # Replicate mrope position_ids shape from original input
+        orig_pos = inp.get('position_ids')
+        if isinstance(orig_pos, torch.Tensor) and orig_pos.dim() == 3:
+            n_dims = orig_pos.shape[0]
+            pos_range = torch.arange(seq_len).unsqueeze(0).unsqueeze(0)
+            oi['position_ids'] = pos_range.expand(n_dims, 1, seq_len)
+        else:
+            oi['position_ids'] = list(range(seq_len))
+        if 'mm_token_type_ids' in inp:
+            oi['mm_token_type_ids'] = torch.zeros(1, seq_len)
+        oi['length'] = seq_len
         oracle_inputs.append(oi)
         any_modified = True
 
@@ -645,8 +695,7 @@ def main():
 
     GLOBAL_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     batches_per_epoch = max(1, len(_prebuilt_dataset) // GLOBAL_BATCH_SIZE)
-    EXPECTED_AVG_TURNS = int(os.environ.get('EXPECTED_AVG_TURNS', 3))
-    optim_steps_per_batch = max(1, (GLOBAL_BATCH_SIZE * NUM_GENERATIONS * EXPECTED_AVG_TURNS
+    optim_steps_per_batch = max(1, (GLOBAL_BATCH_SIZE * NUM_GENERATIONS
                                      + MINI_BATCH_SIZE - 1) // MINI_BATCH_SIZE)
     steps_per_epoch = batches_per_epoch * optim_steps_per_batch
     derived_total_steps = NUM_EPOCHS * steps_per_epoch
@@ -754,6 +803,8 @@ def main():
         trace_dir=_ROLLOUT_TRACE_DIR or None,
         trace_callback=_trace_should_store,
         success_callback=_trace_is_success,
+        post_compress_callback=(
+            _make_oracle_hint_callback(total_steps) if ORACLE_HINT else None),
     )
 
     optim_step = 0
@@ -775,10 +826,6 @@ def main():
 
         metrics.reset()
         expand_prompts = [p for prompt in batch for p in [prompt] * NUM_GENERATIONS]
-
-        # [EXP-ORACLE] inject stage-dependent hint into the Question line before rollout
-        hint_stage = _oracle_hint_stage(batch_step, total_steps)
-        expand_prompts = _apply_oracle_hints(expand_prompts, hint_stage)
 
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()

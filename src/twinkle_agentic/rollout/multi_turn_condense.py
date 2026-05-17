@@ -59,6 +59,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         trace_dir: Optional[str] = None,
         trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        post_compress_callback: Optional[Callable] = None,
     ):
         super().__init__(
             sampler=sampler,
@@ -88,6 +89,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         if getattr(self.condenser, 'template', None) is None:
             self.condenser.template = template
         self.condenser_kwargs = dict(condenser_kwargs or {})
+        self.post_compress_callback = post_compress_callback
         self._trace_block_chunks: Optional[List[Optional[Chunks]]] = None
 
     @remote_function()
@@ -129,6 +131,9 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             compressed = traj_chunks.to_trajectory()
             for k, v in traj.items():
                 compressed.setdefault(k, v)
+            if self.post_compress_callback is not None:
+                compressed = self.post_compress_callback(
+                    compressed, traj_chunks, **kwargs)
             compressed_list.append(compressed)
 
             call_tm = self.tool_manager.copy()
