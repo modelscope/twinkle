@@ -149,7 +149,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
-        breakpoint()
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         # Keep NCCL's device binding behavior, but avoid binding HCCL's default

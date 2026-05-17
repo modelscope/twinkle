@@ -79,7 +79,7 @@ F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0.2))
 
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
-KL_BETA = float(os.environ.get('KL_BETA', 0.00))
+KL_BETA = float(os.environ.get('KL_BETA', 0.02))
 
 # Entropy bonus coefficient; 0 disables entropy compute path.
 ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
@@ -446,8 +446,7 @@ def main():
     metrics = CompletionRewardMetric()
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
-        temperature=1.0, top_p=0.95,
-        include_stop_str_in_output=True)
+        temperature=1.0, top_p=0.95)
 
     def _trace_should_store(traj):
         return _F1_REWARD([traj])[0] == 0.0
