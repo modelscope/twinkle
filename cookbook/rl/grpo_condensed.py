@@ -604,12 +604,13 @@ def _build_oracle_inputs(
 
         assert len(oracle_input_ids) == len(oracle_labels)
         seq_len = len(oracle_input_ids)
-        oi = {
-            'input_ids': oracle_input_ids,
-            'labels': oracle_labels,
-            'attention_mask': [1] * seq_len,
-            'messages': None,
-        }
+        # Start from original keys to keep collator-compatible shape
+        oi = dict(inp)
+        oi['input_ids'] = oracle_input_ids
+        oi['labels'] = oracle_labels
+        oi['attention_mask'] = [1] * seq_len
+        oi['messages'] = None
+        oi['length'] = seq_len
         # Replicate mrope position_ids shape from original input
         orig_pos = inp.get('position_ids')
         if isinstance(orig_pos, torch.Tensor) and orig_pos.dim() == 3:
@@ -620,7 +621,6 @@ def _build_oracle_inputs(
             oi['position_ids'] = list(range(seq_len))
         if 'mm_token_type_ids' in inp:
             oi['mm_token_type_ids'] = torch.zeros(1, seq_len)
-        oi['length'] = seq_len
         oracle_inputs.append(oi)
         any_modified = True
 
@@ -667,12 +667,7 @@ def _compute_token_bonus(
                 orc_row = []
             orc_valid = [v for v, l in zip(orc_row, oracle_labels) if l != -100]
 
-        # Align lengths (should match; pad/truncate as safety net)
-        if len(orc_valid) >= n:
-            orc_valid = orc_valid[:n]
-        else:
-            orc_valid = orc_valid + [0.0] * (n - len(orc_valid))
-
+        assert len(orc_valid) == n
         bonus.append([o - r for o, r in zip(orc_valid, old_lp)])
     return bonus
 
