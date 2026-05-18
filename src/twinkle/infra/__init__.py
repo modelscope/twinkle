@@ -7,7 +7,7 @@ from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 import json
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
-from twinkle.notifier import notify_exception
+from twinkle.notifier import notify_exception, Notifier
 
 logger = get_logger()
 
@@ -46,8 +46,6 @@ def _maybe_load_worker_notifier() -> None:
     if not raw:
         return
 
-    import json
-    from twinkle.notifier import Notifier
     candidate = Notifier.from_dict(json.loads(raw))
     if candidate is not None:
         _notifier = candidate
