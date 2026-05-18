@@ -7,7 +7,7 @@ from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 import json
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
-from ..notifier import notify_exception
+from twinkle.notifier import notify_exception
 
 logger = get_logger()
 
