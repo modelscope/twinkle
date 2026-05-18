@@ -47,6 +47,16 @@ from twinkle.utils.transformers_utils import filter_from_config_kwargs
 logger = get_logger()
 
 
+def _clone_state_dict_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    cloned = {}
+    for key, value in state_dict.items():
+        if hasattr(value, 'detach'):
+            cloned[key] = value.detach().cpu().clone()
+        else:
+            cloned[key] = value
+    return cloned
+
+
 @dataclass
 class OptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Transformers training."""
@@ -286,6 +296,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
+            use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+            set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
+            if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
+                is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
+                set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:

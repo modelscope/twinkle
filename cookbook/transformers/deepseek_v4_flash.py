@@ -43,6 +43,7 @@ ADAPTER_NAME = 'default'
 device_mesh = DeviceMesh.from_sizes(
     fsdp_size=4,
     dp_size=1,
+     ep_size=4,
     device_type=Platform.get_platform().device_prefix(),
 )
 
@@ -87,6 +88,11 @@ def train():
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
         fsdp_config={
             'reshard_after_forward': RESHARD_AFTER_FORWARD,
+             'expert_parallel': {
+        'enabled': True,
+        'router_dtype': 'fp32',
+        'keep_router_logits': False,
+    },
         },
     )
 
