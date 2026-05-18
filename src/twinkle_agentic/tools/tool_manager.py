@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 from typing import List, Optional, Dict, Union, Any, Iterable
 from twinkle.data_format import ToolCall

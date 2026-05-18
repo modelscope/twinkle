@@ -1,19 +1,5 @@
-"""Message-level multi-turn rollout that drives an OpenAI-protocol API.
-
-Twin of :class:`MultiTurnRollout` for the offline / API-baseline path:
-trajectories are message lists, the loop is per-trajectory (thread-pool
-concurrent, OpenAI does not batch), and structured ``tool_calls`` flow
-through :class:`ToolManager` verbatim. No token-level state, no
-logprobs, no chat-template bridge — those are deliberately not part of
-the API contract because the OpenAI protocol cannot expose them
-faithfully.
-
-Suitable for: SFT data construction, validation passes, A/B baselines
-against frontier models. NOT suitable for training (no per-token
-logprobs => no GRPO).
-"""
-from __future__ import annotations
-
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -100,12 +86,7 @@ class APIMultiTurnRollout(Rollout):
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
-        if self.trace_dir:
-            import os
-            try:
-                os.makedirs(self.trace_dir, exist_ok=True)
-            except OSError:
-                self.trace_dir = None
+        os.makedirs(self.trace_dir, exist_ok=True)
 
     def __call__(
         self,
