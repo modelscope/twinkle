@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     import torch
     import torch.nn as nn
 
+
 def align_logps_to_mask(
     ragged: Any,
     mask: 'torch.Tensor',
@@ -43,7 +44,7 @@ def align_logps_to_mask(
         if n > 0:
             result[i, pos[:n]] = vals[:n]
     return result
-	
+
 
 def filter_from_config_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     load_only_keys = {
