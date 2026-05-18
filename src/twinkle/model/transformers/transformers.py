@@ -162,6 +162,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             **kwargs):
+        raise Exception('Test error!')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
