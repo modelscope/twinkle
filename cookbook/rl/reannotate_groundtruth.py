@@ -4,19 +4,33 @@ The original HotpotQA dataset has annotation issues:
   - GT doesn't match the question type (asks "where", GT gives a name)
   - Partial/incomplete answers for multi-hop questions
   - Single form when multiple valid forms exist (e.g. "2" vs "two")
+  - Question itself malformed (wrong question word, truncation, presupposition
+    mismatch with the answer type)
 
 This script:
-  1. Loads HotpotQA fullwiki train split, stratified 3000 per level.
-  2. Force-includes all IDs from wrong_ids.txt (the 340 hard cases).
+  1. Loads HotpotQA fullwiki train split.
+  2. By default (--only-forced), re-annotates ONLY the IDs listed in
+     wrong_ids.txt (the 340 known-bad cases).
+     Pass --no-only-forced to fall back to stratified 3000-per-level sampling
+     with wrong_ids force-included.
   3. For each row, sends question + full context + original GT to a super-LLM.
-  4. The LLM verifies/corrects the GT and returns a list of acceptable answers.
-  5. Outputs JSONL with the corrected ground truth.
+  4. The LLM emits one of four verdicts and (when applicable) a multi-form
+     answer list and/or a repaired question:
+       - keep:         original Q + A are both correct
+       - fix_answer:   Q is fine; A is wrong/incomplete
+       - fix_question: Q is malformed but repairable into a well-formed Q
+                       that the same passages answer with the same gold facts
+       - drop:         Q cannot be repaired without changing the fact, OR
+                       passages do not support any answer
+  5. Outputs ONE JSONL file containing all rows (including drop). Each row has
+     verdict, question, question_fixed, answers, reasoning. Downstream filters
+     by verdict.
 
-Run:
+Run (re-clean wrong_ids.txt only, default):
     python reannotate_groundtruth.py \
         --model qwen-max --api-key $OPENAI_API_KEY \
         --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
-        --output hotpotqa_reannotated.jsonl --concurrency 16
+        --output hotpotqa_reannotated_wrong.jsonl --concurrency 16
 """
 import argparse
 import json
@@ -36,25 +50,40 @@ from twinkle_agentic.protocol.openai import OpenAI
 
 VERIFY_SYSTEM = """You are a dataset quality auditor for a multi-hop QA benchmark (HotpotQA).
 
-Your job: given a Question, supporting Context passages, and the dataset's Original Answer, determine ALL correct short answers.
+Given a Question, supporting Context passages, and the dataset's Original Answer, output ONE of four verdicts and a multi-form answer list grounded in the passages.
 
-Rules:
-1. Read the context carefully. The answer MUST be supported by the given passages.
-2. If the Original Answer is correct, keep it. If it is wrong or incomplete, fix it.
-3. Return ALL acceptable surface forms as a JSON list. Include:
-   - The canonical answer
-   - Common abbreviations (e.g. "New York City", "NYC", "New York")
-   - Numeric variants (e.g. "2", "two", "2.0")
-   - Name variants (e.g. "J.K. Rowling", "Joanne Rowling", "J. K. Rowling")
+VERDICTS
+- "keep":          original question + original answer are both correct.
+- "fix_answer":    question is fine; original answer is wrong/incomplete.
+- "fix_question":  question is malformed (wrong question word, broken grammar, truncated, or presupposition mismatch with the answer type) but can be REPAIRED into a well-formed question that the SAME passages answer with the SAME gold facts.
+- "drop":          question cannot be repaired without changing the underlying fact, OR the passages do not support any answer.
+
+MULTI-FORM ANSWER RULES (apply to keep / fix_answer / fix_question)
+1. Output ALL acceptable surface forms whenever applicable:
+   - Number variants: arabic + english word + hyphen-prefix form (e.g. "3", "three", "three-door", "3-door")
+   - Range variants: start, end, and full range string (e.g. "1901", "1902", "1901-1902", "1901-2")
+   - Location variants: city / state-or-province / country (e.g. "Everett", "Washington", "WA", "United States")
+   - Person variants: legal name / nickname / full name (e.g. "Allan", "Heywood", "Allan Stewart Konigsberg")
+   - Entity-role pairs for role-of-X questions: BOTH the role AND the entity (e.g. "chauffeur", "Hitler's chauffeur")
+   - Show-vs-character pairs for best-known-for questions: BOTH the show AND the character (e.g. "M*A*S*H", "Major Frank Burns")
+   - Common abbreviations (e.g. "NYC", "New York City", "New York")
    - With/without titles (e.g. "Dr. Smith", "Smith")
    - Different date formats if applicable (e.g. "July 4, 1776", "4 July 1776")
-4. Each answer in the list should be SHORT (a name, entity, number, date, or yes/no).
-5. If the question cannot be answered from the given context at all, return ["UNANSWERABLE"].
-6. Do NOT hallucinate. Every answer must be grounded in the provided passages.
-7. For yes/no questions, return ["yes"] or ["no"] (lowercase).
+2. Each answer is SHORT (a name, entity, number, date, or yes/no).
+3. yes/no answers MUST be lowercase ["yes"] or ["no"].
+4. Do NOT hallucinate. Every answer must be grounded in the provided passages.
 
-Output format (JSON only, no markdown fence, no explanation):
-{"answers": ["answer1", "answer2", ...], "reasoning": "one-sentence explanation of your judgment"}"""
+QUESTION REWRITE RULES (verdict = fix_question)
+1. question_fixed MUST be answerable by the SAME passages and yield the SAME factual answer as the original gold facts.
+2. Allowed edits: swap question word (Where -> Did / Who / What), repair grammar, complete truncation, align question word with the answer type.
+3. FORBIDDEN: changing intent, injecting the answer into the question, adding facts not in the passages.
+4. If you cannot satisfy these constraints, downgrade to "drop".
+
+DROP RULES (verdict = drop)
+- answers MUST be [] and question_fixed MUST be null.
+
+OUTPUT FORMAT (JSON only, no markdown fence, no explanation)
+{"verdict": "keep|fix_answer|fix_question|drop", "question_fixed": "..." | null, "answers": ["..."], "reasoning": "one sentence"}"""
 
 VERIFY_USER = """## Question
 {question}
@@ -66,10 +95,8 @@ VERIFY_USER = """## Question
 {context}
 
 ## Task
-Verify whether the Original Answer correctly answers the Question based on the passages above.
-Return a JSON object with:
-- "answers": a list of ALL acceptable short answer forms (if original is wrong, give the correct one(s))
-- "reasoning": one sentence explaining your judgment (e.g. "Original is correct", "Original is wrong because X, correct answer is Y")"""
+Audit the row per the system rules. Pick exactly one verdict (keep / fix_answer / fix_question / drop), produce the multi-form answers list (or [] for drop), and write a one-sentence reasoning. If verdict=fix_question, also produce question_fixed; otherwise set it to null.
+Return a single JSON object only."""
 
 
 LEVELS: Tuple[str, str, str] = ('easy', 'medium', 'hard')
@@ -88,7 +115,9 @@ def _format_context(context: Dict[str, Any]) -> str:
     return '\n\n'.join(lines)
 
 
-_JSON_RE = re.compile(r'\{[^{}]*"answers"\s*:\s*\[.*?\][^{}]*\}', re.DOTALL)
+_JSON_RE = re.compile(r'\{[^{}]*"verdict"\s*:\s*"[^"]+"[^{}]*"answers"\s*:\s*\[.*?\][^{}]*\}', re.DOTALL)
+
+_VALID_VERDICTS = ('keep', 'fix_answer', 'fix_question', 'drop')
 
 
 def _parse_response(text: str) -> Optional[Dict[str, Any]]:
@@ -111,6 +140,21 @@ def _parse_response(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def _validate_verdict(
+    verdict: Optional[str], answers: List[str],
+    qfix: Optional[str], original_question: str,
+) -> bool:
+    if verdict not in _VALID_VERDICTS:
+        return False
+    if verdict == 'drop':
+        return not answers and qfix is None
+    if not answers:
+        return False
+    if verdict == 'fix_question':
+        return bool(qfix) and qfix.strip() != original_question.strip()
+    return qfix is None
 
 
 def verify_answer(
@@ -144,21 +188,28 @@ def verify_answer(
 
         content = reply.get('content') or ''
         parsed = _parse_response(content)
-        if parsed and isinstance(parsed.get('answers'), list) and parsed['answers']:
-            answers = [str(a).strip() for a in parsed['answers'] if str(a).strip()]
-            if not answers:
-                continue
-            return {
-                'id': row['id'],
-                'question': question,
-                'original_answer': original_answer,
-                'answers': answers,
-                'reasoning': parsed.get('reasoning', ''),
-                'level': row.get('level', ''),
-                'type': row.get('type', ''),
-                'context': row.get('context', {}),
-                'supporting_facts': row.get('supporting_facts', {}),
-            }
+        if parsed:
+            verdict = parsed.get('verdict')
+            answers_raw = parsed.get('answers')
+            answers = (
+                [str(a).strip() for a in answers_raw if str(a).strip()]
+                if isinstance(answers_raw, list) else [])
+            qfix_raw = parsed.get('question_fixed')
+            qfix = (qfix_raw.strip() or None) if isinstance(qfix_raw, str) else None
+            if _validate_verdict(verdict, answers, qfix, question):
+                return {
+                    'id': row['id'],
+                    'verdict': verdict,
+                    'question': question,
+                    'question_fixed': qfix,
+                    'original_answer': original_answer,
+                    'answers': answers,
+                    'reasoning': parsed.get('reasoning', ''),
+                    'level': row.get('level', ''),
+                    'type': row.get('type', ''),
+                    'context': row.get('context', {}),
+                    'supporting_facts': row.get('supporting_facts', {}),
+                }
         sys.stderr.write(
             f'[verify retry {attempt+1}] {row["id"]}: '
             f'parse failed, content={content[:200]!r}\n')
@@ -168,7 +219,7 @@ def verify_answer(
 
 
 def stratified_sample_with_forced(
-    ds, per_level: int, forced_ids: frozenset, seed: int,
+    ds, per_level: Dict[str, int], forced_ids: frozenset, seed: int,
 ) -> List[Dict[str, Any]]:
     rng = random.Random(seed)
     buckets: Dict[str, List[int]] = {lv: [] for lv in LEVELS}
@@ -187,7 +238,7 @@ def stratified_sample_with_forced(
 
     picked_set = set(forced_indices)
     for lv in LEVELS:
-        need = max(0, per_level - forced_levels[lv])
+        need = max(0, per_level[lv] - forced_levels[lv])
         pool = [idx for idx in buckets[lv] if idx not in picked_set]
         if len(pool) < need:
             sys.stderr.write(
@@ -199,6 +250,25 @@ def stratified_sample_with_forced(
     picked = sorted(picked_set)
     rng.shuffle(picked)
     return [ds[int(i)] for i in picked]
+
+
+def select_forced_only(ds, forced_ids: frozenset, seed: int) -> List[Dict[str, Any]]:
+    """Pick exactly the rows whose id is in forced_ids; warn on missing."""
+    indices: List[int] = []
+    found: set = set()
+    for i in range(len(ds)):
+        rid = ds[i]['id']
+        if rid in forced_ids:
+            indices.append(i)
+            found.add(rid)
+    missing = forced_ids - found
+    if missing:
+        sys.stderr.write(
+            f'Warning: {len(missing)} forced ids not found in dataset, '
+            f'e.g. {sorted(missing)[:5]}\n')
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    return [ds[int(i)] for i in indices]
 
 
 def load_done_ids(path: str) -> set:
@@ -223,18 +293,19 @@ def main() -> None:
     parser.add_argument('--model', required=True)
     parser.add_argument('--api-key', default=os.environ.get('OPENAI_API_KEY'))
     parser.add_argument('--base-url', default=os.environ.get('OPENAI_BASE_URL'))
-    parser.add_argument('--total', type=int, default=9000)
+    parser.add_argument('--total', type=int, default=12000)
+    parser.add_argument('--easy', type=int, default=2000)
+    parser.add_argument('--medium', type=int, default=4000)
+    parser.add_argument('--hard', type=int, default=6000)
     parser.add_argument('--concurrency', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--wrong-ids', default='cookbook/rl/wrong_ids.txt')
     parser.add_argument('--hf-subset', default='fullwiki')
     parser.add_argument('--hf-split', default='train')
+    parser.add_argument(
+        '--only-forced', action=argparse.BooleanOptionalAction, default=False,
+        help='If set, re-annotate ONLY IDs in --wrong-ids; default is stratified sampling with wrong_ids force-included.')
     args = parser.parse_args()
-
-    if args.total % len(LEVELS) != 0:
-        raise ValueError(
-            f'--total must be divisible by {len(LEVELS)}, got {args.total}')
-    per_level = args.total // len(LEVELS)
 
     forced_ids: frozenset = frozenset()
     if args.wrong_ids and os.path.exists(args.wrong_ids):
@@ -242,14 +313,31 @@ def main() -> None:
             forced_ids = frozenset(ln.strip() for ln in fh if ln.strip())
         sys.stderr.write(f'Forced IDs loaded: {len(forced_ids)}\n')
 
+    if args.only_forced and not forced_ids:
+        raise ValueError(
+            f'--only-forced is set but no IDs loaded from {args.wrong_ids!r}')
+
     sys.stderr.write(
         f'Loading hotpotqa/hotpot_qa:{args.hf_subset}:{args.hf_split}...\n')
     ds = load_dataset(
         'hotpotqa/hotpot_qa', args.hf_subset, split=args.hf_split)
 
-    rows = stratified_sample_with_forced(
-        ds, per_level=per_level, forced_ids=forced_ids, seed=args.seed)
-    sys.stderr.write(f'Selected {len(rows)} rows (forced={len(forced_ids)})\n')
+    if args.only_forced:
+        rows = select_forced_only(ds, forced_ids=forced_ids, seed=args.seed)
+        sys.stderr.write(
+            f'Selected {len(rows)} rows (only-forced mode, '
+            f'requested={len(forced_ids)})\n')
+    else:
+        if args.easy + args.medium + args.hard != args.total:
+            raise ValueError(
+                f'--easy + --medium + --hard ({args.easy + args.medium + args.hard}) '
+                f'must equal --total ({args.total})')
+        per_level = {'easy': args.easy, 'medium': args.medium, 'hard': args.hard}
+        rows = stratified_sample_with_forced(
+            ds, per_level=per_level, forced_ids=forced_ids, seed=args.seed)
+        sys.stderr.write(
+            f'Selected {len(rows)} rows (stratified per_level={per_level}, '
+            f'forced={len(forced_ids)})\n')
 
     done = load_done_ids(args.output)
     sys.stderr.write(f'Resume: {len(done)} rows already done, skipping.\n')

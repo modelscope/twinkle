@@ -65,7 +65,7 @@ TOOL_BONUS_F1_THRESHOLD = float(
 
 # KL penalty coefficient; 0 disables KL (and skips the ref forward pass entirely).
 # CISPO is token-level and DOES support per-token KL — small positive value (e.g. 0.005) recommended as anchor.
-KL_BETA = float(os.environ.get('KL_BETA', 0.02))
+KL_BETA = float(os.environ.get('KL_BETA', 0.01))
 
 # Entropy bonus coefficient; 0 disables the entropy compute path entirely.
 # Typical GRPO values: 0.001–0.01. Loss is: L = L_PPO + beta*KL - entropy_coef*H.
@@ -73,7 +73,7 @@ ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
 
 # Per-token oracle bonus coefficient; 0 disables. Typical: 0.05–0.2.
 # Loss becomes: L = L_PPO + beta*KL - entropy_coef*H - token_bonus_coef*(oracle_logps - rollout_logps)
-ORACLE_BONUS_COEF = float(os.environ.get('ORACLE_BONUS_COEF', 0.1))
+ORACLE_BONUS_COEF = float(os.environ.get('ORACLE_BONUS_COEF', 0.0))
 
 # CISPO token-level IS clamp thresholds (MiniMax CISPO defaults: 0.2 / 0.28 asymmetric).
 CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
@@ -83,6 +83,10 @@ CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
 HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
 
 WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
+# Reannotated override JSONL produced by reannotate_groundtruth.py:
+# rows carry verdict in {keep, fix_answer, fix_question, drop}, plus question_fixed
+# and a multi-form ``answers`` list. Applied as a label-fix overlay on matching ids.
+REANNOTATED_FILE = os.environ.get('REANNOTATED_FILE', '')
 F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
 
 _ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
@@ -92,14 +96,15 @@ ORACLE_HINT = bool(int(os.environ.get('ORACLE_HINT', '1')))
 # [EXP-ORACLE] staged hint injection — appended to the Question line so skip_pattern keeps it uncompressed.
 def _oracle_hint_stage(step: int, total_steps: int) -> int:
     """0 = explicit titles, 1 = vague count, 2 = no hint."""
-    if total_steps <= 0:
-        return 0
-    third = max(1, total_steps // 3)
-    if step < third:
-        return 0
-    if step < 2 * third:
-        return 1
-    return 2
+    return 0
+    # if total_steps <= 0:
+    #     return 0
+    # third = max(1, total_steps // 3)
+    # if step < third:
+    #     return 0
+    # if step < 2 * third:
+    #     return 1
+    # return 2
 
 
 
@@ -328,11 +333,57 @@ def create_hotpotqa_dataset() -> Dataset:
             dataset.dataset = dataset.datasets[_key]
             logger.info(f'[WRONG_IDS_FILE] {_wrong_ids_path}: {_before} -> {len(dataset.dataset)} rows')
 
+    _reannot_path = REANNOTATED_FILE.strip()
+    if _reannot_path:
+        overrides: Dict[str, Dict[str, Any]] = {}
+        drop_ids: set = set()
+        with open(_reannot_path, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rid = obj.get('id')
+                if not rid:
+                    continue
+                if obj.get('verdict') == 'drop':
+                    drop_ids.add(rid)
+                else:
+                    overrides[rid] = obj
+        _key = next(iter(dataset.datasets.keys()))
+        _ds = dataset.datasets[_key]
+        _before = len(_ds)
+        if drop_ids:
+            _ds = _ds.filter(lambda row: row.get('id') not in drop_ids)
+
+        # Always emit ``answers`` to keep schema uniform across rows; processor reads it as multi-form gold.
+        def _apply_reannot(row):
+            ov = overrides.get(row.get('id'))
+            if ov is None:
+                return {'answers': [(row.get('answer') or '').strip()]}
+            qfix = (ov.get('question_fixed') or '').strip()
+            ans = [str(a).strip() for a in (ov.get('answers') or []) if str(a).strip()]
+            return {
+                'question': qfix or row.get('question') or '',
+                'answers': ans or [(row.get('answer') or '').strip()],
+            }
+        _ds = _ds.map(_apply_reannot)
+        dataset.datasets[_key] = _ds
+        dataset.dataset = _ds
+        logger.info(
+            f'[REANNOTATED] {_reannot_path}: {_before} -> {len(_ds)} rows '
+            f'(dropped={len(drop_ids)}, overridden={len(overrides)})')
+
     dataset.set_template(
         'Qwen3_5Template', model_id=MODEL_ID, max_length=HOTPOTQA_MAX_LENGTH,
         truncation_strategy='delete', enable_thinking=False)
     _HOTPOTQA_COLS = ['id', 'question', 'answer', 'type', 'level',
                       'supporting_facts', 'context']
+    if REANNOTATED_FILE.strip():
+        _HOTPOTQA_COLS = _HOTPOTQA_COLS + ['answers']
     dataset.map(HotpotQAProcessor(system=SYSTEM_PROMPT, levels=['hard']), remove_columns=_HOTPOTQA_COLS)
     return dataset
 

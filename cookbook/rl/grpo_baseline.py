@@ -449,7 +449,7 @@ def main():
         temperature=1.0, top_p=0.95)
 
     def _trace_should_store(traj):
-        return _F1_REWARD([traj])[0] == 0.0
+        return True
 
     def _trace_is_success(traj):
         return _F1_REWARD([traj])[0] > 0.0

@@ -103,4 +103,8 @@ class OpenAI(API):
                 }
                 for tc in tool_calls
             ]
+        # Surface finish_reason so multi-turn drivers can detect length-cap truncation.
+        finish = getattr(choice, 'finish_reason', None)
+        if finish is not None:
+            msg['finish_reason'] = finish
         return msg
