@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
-from twinkle.data_format.message import Tool as ToolInfo
+from twinkle.data_format import Tool as ToolInfo
 
 
 class Tool(ABC):
