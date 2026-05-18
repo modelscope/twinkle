@@ -38,8 +38,6 @@ class GRPOLoss(Loss):
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
         self.entropy_coef = entropy_coef
-        # Gate the expensive entropy compute path in the model forward.
-        self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
 
     def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
