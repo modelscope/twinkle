@@ -37,9 +37,11 @@ _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
 
 def _maybe_load_worker_notifier() -> None:
     """Lazily reconstruct notifier + name on ray workers from inherited env vars."""
-    global _notifier
+    global _notifier, _name
     if _notifier is not None:
         return
+    if _name is None:
+        _name = os.environ.get('TWINKLE_NAME') or None
     raw = os.environ.get(_TWINKLE_NOTIFIER_ENV)
     if not raw:
         return
@@ -89,8 +91,6 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     _notifier = notifier
     if name is not None:
         os.environ['TWINKLE_NAME'] = name
-    else:
-        _name = os.environ.get('TWINKLE_NAME') or None
     os.environ.setdefault('TWINKLE_SESSION_ID', str(os.getpid()))
     if notifier is not None and hasattr(notifier, 'to_dict'):
         os.environ[_TWINKLE_NOTIFIER_ENV] = json.dumps(notifier.to_dict())
@@ -493,7 +493,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 _maybe_load_worker_notifier()
                 _new_init_body(self, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
-                notify_exception(_notifier, _ctx, _e)
+                notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
         def _new_init_body(self, *args, **kwargs):
@@ -766,7 +766,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
-                                    notify_exception(_notifier, _ctx, _e)
+                                    notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
                             for _attr in ('_futures',):
@@ -780,7 +780,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
-                notify_exception(_notifier, _ctx, _e)
+                notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
         wrapper._execute = execute
