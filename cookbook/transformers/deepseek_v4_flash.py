@@ -41,9 +41,9 @@ LORA_TARGET_MODULES = [
 ADAPTER_NAME = 'default'
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=4,
+    fsdp_size=8,
     dp_size=1,
-     ep_size=4,
+    ep_size=8,
     device_type=Platform.get_platform().device_prefix(),
 )
 
@@ -89,9 +89,9 @@ def train():
         fsdp_config={
             'reshard_after_forward': RESHARD_AFTER_FORWARD,
              'expert_parallel': {
-        'enabled': True,
-        'router_dtype': 'fp32',
-        'keep_router_logits': False,
+             'enabled': True,
+             'router_dtype': 'fp32',
+             'keep_router_logits': False,
     },
         },
     )
