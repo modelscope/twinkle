@@ -496,7 +496,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             if isinstance(config, LoraConfig):
                 lora_config = types.LoraConfig(rank=config.r, train_unembed=False, train_mlp=True, train_attn=True)
             run_config = types.CreateModelRequest(
-                base_model=self.base_model, lora_config=lora_config, user_metadata={'adapter_name': body.adapter_name})
+                base_model=self.base_model,
+                lora_config=lora_config,
+                save_dir=body.save_dir,
+                user_metadata={'adapter_name': body.adapter_name})
             training_run_manager.save(adapter_name, run_config)
             return {'status': 'ok', 'adapter_name': adapter_name}
 

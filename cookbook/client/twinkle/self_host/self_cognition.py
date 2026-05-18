@@ -24,6 +24,7 @@ logger = get_logger()
 base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://localhost:8000'
 api_key = 'EMPTY_API_KEY'
+save_dir = '/model'
 
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
@@ -81,7 +82,7 @@ def train():
     # Attach the LoRA adapter named 'default' to the model.
     # gradient_accumulation_steps=2 means gradients are accumulated over 2 micro-batches
     # before an optimizer step, effectively doubling the batch size.
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2)
+    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=2, save_dir=save_dir)
 
     # Set the same chat template used during data preprocessing
     model.set_template('Qwen3_5Template')
