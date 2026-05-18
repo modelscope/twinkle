@@ -1,7 +1,7 @@
 import re
 import string
-from typing import List, Dict, Any, Tuple
 from collections import Counter
+from typing import Any, Dict, List, Tuple
 
 from twinkle.reward import Reward
 
@@ -27,7 +27,7 @@ def _extract_final_answer(completion: str) -> str:
                 depth -= 1
             j += 1
         if depth == 0:
-            out = completion[i + len(_BOXED_MARKER): j - 1].strip()
+            out = completion[i + len(_BOXED_MARKER):j - 1].strip()
             idx = j
         else:
             # Unbalanced trailing marker — stop, keep last good match.
@@ -42,9 +42,7 @@ def _last_assistant_text(traj: Dict[str, Any]) -> str:
         content = msg.get('content') or ''
         if isinstance(content, str):
             return content
-        return '\n'.join(
-            p.get('text', '') for p in content
-            if isinstance(p, dict) and p.get('type') == 'text')
+        return '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
     return ''
 
 
@@ -62,10 +60,31 @@ def _normalize_answer(s: str) -> str:
 
 def _f1_score(prediction: str, gold: str) -> Tuple[float, float]:
     filler_tokens: frozenset = frozenset([
-        'long', 'tall', 'high', 'wide', 'deep', 'heavy', 'old', 'large',
-        'small', 'big', 'short', 'away', 'ago', 'approximately', 'about',
-        'around', 'over', 'under', 'below', 'above', 'total', 'roughly',
-        'nearly', 'almost', 'exactly',
+        'long',
+        'tall',
+        'high',
+        'wide',
+        'deep',
+        'heavy',
+        'old',
+        'large',
+        'small',
+        'big',
+        'short',
+        'away',
+        'ago',
+        'approximately',
+        'about',
+        'around',
+        'over',
+        'under',
+        'below',
+        'above',
+        'total',
+        'roughly',
+        'nearly',
+        'almost',
+        'exactly',
     ])
     pred_tokens = _normalize_answer(prediction).split()
     gold_tokens = _normalize_answer(gold).split()
@@ -139,10 +158,8 @@ class CoTReward(Reward):
             # Newline-joined so ``^`` line anchors work even when
             # multiple assistant turns exist.
             assistant_text = '\n'.join(
-                m.get('content', '') or ''
-                for m in msgs
-                if m.get('role') == 'assistant' and isinstance(m.get('content'), str)
-            )
+                m.get('content', '') or '' for m in msgs
+                if m.get('role') == 'assistant' and isinstance(m.get('content'), str))
 
             if not self._HAS_BOXED_RE.search(assistant_text):
                 rewards.append(0.0)
@@ -230,4 +247,3 @@ class ToolExploreReward(Reward):
             else:
                 rewards.append(0.5)
         return rewards
-

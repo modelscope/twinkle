@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle_agentic.chunker.native import (
-    NativeChunker, _hard_cut, _split_keep,
-)
+from twinkle_agentic.chunker.native import NativeChunker, _hard_cut, _split_keep
 from twinkle_agentic.data_format import Chunks
 
 
@@ -115,7 +113,7 @@ def test_custom_separator_list_only():
 def test_empty_string_sentinel_appended_automatically():
     # User omits '' → chunker must still make progress on unsplittable text
     ch = NativeChunker(chunk_size=3, separators=['|'])
-    text = 'abcdefghij'   # no '|' at all
+    text = 'abcdefghij'  # no '|' at all
     out = ch({'messages': [_u(text)]}).chunks
     assert _join(out) == text
     assert all(len(c['content']) <= 3 for c in out)
@@ -127,20 +125,38 @@ def test_empty_string_sentinel_appended_automatically():
 def test_only_first_user_message_is_split():
     ch = NativeChunker(chunk_size=10)
     long = 'a' * 100
-    traj = {'messages': [
-        {'role': 'system',    'content': long},
-        {'role': 'user',      'content': long},   # ← split
-        {'role': 'assistant', 'content': long},
-        {'role': 'user',      'content': long},   # ← pass-through
-        {'role': 'tool',      'content': long, 'tool_call_id': 'c1'},
-    ]}
+    traj = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': long
+            },
+            {
+                'role': 'user',
+                'content': long
+            },  # ← split
+            {
+                'role': 'assistant',
+                'content': long
+            },
+            {
+                'role': 'user',
+                'content': long
+            },  # ← pass-through
+            {
+                'role': 'tool',
+                'content': long,
+                'tool_call_id': 'c1'
+            },
+        ]
+    }
     out = ch(traj).chunks
 
     # Count chunks per message by position.
-    system_chunks    = [c for c in out if c['role'] == 'system']
+    system_chunks = [c for c in out if c['role'] == 'system']
     assistant_chunks = [c for c in out if c['role'] == 'assistant']
-    tool_chunks      = [c for c in out if c['role'] == 'tool']
-    user_chunks      = [c for c in out if c['role'] == 'user']
+    tool_chunks = [c for c in out if c['role'] == 'tool']
+    user_chunks = [c for c in out if c['role'] == 'user']
 
     assert len(system_chunks) == 1
     assert len(assistant_chunks) == 1
@@ -155,10 +171,18 @@ def test_only_first_user_message_is_split():
 def test_system_and_assistant_content_not_split():
     ch = NativeChunker(chunk_size=5)
     long = 'abcdefghijklmn'
-    traj = {'messages': [
-        {'role': 'system',    'content': long},
-        {'role': 'assistant', 'content': long},
-    ]}
+    traj = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': long
+            },
+            {
+                'role': 'assistant',
+                'content': long
+            },
+        ]
+    }
     out = ch(traj).chunks
     assert len(out) == 2
     assert out[0]['content'] == long
@@ -168,10 +192,18 @@ def test_system_and_assistant_content_not_split():
 def test_trajectory_without_user_message_produces_no_split():
     ch = NativeChunker(chunk_size=5)
     long = 'abcdefghij'
-    traj = {'messages': [
-        {'role': 'system',    'content': long},
-        {'role': 'assistant', 'content': long},
-    ]}
+    traj = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': long
+            },
+            {
+                'role': 'assistant',
+                'content': long
+            },
+        ]
+    }
     out = ch(traj).chunks
     assert all(len(c['content']) == len(long) for c in out)
 
@@ -181,12 +213,16 @@ def test_trajectory_without_user_message_produces_no_split():
 # ---------------------------------------------------------------------------
 def test_reasoning_content_becomes_own_chunk():
     ch = NativeChunker(chunk_size=100)
-    traj = {'messages': [
-        _u('hi'),
-        {'role': 'assistant',
-         'reasoning_content': 'think step',
-         'content': 'answer'},
-    ]}
+    traj = {
+        'messages': [
+            _u('hi'),
+            {
+                'role': 'assistant',
+                'reasoning_content': 'think step',
+                'content': 'answer'
+            },
+        ]
+    }
     out = ch(traj).chunks
     # user(hi) + assistant.reasoning + assistant.content
     assert len(out) == 3
@@ -198,16 +234,35 @@ def test_reasoning_content_becomes_own_chunk():
 
 def test_tool_calls_become_empty_text_chunks_with_kind():
     ch = NativeChunker(chunk_size=100)
-    traj = {'messages': [
-        _u('hi'),
-        {'role': 'assistant', 'content': 'calling',
-         'tool_calls': [
-             {'type': 'function',
-              'function': {'name': 'foo', 'arguments': {}}},
-             {'type': 'function',
-              'function': {'name': 'bar', 'arguments': {'x': 1}}},
-         ]},
-    ]}
+    traj = {
+        'messages': [
+            _u('hi'),
+            {
+                'role':
+                'assistant',
+                'content':
+                'calling',
+                'tool_calls': [
+                    {
+                        'type': 'function',
+                        'function': {
+                            'name': 'foo',
+                            'arguments': {}
+                        }
+                    },
+                    {
+                        'type': 'function',
+                        'function': {
+                            'name': 'bar',
+                            'arguments': {
+                                'x': 1
+                            }
+                        }
+                    },
+                ]
+            },
+        ]
+    }
     out = ch(traj).chunks
     tc_chunks = [c for c in out if c.get('raw', {}).get('kind') == 'tool_call']
     assert len(tc_chunks) == 2
@@ -219,10 +274,16 @@ def test_tool_calls_become_empty_text_chunks_with_kind():
 
 def test_tool_message_preserves_tool_call_id():
     ch = NativeChunker(chunk_size=100)
-    traj = {'messages': [
-        _u('hi'),
-        {'role': 'tool', 'content': 'result', 'tool_call_id': 'call-42'},
-    ]}
+    traj = {
+        'messages': [
+            _u('hi'),
+            {
+                'role': 'tool',
+                'content': 'result',
+                'tool_call_id': 'call-42'
+            },
+        ]
+    }
     out = ch(traj).chunks
     tool_chunk = out[-1]
     assert tool_chunk['role'] == 'tool'
@@ -231,15 +292,24 @@ def test_tool_message_preserves_tool_call_id():
 
 def test_multimodal_content_preserved_on_first_user():
     ch = NativeChunker(chunk_size=5)
-    traj = {'messages': [{
-        'role': 'user',
-        'content': [
-            {'type': 'text', 'text': 'describe this image'},
-            {'type': 'image', 'image': 'http://x/y.png'},
-        ],
-    }]}
+    traj = {
+        'messages': [{
+            'role':
+            'user',
+            'content': [
+                {
+                    'type': 'text',
+                    'text': 'describe this image'
+                },
+                {
+                    'type': 'image',
+                    'image': 'http://x/y.png'
+                },
+            ],
+        }]
+    }
     out = ch(traj).chunks
-    text_chunks  = [c for c in out if c['type'] == 'text']
+    text_chunks = [c for c in out if c['type'] == 'text']
     image_chunks = [c for c in out if c['type'] == 'image']
     assert len(image_chunks) == 1
     assert image_chunks[0]['content'] == 'http://x/y.png'
@@ -289,15 +359,17 @@ def test_whitespace_only_text_is_preserved_losslessly():
 # ---------------------------------------------------------------------------
 def test_hotpotqa_like_passage_layout():
     ch = NativeChunker(chunk_size=80)
-    passages = '\n\n'.join(
-        f'[{i}] Title_{i}: ' + 'This is sentence. ' * 6
-        for i in range(1, 6)
-    )
+    passages = '\n\n'.join(f'[{i}] Title_{i}: ' + 'This is sentence. ' * 6 for i in range(1, 6))
     user_text = f'Question: who wrote it?\n\nContext:\n\n{passages}'
-    out = ch({'messages': [
-        {'role': 'system', 'content': 'sys'},
-        _u(user_text),
-    ]}).chunks
+    out = ch({
+        'messages': [
+            {
+                'role': 'system',
+                'content': 'sys'
+            },
+            _u(user_text),
+        ]
+    }).chunks
     # System message is not split.
     assert out[0]['role'] == 'system' and out[0]['content'] == 'sys'
     # User text reconstructs losslessly.
@@ -311,15 +383,29 @@ def test_hotpotqa_like_passage_layout():
 # ---------------------------------------------------------------------------
 def test_non_split_messages_roundtrip_through_to_trajectory():
     ch = NativeChunker(chunk_size=1024)
-    tc = {'type': 'function',
-          'function': {'name': 'foo', 'arguments': {}}}
-    traj = {'messages': [
-        {'role': 'system',    'content': 'sys'},
-        {'role': 'user',      'content': 'short question'},
-        {'role': 'assistant', 'content': 'answer',
-         'tool_calls': [tc]},
-        {'role': 'tool',      'content': 'result', 'tool_call_id': 'c1'},
-    ]}
+    tc = {'type': 'function', 'function': {'name': 'foo', 'arguments': {}}}
+    traj = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': 'sys'
+            },
+            {
+                'role': 'user',
+                'content': 'short question'
+            },
+            {
+                'role': 'assistant',
+                'content': 'answer',
+                'tool_calls': [tc]
+            },
+            {
+                'role': 'tool',
+                'content': 'result',
+                'tool_call_id': 'c1'
+            },
+        ]
+    }
     chunks = ch(traj)
     back = chunks.to_trajectory(block_wrapper=None)
     msgs = back['messages']
@@ -339,13 +425,13 @@ def test_non_split_messages_roundtrip_through_to_trajectory():
 # ---------------------------------------------------------------------------
 def test_split_keep_is_lossless():
     cases = [
-        ('',        '|'),
-        ('abc',     '|'),
-        ('a|b|c',   '|'),
-        ('|abc|',   '|'),
-        ('|||',     '|'),
+        ('', '|'),
+        ('abc', '|'),
+        ('a|b|c', '|'),
+        ('|abc|', '|'),
+        ('|||', '|'),
         ('aa..bb.', '.'),
-        ('hello',   ''),    # empty separator → single piece
+        ('hello', ''),  # empty separator → single piece
     ]
     for text, sep in cases:
         parts = _split_keep(text, sep)
@@ -383,22 +469,35 @@ def test_prefers_paragraph_boundary_over_period_when_both_fit():
 # ---------------------------------------------------------------------------
 def test_round_starts_at_zero_for_pre_user_system():
     ch = NativeChunker(chunk_size=1024)
-    out = ch({'messages': [
-        {'role': 'system', 'content': 'you are helpful'},
-        _u('hello'),
-    ]}).chunks
+    out = ch({
+        'messages': [
+            {
+                'role': 'system',
+                'content': 'you are helpful'
+            },
+            _u('hello'),
+        ]
+    }).chunks
     assert [c['round'] for c in out] == [0, 1]
 
 
 def test_round_increments_on_each_user_message():
     ch = NativeChunker(chunk_size=1024)
-    out = ch({'messages': [
-        _u('first user'),
-        {'role': 'assistant', 'content': 'first reply'},
-        _u('second user'),
-        {'role': 'assistant', 'content': 'second reply'},
-        _u('third user'),
-    ]}).chunks
+    out = ch({
+        'messages': [
+            _u('first user'),
+            {
+                'role': 'assistant',
+                'content': 'first reply'
+            },
+            _u('second user'),
+            {
+                'role': 'assistant',
+                'content': 'second reply'
+            },
+            _u('third user'),
+        ]
+    }).chunks
     rounds = [c['round'] for c in out]
     # assistant msgs inherit the round of the preceding user turn.
     assert rounds == [1, 1, 2, 2, 3]
@@ -406,24 +505,44 @@ def test_round_increments_on_each_user_message():
 
 def test_round_covers_tool_responses_between_users():
     ch = NativeChunker(chunk_size=1024)
-    out = ch({'messages': [
-        _u('query'),
-        {'role': 'assistant', 'content': 'calling tool'},
-        {'role': 'tool', 'content': 'tool result', 'tool_call_id': 'x'},
-        {'role': 'assistant', 'content': 'final'},
-    ]}).chunks
+    out = ch({
+        'messages': [
+            _u('query'),
+            {
+                'role': 'assistant',
+                'content': 'calling tool'
+            },
+            {
+                'role': 'tool',
+                'content': 'tool result',
+                'tool_call_id': 'x'
+            },
+            {
+                'role': 'assistant',
+                'content': 'final'
+            },
+        ]
+    }).chunks
     assert {c['round'] for c in out} == {1}
 
 
 def test_round_preserved_when_first_user_is_split():
     ch = NativeChunker(chunk_size=20)
     long_user = 'hello world. ' * 10  # gets split
-    out = ch({'messages': [
-        {'role': 'system', 'content': 'sys'},
-        _u(long_user),
-        {'role': 'assistant', 'content': 'ack'},
-        _u('again'),
-    ]}).chunks
+    out = ch({
+        'messages': [
+            {
+                'role': 'system',
+                'content': 'sys'
+            },
+            _u(long_user),
+            {
+                'role': 'assistant',
+                'content': 'ack'
+            },
+            _u('again'),
+        ]
+    }).chunks
     # All pieces of the split first user share round=1, system is round=0,
     # assistant inherits round=1, second user is round=2.
     by_role = {}

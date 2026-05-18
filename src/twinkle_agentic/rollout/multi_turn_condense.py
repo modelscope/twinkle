@@ -3,14 +3,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SamplingParams
+from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
-
 from twinkle_agentic.chunker.base import Chunker
 from twinkle_agentic.condenser.base import Condenser
 from twinkle_agentic.data_format import Chunks
-from twinkle.infra import remote_class, remote_function
-from twinkle_agentic.tools.extract_condensed import (
-    ExtractCondensed, TOOL_NAME as EXTRACT_TOOL_NAME)
+from twinkle_agentic.tools.extract_condensed import TOOL_NAME as EXTRACT_TOOL_NAME
+from twinkle_agentic.tools.extract_condensed import ExtractCondensed
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .multi_turn import MultiTurnRollout
 
@@ -18,6 +17,7 @@ from .multi_turn import MultiTurnRollout
 @remote_class()
 class MultiTurnCondenseRollout(MultiTurnRollout):
     """Multi-turn rollout with trajectory compression + on-demand recovery.
+    TODO: Experimental feature, wait for testing
 
     Pipeline for a batch of trajectories:
         1. ``chunker(trajectory)`` splits each incoming trajectory into chunks.
@@ -74,17 +74,14 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             success_callback=success_callback,
         )
         if chunker is None:
-            raise ValueError(
-                'MultiTurnCondenseRollout requires a Chunker instance')
+            raise ValueError('MultiTurnCondenseRollout requires a Chunker instance')
         if condenser is None:
-            raise ValueError(
-                'MultiTurnCondenseRollout requires a Condenser instance')
+            raise ValueError('MultiTurnCondenseRollout requires a Condenser instance')
         if EXTRACT_TOOL_NAME in tool_manager.names():
-            raise ValueError(
-                f'tool_manager already registers {EXTRACT_TOOL_NAME!r}; '
-                f'MultiTurnCondenseRollout registers a trajectory-bound '
-                f'ExtractCondensed per call and would shadow the existing '
-                f'one. Remove it from the shared manager or rename it.')
+            raise ValueError(f'tool_manager already registers {EXTRACT_TOOL_NAME!r}; '
+                             f'MultiTurnCondenseRollout registers a trajectory-bound '
+                             f'ExtractCondensed per call and would shadow the existing '
+                             f'one. Remove it from the shared manager or rename it.')
         self.chunker = chunker
         self.condenser = condenser
         if getattr(self.condenser, 'template', None) is None:
@@ -96,9 +93,8 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
         if isinstance(trajectories, dict):
-            raise TypeError(
-                'MultiTurnCondenseRollout.__call__ expects a '
-                'List[Trajectory]; wrap a single trajectory as [trajectory].')
+            raise TypeError('MultiTurnCondenseRollout.__call__ expects a '
+                            'List[Trajectory]; wrap a single trajectory as [trajectory].')
         trajectories = list(trajectories)
         if not trajectories:
             return []
@@ -133,8 +129,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             for k, v in traj.items():
                 compressed.setdefault(k, v)
             if self.post_compress_callback is not None:
-                compressed = self.post_compress_callback(
-                    compressed, traj_chunks, **kwargs)
+                compressed = self.post_compress_callback(compressed, traj_chunks, **kwargs)
             compressed_list.append(compressed)
 
             call_tm = self.tool_manager.copy()
@@ -146,15 +141,11 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         #    the list) -- drop it to avoid ambiguity.
         kwargs.pop('tool_manager', None)
         if self.trace_dir:
-            self._trace_block_chunks = [
-                canonical[group_first[signatures[i]]]
-                for i in range(len(trajectories))
-            ]
+            self._trace_block_chunks = [canonical[group_first[signatures[i]]] for i in range(len(trajectories))]
         else:
             self._trace_block_chunks = None
         try:
-            return super().__call__(
-                compressed_list, tool_manager=tool_managers, **kwargs)
+            return super().__call__(compressed_list, tool_manager=tool_managers, **kwargs)
         finally:
             self._trace_block_chunks = None
 
@@ -233,8 +224,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
           back to passthrough. This lets the trace show the compressed
           vs. passthrough ratio per rollout.
         """
-        record = super()._build_trace_record(
-            traj, idx=idx, success=success)
+        record = super()._build_trace_record(traj, idx=idx, success=success)
 
         all_chunks = self._trace_block_chunks
         if all_chunks is None or idx >= len(all_chunks):
@@ -248,9 +238,7 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
         return record
 
     @staticmethod
-    def _enumerate_blocks(
-        chunks: Chunks,
-    ) -> 'tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]':
+    def _enumerate_blocks(chunks: Chunks, ) -> 'tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]':
         """Walk ``chunks`` and emit ``(blocks, passages)`` maps.
 
         * ``blocks`` → ``{block_N: {original, compressed}}`` for every
@@ -280,15 +268,12 @@ class MultiTurnCondenseRollout(MultiTurnRollout):
             if role == 'tool':
                 continue
             raw = c.get('raw')
-            is_condensed = (
-                isinstance(raw, dict) and bool(raw.get('condensed')))
+            is_condensed = (isinstance(raw, dict) and bool(raw.get('condensed')))
             if is_condensed:
                 block_counter += 1
                 original = raw.get('original') if isinstance(raw, dict) else None
                 blocks[f'block_{block_counter}'] = {
-                    'original': (
-                        original if isinstance(original, str) and original
-                        else None),
+                    'original': (original if isinstance(original, str) and original else None),
                     'compressed': content,
                 }
             elif role == 'user':

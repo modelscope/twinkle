@@ -69,13 +69,13 @@ def _try_create_claim(path: str, session: str, payload: str) -> bool:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
-                os.write(fd, f'{session}\n{payload}'.encode('utf-8'))
+                os.write(fd, f'{session}\n{payload}'.encode())
             finally:
                 os.close(fd)
             return True
         except FileExistsError:
             try:
-                with open(path, 'r', encoding='utf-8') as f:
+                with open(path, encoding='utf-8') as f:
                     stored = f.readline().strip()
                 if stored == session:
                     return False  # same session, genuine loser

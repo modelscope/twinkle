@@ -4,14 +4,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from twinkle.data_format import Trajectory
-
+from twinkle.data_format.sampling import SamplingParams
 from twinkle_agentic.protocol.openai import OpenAI
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle.data_format.sampling import SamplingParams
-
 from .base import Rollout
 from .multi_turn import MultiTurnRollout
-
 
 # Termination reasons surfaced via ``trajectory['stop_reason']``.
 _STOP_NO_TOOL = 'stop'
@@ -74,9 +71,8 @@ class APIMultiTurnRollout(Rollout):
             raise ValueError(f'concurrency must be >= 1, got {concurrency}')
         sp = sampling_params or SamplingParams()
         if sp.num_samples != 1:
-            raise ValueError(
-                f'APIMultiTurnRollout supports num_samples=1 only, '
-                f'got {sp.num_samples}')
+            raise ValueError(f'APIMultiTurnRollout supports num_samples=1 only, '
+                             f'got {sp.num_samples}')
         self.api = api
         self.tool_manager = tool_manager
         self.sampling_params = sp
@@ -94,18 +90,15 @@ class APIMultiTurnRollout(Rollout):
         **kwargs,
     ) -> List[Trajectory]:
         if isinstance(trajectories, dict):
-            raise TypeError(
-                'APIMultiTurnRollout.__call__ expects a List[Trajectory]; '
-                'wrap a single trajectory as [trajectory].')
+            raise TypeError('APIMultiTurnRollout.__call__ expects a List[Trajectory]; '
+                            'wrap a single trajectory as [trajectory].')
         trajectories = list(trajectories)
         n = len(trajectories)
         if n == 0:
             return []
 
-        sampling_params: SamplingParams = kwargs.get(
-            'sampling_params', self.sampling_params)
-        tool_managers = MultiTurnRollout._resolve_tool_managers(
-            kwargs.get('tool_manager', self.tool_manager), n)
+        sampling_params: SamplingParams = kwargs.get('sampling_params', self.sampling_params)
+        tool_managers = MultiTurnRollout._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
         extra_body = dict(self.extra_body)
         if 'extra_body' in kwargs and kwargs['extra_body']:
             extra_body.update(kwargs['extra_body'])
@@ -116,19 +109,14 @@ class APIMultiTurnRollout(Rollout):
         outs: List[Optional[Trajectory]] = [None] * n
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = {
-                pool.submit(
-                    self._run_one, trajectories[i], tool_managers[i],
-                    sampling_params, extra_body): i
+                pool.submit(self._run_one, trajectories[i], tool_managers[i], sampling_params, extra_body): i
                 for i in range(n)
             }
             for fut in as_completed(futures):
                 i = futures[fut]
                 outs[i] = fut.result()
 
-        result_outs: List[Trajectory] = [
-            o if o is not None else dict(trajectories[i])
-            for i, o in enumerate(outs)
-        ]
+        result_outs: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
         if self.trace_dir:
             self._write_traces(result_outs, kwargs.get('global_step'))
         return result_outs
@@ -165,8 +153,7 @@ class APIMultiTurnRollout(Rollout):
                 req_traj['tools'] = list(tools)
             try:
                 reply = self.api(
-                    req_traj, sampling_params,
-                    extra_body=extra_body) if extra_body else self.api(
+                    req_traj, sampling_params, extra_body=extra_body) if extra_body else self.api(
                         req_traj, sampling_params)
             except Exception as exc:
                 stop_reason = _STOP_API_ERROR
@@ -277,15 +264,11 @@ class APIMultiTurnRollout(Rollout):
                 if traj.get('error'):
                     record['error'] = traj['error']
                 prefix = 'ok' if success else 'fail'
-                step_tag = (
-                    f'step{int(global_step):06d}-'
-                    if global_step is not None else '')
-                fname = (
-                    f'{step_tag}{prefix}-'
-                    f'{MultiTurnRollout._resolve_traj_id(traj, idx)}.json')
+                step_tag = (f'step{int(global_step):06d}-' if global_step is not None else '')
+                fname = (f'{step_tag}{prefix}-'
+                         f'{MultiTurnRollout._resolve_traj_id(traj, idx)}.json')
                 path = os.path.join(self.trace_dir, fname)
                 with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(record, f, ensure_ascii=False,
-                              indent=2, default=str)
+                    json.dump(record, f, ensure_ascii=False, indent=2, default=str)
             except Exception:
                 pass

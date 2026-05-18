@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 from typing import Any, Dict, List, Optional, Union
+
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.utils.transformers_utils import align_logps_to_mask
 from .base import Metric
@@ -247,8 +248,7 @@ class GRPOMetric(Metric):
         inputs_list = inputs if isinstance(inputs, list) else [inputs]
 
         if (torch.is_tensor(logps_val) and len(inputs_list) > 1
-                and all(isinstance(i, dict) and i.get('labels') is not None
-                        for i in inputs_list)):
+                and all(isinstance(i, dict) and i.get('labels') is not None for i in inputs_list)):
             label_tensors = [torch.as_tensor(i['labels']) for i in inputs_list]
             seq_lens = {t.shape[-1] for t in label_tensors}
             if len(seq_lens) == 1:
@@ -271,7 +271,7 @@ class GRPOMetric(Metric):
             labels = mb_input.get('labels')
             if labels is None:
                 continue
-            import torch
+
             labels = torch.as_tensor(labels)
 
             logps_mb = logps_list[mb_idx]
@@ -284,15 +284,13 @@ class GRPOMetric(Metric):
                 # Uncommon: aligned global tensor. Only honour when it
                 # exactly matches the single-mb shape; otherwise drop.
                 import torch as _torch  # noqa: F811
-                old_slice = old_logps if (_torch.is_tensor(old_logps) and old_logps.shape
-                                          == logps_mb.shape) else None
+                old_slice = old_logps if (_torch.is_tensor(old_logps) and old_logps.shape == logps_mb.shape) else None
             else:
                 old_slice = None
 
             adv_mb = flat_adv[cursor:cursor + num_seq_est] if flat_adv is not None else None
             gsi_base = self._gsi_cursor
-            advanced = self._accumulate_mb(
-                labels, logps_mb, old_slice, ent_mb, adv_mb, gsi_base=gsi_base)
+            advanced = self._accumulate_mb(labels, logps_mb, old_slice, ent_mb, adv_mb, gsi_base=gsi_base)
             self._gsi_cursor += advanced
             cursor += advanced
 

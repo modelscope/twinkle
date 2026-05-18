@@ -1,7 +1,7 @@
 import os
 from typing import Dict, Optional
-from twinkle.utils import get_logger
-from twinkle.utils import get_runtime_meta
+
+from twinkle.utils import get_logger, get_runtime_meta
 
 logger = get_logger()
 
@@ -43,6 +43,7 @@ class Notifier:
 
 _runtime_meta_cache = None
 
+
 def _try_claim_notify_slot(exc: BaseException, context: str, name: Optional[str] = None) -> bool:
     """Build an exception fingerprint and delegate to the generic single-winner claim."""
     from twinkle.utils.parallel import try_claim_once
@@ -76,13 +77,11 @@ def notify_exception(notifier: Notifier, context: str, exc: BaseException, name:
         import traceback
         tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         title = f'[Twinkle] `{name or "unnamed"}` — Exception in `{context}`'
-        msg = (
-            f'### {title}\n\n'
-            f'- **Type**: `{type(exc).__name__}`\n'
-            f'- **Message**: {exc}\n'
-            f'{_runtime_meta_cache}\n\n'
-            f'```\n{tb_str}```\n'
-        )
+        msg = (f'### {title}\n\n'
+               f'- **Type**: `{type(exc).__name__}`\n'
+               f'- **Message**: {exc}\n'
+               f'{_runtime_meta_cache}\n\n'
+               f'```\n{tb_str}```\n')
         notifier(msg)
     except Exception as e:  # noqa
         logger.exception(f'Failed to send twinkle exception notification: {e}')

@@ -1,38 +1,27 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Rule-based trajectory chunker.
-
-Only the *first* ``user`` message is split into multiple text chunks
-(capped at ``chunk_size`` characters, using a recursive separator list
-that prefers paragraphs > lines > sentences > words). Every other
-message is decomposed part-by-part *without* further splitting, so the
-resulting :class:`Chunks` round-trips back to the original trajectory
-via :meth:`Chunks.to_trajectory` (for non-split messages).
-
-The chunker never marks chunks as ``condensed`` — that is the
-condenser's job. Consequently :meth:`Chunks.to_trajectory` will not
-wrap any chunk with ``<block_N>...</block_N>`` when called directly on
-a chunker output.
-"""
-from __future__ import annotations
-
 import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle.data_format import Trajectory
 from twinkle_agentic.data_format import Chunk, Chunks
-
 from .base import Chunker
-
 
 # Recursive separator list, coarsest → finest. The empty string at the
 # end forces a hard character cut when nothing finer fits.
 _DEFAULT_SEPARATORS: tuple = (
-    '\n\n', '\n',
-    '。', '．', '.',
-    '！', '!',
-    '？', '?',
-    '；', ';',
-    '，', ',',
+    '\n\n',
+    '\n',
+    '。',
+    '．',
+    '.',
+    '！',
+    '!',
+    '？',
+    '?',
+    '；',
+    ';',
+    '，',
+    ',',
     ' ',
     '',
 )
@@ -44,7 +33,7 @@ _SplitFn = Optional[Callable[[str], List[str]]]
 
 class NativeChunker(Chunker):
     """Character-level recursive chunker for trajectories.
-
+    TODO: Experimental feature, wait for testing
     Args:
         chunk_size: Soft upper bound (in characters) for every emitted
             text chunk. Must be positive.
@@ -68,25 +57,24 @@ class NativeChunker(Chunker):
     def __init__(
         self,
         chunk_size: int = 1024,
-        separators: Optional[Sequence[str]] = None,
-        passage_boundary_re: Optional[str] = None,
+        separators: Sequence[str] | None = None,
+        passage_boundary_re: str | None = None,
     ):
         if chunk_size <= 0:
             raise ValueError(f'chunk_size must be positive, got {chunk_size}')
         self.chunk_size = chunk_size
         seps = tuple(separators) if separators is not None else _DEFAULT_SEPARATORS
         if '' not in seps:
-            seps += ('',)
+            seps += ('', )
         self.separators = seps
-        self.passage_boundary_re: Optional[re.Pattern] = (
-            re.compile(passage_boundary_re, re.MULTILINE)
-            if passage_boundary_re else None)
+        self.passage_boundary_re: re.Pattern | None = (
+            re.compile(passage_boundary_re, re.MULTILINE) if passage_boundary_re else None)
 
     # ------------------------------------------------------------------
     # public entry
     # ------------------------------------------------------------------
     def __call__(self, trajectory: Trajectory) -> Chunks:
-        chunks: List[Chunk] = []
+        chunks: list[Chunk] = []
         first_user_done = False
         # ``round`` is 1-indexed at the first user message. Any messages
         # emitted before that (e.g., leading ``system``) carry round 0.
@@ -95,8 +83,7 @@ class NativeChunker(Chunker):
             is_user = msg.get('role') == 'user'
             if is_user:
                 round_idx += 1
-            split = (self._split_text
-                     if is_user and not first_user_done else None)
+            split = (self._split_text if is_user and not first_user_done else None)
             if is_user:
                 first_user_done = True
             for chunk in self._parts(msg, split):
@@ -107,7 +94,7 @@ class NativeChunker(Chunker):
     # ------------------------------------------------------------------
     # message → chunks decomposition
     # ------------------------------------------------------------------
-    def _parts(self, message: Dict[str, Any], split: _SplitFn) -> Iterator[Chunk]:
+    def _parts(self, message: dict[str, Any], split: _SplitFn) -> Iterator[Chunk]:
         role = message.get('role') or 'user'
         tcid = message.get('tool_call_id')
 
@@ -124,8 +111,7 @@ class NativeChunker(Chunker):
                     continue
                 ptype = part.get('type')
                 if ptype == 'text':
-                    yield from self._emit_text(
-                        role, part.get('text') or '', split, tcid)
+                    yield from self._emit_text(role, part.get('text') or '', split, tcid)
                 elif ptype in _MULTIMODAL_TYPES:
                     # Keep raw part so Chunks.to_trajectory can rebuild
                     # the original OpenAI-style entry verbatim.
@@ -135,11 +121,9 @@ class NativeChunker(Chunker):
                     }
 
         for tc in message.get('tool_calls') or []:
-            yield _text_chunk(role, '', kind='tool_call', tool_call=tc,
-                              tool_call_id=tcid)
+            yield _text_chunk(role, '', kind='tool_call', tool_call=tc, tool_call_id=tcid)
 
-    def _emit_text(self, role: str, text: str, split: _SplitFn,
-                   tool_call_id: Optional[str]) -> Iterator[Chunk]:
+    def _emit_text(self, role: str, text: str, split: _SplitFn, tool_call_id: str | None) -> Iterator[Chunk]:
         if not text:
             return
         pieces = split(text) if split is not None else [text]
@@ -150,7 +134,7 @@ class NativeChunker(Chunker):
     # ------------------------------------------------------------------
     # recursive text splitter
     # ------------------------------------------------------------------
-    def _split_text(self, text: str) -> List[str]:
+    def _split_text(self, text: str) -> list[str]:
         if not text:
             return []
         if self.passage_boundary_re is None:
@@ -160,18 +144,17 @@ class NativeChunker(Chunker):
         # Force-split first; each forced piece is kept intact when it is
         # already short enough, and is recursively re-split (but NOT
         # merged with sibling passages) when it exceeds ``chunk_size``.
-        out: List[str] = []
+        out: list[str] = []
         for piece in self._force_split(text):
             if not piece or not piece.strip():
                 continue
             if len(piece) <= self.chunk_size:
                 out.append(piece)
             else:
-                out.extend(self._merge(
-                    self._recursive_split(piece, list(self.separators))))
+                out.extend(self._merge(self._recursive_split(piece, list(self.separators))))
         return out
 
-    def _force_split(self, text: str) -> List[str]:
+    def _force_split(self, text: str) -> list[str]:
         """Split ``text`` at every ``passage_boundary_re`` match; the
         match itself sticks to the start of the **next** piece, so
         ``''.join(_force_split(text)) == text``.
@@ -180,7 +163,7 @@ class NativeChunker(Chunker):
         matches = list(self.passage_boundary_re.finditer(text))
         if not matches:
             return [text]
-        out: List[str] = []
+        out: list[str] = []
         prev = 0
         for m in matches:
             start = m.start()
@@ -191,7 +174,7 @@ class NativeChunker(Chunker):
             out.append(text[prev:])
         return out
 
-    def _recursive_split(self, text: str, separators: List[str]) -> List[str]:
+    def _recursive_split(self, text: str, separators: list[str]) -> list[str]:
         if len(text) <= self.chunk_size:
             return [text] if text else []
         # Terminal: no more separators, or next one is the hard-cut sentinel.
@@ -199,7 +182,7 @@ class NativeChunker(Chunker):
             return _hard_cut(text, self.chunk_size)
 
         sep, *rest = separators
-        out: List[str] = []
+        out: list[str] = []
         for piece in _split_keep(text, sep):
             if not piece:
                 continue
@@ -209,11 +192,11 @@ class NativeChunker(Chunker):
                 out.extend(self._recursive_split(piece, rest))
         return out
 
-    def _merge(self, pieces: List[str]) -> List[str]:
+    def _merge(self, pieces: list[str]) -> list[str]:
         """Greedy concatenation: small fragments fuse up to ``chunk_size``
         without exceeding it. Relative order is preserved.
         """
-        merged: List[str] = []
+        merged: list[str] = []
         buf = ''
         for p in pieces:
             if not p:
@@ -230,13 +213,13 @@ class NativeChunker(Chunker):
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
-def _split_keep(text: str, sep: str) -> List[str]:
+def _split_keep(text: str, sep: str) -> list[str]:
     """``str.split(sep)`` but the separator stays glued to the end of
     each left-hand piece, so ``''.join(result) == text``.
     """
     if not sep or sep not in text:
         return [text] if text else []
-    out: List[str] = []
+    out: list[str] = []
     start, n = 0, len(sep)
     while (i := text.find(sep, start)) != -1:
         out.append(text[start:i + n])
@@ -246,7 +229,7 @@ def _split_keep(text: str, sep: str) -> List[str]:
     return out
 
 
-def _hard_cut(text: str, size: int) -> List[str]:
+def _hard_cut(text: str, size: int) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] if text else []
 
 
@@ -254,11 +237,11 @@ def _text_chunk(
     role: str,
     content: str,
     *,
-    kind: Optional[str] = None,
+    kind: str | None = None,
     tool_call: Any = None,
-    tool_call_id: Optional[str] = None,
+    tool_call_id: str | None = None,
 ) -> Chunk:
-    raw: Dict[str, Any] = {}
+    raw: dict[str, Any] = {}
     if kind is not None:
         raw['kind'] = kind
     if tool_call is not None:

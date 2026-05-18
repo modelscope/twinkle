@@ -10,11 +10,9 @@ from twinkle.template import Template
 @remote_class()
 class QwenTemplate(Template):
 
-    _BLOCK_RE = re.compile(
-        r'<tool_call>\s*([\s\S]*?)\s*(?:</tool_call>|\Z)')
+    _BLOCK_RE = re.compile(r'<tool_call>\s*([\s\S]*?)\s*(?:</tool_call>|\Z)')
     _FUNCTION_RE = re.compile(r'<function=([^>]+)>([\s\S]*?)</function>')
-    _PARAMETER_RE = re.compile(
-        r'<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>')
+    _PARAMETER_RE = re.compile(r'<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>')
     _STRIP_RE = re.compile(r'<tool_call>[\s\S]*?(?:</tool_call>|\Z)')
 
     def parse(self, decoded: str) -> List[Dict[str, Any]]:

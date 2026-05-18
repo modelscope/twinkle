@@ -1,17 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
-
 import numpy as np
 import os
 from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
 
+from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
 from .utils import TokenizeByRound, transfer_to_standard_message
-from twinkle import remote_class
 
 if TYPE_CHECKING:
     import torch
@@ -210,8 +209,7 @@ class Template:
         if messages is not None:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             parsed = self.parse_tool_call(response_text) or []
-            content_text = (
-                self.clean_tool_call(response_text) if parsed else response_text)
+            content_text = (self.clean_tool_call(response_text) if parsed else response_text)
             asst_msg = Message(role='assistant', content=content_text)
             if parsed:
                 asst_msg['tool_calls'] = parsed
@@ -696,18 +694,14 @@ class Template:
 
         # Process List[Trajectory]
         trajectories = self._invoke_pre_pipeline(trajectories)
-        output = [
-            self._encode_messages(t, add_generation_prompt=add_generation_prompt, **kwargs)
-            for t in trajectories
-        ]
+        output = [self._encode_messages(t, add_generation_prompt=add_generation_prompt, **kwargs) for t in trajectories]
         output = self._invoke_post_pipeline(output)
 
         if _transfer:
             output = self.map_row_to_col(output)
         return output
 
-    def format_trajectory(self, trajectory: Trajectory,
-                          add_default_system: bool = False) -> Trajectory:
+    def format_trajectory(self, trajectory: Trajectory, add_default_system: bool = False) -> Trajectory:
         current = [trajectory]
         for pipeline in self.pre_pipeline:
             if not add_default_system and pipeline == self._add_default_system:

@@ -28,8 +28,8 @@ class Chunks:
     chunks: List[Chunk]
 
     def to_trajectory(
-        self,
-        block_wrapper: Optional[Tuple[str, str]] = ('<block_{n}>', '</block_{n}>'),
+            self,
+            block_wrapper: Optional[Tuple[str, str]] = ('<block_{n}>', '</block_{n}>'),
     ) -> Dict[str, Any]:
         media: Dict[str, List[Any]] = {t: [] for t in _MULTIMODAL_TYPES}
         bound: List[Chunk] = []
@@ -38,8 +38,7 @@ class Chunks:
             if c.get('type') in _MULTIMODAL_TYPES and not isinstance(c.get('raw'), dict):
                 media[c['type']].append(c.get('content'))
                 continue
-            if (block_wrapper and c.get('type') == 'text'
-                    and c.get('role') != 'tool'):
+            if (block_wrapper and c.get('type') == 'text' and c.get('role') != 'tool'):
                 raw = c.get('raw')
                 is_condensed = isinstance(raw, dict) and raw.get('condensed')
                 content = c.get('content')
@@ -91,8 +90,7 @@ class Chunks:
             elif t in _MULTIMODAL_TYPES and isinstance(raw, dict):
                 has_media = True
                 # Drop condenser-only markers, keep the original part shape.
-                parts.append({k: v for k, v in raw.items() if k != 'condensed'}
-                             or {'type': t, t: content})
+                parts.append({k: v for k, v in raw.items() if k != 'condensed'} or {'type': t, t: content})
 
         msg: Dict[str, Any] = {'role': role}
         if reasoning:

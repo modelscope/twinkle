@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
-from typing import List, Optional, Dict, Union, Any, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Union
+
 from twinkle.data_format import ToolCall
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle_agentic.tools.base import Tool
@@ -36,22 +37,19 @@ class ToolManager:
                 info = t.tool_info() if hasattr(t, 'tool_info') else None
                 name = _extract_name(info)
                 if not name:
-                    raise ValueError(
-                        f'tool {type(t).__name__} must expose a non-empty '
-                        f'tool_info()["function"]["name"]')
+                    raise ValueError(f'tool {type(t).__name__} must expose a non-empty '
+                                     f'tool_info()["function"]["name"]')
                 self._tools[name] = t
             return
-        raise TypeError(
-            f'ToolManager expects dict | Iterable[Tool] | None; '
-            f'got {type(tools).__name__}')
+        raise TypeError(f'ToolManager expects dict | Iterable[Tool] | None; '
+                        f'got {type(tools).__name__}')
 
     def register(self, tool: Tool):
         info = tool.tool_info()
         name = _extract_name(info)
         if not name:
-            raise ValueError(
-                f'tool {type(tool).__name__} must expose a non-empty '
-                f'tool_info()["function"]["name"]')
+            raise ValueError(f'tool {type(tool).__name__} must expose a non-empty '
+                             f'tool_info()["function"]["name"]')
         self._tools[name] = tool
 
     def unregister(self, name: str) -> Optional[Tool]:
@@ -95,5 +93,5 @@ class ToolManager:
 
         try:
             return str(tool(name, args))
-        except Exception as e: # noqa
+        except Exception as e:  # noqa
             return f'Error: tool {name!r} raised {type(e).__name__}: {e}'

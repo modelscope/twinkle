@@ -24,8 +24,9 @@ import atexit
 import numpy as np
 import os
 import threading
-from typing import Any, Dict, List, Optional, Type, Union
 from copy import copy
+from typing import Any, Dict, List, Optional, Type, Union
+
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory

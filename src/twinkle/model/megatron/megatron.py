@@ -396,11 +396,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
                 output_tensor.div_(temperature)
-                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy')
-                                         and _loss_instance.require_entropy)
+                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
                 if _loss_require_entropy:
-                    logps, entropies = selective_log_softmax(
-                        output_tensor, masked_labels, return_entropy=True)
+                    logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
                 else:
                     logps = selective_log_softmax(output_tensor, masked_labels)
                 # Reconstruct full-length tensors from CP-split shards

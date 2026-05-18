@@ -3,14 +3,13 @@ import numpy as np
 import torch
 from copy import copy
 from PIL import Image
-from typing import Any, Dict, List, Optional, Union, Callable
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
 from twinkle.template.base import ImageInput, VideoInput
 from twinkle.template.qwen import QwenTemplate
 from twinkle.template.utils import get_inputs_embeds_hf
-
 
 _ROPE_INDEX_CACHE: Dict[str, Callable] = {}
 
@@ -28,8 +27,7 @@ def _build_rope_index_func(config) -> Callable:
         if hasattr(sub_module, 'get_rope_index'):
             _ROPE_INDEX_CACHE[arch] = sub_module.get_rope_index
             return sub_module.get_rope_index
-    raise NotImplementedError(
-        f'Module {dummy_model.__class__.__name__} has no get_rope_index method!')
+    raise NotImplementedError(f'Module {dummy_model.__class__.__name__} has no get_rope_index method!')
 
 
 @remote_class()

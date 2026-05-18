@@ -82,9 +82,8 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
             if return_entropy:
                 # Under vocab TP, entropy needs extra all-reduces over softmax*logits;
                 # not implemented yet — caller should disable entropy_coef under TP>1.
-                raise NotImplementedError(
-                    'selective_log_softmax(return_entropy=True) is not supported '
-                    'under vocab tensor parallelism (TP>1).')
+                raise NotImplementedError('selective_log_softmax(return_entropy=True) is not supported '
+                                          'under vocab tensor parallelism (TP>1).')
             # clone to avoid modifying the original logits
             return _vocab_parallel_selective_log_softmax(logits.clone(), index)
     except (ImportError, AssertionError, OSError):

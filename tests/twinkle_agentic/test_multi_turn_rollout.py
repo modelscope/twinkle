@@ -21,14 +21,11 @@ from __future__ import annotations
 
 import copy
 import json
+import pytest
 import re
 from typing import Any, Dict, List, Optional
 
-import pytest
-
-from twinkle.data_format.sampling import (
-    SampleResponse, SampledSequence, SamplingParams,
-)
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager
@@ -47,8 +44,8 @@ class FakeTokenizer:
     SPECIALS = ('<|im_start|>', '<|im_end|>')
 
     def __init__(self) -> None:
-        self._s2i: Dict[str, int] = {}
-        self._i2s: Dict[int, str] = {}
+        self._s2i: dict[str, int] = {}
+        self._i2s: dict[int, str] = {}
         for s in self.SPECIALS:
             self._add(s)
 
@@ -59,8 +56,8 @@ class FakeTokenizer:
             self._i2s[i] = tok
         return self._s2i[tok]
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
-        ids: List[int] = []
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        ids: list[int] = []
         i = 0
         while i < len(text):
             matched = False
@@ -75,7 +72,7 @@ class FakeTokenizer:
                 i += 1
         return ids
 
-    def decode(self, ids: List[int], skip_special_tokens: bool = False) -> str:
+    def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         specials = set(self.SPECIALS)
         toks = [self._i2s[int(i)] for i in ids]
         if skip_special_tokens:
@@ -84,7 +81,7 @@ class FakeTokenizer:
 
     def apply_chat_template(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         tokenize: bool = False,
         add_generation_prompt: bool = False,
         **_,
@@ -110,18 +107,16 @@ class FakeTemplate:
         self.tokenizer = tokenizer
 
     # --- the public API used by MultiTurnRollout ----------------------------
-    def encode(self, trajectory: Dict[str, Any], add_generation_prompt: bool = False) -> Dict[str, Any]:
+    def encode(self, trajectory: dict[str, Any], add_generation_prompt: bool = False) -> dict[str, Any]:
         messages = trajectory.get('messages', [])
-        s = self.tokenizer.apply_chat_template(
-            messages, tokenize=False,
-            add_generation_prompt=add_generation_prompt)
+        s = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
         input_ids = self.tokenizer.encode(s, add_special_tokens=False)
-        pif: Dict[str, Any] = dict(trajectory)  # preserve top-level fields
+        pif: dict[str, Any] = dict(trajectory)  # preserve top-level fields
         pif['input_ids'] = input_ids
         pif['labels'] = [-100] * len(input_ids)  # inference mode
         return self._invoke_post_pipeline([pif])[0]
 
-    def _invoke_post_pipeline(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _invoke_post_pipeline(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for pif in inputs:
             pif = dict(pif)
@@ -129,9 +124,8 @@ class FakeTemplate:
             labels = list(pif.get('labels') or [])
             if labels:
                 if len(labels) != len(input_ids):
-                    raise RuntimeError(
-                        f'FakeTemplate post_pipeline: labels({len(labels)}) '
-                        f'!= input_ids({len(input_ids)})')
+                    raise RuntimeError(f'FakeTemplate post_pipeline: labels({len(labels)}) '
+                                       f'!= input_ids({len(input_ids)})')
                 # np.roll(labels, -1): shift LEFT by 1 (output/shifted order)
                 labels = labels[1:] + labels[:1]
             pif['input_ids'] = input_ids
@@ -142,9 +136,9 @@ class FakeTemplate:
             out.append(pif)
         return out
 
-    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+    def parse_tool_call(self, decoded: str) -> list[dict[str, Any]]:
         matches = re.findall(r'<tool_call>\s*([\s\S]*?)\s*</tool_call>', decoded or '')
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for m in matches:
             try:
                 d = json.loads(m)
@@ -163,7 +157,7 @@ class FakeTemplate:
         return results
 
     # --- Used by the fake sampler to mirror real concat_input_feature -------
-    def concat_input_feature(self, pif: Dict[str, Any], new_tokens: List[int]) -> Dict[str, Any]:
+    def concat_input_feature(self, pif: dict[str, Any], new_tokens: list[int]) -> dict[str, Any]:
         result = copy.deepcopy(pif)
         prompt_ids = list(result['input_ids'])
         labels = list(result.get('labels') or [])
@@ -190,14 +184,14 @@ class FakeSampler:
 
     def __init__(self, template: FakeTemplate) -> None:
         self.template = template
-        self._queue: List[Dict[str, Any]] = []
+        self._queue: list[dict[str, Any]] = []
         self.sample_calls = 0
 
     def queue(
         self,
         response_text: str,
         stop_reason: str = 'stop',
-        logprobs: Optional[List[Any]] = None,
+        logprobs: list[Any] | None = None,
         append_im_end: bool = True,
     ) -> None:
         """``response_text`` is the model output (may contain <tool_call> …).
@@ -219,9 +213,8 @@ class FakeSampler:
         # accepted for backwards compatibility with older call sites.
         if isinstance(pifs, dict):
             pifs = [pifs]
-        assert isinstance(pifs, list), (
-            f'FakeSampler.sample expects a list, got {type(pifs).__name__}')
-        responses: List[SampleResponse] = []
+        assert isinstance(pifs, list), (f'FakeSampler.sample expects a list, got {type(pifs).__name__}')
+        responses: list[SampleResponse] = []
         for pif in pifs:
             assert self._queue, 'FakeSampler queue exhausted — scripted turns'
             r = self._queue.pop(0)
@@ -244,7 +237,7 @@ class EchoTool(Tool):
     def __init__(self, name: str = 'search'):
         self._name = name
 
-    def __call__(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+    def __call__(self, tool_name: str, arguments: dict[str, Any]) -> str:
         return f'echo[{tool_name}]:{json.dumps(arguments, sort_keys=True)}'
 
     def tool_info(self):
@@ -285,7 +278,8 @@ def tool_manager():
 
 @pytest.fixture
 def make_rollout(sampler, template, tool_manager):
-    def _make(max_turns: int = 4, sampling_params: Optional[SamplingParams] = None):
+
+    def _make(max_turns: int = 4, sampling_params: SamplingParams | None = None):
         return MultiTurnRollout(
             sampler=sampler,
             template=template,
@@ -293,23 +287,23 @@ def make_rollout(sampler, template, tool_manager):
             sampling_params=sampling_params or SamplingParams(),
             max_turns=max_turns,
         )
+
     return _make
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
-def _count_trainable(labels: List[int]) -> int:
-    return sum(1 for l in labels if l != -100)
+def _count_trainable(labels: list[int]) -> int:
+    return sum(1 for label in labels if label != -100)
 
 
-def _user_traj(text: str = 'hi') -> Dict[str, Any]:
+def _user_traj(text: str = 'hi') -> dict[str, Any]:
     return {'messages': [{'role': 'user', 'content': text}]}
 
 
-def _tool_call_text(name: str, arguments: Dict[str, Any]) -> str:
-    return '<tool_call>' + json.dumps(
-        {'name': name, 'arguments': arguments}) + '</tool_call>'
+def _tool_call_text(name: str, arguments: dict[str, Any]) -> str:
+    return '<tool_call>' + json.dumps({'name': name, 'arguments': arguments}) + '</tool_call>'
 
 
 # =============================================================================
@@ -375,8 +369,7 @@ def test_two_turns_one_tool_call(make_rollout, sampler):
 
 def test_multiple_tool_calls_one_turn(make_rollout, sampler):
     """Model emits TWO tool calls in one assistant turn → two tool messages."""
-    decoded = (_tool_call_text('search', {'q': 'a'})
-               + _tool_call_text('search', {'q': 'b'}))
+    decoded = (_tool_call_text('search', {'q': 'a'}) + _tool_call_text('search', {'q': 'b'}))
     sampler.queue(decoded, stop_reason='stop')
     sampler.queue('Done.', stop_reason='stop')
     rollout = make_rollout(max_turns=4)
@@ -507,7 +500,11 @@ def test_extra_trajectory_fields_pass_through(make_rollout, sampler):
     traj['images'] = ['/path/to/img.png']
     traj['tools'] = [{
         'type': 'function',
-        'function': {'name': 'search', 'description': '', 'parameters': {}},
+        'function': {
+            'name': 'search',
+            'description': '',
+            'parameters': {}
+        },
     }]
 
     sampler.queue('ok', stop_reason='stop')
@@ -523,26 +520,25 @@ def test_extra_trajectory_fields_pass_through(make_rollout, sampler):
 # =============================================================================
 def test_rejects_none_template(sampler, tool_manager):
     with pytest.raises(ValueError, match='Template'):
-        MultiTurnRollout(sampler=sampler, template=None,
-                         tool_manager=tool_manager)
+        MultiTurnRollout(sampler=sampler, template=None, tool_manager=tool_manager)
 
 
 def test_rejects_none_tool_manager(sampler, template):
     with pytest.raises(ValueError, match='ToolManager'):
-        MultiTurnRollout(sampler=sampler, template=template,
-                         tool_manager=None)
+        MultiTurnRollout(sampler=sampler, template=template, tool_manager=None)
 
 
 def test_rejects_bad_max_turns(sampler, template, tool_manager):
     with pytest.raises(ValueError, match='max_turns'):
-        MultiTurnRollout(sampler=sampler, template=template,
-                         tool_manager=tool_manager, max_turns=0)
+        MultiTurnRollout(sampler=sampler, template=template, tool_manager=tool_manager, max_turns=0)
 
 
 def test_rejects_num_samples_gt_1(sampler, template, tool_manager):
     with pytest.raises(ValueError, match='num_samples'):
         MultiTurnRollout(
-            sampler=sampler, template=template, tool_manager=tool_manager,
+            sampler=sampler,
+            template=template,
+            tool_manager=tool_manager,
             sampling_params=SamplingParams(num_samples=2))
 
 
@@ -550,45 +546,43 @@ def test_rejects_num_samples_gt_1(sampler, template, tool_manager):
 # Tests: defensive guards
 # =============================================================================
 def test_missing_new_input_feature_raises(template, tool_manager):
+
     class BrokenSampler:
+
         def sample(self, pifs, sampling_params=None):
             if isinstance(pifs, dict):
                 pifs = [pifs]
-            seq = SampledSequence(
-                stop_reason='stop', tokens=[], logprobs=None,
-                decoded='', new_input_feature=None)
+            seq = SampledSequence(stop_reason='stop', tokens=[], logprobs=None, decoded='', new_input_feature=None)
             return [SampleResponse(sequences=[seq]) for _ in pifs]
 
-    rollout = MultiTurnRollout(
-        sampler=BrokenSampler(), template=template,
-        tool_manager=tool_manager)
+    rollout = MultiTurnRollout(sampler=BrokenSampler(), template=template, tool_manager=tool_manager)
     with pytest.raises(RuntimeError, match='new_input_feature'):
         rollout([_user_traj()])
 
 
 def test_empty_sampler_response_raises(template, tool_manager):
+
     class EmptySampler:
+
         def sample(self, pifs, sampling_params=None):
             return []
 
-    rollout = MultiTurnRollout(
-        sampler=EmptySampler(), template=template,
-        tool_manager=tool_manager)
+    rollout = MultiTurnRollout(sampler=EmptySampler(), template=template, tool_manager=tool_manager)
     # Batched contract: 0 responses for a batch of 1 → mismatch error.
     with pytest.raises(RuntimeError, match='0 responses'):
         rollout([_user_traj()])
 
 
 def test_sample_response_no_sequences_raises(template, tool_manager):
+
     class NoSeqSampler:
+
         def sample(self, pifs, sampling_params=None):
             if isinstance(pifs, dict):
                 pifs = [pifs]
             return [SampleResponse(sequences=[]) for _ in pifs]
 
-    rollout = MultiTurnRollout(
-        sampler=NoSeqSampler(), template=template,
-        tool_manager=tool_manager)
+    rollout = MultiTurnRollout(sampler=NoSeqSampler(), template=template, tool_manager=tool_manager)
     with pytest.raises(RuntimeError, match='no sequences'):
         rollout([_user_traj()])
 
@@ -626,10 +620,11 @@ def test_batch_different_termination_turns(make_rollout, sampler):
     Turn 1 batch:  [A: 'done-A' stop, B: tool_call stop]  → A parked.
     Turn 2 batch:  [B: 'done-B' stop]                     → only B live.
     """
-    sampler.queue('done-A', stop_reason='stop')              # A turn 1
-    sampler.queue(_tool_call_text('search', {'q': 'b'}),      # B turn 1
-                  stop_reason='stop')
-    sampler.queue('done-B', stop_reason='stop')              # B turn 2
+    sampler.queue('done-A', stop_reason='stop')  # A turn 1
+    sampler.queue(
+        _tool_call_text('search', {'q': 'b'}),  # B turn 1
+        stop_reason='stop')
+    sampler.queue('done-B', stop_reason='stop')  # B turn 2
     rollout = make_rollout(max_turns=4)
     outs = rollout([_user_traj('Q-A'), _user_traj('Q-B')])
 
@@ -650,10 +645,13 @@ def test_batch_per_trajectory_tool_manager(make_rollout, sampler, template):
     tm_a.register(EchoTool('search'))
 
     class TagTool(Tool):
+
         def __init__(self, tag):
             self._tag = tag
+
         def __call__(self, tool_name, arguments):
             return f'tagged[{self._tag}]:{json.dumps(arguments, sort_keys=True)}'
+
         def tool_info(self):
             return {
                 'type': 'function',
@@ -673,11 +671,11 @@ def test_batch_per_trajectory_tool_manager(make_rollout, sampler, template):
     sampler.queue('done-B', stop_reason='stop')
 
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
+        sampler=sampler,
+        template=template,
         tool_manager=tm_a,  # default (unused when per-call list supplied)
         max_turns=4)
-    outs = rollout([_user_traj('A'), _user_traj('B')],
-                   tool_manager=[tm_a, tm_b])
+    outs = rollout([_user_traj('A'), _user_traj('B')], tool_manager=[tm_a, tm_b])
 
     assert outs[0]['messages'][2]['content'] == 'echo[search]:{"q": "x"}'
     assert outs[1]['messages'][2]['content'] == 'tagged[B]:{"q": "y"}'
@@ -686,8 +684,7 @@ def test_batch_per_trajectory_tool_manager(make_rollout, sampler, template):
 def test_batch_tool_manager_list_length_mismatch(make_rollout, tool_manager):
     rollout = make_rollout(max_turns=2)
     with pytest.raises(ValueError, match='tool_manager list length'):
-        rollout([_user_traj('A'), _user_traj('B')],
-                tool_manager=[tool_manager])  # length 1 vs 2 trajectories
+        rollout([_user_traj('A'), _user_traj('B')], tool_manager=[tool_manager])  # length 1 vs 2 trajectories
 
 
 def test_single_trajectory_dict_rejected(make_rollout):
@@ -704,28 +701,22 @@ def _list_trace_files(trace_dir):
     return sorted(p.name for p in trace_dir.iterdir() if p.suffix == '.json')
 
 
-def test_trace_dir_is_created_and_empty_by_default(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_is_created_and_empty_by_default(tmp_path, sampler, template, tool_manager):
     """Constructor creates the directory eagerly; no files until a rollout runs."""
     trace_dir = tmp_path / 'trace'
     assert not trace_dir.exists()
 
     MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
     assert trace_dir.is_dir()
     assert _list_trace_files(trace_dir) == []
 
 
-def test_trace_dir_writes_one_file_per_rollout(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_writes_one_file_per_rollout(tmp_path, sampler, template, tool_manager):
     """Single trajectory -> single JSON file (regardless of turn count)."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=4, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, trace_dir=str(trace_dir))
     sampler.queue(_tool_call_text('search', {'q': 'x'}))
     sampler.queue('final answer', stop_reason='stop')
 
@@ -739,14 +730,11 @@ def test_trace_dir_writes_one_file_per_rollout(
     assert files[0].endswith('.json')
 
 
-def test_trace_dir_json_is_pretty_printed_and_well_formed(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_json_is_pretty_printed_and_well_formed(tmp_path, sampler, template, tool_manager):
     """Dumped JSON is multi-line (indent=2) and carries the documented keys."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
     sampler.queue('final answer', stop_reason='stop')
 
     rollout([_user_traj('hello')])
@@ -757,8 +745,7 @@ def test_trace_dir_json_is_pretty_printed_and_well_formed(
     assert '\n' in raw, 'pretty-printed JSON must span multiple lines'
 
     rec = json.loads(raw)
-    assert set(rec.keys()) >= {
-        'trajectory', 'ground_truth', 'stop_reason', 'truncated', 'success'}
+    assert set(rec.keys()) >= {'trajectory', 'ground_truth', 'stop_reason', 'truncated', 'success'}
     assert rec['stop_reason'] == 'stop'
     assert rec['truncated'] is False
     assert rec['success'] is False  # no callback => default False
@@ -768,13 +755,14 @@ def test_trace_dir_json_is_pretty_printed_and_well_formed(
     assert isinstance(rec['trajectory'].get('messages'), list)
 
 
-def test_trace_dir_trace_callback_filters_storage(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_trace_callback_filters_storage(tmp_path, sampler, template, tool_manager):
     """``trace_callback`` returning False suppresses the dump entirely."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager, max_turns=2,
+        sampler=sampler,
+        template=template,
+        tool_manager=tool_manager,
+        max_turns=2,
         trace_dir=str(trace_dir),
         trace_callback=lambda traj: False)
     sampler.queue('ok', stop_reason='stop')
@@ -783,10 +771,10 @@ def test_trace_dir_trace_callback_filters_storage(
     assert _list_trace_files(trace_dir) == []
 
 
-def test_trace_dir_success_callback_drives_filename_prefix(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_success_callback_drives_filename_prefix(tmp_path, sampler, template, tool_manager):
     """True -> ``ok-*.json``, False -> ``fail-*.json``, split across batch."""
     trace_dir = tmp_path / 'trace'
+
     # Success is decided by a cheap rule on the last assistant message
     # content; ``store`` accepts everything.
     def _is_success(traj):
@@ -796,8 +784,10 @@ def test_trace_dir_success_callback_drives_filename_prefix(
         return False
 
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager, max_turns=2,
+        sampler=sampler,
+        template=template,
+        tool_manager=tool_manager,
+        max_turns=2,
         trace_dir=str(trace_dir),
         success_callback=_is_success)
     sampler.queue('good answer', stop_reason='stop')
@@ -811,14 +801,11 @@ def test_trace_dir_success_callback_drives_filename_prefix(
     assert any(f.startswith('fail-') for f in files)
 
 
-def test_trace_dir_batch_writes_one_file_per_trajectory(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_batch_writes_one_file_per_trajectory(tmp_path, sampler, template, tool_manager):
     """Batch of N trajectories -> N files (never per-turn records)."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=4, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=4, trace_dir=str(trace_dir))
     # Traj 0: stops turn 1. Traj 1: tool-calls turn 1, stops turn 2.
     sampler.queue('done0', stop_reason='stop')
     sampler.queue(_tool_call_text('search', {'q': 'y'}))
@@ -831,15 +818,12 @@ def test_trace_dir_batch_writes_one_file_per_trajectory(
     assert len(files) == 2
 
 
-def test_trace_dir_none_disables_tracing(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_none_disables_tracing(tmp_path, sampler, template, tool_manager):
     """Default ``trace_dir=None`` never touches the filesystem."""
     trace_dir = tmp_path / 'never'
     assert not trace_dir.exists()
 
-    rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager, max_turns=2)
+    rollout = MultiTurnRollout(sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2)
     sampler.queue('ok', stop_reason='stop')
     rollout([_user_traj('hi')])
 
@@ -847,14 +831,11 @@ def test_trace_dir_none_disables_tracing(
     assert not trace_dir.exists()
 
 
-def test_trace_dir_truncation_marked_on_max_turns(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_truncation_marked_on_max_turns(tmp_path, sampler, template, tool_manager):
     """A rollout hitting ``max_turns`` records ``truncated=True``."""
     trace_dir = tmp_path / 'trunc'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
     # Two tool-call turns -> the second hits max_turns cap.
     sampler.queue(_tool_call_text('search', {'q': 'a'}))
     sampler.queue(_tool_call_text('search', {'q': 'b'}))
@@ -867,14 +848,11 @@ def test_trace_dir_truncation_marked_on_max_turns(
     assert rec['truncated'] is True
 
 
-def test_trace_dir_uses_user_data_id_in_filename(
-        tmp_path, sampler, template, tool_manager):
+def test_trace_dir_uses_user_data_id_in_filename(tmp_path, sampler, template, tool_manager):
     """Filenames prefer ``user_data['id']`` (sanitised) over the fallback."""
     trace_dir = tmp_path / 'trace'
     rollout = MultiTurnRollout(
-        sampler=sampler, template=template,
-        tool_manager=tool_manager,
-        max_turns=2, trace_dir=str(trace_dir))
+        sampler=sampler, template=template, tool_manager=tool_manager, max_turns=2, trace_dir=str(trace_dir))
     sampler.queue('ok', stop_reason='stop')
 
     traj = _user_traj('hi')

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import TYPE_CHECKING, Callable, List, Optional, Any
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 from .utils import deep_getattr
 

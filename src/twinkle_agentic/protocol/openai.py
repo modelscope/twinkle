@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Union
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Message
 from twinkle.data_format.sampling import SamplingParams
-
 from .base import API
 
 
@@ -92,17 +91,14 @@ class OpenAI(API):
             msg['reasoning_content'] = reasoning
         tool_calls = getattr(m, 'tool_calls', None)
         if tool_calls:
-            msg['tool_calls'] = [
-                {
-                    'id': tc.id,
-                    'type': 'function',
-                    'function': {
-                        'name': tc.function.name,
-                        'arguments': tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ]
+            msg['tool_calls'] = [{
+                'id': tc.id,
+                'type': 'function',
+                'function': {
+                    'name': tc.function.name,
+                    'arguments': tc.function.arguments,
+                },
+            } for tc in tool_calls]
         # Surface finish_reason so multi-turn drivers can detect length-cap truncation.
         finish = getattr(choice, 'finish_reason', None)
         if finish is not None:

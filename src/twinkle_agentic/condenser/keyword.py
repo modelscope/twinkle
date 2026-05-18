@@ -1,18 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Extractive, spaCy-driven passage condenser.
-
-For each eligible chunk, produces a compact summary with three slots::
-
-    Open: <first sentence of the chunk>
-    Rel:  (subject | verb | object); (subject | verb | object | prep obj)
-    More: kw1, kw2, kw3
-
-Strictly bounded by ``ceil(len(input) / compression_ratio)`` characters
-for every chunk that passes ``min_chars``. Chunks shorter than
-``min_chars`` are passed through unchanged (pre-filter).
-"""
-from __future__ import annotations
-
 import math
 import re
 import threading
@@ -24,7 +10,7 @@ from twinkle_agentic.data_format import Chunk, Chunks
 # ---------------------------------------------------------------------------
 # spaCy lazy loader (one model per process, thread-safe)
 # ---------------------------------------------------------------------------
-_SPACY_MODELS: Dict[str, Any] = {}
+_SPACY_MODELS: dict[str, Any] = {}
 _SPACY_LOCK = threading.Lock()
 
 
@@ -39,17 +25,13 @@ def _load_spacy(name: str):
         try:
             import spacy
         except ImportError as e:
-            raise ImportError(
-                'KeywordCondenser requires spaCy. Install with: '
-                '`pip install spacy && python -m spacy download en_core_web_sm`'
-            ) from e
+            raise ImportError('KeywordCondenser requires spaCy. Install with: '
+                              '`pip install spacy && python -m spacy download en_core_web_sm`') from e
         try:
             nlp = spacy.load(name)
         except OSError as e:
-            raise OSError(
-                f'spaCy model {name!r} not found. Download with: '
-                f'`python -m spacy download {name}`'
-            ) from e
+            raise OSError(f'spaCy model {name!r} not found. Download with: '
+                          f'`python -m spacy download {name}`') from e
         _SPACY_MODELS[name] = nlp
         return nlp
 
@@ -58,17 +40,15 @@ def _load_spacy(name: str):
 # configuration-free constants
 # ---------------------------------------------------------------------------
 # Entity labels dropped from keyword candidates (low recall value).
-_DROP_ENT_LABELS: FrozenSet[str] = frozenset(
-    {'CARDINAL', 'ORDINAL', 'PERCENT', 'QUANTITY'})
+_DROP_ENT_LABELS: frozenset[str] = frozenset({'CARDINAL', 'ORDINAL', 'PERCENT', 'QUANTITY'})
 
 # Dependency labels that introduce sub-clauses / conjuncts we do NOT want
 # to pull into a single noun-phrase span.
-_DROP_NP_DEPS: FrozenSet[str] = frozenset(
-    {'relcl', 'acl', 'advcl', 'ccomp', 'xcomp',
-     'conj', 'cc', 'appos', 'parataxis'})
+_DROP_NP_DEPS: frozenset[str] = frozenset(
+    {'relcl', 'acl', 'advcl', 'ccomp', 'xcomp', 'conj', 'cc', 'appos', 'parataxis'})
 
 # Tokens stripped from NP boundaries.
-_LEADING_STRIP_POS: FrozenSet[str] = frozenset({'DET', 'PUNCT'})
+_LEADING_STRIP_POS: frozenset[str] = frozenset({'DET', 'PUNCT'})
 
 # Tuple-slot separator. ``|`` avoids confusion when a slot itself
 # contains a comma (e.g. ``"London, England"``).
@@ -90,7 +70,7 @@ def _np_text(head) -> str:
     leading determiners / possessive pronouns.
     """
     # Collect subtree tokens, cutting off whole clausal children.
-    collected: List = []
+    collected: list = []
 
     def _walk(tok):
         if tok is not head and tok.dep_ in _DROP_NP_DEPS:
@@ -105,10 +85,8 @@ def _np_text(head) -> str:
     collected.sort(key=lambda t: t.i)
 
     # Strip leading det/punct and possessive pronouns.
-    while collected and (
-        collected[0].pos_ in _LEADING_STRIP_POS
-        or (collected[0].pos_ == 'PRON' and collected[0].dep_ == 'poss')
-    ):
+    while collected and (collected[0].pos_ in _LEADING_STRIP_POS or
+                         (collected[0].pos_ == 'PRON' and collected[0].dep_ == 'poss')):
         collected.pop(0)
     while collected and collected[-1].pos_ == 'PUNCT':
         collected.pop()
@@ -143,11 +121,8 @@ def _first_child(token, deps: Sequence[str]):
 
 def _strip_leading_nc(noun_chunk) -> str:
     toks = list(noun_chunk)
-    while toks and (
-        toks[0].pos_ in _LEADING_STRIP_POS
-        or toks[0].pos_ == 'NUM'
-        or (toks[0].pos_ == 'PRON' and toks[0].tag_ in ('PRP$', 'WP$'))
-    ):
+    while toks and (toks[0].pos_ in _LEADING_STRIP_POS or toks[0].pos_ == 'NUM' or
+                    (toks[0].pos_ == 'PRON' and toks[0].tag_ in ('PRP$', 'WP$'))):
         toks.pop(0)
     while toks and toks[-1].pos_ == 'PUNCT':
         toks.pop()
@@ -159,7 +134,7 @@ def _strip_leading_nc(noun_chunk) -> str:
     return ''.join(t.text_with_ws for t in toks).strip()
 
 
-def _word_tokens_lower(text: str) -> FrozenSet[str]:
+def _word_tokens_lower(text: str) -> frozenset[str]:
     return frozenset(m.group(0).lower() for m in _WORD_RE.finditer(text))
 
 
@@ -187,7 +162,7 @@ def _extract_opening(doc, max_chars: int) -> str:
     return ''
 
 
-def _extract_triples(doc, n: int) -> List[Tuple[str, ...]]:
+def _extract_triples(doc, n: int) -> list[tuple[str, ...]]:
     """Subject-verb-object (+ optional prep-obj) triples.
 
     - Skips pronoun subjects (unresolved coreference is noise).
@@ -196,7 +171,7 @@ def _extract_triples(doc, n: int) -> List[Tuple[str, ...]]:
     """
     if n <= 0:
         return []
-    out: List[Tuple[str, ...]] = []
+    out: list[tuple[str, ...]] = []
     seen: set = set()
     for sent in doc.sents:
         for verb in sent:
@@ -206,26 +181,22 @@ def _extract_triples(doc, n: int) -> List[Tuple[str, ...]]:
             if subj is None or subj.pos_ == 'PRON':
                 continue
             obj = _first_child(verb, ('dobj', 'attr', 'oprd'))
-            prep = _first_child(verb, ('prep',))
+            prep = _first_child(verb, ('prep', ))
             prep_obj = _first_child(prep, ('pobj', 'pcomp')) if prep is not None else None
 
             subj_txt = _np_text(subj)
             verb_txt = _verb_surface(verb)
 
             if obj is not None and prep_obj is not None:
-                triple = (subj_txt, verb_txt, _np_text(obj),
-                          f'{prep.text} {_np_text(prep_obj)}')
-                key = (subj.lemma_.lower(), verb.lemma_.lower(),
-                       obj.lemma_.lower(),
+                triple = (subj_txt, verb_txt, _np_text(obj), f'{prep.text} {_np_text(prep_obj)}')
+                key = (subj.lemma_.lower(), verb.lemma_.lower(), obj.lemma_.lower(),
                        f'{prep.text.lower()} {prep_obj.lemma_.lower()}')
             elif obj is not None:
                 triple = (subj_txt, verb_txt, _np_text(obj))
                 key = (subj.lemma_.lower(), verb.lemma_.lower(), obj.lemma_.lower())
             elif prep_obj is not None:
                 triple = (subj_txt, f'{verb_txt} {prep.text}', _np_text(prep_obj))
-                key = (subj.lemma_.lower(),
-                       f'{verb.lemma_.lower()} {prep.text.lower()}',
-                       prep_obj.lemma_.lower())
+                key = (subj.lemma_.lower(), f'{verb.lemma_.lower()} {prep.text.lower()}', prep_obj.lemma_.lower())
             else:
                 continue
             if key in seen:
@@ -237,7 +208,7 @@ def _extract_triples(doc, n: int) -> List[Tuple[str, ...]]:
     return out
 
 
-def _extract_keywords(doc, k: int, excluded_tokens: FrozenSet[str]) -> List[str]:
+def _extract_keywords(doc, k: int, excluded_tokens: frozenset[str]) -> list[str]:
     """Rank keyword candidates by (entity-weighted) frequency.
 
     - Drops pure-numeric entities (CARDINAL / ORDINAL / PERCENT / QUANTITY).
@@ -249,8 +220,8 @@ def _extract_keywords(doc, k: int, excluded_tokens: FrozenSet[str]) -> List[str]
     """
     if k <= 0:
         return []
-    counts: Dict[str, float] = {}
-    order: Dict[str, int] = {}
+    counts: dict[str, float] = {}
+    order: dict[str, int] = {}
     idx = 0
 
     def _add(term: str, weight: float) -> None:
@@ -280,8 +251,8 @@ def _extract_keywords(doc, k: int, excluded_tokens: FrozenSet[str]) -> List[str]
 
     ranked = sorted(counts.keys(), key=lambda t: (-counts[t], order[t]))
 
-    kept: List[str] = []
-    kept_word_sets: List[FrozenSet[str]] = []
+    kept: list[str] = []
+    kept_word_sets: list[frozenset[str]] = []
     for term in ranked:
         words = frozenset(_WORD_RE.findall(term.lower()))
         # Subsumed by any already-kept term (identical or proper subset).
@@ -302,12 +273,12 @@ def _extract_keywords(doc, k: int, excluded_tokens: FrozenSet[str]) -> List[str]
 # ---------------------------------------------------------------------------
 # budget-aware formatting (pure strings)
 # ---------------------------------------------------------------------------
-def _format_triple(triple: Tuple[str, ...]) -> str:
+def _format_triple(triple: tuple[str, ...]) -> str:
     return '(' + _SLOT_SEP.join(triple) + ')'
 
 
 def _compose(opening: str, rel: str, kw: str) -> str:
-    parts: List[str] = []
+    parts: list[str] = []
     if opening:
         parts.append(f'Open: {opening}')
     if rel:
@@ -319,8 +290,8 @@ def _compose(opening: str, rel: str, kw: str) -> str:
 
 def _fit_under_budget(
     opening: str,
-    triples: List[Tuple[str, ...]],
-    keywords: List[str],
+    triples: list[tuple[str, ...]],
+    keywords: list[str],
     budget: int,
     *,
     fallback_text: str = '',
@@ -348,7 +319,7 @@ def _fit_under_budget(
         return current[:budget]
 
     # ----- triples -----
-    kept_triples: List[Tuple[str, ...]] = []
+    kept_triples: list[tuple[str, ...]] = []
     for t in triples:
         trial_rel = _TRIPLE_SEP.join(_format_triple(x) for x in kept_triples + [t])
         trial = _compose(opening, trial_rel, '')
@@ -360,7 +331,7 @@ def _fit_under_budget(
     rel_str = _TRIPLE_SEP.join(_format_triple(x) for x in kept_triples)
 
     # ----- keywords -----
-    kept_kws: List[str] = []
+    kept_kws: list[str] = []
     for k in keywords:
         trial_kw = ', '.join(kept_kws + [k])
         trial = _compose(opening, rel_str, trial_kw)
@@ -385,6 +356,7 @@ def _fit_under_budget(
 # ---------------------------------------------------------------------------
 class KeywordCondenser(Condenser):
     """Extractive, spaCy-driven passage condenser.
+    TODO: Experimental feature, wait for testing
 
     Args:
         num_relations: Max number of
@@ -423,26 +395,24 @@ class KeywordCondenser(Condenser):
     """
 
     def __init__(
-        self,
-        num_relations: int = 3,
-        max_first_sentence_chars: int = 160,
-        num_keywords: int = 8,
-        compression_ratio: float = 4.0,
-        spacy_model: str = 'en_core_web_sm',
-        min_chars: int = 200,
-        skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
-        rounds: Optional[Sequence[int]] = None,
+            self,
+            num_relations: int = 3,
+            max_first_sentence_chars: int = 160,
+            num_keywords: int = 8,
+            compression_ratio: float = 4.0,
+            spacy_model: str = 'en_core_web_sm',
+            min_chars: int = 200,
+            skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
+            rounds: Sequence[int] | None = None,
     ):
         if num_relations < 0:
             raise ValueError(f'num_relations must be >= 0, got {num_relations}')
         if num_keywords < 0:
             raise ValueError(f'num_keywords must be >= 0, got {num_keywords}')
         if max_first_sentence_chars < 0:
-            raise ValueError(
-                f'max_first_sentence_chars must be >= 0, got {max_first_sentence_chars}')
+            raise ValueError(f'max_first_sentence_chars must be >= 0, got {max_first_sentence_chars}')
         if compression_ratio <= 1.0:
-            raise ValueError(
-                f'compression_ratio must be > 1, got {compression_ratio}')
+            raise ValueError(f'compression_ratio must be > 1, got {compression_ratio}')
         if min_chars < 0:
             raise ValueError(f'min_chars must be >= 0, got {min_chars}')
 
@@ -458,7 +428,7 @@ class KeywordCondenser(Condenser):
     # ------------------------------------------------------------------
     def __call__(self, chunks: Chunks, **kwargs) -> Chunks:
         nlp = _load_spacy(self.spacy_model)
-        out: List[Chunk] = []
+        out: list[Chunk] = []
         for c in chunks.chunks:
             if not self._should_condense(c):
                 out.append(c)
@@ -495,7 +465,7 @@ class KeywordCondenser(Condenser):
 
     @staticmethod
     def _mark_condensed(chunk: Chunk, content: str) -> Chunk:
-        new: Dict[str, Any] = dict(chunk)
+        new: dict[str, Any] = dict(chunk)
         raw = dict(new.get('raw') or {})
         raw.setdefault('original', new.get('content', ''))
         new['content'] = content
@@ -513,5 +483,4 @@ class KeywordCondenser(Condenser):
         excluded = _word_tokens_lower(opening)
         triples = _extract_triples(doc, self.num_relations)
         keywords = _extract_keywords(doc, self.num_keywords, excluded)
-        return _fit_under_budget(
-            opening, triples, keywords, budget, fallback_text=text)
+        return _fit_under_budget(opening, triples, keywords, budget, fallback_text=text)

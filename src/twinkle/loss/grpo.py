@@ -195,11 +195,10 @@ class GRPOLoss(Loss):
                 # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
                 result[i, pos] = sample[:seq_len][mask[i]]
             else:
-                raise AssertionError(
-                    f'data/mask length mismatch at sample {i}: '
-                    f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                    '(expected n_sample == n_pos for response-only form, '
-                    'or n_sample >= seq_len for full-sequence form)')
+                raise AssertionError(f'data/mask length mismatch at sample {i}: '
+                                     f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
+                                     '(expected n_sample == n_pos for response-only form, '
+                                     'or n_sample >= seq_len for full-sequence form)')
 
         return result
 
@@ -301,9 +300,8 @@ class GRPOLoss(Loss):
 
         if self.entropy_coef > 0.0:
             entropies = outputs.get('entropies')
-            assert entropies is not None, (
-                'entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
-                "loss instance's require_entropy flag was set before the forward call.")
+            assert entropies is not None, ('entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
+                                           "loss instance's require_entropy flag was set before the forward call.")
             # entropies may come in fp32 from the kernel; cast to match logps dtype
             # so the final per_token_loss stays consistent (bf16 under amp).
             per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
@@ -384,6 +382,7 @@ class CISPOLoss(GRPOLoss):
     ) -> 'torch.Tensor':
         """Clamped ratio * advantage * log_prob."""
         import torch
+
         # Two-sided IS clamp with asymmetric epsilon, matching MiniMax CISPO spec.
         clamped_ratios = torch.clamp(ratio, min=1 - self.epsilon, max=1 + self.epsilon_high).detach()
         return -clamped_ratios * advantages * per_token_logps

@@ -9,14 +9,12 @@ Strategy:
     scenario that breaks multi-turn rollout bridge, asserting the patched
     template is byte-level round-trippable.
 """
+import pytest
 import warnings
 from types import SimpleNamespace
 
-import pytest
-
 from twinkle.patch import apply_patch
-from twinkle.patch.qwen3_chat_template import Qwen3ChatTemplate, _OLD, _NEW
-
+from twinkle.patch.qwen3_chat_template import _NEW, _OLD, Qwen3ChatTemplate
 
 # ---------------------------------------------------------------------------
 # Fixtures: minimal jinja harness reproducing the assistant-branch parse path
@@ -41,7 +39,7 @@ _SKELETON = '''\
         {{{{ '<|im_start|>assistant\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>' }}}}
     {{%- endif %}}
 {{%- endfor %}}
-'''
+''' # noqa
 
 
 def _render(block: str, content: str) -> str:
@@ -112,11 +110,9 @@ class TestRenderBehavior:
     # sampler produces CoT ending in an orphan </think>. The generation_prompt
     # injected the opening <think>\n\n</think>\n\n into prompt_ids (not into
     # content), so content here has no opening <think>.
-    CONTENT_WITH_ORPHAN = (
-        'Step 1: Review blocks.\nStep 2: Decide.\n</think>\n\n'
-        '<tool_call>\n<function=extract>\n<parameter=ids>\n[1, 2]\n</parameter>\n'
-        '</function>\n</tool_call>'
-    )
+    CONTENT_WITH_ORPHAN = ('Step 1: Review blocks.\nStep 2: Decide.\n</think>\n\n'
+                           '<tool_call>\n<function=extract>\n<parameter=ids>\n[1, 2]\n</parameter>\n'
+                           '</function>\n</tool_call>')
 
     # Clean content (no </think> at all) — normal policy-compliant output.
     CONTENT_CLEAN = 'Step 1: Just answer.\n\n<tool_call>\n<function=a>\n</function>\n</tool_call>'
@@ -174,11 +170,7 @@ class TestRenderBehavior:
         strict prefix of s_after (re-rendered from messages). Pre-patch this
         fails by 11 bytes; post-patch it holds."""
         # What the decoded input_ids look like for this assistant turn:
-        current_text = (
-            '<|im_start|>assistant\n<think>\n\n</think>\n\n'
-            + self.CONTENT_WITH_ORPHAN
-            + '<|im_end|>'
-        )
+        current_text = ('<|im_start|>assistant\n<think>\n\n</think>\n\n' + self.CONTENT_WITH_ORPHAN + '<|im_end|>')
         # What the chat_template renders the same assistant message as:
         rendered_old = _render(_OLD, self.CONTENT_WITH_ORPHAN).strip()
         rendered_new = _render(_NEW, self.CONTENT_WITH_ORPHAN).strip()

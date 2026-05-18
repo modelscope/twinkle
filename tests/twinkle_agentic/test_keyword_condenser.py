@@ -1,20 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for :class:`twinkle_agentic.condenser.keyword.KeywordCondenser`.
-
-Covers:
-- strict compression-ratio enforcement (``len(output) <= ceil(len(input)/ratio)``)
-- opening / relations / keywords slot extraction
-- budget-priority fallback (drop keywords → drop relations → truncate opening)
-- role / min_chars / kind filtering
-- ``raw.condensed=True`` marker + block wrapping via ``Chunks.to_trajectory``
-- pass-through of non-text / short / skipped chunks
-- constructor validation
-"""
-from __future__ import annotations
-
 import math
-
 import pytest
+
+from twinkle_agentic.chunker.native import NativeChunker
+from twinkle_agentic.condenser.keyword import KeywordCondenser
+from twinkle_agentic.data_format import Chunks
 
 # Module-level skip if spaCy or the small English model are unavailable.
 spacy = pytest.importorskip('spacy')
@@ -23,21 +13,14 @@ try:
 except OSError:
     pytest.skip('en_core_web_sm not available', allow_module_level=True)
 
-from twinkle_agentic.chunker.native import NativeChunker
-from twinkle_agentic.condenser.keyword import KeywordCondenser
-from twinkle_agentic.data_format import Chunks
-
-
 # A realistic multi-sentence passage; long enough to exercise the three
 # output slots and the compression budget.
-LONG_PASSAGE = (
-    'Christopher Nolan was born on 30 July 1970 in London. '
-    'He is a British-American film director, producer and screenwriter. '
-    'His film Inception (2010) is a science-fiction heist movie starring '
-    'Leonardo DiCaprio. Inception grossed over 829 million dollars worldwide '
-    'and received eight Academy Award nominations, winning four. '
-    'Nolan also directed The Dark Knight trilogy and Interstellar in 2014.'
-)
+LONG_PASSAGE = ('Christopher Nolan was born on 30 July 1970 in London. '
+                'He is a British-American film director, producer and screenwriter. '
+                'His film Inception (2010) is a science-fiction heist movie starring '
+                'Leonardo DiCaprio. Inception grossed over 829 million dollars worldwide '
+                'and received eight Academy Award nominations, winning four. '
+                'Nolan also directed The Dark Knight trilogy and Interstellar in 2014.')
 
 
 def _user_chunk(text, role='user'):
@@ -52,12 +35,24 @@ def _wrap(*chunks):
 # constructor validation
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize('kw', [
-    {'num_relations': -1},
-    {'num_keywords': -1},
-    {'max_first_sentence_chars': -1},
-    {'compression_ratio': 1.0},
-    {'compression_ratio': 0.5},
-    {'min_chars': -1},
+    {
+        'num_relations': -1
+    },
+    {
+        'num_keywords': -1
+    },
+    {
+        'max_first_sentence_chars': -1
+    },
+    {
+        'compression_ratio': 1.0
+    },
+    {
+        'compression_ratio': 0.5
+    },
+    {
+        'min_chars': -1
+    },
 ])
 def test_invalid_config_raises(kw):
     with pytest.raises(ValueError):
@@ -70,15 +65,13 @@ def test_invalid_config_raises(kw):
 @pytest.mark.parametrize('ratio', [2.0, 3.0, 4.0, 6.0, 10.0])
 def test_compression_ratio_is_strictly_enforced(ratio):
     cond = KeywordCondenser(
-        num_relations=3, max_first_sentence_chars=160,
-        num_keywords=8, compression_ratio=ratio, min_chars=50)
+        num_relations=3, max_first_sentence_chars=160, num_keywords=8, compression_ratio=ratio, min_chars=50)
     src = _user_chunk(LONG_PASSAGE)
     out = cond(_wrap(src)).chunks
     assert len(out) == 1
     compressed = out[0]['content']
     budget = math.ceil(len(LONG_PASSAGE) / ratio)
-    assert len(compressed) <= budget, (
-        f'ratio={ratio}: got len={len(compressed)} > budget={budget}')
+    assert len(compressed) <= budget, (f'ratio={ratio}: got len={len(compressed)} > budget={budget}')
     assert compressed, 'output must be non-empty'
 
 
@@ -122,8 +115,7 @@ def test_opening_relations_keywords_present_when_budget_allows():
     # LONG_PASSAGE is ~390 chars; full markup is ~370 chars, so we
     # need a ratio close to 1.0 to keep every slot.
     cond = KeywordCondenser(
-        num_relations=3, max_first_sentence_chars=160, num_keywords=8,
-        compression_ratio=1.05, min_chars=50)
+        num_relations=3, max_first_sentence_chars=160, num_keywords=8, compression_ratio=1.05, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     assert out.startswith('Open: ')
     assert '\nRel: ' in out
@@ -134,8 +126,7 @@ def test_opening_relations_keywords_present_when_budget_allows():
 
 def test_opening_first_sentence_respects_max_chars():
     cond = KeywordCondenser(
-        num_relations=0, max_first_sentence_chars=20, num_keywords=0,
-        compression_ratio=1.1, min_chars=10)
+        num_relations=0, max_first_sentence_chars=20, num_keywords=0, compression_ratio=1.1, min_chars=10)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     # Opening slot is trimmed to <= 20 chars
     opening_line = out.split('\n', 1)[0]
@@ -146,8 +137,7 @@ def test_opening_first_sentence_respects_max_chars():
 
 def test_relations_use_triple_or_quadruple_syntax():
     cond = KeywordCondenser(
-        num_relations=5, max_first_sentence_chars=10,
-        num_keywords=0, compression_ratio=1.1, min_chars=50)
+        num_relations=5, max_first_sentence_chars=10, num_keywords=0, compression_ratio=1.1, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     # We expect at least one '(a | b | c)' or '(a | b | c | d)' pattern.
     assert '(' in out and ')' in out
@@ -160,8 +150,7 @@ def test_relations_use_triple_or_quadruple_syntax():
 def test_verb_surface_preserved_not_lemma():
     """Triples keep surface form with auxiliaries: 'was born' not 'bear'."""
     cond = KeywordCondenser(
-        num_relations=3, max_first_sentence_chars=10,
-        num_keywords=0, compression_ratio=1.1, min_chars=50)
+        num_relations=3, max_first_sentence_chars=10, num_keywords=0, compression_ratio=1.1, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     # Auxiliary preserved.
     assert 'was born' in out or 'was released' in out or 'is' in out
@@ -172,8 +161,7 @@ def test_verb_surface_preserved_not_lemma():
 def test_internal_hyphens_preserved_in_np():
     """NP text keeps 'science-fiction' / 'British-American' hyphens."""
     cond = KeywordCondenser(
-        num_relations=5, max_first_sentence_chars=10,
-        num_keywords=0, compression_ratio=1.1, min_chars=50)
+        num_relations=5, max_first_sentence_chars=10, num_keywords=0, compression_ratio=1.1, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     assert 'science-fiction' in out or 'British-American' in out
 
@@ -181,8 +169,7 @@ def test_internal_hyphens_preserved_in_np():
 def test_pronoun_subject_triples_skipped():
     """Unresolved pronoun subjects (He/She/It) are noise and dropped."""
     cond = KeywordCondenser(
-        num_relations=5, max_first_sentence_chars=10,
-        num_keywords=0, compression_ratio=1.1, min_chars=50)
+        num_relations=5, max_first_sentence_chars=10, num_keywords=0, compression_ratio=1.1, min_chars=50)
     # LONG_PASSAGE has 'He is a British-American film director...'
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     assert '(He |' not in out and '(he |' not in out
@@ -190,12 +177,9 @@ def test_pronoun_subject_triples_skipped():
 
 def test_cardinal_entities_filtered_from_keywords():
     cond = KeywordCondenser(
-        num_relations=0, num_keywords=10,
-        max_first_sentence_chars=0, compression_ratio=1.1, min_chars=50)
-    passage = (
-        'Alpha earned 100 medals. Beta scored 200 points. Gamma made 300 attempts. '
-        'Delta received 400 votes. Epsilon collected 500 tokens. Zeta passed 600 miles.'
-    )
+        num_relations=0, num_keywords=10, max_first_sentence_chars=0, compression_ratio=1.1, min_chars=50)
+    passage = ('Alpha earned 100 medals. Beta scored 200 points. Gamma made 300 attempts. '
+               'Delta received 400 votes. Epsilon collected 500 tokens. Zeta passed 600 miles.')
     out = cond(_wrap(_user_chunk(passage))).chunks[0]['content']
     for num in ('100', '200', '300', '400', '500', '600'):
         assert num not in out, f'pure CARDINAL {num!r} leaked into keywords'
@@ -204,8 +188,7 @@ def test_cardinal_entities_filtered_from_keywords():
 def test_keyword_subsumption_prefers_longer_form():
     """'Nolan' is dropped when 'Christopher Nolan' is already kept."""
     cond = KeywordCondenser(
-        num_relations=0, max_first_sentence_chars=10, num_keywords=8,
-        compression_ratio=1.05, min_chars=50)
+        num_relations=0, max_first_sentence_chars=10, num_keywords=8, compression_ratio=1.05, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     more_line = next((ln for ln in out.splitlines() if ln.startswith('More: ')), '')
     kws = [k.strip() for k in more_line[len('More: '):].split(',') if k.strip()]
@@ -215,8 +198,7 @@ def test_keyword_subsumption_prefers_longer_form():
     for i, a in enumerate(sets):
         for j, b in enumerate(sets):
             if i != j:
-                assert not a < b, (
-                    f'{kws[i]!r} is subsumed by {kws[j]!r} but kept')
+                assert not a < b, (f'{kws[i]!r} is subsumed by {kws[j]!r} but kept')
 
 
 def test_keyword_exclusion_is_token_level_not_substring():
@@ -226,12 +208,9 @@ def test_keyword_exclusion_is_token_level_not_substring():
     'star' appears inside other tokens; token-level exclusion keeps it.
     """
     cond = KeywordCondenser(
-        num_relations=0, max_first_sentence_chars=60, num_keywords=5,
-        compression_ratio=1.1, min_chars=50)
-    passage = (
-        'The Starfleet Academy trains officers for deep-space missions. '
-        'Captain Kirk graduated there in 2251. Starfleet operates many vessels.'
-    )
+        num_relations=0, max_first_sentence_chars=60, num_keywords=5, compression_ratio=1.1, min_chars=50)
+    passage = ('The Starfleet Academy trains officers for deep-space missions. '
+               'Captain Kirk graduated there in 2251. Starfleet operates many vessels.')
     out = cond(_wrap(_user_chunk(passage))).chunks[0]['content']
     # 'Starfleet' shouldn't be dropped just because 'star' is a substring
     # of something in the opening.
@@ -241,8 +220,7 @@ def test_keyword_exclusion_is_token_level_not_substring():
 def test_opening_truncation_at_word_boundary():
     """When opening exceeds max_chars, cut at the last whole word."""
     cond = KeywordCondenser(
-        num_relations=0, max_first_sentence_chars=25, num_keywords=0,
-        compression_ratio=1.1, min_chars=10)
+        num_relations=0, max_first_sentence_chars=25, num_keywords=0, compression_ratio=1.1, min_chars=10)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     opening = out.split('\n', 1)[0][len('Open: '):]
     assert len(opening) <= 25
@@ -263,8 +241,7 @@ def test_budget_is_filled_greedily_with_triples_and_keywords():
     opening-only whenever the full composition exceeded budget.
     """
     cond = KeywordCondenser(
-        num_relations=3, max_first_sentence_chars=80,
-        num_keywords=8, compression_ratio=2.0, min_chars=50)
+        num_relations=3, max_first_sentence_chars=80, num_keywords=8, compression_ratio=2.0, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     budget = math.ceil(len(LONG_PASSAGE) / 2.0)
     assert len(out) <= budget
@@ -276,23 +253,20 @@ def test_budget_is_filled_greedily_with_triples_and_keywords():
 def test_budget_too_small_falls_back_to_raw_truncation():
     """Even at absurd ratios, output is non-empty and bounded."""
     cond = KeywordCondenser(
-        num_relations=3, num_keywords=5, max_first_sentence_chars=160,
-        compression_ratio=200.0, min_chars=50)
+        num_relations=3, num_keywords=5, max_first_sentence_chars=160, compression_ratio=200.0, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     budget = math.ceil(len(LONG_PASSAGE) / 200.0)
     assert 0 < len(out) <= budget
 
 
 def test_num_relations_zero_suppresses_slot():
-    cond = KeywordCondenser(
-        num_relations=0, num_keywords=5, compression_ratio=1.2, min_chars=50)
+    cond = KeywordCondenser(num_relations=0, num_keywords=5, compression_ratio=1.2, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     assert '\nRel: ' not in out
 
 
 def test_num_keywords_zero_suppresses_slot():
-    cond = KeywordCondenser(
-        num_relations=3, num_keywords=0, compression_ratio=1.2, min_chars=50)
+    cond = KeywordCondenser(num_relations=3, num_keywords=0, compression_ratio=1.2, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     assert '\nMore: ' not in out
 
@@ -304,8 +278,7 @@ def test_tight_budget_drops_keywords_first():
     # Pick a ratio that is just tight enough to force one slot to go.
     # Full output len ≈ 200+; opening+relations alone ≈ 120.
     cond = KeywordCondenser(
-        num_relations=2, max_first_sentence_chars=80,
-        num_keywords=8, compression_ratio=3.0, min_chars=50)
+        num_relations=2, max_first_sentence_chars=80, num_keywords=8, compression_ratio=3.0, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     budget = math.ceil(len(LONG_PASSAGE) / 3.0)
     assert len(out) <= budget
@@ -316,8 +289,7 @@ def test_very_tight_budget_falls_back_to_opening_only():
     # Ratio large enough that only the opening slot can fit.
     # Keep max_first_sentence_chars small so it does fit.
     cond = KeywordCondenser(
-        num_relations=5, max_first_sentence_chars=40,
-        num_keywords=8, compression_ratio=8.0, min_chars=50)
+        num_relations=5, max_first_sentence_chars=40, num_keywords=8, compression_ratio=8.0, min_chars=50)
     out = cond(_wrap(_user_chunk(LONG_PASSAGE))).chunks[0]['content']
     budget = math.ceil(len(LONG_PASSAGE) / 8.0)
     assert len(out) <= budget
@@ -347,8 +319,7 @@ def test_skip_roles_default_preserves_system_tool_assistant():
 
 
 def test_custom_skip_roles():
-    cond = KeywordCondenser(
-        compression_ratio=4.0, min_chars=50, skip_roles=())
+    cond = KeywordCondenser(compression_ratio=4.0, min_chars=50, skip_roles=())
     src = _wrap(_user_chunk(LONG_PASSAGE, role='assistant'))
     out = cond(src).chunks
     assert out[0]['raw']['condensed'] is True
@@ -364,8 +335,15 @@ def test_short_content_passes_through():
 
 def test_non_text_chunk_passes_through():
     cond = KeywordCondenser(compression_ratio=4.0, min_chars=1)
-    src = {'type': 'image', 'content': 'http://x/y.png',
-           'role': 'user', 'raw': {'type': 'image', 'image': 'http://x/y.png'}}
+    src = {
+        'type': 'image',
+        'content': 'http://x/y.png',
+        'role': 'user',
+        'raw': {
+            'type': 'image',
+            'image': 'http://x/y.png'
+        }
+    }
     out = cond(_wrap(src)).chunks
     assert out[0] == src
 
@@ -373,16 +351,29 @@ def test_non_text_chunk_passes_through():
 def test_reasoning_and_tool_call_kind_chunks_pass_through():
     cond = KeywordCondenser(compression_ratio=4.0, min_chars=50)
     reasoning = {
-        'type': 'text', 'role': 'assistant', 'content': LONG_PASSAGE,
-        'raw': {'kind': 'reasoning_content'},
+        'type': 'text',
+        'role': 'assistant',
+        'content': LONG_PASSAGE,
+        'raw': {
+            'kind': 'reasoning_content'
+        },
     }
     # Assistant role would already be skipped, but the kind-filter must
     # hold even if role is user.
     tool_call = {
-        'type': 'text', 'role': 'user', 'content': LONG_PASSAGE,
-        'raw': {'kind': 'tool_call',
-                'tool_call': {'type': 'function',
-                              'function': {'name': 'x', 'arguments': {}}}},
+        'type': 'text',
+        'role': 'user',
+        'content': LONG_PASSAGE,
+        'raw': {
+            'kind': 'tool_call',
+            'tool_call': {
+                'type': 'function',
+                'function': {
+                    'name': 'x',
+                    'arguments': {}
+                }
+            }
+        },
     }
     out = cond(_wrap(reasoning, tool_call)).chunks
     assert (out[0].get('raw') or {}).get('condensed') is not True
@@ -403,13 +394,20 @@ def test_chunker_then_condenser_produces_block_numbered_output():
     chunker = NativeChunker(chunk_size=300)
     cond = KeywordCondenser(compression_ratio=4.0, min_chars=50)
 
-    passages = '\n\n'.join(
-        f'[{i}] Title_{i}: ' + LONG_PASSAGE for i in range(1, 4))
+    passages = '\n\n'.join(f'[{i}] Title_{i}: ' + LONG_PASSAGE for i in range(1, 4))
     user_text = f'Question: who directed Inception?\n\nContext:\n\n{passages}'
-    traj = {'messages': [
-        {'role': 'system', 'content': 'You are a helpful agent.'},
-        {'role': 'user', 'content': user_text},
-    ]}
+    traj = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': 'You are a helpful agent.'
+            },
+            {
+                'role': 'user',
+                'content': user_text
+            },
+        ]
+    }
     chunks = cond(chunker(traj))
     back = chunks.to_trajectory()
 
@@ -430,9 +428,9 @@ def test_condenser_preserves_chunk_order_and_count():
     )
     out = cond(src_chunks).chunks
     assert len(out) == 3
-    assert out[0]['content'] == 'short'                 # too short
-    assert out[1]['raw']['condensed'] is True           # condensed
-    assert out[2]['content'] == LONG_PASSAGE            # skipped role
+    assert out[0]['content'] == 'short'  # too short
+    assert out[1]['raw']['condensed'] is True  # condensed
+    assert out[2]['content'] == LONG_PASSAGE  # skipped role
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +456,7 @@ def _round_chunk(text, round_idx, role='user'):
 
 
 def test_rounds_filter_only_compresses_first_user_turn():
-    cond = KeywordCondenser(compression_ratio=4.0, min_chars=50,
-                            rounds=[1])
+    cond = KeywordCondenser(compression_ratio=4.0, min_chars=50, rounds=[1])
     out = cond(_wrap(
         _round_chunk(LONG_PASSAGE, 1),
         _round_chunk(LONG_PASSAGE + ' extra.', 2),
@@ -473,8 +470,7 @@ def test_rounds_filter_only_compresses_first_user_turn():
 
 
 def test_rounds_filter_excludes_chunks_without_round_field():
-    cond = KeywordCondenser(compression_ratio=4.0, min_chars=50,
-                            rounds=[1])
+    cond = KeywordCondenser(compression_ratio=4.0, min_chars=50, rounds=[1])
     # Chunk missing ``round`` must be treated as non-matching.
     plain = _user_chunk(LONG_PASSAGE)
     out = cond(_wrap(plain)).chunks[0]

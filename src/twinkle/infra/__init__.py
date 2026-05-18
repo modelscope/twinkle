@@ -1,13 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
+import json
 import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
-import json
+
+from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
-from twinkle.notifier import notify_exception, Notifier
 
 logger = get_logger()
 
@@ -703,7 +704,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                             rank = Platform.get_rank()
                             # Redispatch here
                             _workers_and_args = _dispatch_args(
-                                _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args, kwargs)
+                                _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args,
+                                kwargs)
                             _, args, kwargs = _workers_and_args[rank]
                         return func(self, *args, **kwargs)
                     else:
@@ -767,10 +769,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
-                            for _attr in ('_futures',):
+                            for _attr in ('_futures', ):
                                 if hasattr(_orig_result_func, _attr):
-                                    setattr(_notifying_result_func, _attr,
-                                            getattr(_orig_result_func, _attr))
+                                    setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
                             return _notifying_result_func
                         return result_func()
                 else:

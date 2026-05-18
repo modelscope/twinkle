@@ -42,16 +42,13 @@ _OLD = (
     "            {%- if '</think>' in content %}\n"
     "                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n"  # noqa: E501
     "                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n"
-    "            {%- endif %}"
-)
+    '            {%- endif %}')
 
-_NEW = (
-    "            {%- if content.startswith('<think>') and '</think>' in content %}\n"
-    "                {%- set _parts = content.split('</think>', 1) %}\n"
-    "                {%- set reasoning_content = _parts[0].split('<think>', 1)[1].strip('\\n') %}\n"
-    "                {%- set content = _parts[1].lstrip('\\n') %}\n"
-    "            {%- endif %}"
-)
+_NEW = ("            {%- if content.startswith('<think>') and '</think>' in content %}\n"
+        "                {%- set _parts = content.split('</think>', 1) %}\n"
+        "                {%- set reasoning_content = _parts[0].split('<think>', 1)[1].strip('\\n') %}\n"
+        "                {%- set content = _parts[1].lstrip('\\n') %}\n"
+        '            {%- endif %}')
 
 
 class Qwen3ChatTemplate(Patch):

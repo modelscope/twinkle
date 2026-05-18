@@ -1,40 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""LLM-backed passage condenser.
-
-Pipeline
---------
-``Chunks`` → filter eligible chunks → batched ``Sampler.sample(...)`` →
-strip code fences → length-vs-original guard → ``Chunks`` with
-``raw.condensed=True`` (so :meth:`Chunks.to_trajectory` later wraps
-them in ``<block_N>``). When the decoded output is empty, degenerate,
-or **not strictly shorter than the original passage**, the chunk is
-left untouched and is NOT marked ``raw.condensed`` — so downstream
-bookkeeping (and the rollout trace) can tell compressed vs.
-passthrough chunks apart.
-
-The compression prompt asks for up to three markdown sections
-(``## Summary / ## More / ## Key Facts``) written in **telegraphic
-style** (no articles / copulas / filler) with per-section length
-hints. Telegraphic output is ~2–3× denser than natural-prose summaries
-and is critical under tight compression ratios. The output is **not**
-parsed — sections pass through verbatim. The character budget the
-prompt exposes is a soft target only; we never hard-clip the model
-output, we simply discard it (fall back to the original) when it
-fails to compress.
-"""
-from __future__ import annotations
-
 import math
 import re
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from twinkle_agentic.condenser.base import Condenser
 from twinkle_agentic.data_format import Chunk, Chunks
 
-if TYPE_CHECKING:  # only used for type hints, keep runtime deps minimal
+if TYPE_CHECKING:
     from twinkle.data_format import SamplingParams, Trajectory  # noqa: F401
     from twinkle.sampler.base import Sampler  # noqa: F401
-
 
 _SECTION_SCHEMA = """You are a text compression assistant. A downstream model will read your compressed output to decide whether the detail it needs is inside this block; if yes, it will fetch and read the original passage.
 
@@ -54,7 +28,7 @@ A collapsed index; expansion required to see specific information.
 ```
 
 Rules:
-1. Telegraphic style — drop function words ("the", "a", "is", "are", "of", ...); colons and commas mean "is" / "has". 
+1. Telegraphic style — drop function words ("the", "a", "is", "are", "of", ...); colons and commas mean "is" / "has".
     * Exception: KEEP role-tagging verb+preposition phrases verbatim ("published by X", "written by X", "directed by X", "starring X", "founded by X", "created by X", "composed by X", "produced by X", "based on X", "adapted from X"). Collapsing these to a bare name loses the relation role (author vs publisher vs director) that the downstream question may hinge on.
 2. Summary MUST contain the passage's primary topic + 2–4 concrete core facts drawn from the source (entities, numbers, dates, relations). If a Query is given, order Query-relevant facts first, but STILL include other core facts within the budget. A Query is an ORDERING HINT, NOT a filter.
 3. Summary MUST NOT be meta-commentary about the Query. Forbidden patterns: "no X mention", "Query info: absent", "passage covers Y only", "does not contain ...", "no relevant info", or summaries that are only abstract category words like "structure/order/usage" with no facts. If the passage is unrelated to the Query, you still summarize the passage normally.
@@ -96,24 +70,27 @@ Marie Curie: French-Polish physicist/chemist, founder of radioactivity research,
 ```
 
 Now begin.
-"""
-
+""" # noqa
 
 DEFAULT_SYSTEM_PROMPT = _SECTION_SCHEMA
 
-DEFAULT_USER_PROMPT_TEMPLATE = (
-    'Downstream model will read your compressed block to decide whether to '
-    'expand it. Compress faithfully: preserve the passage topic + core facts. '
-    'Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary '
-    'about the Query (never write "Query info: absent", "no X mention", etc.); '
-    'if the passage does not address the Query, still summarize the passage.\n\n'
-    '## Query (ordering hint only — still summarize the whole passage)\n{query}\n\n'
-    '## Target length\n'
-    'Compress AS MUCH AS faithfully possible. HARD CEILING: {budget} chars. '
-    'If core facts fit in far fewer chars, output fewer. '
-    'Never exceed the ceiling.\n\n'
-    '## Passage\n{text}')
+DEFAULT_USER_PROMPT_TEMPLATE = """\
+Downstream model will read your compressed block to decide whether to \
+expand it. Compress faithfully: preserve the passage topic + core facts. \
+Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary \
+about the Query (never write "Query info: absent", "no X mention", etc.); \
+if the passage does not address the Query, still summarize the passage.
 
+## Query (ordering hint only — still summarize the whole passage)
+{query}
+
+## Target length
+Compress AS MUCH AS faithfully possible. HARD CEILING: {budget} chars. \
+If core facts fit in far fewer chars, output fewer. \
+Never exceed the ceiling.
+
+## Passage
+{text}"""
 
 # A (chunk_index, chunk, char_budget) triple marking one compression job.
 _Job = Tuple[int, Chunk, int]
@@ -124,7 +101,7 @@ _Job = Tuple[int, Chunk, int]
 # ---------------------------------------------------------------------------
 class ModelCondenser(Condenser):
     """Compressor that delegates summarization to an LLM via a :class:`Sampler`.
-
+    TODO: Experimental feature, wait for testing
     Args:
         sampler: Configured :class:`Sampler` with a template set.
         compression_ratio: Target factor (> 1). Used only to derive a
@@ -207,39 +184,36 @@ class ModelCondenser(Condenser):
 
     def __init__(
         self,
-        sampler: 'Sampler',
+        sampler: Sampler,
         compression_ratio: float = 2.0,
         *,
-        sampling_params: Optional['SamplingParams'] = None,
-        system_prompt: Optional[str] = None,
-        user_prompt_template: Optional[str] = None,
+        sampling_params: SamplingParams | None = None,
+        system_prompt: str | None = None,
+        user_prompt_template: str | None = None,
         min_chars: int = 200,
         min_budget_chars: int = 250,
-        template: Optional[Any] = None,
+        template: Any | None = None,
         skip_roles: Sequence[str] = ('system', 'tool', 'assistant'),
-        skip_pattern: Optional[str] = None,
-        related_query: Optional[Callable[[Chunk], Optional[str]]] = None,
-        rounds: Optional[Sequence[int]] = None,
+        skip_pattern: str | None = None,
+        related_query: Callable[[Chunk], str | None] | None = None,
+        rounds: Sequence[int] | None = None,
         batch_size: int = None,
-        lora_path: Optional[str] = None,
+        lora_path: str | None = None,
     ):
         if sampler is None:
             raise ValueError('sampler is required')
         if compression_ratio <= 1.0:
-            raise ValueError(
-                f'compression_ratio must be > 1, got {compression_ratio}')
+            raise ValueError(f'compression_ratio must be > 1, got {compression_ratio}')
         if min_chars < 0:
             raise ValueError(f'min_chars must be >= 0, got {min_chars}')
         if min_budget_chars < 1:
-            raise ValueError(
-                f'min_budget_chars must be >= 1, got {min_budget_chars}')
+            raise ValueError(f'min_budget_chars must be >= 1, got {min_budget_chars}')
         if batch_size is not None and batch_size <= 0:
             raise ValueError(f'batch_size must be >= 1, got {batch_size}')
 
         tpl = user_prompt_template or DEFAULT_USER_PROMPT_TEMPLATE
         if '{budget}' not in tpl or '{text}' not in tpl:
-            raise ValueError(
-                'user_prompt_template must contain both {budget} and {text}')
+            raise ValueError('user_prompt_template must contain both {budget} and {text}')
 
         self.sampler = sampler
         self.compression_ratio = float(compression_ratio)
@@ -252,19 +226,18 @@ class ModelCondenser(Condenser):
         self.skip_roles = tuple(skip_roles)
         # ``^`` must anchor to start-of-string, not start-of-line: a passage
         # whose body contains a ``Question:`` line would otherwise skip compression.
-        self.skip_re: Optional[re.Pattern] = (
-            re.compile(skip_pattern) if skip_pattern else None)
+        self.skip_re: re.Pattern | None = (re.compile(skip_pattern) if skip_pattern else None)
         self.related_query = related_query
         self.rounds = set(rounds) if rounds is not None else None
         self.batch_size = batch_size
         self.lora_path = lora_path if lora_path else None
-        self._special_tokens_cache: Optional[Tuple[str, ...]] = None
+        self._special_tokens_cache: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------
     # entry point
     # ------------------------------------------------------------------
     def __call__(self, chunks: Chunks, **_kwargs: Any) -> Chunks:
-        out: List[Chunk] = list(chunks.chunks)
+        out: list[Chunk] = list(chunks.chunks)
         items = self._collect_jobs(out)
         if not items:
             return Chunks(chunks=out)
@@ -276,8 +249,7 @@ class ModelCondenser(Condenser):
             queries = [q for _job, q in sub]
             responses = self._sample_batch(batch, queries=queries)
             for (idx, chunk, _budget), resp in zip(batch, responses):
-                text = self._postprocess(
-                    _decoded(resp), chunk['content'])
+                text = self._postprocess(_decoded(resp), chunk['content'])
                 if text is None:
                     continue
                 out[idx] = _mark_condensed(chunk, text)
@@ -287,8 +259,9 @@ class ModelCondenser(Condenser):
     # eligibility + job collection
     # ------------------------------------------------------------------
     def _collect_jobs(
-        self, chunks: Sequence[Chunk],
-    ) -> List[Tuple[_Job, Optional[str]]]:
+        self,
+        chunks: Sequence[Chunk],
+    ) -> list[tuple[_Job, str | None]]:
         """Collect compression jobs, tagging each with its trajectory's query.
 
         Walks ``chunks`` in order and maintains a rolling
@@ -302,8 +275,8 @@ class ModelCondenser(Condenser):
         multiple trajectories into a single chunk list — A's
         passages only ever see A's question, B's only B's.
         """
-        items: List[Tuple[_Job, Optional[str]]] = []
-        current_query: Optional[str] = None
+        items: list[tuple[_Job, str | None]] = []
+        current_query: str | None = None
         extract = self.related_query
         for i, c in enumerate(chunks):
             content = c.get('content')
@@ -313,9 +286,7 @@ class ModelCondenser(Condenser):
                     current_query = q
             if not self._should_condense(c):
                 continue
-            budget = max(
-                self.min_budget_chars,
-                math.ceil(len(content) / self.compression_ratio))
+            budget = max(self.min_budget_chars, math.ceil(len(content) / self.compression_ratio))
             if budget >= len(content):
                 continue
             items.append(((i, c, max(1, budget)), current_query))
@@ -347,11 +318,11 @@ class ModelCondenser(Condenser):
     # batched sampling
     # ------------------------------------------------------------------
     def _sample_batch(
-        self,
-        batch: Sequence[_Job],
-        *,
-        queries: Sequence[Optional[str]] = (),
-    ) -> List[Any]:
+            self,
+            batch: Sequence[_Job],
+            *,
+            queries: Sequence[str | None] = (),
+    ) -> list[Any]:
         """Dispatch one batch to the sampler, padded to ``batch_size``.
 
         Distributed samplers slice inputs across DP workers and can
@@ -363,25 +334,21 @@ class ModelCondenser(Condenser):
         is injected into the user prompt's ``{query}`` slot. When
         empty or ``None`` at an index, a neutral placeholder is used.
         """
-        qs: List[Optional[str]] = list(queries) if queries else [None] * len(batch)
+        qs: list[str | None] = list(queries) if queries else [None] * len(batch)
         if len(qs) != len(batch):
-            raise ValueError(
-                f'queries length ({len(qs)}) must match batch length '
-                f'({len(batch)})')
+            raise ValueError(f'queries length ({len(qs)}) must match batch length '
+                             f'({len(batch)})')
         trajectories = [
-            self._build_trajectory(chunk['content'], budget, query=q)
-            for (_, chunk, budget), q in zip(batch, qs)
+            self._build_trajectory(chunk['content'], budget, query=q) for (_, chunk, budget), q in zip(batch, qs)
         ]
         actual = len(trajectories)
         device_mesh = getattr(self.sampler, 'device_mesh', None)
-        min_batch_size = (
-            device_mesh.data_world_size if device_mesh is not None else 1)
+        min_batch_size = (device_mesh.data_world_size if device_mesh is not None else 1)
         if actual < min_batch_size:
-            trajectories.extend(
-                [trajectories[-1]] * (min_batch_size - actual))
+            trajectories.extend([trajectories[-1]] * (min_batch_size - actual))
 
         sp = self._sampling_params_for(max(b for _, _, b in batch))
-        kwargs: Dict[str, Any] = {'sampling_params': sp}
+        kwargs: dict[str, Any] = {'sampling_params': sp}
         if self.lora_path is None:
             kwargs['use_base_model'] = True
         else:
@@ -392,15 +359,18 @@ class ModelCondenser(Condenser):
         return list(responses)[:actual]
 
     def _build_trajectory(
-        self, text: str, budget: int, *, query: Optional[str] = None,
-    ) -> 'Trajectory':
+        self,
+        text: str,
+        budget: int,
+        *,
+        query: str | None = None,
+    ) -> Trajectory:
         system = self.system_prompt
         user = self.user_prompt_template.replace('{budget}', str(budget))
         user = user.replace('{text}', text)
         q_text = (
-            query.strip()
-            if isinstance(query, str) and query and query.strip()
-            else '(no explicit query; compress by general salience)')
+            query.strip() if isinstance(query, str) and query and query.strip() else
+            '(no explicit query; compress by general salience)')
         user = user.replace('{query}', q_text)
         return {  # type: ignore[return-value]
             'messages': [
@@ -409,10 +379,11 @@ class ModelCondenser(Condenser):
             ],
         }
 
-    def _sampling_params_for(self, budget: int) -> 'SamplingParams':
+    def _sampling_params_for(self, budget: int) -> SamplingParams:
         if self.sampling_params is not None:
             return self.sampling_params
         from twinkle.data_format.sampling import SamplingParams
+
         # CJK worst case ~2 tokens/char; budget is a soft char ceiling, not output truth.
         max_new = max(256, budget * 2 + 128)
         return SamplingParams(temperature=0.0, max_tokens=max_new)
@@ -420,7 +391,7 @@ class ModelCondenser(Condenser):
     # ------------------------------------------------------------------
     # postprocess
     # ------------------------------------------------------------------
-    def _postprocess(self, raw: str, original: str) -> Optional[str]:
+    def _postprocess(self, raw: str, original: str) -> str | None:
         """Return compressed text, or ``None`` to signal passthrough.
 
         ``None`` is returned when the decoded output is empty,
@@ -430,15 +401,14 @@ class ModelCondenser(Condenser):
         compression and the caller should keep the original passage
         verbatim (no ``<block_N>`` wrap, not marked ``raw.condensed``).
         """
-        text = _strip_special_tokens(
-            _strip_code_fences(raw), self._get_special_tokens()).strip()
+        text = _strip_special_tokens(_strip_code_fences(raw), self._get_special_tokens()).strip()
         if not text or not _has_alnum(text):
             return None
         if len(text) >= len(original):
             return None
         return text
 
-    def _get_special_tokens(self) -> Tuple[str, ...]:
+    def _get_special_tokens(self) -> tuple[str, ...]:
         """Return protocol tokens to strip from decoded output (cached).
 
         Resolution order:
@@ -461,13 +431,11 @@ class ModelCondenser(Condenser):
             return self._special_tokens_cache
         tpl = self.template or getattr(self.sampler, 'template', None)
         tokenizer = getattr(tpl, 'tokenizer', None) if tpl is not None else None
-        tokens: List[str] = []
+        tokens: list[str] = []
         if tokenizer is not None:
             extras = getattr(tokenizer, 'all_special_tokens', None) or []
             if extras:
-                tokens.extend(
-                    t for t in extras
-                    if isinstance(t, str) and t and not t.isspace())
+                tokens.extend(t for t in extras if isinstance(t, str) and t and not t.isspace())
             else:
                 for attr in ('eos_token', 'pad_token', 'bos_token'):
                     t = getattr(tokenizer, attr, None)
@@ -498,7 +466,7 @@ def _mark_condensed(chunk: Chunk, content: str) -> Chunk:
     ``raw.original`` so a future :class:`ExtractCondensed` call can
     recover the full text).
     """
-    new: Dict[str, Any] = dict(chunk)
+    new: dict[str, Any] = dict(chunk)
     raw = dict(new.get('raw') or {})
     raw.setdefault('original', new.get('content', ''))
     raw['condensed'] = True

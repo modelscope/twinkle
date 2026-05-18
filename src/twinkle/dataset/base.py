@@ -14,7 +14,6 @@ from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, processing_lock
 
-
 try:
     import multiprocess
     multiprocess.set_start_method('spawn', force=True)
