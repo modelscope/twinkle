@@ -106,13 +106,7 @@ class MultiTurnRollout(Rollout):
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
-        if self.trace_dir:
-            try:
-                os.makedirs(self.trace_dir, exist_ok=True)
-            except OSError:
-                # If we can't even create the directory, disable tracing
-                # silently rather than crashing the training job.
-                self.trace_dir = None
+        os.makedirs(self.trace_dir, exist_ok=True)
 
         if self.sampling_params.num_samples != 1:
             raise ValueError(
