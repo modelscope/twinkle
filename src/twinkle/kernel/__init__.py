@@ -49,8 +49,8 @@ def kernelize_model(
     if device == 'npu' or (device is None and _is_npu_device(model)):
         try:
             apply_npu_patch()
-        except Exception as e:
-            logger.warning(f'NPU patch failed: {e}. Continuing without fused ops.')
+        except Exception:
+            logger.warning('NPU patch failed. Continuing without fused ops.', exc_info=True)
 
     model = apply_layer_kernel(model, mode=mode, device=device, use_fallback=use_fallback)
 
