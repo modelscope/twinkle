@@ -96,24 +96,21 @@ def all_to_all_async(group, input, output_split_size, input_split_size):
 
 
 # ========================== moe_utils ==========================
-def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
+def permute(tokens: torch.Tensor, expert_mask: torch.Tensor):
     """
     Permutes the tokens according to the routing map.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden_dim].
-        routing_map (torch.Tensor): The sparse token to expert mapping, [num_experts, tokens].
+        expert_mask (torch.Tensor): The sparse token to expert mapping, [num_experts, top_k, num_tokens].
 
     """
     num_tokens, _ = tokens.shape
-    num_experts = routing_map.shape[0]
-
-    # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-    routing_map = routing_map.bool()
+    expert_mask = expert_mask.bool()
 
     # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-    token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-    sorted_indices = token_indices.masked_select(routing_map)
+    token_indices = torch.arange(num_tokens, device=expert_mask.device).view(1, 1, num_tokens).expand_as(expert_mask)
+    sorted_indices = token_indices.masked_select(expert_mask)
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
@@ -226,6 +223,7 @@ def preprocess(
 def token_pre_all2all(
     hidden_states: torch.Tensor,
     expert_mask: torch.Tensor,
+    routing_weights: torch.Tensor,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,
@@ -235,9 +233,9 @@ def token_pre_all2all(
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
     org_hidden_states_shape = hidden_states.shape
-    routing_map = expert_mask.sum(dim=1)
 
-    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
+    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, expert_mask)
+    local_assignment_weights = routing_weights.T.contiguous().masked_select(expert_mask.bool())
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
@@ -250,18 +248,21 @@ def token_pre_all2all(
         permute_order,
     )
 
-    return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
+    return (
+        global_permuted_hidden_states,
+        local_input_permutation_mapping,
+        local_assignment_weights,
+        org_hidden_states_shape,
+    )
 
 
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
+    local_assignment_weights: torch.Tensor,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
-    routing_map: torch.Tensor,
     local_input_permutation_mapping: torch.Tensor,
     org_hidden_states_shape: torch.Size,
     ep_group: Optional[dist.ProcessGroup] = None,
@@ -276,16 +277,12 @@ def tokens_post_all2all(
     )
 
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
-
-    # [tokens, experts]
-    weights_idx = generate_weights_idx(routing_weights, selected_experts, num_experts)
-
-    unpermute_outputs = unpermute(
-        unpermute_outputs,
-        weights_idx,
-        org_hidden_states_shape,
-        local_input_permutation_mapping,
-        routing_map,
+    weighted_outputs = unpermute_outputs * local_assignment_weights.unsqueeze(-1)
+    hidden_dim = org_hidden_states_shape[-1]
+    final_outputs = torch.zeros(org_hidden_states_shape, device=weighted_outputs.device, dtype=weighted_outputs.dtype)
+    final_outputs.scatter_add_(
+        0,
+        local_input_permutation_mapping.unsqueeze(1).expand(-1, hidden_dim),
+        weighted_outputs,
     )
-
-    return unpermute_outputs
+    return final_outputs

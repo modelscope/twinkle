@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import inspect
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -187,6 +188,11 @@ def patch_forward(
         raise ValueError('MoE block must define top_k/num_experts_per_tok.')
 
     orig_forward = block.forward
+    return_annotation = inspect.signature(orig_forward).return_annotation
+    returns_router_logits = return_annotation in (
+        tuple,
+        Tuple[torch.Tensor, torch.Tensor | None],
+    )
     num_experts = block._ep_num_experts
     experts_per_rank = block._ep_experts_per_rank
     is_tensor_experts = block._ep_tensor_experts
@@ -198,8 +204,8 @@ def patch_forward(
         _install_ep_forward(block.experts, experts_per_rank)
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
-        if args or kwargs:
-            raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
+        if args:
+            raise RuntimeError('Expert parallel patch only supports keyword-only extra args for MoE blocks.')
 
         orig_shape = hidden_states.shape
         if hidden_states.ndim == 3:
@@ -218,11 +224,11 @@ def patch_forward(
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
             norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            **kwargs,
         )
         # Keep routing weights in activation dtype before unpermute weighting.
         if routing_weights.dtype != hidden_states_2d.dtype:
             routing_weights = routing_weights.to(hidden_states_2d.dtype)
-
         # Build expert_mask: [num_experts, top_k, num_tokens]
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=num_experts).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]
@@ -238,12 +244,13 @@ def patch_forward(
         # 2. token_pre_all2all: permute → all_to_all → sort_chunks
         (
             global_permuted_hidden_states,
-            routing_map,
             local_input_permutation_mapping,
+            local_assignment_weights,
             org_hidden_states_shape,
         ) = token_pre_all2all(
             hidden_states_2d,
             expert_mask,
+            routing_weights,
             num_experts,
             input_splits,
             output_splits,
@@ -272,13 +279,11 @@ def patch_forward(
         # 4. tokens_post_all2all: sort_chunks → all_to_all → unpermute (with routing weight)
         final_hidden = tokens_post_all2all(
             expert_outputs,
-            routing_weights,
-            selected_experts,
+            local_assignment_weights,
             num_experts,
             input_splits,
             output_splits,
             num_global_tokens_per_local_expert,
-            routing_map,
             local_input_permutation_mapping,
             org_hidden_states_shape,
             ep_group,
@@ -291,7 +296,7 @@ def patch_forward(
         if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
 
-        if cfg.keep_router_logits:
+        if cfg.keep_router_logits and returns_router_logits:
             return final_hidden, router_logits
         return final_hidden
 
@@ -311,7 +316,10 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
         experts_per_rank: int,
     ) -> torch.Tensor:
         if permuted_tokens.numel() == 0:
-            return torch.empty_like(permuted_tokens)
+            # Preserve the autograd edge to token_pre_all2all. Returning a new
+            # empty tensor can make this rank skip the matching backward
+            # all-to-all, causing EP collective order divergence.
+            return permuted_tokens
 
         input_dtype = permuted_tokens.dtype
 
@@ -333,8 +341,12 @@ def _install_ep_forward(experts_mod: nn.Module, experts_per_rank: int) -> None:
             compute_dtype = gate_up.dtype
             if expert_in.dtype != compute_dtype:
                 expert_in = expert_in.to(compute_dtype)
-            gate, up = F.linear(expert_in, gate_up).chunk(2, dim=-1)
-            out = self.act_fn(gate) * up
+            gate_up_out = F.linear(expert_in, gate_up)
+            if hasattr(self, '_apply_gate'):
+                out = self._apply_gate(gate_up_out)
+            else:
+                gate, up = gate_up_out.chunk(2, dim=-1)
+                out = self.act_fn(gate) * up
             out = F.linear(out, down)
 
             if out.dtype != input_dtype:
@@ -400,6 +412,8 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
         return None
     shared = getattr(block, 'shared_expert', None)
     if shared is None:
+        shared = getattr(block, 'shared_experts', None)
+    if shared is None:
         return None
     return _run_module_with_casting(shared, hidden_states_2d)
 
@@ -431,7 +445,9 @@ def _run_local_experts(
     that happens in unpermute.
     """
     if permuted_tokens.numel() == 0:
-        return torch.empty_like(permuted_tokens)
+        # Keep the backward path through token_pre_all2all even when this EP
+        # rank owns no routed tokens for the current block.
+        return permuted_tokens
 
     input_dtype = permuted_tokens.dtype
     experts = block.experts
@@ -487,8 +503,12 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    gate_out = gate(hidden_states)
+    gate_kwargs = {}
+    if 'input_ids' in kwargs and _module_forward_accepts_kwarg(gate, 'input_ids'):
+        gate_kwargs['input_ids'] = kwargs['input_ids']
+    gate_out = gate(hidden_states, **gate_kwargs)
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
         router_logits, routing_weights, selected_experts = gate_out[:3]
         return router_logits, routing_weights, selected_experts
@@ -499,3 +519,11 @@ def _run_router(
     if norm_topk_prob:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     return router_logits, routing_weights, selected_experts
+
+
+def _module_forward_accepts_kwarg(module: nn.Module, kwarg: str) -> bool:
+    signature = inspect.signature(module.forward)
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return kwarg in signature.parameters
