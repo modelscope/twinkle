@@ -4,9 +4,10 @@ import inspect
 import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
-
+import json
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
+from ..notifier import notify_exception
 
 logger = get_logger()
 
@@ -31,53 +32,12 @@ _notifier: Optional[Any] = None
 
 _name: Optional[str] = None
 
-_runtime_meta_cache: Optional[str] = None
-
-
-def _get_runtime_meta() -> str:
-    global _runtime_meta_cache
-    if _runtime_meta_cache is not None:
-        return _runtime_meta_cache
-    import platform
-    import socket
-    import sys
-    hostname = 'unknown'
-    ip = 'unknown'
-    try:
-        hostname = socket.gethostname()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            # UDP connect does not actually send packets; resolves outbound iface IP.
-            s.connect(('8.8.8.8', 80))
-            ip = s.getsockname()[0]
-        finally:
-            s.close()
-    except Exception:  # noqa: BLE001
-        try:
-            ip = socket.gethostbyname(hostname)
-        except Exception:  # noqa: BLE001
-            pass
-    rank = os.environ.get('RANK', '?')
-    world_size = os.environ.get('WORLD_SIZE', '?')
-    local_rank = os.environ.get('LOCAL_RANK', '?')
-    lines = [
-        f'- **Host**: `{hostname}` (`{ip}`)',
-        f'- **Python**: `{platform.python_version()}` @ `{sys.executable}`',
-        f'- **Rank**: `{rank}/{world_size}` (local_rank=`{local_rank}`)',
-    ]
-    _runtime_meta_cache = '\n'.join(lines)
-    return _runtime_meta_cache
-
-
 _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
 
 
 def _maybe_load_worker_notifier() -> None:
     """Lazily reconstruct notifier + name on ray workers from inherited env vars."""
-    global _notifier, _name
+    global _notifier
     if _notifier is not None:
         return
     raw = os.environ.get(_TWINKLE_NOTIFIER_ENV)
@@ -89,56 +49,6 @@ def _maybe_load_worker_notifier() -> None:
     candidate = Notifier.from_dict(json.loads(raw))
     if candidate is not None:
         _notifier = candidate
-        if _name is None:
-            _name = os.environ.get('TWINKLE_NAME') or None
-
-
-def _try_claim_notify_slot(exc: BaseException, context: str) -> bool:
-    """Build an exception fingerprint and delegate to the generic single-winner claim."""
-    from twinkle.utils.parallel import try_claim_once
-    tb = exc.__traceback__
-    last_frame = ''
-    while tb is not None:
-        last_frame = f'{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}'
-        tb = tb.tb_next
-    key = f'{_name or "_"}|{type(exc).__name__}|{last_frame}|{context}'
-    payload = (f'rank={os.environ.get("RANK", "?")} '
-               f'pid={os.getpid()} ctx={context}\n')
-    return try_claim_once(key, payload=payload, namespace='twinkle_notify')
-
-
-def _notify_exception(context: str, exc: BaseException) -> None:
-    _maybe_load_worker_notifier()
-    if _notifier is None:
-        return
-    if getattr(exc, '_twinkle_notified', False):
-        return
-    if not _try_claim_notify_slot(exc, context):
-        try:
-            setattr(exc, '_twinkle_notified', True)
-        except Exception:  # noqa: BLE001
-            pass
-        return
-    try:
-        import traceback
-        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        title = f'[Twinkle] `{_name or "unnamed"}` — Exception in `{context}`'
-        meta = _get_runtime_meta()
-        msg = (
-            f'### {title}\n\n'
-            f'- **Type**: `{type(exc).__name__}`\n'
-            f'- **Message**: {exc}\n'
-            f'{meta}\n\n'
-            f'```\n{tb_str}```\n'
-        )
-        _notifier(msg)
-    except Exception:  # noqa: BLE001 — must never shadow the original error
-        logger.exception('Failed to send twinkle exception notification')
-    finally:
-        try:
-            setattr(exc, '_twinkle_notified', True)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def initialize(mode: Literal['local', 'ray'] = 'local',
@@ -179,9 +89,10 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
     _notifier = notifier
     if name is not None:
         os.environ['TWINKLE_NAME'] = name
+    else:
+        _name = os.environ.get('TWINKLE_NAME') or None
     os.environ.setdefault('TWINKLE_SESSION_ID', str(os.getpid()))
     if notifier is not None and hasattr(notifier, 'to_dict'):
-        import json
         os.environ[_TWINKLE_NOTIFIER_ENV] = json.dumps(notifier.to_dict())
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
@@ -579,9 +490,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
         def new_init(self, *args, **kwargs):
             _ctx = f'{cls.__name__}.__init__'
             try:
+                _maybe_load_worker_notifier()
                 _new_init_body(self, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
-                _notify_exception(_ctx, _e)
+                notify_exception(_notifier, _ctx, _e)
                 raise
 
         def _new_init_body(self, *args, **kwargs):
@@ -854,7 +766,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
-                                    _notify_exception(_ctx, _e)
+                                    notify_exception(_notifier, _ctx, _e)
                                     raise
 
                             for _attr in ('_futures',):
@@ -868,7 +780,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
-                _notify_exception(_ctx, _e)
+                notify_exception(_notifier, _ctx, _e)
                 raise
 
         wrapper._execute = execute
