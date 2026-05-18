@@ -124,5 +124,5 @@ def _is_npu_device(model=None) -> bool:
         if hasattr(torch, 'npu') and torch.npu.is_available():
             return True
     except Exception:
-        pass
+        logger.debug("Failed to check NPU availability", exc_info=True)
     return False
