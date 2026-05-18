@@ -1,7 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import json
+import re
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.utils import to_device
@@ -10,6 +13,44 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
 _T = TypeVar('_T')
+
+Prompt = List[Union[str, List[int], List[str]]]
+
+
+def _split_str_by_regex(text: str, regex_delimiters: List[str]) -> List[str]:
+    combined_pattern = '|'.join(f'({pattern})' for pattern in regex_delimiters)
+    parts = re.split(combined_pattern, text, flags=re.DOTALL)
+    parts = [part for part in parts if part is not None]
+    if parts[0] == '':
+        parts.pop(0)
+    else:
+        parts.insert(0, '')
+    assert len(parts) % 2 == 0, f'result: {parts}'
+    assert ''.join(parts) == text, f'split_result: {parts}, text: {text}'
+    return parts
+
+
+def split_str_parts_by(text: str, delimiters: List[str], regex_mode: bool = False) -> List[Dict[str, str]]:
+    """Split text into keyed delimiter/content parts."""
+    assert isinstance(text, str), f'text: {text}'
+    delimiters_origin = delimiters
+    if not regex_mode:
+        delimiters = [re.escape(delimiter) for delimiter in delimiters]
+    parts = _split_str_by_regex(text, delimiters) if delimiters else ['', text]
+    res = []
+    if regex_mode:
+        parts = [part for part in parts if part]
+        for part in parts:
+            for delimiter, delimiter_origin in zip(delimiters, delimiters_origin):
+                if re.match(delimiter, part, re.DOTALL):
+                    break
+            else:
+                delimiter_origin = ''
+            res.append({'key': delimiter_origin, 'content': part})
+    else:
+        for key, content in zip(parts[::2], parts[1::2]):
+            res.append({'key': key, 'content': content})
+    return res
 
 
 def _convert_to_vlm_format(messages: List[Dict]) -> List[Dict]:
@@ -368,3 +409,15 @@ class TokenizeByPlaceHolder:
                 labels[i] = full_ids[i]
 
         return full_ids, labels, encoded
+
+
+@dataclass
+class Function:
+    name: str
+    arguments: Optional[Union[str, Any]]
+
+    def __post_init__(self):
+        if not isinstance(self.arguments, str):
+            self.arguments = json.dumps(self.arguments, ensure_ascii=False)
+        self.name = self.name.strip()
+        self.arguments = self.arguments.strip()

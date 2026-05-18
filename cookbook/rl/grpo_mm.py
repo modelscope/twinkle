@@ -187,7 +187,7 @@ def main():
         remote_group='sampler',
     )
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
+    sampler.reset_mm_cache()
     # Checkpoint manager
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -222,7 +222,7 @@ def main():
         # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
-
+        sampler.reset_encoder_cache()
         # Expand prompts: each prompt repeated NUM_GENERATIONS times consecutively
         # so that GRPOAdvantage groups rewards correctly per prompt
         expand_prompts = []

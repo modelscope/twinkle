@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import torch.distributed as dist
 import transformers
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
@@ -15,7 +16,6 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
-from .strategy import AccelerateStrategy
 from .transformers import OptimizerGroup, TransformersModel
 
 
@@ -29,17 +29,28 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
             mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+            strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+            ddp_config: Dict[str, Any] = None,
+            fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
+            memory_efficient_init: bool = False,
             max_loras: int = 5,
             max_r: int = 32,
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
             **kwargs):
-        assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
-        model_id = HubOperation.download_model(model_id)
+        self.device_mesh = device_mesh
+        self.mixed_precision = mixed_precision
+        self._fsdp_config = dict(fsdp_config or {})
+        self._ddp_config = ddp_config or {}
+        self._memory_efficient_init = memory_efficient_init
+        self._decide_strategy(strategy)
+        self.grad_scaler_config = grad_scaler_config
+        if model_id is not None:
+            model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
         if config is None:
             from transformers import AutoConfig
@@ -52,24 +63,20 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
-        self.model_id = model_id
+        if model_id is None:
+            self.model = model_cls.from_config(self.hf_config, **kwargs)
+        else:
+            with self.strategy.pretrained_load_context():
+                self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-        self.device_mesh = device_mesh
-        self.mixed_precision = mixed_precision
-        self.grad_scaler_config = grad_scaler_config
+        self._default_tokenizer = None
         self._model_wrapped = False
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
-        self._expert_parallel_config = None
-        self._enable_expert_parallel = False
-        self._expert_parallel_applied = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
-        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
-        self.model = self.strategy.wrap_model(self.model)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -100,7 +107,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         pass
 
     def _lazy_wrap_model(self):
-        pass
+        return super()._lazy_wrap_model()
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
@@ -232,7 +239,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
-            return super().save(name, output_dir, interval, **kwargs)
+            checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
+        if dist.is_initialized():
+            dist.barrier()
+        return checkpoint_dir
 
     @remote_function()
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
@@ -256,6 +266,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
             if load_optimizer:
                 self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        if dist.is_initialized():
+            dist.barrier()
 
     @remote_function()
     def set_grad_scaler(self, **kwargs):

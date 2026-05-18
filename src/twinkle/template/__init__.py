@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .base import Template
+from .base import BaseAgentTemplate, Template
 from .qwen import QwenTemplate
 from .qwen3_5_vl import Qwen3_5Template
+from .deepseek_v4 import DeepseekV4Template
