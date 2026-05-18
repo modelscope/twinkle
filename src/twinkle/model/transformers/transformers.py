@@ -42,19 +42,10 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
-
-
-def _clone_state_dict_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    cloned = {}
-    for key, value in state_dict.items():
-        if hasattr(value, 'detach'):
-            cloned[key] = value.detach().cpu().clone()
-        else:
-            cloned[key] = value
-    return cloned
 
 
 @dataclass
@@ -300,7 +291,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
             if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
                 is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
-                set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
+                set_pre_ep_state(clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
