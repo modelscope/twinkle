@@ -4,12 +4,10 @@ Converted from the Tinker client version to Ray-based training.
 Uses short reasoning format: shorter thinking gets higher format reward.
 Answer extracted from \\boxed{} or #### format.
 """
-import math
 import os
 import re
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
-import swanlab
 from peft import LoraConfig
 
 import twinkle
@@ -25,7 +23,6 @@ from twinkle.processor import InputProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
-from twinkle.template import Qwen3_5Template
 from twinkle.preprocessor.llm import GSM8KProcessor
 
 logger = get_logger()
@@ -50,17 +47,8 @@ ADAPTER_NAME = 'default'
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', 1000))
 LORA_RANK = int(os.environ.get('LORA_RANK', 16))
 
-GSM8K_MAX_LENGTH = int(os.environ.get('GSM8K_MAX_LENGTH', 4096))
-
-KL_BETA = float(os.environ.get('KL_BETA', 0.0))
-ENTROPY_COEF = float(os.environ.get('ENTROPY_COEF', 0.0))
-CISPO_EPS_LOW = float(os.environ.get('CISPO_EPS_LOW', 0.2))
-CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
-HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
-
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
-
 
 # ========== Reward Functions ==========
 class GSM8KBrevityReward(Reward):
@@ -100,8 +88,7 @@ class GSM8KBrevityReward(Reward):
 def create_gsm8k_dataset():
     dataset = Dataset()
     dataset.add_dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=GSM8K_MAX_LENGTH,
-                         truncation_strategy='delete', enable_thinking=False)
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=4096, truncation_strategy='delete', enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -119,52 +106,8 @@ def compute_rewards(
     return total_rewards, brevity_rewards, accuracy_rewards
 
 
-# ========== Diagnostics ==========
-_LEADING_NUMBER_RE = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
-
-
-def _coerce_for_swanlab(log_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Cast string-valued metrics to float for swanlab line charts."""
-    coerced: Dict[str, Any] = {}
-    for k, v in log_dict.items():
-        if isinstance(v, bool) or isinstance(v, (int, float)):
-            coerced[k] = v
-            continue
-        if isinstance(v, str):
-            m = _LEADING_NUMBER_RE.search(v)
-            if m:
-                try:
-                    coerced[k] = float(m.group())
-                    continue
-                except ValueError:
-                    pass
-        coerced[k] = v
-    return coerced
-
-
-def _logp_split_diagnostics(
-    accuracy_rewards: List[float],
-    old_logps: List[List[float]],
-) -> Dict[str, float]:
-    """Split mean old-logp by accuracy outcome (pos vs zero)."""
-    out: Dict[str, float] = {}
-    if not accuracy_rewards or not old_logps:
-        return out
-    per_traj_mean = [(sum(lp) / len(lp)) if lp else 0.0 for lp in old_logps]
-    pos_logp = [m for m, a in zip(per_traj_mean, accuracy_rewards) if a > 0]
-    zero_logp = [m for m, a in zip(per_traj_mean, accuracy_rewards) if a <= 0]
-    out['acc_correct_rate'] = len(pos_logp) / len(accuracy_rewards)
-    out['mean_old_logp_acc_pos'] = (sum(pos_logp) / len(pos_logp)) if pos_logp else 0.0
-    out['mean_old_logp_acc_zero'] = (sum(zero_logp) / len(zero_logp)) if zero_logp else 0.0
-    out['policy_confidence_acc_pos'] = math.exp(out['mean_old_logp_acc_pos'])
-    out['policy_confidence_acc_zero'] = math.exp(out['mean_old_logp_acc_zero'])
-    return out
-
-
 # ========== Main ==========
 def main():
-    swanlab.init(project='twinkle')
-
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
@@ -174,6 +117,7 @@ def main():
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
+    # Since we are training on text-only data, we avoid using 'all-linear' which would include the ViT layers.
     lora_config = LoraConfig(
         target_modules='all-linear',
         r=LORA_RANK,
@@ -205,21 +149,16 @@ def main():
         model.set_optimizer('AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
 
-    model.set_loss('GRPOLoss', epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
-                   beta=KL_BETA, entropy_coef=ENTROPY_COEF)
+    model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor, padding_free=True)
     model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-
-    model.add_metric('GRPOMetric', is_training=True,
-                     epsilon=CISPO_EPS_LOW, epsilon_high=CISPO_EPS_HIGH,
-                     top_k_kl=HIGH_KL_TOPK)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
-            'max_lora_rank': 32,
+            'max_lora_rank': 32, # save as lora_config
             'enable_lora': True,
             'enable_tower_connector_lora': True,
         },
@@ -227,7 +166,6 @@ def main():
         remote_group='sampler',
     )
     sampler.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False)
-    rollout_template = Qwen3_5Template(MODEL_ID, max_length=GSM8K_MAX_LENGTH, enable_thinking=False)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
@@ -242,10 +180,7 @@ def main():
 
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
-        temperature=1.0, top_p=0.95,
-        include_stop_str_in_output=True)
+    sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95)
 
     optim_step = 0
     logger.info('Starting GSM8K GRPO training (short reasoning)')
@@ -255,17 +190,21 @@ def main():
         if optim_step >= MAX_STEPS:
             break
 
-        batch_step = optim_step
-
         metrics.reset()
         expand_prompts = []
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
 
+        # enable_lora=True used with ckpt_manager.sync_weights(merge_and_sync=False)
+        # meaning only sync lora weights, if merge_and_sync=True,
+        # lora will be merged into the base model and sync all weights to vLLM
         ckpt_manager.sync_weights(merge_and_sync=False)
         sampler.reset_prefix_cache()
 
-        sample_responses = sampler.sample(expand_prompts, sampling_params)
+        sample_responses = sampler.sample(
+            expand_prompts,
+            sampling_params,
+        )
 
         all_input_data: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
@@ -279,15 +218,6 @@ def main():
 
         total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(all_input_data)
 
-        rollout_advantages = advantage_fn(
-            total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
-
-        all_acc_labels: List[bool] = [a > 0 for a in accuracy_rewards]
-        n_pos = sum(1 for p in all_acc_labels if p)
-        n_neg = sum(1 for p in all_acc_labels if not p)
-        pos_with_neg_adv = sum(1 for p, a in zip(all_acc_labels, rollout_advantages) if p and a < 0)
-        neg_with_pos_adv = sum(1 for p, a in zip(all_acc_labels, rollout_advantages) if not p and a > 0)
-
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
@@ -297,32 +227,19 @@ def main():
             },
         )
 
-        total_completions = len(all_input_data)
-        aligned_completions = (total_completions // MODEL_GPUS) * MODEL_GPUS
-        if aligned_completions < total_completions:
-            logger.info(
-                '[dp-align] dropping %d tail sample(s): total=%d -> aligned=%d (dp=%d)',
-                total_completions - aligned_completions,
-                total_completions, aligned_completions, MODEL_GPUS)
+        advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
 
-        for mb_start in range(0, aligned_completions, MINI_BATCH_SIZE):
-            mb_end = min(mb_start + MINI_BATCH_SIZE, aligned_completions)
+        total_completions = len(all_input_data)
+        for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
+            mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
             mb_inputs = all_input_data[mb_start:mb_end]
             mb_old_logps = all_old_logps[mb_start:mb_end]
-            mb_advantages = rollout_advantages[mb_start:mb_end]
-            mb_pos_mask = all_acc_labels[mb_start:mb_end]
-
-            ref_logps = None
-            if KL_BETA > 0.0:
-                ref_outputs = model.forward_only(inputs=mb_inputs, disable_lora=True)
-                ref_logps = ref_outputs.get('logps') if isinstance(ref_outputs, dict) else getattr(ref_outputs, 'logps', None)
+            mb_advantages = advantages[mb_start:mb_end]
 
             model.forward_backward(
                 inputs=mb_inputs,
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
-                ref_logps=ref_logps,
-                positive_mask=mb_pos_mask,
                 micro_batch_size=MICRO_BATCH_SIZE,
             )
             model.clip_grad_and_step()
@@ -335,29 +252,8 @@ def main():
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
-        log_dict.update(_logp_split_diagnostics(accuracy_rewards, all_old_logps))
-        log_dict['pos_neg_adv_rate'] = pos_with_neg_adv / n_pos if n_pos else 0.0
-        log_dict['neg_pos_adv_rate'] = neg_with_pos_adv / n_neg if n_neg else 0.0
-        log_dict['adv_max'] = max(rollout_advantages) if rollout_advantages else 0.0
-        log_dict['adv_min'] = min(rollout_advantages) if rollout_advantages else 0.0
-
-        _hk = log_dict.pop('_high_kl_records', None)
-        if _hk:
-            _tok = rollout_template.tokenizer
-            for r in _hk:
-                gsi = r.get('gsi')
-                try:
-                    tok_text = _tok.decode([r['token_id']])
-                except Exception:
-                    tok_text = None
-                logger.info(
-                    '[high-kl] step=%d gsi=%s pos=%s tok=%r kl=%.4f r=%.4f lp_new=%.4f lp_old=%.4f',
-                    batch_step, gsi, r.get('pos'), tok_text,
-                    r.get('kl'), r.get('ratio'), r.get('logp_new'), r.get('logp_old'))
-
-        swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
         metrics.reset()
-        logger.info(f'[Step {batch_step}/{MAX_STEPS}] {log_dict}')
+        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     model.save('math-grpo-final')
