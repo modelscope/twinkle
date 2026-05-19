@@ -4,7 +4,6 @@ import os
 import re
 import socket
 import subprocess
-import torch
 from typing import Optional
 
 from .base import Platform
@@ -97,12 +96,6 @@ def ensure_npu_backend() -> None:
     except Exception as exc:
         raise RuntimeError('NPU backend is not available. Please install torch_npu/Ascend PyTorch.') from exc
 
-def is_npu_available() -> bool:
-    """Check if NPU (Ascend) is available in the current environment."""
-    try:
-        return hasattr(torch, 'npu') and torch.npu.is_available()
-    except Exception:
-        return False
 
 class NPU(Platform):
 
