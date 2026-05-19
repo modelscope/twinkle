@@ -9,7 +9,7 @@ from .function import apply_function_kernel, register_function_kernel
 from .layer import apply_layer_kernel, register_layer_batch, register_layer_kernel
 from .monkey_patch_npu import apply_npu_patch, register_npu_fused_function_kernels
 from .registry import register_external_layer as _register_external_layer
-from twinkle.utils.torch_util import is_npu_available
+from twinkle.utils.platforms.npu import is_npu_available
 
 logger = getLogger(__name__)
 
