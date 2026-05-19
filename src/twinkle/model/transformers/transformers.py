@@ -42,6 +42,8 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.torch_utils import clone_state_dict_to_cpu
+from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
@@ -191,6 +193,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
+        elif self._should_init_empty_pretrained_model_on_this_rank():
+            self.model = self._init_empty_model_from_config(model_cls, **kwargs)
         else:
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
@@ -203,6 +207,23 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
+        use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+        return bool(use_rank0_broadcast() and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+
+    def _init_empty_model_from_config(self, model_cls, **kwargs):
+        from accelerate import init_empty_weights
+
+        config_kwargs = filter_from_config_kwargs(kwargs)
+        with init_empty_weights(include_buffers=False):
+            if hasattr(model_cls, 'from_config'):
+                model = model_cls.from_config(self.hf_config, **config_kwargs)
+            else:
+                model = model_cls._from_config(self.hf_config, **config_kwargs)
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        return model
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
@@ -266,6 +287,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
+            use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
+            set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
+            if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
+                is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
+                set_pre_ep_state(clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
@@ -1034,17 +1060,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _ensure_lora_dtype(self, model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
+        is_npu_device = Platform.device_prefix() == 'npu'
         for param in model.parameters():
-            if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
+            if base_dtype is not None and is_npu_device:
                 break
         if base_dtype is None:
             return
 
-        # Convert all LoRA parameters to the base model dtype
+        # Temporary workaround: NPU requires all parameters to align with the base dtype.
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if 'lora_' in name.lower() and param.dtype != base_dtype:
+                if (is_npu_device or 'lora_' in name.lower()) and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
 
     def _load_scaler_state(self, scaler_path, **kwargs):
