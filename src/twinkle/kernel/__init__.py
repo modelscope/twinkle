@@ -30,7 +30,7 @@ def kernelize_model(
     device: Optional[DeviceType] = None,
     use_fallback: bool = True,
 ) -> Any:
-    """Apply kernels to model.
+    """Apply kernels to model (main entry point).
 
     For NPU devices, this also applies Ascend fused operators (RMSNorm, RoPE,
     SwiGLU, SDPA Attention) unconditionally when running on NPU.
