@@ -31,7 +31,7 @@ class GmmFunction(torch.autograd.Function):
     r"""Custom autograd function for NPU grouped matrix multiplication."""
 
     @staticmethod
-    def forward(ctx, x, group_list, weight_ekn):
+    def forward(ctx, x: torch.Tensor, group_list: torch.Tensor, weight_ekn: torch.Tensor):
         group_list = group_list.to(torch.int64)
         ctx.save_for_backward(x, group_list, weight_ekn)
         outputs = torch_npu.npu_grouped_matmul(
@@ -54,7 +54,7 @@ class GmmFunction(torch.autograd.Function):
         return grad_input, None, grad_weight.contiguous()
 
 
-def _grouped_mm_npu(input, weight_ekn, offs):
+def _grouped_mm_npu(input: torch.Tensor, weight_ekn: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     counts = torch.empty_like(offs)
     counts[0] = offs[0]
     if offs.numel() > 1:
