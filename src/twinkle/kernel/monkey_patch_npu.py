@@ -101,7 +101,7 @@ class NpuRMSNorm(nn.Module):
         return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
 
     def extra_repr(self) -> str:
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+        return f'{tuple(self.weight.shape)}, eps={self.variance_epsilon}'
 
 
 def npu_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -178,17 +178,17 @@ def _patch_sdpa_forward() -> None:
 
 def _patch_rmsnorm(module, class_name: str) -> None:
     setattr(module, class_name, NpuRMSNorm)
-    logger.debug(f"[NPU] Patched {module.__name__}.{class_name} -> NpuRMSNorm")
+    logger.debug(f'[NPU] Patched {module.__name__}.{class_name} -> NpuRMSNorm')
 
 
 def _patch_rope(module, func_name: str) -> None:
     setattr(module, func_name, npu_apply_rotary_pos_emb)
-    logger.debug(f"[NPU] Patched {module.__name__}.{func_name} -> npu_apply_rotary_pos_emb")
+    logger.debug(f'[NPU] Patched {module.__name__}.{func_name} -> npu_apply_rotary_pos_emb')
 
 
 def _patch_swiglu(module, class_name: str) -> None:
     setattr(getattr(module, class_name), 'forward', npu_swiglu_forward)
-    logger.debug(f"[NPU] Patched {module.__name__}.{class_name}.forward -> npu_swiglu_forward")
+    logger.debug(f'[NPU] Patched {module.__name__}.{class_name}.forward -> npu_swiglu_forward')
 
 
 # =============================================================================
@@ -219,7 +219,7 @@ def _apply_all_fused_ops() -> None:
             module = importlib.import_module(module_name)
 
             # RMSNorm
-            rmsnorm_cls = f"{prefix}RMSNorm"
+            rmsnorm_cls = f'{prefix}RMSNorm'
             if hasattr(module, rmsnorm_cls):
                 _patch_rmsnorm(module, rmsnorm_cls)
                 patched_count += 1
@@ -242,11 +242,11 @@ def _apply_all_fused_ops() -> None:
                 setattr(module, 'apply_multimodal_rotary_pos_emb', npu_apply_multimodal_rotary_pos_emb)
                 logger.debug('[NPU] Patched Qwen2_5_VL multimodal RoPE')
 
-            logger.debug(f"[NPU] Patched {prefix} fused ops")
+            logger.debug(f'[NPU] Patched {prefix} fused ops')
         except ImportError:
             pass  # Model family not installed, skip silently
 
-    logger.info(f"[NPU] Auto-patched {patched_count} components")
+    logger.info(f'[NPU] Auto-patched {patched_count} components')
 
 
 # =============================================================================
