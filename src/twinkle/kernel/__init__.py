@@ -9,7 +9,7 @@ from .function import apply_function_kernel, register_function_kernel
 from .layer import apply_layer_kernel, register_layer_batch, register_layer_kernel
 from .monkey_patch_npu import apply_npu_patch, register_npu_fused_function_kernels
 from .registry import register_external_layer as _register_external_layer
-from twinkle.utils.platforms.npu import is_npu_available
+from twinkle.utils.framework import Torch
 
 logger = getLogger(__name__)
 
@@ -30,7 +30,7 @@ def kernelize_model(
     device: Optional[DeviceType] = None,
     use_fallback: bool = True,
 ) -> Any:
-    """Apply kernels to model (main entry point).
+    """Apply kernels to model.
 
     For NPU devices, this also applies Ascend fused operators (RMSNorm, RoPE,
     SwiGLU, SDPA Attention) unconditionally when running on NPU.
@@ -62,12 +62,6 @@ def kernelize_model(
 
 def apply_npu_fused_ops(config) -> None:
     """Apply NPU fused operators patch manually.
-
-    Deprecated: ``config`` is no longer used. All patches are applied
-    unconditionally via ``apply_npu_patch()``.
-
-    Args:
-        config: Model config with ``architectures`` attribute (ignored).
     """
     logger.warning(
         'apply_npu_fused_ops(config) is deprecated. '
@@ -115,5 +109,5 @@ def _is_npu_device(model=None) -> bool:
         except StopIteration:
             pass
 
-    # Priority 2: Fallback to global NPU availability (reusable util)
-    return is_npu_available()
+    # Priority 2: Fallback to global NPU availability
+    return Torch.is_npu_available()
