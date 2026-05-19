@@ -9,6 +9,7 @@ from .function import apply_function_kernel, register_function_kernel
 from .layer import apply_layer_kernel, register_layer_batch, register_layer_kernel
 from .monkey_patch_npu import apply_npu_patch, register_npu_fused_function_kernels
 from .registry import register_external_layer as _register_external_layer
+from twinkle.utils.torch_util import is_npu_available
 
 logger = getLogger(__name__)
 
@@ -104,25 +105,15 @@ def register_kernels(config: Dict[str, Dict[str, Any]]) -> None:
 
 
 def _is_npu_device(model=None) -> bool:
-    """Check if the model (or current environment) is on NPU device.
-
-    Priority:
-        1. Check model parameter device (most accurate)
-        2. Fallback to torch.npu.is_available() (environment check)
-    """
-    # Priority 1: Check model's actual device
+    """Check if the model (or current environment) is on NPU device."""
+    # Priority 1: Check model's actual device (kernel-specific inference)
     if model is not None:
         try:
             param_device = next(model.parameters()).device
             if param_device.type == 'npu':
                 return True
         except StopIteration:
-            pass  # Model has no parameters
+            pass
 
-    # Priority 2: Fallback to global NPU availability
-    try:
-        if hasattr(torch, 'npu') and torch.npu.is_available():
-            return True
-    except Exception:
-        logger.debug("Failed to check NPU availability", exc_info=True)
-    return False
+    # Priority 2: Fallback to global NPU availability (reusable util)
+    return is_npu_available()
