@@ -52,7 +52,12 @@ def _hash_token(token: str) -> str:
 def _resolve_client_save_dir(save_dir: str) -> Path:
     if not save_dir:
         raise ValueError(f'Invalid save_dir: {save_dir}')
-    return Path(save_dir).expanduser().resolve()
+    path = Path(save_dir).expanduser().resolve()
+    if not path.exists():
+        raise ValueError(f'save_dir does not exist on the server: {path.as_posix()}')
+    if not path.is_dir():
+        raise ValueError(f'save_dir is not a directory on the server: {path.as_posix()}')
+    return path
 
 
 # ----- Internal Pydantic Base Specs -----
