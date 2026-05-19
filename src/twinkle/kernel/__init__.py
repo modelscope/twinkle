@@ -4,12 +4,12 @@ import torch
 from logging import getLogger
 from typing import Any, Dict, Optional, Union
 
+from twinkle.utils.framework import Torch
 from .base import DeviceType, ModeType, is_kernels_enabled
 from .function import apply_function_kernel, register_function_kernel
 from .layer import apply_layer_kernel, register_layer_batch, register_layer_kernel
 from .monkey_patch_npu import apply_npu_patch, register_npu_fused_function_kernels
 from .registry import register_external_layer as _register_external_layer
-from twinkle.utils.framework import Torch
 
 logger = getLogger(__name__)
 
@@ -63,10 +63,8 @@ def kernelize_model(
 def apply_npu_fused_ops(config) -> None:
     """Apply NPU fused operators patch manually.
     """
-    logger.warning(
-        'apply_npu_fused_ops(config) is deprecated. '
-        'Use apply_npu_patch() instead, which enables all patches unconditionally.'
-    )
+    logger.warning('apply_npu_fused_ops(config) is deprecated. '
+                   'Use apply_npu_patch() instead, which enables all patches unconditionally.')
     apply_npu_patch()
 
 
