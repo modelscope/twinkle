@@ -104,7 +104,8 @@ class MultiTurnRollout(Rollout):
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
-        os.makedirs(self.trace_dir, exist_ok=True)
+        if self.trace_dir:
+            os.makedirs(self.trace_dir, exist_ok=True)
 
         if self.sampling_params.num_samples != 1:
             raise ValueError(f'MultiTurnRollout currently supports num_samples=1 only, '

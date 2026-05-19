@@ -383,8 +383,7 @@ class CISPOLoss(GRPOLoss):
         """Clamped ratio * advantage * log_prob."""
         import torch
 
-        # Two-sided IS clamp with asymmetric epsilon, matching MiniMax CISPO spec.
-        clamped_ratios = torch.clamp(ratio, min=1 - self.epsilon, max=1 + self.epsilon_high).detach()
+        clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
         return -clamped_ratios * advantages * per_token_logps
 
     def _aggregate_loss(

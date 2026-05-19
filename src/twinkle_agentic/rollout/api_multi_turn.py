@@ -82,7 +82,8 @@ class APIMultiTurnRollout(Rollout):
         self.trace_dir = trace_dir
         self.trace_callback = trace_callback
         self.success_callback = success_callback
-        os.makedirs(self.trace_dir, exist_ok=True)
+        if self.trace_dir:
+            os.makedirs(self.trace_dir, exist_ok=True)
 
     def __call__(
         self,
