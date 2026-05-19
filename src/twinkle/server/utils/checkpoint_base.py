@@ -49,14 +49,10 @@ def _hash_token(token: str) -> str:
     return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
 
 
-def _normalise_root(path: str) -> Path:
-    return Path(path).expanduser().resolve()
-
-
 def _resolve_client_save_dir(save_dir: str) -> Path:
-    if not save_dir or '\x00' in save_dir:
+    if not save_dir:
         raise ValueError(f'Invalid save_dir: {save_dir}')
-    return _normalise_root(save_dir)
+    return Path(save_dir).expanduser().resolve()
 
 
 # ----- Internal Pydantic Base Specs -----
@@ -350,7 +346,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
 
         pointer = self._read_save_dir_pointer(model_id)
         if pointer and pointer.get('save_dir'):
-            return self.get_model_dir(model_id, save_dir=pointer.get('save_dir'))
+            return self._token_base_dir(pointer.get('save_dir')) / model_id
         return self.get_base_dir() / model_id
 
     def _read_info(self, model_id: str) -> Dict[str, Any]:
