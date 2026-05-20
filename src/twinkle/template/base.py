@@ -37,7 +37,8 @@ class Template:
                  enable_thinking: bool = True,
                  **kwargs):
         model_id = HubOperation.download_model(model_id, ignore_model=True)
-        if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
+        if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')) or os.path.exists(
+                os.path.join(model_id, 'processor_config.json')):
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
         else:
@@ -52,15 +53,26 @@ class Template:
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
-        self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
-            self._add_default_system,  # Add a default system field
-            self._to_standard_reasoning_content,  # Convert thinking to standard field
-            self._build_standard_messages,  # turn to standard mm messages
+        # self.pre_pipeline: List[Callable[[Trajectory], List[Trajectory]]] = [
+        #     self._add_default_system,  # Add a default system field
+        #     self._to_standard_reasoning_content,  # Convert thinking to standard field
+        #     self._build_standard_messages,  # turn to standard mm messages
+        # ]
+        # self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
+        #     self._check_max_length,  # Check and split input_features
+        #     self._add_attention_fields,  # Add useful fields
+        #     self._roll_labels,  # roll labels
+        # ]
+        self.pre_pipeline_names: List[str] = [
+            "_add_default_system",
+            "_to_standard_reasoning_content",
+            "_build_standard_messages",
         ]
-        self.post_pipeline: List[Callable[[InputFeature], List[InputFeature]]] = [
-            self._check_max_length,  # Check and split input_features
-            self._add_attention_fields,  # Add useful fields
-            self._roll_labels,  # roll labels
+        
+        self.post_pipeline_names: List[str] = [
+            "_check_max_length",
+            "_add_attention_fields",
+            "_roll_labels",
         ]
 
     @property
@@ -140,7 +152,8 @@ class Template:
 
     def _invoke_pre_pipeline(self, trajectories: List[Trajectory]) -> List[Trajectory]:
         current = trajectories
-        for pipeline in self.pre_pipeline:
+        for pipeline_name in self.pre_pipeline_names:
+            pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
             next_batch = []
             for trajectory in current:
                 next_batch.extend(pipeline(trajectory))
@@ -149,7 +162,8 @@ class Template:
 
     def _invoke_post_pipeline(self, input_features: List[InputFeature]) -> List[InputFeature]:
         current = input_features
-        for pipeline in self.post_pipeline:
+        for pipeline_name in self.post_pipeline_names:
+            pipeline: Callable[[InputFeature], List[InputFeature]] = getattr(self, pipeline_name)
             next_batch = []
             for input_feature in current:
                 next_batch.extend(pipeline(input_feature))
