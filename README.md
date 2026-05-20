@@ -108,6 +108,7 @@ sh INSTALL_MEGATRON.sh
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog
+- 🎉2026-05-20 Support DeepSeek-V4-Flash and DeepSeek-V4-Pro models.
 - 🎉2026-05-20 Support multi-round rollout and RL tool calling.
 - 🎉2026-05-20 Support notifier which will send an error message when training failed.
 - 🎉2026-04-27 Support the `padding_free` operation for sft/dpo/grpo/gkd, use `set_processor('InputProcessor', padding_free=True)` to train with it.
@@ -166,6 +167,8 @@ supported on Twinkle✨ framework.
 |                     | [deepseek-ai/DeepSeek-Prover-V2-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-Prover-V2-7B)             |                    -                    | transformers>=4.39.3 |        ✔         |       [deepseek-ai/DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B)       |
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                 |                    -                    | transformers>=4.39.3 |        ✔         |                 [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                 |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |             1.5B/7B/14B/32B             | transformers>=4.37   |        ✔         | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |
+| DeepSeek V4全系列         | [deepseek-ai/DeepSeek-V4-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) | 284B| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+|         | [deepseek-ai/DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro) | 1.6T| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 
 ## Sample Code
 
@@ -398,9 +401,13 @@ foundation for building customizable, enterprise-grade training services.
 
 ## Contributions
 
-Twinkle✨ is a collaborative initiative put together by ModelScope in partnership
-with the open-source community, with key contributions from strategic stakeholders
-including China Merchants Bank Tech Team.
+**Twinkle✨** is designed, developed, and maintained by an **Open Workshop** composed of members from various open-source technology teams.
+We welcome more developers passionate about large model training to join us in building and improving this framework.
+
+The core members of the workshop currently come from:
+- [ModelScope](https://modelscope.cn/home) Open Source Community Project Team
+- [China Merchants Bank](https://www.cmbchina.com/) Open Source Technology Team
+- Technical staff from various compute hardware teams
 
 We are grateful to the open-source community, particularly the projects that inspired us,
 including [Transformers](https://github.com/huggingface/transformers),

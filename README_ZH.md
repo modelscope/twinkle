@@ -4,6 +4,7 @@
     <img src="assets/slogan.png" width="200"/>
 </p>
 <p align="center">
+by <a href="https://modelscope.cn/home">ModelScope</a> & <a href="https://www.cmbchina.com/">China Merchants Bank</a>
 <br>
         <a href="README.md">English</a>&nbsp ｜ &nbsp中文&nbsp
 </p>
@@ -102,6 +103,7 @@ sh INSTALL_MEGATRON.sh
 Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](docs/source_zh/使用指引/快速开始.md)
 
 ## 更新日志
+- 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
 - 🎉2026-05-20 支持多轮rollout和RL中的工具调用。
 - 🎉2026-05-20 支持训练任务失败后的IM消息告警。
 - 🎉2026-04-27 支持sft/dpo/grpo/gkd的padding_free方法, 使用`set_processor('InputProcessor', padding_free=True)`来开启训练。
@@ -154,6 +156,8 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 |                     | [deepseek-ai/DeepSeek-Prover-V2-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-Prover-V2-7B)             |                    -                    | transformers>=4.39.3 |        ✔         |       [deepseek-ai/DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B)       |
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                 |                    -                    | transformers>=4.39.3 |        ✔         |                 [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                 |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |             1.5B/7B/14B/32B             | transformers>=4.37   |        ✔         | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |
+| DeepSeek V4全系列         | [deepseek-ai/DeepSeek-V4-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) | 284B| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+|         | [deepseek-ai/DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro) | 1.6T| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 
 ## 示例代码
 
@@ -379,8 +383,13 @@ for epoch in range(3):
 
 ## 开源贡献
 
-Twinkle✨ 是由 ModelScope（魔搭）与开源社区共同发起的协作项目。该项目得到了包括**招商银行技术团队**在内的技术伙伴的关键贡献。
+**Twinkle✨** 框架的设计、开发与维护来自于不同开源技术团队成员组成的**开源协作小组（Open Workshop）**。我们欢迎更多热爱大模型训练的技术人员共同参与此框架的开发与优化。
 
-我们衷心感谢开源社区，特别是为我们提供灵感的项目，包括 [Transformers](https://github.com/huggingface/transformers)、[MS-SWIFT](https://github.com/modelscope/swift)、[veRL](https://github.com/verl-project/verl) 及 [Tinker](https://github.com/thinking-machines-lab/tinker) 等。
+目前技术小组的主要人员来自：
+- [ModelScope](https://modelscope.cn/home) 开源社区项目组
+- [招商银行](https://www.cmbchina.com/) 开源技术团队
+- 各算力硬件团队技术人员
+
+此外，衷心感谢开源社区，特别是为我们提供灵感的项目，包括 [Transformers](https://github.com/huggingface/transformers)、[MS-SWIFT](https://github.com/modelscope/swift)、[veRL](https://github.com/verl-project/verl) 及 [Tinker](https://github.com/thinking-machines-lab/tinker) 等。
 
 我们欢迎通过 [Issues](https://github.com/modelscope/twinkle/issues) 和 [Pull Requests](https://github.com/modelscope/twinkle/pulls) 参与开源贡献。
