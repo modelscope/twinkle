@@ -1,18 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Extractive, spaCy-driven passage condenser.
-
-For each eligible chunk, produces a compact summary with three slots::
-
-    Open: <first sentence of the chunk>
-    Rel:  (subject | verb | object); (subject | verb | object | prep obj)
-    More: kw1, kw2, kw3
-
-Strictly bounded by ``ceil(len(input) / compression_ratio)`` characters
-for every chunk that passes ``min_chars``. Chunks shorter than
-``min_chars`` are passed through unchanged (pre-filter).
-"""
-from __future__ import annotations
-
 import math
 import re
 import threading
@@ -370,6 +356,7 @@ def _fit_under_budget(
 # ---------------------------------------------------------------------------
 class KeywordCondenser(Condenser):
     """Extractive, spaCy-driven passage condenser.
+    TODO: Experimental feature, wait for testing
 
     Args:
         num_relations: Max number of

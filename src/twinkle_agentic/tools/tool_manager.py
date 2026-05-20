@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 from typing import Any, Dict, Iterable, List, Optional, Union
 

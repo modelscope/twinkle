@@ -3,44 +3,8 @@ import math
 from typing import Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, ModelOutput
+from twinkle.utils.transformers_utils import align_logps_to_mask
 from .base import Metric
-
-
-def _align_logps_to_mask(
-        ragged: Any,
-        mask: 'torch.Tensor',  # noqa: F821
-        dtype: 'torch.dtype',  # noqa: F821
-) -> Optional['torch.Tensor']:  # noqa: F821
-    import torch
-
-    device = mask.device
-    batch_size, seq_len = mask.shape
-
-    if isinstance(ragged, torch.Tensor):
-        t = ragged.to(device=device, dtype=dtype)
-        if t.shape == (batch_size, seq_len):
-            return t
-        # Fall through to the list path (row-wise scatter).
-        ragged = [t[i] for i in range(min(batch_size, t.shape[0]))]
-
-    if not isinstance(ragged, (list, tuple)):
-        return None
-
-    result = torch.zeros((batch_size, seq_len), dtype=dtype, device=device)
-    for i, sample in enumerate(ragged):
-        if i >= batch_size:
-            break
-        pos = mask[i].nonzero(as_tuple=True)[0]
-        if len(pos) == 0:
-            continue
-        if isinstance(sample, (int, float)):
-            result[i, pos] = float(sample)
-            continue
-        vals = torch.as_tensor(sample, dtype=dtype, device=device).flatten()
-        n = min(len(pos), int(vals.numel()))
-        if n > 0:
-            result[i, pos[:n]] = vals[:n]
-    return result
 
 
 class GRPOMetric(Metric):
@@ -62,7 +26,6 @@ class GRPOMetric(Metric):
         self.sum_approx_kl = None
         self.sum_diff = None
         self.sum_old = None
-        self.sum_new_sq = None
         self.sum_new = None
         self.ignore_index = ignore_index
         self.temperature = float(temperature)
@@ -73,21 +36,13 @@ class GRPOMetric(Metric):
 
     def reset(self):
         self.sum_new: float = 0.0
-        self.sum_new_sq: float = 0.0
         self.sum_old: float = 0.0
         self.sum_diff: float = 0.0
         self.sum_approx_kl: float = 0.0
         self.max_token_kl: float = 0.0
         self.max_token_ratio: float = 0.0
-        self.kl_values: list = []
         self.n_tokens: int = 0
         self.has_old: bool = False
-        self.sum_new_f1_pos: float = 0.0
-        self.sum_new_f1_zero: float = 0.0
-        self.sum_diff_f1_pos: float = 0.0
-        self.sum_diff_f1_zero: float = 0.0
-        self.n_tokens_f1_pos: int = 0
-        self.n_tokens_f1_zero: int = 0
         self.sum_entropy: float = 0.0
         self.n_entropy_tokens: int = 0
         self.sum_clip_low: float = 0.0
@@ -150,7 +105,6 @@ class GRPOMetric(Metric):
         labels: 'torch.Tensor',
         logps: 'torch.Tensor',
         old_slice: Any,
-        f1_slice: Optional[List[float]] = None,
         entropies: Optional['torch.Tensor'] = None,
         adv_slice: Any = None,
         gsi_base: int = 0,
@@ -194,13 +148,12 @@ class GRPOMetric(Metric):
         # both new and old logps receive the same multiplier.
         scale = self.temperature
         logps_f = logps.float()
-        if scale != 1.0:
+        if scale > 0.0 and scale != 1.0:
             logps_f = logps_f * scale
         mask_f = mask.float()
 
         self.n_tokens += n_tok
         self.sum_new += float((logps_f * mask_f).sum().item())
-        self.sum_new_sq += float(((logps_f**2) * mask_f).sum().item())
 
         # Entropy is loss-type-agnostic; aligned to logps shape by the model forward.
         if entropies is not None and torch.is_tensor(entropies) and entropies.numel() > 0:
@@ -218,43 +171,20 @@ class GRPOMetric(Metric):
             self.sum_entropy += float((ent_f * ent_mask).sum().item())
             self.n_entropy_tokens += int(ent_mask.sum().item())
 
-        if f1_slice is not None and len(f1_slice) >= logps_f.shape[0]:
-            for i in range(logps_f.shape[0]):
-                n_i = int(mask[i].sum().item())
-                if n_i == 0:
-                    continue
-                s_i = float((logps_f[i] * mask_f[i]).sum().item())
-                if f1_slice[i]:
-                    self.sum_new_f1_pos += s_i
-                    self.n_tokens_f1_pos += n_i
-                else:
-                    self.sum_new_f1_zero += s_i
-                    self.n_tokens_f1_zero += n_i
-
         if old_slice is None:
             return num_seq
 
-        aligned = _align_logps_to_mask(old_slice, mask, logps_f.dtype)
+        aligned = align_logps_to_mask(old_slice, mask, logps_f.dtype)
         if aligned is None:
             return num_seq
         old_f = aligned.float()
-        if scale != 1.0:
+        if scale > 0.0 and scale != 1.0:
             old_f = old_f * scale
 
         d = logps_f - old_f  # new - old
         self.sum_old += float((old_f * mask_f).sum().item())
         self.sum_diff += float((d * mask_f).sum().item())
 
-        if f1_slice is not None and len(f1_slice) >= d.shape[0]:
-            for i in range(d.shape[0]):
-                n_i = int(mask[i].sum().item())
-                if n_i == 0:
-                    continue
-                d_i = float((d[i] * mask_f[i]).sum().item())
-                if f1_slice[i]:
-                    self.sum_diff_f1_pos += d_i
-                else:
-                    self.sum_diff_f1_zero += d_i
         # Schulman K3 estimator of KL(old || new):
         #   samples x ~ old,  r(x) = new(x) / old(x),
         #   k3 = r - 1 - log(r) = exp(new - old) - (new - old) - 1.
@@ -271,15 +201,11 @@ class GRPOMetric(Metric):
             cur_max_ratio = float(ratio_masked.max().item())
             if cur_max_ratio > self.max_token_ratio:
                 self.max_token_ratio = cur_max_ratio
-            # Collect valid KL values for percentile computation
-            valid_kl = kl[mask.bool()]
-            if valid_kl.numel() > 0:
-                self.kl_values.append(valid_kl.detach().cpu())
         self.has_old = True
 
         # Clip stats: gated by subclass (token-level / seq-level / unconditional).
         if adv_slice is not None:
-            adv_aligned = _align_logps_to_mask(adv_slice, mask, logps_f.dtype)
+            adv_aligned = align_logps_to_mask(adv_slice, mask, logps_f.dtype)
             if adv_aligned is not None:
                 self._accumulate_clip(d, adv_aligned, mask, mask_f)
         if self.top_k_kl > 0:
@@ -308,7 +234,6 @@ class GRPOMetric(Metric):
         outputs: ModelOutput,
         *,
         old_logps: Any = None,
-        positive_mask: Any = None,
         advantages: Any = None,
         **kwargs,
     ):
@@ -333,9 +258,6 @@ class GRPOMetric(Metric):
         flat_old: Optional[List] = None
         if old_logps is not None and isinstance(old_logps, (list, tuple)):
             flat_old = list(old_logps)
-        flat_pos: Optional[List[bool]] = None
-        if positive_mask is not None and isinstance(positive_mask, (list, tuple)):
-            flat_pos = list(positive_mask)
         flat_adv: Optional[List] = None
         if advantages is not None and isinstance(advantages, (list, tuple)):
             flat_adv = list(advantages)
@@ -361,14 +283,14 @@ class GRPOMetric(Metric):
             elif old_logps is not None and hasattr(old_logps, 'shape'):
                 # Uncommon: aligned global tensor. Only honour when it
                 # exactly matches the single-mb shape; otherwise drop.
-                old_slice = old_logps if (torch.is_tensor(old_logps) and old_logps.shape == logps_mb.shape) else None
+                import torch as _torch  # noqa: F811
+                old_slice = old_logps if (_torch.is_tensor(old_logps) and old_logps.shape == logps_mb.shape) else None
             else:
                 old_slice = None
 
-            f1_mb = flat_pos[cursor:cursor + num_seq_est] if flat_pos is not None else None
             adv_mb = flat_adv[cursor:cursor + num_seq_est] if flat_adv is not None else None
             gsi_base = self._gsi_cursor
-            advanced = self._accumulate_mb(labels, logps_mb, old_slice, f1_mb, ent_mb, adv_mb, gsi_base=gsi_base)
+            advanced = self._accumulate_mb(labels, logps_mb, old_slice, ent_mb, adv_mb, gsi_base=gsi_base)
             self._gsi_cursor += advanced
             cursor += advanced
 
@@ -376,7 +298,6 @@ class GRPOMetric(Metric):
         import torch
         local = [{
             'sum_new': self.sum_new,
-            'sum_new_sq': self.sum_new_sq,
             'sum_old': self.sum_old,
             'sum_diff': self.sum_diff,
             'sum_kl': self.sum_approx_kl,
@@ -384,12 +305,6 @@ class GRPOMetric(Metric):
             'max_token_ratio': self.max_token_ratio,
             'n': self.n_tokens,
             'has_old': self.has_old,
-            'sum_new_f1_pos': self.sum_new_f1_pos,
-            'sum_new_f1_zero': self.sum_new_f1_zero,
-            'sum_diff_f1_pos': self.sum_diff_f1_pos,
-            'sum_diff_f1_zero': self.sum_diff_f1_zero,
-            'n_f1_pos': self.n_tokens_f1_pos,
-            'n_f1_zero': self.n_tokens_f1_zero,
             'sum_entropy': self.sum_entropy,
             'n_entropy_tokens': self.n_entropy_tokens,
             'sum_clip_low': self.sum_clip_low,
@@ -404,14 +319,11 @@ class GRPOMetric(Metric):
             return {}
 
         sum_new = sum(r['sum_new'] for r in all_results)
-        sum_new_sq = sum(r['sum_new_sq'] for r in all_results)
         mean_new = sum_new / n_total
-        var_new = max(0.0, sum_new_sq / n_total - mean_new * mean_new)
 
         results: Dict[str, Any] = {
             'train/policy_confidence': math.exp(mean_new),
             'train/mean_new_logp': mean_new,
-            'train/logp_std': math.sqrt(var_new),
         }
         if any(r['has_old'] for r in all_results):
             mean_old = sum(r['sum_old'] for r in all_results) / n_total
@@ -424,21 +336,6 @@ class GRPOMetric(Metric):
             results['train/approx_kl'] = mean_kl
             results['train/token_kl_max'] = global_max_kl
             results['train/token_ratio_max'] = global_max_ratio
-            # Compute KL percentiles from collected values (local rank only)
-            if self.kl_values:
-                all_kl = torch.cat(self.kl_values)
-                if all_kl.numel() >= 10:
-                    results['train/token_kl_p95'] = float(torch.quantile(all_kl.float(), 0.95).item())
-                    results['train/token_kl_p99'] = float(torch.quantile(all_kl.float(), 0.99).item())
-
-        n_f1_pos = sum(r.get('n_f1_pos', 0) for r in all_results)
-        n_f1_zero = sum(r.get('n_f1_zero', 0) for r in all_results)
-        if n_f1_pos > 0:
-            results['train/mean_new_logp_pos'] = sum(r.get('sum_new_f1_pos', 0) for r in all_results) / n_f1_pos
-            results['train/logp_diff_pos'] = sum(r.get('sum_diff_f1_pos', 0) for r in all_results) / n_f1_pos
-        if n_f1_zero > 0:
-            results['train/mean_new_logp_neg'] = sum(r.get('sum_new_f1_zero', 0) for r in all_results) / n_f1_zero
-            results['train/logp_diff_neg'] = sum(r.get('sum_diff_f1_zero', 0) for r in all_results) / n_f1_zero
 
         n_ent = sum(r.get('n_entropy_tokens', 0) for r in all_results)
         if n_ent > 0:

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.utils.checkpoint_base import _resolve_client_save_dir, validate_user_path
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object
@@ -482,8 +483,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
     ) -> types.AddAdapterResponse:
         assert body.adapter_name, 'You need to specify a valid `adapter_name`'
         token = await self._on_request_start(request)
+        if not validate_user_path(token, body.adapter_name):
+            raise HTTPException(status_code=400, detail=f'Invalid adapter_name: {body.adapter_name}')
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
         session_id = get_session_id_from_request(request)
+        try:
+            resolved_save_dir = _resolve_client_save_dir(body.save_dir).as_posix() if body.save_dir else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
         async def _task():
             config = deserialize_object(body.config)
@@ -496,7 +503,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             if isinstance(config, LoraConfig):
                 lora_config = types.LoraConfig(rank=config.r, train_unembed=False, train_mlp=True, train_attn=True)
             run_config = types.CreateModelRequest(
-                base_model=self.base_model, lora_config=lora_config, user_metadata={'adapter_name': body.adapter_name})
+                base_model=self.base_model,
+                lora_config=lora_config,
+                save_dir=resolved_save_dir,
+                user_metadata={'adapter_name': body.adapter_name})
             training_run_manager.save(adapter_name, run_config)
             return {'status': 'ok', 'adapter_name': adapter_name}
 

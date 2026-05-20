@@ -21,6 +21,16 @@ def to_device(data: Any, device: Union[str, 'torch.device', int], non_blocking: 
         return data
 
 
+def clone_state_dict_to_cpu(state_dict: Mapping[str, Any]) -> dict:
+    cloned = {}
+    for key, value in state_dict.items():
+        if hasattr(value, 'detach'):
+            cloned[key] = value.detach().cpu().clone()
+        else:
+            cloned[key] = value
+    return cloned
+
+
 def pad_sequence_to_length(
     tensor: 'torch.Tensor',
     max_seq_len: int,

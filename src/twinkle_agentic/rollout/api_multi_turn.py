@@ -1,19 +1,5 @@
-"""Message-level multi-turn rollout that drives an OpenAI-protocol API.
-
-Twin of :class:`MultiTurnRollout` for the offline / API-baseline path:
-trajectories are message lists, the loop is per-trajectory (thread-pool
-concurrent, OpenAI does not batch), and structured ``tool_calls`` flow
-through :class:`ToolManager` verbatim. No token-level state, no
-logprobs, no chat-template bridge — those are deliberately not part of
-the API contract because the OpenAI protocol cannot expose them
-faithfully.
-
-Suitable for: SFT data construction, validation passes, A/B baselines
-against frontier models. NOT suitable for training (no per-token
-logprobs => no GRPO).
-"""
-from __future__ import annotations
-
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -66,13 +52,13 @@ class APIMultiTurnRollout(Rollout):
         self,
         api: OpenAI,
         tool_manager: ToolManager,
-        sampling_params: SamplingParams | None = None,
+        sampling_params: Optional[SamplingParams] = None,
         max_turns: int = 6,
         concurrency: int = 8,
-        extra_body: dict[str, Any] | None = None,
-        trace_dir: str | None = None,
-        trace_callback: Callable[[dict[str, Any]], bool] | None = None,
-        success_callback: Callable[[dict[str, Any]], bool] | None = None,
+        extra_body: Optional[Dict[str, Any]] = None,
+        trace_dir: Optional[str] = None,
+        trace_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        success_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         super().__init__()
         if api is None:
@@ -97,17 +83,13 @@ class APIMultiTurnRollout(Rollout):
         self.trace_callback = trace_callback
         self.success_callback = success_callback
         if self.trace_dir:
-            import os
-            try:
-                os.makedirs(self.trace_dir, exist_ok=True)
-            except OSError:
-                self.trace_dir = None
+            os.makedirs(self.trace_dir, exist_ok=True)
 
     def __call__(
         self,
-        trajectories: list[Trajectory],
+        trajectories: List[Trajectory],
         **kwargs,
-    ) -> list[Trajectory]:
+    ) -> List[Trajectory]:
         if isinstance(trajectories, dict):
             raise TypeError('APIMultiTurnRollout.__call__ expects a List[Trajectory]; '
                             'wrap a single trajectory as [trajectory].')
@@ -125,7 +107,7 @@ class APIMultiTurnRollout(Rollout):
         # Per-trajectory thread pool. OpenAI ``/chat/completions`` is
         # one-conversation-per-call; concurrency only buys us network
         # parallelism, never batched compute.
-        outs: list[Trajectory | None] = [None] * n
+        outs: List[Optional[Trajectory]] = [None] * n
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = {
                 pool.submit(self._run_one, trajectories[i], tool_managers[i], sampling_params, extra_body): i
@@ -135,7 +117,7 @@ class APIMultiTurnRollout(Rollout):
                 i = futures[fut]
                 outs[i] = fut.result()
 
-        result_outs: list[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
+        result_outs: List[Trajectory] = [o if o is not None else dict(trajectories[i]) for i, o in enumerate(outs)]
         if self.trace_dir:
             self._write_traces(result_outs, kwargs.get('global_step'))
         return result_outs
@@ -147,7 +129,7 @@ class APIMultiTurnRollout(Rollout):
         trajectory: Trajectory,
         tool_manager: ToolManager,
         sampling_params: SamplingParams,
-        extra_body: dict[str, Any],
+        extra_body: Dict[str, Any],
     ) -> Trajectory:
         """Drive the API turn loop for a single trajectory.
 
@@ -155,7 +137,7 @@ class APIMultiTurnRollout(Rollout):
         with the exception text in ``error``. This keeps one bad row from
         poisoning a whole rollout batch.
         """
-        messages: list[dict[str, Any]] = list(trajectory.get('messages') or [])
+        messages: List[Dict[str, Any]] = list(trajectory.get('messages') or [])
         tools = trajectory.get('tools')
         if tools is None:
             tools = tool_manager.tool_infos() or None
@@ -163,7 +145,7 @@ class APIMultiTurnRollout(Rollout):
         turn = 0
         stop_reason = _STOP_MAX_TURNS
         truncated = False
-        error: str | None = None
+        error: Optional[str] = None
 
         while turn < self.max_turns:
             turn += 1
@@ -214,7 +196,7 @@ class APIMultiTurnRollout(Rollout):
         return out
 
     @staticmethod
-    def _normalise_assistant(reply: Any, turn: int) -> dict[str, Any]:
+    def _normalise_assistant(reply: Any, turn: int) -> Dict[str, Any]:
         """Ensure tool_calls have stable ``id``/``type`` fields and strip
         message-internal noise that would confuse the next API turn.
 
@@ -224,7 +206,7 @@ class APIMultiTurnRollout(Rollout):
         """
         if not isinstance(reply, dict):
             return {'role': 'assistant', 'content': str(reply)}
-        msg: dict[str, Any] = {'role': 'assistant'}
+        msg: Dict[str, Any] = {'role': 'assistant'}
         content = reply.get('content')
         msg['content'] = content if content is not None else ''
         finish = reply.get('finish_reason')
@@ -232,7 +214,7 @@ class APIMultiTurnRollout(Rollout):
             msg['finish_reason'] = finish
         tool_calls = reply.get('tool_calls') or []
         if tool_calls:
-            normalised: list[dict[str, Any]] = []
+            normalised: List[Dict[str, Any]] = []
             for i, tc in enumerate(tool_calls):
                 tc = dict(tc)
                 tc.setdefault('id', f'call_{turn}_{i}')
@@ -248,8 +230,8 @@ class APIMultiTurnRollout(Rollout):
 
     def _write_traces(
         self,
-        outs: list[Trajectory],
-        global_step: int | None,
+        outs: List[Trajectory],
+        global_step: Optional[int],
     ) -> None:
         """Per-trajectory JSON dump. Mirrors :meth:`MultiTurnRollout.
         _write_rollout_traces` but reuses its static helpers — failures

@@ -22,9 +22,6 @@ class GRPOLoss(Loss):
             subtracts ``entropy_coef * H(pi)`` per token to encourage exploration and
             prevent mode-collapse / repetition. Requires the model forward to supply
             ``outputs['entropies']`` — enabled automatically via ``require_entropy``.
-        token_bonus_coef: Per-token oracle bonus coefficient (0.0 = disabled). When > 0,
-            subtracts ``token_bonus_coef * token_bonus`` from the per-token loss, where
-            ``token_bonus`` is typically ``oracle_logps - rollout_logps``.
         ignore_index: Index to ignore in labels (default: -100)
     """
 
@@ -34,7 +31,6 @@ class GRPOLoss(Loss):
         epsilon_high: Optional[float] = None,
         beta: float = 0.0,
         entropy_coef: float = 0.0,
-        token_bonus_coef: float = 0.0,
         ignore_index: int = -100,
         **kwargs,
     ):
@@ -42,7 +38,6 @@ class GRPOLoss(Loss):
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
         self.entropy_coef = entropy_coef
-        self.token_bonus_coef = token_bonus_coef
         # Gate the expensive entropy compute path in the model forward.
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
@@ -215,7 +210,6 @@ class GRPOLoss(Loss):
         old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         ref_logps: Optional['torch.Tensor'] = None,
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
-        token_bonus: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         **kwargs,
     ):
         """
@@ -234,9 +228,6 @@ class GRPOLoss(Loss):
             ref_logps: Optional [batch, seq_len] reference model log probs for KL penalty.
                       Same padding/alignment rules as old_logps.
             advantages: advantage values
-            token_bonus: Optional per-token bonus signal (e.g. oracle_logps - rollout_logps).
-                        Same ragged/padding rules as old_logps. Reduces per-token loss when
-                        token_bonus_coef > 0.
             **kwargs: Additional arguments
         """
         import torch
@@ -307,10 +298,6 @@ class GRPOLoss(Loss):
             per_token_kl = (torch.exp(ref_logps - logps) - (ref_logps - logps) - 1)
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        # Entropy bonus: subtract entropy_coef * H(pi) to encourage exploration.
-        # The model forward is gated by self.require_entropy to actually materialize
-        # outputs['entropies']; if a caller set entropy_coef>0 but the forward did
-        # not populate it, we fail loudly so mis-wiring is caught early.
         if self.entropy_coef > 0.0:
             entropies = outputs.get('entropies')
             assert entropies is not None, ('entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
@@ -318,11 +305,6 @@ class GRPOLoss(Loss):
             # entropies may come in fp32 from the kernel; cast to match logps dtype
             # so the final per_token_loss stays consistent (bf16 under amp).
             per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
-
-        # Per-token oracle bonus: tokens the oracle favors get reduced loss.
-        if self.token_bonus_coef > 0.0 and token_bonus is not None:
-            token_bonus = self._pad_and_align_to_batch(token_bonus, loss_mask, device, logps.dtype)
-            per_token_loss = per_token_loss - self.token_bonus_coef * token_bonus
 
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
@@ -401,8 +383,7 @@ class CISPOLoss(GRPOLoss):
         """Clamped ratio * advantage * log_prob."""
         import torch
 
-        # Two-sided IS clamp with asymmetric epsilon, matching MiniMax CISPO spec.
-        clamped_ratios = torch.clamp(ratio, min=1 - self.epsilon, max=1 + self.epsilon_high).detach()
+        clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
         return -clamped_ratios * advantages * per_token_logps
 
     def _aggregate_loss(

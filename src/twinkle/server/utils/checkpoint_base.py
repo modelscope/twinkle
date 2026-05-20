@@ -33,6 +33,7 @@ logger = get_logger()
 TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
 CHECKPOINT_INFO_FILENAME = 'checkpoint_metadata.json'
 TRAIN_RUN_INFO_FILENAME = 'twinkle_metadata.json'
+SAVE_DIR_POINTER_KEY = 'save_dir_pointer'
 
 # Salt used when hashing tokens for directory isolation.
 # Override via env var TWINKLE_TOKEN_SALT to customise per-deployment.
@@ -46,6 +47,17 @@ def _hash_token(token: str) -> str:
     token value is never written to the filesystem.
     """
     return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+
+
+def _resolve_client_save_dir(save_dir: str) -> Path:
+    if not save_dir:
+        raise ValueError(f'Invalid save_dir: {save_dir}')
+    path = Path(save_dir).expanduser().resolve()
+    if not path.exists():
+        raise ValueError(f'save_dir does not exist on the server: {path.as_posix()}')
+    if not path.is_dir():
+        raise ValueError(f'save_dir is not a directory on the server: {path.as_posix()}')
+    return path
 
 
 # ----- Internal Pydantic Base Specs -----
@@ -73,6 +85,7 @@ class BaseTrainingRun(BaseModel):
     training_run_id: str
     base_model: str
     model_owner: str
+    save_dir: Optional[str] = None
     is_lora: bool = False
     corrupted: bool = False
     lora_rank: Optional[int] = None
@@ -94,6 +107,7 @@ class BaseCreateModelRequest(BaseModel):
     """Base request model for creating a model."""
     base_model: str
     lora_config: Optional[BaseLoraConfig] = None
+    save_dir: Optional[str] = None
     user_metadata: Optional[Dict[str, Any]] = None
 
 
@@ -271,6 +285,44 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """
         pass
 
+    def _token_base_dir(self, save_dir: Optional[str] = None) -> Path:
+        if save_dir:
+            base_path = _resolve_client_save_dir(save_dir)
+        else:
+            base_path = Path(TWINKLE_DEFAULT_SAVE_DIR).absolute()
+        return base_path / _hash_token(self.token)
+
+    def _default_model_dir(self, model_id: str) -> Path:
+        return self._token_base_dir() / model_id
+
+    def _read_json_file(self, path: Path) -> Dict[str, Any]:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _read_save_dir_pointer(self, model_id: str) -> Optional[Dict[str, Any]]:
+        data = self._read_json_file(self._default_model_dir(model_id) / self.train_run_info_filename)
+        if data.get(SAVE_DIR_POINTER_KEY):
+            return data
+        return None
+
+    @staticmethod
+    def _extract_save_dir(run_config: Any) -> Optional[str]:
+        save_dir = getattr(run_config, 'save_dir', None)
+        if save_dir:
+            return save_dir
+        model_extra = getattr(run_config, 'model_extra', None)
+        if isinstance(model_extra, dict):
+            save_dir = model_extra.get('save_dir')
+            if save_dir:
+                return save_dir
+        user_metadata = getattr(run_config, 'user_metadata', None)
+        if isinstance(user_metadata, dict):
+            return user_metadata.get('save_dir')
+        return None
+
     def get_base_dir(self) -> Path:
         """
         Get base directory with token-based isolation.
@@ -282,10 +334,9 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         Returns:
             Path to token-specific base directory
         """
-        base_path = Path(TWINKLE_DEFAULT_SAVE_DIR).absolute()
-        return base_path / _hash_token(self.token)
+        return self._token_base_dir()
 
-    def get_model_dir(self, model_id: str) -> Path:
+    def get_model_dir(self, model_id: str, save_dir: Optional[str] = None) -> Path:
         """
         Get model directory with token-based isolation.
 
@@ -295,6 +346,12 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         Returns:
             Path to model directory
         """
+        if save_dir:
+            return self._token_base_dir(save_dir) / model_id
+
+        pointer = self._read_save_dir_pointer(model_id)
+        if pointer and pointer.get('save_dir'):
+            return self._token_base_dir(pointer.get('save_dir')) / model_id
         return self.get_base_dir() / model_id
 
     def _read_info(self, model_id: str) -> Dict[str, Any]:
@@ -310,11 +367,14 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         metadata_path = self.get_model_dir(model_id) / self.train_run_info_filename
         if not metadata_path.exists():
             return {}
-        try:
-            with open(metadata_path) as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        data = self._read_json_file(metadata_path)
+        if data.get(SAVE_DIR_POINTER_KEY):
+            save_dir = data.get('save_dir')
+            if not save_dir:
+                return {}
+            target_path = self.get_model_dir(model_id, save_dir=save_dir) / self.train_run_info_filename
+            return self._read_json_file(target_path)
+        return data
 
     def _write_info(self, model_id: str, data: Dict[str, Any]):
         """
@@ -324,11 +384,25 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             model_id: The model identifier
             data: Metadata to write
         """
-        model_dir = self.get_model_dir(model_id)
+        save_dir = data.get('save_dir')
+        model_dir = self.get_model_dir(model_id, save_dir=save_dir)
         model_dir.mkdir(parents=True, exist_ok=True)
         metadata_path = model_dir / self.train_run_info_filename
         with open(metadata_path, 'w') as f:
             json.dump(data, f, indent=2)
+
+        if save_dir:
+            pointer_dir = self._default_model_dir(model_id)
+            if pointer_dir.resolve() != model_dir.resolve():
+                pointer_dir.mkdir(parents=True, exist_ok=True)
+                pointer_path = pointer_dir / self.train_run_info_filename
+                pointer_data = {
+                    SAVE_DIR_POINTER_KEY: True,
+                    'training_run_id': model_id,
+                    'save_dir': save_dir,
+                }
+                with open(pointer_path, 'w') as f:
+                    json.dump(pointer_data, f, indent=2)
 
     def save(self, model_id: str, run_config: Any):
         """
@@ -339,6 +413,9 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             run_config: Configuration for the training run
         """
         new_data = self._create_training_run(model_id, run_config)
+        save_dir = self._extract_save_dir(run_config)
+        if save_dir:
+            new_data['save_dir'] = _resolve_client_save_dir(save_dir).as_posix()
         self._write_info(model_id, new_data)
 
     def get(self, model_id: str) -> Optional[Any]:
@@ -381,13 +458,11 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             TrainingRunsResponse with list of training runs
         """
         base_dir = self.get_base_dir()
-        if not base_dir.exists():
-            return self._create_training_runs_response([], limit, offset, 0)
-
         candidates = []
-        for d in base_dir.iterdir():
-            if d.is_dir() and (d / self.train_run_info_filename).exists():
-                candidates.append(d)
+        if base_dir.exists():
+            for d in base_dir.iterdir():
+                if d.is_dir() and (d / self.train_run_info_filename).exists():
+                    candidates.append(d)
 
         candidates.sort(key=lambda d: (d / self.train_run_info_filename).stat().st_mtime, reverse=True)
 
@@ -554,8 +629,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             String path to save directory
         """
         weights_type = 'sampler_weights' if is_sampler else 'weights'
-        checkpoint_id = Path(model_id) / weights_type
-        save_path = self.training_run_manager.get_base_dir() / checkpoint_id
+        save_path = self.training_run_manager.get_model_dir(model_id) / weights_type
         return save_path.as_posix()
 
     @staticmethod

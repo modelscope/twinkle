@@ -4,7 +4,7 @@ import hmac
 import json
 import time
 import urllib.parse
-from typing import Optional
+from typing import Dict, Optional
 
 from .base import Notifier
 
@@ -34,6 +34,27 @@ class DingNotifier(Notifier):
         self.secret = secret
         self.timeout = timeout
 
+    def to_dict(self) -> Dict[str, str]:
+        d = {
+            'class': 'DingNotifier',
+            'ding_url': self.ding_url,
+            'timeout': str(self.timeout),
+        }
+        if self.secret:
+            d['secret'] = self.secret
+        return d
+
+    @classmethod
+    def _from_dict_impl(cls, data: dict):
+        url = data.get('ding_url', '')
+        if not url:
+            return None
+        return cls(
+            ding_url=url,
+            secret=data.get('secret') or None,
+            timeout=float(data.get('timeout', '5.0')),
+        )
+
     def _sign(self) -> dict:
         """Build ``timestamp``/``sign`` query params for signed webhooks."""
         if not self.secret:
@@ -57,17 +78,24 @@ class DingNotifier(Notifier):
         return f'{self.ding_url}{sep}{query}'
 
     def __call__(self, message: str) -> dict:
-        """Send ``message`` as a plain-text DingTalk notification.
+        """Send ``message`` as a DingTalk markdown notification.
+
+        The first ``#``/``##``/``###`` heading line is used as ``title``
+        (which surfaces in the chat preview); falls back to the first
+        non-empty line, truncated to 64 chars.
 
         Returns the parsed JSON response from DingTalk. Raises on HTTP
         failure or on a non-zero ``errcode`` in the response body.
         """
         import requests
 
+        text = str(message)
+        title = _extract_title(text)
         payload = {
-            'msgtype': 'text',
-            'text': {
-                'content': str(message)
+            'msgtype': 'markdown',
+            'markdown': {
+                'title': title,
+                'text': text
             },
         }
         resp = requests.post(
@@ -82,3 +110,14 @@ class DingNotifier(Notifier):
             raise RuntimeError(f'DingTalk notify failed: errcode={result.get("errcode")}, '
                                f'errmsg={result.get("errmsg")}')
         return result
+
+
+def _extract_title(text: str, max_len: int = 64) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Strip leading markdown heading markers if any.
+        cleaned = stripped.lstrip('#').strip() or stripped
+        return cleaned[:max_len]
+    return 'Twinkle'

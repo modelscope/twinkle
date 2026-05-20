@@ -438,6 +438,7 @@ def generate_models():
     client_module_path.mkdir(parents=True, exist_ok=True)
 
     model_code = AUTO_GEN_WARNING + '''from typing import Any, Dict, Optional
+from pathlib import Path
 import time
 from twinkle_client.http import http_get, http_post
 from twinkle_client.types.model import (
@@ -477,6 +478,9 @@ class MultiLoraTransformersModel:
 
     def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs) -> None:
         """Add a new adapter to the model."""
+        save_dir = kwargs.get('save_dir')
+        if save_dir:
+            kwargs['save_dir'] = Path(save_dir).expanduser().resolve().as_posix()
         response = http_post(
             url=f'{self.server_url}/add_adapter_to_model',
             json_data={'adapter_name': adapter_name, 'config': config, **kwargs}

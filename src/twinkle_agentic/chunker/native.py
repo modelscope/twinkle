@@ -1,20 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Rule-based trajectory chunker.
-
-Only the *first* ``user`` message is split into multiple text chunks
-(capped at ``chunk_size`` characters, using a recursive separator list
-that prefers paragraphs > lines > sentences > words). Every other
-message is decomposed part-by-part *without* further splitting, so the
-resulting :class:`Chunks` round-trips back to the original trajectory
-via :meth:`Chunks.to_trajectory` (for non-split messages).
-
-The chunker never marks chunks as ``condensed`` — that is the
-condenser's job. Consequently :meth:`Chunks.to_trajectory` will not
-wrap any chunk with ``<block_N>...</block_N>`` when called directly on
-a chunker output.
-"""
-from __future__ import annotations
-
 import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
@@ -49,7 +33,7 @@ _SplitFn = Optional[Callable[[str], List[str]]]
 
 class NativeChunker(Chunker):
     """Character-level recursive chunker for trajectories.
-
+    TODO: Experimental feature, wait for testing
     Args:
         chunk_size: Soft upper bound (in characters) for every emitted
             text chunk. Must be positive.

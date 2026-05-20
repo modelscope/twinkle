@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
+from torch.distributed.tensor import distribute_tensor
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -41,6 +42,69 @@ class MultiLora:
             if _lora.tenant_adapter_name is None:
                 return _lora
         return None
+
+    def _read_param_tensor(self, parameter):
+        return torch_util.to_local_tensor(parameter)
+
+    @staticmethod
+    def _is_distributed_param(parameter):
+        return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
+
+    def _write_param_tensor(self, parameter, value):
+        if value is None:
+            return
+        value = value.detach().to(dtype=parameter.dtype)
+        if self._is_distributed_param(parameter):
+            if self._is_distributed_param(value):
+                parameter.data.copy_(value.to(parameter.device))
+                return
+
+            local_param = parameter.to_local() if hasattr(parameter, 'to_local') else None
+            parameter_shape = tuple(parameter.shape)
+            value_shape = tuple(value.shape)
+            if local_param is not None:
+                local_shape = tuple(local_param.shape)
+                if value_shape == local_shape and value_shape != parameter_shape:
+                    local_param.copy_(value.to(local_param.device))
+                    return
+                if value_shape != parameter_shape:
+                    raise ValueError(
+                        f'Cannot write tensor with shape {value_shape} to distributed parameter with global shape '
+                        f'{parameter_shape} and local shape {local_shape}')
+            value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
+        else:
+            value = value.to(parameter.device)
+        parameter.data.copy_(value)
+
+    @staticmethod
+    def _slice_rank_tensor(name: str, tensor, rank: int):
+        if tensor is None:
+            return None
+        if 'embedding_A' in name:
+            return tensor[:, :rank]
+        if 'embedding_B' in name:
+            return tensor[:rank, :]
+        if '_A' in name:
+            return tensor[:rank, :]
+        if '_B' in name:
+            return tensor[:, :rank]
+        return tensor
+
+    @staticmethod
+    def _copy_rank_tensor(name: str, target, value):
+        if target is None or value is None:
+            return None
+        if 'embedding_A' in name:
+            target[:, :value.shape[1]].copy_(value)
+        elif 'embedding_B' in name:
+            target[:value.shape[0], :].copy_(value)
+        elif '_A' in name:
+            target[:value.shape[0], :].copy_(value)
+        elif '_B' in name:
+            target[:, :value.shape[1]].copy_(value)
+        else:
+            target.copy_(value)
+        return target
 
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
@@ -472,7 +536,7 @@ class MultiLora:
             def _store_weights(_module):
                 for name, parameter in _module.named_parameters():
                     if pattern.search(name):
-                        lora_tenant.lora_A_weights[name] = parameter.data.clone().to('cpu')
+                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
 
             if isinstance(self.module, list):
                 for _module in self.module:
@@ -572,17 +636,9 @@ class MultiLora:
         # patching makes the bridge skip non-target modules entirely), so we
         # only check the adapter-name / weight pattern here.
         if re.search(rf'\.lora_\w+\.({adapter_name}|weight)', name):
-            _param = torch_util.to_local_tensor(parameter)
-            if _param is None:
-                pass
-            elif 'embedding_A' in name:
-                _param = _param[:, :_lora.tenant_config.r].clone()
-            elif 'embedding_B' in name:
-                _param = _param[:_lora.tenant_config.r, :].clone()
-            elif '_A' in name:
-                _param = _param[:_lora.tenant_config.r, :].clone()
-            elif '_B' in name:
-                _param = _param[:, :_lora.tenant_config.r].clone()
+            _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
+            if _param is not None:
+                _param = _param.clone()
             name = name.replace(f'.{_lora.adapter_name}.', '.')
             return name, _param
         else:
@@ -595,20 +651,14 @@ class MultiLora:
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    name = name.replace(f'.{_lora.adapter_name}.', '.')
-                    src_tensor = state_dict[name]
-                    if 'embedding_A' in name:
-                        r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
-                    elif 'embedding_B' in name:
-                        r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
-                    elif '_A' in name:
-                        r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
-                    elif '_B' in name:
-                        r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
+                    state_key = name.replace(f'.{_lora.adapter_name}.', '.')
+                    target_tensor = self._read_param_tensor(parameter)
+                    if target_tensor is None:
+                        continue
+                    target_tensor = target_tensor.clone()
+                    src_tensor = state_dict[state_key].to(dtype=target_tensor.dtype, device=target_tensor.device)
+                    self._copy_rank_tensor(name, target_tensor, src_tensor)
+                    self._write_param_tensor(parameter, target_tensor)
 
         if isinstance(self.module, list):
             for _module in self.module:
@@ -625,15 +675,9 @@ class MultiLora:
             state_dict = {}
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
-                    _param = torch_util.to_local_tensor(parameter)
-                    if 'embedding_A' in name:
-                        _param = _param[:, :_lora.tenant_config.r]
-                    elif 'embedding_B' in name:
-                        _param = _param[:_lora.tenant_config.r, :]
-                    elif '_A' in name:
-                        _param = _param[:_lora.tenant_config.r, :]
-                    elif '_B' in name:
-                        _param = _param[:, :_lora.tenant_config.r]
+                    _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
+                    if _param is None:
+                        continue
                     name = name.replace(f'.{_lora.adapter_name}.', '.')
                     state_dict[name] = _param
             return state_dict
@@ -653,9 +697,14 @@ class MultiLora:
         def _load_initial_weights(_module):
             for name, parameter in _module.named_parameters():
                 if pattern_A.search(name):
-                    parameter.data.copy_(_lora.lora_A_weights[name])
+                    local_param = self._read_param_tensor(parameter)
+                    if local_param is not None:
+                        value = _lora.lora_A_weights[name].to(dtype=parameter.dtype, device=local_param.device)
+                        self._write_param_tensor(parameter, value)
                 if pattern_B.search(name):
-                    parameter.data.copy_(torch.zeros_like(parameter.data).to(parameter.data.dtype))
+                    local_param = self._read_param_tensor(parameter)
+                    if local_param is not None:
+                        self._write_param_tensor(parameter, torch.zeros_like(local_param))
 
         if isinstance(self.module, list):
             for _module in self.module:

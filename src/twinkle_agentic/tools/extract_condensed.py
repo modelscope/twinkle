@@ -11,6 +11,7 @@ TOOL_NAME = 'extract_condensed'
 class ExtractCondensed(Tool):
     """Return the original text behind a ``<block_N>`` compressed segment.
 
+    TODO: Experimental feature, wait for testing
     Args:
         chunks: The :class:`Chunks` object emitted by a condenser
             (post-compression). Each condensed chunk should carry

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.data_format import Trajectory
@@ -16,6 +17,7 @@ from .multi_turn import MultiTurnRollout
 @remote_class()
 class MultiTurnCondenseRollout(MultiTurnRollout):
     """Multi-turn rollout with trajectory compression + on-demand recovery.
+    TODO: Experimental feature, wait for testing
 
     Pipeline for a batch of trajectories:
         1. ``chunker(trajectory)`` splits each incoming trajectory into chunks.

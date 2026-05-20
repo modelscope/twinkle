@@ -1,29 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""LLM-backed passage condenser.
-
-Pipeline
---------
-``Chunks`` → filter eligible chunks → batched ``Sampler.sample(...)`` →
-strip code fences → length-vs-original guard → ``Chunks`` with
-``raw.condensed=True`` (so :meth:`Chunks.to_trajectory` later wraps
-them in ``<block_N>``). When the decoded output is empty, degenerate,
-or **not strictly shorter than the original passage**, the chunk is
-left untouched and is NOT marked ``raw.condensed`` — so downstream
-bookkeeping (and the rollout trace) can tell compressed vs.
-passthrough chunks apart.
-
-The compression prompt asks for up to three markdown sections
-(``## Summary / ## More / ## Key Facts``) written in **telegraphic
-style** (no articles / copulas / filler) with per-section length
-hints. Telegraphic output is ~2–3× denser than natural-prose summaries
-and is critical under tight compression ratios. The output is **not**
-parsed — sections pass through verbatim. The character budget the
-prompt exposes is a soft target only; we never hard-clip the model
-output, we simply discard it (fall back to the original) when it
-fails to compress.
-"""
-from __future__ import annotations
-
 import math
 import re
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -31,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 from twinkle_agentic.condenser.base import Condenser
 from twinkle_agentic.data_format import Chunk, Chunks
 
-if TYPE_CHECKING:  # only used for type hints, keep runtime deps minimal
+if TYPE_CHECKING:
     from twinkle.data_format import SamplingParams, Trajectory  # noqa: F401
     from twinkle.sampler.base import Sampler  # noqa: F401
 
@@ -99,17 +74,23 @@ Now begin.
 
 DEFAULT_SYSTEM_PROMPT = _SECTION_SCHEMA
 
-DEFAULT_USER_PROMPT_TEMPLATE = ('Downstream model will read your compressed block to decide whether to '
-                                'expand it. Compress faithfully: preserve the passage topic + core facts. '
-                                'Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary '
-                                'about the Query (never write "Query info: absent", "no X mention", etc.); '
-                                'if the passage does not address the Query, still summarize the passage.\n\n'
-                                '## Query (ordering hint only — still summarize the whole passage)\n{query}\n\n'
-                                '## Target length\n'
-                                'Compress AS MUCH AS faithfully possible. HARD CEILING: {budget} chars. '
-                                'If core facts fit in far fewer chars, output fewer. '
-                                'Never exceed the ceiling.\n\n'
-                                '## Passage\n{text}')
+DEFAULT_USER_PROMPT_TEMPLATE = """\
+Downstream model will read your compressed block to decide whether to \
+expand it. Compress faithfully: preserve the passage topic + core facts. \
+Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary \
+about the Query (never write "Query info: absent", "no X mention", etc.); \
+if the passage does not address the Query, still summarize the passage.
+
+## Query (ordering hint only — still summarize the whole passage)
+{query}
+
+## Target length
+Compress AS MUCH AS faithfully possible. HARD CEILING: {budget} chars. \
+If core facts fit in far fewer chars, output fewer. \
+Never exceed the ceiling.
+
+## Passage
+{text}"""
 
 # A (chunk_index, chunk, char_budget) triple marking one compression job.
 _Job = Tuple[int, Chunk, int]
@@ -120,7 +101,7 @@ _Job = Tuple[int, Chunk, int]
 # ---------------------------------------------------------------------------
 class ModelCondenser(Condenser):
     """Compressor that delegates summarization to an LLM via a :class:`Sampler`.
-
+    TODO: Experimental feature, wait for testing
     Args:
         sampler: Configured :class:`Sampler` with a template set.
         compression_ratio: Target factor (> 1). Used only to derive a
@@ -404,7 +385,7 @@ class ModelCondenser(Condenser):
         from twinkle.data_format.sampling import SamplingParams
 
         # CJK worst case ~2 tokens/char; budget is a soft char ceiling, not output truth.
-        max_new = max(256, budget * 2 + 128)
+        max_new = max(512, budget * 3 + 128)
         return SamplingParams(temperature=0.0, max_tokens=max_new)
 
     # ------------------------------------------------------------------

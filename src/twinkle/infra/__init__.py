@@ -1,10 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
+import json
 import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
+from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
 
@@ -27,29 +29,27 @@ _device_group: Optional[List[DeviceGroup]] = None
 
 _device_mesh = None
 
-_remote_components: dict = {}
-
 _notifier: Optional[Any] = None
 
+_name: Optional[str] = None
 
-def _notify_exception(context: str, exc: BaseException) -> None:
-    if _notifier is None:
+_TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
+
+
+def _maybe_load_worker_notifier() -> None:
+    """Lazily reconstruct notifier + name on ray workers from inherited env vars."""
+    global _notifier, _name
+    if _notifier is not None:
         return
-    if getattr(exc, '_twinkle_notified', False):
+    if _name is None:
+        _name = os.environ.get('TWINKLE_NAME') or None
+    raw = os.environ.get(_TWINKLE_NOTIFIER_ENV)
+    if not raw:
         return
-    try:
-        import traceback
-        tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        msg = (f'[Twinkle] Exception in {context}: '
-               f'{type(exc).__name__}: {exc}\n{tb_str}')
-        _notifier(msg)
-    except Exception:  # noqa: BLE001 — must never shadow the original error
-        logger.exception('Failed to send twinkle exception notification')
-    finally:
-        try:
-            setattr(exc, '_twinkle_notified', True)
-        except Exception:  # noqa: BLE001
-            pass
+
+    candidate = Notifier.from_dict(json.loads(raw))
+    if candidate is not None:
+        _notifier = candidate
 
 
 def initialize(mode: Literal['local', 'ray'] = 'local',
@@ -60,6 +60,7 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                groups: Optional[List[DeviceGroup]] = None,
                global_device_mesh: Optional[DeviceMesh] = None,
                lazy_collect: bool = True,
+               name: Optional[str] = None,
                notifier: Optional[Any] = None):
     """Initialize the twinkle infrastructure.
 
@@ -74,17 +75,24 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         groups: The device groups of the training.
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
+        name: The name of this run.
         notifier: Optional callable (e.g. ``DingNotifier``) invoked with a
             single ``str`` message whenever any ``remote_function``-decorated
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _notifier
+    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
+    _name = name
     _full_determinism = full_determinism
     _lazy_collect = lazy_collect
     _notifier = notifier
+    if name is not None:
+        os.environ['TWINKLE_NAME'] = name
+    os.environ.setdefault('TWINKLE_SESSION_ID', str(os.getpid()))
+    if notifier is not None and hasattr(notifier, 'to_dict'):
+        os.environ[_TWINKLE_NOTIFIER_ENV] = json.dumps(notifier.to_dict())
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
 
@@ -479,6 +487,15 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
 
         @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
+            _ctx = f'{cls.__name__}.__init__'
+            try:
+                _maybe_load_worker_notifier()
+                _new_init_body(self, *args, **kwargs)
+            except Exception as _e:  # noqa: BLE001
+                notify_exception(_notifier, _ctx, _e, _name)
+                raise
+
+        def _new_init_body(self, *args, **kwargs):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -749,7 +766,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
-                                    _notify_exception(_ctx, _e)
+                                    notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
                             for _attr in ('_futures', ):
@@ -762,7 +779,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
-                _notify_exception(_ctx, _e)
+                notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
         wrapper._execute = execute

@@ -1,17 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for :class:`twinkle_agentic.condenser.keyword.KeywordCondenser`.
-
-Covers:
-- strict compression-ratio enforcement (``len(output) <= ceil(len(input)/ratio)``)
-- opening / relations / keywords slot extraction
-- budget-priority fallback (drop keywords → drop relations → truncate opening)
-- role / min_chars / kind filtering
-- ``raw.condensed=True`` marker + block wrapping via ``Chunks.to_trajectory``
-- pass-through of non-text / short / skipped chunks
-- constructor validation
-"""
-from __future__ import annotations
-
 import math
 import pytest
 
