@@ -385,7 +385,7 @@ class ModelCondenser(Condenser):
         from twinkle.data_format.sampling import SamplingParams
 
         # CJK worst case ~2 tokens/char; budget is a soft char ceiling, not output truth.
-        max_new = max(256, budget * 2 + 128)
+        max_new = max(512, budget * 3 + 128)
         return SamplingParams(temperature=0.0, max_tokens=max_new)
 
     # ------------------------------------------------------------------

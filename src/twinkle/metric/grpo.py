@@ -148,7 +148,7 @@ class GRPOMetric(Metric):
         # both new and old logps receive the same multiplier.
         scale = self.temperature
         logps_f = logps.float()
-        if scale != 1.0:
+        if scale > 0.0 and scale != 1.0:
             logps_f = logps_f * scale
         mask_f = mask.float()
 
@@ -178,7 +178,7 @@ class GRPOMetric(Metric):
         if aligned is None:
             return num_seq
         old_f = aligned.float()
-        if scale != 1.0:
+        if scale > 0.0 and scale != 1.0:
             old_f = old_f * scale
 
         d = logps_f - old_f  # new - old
