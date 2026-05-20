@@ -271,7 +271,7 @@ class NativeFSDPStrategy:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=0)
+                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
@@ -294,6 +294,12 @@ def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
             candidate_names.add(experts_prefix + pname)
     actual_param_names = {n for n, _ in model.named_parameters()}
     return candidate_names & actual_param_names
+
+
+def _ep_expert_state_dict_gather_dim(name: str) -> int:
+    if 'lora_B' in name:
+        return 1
+    return 0
 
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':

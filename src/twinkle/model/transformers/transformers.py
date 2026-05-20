@@ -142,6 +142,19 @@ def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_
     return value
 
 
+def _has_param_wrapper_without_base_weight(model) -> bool:
+    for module in model.modules():
+        if not hasattr(module, 'parameter_name'):
+            continue
+        get_base_layer = getattr(module, 'get_base_layer', None)
+        if get_base_layer is None:
+            continue
+        base_layer = get_base_layer()
+        if not hasattr(base_layer, 'weight'):
+            return True
+    return False
+
+
 @dataclass
 class OptimizerGroup(BaseOptimizerGroup):
     """Optimizer group for Transformers training."""
@@ -1175,6 +1188,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
                 model_sd = model.state_dict()
                 converted_weights = {}
+                direct_weights = {}
                 for key, value in adapter_weights.items():
                     model_key = key
                     if f'.{adapter_name}.weight' not in model_key:
@@ -1184,9 +1198,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                         value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
+                        direct_weights[model_key] = value
                     converted_weights[key] = value
 
-                set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
+                if _has_param_wrapper_without_base_weight(model):
+                    model.load_state_dict(direct_weights, strict=False)
+                else:
+                    set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
 
             if self.device_mesh.fsdp_world_size > 1:
                 load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name=adapter_name)
