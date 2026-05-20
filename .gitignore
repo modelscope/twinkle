@@ -9,6 +9,7 @@ test.sh
 twinkle-web
 # C extensions
 *.so
+rollout_trace*
 
 # Distribution / packaging
 .Python

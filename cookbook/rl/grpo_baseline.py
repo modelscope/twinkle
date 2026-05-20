@@ -57,7 +57,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
-NUM_EPOCHS = int(os.environ.get('NUM_EPOCHS', 10))
+NUM_EPOCHS = int(os.environ.get('NUM_EPOCHS', 1))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 0))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
@@ -91,7 +91,10 @@ CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
 # High-KL token capture: top-K per microbatch dumped into log_dict['_high_kl_records']. 0 = disabled.
 HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
 
-WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
+DATASET_PATH = os.environ.get(
+    'DATASET_PATH',
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                'hotpotqa_fullwiki_reannotated_12k.jsonl'))
 F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
 
 _ROLLOUT_TRACE_DIR = os.environ.get(
@@ -137,14 +140,12 @@ def compute_rewards(trajectories: List[Dict[str, Any]]):
 
 
 class HotpotQAProcessor(Preprocessor):
-    """Same processor as ``grpo_condensed.py`` — passages are emitted as
-    ``[K] Title: ...`` lines. The downstream is what differs: the baseline
-    feeds the full context straight to the model (no ``<block_N>`` wrapping,
-    no chunking, no condensation)."""
+    """Preprocessor for the reannotated HotpotQA JSONL. Passages are emitted
+    as ``[K] Title: ...`` lines. Rows with ``verdict='drop'`` are excluded;
+    ``question_fixed`` is used in place of ``question`` when present."""
 
-    def __init__(self, system: str = SYSTEM_PROMPT, levels=None):
+    def __init__(self, system: str = SYSTEM_PROMPT):
         self.system = system
-        self.levels = levels
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
@@ -167,46 +168,35 @@ class HotpotQAProcessor(Preprocessor):
         return '\n\n'.join(lines)
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Trajectory]:
-        if self.levels is not None and (row.get('level') or '').strip().lower() not in self.levels:
+        if (row.get('verdict') or '').strip().lower() == 'drop':
             return None
-        question = row['question']
+        question = row.get('question_fixed') or row['question']
         answers = row.get('answers')
         if isinstance(answers, list) and answers:
-            gold = [str(a).strip() for a in answers if str(a).strip()]
+            golds = [str(a).strip() for a in answers if str(a).strip()]
         else:
-            gold = (row.get('answer', '') or '').strip()
+            golds = [s for s in [(row.get('answer', '') or '').strip()] if s]
         context_block = self._format_context(row.get('context', {}) or {})
         user_msg = f'Question: {question}\n\nContext:\n\n{context_block}'
         messages = [
             Message(role='system', content=self.system),
             Message(role='user', content=user_msg),
         ]
-        return Trajectory(messages=messages, user_data=[('ground_truth', gold)])
+        return Trajectory(messages=messages, user_data=[('ground_truth', g) for g in golds])
 
 
 def create_hotpotqa_dataset() -> Dataset:
     dataset = Dataset()
-    dataset.add_dataset(DatasetMeta(
-        'hf://hotpotqa/hotpot_qa', subset_name='fullwiki', split='train'))
-
-    _wrong_ids_path = WRONG_IDS_FILE.strip()
-    if _wrong_ids_path:
-        with open(_wrong_ids_path, 'r', encoding='utf-8') as fh:
-            _ids = frozenset(ln.strip() for ln in fh if ln.strip())
-        if _ids:
-            _key = next(iter(dataset.datasets.keys()))
-            _before = len(dataset.datasets[_key])
-            dataset.datasets[_key] = dataset.datasets[_key].filter(
-                lambda row: row.get('id') in _ids)
-            dataset.dataset = dataset.datasets[_key]
-            logger.info(f'[WRONG_IDS_FILE] {_wrong_ids_path}: {_before} -> {len(dataset.dataset)} rows')
+    dataset.add_dataset(DatasetMeta(DATASET_PATH))
+    logger.info('[dataset] loaded %s: %d rows', DATASET_PATH, len(dataset))
 
     dataset.set_template(
         'Qwen3_5Template', model_id=MODEL_ID, max_length=HOTPOTQA_MAX_LENGTH,
         truncation_strategy='delete', enable_thinking=False)
-    _HOTPOTQA_COLS = ['id', 'question', 'answer', 'type', 'level',
-                      'supporting_facts', 'context']
-    dataset.map(HotpotQAProcessor(system=SYSTEM_PROMPT, levels=['hard']),
+    _HOTPOTQA_COLS = ['id', 'question', 'question_fixed', 'answers',
+                      'original_answer', 'type', 'level', 'verdict',
+                      'reasoning', 'supporting_facts', 'context']
+    dataset.map(HotpotQAProcessor(system=SYSTEM_PROMPT),
                 remove_columns=_HOTPOTQA_COLS)
     return dataset
 
@@ -528,6 +518,7 @@ def main():
             swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
             metrics.reset()
             logger.info(f'[Step {batch_step}/{total_steps}] [SKIPPED] {log_dict}')
+            optim_step += optim_steps_per_batch
             continue
 
         metrics.accumulate(

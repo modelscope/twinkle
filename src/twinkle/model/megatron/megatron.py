@@ -922,12 +922,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             )
         else:
             bridge = self.strategy.bridge
-            for _model in self.strategy.unwrap_model(self.model):
-                bridge.load_weights(
-                    _model,
-                    checkpoint_dir,
-                    peft_format=(adapter_name != _default_adapter_name),
-                )
+            bridge.load_weights(
+                self.strategy.unwrap_model(self.model),
+                checkpoint_dir,
+                peft_format=(adapter_name != _default_adapter_name),
+            )
 
         if dist.is_initialized():
             dist.barrier()

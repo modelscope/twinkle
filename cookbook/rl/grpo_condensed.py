@@ -1,5 +1,4 @@
 import copy
-import json
 import math
 import os
 import re
@@ -31,7 +30,7 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 logger = get_logger()
 
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
-USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '1')))
+USE_MEGATRON = bool(int(os.environ.get('USE_MEGATRON', '0')))
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
 SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
@@ -40,7 +39,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
-NUM_EPOCHS = int(os.environ.get('NUM_EPOCHS', 10))
+NUM_EPOCHS = int(os.environ.get('NUM_EPOCHS', 1))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 0))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
@@ -59,7 +58,7 @@ HOTPOTQA_MAX_LENGTH = int(os.environ.get('HOTPOTQA_MAX_LENGTH', 64000))
 
 F1_REWARD_WEIGHT = float(os.environ.get('F1_REWARD_WEIGHT', 1.0))
 COT_REWARD_WEIGHT = float(os.environ.get('COT_REWARD_WEIGHT', 0))
-TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.00))
+TOOL_BONUS_WEIGHT = float(os.environ.get('TOOL_BONUS_WEIGHT', 0.0))
 TOOL_BONUS_F1_THRESHOLD = float(
     os.environ.get('TOOL_BONUS_F1_THRESHOLD', 0.5))
 
@@ -82,15 +81,15 @@ CISPO_EPS_HIGH = float(os.environ.get('CISPO_EPS_HIGH', 0.2))
 # High-KL token capture: top-K per microbatch dumped into log_dict['_high_kl_records']. 0 = disabled.
 HIGH_KL_TOPK = int(os.environ.get('HIGH_KL_TOPK', 0))
 
-WRONG_IDS_FILE = os.environ.get('WRONG_IDS_FILE', '')
-# Reannotated override JSONL produced by reannotate_groundtruth.py:
-# rows carry verdict in {keep, fix_answer, fix_question, drop}, plus question_fixed
-# and a multi-form ``answers`` list. Applied as a label-fix overlay on matching ids.
-REANNOTATED_FILE = os.environ.get('REANNOTATED_FILE', '')
+INIT_LORA_PATH = os.environ.get('INIT_LORA_PATH', 'output/condensed_sft_ddp/last-checkpoint')
+DATASET_PATH = os.environ.get(
+    'DATASET_PATH',
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                'hotpotqa_fullwiki_reannotated_12k.jsonl'))
 F1_BINARY_THRESHOLD = float(os.environ.get('F1_BINARY_THRESHOLD', 0.5))
 
 _ROLLOUT_TRACE_DIR = os.environ.get('ROLLOUT_TRACE_DIR', 'rollout_trace')
-ORACLE_HINT = bool(int(os.environ.get('ORACLE_HINT', '1')))
+ORACLE_HINT = bool(int(os.environ.get('ORACLE_HINT', '0')))
 
 
 # [EXP-ORACLE] staged hint injection — appended to the Question line so skip_pattern keeps it uncompressed.
@@ -267,9 +266,8 @@ def compute_rewards(trajectories: List[Dict[str, Any]]):
 
 
 class HotpotQAProcessor(Preprocessor):
-    def __init__(self, system: str = SYSTEM_PROMPT, levels=None):
+    def __init__(self, system: str = SYSTEM_PROMPT):
         self.system = system
-        self.levels = levels
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
@@ -292,14 +290,14 @@ class HotpotQAProcessor(Preprocessor):
         return '\n\n'.join(lines)
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Trajectory]:
-        if self.levels is not None and (row.get('level') or '').strip().lower() not in self.levels:
+        if (row.get('verdict') or '').strip().lower() == 'drop':
             return None
-        question = row['question']
+        question = row.get('question_fixed') or row['question']
         answers = row.get('answers')
         if isinstance(answers, list) and answers:
             gold = [str(a).strip() for a in answers if str(a).strip()]
         else:
-            gold = [(row.get('answer', '') or '').strip()]
+            gold = [s for s in [(row.get('answer', '') or '').strip()] if s]
         context_block = self._format_context(row.get('context', {}) or {})
         user_msg = f'Question: {question}\n\nContext:\n\n{context_block}'
         messages = [
@@ -316,75 +314,16 @@ class HotpotQAProcessor(Preprocessor):
 
 def create_hotpotqa_dataset() -> Dataset:
     dataset = Dataset()
-    dataset.add_dataset(DatasetMeta(
-        'hf://hotpotqa/hotpot_qa', subset_name='fullwiki', split='train'))
-    # dataset.add_dataset(DatasetMeta(
-    #     'ds_reannotated.jsonl', subset_name='fullwiki', split='train'))
-
-    _wrong_ids_path = WRONG_IDS_FILE.strip()
-    if _wrong_ids_path:
-        with open(_wrong_ids_path, 'r', encoding='utf-8') as fh:
-            _ids = frozenset(ln.strip() for ln in fh if ln.strip())
-        if _ids:
-            _key = next(iter(dataset.datasets.keys()))
-            _before = len(dataset.datasets[_key])
-            dataset.datasets[_key] = dataset.datasets[_key].filter(
-                lambda row: row.get('id') in _ids)
-            dataset.dataset = dataset.datasets[_key]
-            logger.info(f'[WRONG_IDS_FILE] {_wrong_ids_path}: {_before} -> {len(dataset.dataset)} rows')
-
-    _reannot_path = REANNOTATED_FILE.strip()
-    if _reannot_path:
-        overrides: Dict[str, Dict[str, Any]] = {}
-        drop_ids: set = set()
-        with open(_reannot_path, 'r', encoding='utf-8') as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                rid = obj.get('id')
-                if not rid:
-                    continue
-                if obj.get('verdict') == 'drop':
-                    drop_ids.add(rid)
-                else:
-                    overrides[rid] = obj
-        _key = next(iter(dataset.datasets.keys()))
-        _ds = dataset.datasets[_key]
-        _before = len(_ds)
-        if drop_ids:
-            _ds = _ds.filter(lambda row: row.get('id') not in drop_ids)
-
-        # Always emit ``answers`` to keep schema uniform across rows; processor reads it as multi-form gold.
-        def _apply_reannot(row):
-            ov = overrides.get(row.get('id'))
-            if ov is None:
-                return {'answers': [(row.get('answer') or '').strip()]}
-            qfix = (ov.get('question_fixed') or '').strip()
-            ans = [str(a).strip() for a in (ov.get('answers') or []) if str(a).strip()]
-            return {
-                'question': qfix or row.get('question') or '',
-                'answers': ans or [(row.get('answer') or '').strip()],
-            }
-        _ds = _ds.map(_apply_reannot)
-        dataset.datasets[_key] = _ds
-        dataset.dataset = _ds
-        logger.info(
-            f'[REANNOTATED] {_reannot_path}: {_before} -> {len(_ds)} rows '
-            f'(dropped={len(drop_ids)}, overridden={len(overrides)})')
+    dataset.add_dataset(DatasetMeta(DATASET_PATH))
+    logger.info('[dataset] loaded %s: %d rows', DATASET_PATH, len(dataset))
 
     dataset.set_template(
         'Qwen3_5Template', model_id=MODEL_ID, max_length=HOTPOTQA_MAX_LENGTH,
         truncation_strategy='delete', enable_thinking=False)
-    _HOTPOTQA_COLS = ['id', 'question', 'answer', 'type', 'level',
-                      'supporting_facts', 'context']
-    if REANNOTATED_FILE.strip():
-        _HOTPOTQA_COLS = _HOTPOTQA_COLS + ['answers']
-    dataset.map(HotpotQAProcessor(system=SYSTEM_PROMPT, levels=['hard']), remove_columns=_HOTPOTQA_COLS)
+    _HOTPOTQA_COLS = ['id', 'question', 'question_fixed', 'answers',
+                      'original_answer', 'type', 'level', 'verdict',
+                      'reasoning', 'supporting_facts', 'context']
+    dataset.map(HotpotQAProcessor(system=SYSTEM_PROMPT), remove_columns=_HOTPOTQA_COLS)
     return dataset
 
 
@@ -764,6 +703,9 @@ def main():
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config,
                                gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+    if INIT_LORA_PATH:
+        model.load(INIT_LORA_PATH, adapter_name=ADAPTER_NAME)
+        logger.info('Loaded cold-start LoRA from %s', INIT_LORA_PATH)
     if USE_MEGATRON:
         model.set_optimizer('default', lr=LEARNING_RATE)
         model.set_lr_scheduler('default', lr_decay_steps=total_steps, max_lr=LEARNING_RATE)
@@ -918,6 +860,7 @@ def main():
             swanlab.log(_coerce_for_swanlab(log_dict), step=batch_step)
             metrics.reset()
             logger.info(f'[Step {batch_step}/{total_steps}] [SKIPPED] {log_dict}')
+            optim_step += optim_steps_per_batch
             continue
 
         metrics.accumulate(
