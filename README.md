@@ -113,6 +113,8 @@ sh INSTALL_MEGATRON.sh
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog
+- 🎉2026-05-20 Support multi-round rollout and RL tool calling.
+- 🎉2026-05-20 Support notifier which will send an error message when training failed.
 - 🎉2026-04-27 Support the `padding_free` operation for sft/dpo/grpo/gkd, use `set_processor('InputProcessor', padding_free=True)` to train with it.
 - 🎉2026-04-22 The ModelScope service has been deployed to [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) with a new release 0.2.1.
 - 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) with a new release 0.2.0.
