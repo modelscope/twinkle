@@ -172,7 +172,7 @@ class SampledSequence:
     """A single sampled sequence with tokens and logprobs."""
     stop_reason: StopReason
     tokens: List[int]
-    logprobs: Optional[List[float]] = None
+    logprobs: Optional[List[List[Tuple[int, float]]]] = None
     decoded: str = None
     new_input_feature: InputFeature = None
 

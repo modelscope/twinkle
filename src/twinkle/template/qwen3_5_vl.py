@@ -3,17 +3,35 @@ import numpy as np
 import torch
 from copy import copy
 from PIL import Image
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
-from twinkle.template import Template
 from twinkle.template.base import ImageInput, VideoInput
+from twinkle.template.qwen import QwenTemplate
 from twinkle.template.utils import get_inputs_embeds_hf
+
+_ROPE_INDEX_CACHE: Dict[str, Callable] = {}
+
+
+def _build_rope_index_func(config) -> Callable:
+    arch = config.architectures[0]
+    fn = _ROPE_INDEX_CACHE.get(arch)
+    if fn is not None:
+        return fn
+    import transformers
+    with torch.device('meta'):
+        model_cls = getattr(transformers, arch)
+        dummy_model = model_cls(config)
+    for _, sub_module in dummy_model.named_modules():
+        if hasattr(sub_module, 'get_rope_index'):
+            _ROPE_INDEX_CACHE[arch] = sub_module.get_rope_index
+            return sub_module.get_rope_index
+    raise NotImplementedError(f'Module {dummy_model.__class__.__name__} has no get_rope_index method!')
 
 
 @remote_class()
-class Qwen3_5Template(Template):
+class Qwen3_5Template(QwenTemplate):
     """
     Processor for Qwen VL series.
 
@@ -23,21 +41,24 @@ class Qwen3_5Template(Template):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Fix upstream Qwen3 chat_template parse bugs (orphan </think> handling).
+        # Deferred import to avoid cycles; idempotent across Ray actor re-init.
+        from twinkle.patch import apply_patch
+        from twinkle.patch.qwen3_chat_template import Qwen3ChatTemplate
+        apply_patch(self.tokenizer, Qwen3ChatTemplate)
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()
-        with torch.device('meta'):
-            import transformers
-            model_cls = self.config.architectures[0]
-            model_cls = getattr(transformers, model_cls)
-            self.dummy_model = model_cls(self.config)
-            self.rope_index_func = self.get_rope_index()
 
-    def get_rope_index(self):
-        for _, sub_module in self.dummy_model.named_modules():
-            if hasattr(sub_module, 'get_rope_index'):
-                return sub_module.get_rope_index
-        raise NotImplementedError(f'Module {self.dummy_model.__class__.__name__} has no get_rope_index method!')
+    @property
+    def rope_index_func(self) -> Callable:
+        """Lazily resolve the rope-index function via a module-level cache.
+
+        Kept off ``self`` so the template's ``__dict__`` stays free of
+        ``nn.Module`` state, which in turn keeps ``dill.dumps(template)``
+        deterministic for HF datasets fingerprinting.
+        """
+        return _build_rope_index_func(self.config)
 
     def _init_vision_config(self):
         """Initialize vision config from processor."""
@@ -117,15 +138,21 @@ class Qwen3_5Template(Template):
         input_feature = self.to_tensor(input_feature)
         attention_mask = input_feature.get('attention_mask').unsqueeze(0)
         input_ids = input_feature['input_ids'].unsqueeze(0)
+        image_grid_thw = input_feature.get('image_grid_thw')
+        video_grid_thw = input_feature.get('video_grid_thw')
+        has_image_grid = image_grid_thw is not None and (torch.is_tensor(image_grid_thw) and image_grid_thw.numel() > 0)
+        has_video_grid = video_grid_thw is not None and (torch.is_tensor(video_grid_thw) and video_grid_thw.numel() > 0)
         if 'mm_token_type_ids' in inspect.signature(self.rope_index_func).parameters:
             mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == self.processor.image_token_id] = 1
-            mm_token_type_ids[input_ids == self.processor.video_token_id] = 2
+            if has_image_grid:
+                mm_token_type_ids[input_ids == self.processor.image_token_id] = 1
+            if has_video_grid:
+                mm_token_type_ids[input_ids == self.processor.video_token_id] = 2
             kwargs['mm_token_type_ids'] = mm_token_type_ids
         position_ids, _ = self.rope_index_func(
             input_ids,
-            image_grid_thw=input_feature.get('image_grid_thw'),
-            video_grid_thw=input_feature.get('video_grid_thw'),
+            image_grid_thw=image_grid_thw if has_image_grid else None,
+            video_grid_thw=video_grid_thw if has_video_grid else None,
             attention_mask=attention_mask,
             **kwargs)
         return self._concat_text_position_ids(position_ids)

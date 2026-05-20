@@ -4,7 +4,6 @@
     <img src="assets/slogan.png" width="200"/>
 </p>
 <p align="center">
-by <a href="https://modelscope.cn/home">ModelScope</a>
 <br>
         English&nbsp ｜ &nbsp<a href="README_ZH.md">中文</a>&nbsp
 </p>
@@ -38,10 +37,6 @@ which offers more functionalities.
 🚀 <b>Multiple Runtime Modes</b>: torchrun / Ray / HTTP.<br>
 🔌 <b>Versatile Backends</b>: Transformers / Megatron.<br>
 👥 <b>Multi-Tenancy Training Service</b>: Train multiple LoRAs that share one base model deployment.<br>
-
-Note: Twinkle✨ is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
-we expect the two projects to evolve together. We expect some fundamental components in Twinkle✨will likely
-be reused in [ms-swift](https://github.com/modelscope/ms-swift).
 
 [Discord Group](https://discord.gg/yeN59wxjwe)              |                  Twinkle Wechat Group                  |
 :------------------------------------------------------:|:------------------------------------------------------:|
@@ -113,6 +108,9 @@ sh INSTALL_MEGATRON.sh
 | Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
 
 ## Changelog
+- 🎉2026-05-20 Support DeepSeek-V4-Flash and DeepSeek-V4-Pro models.
+- 🎉2026-05-20 Multi-turn rollout and tool calling in RL are now supported. The Cookbook is currently being written. You can use `from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout` directly for multi-turn rollout.
+- 🎉2026-05-20 IM message alerting on training job failure is now supported. Usage: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`.
 - 🎉2026-04-27 Support the `padding_free` operation for sft/dpo/grpo/gkd, use `set_processor('InputProcessor', padding_free=True)` to train with it.
 - 🎉2026-04-22 The ModelScope service has been deployed to [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) with a new release 0.2.1.
 - 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) with a new release 0.2.0.
@@ -169,6 +167,8 @@ supported on Twinkle✨ framework.
 |                     | [deepseek-ai/DeepSeek-Prover-V2-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-Prover-V2-7B)             |                    -                    | transformers>=4.39.3 |        ✔         |       [deepseek-ai/DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B)       |
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                 |                    -                    | transformers>=4.39.3 |        ✔         |                 [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                 |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |             1.5B/7B/14B/32B             | transformers>=4.37   |        ✔         | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |
+| DeepSeek V4全系列         | [deepseek-ai/DeepSeek-V4-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) | 284B| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+|         | [deepseek-ai/DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro) | 1.6T| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 
 ## Sample Code
 
@@ -401,9 +401,13 @@ foundation for building customizable, enterprise-grade training services.
 
 ## Contributions
 
-Twinkle✨ is a collaborative initiative put together by ModelScope in partnership
-with the open-source community, with key contributions from strategic stakeholders
-including China Merchants Bank Tech Team.
+**Twinkle✨** is designed, developed, and maintained by an **Open Workshop** composed of members from various open-source technology teams.
+We welcome more developers passionate about large model training to join us in building and improving this framework.
+
+The core members of the workshop currently come from:
+- [ModelScope](https://modelscope.cn/home) Open Source Community Project Team
+- [China Merchants Bank](https://www.cmbchina.com/) Open Source Technology Team
+- Technical staff from various compute hardware teams
 
 We are grateful to the open-source community, particularly the projects that inspired us,
 including [Transformers](https://github.com/huggingface/transformers),

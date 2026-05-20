@@ -947,6 +947,10 @@ class SequenceParallelStrategy:
         gathered_labels = self._trim_gathered_sequence_padding(gathered_labels, real_position_ids)
         outputs['logps'] = gathered_logps
         inputs['labels'] = gathered_labels
+        entropies = outputs.get('entropies')
+        if entropies is not None and torch.is_tensor(entropies) and entropies.dim() >= 2:
+            gathered_entropies, _ = GatherLoss.apply(entropies, labels, 1, real_position_ids)
+            outputs['entropies'] = self._trim_gathered_sequence_padding(gathered_entropies, real_position_ids)
         return inputs, outputs
 
     def wrap_model(self, model, optimizer=None):

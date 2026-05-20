@@ -5,7 +5,45 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from .utils import deep_getattr
 
 if TYPE_CHECKING:
+    import torch
     import torch.nn as nn
+
+
+def align_logps_to_mask(
+    ragged: Any,
+    mask: 'torch.Tensor',
+    dtype: 'torch.dtype',
+) -> Optional['torch.Tensor']:
+    import torch
+
+    device = mask.device
+    batch_size, seq_len = mask.shape
+
+    if isinstance(ragged, torch.Tensor):
+        t = ragged.to(device=device, dtype=dtype)
+        if t.shape == (batch_size, seq_len):
+            return t
+        # Fall through to the list path (row-wise scatter).
+        ragged = [t[i] for i in range(min(batch_size, t.shape[0]))]
+
+    if not isinstance(ragged, (list, tuple)):
+        return None
+
+    result = torch.zeros((batch_size, seq_len), dtype=dtype, device=device)
+    for i, sample in enumerate(ragged):
+        if i >= batch_size:
+            break
+        pos = mask[i].nonzero(as_tuple=True)[0]
+        if len(pos) == 0:
+            continue
+        if isinstance(sample, (int, float)):
+            result[i, pos] = float(sample)
+            continue
+        vals = torch.as_tensor(sample, dtype=dtype, device=device).flatten()
+        n = min(len(pos), int(vals.numel()))
+        if n > 0:
+            result[i, pos[:n]] = vals[:n]
+    return result
 
 
 def filter_from_config_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:

@@ -488,7 +488,7 @@ class InputProcessor:
 
         # Collect output keys to unpack: (key, pad_value)
         output_keys = []
-        for key, pad_val in [('logps', 0), ('logits', 0)]:
+        for key, pad_val in [('logps', 0), ('entropies', 0), ('logits', 0)]:
             if outputs and outputs.get(key) is not None:
                 output_keys.append((key, pad_val))
 

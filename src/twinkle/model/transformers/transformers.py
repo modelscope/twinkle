@@ -396,6 +396,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         processor: InputProcessor = optimizer_config.processor
         loss_instance = optimizer_config.loss_instance
         loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
+        loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -414,7 +415,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             masked_labels[~loss_mask] = 0
             logits = outputs['logits']
             logits.div_(temperature)
-            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+            if loss_require_entropy:
+                outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                    logits, masked_labels, return_entropy=True)
+            else:
+                outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
@@ -464,6 +469,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.loss_instance
             loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
+            loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -486,7 +492,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 masked_labels[~loss_mask] = 0
                 logits = outputs['logits']
                 logits.div_(temperature)
-                outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                if loss_require_entropy:
+                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                        logits, masked_labels, return_entropy=True)
+                else:
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):

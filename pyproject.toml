@@ -43,6 +43,7 @@ docs = [
 packages = [
   { include = "twinkle", from = "src" },
   { include = "twinkle_client", from = "src" },
+  { include = "twinkle_agentic", from = "src" },
 ]
 
 [build-system]

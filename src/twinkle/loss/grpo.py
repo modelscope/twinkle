@@ -18,6 +18,10 @@ class GRPOLoss(Loss):
         epsilon: Clipping epsilon for PPO objective (lower bound)
         epsilon_high: Clipping epsilon for high importance sampling ratio (upper bound)
         beta: KL penalty coefficient (0.0 = no KL penalty)
+        entropy_coef: Entropy bonus coefficient (0.0 = disabled). When > 0, the loss
+            subtracts ``entropy_coef * H(pi)`` per token to encourage exploration and
+            prevent mode-collapse / repetition. Requires the model forward to supply
+            ``outputs['entropies']`` — enabled automatically via ``require_entropy``.
         ignore_index: Index to ignore in labels (default: -100)
     """
 
@@ -26,12 +30,16 @@ class GRPOLoss(Loss):
         epsilon: float = 0.2,
         epsilon_high: Optional[float] = None,
         beta: float = 0.0,
+        entropy_coef: float = 0.0,
         ignore_index: int = -100,
         **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
+        self.entropy_coef = entropy_coef
+        # Gate the expensive entropy compute path in the model forward.
+        self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
 
     def _compute_loss_mask(self, labels: 'torch.Tensor') -> 'torch.Tensor':
@@ -129,7 +137,21 @@ class GRPOLoss(Loss):
         dtype: 'torch.dtype',
         fill_value: float = 0.0,
     ) -> 'torch.Tensor':
-        """Align data to mask: scalars broadcast, sequences scatter."""
+        """Align data to mask: scalars broadcast, sequences scatter.
+
+        Two valid per-sample sequence forms are supported and disambiguated
+        by length:
+          * Response-only form (e.g. ``old_logps`` from vLLM): length equals
+            the number of trainable positions in ``mask[i]`` and is scattered
+            directly onto those positions.
+          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward,
+            right-padded to ``mask.shape[1]``): length ``>= mask.shape[1]``;
+            we slice to ``seq_len`` and index by ``mask[i]`` to extract the
+            trainable positions, then scatter.
+
+        Any other length is a real bug and triggers a hard assert — never
+        silently truncate, since that misaligns IS ratios to the wrong tokens.
+        """
         import torch
 
         batch_size, seq_len = mask.shape
@@ -161,11 +183,22 @@ class GRPOLoss(Loss):
         for i, sample in enumerate(data):
             sample = sample.flatten()
             pos = mask[i].nonzero(as_tuple=True)[0]
-            if sample.numel() == 1:
+            n_pos = len(pos)
+            n_sample = sample.numel()
+
+            if n_sample == 1:
                 result[i, pos] = sample.item()
+            elif n_sample == n_pos:
+                # Response-only form (e.g. old_logps from vLLM).
+                result[i, pos] = sample
+            elif n_sample >= seq_len:
+                # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
+                result[i, pos] = sample[:seq_len][mask[i]]
             else:
-                n = min(len(pos), len(sample))
-                result[i, pos[:n]] = sample[:n]
+                raise AssertionError(f'data/mask length mismatch at sample {i}: '
+                                     f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
+                                     '(expected n_sample == n_pos for response-only form, '
+                                     'or n_sample >= seq_len for full-sequence form)')
 
         return result
 
@@ -242,8 +275,11 @@ class GRPOLoss(Loss):
                 logps.dtype,
             )
 
-        assert advantages is not None, \
-            'advantages must be provided (pass as kwarg to forward_backward)'
+        # GRPO loss is ill-defined without advantages (e.g. ref-logps-only forward,
+        # or eval/validation forwards). Return a zero loss so the forward still
+        # flows through cleanly and callers can harvest outputs['logps'] freely.
+        if advantages is None:
+            return LossOutput(loss=torch.zeros((), device=device, dtype=logps.dtype), num_tokens=0)
 
         advantages = self._pad_and_align_to_batch(
             advantages,
@@ -262,61 +298,17 @@ class GRPOLoss(Loss):
             per_token_kl = (torch.exp(ref_logps - logps) - (ref_logps - logps) - 1)
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
+        if self.entropy_coef > 0.0:
+            entropies = outputs.get('entropies')
+            assert entropies is not None, ('entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
+                                           "loss instance's require_entropy flag was set before the forward call.")
+            # entropies may come in fp32 from the kernel; cast to match logps dtype
+            # so the final per_token_loss stays consistent (bf16 under amp).
+            per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
+
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
         return LossOutput(loss=loss, num_tokens=0)
-
-    def compute_metrics(
-        self,
-        per_token_logps: 'torch.Tensor',
-        per_token_old_logps: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        labels: 'torch.Tensor',
-        ref_logps: Optional['torch.Tensor'] = None,
-    ) -> Dict[str, float]:
-        """Compute training metrics."""
-        import torch
-
-        # Ensure labels are shifted for loss_mask
-        shift_labels = labels[:, 1:] if labels.shape[1] > per_token_logps.shape[1] else labels
-        loss_mask = self._compute_loss_mask(shift_labels)
-
-        # Align shapes
-        seq_len = min(per_token_logps.shape[1], per_token_old_logps.shape[1], loss_mask.shape[1])
-        per_token_logps = per_token_logps[:, -seq_len:]
-        per_token_old_logps = per_token_old_logps[:, -seq_len:]
-        loss_mask = loss_mask[:, -seq_len:]
-
-        token_count = loss_mask.sum().clamp(min=1.0)
-
-        def masked_mean(x):
-            if x.shape[-1] == 1:
-                return x.mean()
-            return (x * loss_mask).sum() / token_count
-
-        log_ratio = torch.clamp(per_token_logps - per_token_old_logps, min=-20.0, max=20.0)
-        ratio = torch.exp(log_ratio)
-
-        # Ensure advantages is 2D
-        if advantages.dim() == 1:
-            advantages = advantages.unsqueeze(1)
-
-        metrics = {}
-
-        # KL divergence
-        metrics['kl'] = masked_mean(-log_ratio).item()
-
-        # Clipping metrics
-        is_low_clipped = (ratio < 1 - self.epsilon) & (advantages < 0)
-        is_high_clipped = (ratio > 1 + self.epsilon_high) & (advantages > 0)
-        metrics['clip_ratio_low'] = masked_mean(is_low_clipped.float()).item()
-        metrics['clip_ratio_high'] = masked_mean(is_high_clipped.float()).item()
-        metrics['clip_ratio'] = masked_mean((is_low_clipped | is_high_clipped).float()).item()
-
-        # Ratio statistics
-        metrics['ratio_mean'] = masked_mean(ratio).item()
-
-        return metrics
 
 
 class GSPOLoss(GRPOLoss):
@@ -390,6 +382,7 @@ class CISPOLoss(GRPOLoss):
     ) -> 'torch.Tensor':
         """Clamped ratio * advantage * log_prob."""
         import torch
+
         clamped_ratios = torch.clamp(ratio, max=1 + self.epsilon).detach()
         return -clamped_ratios * advantages * per_token_logps
 

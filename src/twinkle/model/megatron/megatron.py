@@ -349,12 +349,14 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None):
+        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None, entropies=None):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
             logits = unpacked_logits if unpacked_logits is not None else output_tensor
             outputs = ModelOutput(logits=logits, logps=logps)
+            if entropies is not None:
+                outputs['entropies'] = entropies
             result = loss_instance(inputs, outputs, **current_kwargs)
             if unpacked_logits is not None:
                 outputs.pop('logits', None)
@@ -387,15 +389,22 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             batch['labels'] = labels
             logps = None
             unpacked_logits = None
+            entropies = None
             _loss_instance = loss_instance
             if labels is not None and mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage):
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.clone()
                 masked_labels[~loss_mask] = 0
                 output_tensor.div_(temperature)
-                logps = selective_log_softmax(output_tensor, masked_labels)
+                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
+                if _loss_require_entropy:
+                    logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
+                else:
+                    logps = selective_log_softmax(output_tensor, masked_labels)
                 # Reconstruct full-length tensors from CP-split shards
                 logps = processor.postprocess_tensor_cp(logps)
+                if entropies is not None:
+                    entropies = processor.postprocess_tensor_cp(entropies)
                 batch['labels'] = processor.postprocess_tensor_cp(labels)
                 if 'position_ids' in batch:
                     pos = batch['position_ids']
@@ -404,16 +413,20 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     batch['position_ids'] = processor.postprocess_tensor_cp(pos)
                 # Unpack packed sequences into per-sequence batch format
                 _outputs = {'logps': logps}
+                if entropies is not None:
+                    _outputs['entropies'] = entropies
                 if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
                     _outputs['logits'] = output_tensor
                 batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
                 logps = _outputs['logps']
+                entropies = _outputs.get('entropies', None)
                 unpacked_logits = _outputs.get('logits', None)
             return output_tensor, partial(
                 post_loss_function,
                 inputs=batch,
                 logps=logps,
                 unpacked_logits=unpacked_logits,
+                entropies=entropies,
             )
 
         # Get Megatron's forward-backward function

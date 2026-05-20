@@ -58,7 +58,7 @@ def pad_sequence_to_length(
     return F.pad(tensor, pad_tuple, mode='constant', value=pad_value)
 
 
-def selective_log_softmax(logits, index) -> 'torch.Tensor':
+def selective_log_softmax(logits, index, return_entropy: bool = False):
     """
     refer: trl/trainer/utils
 
@@ -74,10 +74,14 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
             Logits tensor of shape `(..., num_classes)`.
         index (`torch.Tensor`):
             Index tensor of shape `(...)`, specifying the positions to gather from the log-softmax output.
+        return_entropy (`bool`):
+            If True, also compute per-token entropy ``H = -sum_v p_v * log p_v`` in the
+            same pass (logits are only resident here, so computing entropy at this call
+            site avoids materializing a second full-vocab tensor later).
 
     Returns:
-        `torch.Tensor`:
-            Gathered log probabilities with the same shape as `index`.
+        Gathered log probabilities with the same shape as ``index``.
+        If ``return_entropy`` is True, returns ``(per_token_logps, per_token_entropy)``.
     """
     import torch
     import torch.nn.functional as F
@@ -85,6 +89,11 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
     try:
         from megatron.core import parallel_state as mpu
         if mpu.get_tensor_model_parallel_world_size() > 1:
+            if return_entropy:
+                # Under vocab TP, entropy needs extra all-reduces over softmax*logits;
+                # not implemented yet — caller should disable entropy_coef under TP>1.
+                raise NotImplementedError('selective_log_softmax(return_entropy=True) is not supported '
+                                          'under vocab tensor parallelism (TP>1).')
             # clone to avoid modifying the original logits
             return _vocab_parallel_selective_log_softmax(logits.clone(), index)
     except (ImportError, AssertionError, OSError):
@@ -92,17 +101,38 @@ def selective_log_softmax(logits, index) -> 'torch.Tensor':
 
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        if return_entropy:
+            # Per-row loop mirrors the logsumexp path below, to keep peak memory bounded.
+            logsumexp_values = []
+            per_token_entropy = []
+            for row_logits in logits:
+                row_lse = torch.logsumexp(row_logits, dim=-1)
+                logsumexp_values.append(row_lse)
+                # H = lse - E_p[x] = lse - sum(exp(x - lse) * x)
+                row_p = torch.exp(row_logits - row_lse.unsqueeze(-1))
+                per_token_entropy.append(row_lse - (row_p * row_logits).sum(dim=-1))
+            logsumexp_values = torch.stack(logsumexp_values)
+            per_token_entropy = torch.stack(per_token_entropy)
+            per_token_logps = selected_logits - logsumexp_values
+            return per_token_logps, per_token_entropy
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
         per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
         per_token_logps = []
+        per_token_entropy = [] if return_entropy else None
         for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
             row_logps = F.log_softmax(row_logits, dim=-1)
             row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
             per_token_logps.append(row_per_token_logps)
+            if return_entropy:
+                # row_logps is already stable; softmax reuses the same numerics.
+                row_p = torch.exp(row_logps)
+                per_token_entropy.append(-(row_p * row_logps).sum(dim=-1))
         per_token_logps = torch.stack(per_token_logps)
+        if return_entropy:
+            return per_token_logps, torch.stack(per_token_entropy)
     return per_token_logps
 
 
