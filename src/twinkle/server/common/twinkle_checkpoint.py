@@ -27,6 +27,7 @@ class TwinkleTrainingRunManager(BaseTrainingRunManager):
             training_run_id=model_id,
             base_model=run_config.base_model,
             model_owner=self.token,
+            save_dir=run_config.save_dir,
             is_lora=True if lora_config else False,
             corrupted=False,
             lora_rank=lora_config.rank if lora_config else None,

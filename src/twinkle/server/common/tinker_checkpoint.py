@@ -41,6 +41,7 @@ class TinkerTrainingRunManager(BaseTrainingRunManager):
 
     def _parse_training_run(self, data: Dict[str, Any]) -> tinker_types.TrainingRun:
         data = self._transform_checkpoint_fields(data)
+        data.pop('save_dir', None)
         return tinker_types.TrainingRun(**data)
 
     def _transform_checkpoint_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:

@@ -110,6 +110,7 @@ class ResumeFromCheckpointRequest(BaseModel):
 class AddAdapterRequest(BaseModel):
     adapter_name: str
     config: str
+    save_dir: Optional[str] = None
 
     class Config:
         extra = 'allow'
