@@ -1,11 +1,38 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from .utils import deep_getattr
 
 if TYPE_CHECKING:
     import torch.nn as nn
+
+
+def filter_from_config_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    load_only_keys = {
+        'cache_dir',
+        'device_map',
+        'force_download',
+        'ignore_mismatched_sizes',
+        'local_files_only',
+        'low_cpu_mem_usage',
+        'max_memory',
+        'offload_buffers',
+        'offload_folder',
+        'offload_state_dict',
+        'output_loading_info',
+        'proxies',
+        'resume_download',
+        'revision',
+        'state_dict',
+        'subfolder',
+        'token',
+        'tokenizer_id',
+        'trust_remote_code',
+        'use_safetensors',
+        'weights_only',
+    }
+    return {key: value for key, value in kwargs.items() if key not in load_only_keys}
 
 
 def find_layers(
