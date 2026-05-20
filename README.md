@@ -4,7 +4,6 @@
     <img src="assets/slogan.png" width="200"/>
 </p>
 <p align="center">
-by <a href="https://modelscope.cn/home">ModelScope</a>
 <br>
         English&nbsp ｜ &nbsp<a href="README_ZH.md">中文</a>&nbsp
 </p>
@@ -38,10 +37,6 @@ which offers more functionalities.
 🚀 <b>Multiple Runtime Modes</b>: torchrun / Ray / HTTP.<br>
 🔌 <b>Versatile Backends</b>: Transformers / Megatron.<br>
 👥 <b>Multi-Tenancy Training Service</b>: Train multiple LoRAs that share one base model deployment.<br>
-
-Note: Twinkle✨ is built by the team behind [ms-swift](https://github.com/modelscope/ms-swift), and
-we expect the two projects to evolve together. We expect some fundamental components in Twinkle✨will likely
-be reused in [ms-swift](https://github.com/modelscope/ms-swift).
 
 [Discord Group](https://discord.gg/yeN59wxjwe)              |                  Twinkle Wechat Group                  |
 :------------------------------------------------------:|:------------------------------------------------------:|
