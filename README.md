@@ -109,8 +109,8 @@ sh INSTALL_MEGATRON.sh
 
 ## Changelog
 - 🎉2026-05-20 Support DeepSeek-V4-Flash and DeepSeek-V4-Pro models.
-- 🎉2026-05-20 Support multi-round rollout and RL tool calling.
-- 🎉2026-05-20 Support notifier which will send an error message when training failed.
+- 🎉2026-05-20 Multi-turn rollout and tool calling in RL are now supported. The Cookbook is currently being written. You can use `from twinkle_agentic.rollout import MultiTurnRollout/APIMultiTurnRollout` directly for multi-turn rollout.
+- 🎉2026-05-20 IM message alerting on training job failure is now supported. Usage: `import twinkle; twinkle.initialize(..., notifier=DingNotifier(...))`.
 - 🎉2026-04-27 Support the `padding_free` operation for sft/dpo/grpo/gkd, use `set_processor('InputProcessor', padding_free=True)` to train with it.
 - 🎉2026-04-22 The ModelScope service has been deployed to [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) with a new release 0.2.1.
 - 🎉2026-04-14 The ModelScope service has been deployed to [Qwen/Qwen3.6-35B-A3B](https://www.modelscope.cn/models/Qwen/Qwen3.6-35B-A3B) with a new release 0.2.0.
