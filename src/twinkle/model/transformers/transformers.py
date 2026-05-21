@@ -1189,17 +1189,23 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 model_sd = model.state_dict()
                 converted_weights = {}
                 direct_weights = {}
+                full_adapter_source = {}
                 for key, value in adapter_weights.items():
                     model_key = key
                     if f'.{adapter_name}.weight' not in model_key:
                         model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
                     if model_key in model_sd:
                         param = model_sd[model_key]
+                        full_adapter_source[model_key] = value.detach().cpu().clone()
                         value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
                         if isinstance(param, DTensor) and not isinstance(value, DTensor):
                             value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
                         direct_weights[model_key] = value
                     converted_weights[key] = value
+
+                set_adapter_full_state = getattr(self.strategy, 'set_adapter_full_state_dict', None)
+                if set_adapter_full_state is not None and full_adapter_source:
+                    set_adapter_full_state(full_adapter_source)
 
                 if _has_param_wrapper_without_base_weight(model):
                     model.load_state_dict(direct_weights, strict=False)
