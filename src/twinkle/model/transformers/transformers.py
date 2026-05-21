@@ -13,7 +13,7 @@ import transformers
 from copy import copy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
-from peft.utils import load_peft_weights, set_peft_model_state_dict
+from peft.utils import load_peft_weights
 from safetensors.torch import save_file
 from torch import GradScaler
 from torch.optim import Adam, AdamW, Optimizer
@@ -46,58 +46,6 @@ from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
-
-
-def _get_named_child(module, name: str):
-    if hasattr(module, name):
-        return getattr(module, name)
-    if name.isdigit() and hasattr(module, '__getitem__'):
-        try:
-            return module[int(name)]
-        except (IndexError, TypeError, KeyError):
-            return None
-    return None
-
-
-def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_world_size: int,
-                                 ep_rank: int) -> torch.Tensor:
-    """Slice saved LoRA expert weights by EP rank before DTensor/FSDP placement."""
-    if ep_world_size <= 1:
-        return value
-
-    parts = model_key.split('.')
-    parent = model
-    matched = False
-    for i, part in enumerate(parts[:-1]):
-        parent = _get_named_child(parent, part)
-        if parent is None:
-            return value
-        next_seg = parts[i + 1] if i + 1 < len(parts) else None
-        if getattr(parent, '_ep_patched', False) and next_seg == 'experts':
-            matched = True
-
-    if not matched:
-        return value
-    if 'lora_A' in model_key:
-        chunk = value.size(0) // ep_world_size
-        return value.narrow(0, ep_rank * chunk, chunk).contiguous()
-    if 'lora_B' in model_key:
-        chunk = value.size(1) // ep_world_size
-        return value.narrow(1, ep_rank * chunk, chunk).contiguous()
-    return value
-
-
-def _has_param_wrapper_without_base_weight(model) -> bool:
-    for module in model.modules():
-        if not hasattr(module, 'parameter_name'):
-            continue
-        get_base_layer = getattr(module, 'get_base_layer', None)
-        if get_base_layer is None:
-            continue
-        base_layer = get_base_layer()
-        if not hasattr(base_layer, 'weight'):
-            return True
-    return False
 
 
 @dataclass
@@ -1092,44 +1040,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
-
-            def load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name='default'):
-                from torch.distributed.tensor import DTensor, distribute_tensor
-
-                ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
-                ep_world_size = ep_fsdp_mesh['ep'].size() if ep_fsdp_mesh is not None else 1
-                ep_rank = ep_fsdp_mesh['ep'].get_local_rank() if ep_world_size > 1 else 0
-
-                model_sd = model.state_dict()
-                converted_weights = {}
-                direct_weights = {}
-                full_adapter_source = {}
-                for key, value in adapter_weights.items():
-                    model_key = key
-                    if f'.{adapter_name}.weight' not in model_key:
-                        model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
-                    if model_key in model_sd:
-                        param = model_sd[model_key]
-                        full_adapter_source[model_key] = value.detach().cpu().clone()
-                        value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
-                        if isinstance(param, DTensor) and not isinstance(value, DTensor):
-                            value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
-                        direct_weights[model_key] = value
-                    converted_weights[key] = value
-
-                set_adapter_full_state = getattr(self.strategy, 'set_adapter_full_state_dict', None)
-                if set_adapter_full_state is not None and full_adapter_source:
-                    set_adapter_full_state(full_adapter_source)
-
-                if _has_param_wrapper_without_base_weight(model):
-                    model.load_state_dict(direct_weights, strict=False)
-                else:
-                    set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
-
-            if self.device_mesh.fsdp_world_size > 1:
-                load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name=adapter_name)
-            else:
-                set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+            self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
             raise NotImplementedError
 

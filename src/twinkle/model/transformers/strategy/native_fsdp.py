@@ -4,15 +4,17 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, torch_util
 from .load_context import fsdp_pretrained_load_context
-from .native_fsdp_state import (_collect_adapter_source_state, _collect_state_metadata, _is_lora_state_key,
-                                _resolve_full_state_source_key)
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
+
+LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
+PEFT_BASE_PREFIX = 'base_model.model.'
+PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
 class NativeFSDPStrategy:
@@ -47,6 +49,15 @@ class NativeFSDPStrategy:
 
     def set_adapter_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         self._adapter_full_state_dict = state_dict
+
+    def load_peft_weights(self, model, adapter_weights: Mapping[str, torch.Tensor], adapter_name: str) -> None:
+        from peft.utils import set_peft_model_state_dict
+
+        fsdp_world_size = self.device_mesh.fsdp_world_size if self.device_mesh is not None else 1
+        if fsdp_world_size > 1:
+            _load_peft_weights_for_native_fsdp2(model, adapter_weights, adapter_name, self)
+        else:
+            set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -579,6 +590,154 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
         return optimizer
     optimizer.param_groups[0]['params'] = list(model.parameters())
     return optimizer
+
+
+def _is_lora_state_key(name: str) -> bool:
+    return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
+
+
+def _strip_peft_base_prefix(name: str) -> str:
+    while name.startswith(PEFT_BASE_PREFIX):
+        name = name[len(PEFT_BASE_PREFIX):]
+    return name
+
+
+def _strip_base_layer_segments(name: str) -> str:
+    return '.'.join(segment for segment in name.split('.') if segment != PEFT_BASE_LAYER_SEGMENT)
+
+
+def _source_key_candidates(param_name: str) -> List[str]:
+    stripped_prefix = _strip_peft_base_prefix(param_name)
+    candidates = [
+        param_name,
+        stripped_prefix,
+        _strip_base_layer_segments(param_name),
+        _strip_base_layer_segments(stripped_prefix),
+    ]
+    deduped = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, Any]) -> str:
+    if _is_lora_state_key(param_name):
+        raise KeyError(f"LoRA parameter '{param_name}' must be loaded from adapter source state.")
+
+    candidates = _source_key_candidates(param_name)
+    for candidate in candidates:
+        if candidate in source_state:
+            return candidate
+    raise KeyError(f"Missing source metadata for parameter '{param_name}'. "
+                   f'Tried source keys: {", ".join(candidates)}.')
+
+
+def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+    adapter_state = {}
+    for name, tensor in state_dict.items():
+        if not _is_lora_state_key(name) or not hasattr(tensor, 'detach'):
+            continue
+        if getattr(tensor, 'is_meta', False):
+            continue
+        adapter_state[name] = tensor.detach().cpu().clone()
+    return adapter_state
+
+
+def _collect_state_metadata(state_dict: Mapping[str, Any]) -> Dict[str, tuple[tuple[int, ...], Any]]:
+    return {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in state_dict.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+    }
+
+
+def _get_named_child(module, name: str):
+    if hasattr(module, name):
+        return getattr(module, name)
+    if name.isdigit() and hasattr(module, '__getitem__'):
+        try:
+            return module[int(name)]
+        except (IndexError, TypeError, KeyError):
+            return None
+    return None
+
+
+def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_world_size: int,
+                                 ep_rank: int) -> torch.Tensor:
+    """Slice saved LoRA expert weights by EP rank before DTensor/FSDP placement."""
+    if ep_world_size <= 1:
+        return value
+
+    parent = model
+    matched = False
+    parts = model_key.split('.')
+    for i, part in enumerate(parts[:-1]):
+        parent = _get_named_child(parent, part)
+        if parent is None:
+            return value
+        next_seg = parts[i + 1] if i + 1 < len(parts) else None
+        if getattr(parent, '_ep_patched', False) and next_seg == 'experts':
+            matched = True
+
+    if not matched:
+        return value
+    if 'lora_A' in model_key:
+        chunk = value.size(0) // ep_world_size
+        return value.narrow(0, ep_rank * chunk, chunk).contiguous()
+    if 'lora_B' in model_key:
+        chunk = value.size(1) // ep_world_size
+        return value.narrow(1, ep_rank * chunk, chunk).contiguous()
+    return value
+
+
+def _has_param_wrapper_without_base_weight(model) -> bool:
+    for module in model.modules():
+        if not hasattr(module, 'parameter_name'):
+            continue
+        get_base_layer = getattr(module, 'get_base_layer', None)
+        if get_base_layer is None:
+            continue
+        base_layer = get_base_layer()
+        if not hasattr(base_layer, 'weight'):
+            return True
+    return False
+
+
+def _load_peft_weights_for_native_fsdp2(model, adapter_weights: Mapping[str, torch.Tensor], adapter_name: str,
+                                        strategy: NativeFSDPStrategy) -> None:
+    """Load PEFT adapter weights into a native FSDP2 model, including EP expert adapters."""
+    from peft.utils import set_peft_model_state_dict
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    ep_fsdp_mesh = getattr(strategy, 'ep_fsdp_device_mesh', None)
+    ep_world_size = ep_fsdp_mesh['ep'].size() if ep_fsdp_mesh is not None else 1
+    ep_rank = ep_fsdp_mesh['ep'].get_local_rank() if ep_world_size > 1 else 0
+
+    model_sd = model.state_dict()
+    converted_weights = {}
+    direct_weights = {}
+    full_adapter_source = {}
+    for key, value in adapter_weights.items():
+        model_key = key
+        if f'.{adapter_name}.weight' not in model_key:
+            model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
+        if model_key in model_sd:
+            param = model_sd[model_key]
+            full_adapter_source[model_key] = value.detach().cpu().clone()
+            value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
+            if isinstance(param, DTensor) and not isinstance(value, DTensor):
+                value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
+            direct_weights[model_key] = value
+        converted_weights[key] = value
+
+    set_adapter_full_state = getattr(strategy, 'set_adapter_full_state_dict', None)
+    if set_adapter_full_state is not None and full_adapter_source:
+        set_adapter_full_state(full_adapter_source)
+
+    if _has_param_wrapper_without_base_weight(model):
+        model.load_state_dict(direct_weights, strict=False)
+    else:
+        set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
 
 
 def _broadcast_sharded_state_dict(

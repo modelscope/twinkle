@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from datetime import timedelta
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Mapping, Optional
 
 from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
@@ -274,6 +274,11 @@ class AccelerateStrategy:
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
+
+    def load_peft_weights(self, model, adapter_weights: Mapping[str, Any], adapter_name: str) -> None:
+        from peft.utils import set_peft_model_state_dict
+
+        set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
 
     def _get_fsdp_plugin(self):
         state = self.accelerator.state
