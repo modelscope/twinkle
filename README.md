@@ -92,8 +92,7 @@ sh INSTALL_MEGATRON.sh
 | Training Type                        | Model Framework | Cookbook Path                                          |
 | ------------------------------------ | --------------- | ----------------------------------------------------- |
 | FSDP finetuning                      | transformers    | [Script](cookbook/transformers/fsdp2.py)               |
-| FSDP MoE finetuning                  | transformers    | [Script](cookbook/transformers/fsdp2_moe.py)           |
-| EP FSDP MoE finetuning               | transformers    | [Script](cookbook/transformers/ep_fsdp_qwen3_moe.py)  |
+| EP FSDP2 LoRA finetuning             | transformers    | [Script](cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py) |
 | SP FSDP finetuning                   | transformers    | [Script](cookbook/transformers/sp_fsdp_dense.py)      |
 | pp/tp/cp finetuning                  | megatron        | [Script](cookbook/megatron/tp.py)                      |
 | pp/tp/cp MoE finetuning              | megatron        | [Script](cookbook/megatron/tp_moe.py)                  |
