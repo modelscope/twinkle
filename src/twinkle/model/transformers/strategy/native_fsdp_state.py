@@ -43,9 +43,8 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
     for candidate in candidates:
         if candidate in source_state:
             return candidate
-    raise KeyError(
-        f"Missing source metadata for parameter '{param_name}'. "
-        f'Tried source keys: {", ".join(candidates)}.')
+    raise KeyError(f"Missing source metadata for parameter '{param_name}'. "
+                   f'Tried source keys: {", ".join(candidates)}.')
 
 
 def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
@@ -62,6 +61,5 @@ def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, An
 def _collect_state_metadata(state_dict: Mapping[str, Any]) -> Dict[str, tuple[tuple[int, ...], Any]]:
     return {
         name: (tuple(tensor.shape), tensor.dtype)
-        for name, tensor in state_dict.items()
-        if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+        for name, tensor in state_dict.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
     }

@@ -7,7 +7,6 @@ import os
 import random
 import re
 import threading
-import time
 import torch
 import torch.distributed as dist
 import transformers
@@ -47,25 +46,6 @@ from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
-
-
-def _twinkle_fsdp_debug(message: str) -> None:
-    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
-        return
-    try:
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', 0))
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    except Exception:
-        rank = int(os.environ.get('RANK', 0))
-        world_size = 1
-    local_rank = os.environ.get('LOCAL_RANK', '?')
-    text = f'[twinkle-model-debug][time={time.time():.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
-    print(text, flush=True)
-    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        with open(os.path.join(debug_dir, f'model_rank{rank}.log'), 'a', encoding='utf-8') as f:
-            f.write(text + '\n')
 
 
 def _get_named_child(module, name: str):
@@ -237,9 +217,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             memory_efficient_init: bool = False,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        _twinkle_fsdp_debug('TransformersModel init before process_group')
         self._try_init_process_group()
-        _twinkle_fsdp_debug('TransformersModel init after process_group')
         super(PreTrainedModel, self).__init__()
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
@@ -249,14 +227,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
-        _twinkle_fsdp_debug(
-            f'TransformersModel strategy decided strategy={strategy} '
-            f'memory_efficient_init={memory_efficient_init}')
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
-            _twinkle_fsdp_debug(f'before HubOperation.download_model model_id={model_id}')
             model_id = HubOperation.download_model(model_id)
-            _twinkle_fsdp_debug(f'after HubOperation.download_model model_id={model_id}')
         self.model_id = model_id
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         if config is None:
@@ -271,24 +244,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
-            _twinkle_fsdp_debug('before model_cls.from_config')
             self.model = model_cls.from_config(self.hf_config, **kwargs)
-            _twinkle_fsdp_debug('after model_cls.from_config')
         elif self._should_init_empty_pretrained_model_on_this_rank():
-            _twinkle_fsdp_debug('before empty model_cls.from_config for rank0 broadcast')
             self.model = self._init_empty_model_from_config(model_cls, **kwargs)
-            _twinkle_fsdp_debug('after empty model_cls.from_config for rank0 broadcast')
         else:
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
-            _twinkle_fsdp_debug('before pretrained_load_context')
             with self.strategy.pretrained_load_context():
-                _twinkle_fsdp_debug('before model_cls.from_pretrained')
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
-                _twinkle_fsdp_debug('after model_cls.from_pretrained')
-            _twinkle_fsdp_debug('after pretrained_load_context')
-        _twinkle_fsdp_debug('before gradient_checkpointing_enable')
         self.model.gradient_checkpointing_enable()
-        _twinkle_fsdp_debug('after gradient_checkpointing_enable')
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {
@@ -299,11 +262,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
-        return bool(
-            use_rank0_broadcast()
-            and dist.is_available()
-            and dist.is_initialized()
-            and dist.get_rank() != 0)
+        return bool(use_rank0_broadcast() and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
 
     def _init_empty_model_from_config(self, model_cls, **kwargs):
         from accelerate import init_empty_weights
@@ -482,9 +441,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         temperature = float(kwargs.pop('temperature', 1.0))
         return_logits = kwargs.pop('return_logits', False)
         optimizer_config = self.optimizer_group[adapter_name]
-        _twinkle_fsdp_debug('forward before _lazy_wrap_model')
         self._lazy_wrap_model()
-        _twinkle_fsdp_debug('forward after _lazy_wrap_model')
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.train()
@@ -678,42 +635,28 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
-        _twinkle_fsdp_debug(
-            f'backward enter adapter={adapter_name} loss_shape={tuple(loss_value.shape)} '
-            f'loss_dtype={loss_value.dtype} loss_device={loss_value.device}')
         scaler = optimizer_config.scaler
         if scaler is None and self.mixed_precision == 'fp16':
             # Auto set a grad scaler
-            _twinkle_fsdp_debug('backward before set_grad_scaler')
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
-            _twinkle_fsdp_debug('backward after set_grad_scaler')
 
         optimizer_config.cur_step += 1
         should_sync = optimizer_config.do_grad_sync()
-        _twinkle_fsdp_debug(f'backward cur_step={optimizer_config.cur_step} should_sync={should_sync}')
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
         if not should_sync and hasattr(self.model, 'no_sync'):
-            _twinkle_fsdp_debug('backward using model.no_sync')
             no_sync_ctx = self.model.no_sync()
 
-        _twinkle_fsdp_debug('backward before no_sync_ctx')
         with no_sync_ctx:
             if scaler is not None:
-                _twinkle_fsdp_debug('backward before scaler backward')
                 scaler.scale(loss_value).backward()
-                _twinkle_fsdp_debug('backward after scaler backward')
             else:
-                _twinkle_fsdp_debug('backward before loss.backward')
                 loss_value.backward()
-                _twinkle_fsdp_debug('backward after loss.backward')
-        _twinkle_fsdp_debug('backward after no_sync_ctx')
 
         # self._sync_after_backward_if_needed()
         optimizer_config.train_status.loss_value = None
-        _twinkle_fsdp_debug('backward exit')
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -729,14 +672,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             The output of the model forward.
         """
-        _twinkle_fsdp_debug('forward_backward enter')
         outputs = self.forward(inputs=inputs, **kwargs)
-        _twinkle_fsdp_debug('forward_backward after forward')
         loss = self.calculate_loss(**kwargs)
-        _twinkle_fsdp_debug('forward_backward after calculate_loss')
         outputs['loss'] = loss
         self.backward(**kwargs)
-        _twinkle_fsdp_debug('forward_backward after backward')
         return outputs
 
     # def _sync_after_backward_if_needed(self) -> None:
@@ -1359,23 +1298,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not getattr(self, '_enable_expert_parallel', False):
             return
         if not isinstance(self.strategy, NativeFSDPStrategy):
-            raise RuntimeError(
-                'EP + LoRA requires strategy=native_fsdp; '
-                f'got {type(self.strategy).__name__}.')
+            raise RuntimeError('EP + LoRA requires strategy=native_fsdp; '
+                               f'got {type(self.strategy).__name__}.')
         if not isinstance(lora_config, LoraConfig):
             return
         target_params = getattr(lora_config, 'target_parameters', None) or []
         if target_params:
             if getattr(lora_config, 'use_dora', False):
-                raise ValueError(
-                    'PEFT ParamWrapper does not support use_dora=True with target_parameters; '
-                    'disable DoRA when training expert parameters.')
+                raise ValueError('PEFT ParamWrapper does not support use_dora=True with target_parameters; '
+                                 'disable DoRA when training expert parameters.')
             if getattr(lora_config, 'lora_bias', False):
-                raise ValueError(
-                    'PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
+                raise ValueError('PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
             if float(getattr(lora_config, 'lora_dropout', 0.0)) > 0.0:
-                raise ValueError(
-                    'PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
+                raise ValueError('PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
 
     @staticmethod
     def _maybe_autofill_target_parameters(lora_config, enable_ep: bool):
@@ -1386,9 +1321,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         target_params = getattr(lora_config, 'target_parameters', None) or []
         if not target_params:
             lora_config.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
-            logger.info(
-                "EP+LoRA auto-filled target_parameters with "
-                "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
+            logger.info('EP+LoRA auto-filled target_parameters with '
+                        "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
         return lora_config
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):

@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import time
 from datetime import timedelta
 from typing import Any, Dict, Literal, Optional
 
@@ -16,9 +15,9 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     tensors; older Accelerate versions assume every state-dict entry has
     `device_mesh` and fail on such buffers.
     """
+    import accelerate.utils.fsdp_utils as fsdp_utils
     import torch
     import torch.distributed as dist
-    import accelerate.utils.fsdp_utils as fsdp_utils
     from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 
     if getattr(fsdp_utils.fsdp2_load_full_state_dict, '_twinkle_patched', False):
@@ -27,13 +26,8 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     original = fsdp_utils.fsdp2_load_full_state_dict
 
     def patched_fsdp2_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
-        _fsdp_debug(
-            f'enter fsdp2_load_full_state_dict device={accelerator.device} '
-            f'full_sd_keys={len(full_sd) if full_sd is not None else "None"}')
-
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
-        _fsdp_debug(f'patched fsdp2 meta_sharded_keys={len(meta_sharded_sd)}')
 
         def _infer_parameter_dtype(model, param_name, empty_param):
             try:
@@ -103,21 +97,13 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
 
         def _tensor_debug(tensor):
             if isinstance(tensor, DTensor):
-                return (
-                    f'type=DTensor shape={tuple(tensor.size())} dtype={tensor.dtype} '
-                    f'placements={tensor.placements} mesh={tensor.device_mesh}')
+                return (f'type=DTensor shape={tuple(tensor.size())} dtype={tensor.dtype} '
+                        f'placements={tensor.placements} mesh={tensor.device_mesh}')
             if hasattr(tensor, 'size') and hasattr(tensor, 'dtype'):
                 return f'type={type(tensor).__name__} shape={tuple(tensor.size())} dtype={tensor.dtype}'
             return f'type={type(tensor).__name__}'
 
         for param_name, sharded_param in meta_sharded_sd.items():
-            _fsdp_debug(f'load state entry start: {param_name} {_tensor_debug(sharded_param)}')
-            if accelerator.is_main_process:
-                full_value = full_sd.get(param_name)
-                if full_value is None:
-                    _fsdp_debug(f'full state entry missing: {param_name}')
-                else:
-                    _fsdp_debug(f'full state entry: {param_name} {_tensor_debug(full_value)}')
             if isinstance(sharded_param, DTensor):
                 device_mesh = sharded_param.device_mesh
                 placements = sharded_param.placements
@@ -131,9 +117,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                     )
 
                 dist.broadcast(full_param, src=0, group=dist.group.WORLD)
-                _fsdp_debug(f'broadcast done: {param_name}')
                 sharded_tensor = _dtensor_from_replicated_full_tensor(full_param, device_mesh, placements)
-                _fsdp_debug(f'local shard done: {param_name}')
                 to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_param)
                 sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
                 if cpu_offload:
@@ -151,7 +135,6 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
                 )
 
             dist.broadcast(full_value, src=0, group=dist.group.WORLD)
-            _fsdp_debug(f'broadcast done: {param_name}')
             to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_value)
             full_value = _cast_and_contiguous(full_value, to_contiguous, casting_dtype)
             if cpu_offload:
@@ -159,33 +142,11 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
             sharded_sd[param_name] = full_value
 
         model.load_state_dict(sharded_sd, assign=True)
-        _fsdp_debug('exit patched fsdp2_load_full_state_dict')
         return model
 
     patched_fsdp2_load_full_state_dict._twinkle_patched = True
     patched_fsdp2_load_full_state_dict._twinkle_original = original
     fsdp_utils.fsdp2_load_full_state_dict = patched_fsdp2_load_full_state_dict
-
-
-def _fsdp_debug(message: str) -> None:
-    if os.environ.get('TWINKLE_FSDP_DEBUG', '0') != '1':
-        return
-    try:
-        import torch.distributed as dist
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    except Exception:
-        rank = 0
-        world_size = 1
-    local_rank = os.environ.get('LOCAL_RANK', '?')
-    timestamp = time.time()
-    text = f'[twinkle-fsdp-debug][time={timestamp:.6f} rank{rank}/{world_size} local_rank={local_rank}] {message}'
-    print(text, flush=True)
-    debug_dir = os.environ.get('TWINKLE_DEBUG_DIR')
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        with open(os.path.join(debug_dir, f'fsdp_rank{rank}.log'), 'a', encoding='utf-8') as f:
-            f.write(text + '\n')
 
 
 class AccelerateStrategy:
@@ -219,8 +180,8 @@ class AccelerateStrategy:
 
         kwargs_handlers = []
         kwargs_handlers.append(
-            InitProcessGroupKwargs(timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))))
-        )
+            InitProcessGroupKwargs(
+                timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200')))))
         if ddp_config is not None:
             from accelerate import DistributedDataParallelKwargs
             ddp_config = DistributedDataParallelKwargs(**ddp_config)
@@ -308,9 +269,7 @@ class AccelerateStrategy:
         return fsdp_plugin
 
     def wrap_model(self, model, *args):
-        _fsdp_debug('enter accelerator.prepare')
         result = self.accelerator.prepare(model, *args)
-        _fsdp_debug('exit accelerator.prepare')
         return result
 
     def unwrap_model(self, model):
