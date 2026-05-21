@@ -88,11 +88,11 @@ def train():
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
         fsdp_config={
             'reshard_after_forward': RESHARD_AFTER_FORWARD,
-             'expert_parallel': {
-             'enabled': True,
-             'router_dtype': 'fp32',
-             'keep_router_logits': False,
-    },
+            'expert_parallel': {
+                'enabled': True,
+                'router_dtype': 'fp32',
+                'keep_router_logits': False,
+            },
         },
     )
 
