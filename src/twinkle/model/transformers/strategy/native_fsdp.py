@@ -6,11 +6,14 @@ from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
-from twinkle.utils import DeviceMesh, Platform, torch_util
+from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
+from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
+
+logger = get_logger()
 
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
 PEFT_BASE_PREFIX = 'base_model.model.'
@@ -34,6 +37,7 @@ class NativeFSDPStrategy:
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
         self._rank0_pre_ep_full_state_dict = None
         self._adapter_full_state_dict = None
+        self._pre_ep_state_captured = False
 
     def pretrained_load_context(self):
         # Native FSDP loads pretrained weights via rank0 broadcast during wrap_model().
@@ -43,6 +47,40 @@ class NativeFSDPStrategy:
 
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
+
+    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
+        if self._pre_ep_state_captured:
+            return
+        if not (enable_ep and self.use_rank0_pretrained_broadcast()):
+            return
+        is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
+        self.set_rank0_pre_ep_full_state_dict(clone_state_dict_to_cpu(model.state_dict()) if is_rank0 else {})
+        self._pre_ep_state_captured = True
+
+    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
+        if not enable_ep:
+            return config_or_dir
+
+        from peft import LoraConfig
+
+        if not isinstance(config_or_dir, LoraConfig):
+            return config_or_dir
+
+        target_params = getattr(config_or_dir, 'target_parameters', None) or []
+        if target_params:
+            if getattr(config_or_dir, 'use_dora', False):
+                raise ValueError('PEFT ParamWrapper does not support use_dora=True with target_parameters; '
+                                 'disable DoRA when training expert parameters.')
+            if getattr(config_or_dir, 'lora_bias', False):
+                raise ValueError('PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
+            if float(getattr(config_or_dir, 'lora_dropout', 0.0)) > 0.0:
+                raise ValueError('PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
+            return config_or_dir
+
+        config_or_dir.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
+        logger.info('EP+LoRA auto-filled target_parameters with '
+                    "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
+        return config_or_dir
 
     def set_rank0_pre_ep_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         self._rank0_pre_ep_full_state_dict = state_dict

@@ -197,6 +197,12 @@ class AccelerateStrategy:
     def pretrained_load_context(self):
         return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
 
+    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
+        return
+
+    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
+        return config_or_dir
+
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):
         # TODO should test with transformers v5.0
