@@ -77,3 +77,37 @@ def copy_files_by_pattern(source_dir, dest_dir, patterns, exclude_patterns=None)
                     destination = os.path.join(dest_dir, file_name)
                     if not os.path.exists(destination):
                         shutil.copy2(file_path, destination)
+
+
+def get_runtime_meta() -> str:
+    import platform
+    import socket
+    import sys
+    hostname = 'unknown'
+    ip = 'unknown'
+    try:
+        hostname = socket.gethostname()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # UDP connect does not actually send packets; resolves outbound iface IP.
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:  # noqa: BLE001
+        try:
+            ip = socket.gethostbyname(hostname)
+        except Exception:  # noqa: BLE001
+            pass
+    rank = os.environ.get('RANK', '?')
+    world_size = os.environ.get('WORLD_SIZE', '?')
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    lines = [
+        f'- **Host**: `{hostname}` (`{ip}`)',
+        f'- **Python**: `{platform.python_version()}` @ `{sys.executable}`',
+        f'- **Rank**: `{rank}/{world_size}` (local_rank=`{local_rank}`)',
+    ]
+    return '\n'.join(lines)

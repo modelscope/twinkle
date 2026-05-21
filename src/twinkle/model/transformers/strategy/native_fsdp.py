@@ -38,9 +38,9 @@ class NativeFSDPStrategy:
         self._adapter_full_state_dict = None
 
     def pretrained_load_context(self):
-        # Native FSDP handles rank0-load itself. Do not enable Transformers'
-        # FSDP efficient-loading env here, because some versions have an
-        # unmatched non-rank0 barrier in from_pretrained().
+        # Native FSDP loads pretrained weights via rank0 broadcast during wrap_model().
+        # Avoid Transformers' FSDP loading env here; some versions can hang non-rank0
+        # ranks in from_pretrained barriers.
         return fsdp_pretrained_load_context(False)
 
     def use_rank0_pretrained_broadcast(self) -> bool:
@@ -79,7 +79,6 @@ class NativeFSDPStrategy:
             if optimizer is not None:
                 _unbind_optimizer_params(optimizer)
 
-            # EP path requires experts on a real device, incompatible with meta-device flow.
             use_meta = self.use_rank0_pretrained_broadcast()
 
             original_sd = None
@@ -136,7 +135,8 @@ class NativeFSDPStrategy:
                         mp_policy=ep_mp_policy,
                         shard_placement_fn=lambda param: Shard(1),
                     )
-                    experts_mod.set_gradient_divide_factor(world_size)
+                    if hasattr(experts_mod, 'set_gradient_divide_factor'):
+                        experts_mod.set_gradient_divide_factor(world_size)
                     layer_mod._fsdp_modules.append(experts_mod)
 
                 fully_shard(
@@ -162,7 +162,7 @@ class NativeFSDPStrategy:
                 rank_to_ep_rank = _build_rank_to_ep_rank(self.ep_fsdp_device_mesh) if ep_enabled else {}
                 _broadcast_sharded_state_dict(
                     model,
-                    original_sd,
+                    original_sd or {},
                     device_type=device_type,
                     expert_shard_specs=expert_shard_specs,
                     rank_to_ep_rank=rank_to_ep_rank,
@@ -454,7 +454,7 @@ def _collect_ep_experts_map(model: nn.Module) -> Dict[str, nn.Module]:
 
 
 def _collect_ep_expert_shard_specs(model: nn.Module) -> Dict[str, Dict[str, int]]:
-    """Collect state-dict names that are sharded by EP and their local expert range."""
+    """Collect state-dict names for expert tensors sharded by EP."""
     specs = {}
     for fqn, module in model.named_modules():
         if not getattr(module, '_ep_patched', False):
@@ -517,17 +517,19 @@ def _place_ep_experts_on_local_device(model: nn.Module, ep_fsdp_device_mesh: Opt
             continue
         experts = getattr(module, 'experts', None)
         if experts is not None:
-            _move_module_to_device_or_empty(experts, local_device)
+            _move_ep_module_to_device(experts, local_device)
         if getattr(module, '_ep_ignore_shared_experts', False):
             shared = getattr(module, 'shared_expert', None)
             if shared is None:
                 shared = getattr(module, 'shared_experts', None)
             if shared is not None:
-                _move_module_to_device_or_empty(shared, local_device)
+                _move_ep_module_to_device(shared, local_device)
 
 
-def _move_module_to_device_or_empty(module: nn.Module, device: torch.device) -> None:
-    if any(param.is_meta for param in module.parameters(recurse=True)):
+def _move_ep_module_to_device(module: nn.Module, device: torch.device) -> None:
+    has_meta_tensor = any(param.is_meta for param in module.parameters(recurse=True))
+    has_meta_tensor = has_meta_tensor or any(buffer.is_meta for buffer in module.buffers(recurse=True))
+    if has_meta_tensor:
         module.to_empty(device=device)
     else:
         module.to(device)
@@ -592,7 +594,7 @@ def _broadcast_sharded_state_dict(
     adapter_source_sd: Optional[Dict[str, torch.Tensor]] = None,
     adapter_full_sd: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
-    """Broadcast full state dict from rank 0 and materialize local FSDP2 shards."""
+    """Broadcast rank0 full state dict and materialize local FSDP2/EP shards."""
     from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
     meta_sharded_sd = model.state_dict()

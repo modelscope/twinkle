@@ -2,7 +2,7 @@
 import copy
 import torch
 from transformers import AutoConfig, PreTrainedTokenizerFast
-from typing import Any, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from twinkle.hub import HubOperation
 from .base import Template
@@ -22,7 +22,7 @@ def get_deepseek_v4_tokenizer(tokenizer):
         def apply_chat_template(
             self,
             messages,
-            tools: list[dict[str, Any]] | None = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
             **kwargs,
         ):
             thinking = kwargs.get('thinking', False)

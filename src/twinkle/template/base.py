@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
 
+from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
@@ -21,6 +22,7 @@ VideoInput = Union[str, List['Image.Image'], 'torch.Tensor']
 AudioInput = Union[str, np.ndarray, 'torch.Tensor']
 
 
+@remote_class()
 class Template:
 
     # Placeholder tokens in user text
@@ -36,6 +38,7 @@ class Template:
                  default_system: Optional[str] = None,
                  enable_thinking: bool = True,
                  **kwargs):
+        self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
         if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
             from transformers import AutoProcessor
@@ -62,6 +65,29 @@ class Template:
             self._add_attention_fields,  # Add useful fields
             self._roll_labels,  # roll labels
         ]
+
+    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+        """Parse tool calls from the assistant's decoded output.
+
+        Dispatches by model family on ``self.model_id``; the actual
+        wire-format logic lives in :mod:`.tool_call_parser`.
+        """
+        mid = (self.model_id or '').lower()
+        if 'qwen' in mid:
+            from .qwen import QwenTemplate
+            return QwenTemplate.parse(self, decoded)
+        # TODO: Other models (Llama3, OpenAI JSON, …) — add a parser in
+        # ``tool_call_parser.py`` and extend this dispatch.
+        return []
+
+    def clean_tool_call(self, decoded: str) -> str:
+        """Strip family-specific tool-call markup from assistant text."""
+        mid = (self.model_id or '').lower()
+        if 'qwen' in mid:
+            from .qwen import QwenTemplate
+            return QwenTemplate.clean(self, decoded)
+        # TODO: Other models
+        return (decoded or '').rstrip()
 
     @property
     def tokenizer(self):
@@ -182,7 +208,12 @@ class Template:
         messages: List[Message] = result.get('messages')
         if messages is not None:
             response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            messages.append(Message(role='assistant', content=response_text))
+            parsed = self.parse_tool_call(response_text) or []
+            content_text = (self.clean_tool_call(response_text) if parsed else response_text)
+            asst_msg = Message(role='assistant', content=content_text)
+            if parsed:
+                asst_msg['tool_calls'] = parsed
+            messages.append(asst_msg)
             result['messages'] = messages
         return result
 
@@ -458,7 +489,9 @@ class Template:
                 k: v
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
-        tools = [dict(tool) for tool in trajectory.get('tools', [])]
+        # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
+        # :mod:`twinkle.data_format.message`); pass them through verbatim.
+        tools = list(trajectory.get('tools') or [])
 
         # Use inspect to get apply_chat_template signature params
         sig = inspect.signature(self.processor.apply_chat_template)
@@ -661,23 +694,23 @@ class Template:
 
         # Process List[Trajectory]
         trajectories = self._invoke_pre_pipeline(trajectories)
-
-        # Use thread pool for parallel encoding
-        from concurrent.futures import ThreadPoolExecutor
-        from functools import partial
-        encode_fn = partial(
-            self._encode_messages,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-        with ThreadPoolExecutor() as executor:
-            output = list(executor.map(encode_fn, trajectories))
-
+        output = [self._encode_messages(t, add_generation_prompt=add_generation_prompt, **kwargs) for t in trajectories]
         output = self._invoke_post_pipeline(output)
 
         if _transfer:
             output = self.map_row_to_col(output)
         return output
+
+    def format_trajectory(self, trajectory: Trajectory, add_default_system: bool = False) -> Trajectory:
+        current = [trajectory]
+        for pipeline in self.pre_pipeline:
+            if not add_default_system and pipeline == self._add_default_system:
+                continue
+            next_batch = []
+            for traj in current:
+                next_batch.extend(pipeline(traj))
+            current = next_batch
+        return current[0]
 
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None

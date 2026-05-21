@@ -39,6 +39,7 @@ class TrainingRun(BaseModel):
     training_run_id: str
     base_model: str
     model_owner: str
+    save_dir: Optional[str] = None
     is_lora: bool = False
     corrupted: bool = False
     lora_rank: Optional[int] = None
@@ -88,4 +89,5 @@ class CreateModelRequest(BaseModel):
     """Twinkle create model request."""
     base_model: str
     lora_config: Optional[LoraConfig] = None
+    save_dir: Optional[str] = None
     user_metadata: Optional[Dict[str, Any]] = None

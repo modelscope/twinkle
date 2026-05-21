@@ -58,13 +58,16 @@ tool_output_template: str = (
 
 REASONING_EFFORT_MAX = (
     'Reasoning Effort: Absolute maximum with no shortcuts permitted.\n'
-    'You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n'
-    'Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n'
+    'You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root '
+    'cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n'
+    'Explicitly write out your entire deliberation process, documenting every intermediate step, considered '
+    'alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n'
 )
 
 TOOLS_TEMPLATE = """## Tools
 
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml_token}tool_calls>" block like the following:
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a
+"<{dsml_token}tool_calls>" block like the following:
 
 <{dsml_token}tool_calls>
 <{dsml_token}invoke name="$TOOL_NAME">
@@ -76,9 +79,11 @@ You have access to a set of tools to help answer the user's question. You can in
 </{dsml_token}invoke>
 </{dsml_token}tool_calls>
 
-String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays,
+objects), pass the value in JSON format and set `string="false"`.
 
-If thinking_mode is enabled (triggered by {thinking_start_token}), you MUST output your complete reasoning inside {thinking_start_token}...{thinking_end_token} BEFORE any tool calls or final response.
+If thinking_mode is enabled (triggered by {thinking_start_token}), you MUST output your complete reasoning inside
+{thinking_start_token}...{thinking_end_token} BEFORE any tool calls or final response.
 
 Otherwise, output directly after {thinking_end_token} with tool calls or final response.
 
@@ -175,7 +180,13 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     return last_user_index
 
 
-def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None) -> str:
+def render_message(
+    index: int,
+    messages: List[Dict[str, Any]],
+    thinking_mode: str,
+    drop_thinking: bool = True,
+    reasoning_effort: Optional[str] = None,
+) -> str:
     assert 0 <= index < len(messages)
     assert thinking_mode in ['chat', 'thinking'], f'Invalid thinking_mode `{thinking_mode}`'
 
@@ -251,7 +262,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         prompt += LATEST_REMINDER_SP_TOKEN + latest_reminder_msg_template.format(content=content)
 
     elif role == 'tool':
-        raise NotImplementedError('deepseek_v4 merges tool messages into user; please preprocess with merge_tool_messages()')
+        raise NotImplementedError(
+            'deepseek_v4 merges tool messages into user; please preprocess with merge_tool_messages()')
 
     elif role == 'assistant':
         thinking_part = ''
@@ -347,7 +359,8 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 })
         elif role == 'user':
             text_block = {'type': 'text', 'text': msg.get('content', '')}
-            if merged and merged[-1].get('role') == 'user' and 'content_blocks' in merged[-1] and merged[-1].get('task') is None:
+            if (merged and merged[-1].get('role') == 'user' and 'content_blocks' in merged[-1]
+                    and merged[-1].get('task') is None):
                 merged[-1]['content_blocks'].append(text_block)
             else:
                 new_msg = {
@@ -482,7 +495,8 @@ def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Di
     tool_calls_end_token = f'</{dsml_token}{tool_calls_block_name}>'
 
     while index < len(text):
-        index, content_before, stop_token = _read_until_stop(index, text, [f'<{dsml_token}invoke', tool_calls_end_token])
+        index, content_before, stop_token = _read_until_stop(
+            index, text, [f'<{dsml_token}invoke', tool_calls_end_token])
         if content_before != '>\n':
             raise ValueError(f"Tool call format error: expected '>\\n' but got '{content_before}'")
 
@@ -492,7 +506,8 @@ def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Di
         if stop_token is None:
             raise ValueError('Missing special token in tool calls')
 
-        index, tool_name_content, stop_token = _read_until_stop(index, text, [f'<{dsml_token}parameter', f'</{dsml_token}invoke'])
+        index, tool_name_content, stop_token = _read_until_stop(
+            index, text, [f'<{dsml_token}parameter', f'</{dsml_token}invoke'])
 
         p_tool_name = re.findall(r'^\s*name="(.*?)">\n$', tool_name_content, flags=re.DOTALL)
         if len(p_tool_name) != 1:
@@ -512,7 +527,8 @@ def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Di
                 raise ValueError(f"Duplicate parameter name: '{param_name}'")
             tool_args[param_name] = (param_value, string)
 
-            index, content, stop_token = _read_until_stop(index, text, [f'<{dsml_token}parameter', f'</{dsml_token}invoke'])
+            index, content, stop_token = _read_until_stop(
+                index, text, [f'<{dsml_token}parameter', f'</{dsml_token}invoke'])
             if content != '>\n':
                 raise ValueError(f"Parameter format error: expected '>\\n' but got '{content}'")
 

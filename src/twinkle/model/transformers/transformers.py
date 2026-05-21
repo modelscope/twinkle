@@ -43,6 +43,8 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.torch_utils import clone_state_dict_to_cpu
+from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
@@ -64,43 +66,6 @@ def _twinkle_fsdp_debug(message: str) -> None:
         os.makedirs(debug_dir, exist_ok=True)
         with open(os.path.join(debug_dir, f'model_rank{rank}.log'), 'a', encoding='utf-8') as f:
             f.write(text + '\n')
-
-
-def _filter_from_config_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    load_only_keys = {
-        'cache_dir',
-        'device_map',
-        'force_download',
-        'ignore_mismatched_sizes',
-        'local_files_only',
-        'low_cpu_mem_usage',
-        'max_memory',
-        'offload_buffers',
-        'offload_folder',
-        'offload_state_dict',
-        'output_loading_info',
-        'proxies',
-        'resume_download',
-        'revision',
-        'state_dict',
-        'subfolder',
-        'token',
-        'tokenizer_id',
-        'trust_remote_code',
-        'use_safetensors',
-        'weights_only',
-    }
-    return {key: value for key, value in kwargs.items() if key not in load_only_keys}
-
-
-def _clone_state_dict_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    cloned = {}
-    for key, value in state_dict.items():
-        if hasattr(value, 'detach'):
-            cloned[key] = value.detach().cpu().clone()
-        else:
-            cloned[key] = value
-    return cloned
 
 
 def _get_named_child(module, name: str):
@@ -343,7 +308,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _init_empty_model_from_config(self, model_cls, **kwargs):
         from accelerate import init_empty_weights
 
-        config_kwargs = _filter_from_config_kwargs(kwargs)
+        config_kwargs = filter_from_config_kwargs(kwargs)
         with init_empty_weights(include_buffers=False):
             if hasattr(model_cls, 'from_config'):
                 model = model_cls.from_config(self.hf_config, **config_kwargs)
@@ -421,7 +386,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not (self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None):
             return
         is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
-        set_pre_ep_state(_clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
+        set_pre_ep_state(clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
         self._pre_ep_state_captured = True
 
     def _lazy_wrap_model(self):
@@ -534,6 +499,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         processor: InputProcessor = optimizer_config.processor
         loss_instance = optimizer_config.loss_instance
         loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
+        loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -552,7 +518,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             masked_labels[~loss_mask] = 0
             logits = outputs['logits']
             logits.div_(temperature)
-            outputs['logps'] = selective_log_softmax(logits, masked_labels)
+            if loss_require_entropy:
+                outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                    logits, masked_labels, return_entropy=True)
+            else:
+                outputs['logps'] = selective_log_softmax(logits, masked_labels)
             del logits
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
@@ -602,6 +572,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.loss_instance
             loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
+            loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -624,7 +595,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 masked_labels[~loss_mask] = 0
                 logits = outputs['logits']
                 logits.div_(temperature)
-                outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                if loss_require_entropy:
+                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                        logits, masked_labels, return_entropy=True)
+                else:
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
             outputs['past_key_values'] = None
             if not (return_logits or loss_require_logits):
@@ -1249,17 +1224,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _ensure_lora_dtype(self, model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
+        is_npu_device = Platform.device_prefix() == 'npu'
         for param in model.parameters():
-            if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if base_dtype is None and param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 base_dtype = param.dtype
+            if base_dtype is not None and is_npu_device:
                 break
         if base_dtype is None:
             return
 
-        # Convert all LoRA parameters to the base model dtype
+        # Temporary workaround: NPU requires all parameters to align with the base dtype.
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if 'lora_' in name.lower() and param.dtype != base_dtype:
+                if (is_npu_device or 'lora_' in name.lower()) and param.dtype != base_dtype:
                     param.data = param.data.to(base_dtype)
 
     def _load_scaler_state(self, scaler_path, **kwargs):

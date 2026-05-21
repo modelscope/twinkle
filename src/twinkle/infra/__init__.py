@@ -1,10 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
+import json
 import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
+from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
 from .collectors import collect_tensor_dict
 
@@ -27,7 +29,27 @@ _device_group: Optional[List[DeviceGroup]] = None
 
 _device_mesh = None
 
-_remote_components: dict = {}
+_notifier: Optional[Any] = None
+
+_name: Optional[str] = None
+
+_TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
+
+
+def _maybe_load_worker_notifier() -> None:
+    """Lazily reconstruct notifier + name on ray workers from inherited env vars."""
+    global _notifier, _name
+    if _notifier is not None:
+        return
+    if _name is None:
+        _name = os.environ.get('TWINKLE_NAME') or None
+    raw = os.environ.get(_TWINKLE_NOTIFIER_ENV)
+    if not raw:
+        return
+
+    candidate = Notifier.from_dict(json.loads(raw))
+    if candidate is not None:
+        _notifier = candidate
 
 
 def initialize(mode: Literal['local', 'ray'] = 'local',
@@ -37,7 +59,9 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
                full_determinism: bool = False,
                groups: Optional[List[DeviceGroup]] = None,
                global_device_mesh: Optional[DeviceMesh] = None,
-               lazy_collect: bool = True):
+               lazy_collect: bool = True,
+               name: Optional[str] = None,
+               notifier: Optional[Any] = None):
     """Initialize the twinkle infrastructure.
 
     Args:
@@ -51,12 +75,24 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         groups: The device groups of the training.
         global_device_mesh: The global default device mesh.
         lazy_collect: Lazy collect all outputs in workers, default `True`.
+        name: The name of this run.
+        notifier: Optional callable (e.g. ``DingNotifier``) invoked with a
+            single ``str`` message whenever any ``remote_function``-decorated
+            method raises. The original exception is always re-raised; the
+            notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh
+    global _mode, _device_group, _seed, _full_determinism, _lazy_collect, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
+    _name = name
     _full_determinism = full_determinism
     _lazy_collect = lazy_collect
+    _notifier = notifier
+    if name is not None:
+        os.environ['TWINKLE_NAME'] = name
+    os.environ.setdefault('TWINKLE_SESSION_ID', str(os.getpid()))
+    if notifier is not None and hasattr(notifier, 'to_dict'):
+        os.environ[_TWINKLE_NOTIFIER_ENV] = json.dumps(notifier.to_dict())
     if global_device_mesh is not None:
         _device_mesh = global_device_mesh
 
@@ -451,6 +487,15 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
 
         @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
+            _ctx = f'{cls.__name__}.__init__'
+            try:
+                _maybe_load_worker_notifier()
+                _new_init_body(self, *args, **kwargs)
+            except Exception as _e:  # noqa: BLE001
+                notify_exception(_notifier, _ctx, _e, _name)
+                raise
+
+        def _new_init_body(self, *args, **kwargs):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -642,73 +687,100 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
-            device_mesh = getattr(self, 'device_mesh', None)
-            if _mode == 'local':
-                return func(self, *args, **kwargs)
-            elif _mode == 'ray':
-                check_unsafe(*args, **kwargs)
-                if not hasattr(self, '_actors'):
-                    # This is the worker
-                    from ._ray import RayHelper
-                    if RayHelper.has_ref(args, kwargs):
-                        # In this case, driver dispatch is all, redispatch here
-                        args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                        world_size = Platform.get_world_size()
-                        rank = Platform.get_rank()
-                        # Redispatch here
-                        _workers_and_args = _dispatch_args(
-                            _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args, kwargs)
-                        _, args, kwargs = _workers_and_args[rank]
+            _ctx = f'{type(self).__name__}.{func.__name__}'
+            try:
+                device_mesh = getattr(self, 'device_mesh', None)
+                if _mode == 'local':
                     return func(self, *args, **kwargs)
-                else:
-                    # This is the driver
-                    from ._ray import RayHelper
-                    execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
-                    if RayHelper.has_ref(args, kwargs):
-                        # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
-                        # for example, dataloader returns any data list.
-                        _workers_and_args = _dispatch_args(
-                            _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
+                elif _mode == 'ray':
+                    check_unsafe(*args, **kwargs)
+                    if not hasattr(self, '_actors'):
+                        # This is the worker
+                        from ._ray import RayHelper
+                        if RayHelper.has_ref(args, kwargs):
+                            # In this case, driver dispatch is all, redispatch here
+                            args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
+                            world_size = Platform.get_world_size()
+                            rank = Platform.get_rank()
+                            # Redispatch here
+                            _workers_and_args = _dispatch_args(
+                                _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args,
+                                kwargs)
+                            _, args, kwargs = _workers_and_args[rank]
+                        return func(self, *args, **kwargs)
                     else:
-                        # dispatch now
-                        _workers_and_args = _dispatch_args(
-                            _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
+                        # This is the driver
+                        from ._ray import RayHelper
+                        execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
+                        if RayHelper.has_ref(args, kwargs):
+                            # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
+                            # for example, dataloader returns any data list.
+                            _workers_and_args = _dispatch_args(
+                                _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
+                        else:
+                            # dispatch now
+                            _workers_and_args = _dispatch_args(
+                                _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
 
-                    result = execute_method(func.__name__, _workers_and_args)
-                    # This is a result future, call it to get the actual result
-                    result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
-                    _local_lazy_collect = _lazy_collect
-                    if func.__name__ == '__iter__':
-                        # return self
-                        return self
+                        result = execute_method(func.__name__, _workers_and_args)
+                        # This is a result future, call it to get the actual result
+                        result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
+                        _local_lazy_collect = _lazy_collect
+                        if func.__name__ == '__iter__':
+                            # return self
+                            return self
 
-                    if func.__name__ == '__len__':
-                        # Get the first result and ignore the `lazy_collect`
-                        import ray
-                        return ray.get(result[0])
+                        if func.__name__ == '__len__':
+                            # Get the first result and ignore the `lazy_collect`
+                            import ray
+                            return ray.get(result[0])
 
-                    if func.__name__ == '__next__':
-                        import ray
-                        for _res in result:
-                            # raise when any worker raises StopIteration
-                            stop = ray.get(_res[1])
-                            if stop:
-                                raise StopIteration()
-                        result = [_res[0] for _res in result]
-                        result_func._futures = result
+                        if func.__name__ == '__next__':
+                            import ray
+                            for _res in result:
+                                # raise when any worker raises StopIteration
+                                stop = ray.get(_res[1])
+                                if stop:
+                                    raise StopIteration()
+                            result = [_res[0] for _res in result]
+                            result_func._futures = result
 
-                    if lazy_collect is not None:
-                        # Maybe this function returns a small object
-                        _local_lazy_collect = lazy_collect
-                    if hasattr(self, '_lazy_collect'):
-                        # _lazy_collect in class has the highest priority
-                        # This is the unique case that an object ref contains another
-                        # And this is user independent, only decided by the code.
-                        _local_lazy_collect = self._lazy_collect
-                    result = result_func if _local_lazy_collect else result_func()
-                    return result
-            else:
-                raise NotImplementedError(f'Unsupported mode {_mode}')
+                        if lazy_collect is not None:
+                            # Maybe this function returns a small object
+                            _local_lazy_collect = lazy_collect
+                        if hasattr(self, '_lazy_collect'):
+                            # _lazy_collect in class has the highest priority
+                            # This is the unique case that an object ref contains another
+                            # And this is user independent, only decided by the code.
+                            _local_lazy_collect = self._lazy_collect
+                        if _local_lazy_collect:
+                            # Wrap the deferred collector so that exceptions
+                            # raised when the caller later materializes the
+                            # result also trigger the notifier. Attributes
+                            # (``_futures`` etc.) on the original collector
+                            # are preserved for downstream code paths.
+                            _orig_result_func = result_func
+
+                            @functools.wraps(_orig_result_func)
+                            def _notifying_result_func(*rargs, **rkwargs):
+                                try:
+                                    return _orig_result_func(*rargs, **rkwargs)
+                                except Exception as _e:  # noqa: BLE001
+                                    notify_exception(_notifier, _ctx, _e, _name)
+                                    raise
+
+                            for _attr in ('_futures', ):
+                                if hasattr(_orig_result_func, _attr):
+                                    setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
+                            return _notifying_result_func
+                        return result_func()
+                else:
+                    raise NotImplementedError(f'Unsupported mode {_mode}')
+            except StopIteration:
+                raise
+            except Exception as _e:  # noqa: BLE001
+                notify_exception(_notifier, _ctx, _e, _name)
+                raise
 
         wrapper._execute = execute
         wrapper._collect = collect

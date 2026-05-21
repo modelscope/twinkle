@@ -4,15 +4,21 @@ A message represents a single round of information in a model conversation. The 
 
 ```python
 
+class FunctionCall(TypedDict, total=False):
+    name: str
+    arguments: Union[str, Dict[str, Any]]
+
 class ToolCall(TypedDict, total=False):
-    tool_name: str
-    arguments: str
+    id: str
+    type: Literal['function']
+    function: FunctionCall
 
 class Message(TypedDict, total=False):
     role: Literal['system', 'user', 'assistant', 'tool']
     type: str
     content: Union[str, List[Dict[str, str]]]
     tool_calls: List[ToolCall]
+    tool_call_id: str
     reasoning_content: str
     images: Optional[List[Union[str, Any]]]
     videos: Optional[List[Union[str, Any]]]
@@ -36,7 +42,7 @@ Essentially, `Message` is a Dict. It contains several fields, with the following
 ```
 
 - tool_calls: Tool call list, information output by the model to the user, usually parsed from the content corresponding to assistant.
-  - The ToolCall structure contains two fields: tool_name and arguments, which are the tool name and parameters respectively. arguments is a json-string that can be parsed into a valid json string.
+  - ToolCall matches the OpenAI chat-completion schema: the outer dict is `{type: "function", function: {...}}`, with the tool name at `function.name`. `arguments` must be a dict at chat-template render time (dispatch also accepts a JSON string).
 
 - images: Original image information contained in the message
 - videos: Original video information contained in the message
