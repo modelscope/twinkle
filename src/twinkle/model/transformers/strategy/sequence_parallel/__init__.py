@@ -114,20 +114,37 @@ class SequenceParallel:
                 origin_sdpa = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin']
                 origin_uses_cache_position = 'cache_position' in inspect.signature(origin_sdpa).parameters
                 q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
-                device = q_length.device if torch.is_tensor(q_length) else kwargs.get('device')
+                device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
                 if device is None:
                     device = self.real_position_ids.device
 
                 cache_position = None
-                if self.world_size > 1 and origin_uses_cache_position:
+                if self.world_size > 1:
                     padded_position_ids = self.pad(
                         self.real_position_ids[0],
                         padding_value=-1,
                         position_ids=self.real_position_ids,
                         dim=0,
                     )
-                    cache_position = torch.arange(0, padded_position_ids.shape[0], device=device)
-                    kv_length = cache_position.shape[0]
+                    global_length = padded_position_ids.shape[0]
+                    if origin_uses_cache_position:
+                        cache_position = torch.arange(0, global_length, device=device)
+                        kv_length = global_length
+                    else:
+                        # Newer Transformers passes q_length/q_offset instead of cache_position. In SP training,
+                        # create_causal_mask may still see the local shard length, so restore the global query length
+                        # only for the no-cache prefill path; cache/sliding paths keep their upstream offsets.
+                        q_offset = kwargs.get('q_offset', 0)
+                        kv_offset = kwargs.get('kv_offset', 0)
+                        no_cache_offsets = ((not torch.is_tensor(q_offset) and q_offset == 0)
+                                            and (not torch.is_tensor(kv_offset) and kv_offset == 0))
+                        if no_cache_offsets:
+                            q_length = global_length
+                            attention_mask = kwargs.get('attention_mask')
+                            if attention_mask is not None and torch.is_tensor(attention_mask):
+                                kv_length = attention_mask.shape[-1]
+                            else:
+                                kv_length = global_length
 
                 if origin_uses_cache_position:
                     if cache_position is None:
