@@ -1,98 +1,241 @@
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
 from modelscope import dataset_snapshot_download
 
 from twinkle.dataset import Dataset, DatasetMeta
-
-MUSIQUE_REPO = 'ms://voidful/MuSiQue'
-# 仓库内仅包含这两份原始 JSONL，没有 HF datasets 元数据，
-# 因此不能直接用 ``DatasetMeta(repo_id)`` 加载，只能落本地后再读。
-MUSIQUE_RAW_FILES = (
-    'musique_full_v1.0_train.jsonl',  # 含 answerable + 对抗式不可答样本
-    'musique_ans_v1.0_train.jsonl',   # 仅 answerable，2/3/4-hop 全量
-)
-
-
-def _musique_row_to_passages(row: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
-    """把单条 MuSiQue 样本 flatten 成多个 passage row，供压缩 SFT 单 passage 训练。"""
-    parent_id = str(row.get('id', ''))
-    # id 形如 ``2hop__482757_12019``，前缀直接当作 hop 类型
-    hop_type = parent_id.split('__', 1)[0] if '__' in parent_id else ''
-    question = row.get('question', '') or ''
-
-    primary = (row.get('answer') or '').strip()
-    answers = [primary] if primary else []
-    for alias in (row.get('answer_aliases') or []):
-        a = (alias or '').strip()
-        if a and a not in answers:
-            answers.append(a)
-
-    for idx, p in enumerate(row.get('paragraphs') or []):
-        passage = (p.get('paragraph_text') or '').strip()
-        if not passage:
-            continue
-        yield {
-            'id': f'{parent_id}__{idx}',
-            'row_id': parent_id,
-            'source': 'musique',
-            'type': hop_type,
-            'paragraph_idx': idx,
-            'question': question,
-            'title': p.get('title', '') or '',
-            'passage': passage,
-            'is_supporting': bool(p.get('is_supporting')),
-            'answer': primary,
-            'answers': answers,
-        }
-
-
-def prepare_musique_dataset(
-    local_dir: Optional[str] = None,
-    file_name: str = 'musique_ans_v1.0_train.jsonl',
-    cache_path: Optional[str] = None,
-) -> str:
-    """把 MuSiQue 落本地后 flatten 成 passage-per-row JSONL，返回 JSONL 路径。
-
-    Args:
-        local_dir: 已下载好的 MuSiQue 目录；为 ``None`` 时调用
-            ``dataset_snapshot_download`` 自动拉取。
-        file_name: 选用哪份原始 JSONL，``_ans_`` 只含可答样本，
-            ``_full_`` 还混入了对抗式不可答样本（会被自动过滤掉）。
-        cache_path: 输出路径，默认放在 ``local_dir`` 下，stem 形如
-            ``passages_musique_ans_v1.0_train.jsonl``。
-    """
-    if local_dir is None:
-        local_dir = dataset_snapshot_download(MUSIQUE_REPO)
-    local_dir = Path(local_dir)
-    src = local_dir / file_name
-    if not src.is_file():
-        raise FileNotFoundError(
-            f'MuSiQue raw file not found: {src} (expected one of {MUSIQUE_RAW_FILES})')
-
-    if cache_path is None:
-        cache_path = str(local_dir / f'passages_{Path(file_name).stem}.jsonl')
-    cache = Path(cache_path)
-    if cache.is_file() and cache.stat().st_size > 0:
-        return str(cache)
-
-    is_ans = '_ans_' in file_name
-    tmp = cache.with_suffix('.jsonl.tmp')
-    with src.open('r', encoding='utf-8') as fin, tmp.open('w', encoding='utf-8') as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not is_ans and not row.get('answerable', True):
-                continue
-            for passage_row in _musique_row_to_passages(row):
-                fout.write(json.dumps(passage_row, ensure_ascii=False) + '\n')
-    os.replace(tmp, cache)
-    return str(cache)
-
+from twinkle.preprocessor import Preprocessor
 
 dataset = Dataset()
-dataset.add_dataset(DatasetMeta(prepare_musique_dataset()))
+
+
+def _hash_id(prefix: str, content: str) -> str:
+    """Stable id from MD5 of content; collision-free for textual datasets."""
+    return f'{prefix}__{hashlib.md5(content.encode("utf-8")).hexdigest()[:16]}'
+
+
+def _register(processor_cls, meta: DatasetMeta, init_args: Optional[Dict[str, Any]] = None) -> None:
+    """Add dataset and run preprocessor; auto-strip every input column to enforce
+    the universal ``{id, source, messages}`` output schema."""
+    dataset.add_dataset(meta)
+    cols = list(dataset.datasets[meta.get_id()].column_names)
+    dataset.map(
+        processor_cls,
+        dataset_meta=meta,
+        init_args=init_args or {},
+        remove_columns=cols,
+        load_from_cache_file=True,
+    )
+
+
+# ===== MuSiQue =====
+MUSIQUE_REPO = 'voidful/MuSiQue'
+
+
+class MusiqueProcessor(Preprocessor):
+    """MuSiQue raw row → multiple ``{id, source, messages}`` rows, one per paragraph."""
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if row.get('answerable') is False:
+                continue
+            parent = str(row.get('id', ''))
+            for idx, p in enumerate(row.get('paragraphs') or []):
+                text = (p.get('paragraph_text') or '').strip()
+                if not text:
+                    continue
+                out.append({
+                    'id': f'musique__{parent}__{idx}',
+                    'source': 'musique',
+                    'messages': [{'role': 'user', 'content': text}],
+                })
+        return self.map_row_to_col(out)
+
+
+# Repo 仅含原始 JSONL 无 HF 元数据，必须先快照下载再以文件路径注册。
+_musique_jsonl = Path(dataset_snapshot_download(MUSIQUE_REPO)) / 'musique_ans_v1.0_train.jsonl'
+if not _musique_jsonl.is_file():
+    raise FileNotFoundError(f'MuSiQue raw file not found: {_musique_jsonl}')
+_register(MusiqueProcessor, DatasetMeta(str(_musique_jsonl)))
+
+
+
+# ===== swift/github-code =====
+GITHUB_CODE_REPO = 'ms://swift/github-code'
+
+
+class GithubCodeProcessor(Preprocessor):
+    """github-code row → ``{id, source, messages}``；按代码长度均匀采样。
+
+    把 ``[length_min, length_max)`` 切 ``n_buckets`` 桶，每桶配额 ``target/n_buckets``，
+    桶满或超界即丢；近似得到 ``target`` 条且长度均匀分布的样本。
+    依赖 batched map 单进程下实例状态跨 batch 共享（``num_proc>1`` 会失效）。
+    """
+
+    def __init__(self, target: int = 30000, length_min: int = 500,
+                 length_max: int = 20000, n_buckets: int = 30):
+        self.length_min = length_min
+        self.length_max = length_max
+        self.n_buckets = n_buckets
+        self.bucket_quota = max(1, target // n_buckets)
+        self.bucket_count = [0] * n_buckets
+
+    def _bucket(self, n: int) -> int:
+        if n < self.length_min or n >= self.length_max:
+            return -1
+        idx = int((n - self.length_min) / (self.length_max - self.length_min) * self.n_buckets)
+        return min(idx, self.n_buckets - 1)
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            code = row.get('code') or ''
+            if not isinstance(code, str):
+                continue
+            b = self._bucket(len(code))
+            if b < 0 or self.bucket_count[b] >= self.bucket_quota:
+                continue
+            self.bucket_count[b] += 1
+            lang = row.get('language') or 'unknown'
+            out.append({
+                'id': _hash_id(f'github_code__{lang}', code),
+                'source': 'github-code',
+                'messages': [{'role': 'user', 'content': code}],
+            })
+        return self.map_row_to_col(out)
+
+
+_register(GithubCodeProcessor,
+          DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'))
+
+
+# ===== modelscope/competition_math =====
+COMPETITION_MATH_REPO = 'ms://modelscope/competition_math'
+
+
+class MathProcessor(Preprocessor):
+    """competition_math row → ``{id, source, messages}`` (user/assistant pair)."""
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            problem = (row.get('problem') or '').strip()
+            solution = (row.get('solution') or '').strip()
+            if not problem or not solution:
+                continue
+            out.append({
+                'id': _hash_id('math', f'{problem}\n{solution}'),
+                'source': 'competition_math',
+                'messages': [
+                    {'role': 'user', 'content': problem},
+                    {'role': 'assistant', 'content': solution},
+                ],
+            })
+        return self.map_row_to_col(out)
+
+
+_register(MathProcessor,
+          DatasetMeta(dataset_id=COMPETITION_MATH_REPO, subset_name='default', split='train'))
+
+
+# ===== nampdn-ai/tiny-textbooks =====
+TINY_TEXTBOOKS_REPO = 'hf://nampdn-ai/tiny-textbooks'
+
+
+class TinyTextbooksProcessor(Preprocessor):
+    """tiny-textbooks row → ``{id, source, messages}`` (user/assistant pair)."""
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            text = (row.get('text') or '').strip()
+            textbook = (row.get('textbook') or '').strip()
+            if not text or not textbook:
+                continue
+            out.append({
+                'id': _hash_id('tinytb', f'{text}\n{textbook}'),
+                'source': 'tiny-textbooks',
+                'messages': [
+                    {'role': 'user', 'content': text},
+                    {'role': 'assistant', 'content': textbook},
+                ],
+            })
+        return self.map_row_to_col(out)
+
+
+_register(TinyTextbooksProcessor,
+          DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train'))
+
+
+# ===== Multi-turn ``messages`` datasets (Toucan, SWE-smith) =====
+
+
+class MessagesNormalizeProcessor(Preprocessor):
+    """Normalize multi-turn ``messages`` row → ``{id, source, messages}``。
+
+    丢弃 system 消息；把 OpenAI 多模态 list-content 拼成纯文本；过滤空消息行。
+    """
+
+    def __init__(self, source: str):
+        self.source = source
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            messages = row.get('messages')
+            if isinstance(messages, str):
+                try:
+                    messages = json.loads(messages)
+                except (ValueError, TypeError):
+                    continue
+            if not isinstance(messages, list):
+                continue
+            normalized: List[Dict[str, str]] = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get('role') or ''
+                if role == 'system':
+                    continue
+                content = m.get('content')
+                if isinstance(content, list):
+                    content = '\n'.join(p.get('text', '') if isinstance(p, dict) else str(p)
+                                        for p in content)
+                if content is None:
+                    content = ''
+                if not isinstance(content, str):
+                    content = str(content)
+                if not content.strip():
+                    continue
+                normalized.append({'role': role, 'content': content})
+            if not normalized:
+                continue
+            blob = ''.join(f'{m["role"]}:{m["content"]}' for m in normalized)
+            out.append({
+                'id': _hash_id(self.source, blob),
+                'source': self.source,
+                'messages': normalized,
+            })
+        return self.map_row_to_col(out)
+
+
+_register(MessagesNormalizeProcessor,
+          DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train'),
+          init_args={'source': 'toucan'})
+
+
+_register(MessagesNormalizeProcessor,
+          DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='train'),
+          init_args={'source': 'swe-smith'})
+
+
+print()
