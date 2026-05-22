@@ -3,13 +3,6 @@ import httpx
 import re
 from typing import Any, Dict, List, Optional
 
-# 绕过自签证书代理导致的 SSL 校验失败
-_orig_httpx_init = httpx.Client.__init__
-def _patched_httpx_init(self, *a, **kw):
-    kw['verify'] = False
-    _orig_httpx_init(self, *a, **kw)
-httpx.Client.__init__ = _patched_httpx_init
-
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import Preprocessor
 
