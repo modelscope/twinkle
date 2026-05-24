@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.preprocessor import Preprocessor
 
+from .consistency_filter import ConsistencyFilter
 from .data_juicer import DataJuicerPreprocessor
 from .dead_loop_filter import DeadLoopFilter
 from .hard_filter import HardFilter
@@ -28,6 +29,7 @@ class QualityPreprocessor(Preprocessor):
     Phase 7  KenLM PPL             kenlm_perplexity_filter (N-gram, CPU)
     Phase 8  MinHash dedup         minhash_dedup (off by default)
     Phase 9  Neural PPL            PerplexityFilter (vLLM sampler, off by default)
+    Phase 9.5 2D Consistency       ConsistencyFilter (rollout + embed, off by default)
     Phase 10 LLM API filters       quality/difficulty/condition (off by default)
     """
 
@@ -71,6 +73,17 @@ class QualityPreprocessor(Preprocessor):
         ppl_min: float = 2.0,
         ppl_max: float = 100.0,
         ppl_max_workers: int = 8,
+        # ── Phase 9.5: 2D consistency filter (optional) ───────────────────────
+        consistency_sampler_endpoint: str = '',  # '' = skip
+        consistency_embed_endpoint: str = '',
+        consistency_sampler_model: str = 'default',
+        consistency_embed_model: str = 'bge-m3',
+        consistency_n_rollouts: int = 8,
+        consistency_c_thresh: float = 0.7,
+        consistency_d_thresh: float = 0.3,
+        consistency_source: str = 'auto',    # 'teacher'|'self'|'auto'
+        consistency_annotate: bool = False,
+        consistency_max_workers: int = 4,
         # ── Phase 10: LLM API filters (optional) ──────────────────────────────
         llm_api_endpoint: str = '',          # '' = skip all LLM filters
         llm_model: str = 'default',
@@ -148,6 +161,22 @@ class QualityPreprocessor(Preprocessor):
                 max_workers=ppl_max_workers,
             )
             pipeline.append(pf.ppl_filter)
+
+        # Phase 9.5: 2D consistency filter
+        if consistency_sampler_endpoint and consistency_embed_endpoint:
+            cf = ConsistencyFilter(
+                sampler_endpoint=consistency_sampler_endpoint,
+                embed_endpoint=consistency_embed_endpoint,
+                sampler_model=consistency_sampler_model,
+                embed_model=consistency_embed_model,
+                n_rollouts=consistency_n_rollouts,
+                c_thresh=consistency_c_thresh,
+                d_thresh=consistency_d_thresh,
+                source=consistency_source,
+                annotate=consistency_annotate,
+                max_workers=consistency_max_workers,
+            )
+            pipeline.append(cf.consistency_filter)
 
         # Phase 10: LLM API filters
         if llm_api_endpoint:
