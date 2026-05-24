@@ -1,0 +1,131 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import re
+import unicodedata
+from collections import Counter
+from typing import Any, Dict, List
+
+from twinkle.preprocessor import Preprocessor
+
+# ── Thresholds ────────────────────────────────────────────────────────────────
+
+_REPLACEMENT_CHAR_RATIO = 0.02   # \ufffd (UTF-8 decode failure)
+_CONTROL_CHAR_RATIO     = 0.01   # non-printable control chars
+_PRIVATE_USE_RATIO      = 0.03   # Unicode private-use-area glyphs
+_SPECIAL_TOKEN_COUNT    = 4      # repeated chat special tokens in one reply
+_SCRIPT_CHAOS_THRESHOLD = 0.55   # fraction of adjacent non-space char pairs that switch script
+_SCRIPT_CHAOS_MIN_CHARS = 40     # skip chaos check for very short text
+
+# ── Pre-compiled patterns ─────────────────────────────────────────────────────
+
+# Unicode replacement character
+_REPLACEMENT_CHAR_RE = re.compile(r'\ufffd')
+
+# Non-printable control chars (keep \t \n \r as legitimate whitespace)
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+# Unicode private use area (E000–F8FF, F0000–FFFFF, 100000–10FFFF)
+_PRIVATE_USE_RE = re.compile(r'[\ue000-\uf8ff\U000f0000-\U000fffff]')
+
+# Chat-template special tokens repeated ≥ _SPECIAL_TOKEN_COUNT times
+_SPECIAL_TOKEN_RE = re.compile(
+    r'(<\|[^|>\n]{1,40}\|>|</s>|\[/?(?:PAD|UNK|SEP|CLS|MASK)\]|</?unk>|</?pad>|<0x[0-9A-Fa-f]{2}>)',
+    re.IGNORECASE,
+)
+
+# Same printable character repeated 20+ times consecutively (excluding space/newline)
+_SINGLE_CHAR_REPEAT_RE = re.compile(r'([^\s\n])\1{19,}')
+
+
+# ── Unicode script classifier ─────────────────────────────────────────────────
+
+def _script_of(cp: int) -> str:
+    """Map a codepoint to a coarse script bucket."""
+    if cp <= 0x024F:                       return 'latin'
+    if 0x0370 <= cp <= 0x03FF:             return 'greek'
+    if 0x0400 <= cp <= 0x04FF:             return 'cyrillic'
+    if 0x0590 <= cp <= 0x05FF:             return 'hebrew'
+    if 0x0600 <= cp <= 0x06FF:             return 'arabic'
+    if 0x0900 <= cp <= 0x097F:             return 'devanagari'
+    if 0x0E00 <= cp <= 0x0E7F:             return 'thai'
+    if 0x3040 <= cp <= 0x309F:             return 'hiragana'
+    if 0x30A0 <= cp <= 0x30FF:             return 'katakana'
+    if 0x4E00 <= cp <= 0x9FFF:             return 'cjk'
+    if 0xAC00 <= cp <= 0xD7A3:             return 'hangul'
+    if 0xE000 <= cp <= 0xF8FF:             return 'private'
+    return 'other'
+
+
+def _script_chaos(text: str) -> float:
+    """Return the fraction of adjacent non-space char pairs that switch script.
+
+    Legitimate multilingual text keeps each script in contiguous blocks.
+    Garbled output switches scripts randomly at the character level.
+    """
+    # Only examine letter/digit characters (skip punctuation, space)
+    chars = [c for c in text if unicodedata.category(c)[0] in ('L', 'N')]
+    if len(chars) < _SCRIPT_CHAOS_MIN_CHARS:
+        return 0.0
+    scripts = [_script_of(ord(c)) for c in chars]
+    switches = sum(a != b for a, b in zip(scripts, scripts[1:]))
+    return switches / (len(scripts) - 1)
+
+
+# ── Per-signal detectors ──────────────────────────────────────────────────────
+
+def _ratio(pattern: re.Pattern, text: str) -> float:
+    return len(pattern.findall(text)) / max(len(text), 1)
+
+
+def _is_token_soup(text: str) -> bool:
+    """Return True if the text exhibits any garbled-output signal."""
+    if not text:
+        return False
+
+    # Tier-1: near-certain encoding / decoding failure
+    if _ratio(_REPLACEMENT_CHAR_RE, text) > _REPLACEMENT_CHAR_RATIO:
+        return True
+    if _ratio(_CONTROL_CHAR_RE, text) > _CONTROL_CHAR_RATIO:
+        return True
+    if _ratio(_PRIVATE_USE_RE, text) > _PRIVATE_USE_RATIO:
+        return True
+
+    # Tier-2: structural / token-level corruption
+    if len(_SPECIAL_TOKEN_RE.findall(text)) >= _SPECIAL_TOKEN_COUNT:
+        return True
+    if _SINGLE_CHAR_REPEAT_RE.search(text):
+        return True
+
+    # Tier-3: statistical — random script interleaving
+    if _script_chaos(text) > _SCRIPT_CHAOS_THRESHOLD:
+        return True
+
+    return False
+
+
+# ── Preprocessor ─────────────────────────────────────────────────────────────
+
+class TokenSoupFilter(Preprocessor):
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = self.token_soup_filter(rows)
+        rows = self.map_row_to_col(rows)
+        return rows
+
+    def token_soup_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop rows where any assistant message contains garbled/token-soup content."""
+        out = []
+        for row in rows:
+            messages = row.get('messages') or []
+            asst_msgs = [
+                m for m in messages
+                if isinstance(m, dict) and m.get('role') == 'assistant'
+            ]
+            if not asst_msgs:
+                out.append(row)
+                continue
+            # Check all assistant turns; drop if any is garbled
+            if any(_is_token_soup((m.get('content') or '').strip()) for m in asst_msgs):
+                continue
+            out.append(row)
+        return out
