@@ -8,6 +8,7 @@ from .consistency_filter import ConsistencyFilter
 from .data_juicer import DataJuicerPreprocessor
 from .dead_loop_filter import DeadLoopFilter
 from .hard_filter import HardFilter
+from .majority_vote import MajorityVoteFilter
 from .perplexity import PerplexityFilter
 from .refuse_filter import RefuseFilter
 from .token_soup import TokenSoupFilter
@@ -84,6 +85,12 @@ class QualityPreprocessor(Preprocessor):
         consistency_source: str = 'auto',    # 'teacher'|'self'|'auto'
         consistency_annotate: bool = False,
         consistency_max_workers: int = 4,
+        # ── Phase 9.7: majority vote filter (optional) ────────────────────────
+        majority_vote_sources: Optional[List[Dict[str, Any]]] = None,
+        majority_vote_system_prompt: str = '',
+        majority_vote_threshold: float = 0.5,
+        majority_vote_temperature: float = 0.0,
+        majority_vote_max_workers: int = 8,
         # ── Phase 10: LLM API filters (optional) ──────────────────────────────
         llm_api_endpoint: str = '',          # '' = skip all LLM filters
         llm_model: str = 'default',
@@ -177,6 +184,18 @@ class QualityPreprocessor(Preprocessor):
                 max_workers=consistency_max_workers,
             )
             pipeline.append(cf.consistency_filter)
+
+        # Phase 9.7: majority vote
+        if majority_vote_sources:
+            mv_kwargs: Dict[str, Any] = {
+                'sources': majority_vote_sources,
+                'pass_threshold': majority_vote_threshold,
+                'temperature': majority_vote_temperature,
+                'max_workers': majority_vote_max_workers,
+            }
+            if majority_vote_system_prompt:
+                mv_kwargs['system_prompt'] = majority_vote_system_prompt
+            pipeline.append(MajorityVoteFilter(**mv_kwargs).majority_vote_filter)
 
         # Phase 10: LLM API filters
         if llm_api_endpoint:

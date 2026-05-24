@@ -186,6 +186,7 @@ class LazyDataset(Dataset):
         elif self.do_check:
             item = self.template.check(item)
 
+        self._write_through(item)
         return item
 
     @remote_function()

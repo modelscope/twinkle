@@ -4,37 +4,28 @@ from .base import Loss
 
 
 class CrossEntropyLoss(Loss):
-    """Calculate CE from logps"""
+    """Calculate CE from logps, with optional DFT (arxiv 2508.05629) entropy weighting."""
 
-    def __init__(self, ignore_index: int = -100, reduction='mean', **kwargs):
+    def __init__(self, ignore_index: int = -100, reduction='mean', dft: bool = False, **kwargs):
         super().__init__()
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self.dft = dft
 
     def __call__(self, inputs, outputs, **kwargs):
         labels = inputs['labels']
         logps = outputs.get('logps')
-        logits = outputs.get('logits')
 
-        if logps is not None:
-            loss_mask = (labels != self.ignore_index).float()
-            if self.reduction != 'sum':
-                return LossOutput(
-                    loss=(-logps * loss_mask).sum() / loss_mask.sum().clamp(min=1),
-                    num_tokens=0,
-                )
-            else:
-                return LossOutput(
-                    loss=(-logps * loss_mask).sum(),
-                    num_tokens=loss_mask.sum().clamp(min=1),
-                )
-        else:
-            import torch
-            assert logits is not None
-            logits = logits.view(-1, logits.shape[-1])
+        if logps is None:
+            import torch.nn.functional as F
+            logits = outputs['logits'].view(-1, outputs['logits'].shape[-1])
             labels = labels.view(-1)
-            loss = torch.nn.CrossEntropyLoss(reduction=self.reduction)(logits, labels)
-            if self.reduction != 'sum':
-                return LossOutput(loss=loss, num_tokens=0)
-            else:
-                return LossOutput(loss=loss, num_tokens=(labels != self.ignore_index).sum())
+            logps = F.log_softmax(logits, dim=-1).gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+
+        mask = (labels != self.ignore_index).float()
+        # DFT: -p·log(p) instead of -log(p)
+        per_token = -logps * logps.exp() if self.dft else -logps
+
+        if self.reduction != 'sum':
+            return LossOutput(loss=(per_token * mask).sum() / mask.sum().clamp(min=1), num_tokens=0)
+        return LossOutput(loss=(per_token * mask).sum(), num_tokens=mask.sum().clamp(min=1))

@@ -26,6 +26,8 @@ kernels = ["kernels"]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge"]
 vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
+pyodps = ["pyodps"]
+datajuicer = ["py-data-juicer"]
 tinker = ["tinker==0.14.0"]
 docs = [
   "sphinx>=5.3.0,<6.0.0",

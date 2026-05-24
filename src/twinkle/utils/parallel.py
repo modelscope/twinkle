@@ -87,6 +87,31 @@ def _try_create_claim(path: str, session: str, payload: str) -> bool:
     return True
 
 
+class PosixFileLock:
+    """POSIX advisory file lock with persistent fd for repeated acquire/release."""
+
+    def __init__(self, path: str):
+        import fcntl
+        self._fd = open(path, 'w')
+        self._fcntl = fcntl
+
+    def acquire(self):
+        self._fcntl.flock(self._fd, self._fcntl.LOCK_EX)
+
+    def release(self):
+        self._fcntl.flock(self._fd, self._fcntl.LOCK_UN)
+
+    def close(self):
+        self._fd.close()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 @contextmanager
 def processing_lock(lock_file: str):
     """A file lock to prevent parallel operations to one file.
