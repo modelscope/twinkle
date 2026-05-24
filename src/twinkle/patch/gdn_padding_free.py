@@ -1,7 +1,5 @@
 import inspect
 import torch
-from packaging.version import Version
-from transformers import __version__ as transformers_version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
 
@@ -41,10 +39,6 @@ def _call_with_supported_kwargs(fn, *args, **kwargs):
     if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
         kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
     return fn(*args, **kwargs)
-
-
-def _supports_native_padding_free() -> bool:
-    return Version(Version(transformers_version).base_version) >= Version('5.9.0')
 
 
 def _patch_gdn_kernels_for_cu_seqlens(
@@ -98,8 +92,6 @@ class GatedDeltaNetPaddingFreePatch(Patch):
         if getattr(Qwen3_5GatedDeltaNet, '_twinkle_sp_linear_patched', False):
             return
         module._twinkle_gdn_padding_free_patched = True
-        if _supports_native_padding_free():
-            return
 
         if not getattr(Qwen3_5DecoderLayer, '_twinkle_padding_free_cu_seqlens_patched', False):
             origin_decoder_forward = Qwen3_5DecoderLayer.forward
