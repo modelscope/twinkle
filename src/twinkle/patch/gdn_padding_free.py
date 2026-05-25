@@ -1,5 +1,7 @@
 import inspect
 import torch
+import transformers
+from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
 
@@ -41,10 +43,15 @@ def _call_with_supported_kwargs(fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
+def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
+    return Version(transformers.__version__) < Version('5.9.0')
+
+
 def _patch_gdn_kernels_for_cu_seqlens(
     mod: torch.nn.Module,
     *,
     cu_seqlens: torch.Tensor,
+    patch_chunk_rule: bool,
     origin_forward,
     forward_args,
     forward_kwargs,
@@ -70,12 +77,14 @@ def _patch_gdn_kernels_for_cu_seqlens(
         return chunk_gated_delta_rule(query, key, value, **kwargs)
 
     mod.causal_conv1d_fn = causal_conv1d_wrapper
-    mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
+    if patch_chunk_rule:
+        mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
     try:
         return _call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
         mod.causal_conv1d_fn = old_conv_fn
-        mod.chunk_gated_delta_rule = old_chunk_rule
+        if patch_chunk_rule:
+            mod.chunk_gated_delta_rule = old_chunk_rule
 
 
 class GatedDeltaNetPaddingFreePatch(Patch):
@@ -145,6 +154,7 @@ class GatedDeltaNetPaddingFreePatch(Patch):
 
         if not getattr(Qwen3_5GatedDeltaNet, '_twinkle_padding_free_gdn_patched', False):
             origin_forward = Qwen3_5GatedDeltaNet.forward
+            patch_chunk_rule = _needs_chunk_gated_delta_rule_cu_seqlens_patch()
 
             def forward(
                 mod,
@@ -168,12 +178,14 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 return _patch_gdn_kernels_for_cu_seqlens(
                     mod,
                     cu_seqlens=cu_seq_lens_q,
+                    patch_chunk_rule=patch_chunk_rule,
                     origin_forward=origin_forward,
                     forward_args=(hidden_states, ),
                     forward_kwargs={
                         'cache_params': cache_params,
                         'cache_position': cache_position,
                         'attention_mask': attention_mask,
+                        'cu_seq_lens_q': cu_seq_lens_q,
                         **extra_kwargs,
                     },
                 )
