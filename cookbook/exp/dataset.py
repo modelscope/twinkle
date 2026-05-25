@@ -4,14 +4,6 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-# 绕过自签证书代理导致的 SSL 校验失败
-_orig_httpx_init = httpx.Client.__init__
-def _patched_httpx_init(self, *a, **kw):
-    kw['verify'] = False
-    _orig_httpx_init(self, *a, **kw)
-httpx.Client.__init__ = _patched_httpx_init
-
 from modelscope import dataset_snapshot_download
 
 from twinkle.dataset import Dataset, DatasetMeta
@@ -69,8 +61,7 @@ class MusiqueProcessor(Preprocessor):
 _musique_jsonl = Path(dataset_snapshot_download(MUSIQUE_REPO)) / 'musique_ans_v1.0_train.jsonl'
 if not _musique_jsonl.is_file():
     raise FileNotFoundError(f'MuSiQue raw file not found: {_musique_jsonl}')
-_register(MusiqueProcessor, DatasetMeta(str(_musique_jsonl)))
-
+_register(MusiqueProcessor, DatasetMeta(str(_musique_jsonl), data_slice=range(20000)))
 
 
 # ===== swift/github-code =====
@@ -119,8 +110,8 @@ class GithubCodeProcessor(Preprocessor):
         return self.map_row_to_col(out)
 
 
-#_register(GithubCodeProcessor,
-#          DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'))
+_register(GithubCodeProcessor,
+         DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'))
 
 
 # ===== modelscope/competition_math =====
@@ -180,7 +171,7 @@ class TinyTextbooksProcessor(Preprocessor):
 
 
 _register(TinyTextbooksProcessor,
-          DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train'))
+          DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(30000)))
 
 
 # ===== Multi-turn ``messages`` datasets (Toucan, SWE-smith) =====
@@ -237,12 +228,12 @@ class MessagesNormalizeProcessor(Preprocessor):
 
 
 _register(MessagesNormalizeProcessor,
-          DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train'),
+          DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(10000)),
           init_args={'source': 'toucan'})
 
 
 _register(MessagesNormalizeProcessor,
-          DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool'),
+          DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(10000)),
           init_args={'source': 'swe-smith'})
 
 
