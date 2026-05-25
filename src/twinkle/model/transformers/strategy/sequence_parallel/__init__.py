@@ -110,9 +110,10 @@ class SequenceParallel:
         try:
             from transformers import masking_utils
 
+            origin_sdpa = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
+            origin_uses_cache_position = 'cache_position' in inspect.signature(origin_sdpa).parameters
+
             def sdpa_mask(batch_size, q_length=None, kv_length=None, *args, **kwargs):
-                origin_sdpa = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin']
-                origin_uses_cache_position = 'cache_position' in inspect.signature(origin_sdpa).parameters
                 q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
                 device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
                 if device is None:
@@ -154,8 +155,7 @@ class SequenceParallel:
 
                 return origin_sdpa(batch_size, q_length, kv_length, *args, device=device, **kwargs)
 
-            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[
-                'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
+            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'] = origin_sdpa
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
             def create_causal_mask(config,

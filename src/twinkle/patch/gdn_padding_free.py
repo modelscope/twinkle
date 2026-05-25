@@ -1,6 +1,7 @@
 import inspect
 import torch
 import transformers
+from functools import lru_cache
 from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
@@ -36,10 +37,18 @@ def _get_flash_linear_attention_kernels():
     return causal_conv1d, chunk_gated_delta_rule
 
 
-def _call_with_supported_kwargs(fn, *args, **kwargs):
+@lru_cache(maxsize=None)
+def _supported_kwarg_names(fn):
     signature = inspect.signature(fn)
-    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return None
+    return frozenset(signature.parameters)
+
+
+def _call_with_supported_kwargs(fn, *args, **kwargs):
+    supported_kwargs = _supported_kwarg_names(fn)
+    if supported_kwargs is not None:
+        kwargs = {key: value for key, value in kwargs.items() if key in supported_kwargs}
     return fn(*args, **kwargs)
 
 
