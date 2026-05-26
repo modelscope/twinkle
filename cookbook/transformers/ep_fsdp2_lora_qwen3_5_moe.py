@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """EP + FSDP2 + LoRA SFT cookbook for Qwen3.5-MoE.
 
-Run on 4 GPUs:
-    torchrun --nproc-per-node=4 cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py
+Run on 8 GPUs:
+    torchrun --nproc-per-node=8 cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py
 """
 import os
 from pathlib import Path
@@ -37,9 +37,9 @@ IGNORE_DATA_SKIP = os.environ.get('IGNORE_DATA_SKIP', '0') == '1'
 ADAPTER_NAME = os.environ.get('ADAPTER_NAME', 'default')
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=4,
+    fsdp_size=8,
     dp_size=1,
-    ep_size=4,
+    ep_size=8,
     device_type=Platform.get_platform().device_prefix(),
 )
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)

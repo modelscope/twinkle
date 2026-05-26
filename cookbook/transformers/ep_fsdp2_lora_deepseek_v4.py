@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """EP + FSDP2 + LoRA SFT cookbook for DeepSeek-V4.
 
-Run on 4 GPUs:
-    torchrun --nproc-per-node=4 cookbook/transformers/ep_fsdp2_lora_deepseek_v4.py
+Run on 8 GPUs:
+    torchrun --nproc-per-node=8 cookbook/transformers/ep_fsdp2_lora_deepseek_v4.py
 """
 import os
 from pathlib import Path
@@ -19,7 +19,7 @@ from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
 
-MODEL_ID = os.environ.get('DSV4_MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4')
+MODEL_ID = os.environ.get('DSV4_MODEL_ID', 'ms://deepseek-ai/DeepSeek-V4-Flash')
 DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
@@ -37,9 +37,9 @@ IGNORE_DATA_SKIP = os.environ.get('IGNORE_DATA_SKIP', '0') == '1'
 ADAPTER_NAME = os.environ.get('ADAPTER_NAME', 'default')
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=4,
+    fsdp_size=8,
     dp_size=1,
-    ep_size=4,
+    ep_size=8,
     device_type=Platform.get_platform().device_prefix(),
 )
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
