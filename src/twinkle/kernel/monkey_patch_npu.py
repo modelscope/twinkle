@@ -142,20 +142,27 @@ def _get_cached_expert_weights(self, target_dtype: torch.dtype, hidden_dim: int)
       - LoRA training: frozen weights keep _version stable, cache persists
       - Inference: cache is permanent
       - AMP autocast: separate cache per dtype
+
+    Safety: when weights require gradients, the cache is bypassed to avoid
+    breaking the PyTorch autograd graph (non-leaf tensors from .to() cannot
+    be reused across forward passes).
     """
+    requires_grad = (
+        getattr(self.gate_up_proj, 'requires_grad', False) or getattr(self.down_proj, 'requires_grad', False))
     cache_attr = '_npu_expert_cache'
-    if hasattr(self, cache_attr):
+    if not requires_grad and hasattr(self, cache_attr):
         cached_dtype, cached_gate_ver, cached_down_ver, cached = getattr(self, cache_attr)
         if (cached_dtype == target_dtype and cached_gate_ver == self.gate_up_proj._version
                 and cached_down_ver == self.down_proj._version):
             return cached
 
     weights = _normalize_packed_expert_weights(self, target_dtype, hidden_dim)
-    setattr(
-        self,
-        cache_attr,
-        (target_dtype, self.gate_up_proj._version, self.down_proj._version, weights),
-    )
+    if not requires_grad:
+        setattr(
+            self,
+            cache_attr,
+            (target_dtype, self.gate_up_proj._version, self.down_proj._version, weights),
+        )
     return weights
 
 
@@ -491,6 +498,11 @@ def _patch_qwen3_5_fla(model=None) -> None:
 
     # 4. Traverse instantiated model and replace per-layer chunk_gated_delta_rule
     if model is not None and mindspeed_fla is not None:
+        # Resolve the underlying PyTorch model from TransformersModel wrapper
+        model = getattr(model, 'model', getattr(model, 'module', model))
+        if not hasattr(model, 'named_modules'):
+            logger.warning('[NPU] [FLA] Model does not support named_modules, skipping instance patch')
+            return
         patched_instances = 0
         for _name, _module in model.named_modules():
             if hasattr(_module, 'chunk_gated_delta_rule') and callable(getattr(_module, 'chunk_gated_delta_rule')):
