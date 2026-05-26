@@ -9,6 +9,8 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.utils.framework import Torch
+from twinkle.kernel import kernelize_model
 
 logger = get_logger()
 
@@ -72,7 +74,9 @@ def train():
     # Use a TransformersModel
     model = TransformersModel(model_id=MODEL_ID)
     model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
-
+    # npu patch
+    if Torch.is_npu_available():
+        model = kernelize_model(model, mode='train', device='npu')
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
     # Add a lora to model, with name `default`
