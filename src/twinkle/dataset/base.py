@@ -282,10 +282,22 @@ class Dataset(TorchDataset):
             dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
             assert all(
                 dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
-            if interleave:
-                self.dataset = interleave_datasets(list(self.datasets.values()))
+            # Align features: cast large_string → string to avoid concatenation type mismatch
+            if not any(dataset_types):
+                from datasets import Features, Value, Sequence
+                dsets = list(self.datasets.values())
+                ref_features = dsets[0].features
+                aligned = []
+                for ds in dsets:
+                    if ds.features != ref_features:
+                        ds = ds.cast(ref_features)
+                    aligned.append(ds)
             else:
-                self.dataset = concatenate_datasets(list(self.datasets.values()))
+                aligned = list(self.datasets.values())
+            if interleave:
+                self.dataset = interleave_datasets(aligned)
+            else:
+                self.dataset = concatenate_datasets(aligned)
 
     @remote_function()
     def save_as(self, output_path: str, format: Optional[str] = None,

@@ -61,7 +61,7 @@ class MusiqueProcessor(Preprocessor):
 _musique_jsonl = Path(dataset_snapshot_download(MUSIQUE_REPO)) / 'musique_ans_v1.0_train.jsonl'
 if not _musique_jsonl.is_file():
     raise FileNotFoundError(f'MuSiQue raw file not found: {_musique_jsonl}')
-_register(MusiqueProcessor, DatasetMeta(str(_musique_jsonl), data_slice=range(20000)))
+_register(MusiqueProcessor, DatasetMeta(str(_musique_jsonl), data_slice=range(3000)))
 
 
 # ===== swift/github-code =====
@@ -76,8 +76,8 @@ class GithubCodeProcessor(Preprocessor):
     依赖 batched map 单进程下实例状态跨 batch 共享（``num_proc>1`` 会失效）。
     """
 
-    def __init__(self, target: int = 30000, length_min: int = 500,
-                 length_max: int = 20000, n_buckets: int = 30):
+    def __init__(self, target: int = 60000, length_min: int = 500,
+                 length_max: int = 40000, n_buckets: int = 30):
         self.length_min = length_min
         self.length_max = length_max
         self.n_buckets = n_buckets
@@ -171,7 +171,7 @@ class TinyTextbooksProcessor(Preprocessor):
 
 
 _register(TinyTextbooksProcessor,
-          DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(30000)))
+          DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(60000)))
 
 
 # ===== Multi-turn ``messages`` datasets (Toucan, SWE-smith) =====
@@ -228,13 +228,12 @@ class MessagesNormalizeProcessor(Preprocessor):
 
 
 _register(MessagesNormalizeProcessor,
-          DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(10000)),
+          DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(30000)),
           init_args={'source': 'toucan'})
 
 
 _register(MessagesNormalizeProcessor,
-          DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(10000)),
+          DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(30000)),
           init_args={'source': 'swe-smith'})
 
-
-print()
+dataset.mix_dataset(False)

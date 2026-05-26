@@ -67,7 +67,7 @@ class CodeXThinkingProcessor(Preprocessor):
 
 
 _register(CodeXThinkingProcessor,
-          DatasetMeta(dataset_id=CODEX_THINKING_REPO, split='train'))
+          DatasetMeta(dataset_id=CODEX_THINKING_REPO, split='train', data_slice=range(200000)))
 
 
 # ===== open-thoughts/OpenThoughts3-1.2M =====
@@ -120,7 +120,7 @@ class OpenThoughtsProcessor(Preprocessor):
 
 
 _register(OpenThoughtsProcessor,
-          DatasetMeta(dataset_id=OPEN_THOUGHTS_REPO, split='train'))
+          DatasetMeta(dataset_id=OPEN_THOUGHTS_REPO, split='train', data_slice=range(100000)))
 
 
 # ===== GAIR/LIMO-v2 =====
@@ -196,7 +196,7 @@ class ChineseR1DistillProcessor(Preprocessor):
 
 
 _register(ChineseR1DistillProcessor,
-          DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train'))
+          DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train', data_slice=range(100000)))
 
 
 # ===== nohurry/Opus-4.6-Reasoning-3000x-filtered =====
@@ -344,4 +344,5 @@ class AngrygiraffeOpusReasoningProcessor(Preprocessor):
 _register(AngrygiraffeOpusReasoningProcessor,
           DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train'))
 
+dataset.mix_dataset(False)
 print()
