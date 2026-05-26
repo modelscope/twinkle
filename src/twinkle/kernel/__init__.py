@@ -49,7 +49,7 @@ def kernelize_model(
     # so that patched module classes are used when new instances are created.
     if device == 'npu' or (device is None and _is_npu_device(model)):
         try:
-            apply_npu_patch()
+            apply_npu_patch(model)
         except Exception:
             logger.warning('NPU patch failed. Continuing without fused ops.', exc_info=True)
 
