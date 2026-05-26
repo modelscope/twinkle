@@ -30,15 +30,7 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
         sharded_sd = {}
 
         def _infer_parameter_dtype(model, param_name, empty_param):
-            try:
-                old_param = model.get_parameter_or_buffer(param_name)
-            except AttributeError:
-                # Need this for LoRA, as some params are not registered as
-                # parameters/buffers but still appear in the state dict.
-                base_param_name, local_param_name = param_name.rsplit('.', 1)
-                submodule = model.get_submodule(base_param_name)
-                old_param = getattr(submodule, local_param_name)
-
+            old_param = _get_state_dict_param_for_dtype_inference(model, param_name)
             is_torch_e4m3fn_available = hasattr(torch, 'float8_e4m3fn')
             is_param_float8_e4m3fn = is_torch_e4m3fn_available and empty_param.dtype == torch.float8_e4m3fn
             casting_dtype = None
@@ -147,6 +139,16 @@ def _patch_accelerate_fsdp2_load_full_state_dict():
     patched_fsdp2_load_full_state_dict._twinkle_patched = True
     patched_fsdp2_load_full_state_dict._twinkle_original = original
     fsdp_utils.fsdp2_load_full_state_dict = patched_fsdp2_load_full_state_dict
+
+
+def _get_state_dict_param_for_dtype_inference(model, param_name: str):
+    try:
+        return model.get_parameter_or_buffer(param_name)
+    except AttributeError:
+        if '.' in param_name:
+            base_param_name, param_name = param_name.rsplit('.', 1)
+            model = model.get_submodule(base_param_name)
+        return getattr(model, param_name)
 
 
 class AccelerateStrategy:

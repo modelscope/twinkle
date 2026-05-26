@@ -359,6 +359,11 @@ def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
 
 
 def _ep_expert_state_dict_gather_dim(name: str) -> int:
+    # PEFT ParamWrapper keeps expert LoRA tensors flattened instead of storing
+    # them as [num_experts, ...]: lora_A is [r * num_experts, in] and lora_B is
+    # [out, r * num_experts]. EP therefore owns a contiguous expert block on
+    # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
+    # parallelism, so the forward pass does not need an EP all-reduce.
     if 'lora_B' in name:
         return 1
     return 0
@@ -702,8 +707,8 @@ def _get_named_child(module, name: str):
 
 def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_world_size: int,
                                  ep_rank: int) -> torch.Tensor:
-    """Slice saved LoRA expert weights by EP rank before DTensor/FSDP placement."""
-    if ep_world_size <= 1:
+    """Slice saved PEFT ParamWrapper LoRA expert weights by EP rank before DTensor/FSDP placement."""
+    if ep_world_size <= 1 or ('lora_A' not in model_key and 'lora_B' not in model_key):
         return value
 
     parent = model
@@ -719,13 +724,9 @@ def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_
 
     if not matched:
         return value
-    if 'lora_A' in model_key:
-        chunk = value.size(0) // ep_world_size
-        return value.narrow(0, ep_rank * chunk, chunk).contiguous()
-    if 'lora_B' in model_key:
-        chunk = value.size(1) // ep_world_size
-        return value.narrow(1, ep_rank * chunk, chunk).contiguous()
-    return value
+    shard_dim = _ep_expert_state_dict_gather_dim(model_key)
+    chunk = value.size(shard_dim) // ep_world_size
+    return value.narrow(shard_dim, ep_rank * chunk, chunk).contiguous()
 
 
 def _has_param_wrapper_without_base_weight(model) -> bool:
