@@ -13,7 +13,7 @@ import transformers
 from copy import copy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
-from peft.utils import load_peft_weights, set_peft_model_state_dict
+from peft.utils import load_peft_weights
 from safetensors.torch import save_file
 from torch import GradScaler
 from torch.optim import Adam, AdamW, Optimizer
@@ -42,7 +42,6 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax, torch_util
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
-from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
@@ -287,11 +286,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
-            use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
-            set_pre_ep_state = getattr(self.strategy, 'set_rank0_pre_ep_full_state_dict', None)
-            if self._enable_expert_parallel and use_rank0_broadcast() and set_pre_ep_state is not None:
-                is_rank0 = dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
-                set_pre_ep_state(clone_state_dict_to_cpu(self.model.state_dict()) if is_rank0 else {})
+            self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
             self._maybe_apply_expert_parallel()
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
@@ -912,11 +907,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save
-            state_dict = self.get_state_dict(adapter_name=adapter_name, **kwargs)
-            for key, value in state_dict.items():
-                key = key.replace(f'.{adapter_name}.', '.')
-                processed_state_dict[key] = torch_util.to_local_tensor(value).cpu()
+            # LoRA adapter save (EP-aware via strategy.get_full_state_dict)
+            full_state = self.strategy.get_full_state_dict(self.model)
+            adapter_marker = '.lora_'
+            adapter_suffix = f'.{adapter_name}.'
+            for key, value in full_state.items():
+                if adapter_marker not in key:
+                    continue
+                if adapter_suffix not in key:
+                    continue
+                normalized = key.replace(adapter_suffix, '.')
+                processed_state_dict[normalized] = value
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
@@ -1015,28 +1016,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
-
-            def load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name='default'):
-                from torch.distributed.tensor import DTensor, distribute_tensor
-
-                model_sd = model.state_dict()
-                converted_weights = {}
-                for key, value in adapter_weights.items():
-                    model_key = key
-                    if f'.{adapter_name}.weight' not in model_key:
-                        model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
-                    if model_key in model_sd:
-                        param = model_sd[model_key]
-                        if isinstance(param, DTensor) and not isinstance(value, DTensor):
-                            value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
-                    converted_weights[key] = value
-
-                set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
-
-            if self.device_mesh.fsdp_world_size > 1:
-                load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name=adapter_name)
-            else:
-                set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+            self.strategy.load_peft_weights(model, adapter_weights, adapter_name)
         else:
             raise NotImplementedError
 
@@ -1201,6 +1181,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
         unwrapped_model = self.strategy.unwrap_model(self.model)
+        if not isinstance(config_or_dir, str):
+            config_or_dir = self.strategy.prepare_adapter_config(
+                config_or_dir, enable_ep=getattr(self, '_enable_expert_parallel', False))
+
+        if getattr(self, '_enable_expert_parallel', False):
+            self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
+            self._maybe_apply_expert_parallel()
+            unwrapped_model = self.strategy.unwrap_model(self.model)
+
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
             _adapted_model = PeftModel.from_pretrained(

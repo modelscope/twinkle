@@ -63,7 +63,7 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for block in find_moe_blocks(model):
+    for _, block in find_moe_blocks_with_names(model):
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
         patch_forward(block, ep_group, ep_world_size, cfg)
         specs.append(spec)
@@ -83,8 +83,12 @@ def _merge_config(config: dict[str, Any] | None) -> ExpertParallelConfig:
 
 
 def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
+    return [block for _, block in find_moe_blocks_with_names(model)]
+
+
+def find_moe_blocks_with_names(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     blocks = []
-    for module in model.modules():
+    for name, module in model.named_modules():
         experts = getattr(module, 'experts', None)
         if experts is None:
             continue
@@ -92,7 +96,7 @@ def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
             continue
         if not _get_gate(module):
             continue
-        blocks.append(module)
+        blocks.append((name, module))
     return blocks
 
 
