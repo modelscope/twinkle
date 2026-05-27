@@ -377,7 +377,7 @@ if __name__ == '__main__':
     if os.path.exists(dropped_log):
         os.remove(dropped_log)
 
-    dataset.map(ToMessagesProcessor(), remove_columns=['query', 'cot', 'response'])
+    dataset.map(ToMessagesProcessor(), remove_columns=['query', 'cot', 'response'], load_from_cache_file=True)
     dataset.map(QualityPreprocessor(special_chars_max_ratio=0.4, token_num_max=32768,
-                                    dropped_log_path=dropped_log), num_proc=16)
+                                    dropped_log_path=dropped_log), num_proc=16, load_from_cache_file=True)
     print(len(dataset))
