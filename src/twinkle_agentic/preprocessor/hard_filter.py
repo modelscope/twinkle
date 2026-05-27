@@ -142,6 +142,10 @@ def _has_thinking(msg: Dict[str, Any]) -> bool:
 
 class HardFilter(Preprocessor):
 
+    def __init__(self, allow_incomplete_role: bool = False) -> None:
+        super().__init__()
+        self.allow_incomplete_role = allow_incomplete_role
+
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
         rows = self.hard_filter(rows)
@@ -168,6 +172,8 @@ class HardFilter(Preprocessor):
             asst_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'assistant']
 
             if not user_msgs:
+                if self.allow_incomplete_role:
+                    out.append(row)
                 continue
 
             # Rule 1: single-turn trivial query

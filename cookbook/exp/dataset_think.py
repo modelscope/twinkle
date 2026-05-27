@@ -12,7 +12,8 @@ def _hash_id(prefix: str, content: str) -> str:
     return f'{prefix}__{hashlib.md5(content.encode("utf-8")).hexdigest()[:16]}'
 
 
-def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dict[str, Any]] = None) -> None:
+def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dict[str, Any]] = None,
+              load_from_cache_file: bool = True) -> None:
     """Add dataset and run preprocessor; auto-strip every input column to enforce
     the universal ``{id, source, query, cot, response}`` output schema."""
     dataset.add_dataset(meta)
@@ -22,7 +23,7 @@ def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dic
         dataset_meta=meta,
         init_args=init_args or {},
         remove_columns=cols,
-        load_from_cache_file=True,
+        load_from_cache_file=load_from_cache_file,
     )
 
 
@@ -322,29 +323,60 @@ class AngrygiraffeOpusReasoningProcessor(Preprocessor):
         return self.map_row_to_col(out)
 
 
-def _build_dataset() -> Dataset:
+_BASE_SIZES = {
+    'codex_think': 100000,
+    'open_thoughts': 150000,
+    'cn_r1_distill': 100000,
+    'opus_reasoning': 3000,
+    'claude_opus': 10000,
+    'angrygiraffe': 38000,
+}
+
+
+def _scaled_sizes(total: Optional[int]) -> Dict[str, int]:
+    if total is None:
+        return dict(_BASE_SIZES)
+    scale = total / sum(_BASE_SIZES.values())
+    return {k: max(1, int(round(v * scale))) for k, v in _BASE_SIZES.items()}
+
+
+def _build_dataset(total: Optional[int] = None, load_from_cache_file: bool = True) -> Dataset:
+    sizes = _scaled_sizes(total)
     dataset = Dataset()
 
     _register(dataset, CodeXThinkingProcessor,
-              DatasetMeta(dataset_id=CODEX_THINKING_REPO, split='train', data_slice=range(200000)))
+              DatasetMeta(dataset_id=CODEX_THINKING_REPO, split='train',
+                          data_slice=range(sizes['codex_think'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, OpenThoughtsProcessor,
-              DatasetMeta(dataset_id=OPEN_THOUGHTS_REPO, split='train', data_slice=range(100000)))
+              DatasetMeta(dataset_id=OPEN_THOUGHTS_REPO, split='train',
+                          data_slice=range(sizes['open_thoughts'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, LIMOProcessor,
-              DatasetMeta(dataset_id=LIMO_REPO, split='train'))
+              DatasetMeta(dataset_id=LIMO_REPO, split='train'),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, ChineseR1DistillProcessor,
-              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train', data_slice=range(100000)))
+              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train',
+                          data_slice=range(sizes['cn_r1_distill'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, OpusReasoningProcessor,
-              DatasetMeta(dataset_id=OPUS_REASONING_REPO, split='train'))
+              DatasetMeta(dataset_id=OPUS_REASONING_REPO, split='train',
+                          data_slice=range(sizes['opus_reasoning'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, ClaudeOpusProcessor,
-              DatasetMeta(dataset_id=CLAUDE_OPUS_REPO, split='train'))
+              DatasetMeta(dataset_id=CLAUDE_OPUS_REPO, split='train',
+                          data_slice=range(sizes['claude_opus'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, AngrygiraffeOpusReasoningProcessor,
-              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train'))
+              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train',
+                          data_slice=range(sizes['angrygiraffe'])),
+              load_from_cache_file=load_from_cache_file)
 
     dataset.mix_dataset(False)
     return dataset
@@ -375,16 +407,30 @@ class ToMessagesProcessor(Preprocessor):
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
 
+def get_dataset(total: Optional[int] = None, dropped_log: Optional[str] = None,
+                load_from_cache_file: bool = True) -> Dataset:
+    """Build, convert to messages format, and quality-filter the CoT dataset.
+
+    If ``total`` is given, every per-source row count in ``_BASE_SIZES`` is
+    scaled proportionally so the input-row sum approximates ``total``.
+    """
+    from twinkle_agentic.preprocessor import QualityPreprocessor
+
+    dataset = _build_dataset(total=total, load_from_cache_file=load_from_cache_file)
+    dataset.map(ToMessagesProcessor(), remove_columns=['query', 'cot', 'response'],
+                load_from_cache_file=load_from_cache_file)
+    qp_kwargs: Dict[str, Any] = {'special_chars_max_ratio': 0.4, 'token_num_max': 32768}
+    if dropped_log:
+        qp_kwargs['dropped_log_path'] = dropped_log
+    dataset.map(QualityPreprocessor(**qp_kwargs), num_proc=16,
+                load_from_cache_file=load_from_cache_file)
+    return dataset
+
+
 if __name__ == '__main__':
     import os
-    from twinkle_agentic.preprocessor import QualityPreprocessor
-    dataset = _build_dataset()
-
     dropped_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dropped.jsonl')
     if os.path.exists(dropped_log):
         os.remove(dropped_log)
-
-    dataset.map(ToMessagesProcessor(), remove_columns=['query', 'cot', 'response'], load_from_cache_file=True)
-    dataset.map(QualityPreprocessor(special_chars_max_ratio=0.4, token_num_max=32768,
-                                    dropped_log_path=dropped_log), num_proc=16, load_from_cache_file=True)
+    dataset = get_dataset(dropped_log=dropped_log)
     print(len(dataset))

@@ -22,7 +22,8 @@ def _hash_id(prefix: str, content: str) -> str:
     return f'{prefix}__{hashlib.md5(content.encode("utf-8")).hexdigest()[:16]}'
 
 
-def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dict[str, Any]] = None) -> None:
+def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dict[str, Any]] = None,
+              load_from_cache_file: bool = True) -> None:
     """Add dataset and run preprocessor; auto-strip every input column to enforce
     the universal ``{id, source, messages}`` output schema."""
     dataset.add_dataset(meta)
@@ -32,7 +33,7 @@ def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dic
         dataset_meta=meta,
         init_args=init_args or {},
         remove_columns=cols,
-        load_from_cache_file=False,
+        load_from_cache_file=load_from_cache_file,
         features=_TARGET_FEATURES,
     )
 
@@ -58,7 +59,7 @@ class MusiqueProcessor(Preprocessor):
                 out.append({
                     'id': f'musique__{parent}__{idx}',
                     'source': 'musique',
-                    'messages': [{'role': 'user', 'content': text}],
+                    'messages': [{'role': 'assistant', 'content': text}],
                 })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
@@ -110,7 +111,7 @@ class GithubCodeProcessor(Preprocessor):
             out.append({
                 'id': _hash_id(f'github_code__{lang}', code),
                 'source': 'github-code',
-                'messages': [{'role': 'user', 'content': code}],
+                'messages': [{'role': 'assistant', 'content': code}],
             })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
@@ -134,7 +135,7 @@ class MathProcessor(Preprocessor):
                 'id': _hash_id('math', f'{problem}\n{solution}'),
                 'source': 'competition_math',
                 'messages': [
-                    {'role': 'user', 'content': f'{problem}\n{solution}'},
+                    {'role': 'assistant', 'content': solution},
                 ],
             })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
@@ -159,20 +160,37 @@ class TinyTextbooksProcessor(Preprocessor):
                 'id': _hash_id('tinytb', f'{text}\n{textbook}'),
                 'source': 'tiny-textbooks',
                 'messages': [
-                    {'role': 'user', 'content': textbook},
+                    {'role': 'assistant', 'content': textbook},
                 ],
             })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
 
-# ===== Multi-turn ``messages`` datasets (Toucan, SWE-smith) =====
+# ===== Passage Explosion for Compression Distillation =====
+# Each message content >= threshold becomes a standalone row: messages=[{role:user, content:X}]
+
+_MIN_PASSAGE_LEN = 500  # CJK-equivalent units
 
 
-class MessagesNormalizeProcessor(Preprocessor):
-    """Normalize multi-turn ``messages`` row → ``{id, source, messages}``。
+def _effective_len(text: str) -> int:
+    """CJK chars count double; threshold 500 ≈ 500 Chinese chars ≈ 1000 Latin chars."""
+    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u303f')
+    return cjk * 2 + (len(text) - cjk)
 
-    丢弃 system 消息；把 OpenAI 多模态 list-content 拼成纯文本；过滤空消息行。
-    """
+
+def _extract_content(msg: dict) -> str:
+    """Extract text content from a message dict, handling multimodal list-content."""
+    content = msg.get('content')
+    if isinstance(content, list):
+        content = '\n'.join(
+            p.get('text', '') if isinstance(p, dict) else str(p) for p in content)
+    if not isinstance(content, str):
+        return ''
+    return content.strip()
+
+
+class PassageExplodeProcessor(Preprocessor):
+    """Explode multi-turn messages into individual long passages for compression distillation."""
 
     def __init__(self, source: str):
         self.source = source
@@ -189,105 +207,94 @@ class MessagesNormalizeProcessor(Preprocessor):
                     continue
             if not isinstance(messages, list):
                 continue
-            normalized: List[Dict[str, str]] = []
-            for m in messages:
-                if not isinstance(m, dict):
+            for msg in messages:
+                if not isinstance(msg, dict):
                     continue
-                role = m.get('role') or ''
+                role = msg.get('role') or ''
                 if role == 'system':
                     continue
-                content = m.get('content')
-                if isinstance(content, list):
-                    content = '\n'.join(p.get('text', '') if isinstance(p, dict) else str(p)
-                                        for p in content)
-                if content is None:
-                    content = ''
-                if not isinstance(content, str):
-                    content = str(content)
-                if not content.strip():
+                content = _extract_content(msg)
+                if not content or _effective_len(content) < _MIN_PASSAGE_LEN:
                     continue
-                normalized.append({'role': role, 'content': content})
-            if not normalized:
-                continue
-            blob = ''.join(f'{m["role"]}:{m["content"]}' for m in normalized)
-            out.append({
-                'id': _hash_id(self.source, blob),
-                'source': self.source,
-                'messages': normalized,
-            })
+                out.append({
+                    'id': _hash_id(self.source, content),
+                    'source': self.source,
+                    'messages': [{'role': 'assistant', 'content': content}],
+                })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
 
-# ===== Reasoning / CoT datasets (query → <think>cot</think> → response) =====
+# ===== Reasoning / CoT datasets — explode query and assistant separately =====
 _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 
-def _cot_messages(query: str, cot: str, response: str) -> List[Dict[str, str]]:
-    """Build messages list for CoT datasets."""
-    if cot:
-        response = _THINK_RE.sub('', response).strip()
-    assistant_content = f'<think>{cot}</think>{response}' if cot else response
-    return [{'role': 'user', 'content': query}, {'role': 'assistant', 'content': assistant_content}]
+class CotExplodeProcessor(Preprocessor):
+    """Base for CoT datasets: explode query and full assistant content as separate passages."""
+
+    def _extract_rows(self, rows: List[Dict[str, Any]]) -> List[tuple]:
+        """Subclass returns list of (query, cot, response) tuples."""
+        raise NotImplementedError
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows_list = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        for query, cot, response, source in self._extract_rows(rows_list):
+            if cot:
+                response = _THINK_RE.sub('', response).strip()
+            assistant_content = f'<think>{cot}</think>{response}' if cot else response
+            for text in (query, assistant_content):
+                if not text or _effective_len(text) < _MIN_PASSAGE_LEN:
+                    continue
+                out.append({
+                    'id': _hash_id(source, text),
+                    'source': source,
+                    'messages': [{'role': 'assistant', 'content': text}],
+                })
+        return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
 
 
 # -- Chinese-DeepSeek-R1-Distill-data-110k --
 CN_R1_DISTILL_REPO = 'ms://AI-ModelScope/Chinese-DeepSeek-R1-Distill-data-110k'
 
 
-class ChineseR1DistillProcessor(Preprocessor):
+class ChineseR1DistillProcessor(CotExplodeProcessor):
     """input → query, reasoning_content → cot, content → response."""
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
+    def _extract_rows(self, rows):
         for row in rows:
             query = (row.get('input') or '').strip()
             cot = (row.get('reasoning_content') or '').strip()
             response = (row.get('content') or '').strip()
             if not query or not response:
                 continue
-            out.append({
-                'id': _hash_id('cn_r1_distill', f'{query}\n{response}'),
-                'source': 'Chinese-DeepSeek-R1-Distill-data-110k',
-                'messages': _cot_messages(query, cot, response),
-            })
-        return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
+            yield query, cot, response, 'Chinese-DeepSeek-R1-Distill-data-110k'
 
 
 # -- Opus-4.6-Reasoning-3000x-filtered --
 OPUS_REASONING_REPO = 'ms://nohurry/Opus-4.6-Reasoning-3000x-filtered'
 
 
-class OpusReasoningProcessor(Preprocessor):
+class OpusReasoningProcessor(CotExplodeProcessor):
     """problem → query, thinking → cot, solution → response."""
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
+    def _extract_rows(self, rows):
         for row in rows:
             query = (row.get('problem') or '').strip()
             cot = (row.get('thinking') or '').strip()
             response = (row.get('solution') or '').strip()
             if not query or not response:
                 continue
-            out.append({
-                'id': _hash_id('opus_reasoning', f'{query}\n{response}'),
-                'source': 'Opus-4.6-Reasoning-3000x-filtered',
-                'messages': _cot_messages(query, cot, response),
-            })
-        return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
+            yield query, cot, response, 'Opus-4.6-Reasoning-3000x-filtered'
 
 
 # -- claude-opus-4.6-10000x --
 CLAUDE_OPUS_REPO = 'ms://Roman1111111/claude-opus-4.6-10000x'
 
 
-class ClaudeOpusProcessor(Preprocessor):
-    """messages (OpenAI format) → extract first user/assistant, split <think> tag or reasoning field."""
+class ClaudeOpusProcessor(CotExplodeProcessor):
+    """messages (OpenAI format) → extract user/assistant, split <think> or reasoning field."""
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
+    def _extract_rows(self, rows):
         for row in rows:
             messages = row.get('messages')
             if not isinstance(messages, list):
@@ -319,24 +326,17 @@ class ClaudeOpusProcessor(Preprocessor):
             response = assistant_text if not reasoning else _THINK_RE.sub('', assistant_text).strip()
             if not response:
                 continue
-            out.append({
-                'id': _hash_id('claude_opus', f'{query}\n{response}'),
-                'source': 'claude-opus-4.6-10000x',
-                'messages': _cot_messages(query, cot, response),
-            })
-        return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
+            yield query, cot, response, 'claude-opus-4.6-10000x'
 
 
 # -- angrygiraffe-claude-opus-4.6-4.7-reasoning-8.7k --
 ANGRYGIRAFFE_REPO = 'ms://hf/angrygiraffe-claude-opus-4.6-4.7-reasoning-8.7k'
 
 
-class AngrygiraffeOpusReasoningProcessor(Preprocessor):
+class AngrygiraffeOpusReasoningProcessor(CotExplodeProcessor):
     """messages (OpenAI format) → extract first user/assistant, split <think> tag."""
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
+    def _extract_rows(self, rows):
         for row in rows:
             messages = row.get('messages')
             if not isinstance(messages, list):
@@ -366,62 +366,94 @@ class AngrygiraffeOpusReasoningProcessor(Preprocessor):
                 response = assistant_text
             if not response:
                 continue
-            out.append({
-                'id': _hash_id('angrygiraffe_opus', f'{query}\n{response}'),
-                'source': 'angrygiraffe-claude-opus-4.6-4.7-reasoning-8.7k',
-                'messages': _cot_messages(query, cot, response),
-            })
-        return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
+            yield query, cot, response, 'angrygiraffe-claude-opus-4.6-4.7-reasoning-8.7k'
 
 
-def _build_dataset() -> Dataset:
+_BASE_SIZES = {
+    'tiny_textbooks': 30000,
+    'musique': 1000,
+    'github_code': 30000,
+    'competition_math': 7500,
+    'toucan': 10000,
+    'swe_smith': 1000,
+    'cn_r1_distill': 10000,
+    'opus_reasoning': 3000,
+    'claude_opus': 10000,
+    'angrygiraffe': 20000,
+}
+
+
+def _scaled_sizes(total: Optional[int]) -> Dict[str, int]:
+    if total is None:
+        return dict(_BASE_SIZES)
+    scale = total / sum(_BASE_SIZES.values())
+    return {k: max(1, int(round(v * scale))) for k, v in _BASE_SIZES.items()}
+
+
+def get_dataset(total: Optional[int] = None, load_from_cache_file: bool = True) -> Dataset:
+    """Build the unified compression-distillation dataset.
+
+    If ``total`` is given, every per-source row count in ``_BASE_SIZES`` is
+    scaled proportionally so the input-row sum approximates ``total``.
+    """
+    sizes = _scaled_sizes(total)
     dataset = Dataset()
 
+    _register(dataset, TinyTextbooksProcessor,
+              DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train',
+                          data_slice=range(sizes['tiny_textbooks'])),
+              load_from_cache_file=load_from_cache_file)
+
     _register(dataset, MusiqueProcessor,
-              DatasetMeta(str(_musique_jsonl), data_slice=range(1000)))
+              DatasetMeta(str(_musique_jsonl), data_slice=range(sizes['musique'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, GithubCodeProcessor,
-              DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'))
+              DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'),
+              init_args={'target': sizes['github_code']},
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, MathProcessor,
-              DatasetMeta(dataset_id=COMPETITION_MATH_REPO, subset_name='default', split='train'))
+              DatasetMeta(dataset_id=COMPETITION_MATH_REPO, subset_name='default', split='train',
+                          data_slice=range(sizes['competition_math'])),
+              load_from_cache_file=load_from_cache_file)
 
-    _register(dataset, TinyTextbooksProcessor,
-              DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(30000)))
+    _register(dataset, PassageExplodeProcessor,
+              DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train',
+                          data_slice=range(sizes['toucan'])),
+              init_args={'source': 'toucan'},
+              load_from_cache_file=load_from_cache_file)
 
-    _register(dataset, MessagesNormalizeProcessor,
-              DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(10000)),
-              init_args={'source': 'toucan'})
-
-    _register(dataset, MessagesNormalizeProcessor,
-              DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(10000)),
-              init_args={'source': 'swe-smith'})
+    _register(dataset, PassageExplodeProcessor,
+              DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool',
+                          data_slice=range(sizes['swe_smith'])),
+              init_args={'source': 'swe-smith'},
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, ChineseR1DistillProcessor,
-              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train', data_slice=range(10000)))
+              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train',
+                          data_slice=range(sizes['cn_r1_distill'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, OpusReasoningProcessor,
-              DatasetMeta(dataset_id=OPUS_REASONING_REPO, split='train'))
+              DatasetMeta(dataset_id=OPUS_REASONING_REPO, split='train',
+                          data_slice=range(sizes['opus_reasoning'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, ClaudeOpusProcessor,
-              DatasetMeta(dataset_id=CLAUDE_OPUS_REPO, split='train'))
+              DatasetMeta(dataset_id=CLAUDE_OPUS_REPO, split='train',
+                          data_slice=range(sizes['claude_opus'])),
+              load_from_cache_file=load_from_cache_file)
 
     _register(dataset, AngrygiraffeOpusReasoningProcessor,
-              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train', data_slice=range(10000)))
+              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train',
+                          data_slice=range(sizes['angrygiraffe'])),
+              load_from_cache_file=load_from_cache_file)
 
     dataset.mix_dataset(False)
     return dataset
 
 
 if __name__ == '__main__':
-    from twinkle_agentic.preprocessor import QualityPreprocessor
-
-    dataset = _build_dataset()
-
-    dropped_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dropped.jsonl')
-    if os.path.exists(dropped_log):
-        os.remove(dropped_log)
-
-    dataset.map(QualityPreprocessor(special_chars_max_ratio=0.4, token_num_max=32768,
-                                    dropped_log_path=dropped_log), num_proc=16, load_from_cache_file=True)
+    dataset = get_dataset()
     print(len(dataset))

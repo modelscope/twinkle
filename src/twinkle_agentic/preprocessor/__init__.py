@@ -47,6 +47,9 @@ class QualityPreprocessor(Preprocessor):
         hard_filter: bool = True,
         refuse_filter: bool = True,
         dead_loop_filter: bool = True,
+        # Pass-through for passage-only rows (no user turn) so HardFilter does not
+        # drop them outright.
+        allow_incomplete_role: bool = False,
         # ── Phase 3: character-level quality ──────────────────────────────────
         token_soup_filter: bool = True,
         word_repeat_max_ratio: float = 0.4,
@@ -121,7 +124,7 @@ class QualityPreprocessor(Preprocessor):
 
         # Phase 2: structural rules
         if hard_filter:
-            pipeline.append(HardFilter().hard_filter)
+            pipeline.append(HardFilter(allow_incomplete_role=allow_incomplete_role).hard_filter)
         if refuse_filter:
             pipeline.append(RefuseFilter().refuse_filter)
         if dead_loop_filter:
