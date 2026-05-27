@@ -126,8 +126,7 @@ class MathProcessor(Preprocessor):
                 'id': _hash_id('math', f'{problem}\n{solution}'),
                 'source': 'competition_math',
                 'messages': [
-                    {'role': 'user', 'content': problem},
-                    {'role': 'assistant', 'content': solution},
+                    {'role': 'user', 'content': f'{problem}\n{solution}'},
                 ],
             })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
@@ -152,8 +151,7 @@ class TinyTextbooksProcessor(Preprocessor):
                 'id': _hash_id('tinytb', f'{text}\n{textbook}'),
                 'source': 'tiny-textbooks',
                 'messages': [
-                    {'role': 'user', 'content': text},
-                    {'role': 'assistant', 'content': textbook},
+                    {'role': 'user', 'content': textbook},
                 ],
             })
         return self.map_row_to_col(out, keys=['id', 'source', 'messages'])
