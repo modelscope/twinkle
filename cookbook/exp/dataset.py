@@ -4,10 +4,17 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datasets import Features, Value
 from modelscope import dataset_snapshot_download
 
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import Preprocessor
+
+_TARGET_FEATURES = Features({
+    'id': Value('string'),
+    'source': Value('string'),
+    'messages': [{'role': Value('string'), 'content': Value('string')}],
+})
 
 
 def _hash_id(prefix: str, content: str) -> str:
@@ -25,7 +32,8 @@ def _register(dataset, processor_cls, meta: DatasetMeta, init_args: Optional[Dic
         dataset_meta=meta,
         init_args=init_args or {},
         remove_columns=cols,
-        load_from_cache_file=True,
+        load_from_cache_file=False,
+        features=_TARGET_FEATURES,
     )
 
 
@@ -73,7 +81,7 @@ class GithubCodeProcessor(Preprocessor):
     依赖 batched map 单进程下实例状态跨 batch 共享（``num_proc>1`` 会失效）。
     """
 
-    def __init__(self, target: int = 60000, length_min: int = 500,
+    def __init__(self, target: int = 30000, length_min: int = 500,
                  length_max: int = 40000, n_buckets: int = 30):
         self.length_min = length_min
         self.length_max = length_max
@@ -215,15 +223,11 @@ _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 
 def _cot_messages(query: str, cot: str, response: str) -> List[Dict[str, str]]:
-    """Build messages list with reasoning_content for CoT datasets."""
+    """Build messages list for CoT datasets."""
     if cot:
-        # Strip duplicated <think> block from response when cot is already separate
         response = _THINK_RE.sub('', response).strip()
     assistant_content = f'<think>{cot}</think>{response}' if cot else response
-    msg = {'role': 'assistant', 'content': assistant_content}
-    if cot:
-        msg['reasoning_content'] = cot
-    return [{'role': 'user', 'content': query}, msg]
+    return [{'role': 'user', 'content': query}, {'role': 'assistant', 'content': assistant_content}]
 
 
 # -- Chinese-DeepSeek-R1-Distill-data-110k --
@@ -279,7 +283,7 @@ CLAUDE_OPUS_REPO = 'ms://Roman1111111/claude-opus-4.6-10000x'
 
 
 class ClaudeOpusProcessor(Preprocessor):
-    """messages (OpenAI format) → extract first user/assistant, split <think> tag."""
+    """messages (OpenAI format) → extract first user/assistant, split <think> tag or reasoning field."""
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
@@ -290,6 +294,7 @@ class ClaudeOpusProcessor(Preprocessor):
                 continue
             query = ''
             assistant_text = ''
+            reasoning = ''
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
@@ -301,16 +306,17 @@ class ClaudeOpusProcessor(Preprocessor):
                     query = content.strip()
                 elif role == 'assistant' and not assistant_text:
                     assistant_text = content.strip()
+                    reasoning = (msg.get('reasoning') or '').strip()
                     break
             if not query or not assistant_text:
                 continue
-            m = _THINK_RE.search(assistant_text)
-            if m:
-                cot = m.group(1).strip()
-                response = assistant_text[m.end():].strip()
-            else:
-                cot = ''
-                response = assistant_text
+            cot = reasoning
+            if not cot:
+                m = _THINK_RE.search(assistant_text)
+                if m:
+                    cot = m.group(1).strip()
+                    assistant_text = assistant_text[m.end():].strip()
+            response = assistant_text if not reasoning else _THINK_RE.sub('', assistant_text).strip()
             if not response:
                 continue
             out.append({
@@ -372,7 +378,7 @@ def _build_dataset() -> Dataset:
     dataset = Dataset()
 
     _register(dataset, MusiqueProcessor,
-              DatasetMeta(str(_musique_jsonl), data_slice=range(3000)))
+              DatasetMeta(str(_musique_jsonl), data_slice=range(1000)))
 
     _register(dataset, GithubCodeProcessor,
               DatasetMeta(dataset_id=GITHUB_CODE_REPO, subset_name='all-apache-2.0', split='train'))
@@ -381,18 +387,18 @@ def _build_dataset() -> Dataset:
               DatasetMeta(dataset_id=COMPETITION_MATH_REPO, subset_name='default', split='train'))
 
     _register(dataset, TinyTextbooksProcessor,
-              DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(60000)))
+              DatasetMeta(dataset_id=TINY_TEXTBOOKS_REPO, split='train', data_slice=range(30000)))
 
     _register(dataset, MessagesNormalizeProcessor,
-              DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(30000)),
+              DatasetMeta(dataset_id='ms://Agent-Ark/Toucan-1.5M', subset_name='Kimi-K2', split='train', data_slice=range(10000)),
               init_args={'source': 'toucan'})
 
     _register(dataset, MessagesNormalizeProcessor,
-              DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(30000)),
+              DatasetMeta(dataset_id='ms://SWE-bench/SWE-smith-trajectories', split='tool', data_slice=range(10000)),
               init_args={'source': 'swe-smith'})
 
     _register(dataset, ChineseR1DistillProcessor,
-              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train', data_slice=range(30000)))
+              DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train', data_slice=range(10000)))
 
     _register(dataset, OpusReasoningProcessor,
               DatasetMeta(dataset_id=OPUS_REASONING_REPO, split='train'))
@@ -401,7 +407,7 @@ def _build_dataset() -> Dataset:
               DatasetMeta(dataset_id=CLAUDE_OPUS_REPO, split='train'))
 
     _register(dataset, AngrygiraffeOpusReasoningProcessor,
-              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train'))
+              DatasetMeta(dataset_id=ANGRYGIRAFFE_REPO, split='train', data_slice=range(10000)))
 
     dataset.mix_dataset(False)
     return dataset
