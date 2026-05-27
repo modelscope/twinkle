@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import inspect
 import math
 import torch
 import torch.distributed as dist
@@ -13,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
+from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
 from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
@@ -29,17 +29,10 @@ def is_qwen3_omni(model):
     return 'qwen3_omni' in mt
 
 
-def _call_with_supported_kwargs(fn, *args, **kwargs):
-    signature = inspect.signature(fn)
-    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
-    return fn(*args, **kwargs)
-
-
 def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_position_or_past_key_values, *args,
                              **kwargs):
-    if 'cache_position' in inspect.signature(fn).parameters:
-        return _call_with_supported_kwargs(
+    if has_signature_parameter(fn, 'cache_position'):
+        return call_with_supported_kwargs(
             fn,
             config,
             input_embeds,
@@ -49,8 +42,8 @@ def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_pos
             **kwargs,
         )
     if cache_position_or_past_key_values is None and 'past_key_values' in kwargs:
-        return _call_with_supported_kwargs(fn, config, input_embeds, attention_mask, *args, **kwargs)
-    return _call_with_supported_kwargs(
+        return call_with_supported_kwargs(fn, config, input_embeds, attention_mask, *args, **kwargs)
+    return call_with_supported_kwargs(
         fn,
         config,
         input_embeds,
@@ -111,7 +104,7 @@ class SequenceParallel:
             from transformers import masking_utils
 
             origin_sdpa = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
-            origin_uses_cache_position = 'cache_position' in inspect.signature(origin_sdpa).parameters
+            origin_uses_cache_position = has_signature_parameter(origin_sdpa, 'cache_position')
 
             def sdpa_mask(batch_size, q_length=None, kv_length=None, *args, **kwargs):
                 q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
@@ -178,7 +171,7 @@ class SequenceParallel:
                     (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
-                if 'cache_position' in inspect.signature(masking_utils.origin_create_causal_mask).parameters:
+                if has_signature_parameter(masking_utils.origin_create_causal_mask, 'cache_position'):
                     cache_position_or_past_key_values = torch.arange(
                         0,
                         input_embeds.shape[1],

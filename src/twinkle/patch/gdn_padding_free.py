@@ -1,12 +1,11 @@
-import inspect
 import torch
 import transformers
-from functools import lru_cache
 from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
 
 from twinkle.patch import Patch
+from twinkle.utils.utils import call_with_supported_kwargs
 
 
 def _is_qwen35_model(hf_config) -> bool:
@@ -35,21 +34,6 @@ def _get_flash_linear_attention_kernels():
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     return causal_conv1d, chunk_gated_delta_rule
-
-
-@lru_cache(maxsize=None)
-def _supported_kwarg_names(fn):
-    signature = inspect.signature(fn)
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        return None
-    return frozenset(signature.parameters)
-
-
-def _call_with_supported_kwargs(fn, *args, **kwargs):
-    supported_kwargs = _supported_kwarg_names(fn)
-    if supported_kwargs is not None:
-        kwargs = {key: value for key, value in kwargs.items() if key in supported_kwargs}
-    return fn(*args, **kwargs)
 
 
 def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
@@ -89,7 +73,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
     if patch_chunk_rule:
         mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
     try:
-        return _call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
+        return call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
         mod.causal_conv1d_fn = old_conv_fn
         if patch_chunk_rule:
@@ -125,7 +109,7 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 **extra_kwargs,
             ):
                 if getattr(layer, 'layer_type', None) != 'linear_attention':
-                    return _call_with_supported_kwargs(
+                    return call_with_supported_kwargs(
                         origin_decoder_forward,
                         layer,
                         hidden_states=hidden_states,
@@ -175,7 +159,7 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 **extra_kwargs,
             ):
                 if cu_seq_lens_q is None:
-                    return _call_with_supported_kwargs(
+                    return call_with_supported_kwargs(
                         origin_forward,
                         mod,
                         hidden_states,
