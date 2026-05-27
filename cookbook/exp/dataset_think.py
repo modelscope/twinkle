@@ -325,7 +325,7 @@ class AngrygiraffeOpusReasoningProcessor(Preprocessor):
 
 _BASE_SIZES = {
     'codex_think': 100000,
-    'open_thoughts': 150000,
+    'open_thoughts': 400000,
     'cn_r1_distill': 100000,
     'opus_reasoning': 3000,
     'claude_opus': 10000,
@@ -432,5 +432,5 @@ if __name__ == '__main__':
     dropped_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dropped.jsonl')
     if os.path.exists(dropped_log):
         os.remove(dropped_log)
-    dataset = get_dataset(dropped_log=dropped_log)
+    dataset = get_dataset(load_from_cache_file=False)
     print(len(dataset))
