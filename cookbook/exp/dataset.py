@@ -455,5 +455,5 @@ def get_dataset(total: Optional[int] = None, load_from_cache_file: bool = True) 
 
 
 if __name__ == '__main__':
-    dataset = get_dataset()
+    dataset = get_dataset(load_from_cache_file=False)
     print(len(dataset))
