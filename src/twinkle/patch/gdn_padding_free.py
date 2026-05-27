@@ -1,8 +1,11 @@
 import torch
+import transformers
+from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
 
 from twinkle.patch import Patch
+from twinkle.utils.utils import call_with_supported_kwargs
 
 
 def _is_qwen35_model(hf_config) -> bool:
@@ -33,10 +36,15 @@ def _get_flash_linear_attention_kernels():
     return causal_conv1d, chunk_gated_delta_rule
 
 
+def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
+    return Version(transformers.__version__) < Version('5.9.0')
+
+
 def _patch_gdn_kernels_for_cu_seqlens(
     mod: torch.nn.Module,
     *,
     cu_seqlens: torch.Tensor,
+    patch_chunk_rule: bool,
     origin_forward,
     forward_args,
     forward_kwargs,
@@ -62,12 +70,14 @@ def _patch_gdn_kernels_for_cu_seqlens(
         return chunk_gated_delta_rule(query, key, value, **kwargs)
 
     mod.causal_conv1d_fn = causal_conv1d_wrapper
-    mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
+    if patch_chunk_rule:
+        mod.chunk_gated_delta_rule = chunk_gated_delta_rule_wrapper
     try:
-        return origin_forward(mod, *forward_args, **forward_kwargs)
+        return call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
         mod.causal_conv1d_fn = old_conv_fn
-        mod.chunk_gated_delta_rule = old_chunk_rule
+        if patch_chunk_rule:
+            mod.chunk_gated_delta_rule = old_chunk_rule
 
 
 class GatedDeltaNetPaddingFreePatch(Patch):
@@ -99,7 +109,8 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 **extra_kwargs,
             ):
                 if getattr(layer, 'layer_type', None) != 'linear_attention':
-                    return origin_decoder_forward(
+                    return call_with_supported_kwargs(
+                        origin_decoder_forward,
                         layer,
                         hidden_states=hidden_states,
                         position_embeddings=position_embeddings,
@@ -136,6 +147,7 @@ class GatedDeltaNetPaddingFreePatch(Patch):
 
         if not getattr(Qwen3_5GatedDeltaNet, '_twinkle_padding_free_gdn_patched', False):
             origin_forward = Qwen3_5GatedDeltaNet.forward
+            patch_chunk_rule = _needs_chunk_gated_delta_rule_cu_seqlens_patch()
 
             def forward(
                 mod,
@@ -147,7 +159,8 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 **extra_kwargs,
             ):
                 if cu_seq_lens_q is None:
-                    return origin_forward(
+                    return call_with_supported_kwargs(
+                        origin_forward,
                         mod,
                         hidden_states,
                         cache_params=cache_params,
@@ -158,12 +171,14 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                 return _patch_gdn_kernels_for_cu_seqlens(
                     mod,
                     cu_seqlens=cu_seq_lens_q,
+                    patch_chunk_rule=patch_chunk_rule,
                     origin_forward=origin_forward,
                     forward_args=(hidden_states, ),
                     forward_kwargs={
                         'cache_params': cache_params,
                         'cache_position': cache_position,
                         'attention_mask': attention_mask,
+                        'cu_seq_lens_q': cu_seq_lens_q,
                         **extra_kwargs,
                     },
                 )
