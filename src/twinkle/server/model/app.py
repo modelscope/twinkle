@@ -163,6 +163,10 @@ def build_model_app(model_id: str,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        try:
+            await get_self()._ensure_replica_registered()
+        except Exception as e:
+            logger.warning(f'Failed to register replica at startup: {e}')
         yield
         try:
             await get_self().shutdown()

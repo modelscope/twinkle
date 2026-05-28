@@ -40,3 +40,10 @@ class CheckpointPathResponse(BaseModel):
     """Response body for the /checkpoint_path endpoint."""
     path: str
     twinkle_path: str
+
+
+class CapacityInfoResponse(BaseModel):
+    """Response body for the /capacity_info endpoint."""
+    max_loras: int
+    used_loras: int
+    free_loras: int
