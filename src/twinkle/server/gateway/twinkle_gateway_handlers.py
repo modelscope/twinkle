@@ -24,6 +24,14 @@ logger = get_logger()
 def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register all /twinkle/* routes on the given FastAPI app."""
 
+    @app.get('/twinkle/capacity_info', response_model=types.CapacityInfoResponse)
+    async def get_capacity_info(
+            request: Request,
+            self: GatewayServer = Depends(self_fn),
+    ) -> types.CapacityInfoResponse:
+        info = await self.state.get_capacity_info()
+        return types.CapacityInfoResponse(**info)
+
     @app.get('/twinkle/healthz', response_model=types.HealthResponse)
     async def healthz(request: Request) -> types.HealthResponse:
         return types.HealthResponse(status='ok')
