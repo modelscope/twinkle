@@ -177,9 +177,9 @@ class IFDFilter(Preprocessor):
             if not isinstance(key_rounds, list) or not key_rounds:
                 continue
             messages = row.get('messages') or []
-            for rnd_idx, rnd in enumerate(key_rounds):
-                if isinstance(rnd, dict) and 'assistant_idx' in rnd:
-                    tasks.append((ri, rnd_idx, rnd['assistant_idx'], messages))
+            for rnd_idx, asst_idx in enumerate(key_rounds):
+                if isinstance(asst_idx, int):
+                    tasks.append((ri, rnd_idx, asst_idx, messages))
 
         # Parallel IFD scoring
         scores: Dict[Tuple[int, int], Optional[float]] = {}
@@ -210,17 +210,18 @@ class IFDFilter(Preprocessor):
 
             key_rounds = user_data.get('key_rounds')
             if not isinstance(key_rounds, list) or not key_rounds:
-                n_removed_rows += 1
+                if self._keep_if_no_key_rounds:
+                    out.append(row)
+                else:
+                    n_removed_rows += 1
                 continue
 
             # Keep only hard rounds (IFD > threshold or score unavailable)
             kept_rounds = []
-            for rnd_idx, rnd in enumerate(key_rounds):
+            for rnd_idx, asst_idx in enumerate(key_rounds):
                 ifd = scores.get((ri, rnd_idx))
                 if ifd is None or ifd > self._ifd_threshold:
-                    if isinstance(rnd, dict):
-                        rnd = dict(rnd, ifd_score=ifd)
-                    kept_rounds.append(rnd)
+                    kept_rounds.append(asst_idx)
                 else:
                     n_removed_rounds += 1
 

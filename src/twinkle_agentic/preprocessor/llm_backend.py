@@ -164,7 +164,12 @@ class SamplerBackend(LLMBackend):
             for resp in responses:
                 for seq in resp.sequences:
                     text = seq.decoded or ''
-                    results.append({'content': text, 'reasoning_content': ''})
+                    reasoning = ''
+                    if '</think>' in text:
+                        parts = text.split('</think>', 1)
+                        reasoning = parts[0].split('<think>')[-1].strip()
+                        text = parts[1].strip()
+                    results.append({'content': text, 'reasoning_content': reasoning})
             return results
         except Exception as e:
             logger.warning(f'[SamplerBackend] chat failed: {e}')

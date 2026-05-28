@@ -4,7 +4,7 @@ import numpy as np
 import os
 from collections.abc import Mapping
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set, Union
 
 from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory
@@ -570,10 +570,23 @@ class Template:
                 **kwargs)
         return inputs
 
+    @staticmethod
+    def _get_train_indices(trajectory: Trajectory) -> Optional[Set[int]]:
+        """Extract key-round assistant indices from trajectory's ``user_data``."""
+        user_data = trajectory.get('user_data')
+        if not isinstance(user_data, dict):
+            return None
+        key_rounds = user_data.get('key_rounds')
+        if not isinstance(key_rounds, list) or not key_rounds:
+            return None
+        return set(key_rounds) or None
+
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""
         labels = None
         input_ids = None
+        # key-round selective training
+        train_indices = self._get_train_indices(trajectory) if not add_generation_prompt else None
         if self.use_chat_template:
             if add_generation_prompt:
                 # For inference: just get input_ids with generation prompt, no labels needed
@@ -583,6 +596,14 @@ class Template:
                     if hasattr(input_ids, 'squeeze'):
                         input_ids = input_ids.squeeze(0)
                     labels = np.full_like(input_ids, -100)  # No labels for inference
+            elif train_indices is not None:
+                # key-round-only: always use TokenizeByRound with filtered indices
+                if kwargs.get('tokenize', True):
+                    input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(
+                        self.tokenizer, self._apply_chat_template, trajectory,
+                        train_indices=train_indices, **kwargs)
+                else:
+                    encoded = self._apply_chat_template(trajectory, **kwargs)
             elif self._template_support_assistant_tokens_mask:
                 encoded = self._apply_chat_template(
                     trajectory, return_assistant_tokens_mask=kwargs.get('tokenize', True), **kwargs)

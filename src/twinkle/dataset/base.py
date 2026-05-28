@@ -231,7 +231,9 @@ class Dataset(TorchDataset):
             kwargs['batched'] = True
             with processing_lock(key):
                 if 'remove_columns' not in kwargs:
-                    kwargs['remove_columns'] = list(self.datasets[key].features.keys())
+                    features = getattr(self.datasets[key], 'features', None)
+                    if features is not None:
+                        kwargs['remove_columns'] = list(features.keys())
                 self.datasets[key] = self.datasets[key].map(preprocess_func, **kwargs)
             if len(self.datasets) == 1:
                 self.dataset = self.datasets[key]

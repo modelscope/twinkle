@@ -209,7 +209,7 @@ class QualityPreprocessor(Preprocessor):
             pipeline.append(partial(dj.minhash_dedup, jaccard_threshold=jaccard_threshold))
 
         # Phase 9: neural PPL
-        if backend or ppl_api_endpoint:
+        if (backend or ppl_api_endpoint) and ppl_tokenizer:
             pf = PerplexityFilter(
                 backend=backend,
                 api_endpoint=ppl_api_endpoint,
@@ -222,7 +222,7 @@ class QualityPreprocessor(Preprocessor):
             pipeline.append(pf.ppl_filter)
 
         # Phase 9.5: 2D consistency filter
-        if backend or (consistency_sampler_endpoint and consistency_embed_endpoint):
+        if (backend or consistency_sampler_endpoint) and (embed_backend or consistency_embed_endpoint):
             cf = ConsistencyFilter(
                 backend=backend,
                 embed_backend=embed_backend,

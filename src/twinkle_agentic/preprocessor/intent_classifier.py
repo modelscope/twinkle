@@ -271,7 +271,8 @@ class IntentClassifier(Preprocessor):
         # Each entry: (row_idx, assistant_idx, user_text, asst_text, proposed_intent)
         candidates: List[tuple] = []
         row_intents: Dict[int, str] = {}
-        confirmed_rounds: Dict[int, List[Dict[str, Any]]] = {}  # row_idx → list of key rounds
+        confirmed_rounds: Dict[int, List[int]] = {}  # row_idx → list of assistant indices
+        round_intents: Dict[int, Dict[int, str]] = {}  # row_idx → {asst_idx: intent}
 
         for ri, row in enumerate(rows):
             messages = row.get('messages')
@@ -284,8 +285,8 @@ class IntentClassifier(Preprocessor):
                 row_intents[ri] = INTENT_TOOL_CALL
                 for idx, m in enumerate(messages):
                     if isinstance(m, dict) and m.get('role') == 'assistant' and m.get('tool_calls'):
-                        confirmed_rounds.setdefault(ri, []).append(
-                            {'assistant_idx': idx, 'intent': INTENT_TOOL_CALL})
+                        confirmed_rounds.setdefault(ri, []).append(idx)
+                        round_intents.setdefault(ri, {})[idx] = INTENT_TOOL_CALL
                 continue
 
             # Scan each message for signals
@@ -363,13 +364,13 @@ class IntentClassifier(Preprocessor):
                     except Exception:
                         confirmed = None
                     if confirmed:
-                        confirmed_rounds.setdefault(ri, []).append(
-                            {'assistant_idx': asst_idx, 'intent': confirmed})
+                        confirmed_rounds.setdefault(ri, []).append(asst_idx)
+                        round_intents.setdefault(ri, {})[asst_idx] = confirmed
         elif candidates:
             # No LLM — trust heuristic directly
             for ri, asst_idx, _, _, proposed in candidates:
-                confirmed_rounds.setdefault(ri, []).append(
-                    {'assistant_idx': asst_idx, 'intent': proposed})
+                confirmed_rounds.setdefault(ri, []).append(asst_idx)
+                round_intents.setdefault(ri, {})[asst_idx] = proposed
 
         # Phase 3: full-trajectory LLM for rows without any heuristic signal
         needs_full_llm = [ri for ri, v in row_intents.items() if v is None]
@@ -412,15 +413,16 @@ class IntentClassifier(Preprocessor):
                     last_asst = idx
                     break
             if last_asst is not None:
-                confirmed_rounds.setdefault(ri, []).append(
-                    {'assistant_idx': last_asst, 'intent': intent})
+                confirmed_rounds.setdefault(ri, []).append(last_asst)
+                round_intents.setdefault(ri, {})[last_asst] = intent
 
         # Phase 4: determine primary intent from key_rounds for candidate rows
         for ri in confirmed_rounds:
             if ri not in row_intents or row_intents.get(ri) == INTENT_TOOL_CALL:
                 continue
             # Primary = most common confirmed intent
-            intents = [r['intent'] for r in confirmed_rounds[ri]]
+            ri_intents = round_intents.get(ri, {})
+            intents = [ri_intents.get(idx, INTENT_OTHER) for idx in confirmed_rounds[ri]]
             from collections import Counter
             most_common = Counter(intents).most_common(1)[0][0]
             row_intents[ri] = most_common
@@ -439,6 +441,8 @@ class IntentClassifier(Preprocessor):
             if i in confirmed_rounds and confirmed_rounds[i]:
                 user_data = dict(row.get('user_data') or {})
                 user_data['key_rounds'] = confirmed_rounds[i]
+                if i in round_intents:
+                    user_data['intents'] = round_intents[i]
                 row['user_data'] = user_data
             out.append(row)
 

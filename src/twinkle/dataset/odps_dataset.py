@@ -109,6 +109,7 @@ class OdpsIterableDataset(IterableDataset):
     ):
         # bypass parent __init__ that would call _load_dataset
         self.template = None
+        self._mixed = False
         self.datasets = {}
         self.dataset = None
 
@@ -169,4 +170,6 @@ class OdpsIterableDataset(IterableDataset):
 
     @remote_function()
     def __iter__(self):
-        return self.dataset.__iter__()
+        for row in self.dataset:
+            self._write_through(row)
+            yield row

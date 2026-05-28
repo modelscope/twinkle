@@ -155,9 +155,9 @@ class ResponseRefiner(Preprocessor):
             if not isinstance(key_rounds, list) or not key_rounds:
                 continue
             messages = row.get('messages') or []
-            for rnd_idx, rnd in enumerate(key_rounds):
-                if isinstance(rnd, dict) and 'assistant_idx' in rnd:
-                    tasks.append((ri, rnd_idx, rnd['assistant_idx'], messages, rnd.get('intent', '')))
+            intents = user_data.get('intents') or {}
+            for rnd_idx, asst_idx in enumerate(key_rounds):
+                tasks.append((ri, rnd_idx, asst_idx, messages, intents.get(asst_idx, '')))
 
         if not tasks:
             # No key rounds anywhere → drop all
@@ -201,15 +201,12 @@ class ResponseRefiner(Preprocessor):
             messages = list(row.get('messages') or [])
             modified = False
 
-            for rnd_idx, rnd in enumerate(key_rounds):
-                if not isinstance(rnd, dict):
-                    continue
+            for rnd_idx, asst_idx in enumerate(key_rounds):
                 result = results.get((ri, rnd_idx))
                 if result is None:
                     continue
 
-                asst_idx = rnd.get('assistant_idx')
-                if asst_idx is None or asst_idx >= len(messages):
+                if asst_idx >= len(messages):
                     continue
 
                 # Replace assistant content
