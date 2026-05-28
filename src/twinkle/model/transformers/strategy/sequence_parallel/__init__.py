@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
+from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
 from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
@@ -26,6 +27,31 @@ def is_qwen3_vl(model):
 def is_qwen3_omni(model):
     mt = getattr(getattr(model, 'config', None), 'model_type', '')
     return 'qwen3_omni' in mt
+
+
+def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_position_or_past_key_values, *args,
+                             **kwargs):
+    if has_signature_parameter(fn, 'cache_position'):
+        return call_with_supported_kwargs(
+            fn,
+            config,
+            input_embeds,
+            attention_mask,
+            cache_position_or_past_key_values,
+            *args,
+            **kwargs,
+        )
+    if cache_position_or_past_key_values is None and 'past_key_values' in kwargs:
+        return call_with_supported_kwargs(fn, config, input_embeds, attention_mask, *args, **kwargs)
+    return call_with_supported_kwargs(
+        fn,
+        config,
+        input_embeds,
+        attention_mask,
+        cache_position_or_past_key_values,
+        *args,
+        **kwargs,
+    )
 
 
 # main content copied from ms-swift
@@ -77,59 +103,89 @@ class SequenceParallel:
         try:
             from transformers import masking_utils
 
-            _origin_flash_attention_mask = masking_utils.flash_attention_mask
+            origin_sdpa = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
+            origin_uses_cache_position = has_signature_parameter(origin_sdpa, 'cache_position')
 
-            # Patch attention masks for SP: avoid masking when full sequence is reconstructed.
-            def flash_attention_mask(batch_size,
-                                     cache_position,
-                                     kv_length,
-                                     kv_offset=0,
-                                     mask_function=masking_utils.causal_mask_function,
-                                     attention_mask=None,
-                                     **kwargs):
-                if self.world_size == 1:
-                    return _origin_flash_attention_mask(batch_size, cache_position, kv_length, kv_offset, mask_function,
-                                                        attention_mask, **kwargs)
-                if attention_mask is not None:
-                    if attention_mask.all():
-                        attention_mask = None
+            def sdpa_mask(batch_size, q_length=None, kv_length=None, *args, **kwargs):
+                q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
+                device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
+                if device is None:
+                    device = self.real_position_ids.device
 
-                return attention_mask
+                cache_position = None
+                if self.world_size > 1:
+                    padded_position_ids = self.pad(
+                        self.real_position_ids[0],
+                        padding_value=-1,
+                        position_ids=self.real_position_ids,
+                        dim=0,
+                    )
+                    global_length = padded_position_ids.shape[0]
+                    if origin_uses_cache_position:
+                        cache_position = torch.arange(0, global_length, device=device)
+                        kv_length = global_length
+                    else:
+                        # Newer Transformers passes q_length/q_offset instead of cache_position. In SP training,
+                        # create_causal_mask may still see the local shard length, so restore the global query length
+                        # only for the no-cache prefill path; cache/sliding paths keep their upstream offsets.
+                        q_offset = kwargs.get('q_offset', 0)
+                        kv_offset = kwargs.get('kv_offset', 0)
+                        no_cache_offsets = ((not torch.is_tensor(q_offset) and q_offset == 0)
+                                            and (not torch.is_tensor(kv_offset) and kv_offset == 0))
+                        if no_cache_offsets:
+                            q_length = global_length
+                            attention_mask = kwargs.get('attention_mask')
+                            if attention_mask is not None and torch.is_tensor(attention_mask):
+                                kv_length = attention_mask.shape[-1]
+                            else:
+                                kv_length = global_length
 
-            masking_utils.flash_attention_mask = flash_attention_mask
-            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['flash_attention_2'] = flash_attention_mask
+                if origin_uses_cache_position:
+                    if cache_position is None:
+                        cache_position = q_length if torch.is_tensor(q_length) else torch.arange(
+                            q_length, device=device)
+                    return origin_sdpa(batch_size, cache_position, kv_length, *args, **kwargs)
 
-            def sdpa_mask(batch_size, cache_position, kv_length, *args, **kwargs):
-                if self.world_size == 1:
-                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                     cache_position,
-                                                                                                     kv_length, *args,
-                                                                                                     **kwargs)
-                device = cache_position.device
-                cache_position = self.real_position_ids[0]
-                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
-                cache_position = torch.arange(0, cache_position.shape[0], device=device)
-                kv_length = cache_position.shape[0]
-                return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                 cache_position,
-                                                                                                 kv_length, *args,
-                                                                                                 **kwargs)
+                return origin_sdpa(batch_size, q_length, kv_length, *args, device=device, **kwargs)
 
-            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[
-                'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
+            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'] = origin_sdpa
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
-            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
+            def create_causal_mask(config,
+                                   input_embeds,
+                                   attention_mask,
+                                   cache_position_or_past_key_values=None,
+                                   *args,
+                                   **kwargs):
                 if self.world_size == 1:
-                    return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                                   *args, **kwargs)
+                    return _call_create_causal_mask(
+                        masking_utils.origin_create_causal_mask,
+                        config,
+                        input_embeds,
+                        attention_mask,
+                        cache_position_or_past_key_values,
+                        *args,
+                        **kwargs,
+                    )
                 input_embeds = torch.ones(
                     (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
-                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
-                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                               *args, **kwargs)
+                if has_signature_parameter(masking_utils.origin_create_causal_mask, 'cache_position'):
+                    cache_position_or_past_key_values = torch.arange(
+                        0,
+                        input_embeds.shape[1],
+                        device=input_embeds.device,
+                    )
+                return _call_create_causal_mask(
+                    masking_utils.origin_create_causal_mask,
+                    config,
+                    input_embeds,
+                    attention_mask,
+                    cache_position_or_past_key_values,
+                    *args,
+                    **kwargs,
+                )
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
