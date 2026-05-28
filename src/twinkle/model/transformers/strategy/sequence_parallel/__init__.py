@@ -140,6 +140,14 @@ class SequenceParallel:
                             else:
                                 kv_length = global_length
 
+                # padding_mask may be an AttentionMask wrapper instead of Tensor
+                _pm = kwargs.get('padding_mask')
+                if _pm is not None and not isinstance(_pm, torch.Tensor):
+                    if hasattr(_pm, 'to_tensor'):
+                        kwargs['padding_mask'] = _pm.to_tensor()
+                    elif hasattr(_pm, 'mask'):
+                        kwargs['padding_mask'] = _pm.mask
+
                 if origin_uses_cache_position:
                     if cache_position is None:
                         cache_position = q_length if torch.is_tensor(q_length) else torch.arange(
