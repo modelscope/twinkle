@@ -33,14 +33,6 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     It is wired in via ``Depends`` so it is resolved lazily at request time.
     """
 
-    @app.get('/capacity_info')
-    async def get_capacity_info(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
-    ) -> dict:
-        info = await self.state.get_capacity_info()
-        return info
-
     @app.get('/healthz')
     async def healthz(request: Request) -> types.HealthResponse:
         return types.HealthResponse(status='ok')

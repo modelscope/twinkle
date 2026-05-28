@@ -102,7 +102,8 @@ class ServerState:
                              payload: dict[str, Any],
                              token: str,
                              model_id: str | None = None,
-                             replica_id: str | None = None) -> str:
+                             replica_id: str | None = None,
+                             session_id: str | None = None) -> str:
         """Register a new model with the server state.
 
         Args:
@@ -110,6 +111,8 @@ class ServerState:
             token: User token that owns this model. Required.
             model_id: Optional explicit model_id; otherwise auto-generated.
             replica_id: Optional replica that is hosting this model.
+            session_id: Optional owning session; enables cascade cleanup when
+                the session expires. Falls back to ``payload['session_id']``.
 
         Returns:
             The model_id for the registered model.
@@ -120,7 +123,7 @@ class ServerState:
         _model_id = re.sub(r'[^\w\-]', '_', _model_id)
 
         record = ModelRecord(
-            session_id=payload.get('session_id'),
+            session_id=session_id or payload.get('session_id'),
             model_seq_id=payload.get('model_seq_id'),
             base_model=payload.get('base_model'),
             user_metadata=payload.get('user_metadata') or {},
@@ -397,8 +400,9 @@ class ServerStateProxy:
                              payload: dict[str, Any],
                              token: str,
                              model_id: str | None = None,
-                             replica_id: str | None = None) -> str:
-        return await self._actor.register_model.remote(payload, token, model_id, replica_id)
+                             replica_id: str | None = None,
+                             session_id: str | None = None) -> str:
+        return await self._actor.register_model.remote(payload, token, model_id, replica_id, session_id)
 
     async def unload_model(self, model_id: str) -> bool:
         return await self._actor.unload_model.remote(model_id)
@@ -410,9 +414,6 @@ class ServerStateProxy:
 
     async def register_replica(self, replica_id: str, max_loras: int) -> None:
         await self._actor.register_replica.remote(replica_id, max_loras)
-
-    def register_replica_blocking(self, replica_id: str, max_loras: int) -> None:
-        ray.get(self._actor.register_replica.remote(replica_id, max_loras))
 
     async def unregister_replica(self, replica_id: str) -> None:
         await self._actor.unregister_replica.remote(replica_id)

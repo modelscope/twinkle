@@ -510,6 +510,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 model_id=adapter_name,
                 replica_id=self.replica_id,
+                session_id=session_id,
             )
             try:
                 self.register_resource(adapter_name, token, session_id)

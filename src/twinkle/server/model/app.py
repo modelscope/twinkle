@@ -85,15 +85,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         # Initialize mixins
         self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Model')
         self._init_adapter_manager(**(adapter_config or {}))
-        self._register_replica_at_startup()
         # Note: countdown task is started lazily in _ensure_sticky()
-
-    def _register_replica_at_startup(self) -> None:
-        try:
-            self.state.register_replica_blocking(self.replica_id, self.max_loras)
-            self._replica_registered = True
-        except Exception as e:
-            logger.warning(f'Failed to register replica at startup: {e}')
 
     async def _ensure_replica_registered(self):
         """Lazily register replica on first async request."""
