@@ -128,7 +128,7 @@ def _apply_hf_moe_grouped_mm_patch(model=None) -> None:
         skip if EP is **not** enabled (avoid ~8x overhead).
       - ``TWINKLE_NPU_GMM_PATCH=0`` → **disable** the patch regardless.
     """
-    moe_enabled = _is_env_enabled('TWINKLE_NPU_GMM_PATCH', default=True)
+    moe_enabled = _is_env_enabled('TWINKLE_NPU_GMM_PATCH', default=False)
 
     if not moe_enabled:
         has_native_gmm = hasattr(torch.nn.functional, 'grouped_mm')
