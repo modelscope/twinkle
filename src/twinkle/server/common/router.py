@@ -4,7 +4,7 @@ from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest,
                                       RequestRouter, RunningReplica)
 from typing import Dict, List, Optional
 
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()

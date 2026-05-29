@@ -11,6 +11,7 @@ from typing import Any
 
 from twinkle.server.utils.metrics import get_resource_metrics
 from twinkle.utils.logger import get_logger
+from .backend import MemoryBackend, StateBackend
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
 from .model_manager import ModelManager
@@ -37,15 +38,19 @@ class ServerState:
 
     def __init__(
             self,
+            backend: StateBackend | None = None,
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
             cleanup_interval: float = 3600.0,  # 1 hour in seconds
             per_token_model_limit: int = 30,
             **kwargs) -> None:
+        # Backend is currently consumed only by ConfigManager; other managers
+        # will be migrated in subsequent tasks.
+        self._backend: StateBackend = backend if backend is not None else MemoryBackend()
         self._session_mgr = SessionManager(expiration_timeout)
         self._model_mgr = ModelManager(expiration_timeout, per_token_model_limit)
         self._sampling_mgr = SamplingSessionManager(expiration_timeout)
         self._future_mgr = FutureManager(expiration_timeout)
-        self._config_mgr = ConfigManager()
+        self._config_mgr = ConfigManager(self._backend)
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
@@ -251,6 +256,32 @@ class ServerState:
             queue_state_reason=queue_state_reason,
         )
 
+    # ----- Configuration Management -----
+
+    async def add_config(self, key: str, value: Any) -> None:
+        """Add or overwrite a configuration value."""
+        await self._config_mgr.add(key, value)
+
+    async def add_or_get_config(self, key: str, value: Any) -> Any:
+        """Add a config value if absent; otherwise return the existing value."""
+        return await self._config_mgr.add_or_get(key, value)
+
+    async def get_config(self, key: str) -> Any | None:
+        """Return the configuration value for key, or None."""
+        return await self._config_mgr.get(key)
+
+    async def pop_config(self, key: str) -> Any | None:
+        """Remove and return the configuration value for key, or None."""
+        return await self._config_mgr.pop(key)
+
+    async def clear_config(self) -> None:
+        """Remove all configuration entries."""
+        await self._config_mgr.clear()
+
+    async def count_config(self) -> int:
+        """Return the number of stored configuration entries."""
+        return await self._config_mgr.count()
+
     # ----- Resource Cleanup -----
 
     async def cleanup_expired_resources(self) -> dict[str, int]:
@@ -429,6 +460,26 @@ class ServerStateProxy:
     async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
         return await self._actor.get_sampling_session.remote(sampling_session_id)
 
+    # ----- Configuration Management -----
+
+    async def add_config(self, key: str, value: Any) -> None:
+        await self._actor.add_config.remote(key, value)
+
+    async def add_or_get_config(self, key: str, value: Any) -> Any:
+        return await self._actor.add_or_get_config.remote(key, value)
+
+    async def get_config(self, key: str) -> Any | None:
+        return await self._actor.get_config.remote(key)
+
+    async def pop_config(self, key: str) -> Any | None:
+        return await self._actor.pop_config.remote(key)
+
+    async def clear_config(self) -> None:
+        await self._actor.clear_config.remote()
+
+    async def count_config(self) -> int:
+        return await self._actor.count_config.remote()
+
     # ----- Future Management -----
 
     async def get_future(self, request_id: str) -> dict[str, Any] | None:
@@ -447,6 +498,26 @@ class ServerStateProxy:
         """Store task status with optional result."""
         await self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
                                                      queue_state_reason)
+
+    # ----- Configuration Management -----
+
+    async def add_config(self, key: str, value: Any) -> None:
+        await self._actor.add_config.remote(key, value)
+
+    async def add_or_get_config(self, key: str, value: Any) -> Any:
+        return await self._actor.add_or_get_config.remote(key, value)
+
+    async def get_config(self, key: str) -> Any | None:
+        return await self._actor.get_config.remote(key)
+
+    async def pop_config(self, key: str) -> Any | None:
+        return await self._actor.pop_config.remote(key)
+
+    async def clear_config(self) -> None:
+        await self._actor.clear_config.remote()
+
+    async def count_config(self) -> int:
+        return await self._actor.count_config.remote()
 
     # ----- Resource Cleanup -----
 
@@ -468,7 +539,10 @@ class ServerStateProxy:
 # ---------------------------------------------------------------------------
 
 
-def get_server_state(actor_name: str = 'twinkle_server_state', **kwargs) -> ServerStateProxy:
+def get_server_state(
+        actor_name: str = 'twinkle_server_state',
+        backend: StateBackend | None = None,
+        **kwargs) -> ServerStateProxy:
     """Get or create the ServerState Ray actor.
 
     Ensures only one ServerState actor exists with the given name.  Uses a
@@ -476,6 +550,9 @@ def get_server_state(actor_name: str = 'twinkle_server_state', **kwargs) -> Serv
 
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state').
+        backend: Optional :class:`StateBackend` injected into the ServerState
+            actor.  When ``None`` the actor falls back to an in-process
+            :class:`MemoryBackend`.
         **kwargs: Additional keyword arguments passed to ServerState constructor
             (e.g., expiration_timeout, cleanup_interval).
 
@@ -487,7 +564,8 @@ def get_server_state(actor_name: str = 'twinkle_server_state', **kwargs) -> Serv
     except ValueError:
         try:
             _ServerState = ray.remote(ServerState)
-            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(**kwargs)
+            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(
+                backend=backend, **kwargs)
             try:
                 ray.get(actor.start_cleanup_task.remote())
             except Exception as e:

@@ -22,7 +22,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
 from twinkle.server.utils.lifecycle import ProcessorManagerMixin
 from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from .twinkle_handlers import _register_processor_routes
 

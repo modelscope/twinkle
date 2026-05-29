@@ -20,7 +20,7 @@ from .types import QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
     from twinkle.server.utils.metrics import TaskMetrics
-    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.server.state import ServerStateProxy
 
 logger = get_logger()
 
