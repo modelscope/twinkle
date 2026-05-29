@@ -9,9 +9,11 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.telemetry import MetricsRegistry
 from twinkle.utils.logger import get_logger
-from .backend import MemoryBackend, StateBackend
+from .backend import StateBackend
+from .backend.factory import PersistenceConfig, create_backend
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
 from .model_manager import ModelManager
@@ -39,23 +41,31 @@ class ServerState:
     def __init__(
             self,
             backend: StateBackend | None = None,
+            persistence_config: PersistenceConfig | None = None,
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
             cleanup_interval: float = 3600.0,  # 1 hour in seconds
             per_token_model_limit: int = 30,
+            signature_config: dict[str, Any] | None = None,
+            signature_policy: str = 'warn',
             **kwargs) -> None:
-        # Backend is currently consumed only by ConfigManager; other managers
-        # will be migrated in subsequent tasks.
-        self._backend: StateBackend = backend if backend is not None else MemoryBackend()
-        self._session_mgr = SessionManager(expiration_timeout)
-        self._model_mgr = ModelManager(expiration_timeout, per_token_model_limit)
-        self._sampling_mgr = SamplingSessionManager(expiration_timeout)
-        self._future_mgr = FutureManager(expiration_timeout)
+        if backend is not None:
+            self._backend: StateBackend = backend
+        else:
+            self._backend = create_backend(persistence_config)
+        self._session_mgr = SessionManager(self._backend, expiration_timeout)
+        self._model_mgr = ModelManager(self._backend, expiration_timeout, per_token_model_limit)
+        self._sampling_mgr = SamplingSessionManager(self._backend, expiration_timeout)
+        self._future_mgr = FutureManager(self._backend, expiration_timeout)
         self._config_mgr = ConfigManager(self._backend)
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_running = False
+
+        # Config signature validation state
+        self._signature_config = signature_config
+        self._signature_policy = signature_policy
 
         # Metrics loop state
         self._metrics_task: asyncio.Task | None = None
@@ -82,7 +92,7 @@ class ServerState:
             user_metadata=payload.get('user_metadata') or {},
             sdk_version=payload.get('sdk_version'),
         )
-        self._session_mgr.add(session_id, record)
+        await self._session_mgr.add(session_id, record)
         return session_id
 
     async def touch_session(self, session_id: str) -> bool:
@@ -91,7 +101,7 @@ class ServerState:
         Returns:
             True if the session exists and was touched, False otherwise.
         """
-        return self._session_mgr.touch(session_id)
+        return await self._session_mgr.touch(session_id)
 
     async def get_session_last_heartbeat(self, session_id: str) -> float | None:
         """Get the last heartbeat timestamp for a session.
@@ -99,7 +109,7 @@ class ServerState:
         Returns:
             Last heartbeat timestamp, or None if the session does not exist.
         """
-        return self._session_mgr.get_last_heartbeat(session_id)
+        return await self._session_mgr.get_last_heartbeat(session_id)
 
     # ----- Model Registration -----
 
@@ -136,7 +146,7 @@ class ServerState:
             token=token,
             replica_id=replica_id,
         )
-        self._model_mgr.add(_model_id, record)
+        await self._model_mgr.add(_model_id, record)
         return _model_id
 
     async def unload_model(self, model_id: str) -> bool:
@@ -145,11 +155,11 @@ class ServerState:
         Returns:
             True if the model was found and removed, False otherwise.
         """
-        return self._model_mgr.remove(model_id)
+        return await self._model_mgr.remove(model_id)
 
     async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
         """Get metadata for a registered model as a plain dict."""
-        record = self._model_mgr.get(model_id)
+        record = await self._model_mgr.get(model_id)
         return record.model_dump() if record is not None else None
 
     # ----- Replica Management -----
@@ -169,7 +179,7 @@ class ServerState:
         Args:
             replica_id: Unique identifier for the replica to remove.
         """
-        self._model_mgr.unregister_replica(replica_id)
+        await self._model_mgr.unregister_replica(replica_id)
 
     async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
         """Return candidate replica IDs that have not reached their max_loras limit.
@@ -202,19 +212,19 @@ class ServerState:
             base_model=payload.get('base_model'),
             model_path=payload.get('model_path'),
         )
-        self._sampling_mgr.add(_sampling_session_id, record)
+        await self._sampling_mgr.add(_sampling_session_id, record)
         return _sampling_session_id
 
     async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
         """Get a sampling session by ID as a plain dict."""
-        record = self._sampling_mgr.get(sampling_session_id)
+        record = await self._sampling_mgr.get(sampling_session_id)
         return record.model_dump() if record is not None else None
 
     # ----- Future Management -----
 
     async def get_future(self, request_id: str) -> dict[str, Any] | None:
         """Retrieve a stored future result as a plain dict."""
-        record = self._future_mgr.get(request_id)
+        record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
     async def store_future_status(
@@ -246,7 +256,7 @@ class ServerState:
             queue_state: Optional queue state for tinker client (active/paused_rate_limit/paused_capacity).
             queue_state_reason: Optional reason for the queue state.
         """
-        self._future_mgr.store_status(
+        await self._future_mgr.store_status(
             request_id=request_id,
             status=status,
             model_id=model_id,
@@ -298,13 +308,13 @@ class ServerState:
         cutoff_time = current_time - self.expiration_timeout
 
         # Collect expired session IDs first for cascade logic
-        expired_session_ids = self._session_mgr.get_expired_ids(cutoff_time)
+        expired_session_ids = await self._session_mgr.get_expired_ids(cutoff_time)
 
         # Perform actual cleanup in dependency order
-        sessions_removed = self._session_mgr.cleanup_expired(cutoff_time)
-        models_removed = self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids)
-        samplings_removed = self._sampling_mgr.cleanup_expired(cutoff_time, expired_session_ids)
-        futures_removed = self._future_mgr.cleanup_expired(cutoff_time)
+        sessions_removed = await self._session_mgr.cleanup_expired(cutoff_time)
+        models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
+        samplings_removed = await self._sampling_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
+        futures_removed = await self._future_mgr.cleanup_expired(cutoff_time)
 
         return {
             'sessions': sessions_removed,
@@ -336,17 +346,17 @@ class ServerState:
         """
         registry = MetricsRegistry.get()
         sources = (
-            ('active_sessions', self._session_mgr.count),
-            ('active_models', self._model_mgr.count),
-            ('active_sampling_sessions', self._sampling_mgr.count),
-            ('active_futures', self._future_mgr.count),
+            ('active_sessions', self._session_mgr),
+            ('active_models', self._model_mgr),
+            ('active_sampling_sessions', self._sampling_mgr),
+            ('active_futures', self._future_mgr),
         )
         last_values: dict[str, int] = {name: 0 for name, _ in sources}
         while self._metrics_running:
             try:
                 await asyncio.sleep(self._metrics_update_interval)
-                for name, counter in sources:
-                    current = counter()
+                for name, mgr in sources:
+                    current = await mgr.count()
                     delta = current - last_values[name]
                     if delta != 0:
                         getattr(registry, name).add(delta)
@@ -365,12 +375,32 @@ class ServerState:
         """
         if self._cleanup_running:
             return False
+        # Rebuild in-memory indexes from backend data
+        await self._rebuild_indexes()
         self._cleanup_running = True
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         if not self._metrics_running:
             self._metrics_running = True
             self._metrics_task = asyncio.create_task(self._metrics_loop())
         return True
+
+    async def _rebuild_indexes(self) -> None:
+        """Rebuild in-memory indexes from backend data after startup.
+
+        Also validates config signature when ``signature_config`` was provided
+        at construction time.
+        """
+        # Validate config signature if provided
+        if self._signature_config is not None:
+            from twinkle.server.state.config_signature import (
+                SignatureMismatchPolicy,
+                validate_config_signature,
+            )
+            policy = SignatureMismatchPolicy(self._signature_policy)
+            await validate_config_signature(self._backend, self._signature_config, policy)
+
+        # Rebuild model indexes
+        await self._model_mgr.rebuild_indexes()
 
     async def stop_cleanup_task(self) -> bool:
         """Stop the background cleanup task.
@@ -401,10 +431,10 @@ class ServerState:
             'cleanup_interval': self.cleanup_interval,
             'cleanup_running': self._cleanup_running,
             'resource_counts': {
-                'sessions': self._session_mgr.count(),
-                'models': self._model_mgr.count(),
-                'sampling_sessions': self._sampling_mgr.count(),
-                'futures': self._future_mgr.count(),
+                'sessions': await self._session_mgr.count(),
+                'models': await self._model_mgr.count(),
+                'sampling_sessions': await self._sampling_mgr.count(),
+                'futures': await self._future_mgr.count(),
             },
         }
 
@@ -536,6 +566,9 @@ class ServerStateProxy:
 def get_server_state(
         actor_name: str = 'twinkle_server_state',
         backend: StateBackend | None = None,
+        persistence_config: PersistenceConfig | None = None,
+        signature_config: dict[str, Any] | None = None,
+        signature_policy: str = 'warn',
         **kwargs) -> ServerStateProxy:
     """Get or create the ServerState Ray actor.
 
@@ -545,8 +578,10 @@ def get_server_state(
     Args:
         actor_name: Name for the Ray actor (default: 'twinkle_server_state').
         backend: Optional :class:`StateBackend` injected into the ServerState
-            actor.  When ``None`` the actor falls back to an in-process
-            :class:`MemoryBackend`.
+            actor.  When ``None`` the actor falls back to ``persistence_config``
+            or an in-process :class:`MemoryBackend`.
+        persistence_config: Optional :class:`PersistenceConfig` used to build
+            a backend via :func:`create_backend` when ``backend`` is None.
         **kwargs: Additional keyword arguments passed to ServerState constructor
             (e.g., expiration_timeout, cleanup_interval).
 
@@ -559,10 +594,18 @@ def get_server_state(
         try:
             _ServerState = ray.remote(ServerState)
             actor = _ServerState.options(name=actor_name, lifetime='detached').remote(
-                backend=backend, **kwargs)
+                backend=backend,
+                persistence_config=persistence_config,
+                signature_config=signature_config,
+                signature_policy=signature_policy,
+                **kwargs)
             try:
                 ray.get(actor.start_cleanup_task.remote())
             except Exception as e:
+                # Ray wraps remote exceptions - check cause
+                cause = e.__cause__ if hasattr(e, '__cause__') and e.__cause__ else e
+                if isinstance(cause, ConfigMismatchError) or 'ConfigMismatchError' in type(e).__name__:
+                    raise
                 logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
         except ValueError:
             actor = ray.get_actor(actor_name)

@@ -1,21 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+from .backend.base import StateBackend
 from .base import BaseManager
 from .models import SamplingSessionRecord
 
 
 class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
-    """
-    Manages sampling sessions.
+    """Manages sampling sessions.
 
     Expiry is based on `created_at`.  A sampling session is also considered
     expired if its owning session has already been removed (cascade expiry).
     """
 
+    def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
+        super().__init__(backend, "sampling::", SamplingSessionRecord, expiration_timeout)
+
     # ----- Cleanup -----
 
-    def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str] | None = None) -> int:
+    async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str] | None = None, **kwargs) -> int:
         """Remove sampling sessions that are older than cutoff_time, or whose
         owning session has already been expired.
 
@@ -29,9 +32,10 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
             Number of sampling sessions removed.
         """
         session_set = set(expired_session_ids or [])
+        all_records = await self.get_all()
         expired_ids = []
 
-        for sampling_id, record in self._store.items():
+        for sampling_id, record in all_records.items():
             # Cascade: owner session was expired
             if record.session_id and record.session_id in session_set:
                 expired_ids.append(sampling_id)
@@ -42,6 +46,6 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
                 expired_ids.append(sampling_id)
 
         for sampling_id in expired_ids:
-            del self._store[sampling_id]
+            await self.remove(sampling_id)
 
         return len(expired_ids)
