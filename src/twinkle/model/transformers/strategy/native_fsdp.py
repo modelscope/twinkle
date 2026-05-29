@@ -551,15 +551,13 @@ def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
         raise RuntimeError('Native FSDP node-local state loading requires LOCAL_WORLD_SIZE or LOCAL_SIZE.')
     local_world_size = Platform.get_local_world_size()
     if local_rank < 0 or local_world_size <= 0 or world_size % local_world_size != 0:
-        raise RuntimeError(
-            f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
-            f'local_rank={local_rank}, local_world_size={local_world_size}.')
+        raise RuntimeError(f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
+                           f'local_rank={local_rank}, local_world_size={local_world_size}.')
     node_start = rank - local_rank
     node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
     if rank not in node_ranks or len(node_ranks) != local_world_size:
-        raise RuntimeError(
-            f'Invalid local rank group: rank={rank}, local_rank={local_rank}, '
-            f'local_world_size={local_world_size}, node_ranks={node_ranks}.')
+        raise RuntimeError(f'Invalid local rank group: rank={rank}, local_rank={local_rank}, '
+                           f'local_world_size={local_world_size}, node_ranks={node_ranks}.')
     return rank, world_size, node_start, node_ranks
 
 
