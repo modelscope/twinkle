@@ -11,6 +11,7 @@ from .tracing import (
     extract_context,
     get_current_span,
 )
+from .worker_init import ensure_telemetry_initialized
 
 __all__ = [
     "MetricsRegistry",
@@ -22,4 +23,5 @@ __all__ = [
     "inject_context",
     "extract_context",
     "get_current_span",
+    "ensure_telemetry_initialized",
 ]

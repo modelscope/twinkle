@@ -24,7 +24,7 @@ logger = get_logger()
 base_model = 'Qwen/Qwen3.5-4B'
 base_url = 'http://localhost:8000'
 api_key = 'EMPTY_API_KEY'
-save_dir = '/model'
+save_dir = '/tmp/twinkle_sft_output'
 
 
 # Step 2: Initialize the Twinkle client to communicate with the remote server.
@@ -108,8 +108,10 @@ def train():
         start_step = progress['cur_step']
 
     # Step 7: Run the training loop
+    max_steps = 10  # Limit to 10 steps for quick verification
     logger.info(model.get_train_configs().model_dump())
 
+    global_step = 0
     for epoch in range(3):
         logger.info(f'Starting epoch {epoch}')
         for cur_step, batch in enumerate(dataloader, start=start_step + 1):
@@ -128,11 +130,21 @@ def train():
             # # Advance the learning rate scheduler by one step
             # model.lr_step()
 
+            global_step += 1
+
             # Log the loss every 2 steps (aligned with gradient accumulation)
             if cur_step % 2 == 0:
                 # Print metric
                 metric = model.calculate_metric(is_training=True)
                 logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric.result}')
+
+            # Stop after max_steps
+            if global_step >= max_steps:
+                logger.info(f'Reached max_steps={max_steps}, stopping training.')
+                break
+
+        if global_step >= max_steps:
+            break
 
         # Step 8: Save the trained checkpoint
         twinkle_path = model.save(

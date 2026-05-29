@@ -69,6 +69,24 @@ class ServerLauncher:
         self._ray_initialized = False
         self._serve_started = False
 
+    # Telemetry env var keys that need to be propagated to Ray worker processes
+    _TELEMETRY_ENV_KEYS: tuple[str, ...] = (
+        'TWINKLE_TELEMETRY_ENABLED',
+        'TWINKLE_TELEMETRY_DEBUG',
+        'TWINKLE_TELEMETRY_SERVICE',
+        'TWINKLE_TELEMETRY_ENDPOINT',
+        'TWINKLE_TELEMETRY_INTERVAL',
+    )
+
+    def _build_telemetry_env_vars(self) -> dict[str, str]:
+        """Collect telemetry env vars from os.environ for propagation to Ray workers.
+
+        These vars are read by ``ensure_telemetry_initialized()`` inside the
+        FastAPI startup hook running in each worker process.
+        """
+        import os
+        return {k: os.environ[k] for k in self._TELEMETRY_ENV_KEYS if k in os.environ}
+
     def _get_builders(self) -> dict[str, Callable]:
         """Get the builder functions for all app types."""
         if self._builders:
@@ -129,6 +147,12 @@ class ServerLauncher:
             # Use runtime_env to apply patches in worker processes
             # This is required because Ray Serve's ProxyActor runs in separate processes
             runtime_env = get_runtime_env_for_patches()
+            # Propagate telemetry env vars to all Ray workers spawned in this job
+            telemetry_env_vars = self._build_telemetry_env_vars()
+            if telemetry_env_vars:
+                merged_env_vars = dict(runtime_env.get('env_vars') or {})
+                merged_env_vars.update(telemetry_env_vars)
+                runtime_env['env_vars'] = merged_env_vars
             # Connect to existing cluster if available, otherwise start local instance
             ray.init(
                 address='auto',
@@ -193,6 +217,20 @@ class ServerLauncher:
             if isinstance(deploy_config, dict):
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
 
+        # Inject telemetry env vars into the deployment's runtime_env so that
+        # Ray Serve replicas (worker processes) can initialize telemetry.
+        # User-specified env_vars take precedence to avoid overriding existing config.
+        telemetry_env_vars = self._build_telemetry_env_vars()
+        if telemetry_env_vars:
+            ray_actor_options = dict(deploy_options.get('ray_actor_options') or {})
+            runtime_env = dict(ray_actor_options.get('runtime_env') or {})
+            env_vars = dict(runtime_env.get('env_vars') or {})
+            for k, v in telemetry_env_vars.items():
+                env_vars.setdefault(k, v)
+            runtime_env['env_vars'] = env_vars
+            ray_actor_options['runtime_env'] = runtime_env
+            deploy_options['ray_actor_options'] = ray_actor_options
+
         # Pass http_options to server apps for internal proxy routing
         http_options = self.config.get('http_options', {})
         if import_path == 'server' and http_options:
@@ -212,6 +250,20 @@ class ServerLauncher:
         """
         # Apply Ray Serve patches before initializing Ray
         apply_ray_serve_patches()
+
+        # Initialize telemetry if configured
+        telemetry_config = self.config.get('telemetry_config', {})
+        if telemetry_config:
+            from twinkle.server.telemetry import TelemetryConfig, init_telemetry
+            config = TelemetryConfig(**telemetry_config)
+            init_telemetry(config)
+            # Export config to env vars for Ray worker processes
+            import os
+            os.environ['TWINKLE_TELEMETRY_ENABLED'] = '1'
+            os.environ['TWINKLE_TELEMETRY_DEBUG'] = '1' if config.debug else '0'
+            os.environ['TWINKLE_TELEMETRY_SERVICE'] = config.service_name
+            os.environ['TWINKLE_TELEMETRY_ENDPOINT'] = config.otlp_endpoint
+            os.environ['TWINKLE_TELEMETRY_INTERVAL'] = str(config.export_interval_ms)
 
         self._init_ray()
         self._start_serve()

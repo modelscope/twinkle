@@ -6,9 +6,9 @@ from .provider import get_meter
 
 
 class MetricsRegistry:
-    """集中声明所有指标。业务代码通过 MetricsRegistry.get() 获取单例使用。
+    """Centrally declares all metrics. Business code retrieves singleton via MetricsRegistry.get().
 
-    当 telemetry 未初始化时，OTEL 返回 NoOp meter，所有记录操作自动静默。
+    When telemetry is not initialized, OTEL returns a NoOp meter and all recording operations are silently no-op.
     """
 
     _instance: MetricsRegistry | None = None
@@ -16,7 +16,7 @@ class MetricsRegistry:
     def __init__(self) -> None:
         meter = get_meter("twinkle-server")
 
-        # === HTTP 请求 ===
+        # === HTTP Requests ===
         self.requests_total = meter.create_counter(
             "twinkle.http.requests.total",
             description="Total HTTP requests received",
@@ -27,7 +27,7 @@ class MetricsRegistry:
             unit="s",
         )
 
-        # === 任务队列 ===
+        # === Task Queue ===
         self.queue_depth = meter.create_up_down_counter(
             "twinkle.queue.depth",
             description="Current task queue depth",
@@ -55,7 +55,7 @@ class MetricsRegistry:
             description="Number of tokens currently tracked by the rate limiter",
         )
 
-        # === 资源 ===
+        # === Resources ===
         self.active_sessions = meter.create_up_down_counter(
             "twinkle.sessions.active",
             description="Number of active client sessions",
@@ -75,12 +75,12 @@ class MetricsRegistry:
 
     @classmethod
     def get(cls) -> MetricsRegistry:
-        """获取全局 MetricsRegistry 单例。首次调用时创建。"""
+        """Retrieve global MetricsRegistry singleton. Created on first call."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     @classmethod
     def reset(cls) -> None:
-        """重置单例（用于测试或 telemetry 重新初始化）"""
+        """Reset singleton (for testing or telemetry re-initialization)."""
         cls._instance = None

@@ -4,20 +4,20 @@ from __future__ import annotations
 
 
 class TwinkleServerError(Exception):
-    """所有 Twinkle Server 异常的基类"""
+    """Base class for all Twinkle Server exceptions."""
     pass
 
 
 class StateBackendError(TwinkleServerError):
-    """状态后端操作失败（连接断开、超时、数据序列化错误等）"""
+    """State backend operation failed (connection lost, timeout, data serialization error, etc.)."""
     pass
 
 
 class ConfigMismatchError(TwinkleServerError):
-    """配置签名不匹配 — 重启后检测到配置变更，持久化数据可能与当前配置不兼容"""
+    """Configuration signature mismatch — config changes detected after restart, persisted data may be incompatible with current configuration."""
     pass
 
 
 class ResourceExhaustedError(TwinkleServerError):
-    """资源耗尽 — 队列满、内存不足、连接池耗尽等"""
+    """Resource exhausted — queue full, insufficient memory, connection pool exhausted, etc."""
     pass

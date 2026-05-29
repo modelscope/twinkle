@@ -8,17 +8,17 @@ from .base import StateBackend
 
 
 class MemoryBackend(StateBackend):
-    """基于内存字典的状态后端实现。
+    """In-memory dictionary-based state backend implementation.
 
-    使用 ``dict[str, tuple[Any, float | None]]`` 存储 (value, expire_at)。
-    过期检查在 get/exists 时进行（惰性过期），适用于 Ray Actor 单线程模型。
+    Uses ``dict[str, tuple[Any, float | None]]`` to store (value, expire_at).
+    Expiration is checked lazily during get/exists, suitable for Ray Actor single-threaded model.
     """
 
     def __init__(self) -> None:
         self._store: dict[str, tuple[Any, float | None]] = {}
 
     def _is_expired(self, key: str) -> bool:
-        """检查键是否已过期。如已过期则删除并返回 True。"""
+        """Check if key is expired. If expired, delete and return True."""
         entry = self._store.get(key)
         if entry is None:
             return True
@@ -29,29 +29,29 @@ class MemoryBackend(StateBackend):
         return False
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        """存储键值对，可选 TTL（秒）"""
+        """Store key-value pair with optional TTL in seconds."""
         expire_at = (time.time() + ttl) if ttl is not None else None
         self._store[key] = (value, expire_at)
 
     async def get(self, key: str) -> Any | None:
-        """获取值，不存在或已过期返回 None"""
+        """Retrieve value, return None if not found or expired."""
         if self._is_expired(key):
             return None
         value, _ = self._store[key]
         return value
 
     async def delete(self, key: str) -> None:
-        """删除键，不存在时静默忽略"""
+        """Delete key, silently ignore if not found."""
         self._store.pop(key, None)
 
     async def exists(self, key: str) -> bool:
-        """检查键是否存在且未过期"""
+        """Check if key exists and is not expired."""
         return not self._is_expired(key)
 
     async def keys(self, pattern: str) -> list[str]:
-        """按模式匹配返回所有键名。pattern 支持 * 通配符。"""
+        """Return all key names matching the pattern. Supports * wildcard."""
         result: list[str] = []
-        # 遍历时收集过期键，避免在迭代中修改字典
+        # Collect expired keys during iteration to avoid modifying dict while iterating
         expired_keys: list[str] = []
         for key, (_, expire_at) in self._store.items():
             if expire_at is not None and time.time() >= expire_at:
@@ -64,20 +64,20 @@ class MemoryBackend(StateBackend):
         return result
 
     async def count(self, pattern: str) -> int:
-        """按模式匹配计数"""
+        """Count keys matching the pattern."""
         return len(await self.keys(pattern))
 
     async def set_nx(self, key: str, value: Any) -> bool:
-        """Set if not exists. 返回 True 如果成功设置，False 如果键已存在。"""
+        """Set if not exists. Return True if successfully set, False if key already exists."""
         if not self._is_expired(key):
             return False
         self._store[key] = (value, None)
         return True
 
     async def close(self) -> None:
-        """关闭后端，清空存储"""
+        """Close backend, clear storage."""
         self._store.clear()
 
     async def health_check(self) -> bool:
-        """检查后端是否健康可用，内存后端始终返回 True"""
+        """Check if backend is healthy and available. Memory backend always returns True."""
         return True
