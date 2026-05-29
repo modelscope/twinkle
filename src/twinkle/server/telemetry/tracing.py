@@ -12,28 +12,28 @@ except Exception:
 
 
 def get_tracer(name: str = "twinkle-server"):
-    """获取 tracer 实例。OTEL 未安装时返回 NoOp tracer。"""
+    """Retrieve tracer instance. Returns NoOp tracer when OTEL is not installed."""
     if not _OTEL_AVAILABLE:
         return _NoopTracer()
     return trace.get_tracer(name)
 
 
 def inject_context(carrier: dict) -> None:
-    """将当前 trace context 注入到 carrier。OTEL 未安装时为 noop。"""
+    """Inject current trace context into carrier. Noop when OTEL is not installed."""
     if not _OTEL_AVAILABLE:
         return
     inject(carrier)
 
 
 def extract_context(carrier: dict):
-    """从 carrier 中提取 trace context。OTEL 未安装时返回空 context。"""
+    """Extract trace context from carrier. Returns empty context when OTEL is not installed."""
     if not _OTEL_AVAILABLE:
         return None
     return extract(carrier)
 
 
 def get_current_span():
-    """获取当前活跃的 span。OTEL 未安装时返回 noop span。"""
+    """Get current active span. Returns noop span when OTEL is not installed."""
     if not _OTEL_AVAILABLE:
         return _NoopSpan()
     return trace.get_current_span()

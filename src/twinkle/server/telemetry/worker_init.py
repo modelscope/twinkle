@@ -1,0 +1,49 @@
+"""Telemetry initialization for Ray worker processes.
+
+Ray Serve deployments run in separate worker processes that do not inherit
+the driver process's OTEL global state. This module provides a function
+to re-initialize telemetry in each worker process using environment variables
+set by the launcher.
+"""
+from __future__ import annotations
+
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_worker_initialized = False
+
+
+def ensure_telemetry_initialized() -> None:
+    """Initialize telemetry in the current worker process if not already done.
+
+    Reads configuration from environment variables set by the launcher process.
+    Safe to call multiple times - only initializes once per process.
+    """
+    global _worker_initialized
+    if _worker_initialized:
+        return
+
+    _worker_initialized = True
+
+    if os.environ.get('TWINKLE_TELEMETRY_ENABLED') != '1':
+        return
+
+    try:
+        from twinkle.server.telemetry import TelemetryConfig, init_telemetry
+        from twinkle.server.telemetry.metrics import MetricsRegistry
+
+        config = TelemetryConfig(
+            enabled=True,
+            debug=os.environ.get('TWINKLE_TELEMETRY_DEBUG', '0') == '1',
+            service_name=os.environ.get('TWINKLE_TELEMETRY_SERVICE', 'twinkle-server'),
+            otlp_endpoint=os.environ.get('TWINKLE_TELEMETRY_ENDPOINT', 'http://localhost:4317'),
+            export_interval_ms=int(os.environ.get('TWINKLE_TELEMETRY_INTERVAL', '30000')),
+        )
+        init_telemetry(config)
+        # Reset MetricsRegistry singleton so it picks up the real MeterProvider
+        MetricsRegistry.reset()
+        logger.info(f'Worker telemetry initialized (service={config.service_name}, debug={config.debug})')
+    except Exception as e:
+        logger.warning(f'Failed to initialize worker telemetry: {e}')

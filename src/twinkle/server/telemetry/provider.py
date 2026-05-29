@@ -84,6 +84,29 @@ _logging_handler: Optional[Any] = None
 _initialized: bool = False
 
 
+class _LoggingWriter:
+    """IO adapter that routes writes to Python logging.
+
+    Used to redirect ConsoleExporter output through the logging system
+    so that Ray Serve worker logs are properly captured. Without this,
+    ConsoleSpanExporter / ConsoleMetricExporter write directly to
+    ``sys.stdout`` which Ray reroutes into its internal log files,
+    making telemetry output invisible to the standard logging pipeline.
+    """
+
+    def __init__(self, logger_name: str = 'twinkle.server.telemetry.export'):
+        self._logger = logging.getLogger(logger_name)
+
+    def write(self, text: str) -> int:
+        text = text.strip()
+        if text:
+            self._logger.info(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
 class TelemetryConfig(BaseModel):
     """Configuration for the OpenTelemetry pipeline."""
 
@@ -129,9 +152,13 @@ def init_telemetry(config: TelemetryConfig) -> None:
             "OTLP exporters not available; falling back to console exporters."
         )
 
+    # When using console exporters, route their output through the Python
+    # logging system so that Ray Serve workers actually surface the data.
+    _console_writer = _LoggingWriter() if use_console else None
+
     # ---- Traces ---------------------------------------------------------
     if use_console:
-        span_exporter = ConsoleSpanExporter()
+        span_exporter = ConsoleSpanExporter(out=_console_writer)
     else:
         span_exporter = OTLPSpanExporter(endpoint=config.otlp_endpoint)
 
@@ -142,7 +169,7 @@ def init_telemetry(config: TelemetryConfig) -> None:
 
     # ---- Metrics --------------------------------------------------------
     if use_console:
-        metric_exporter = ConsoleMetricExporter()
+        metric_exporter = ConsoleMetricExporter(out=_console_writer)
     else:
         metric_exporter = OTLPMetricExporter(endpoint=config.otlp_endpoint)
 

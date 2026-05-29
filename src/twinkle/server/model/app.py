@@ -158,6 +158,7 @@ def build_model_app(model_id: str,
 
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
+
     def get_self() -> ModelManagement:
         return serve.get_replica_context().servable_object
 
@@ -174,6 +175,17 @@ def build_model_app(model_id: str,
             pass
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.on_event('startup')
+    async def _init_telemetry_and_instrument():
+        """Initialize telemetry and instrument app in worker process (after deserialization)."""
+        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
+        ensure_telemetry_initialized()
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            FastAPIInstrumentor.instrument_app(app)
+        except ImportError:
+            pass  # OTEL instrumentation not installed
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):

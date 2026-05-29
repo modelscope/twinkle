@@ -588,6 +588,10 @@ def get_server_state(
     Returns:
         A ServerStateProxy for interacting with the actor.
     """
+    # Support passing persistence_config as raw dict from YAML
+    if isinstance(persistence_config, dict):
+        persistence_config = PersistenceConfig(**persistence_config)
+
     try:
         actor = ray.get_actor(actor_name)
     except ValueError:

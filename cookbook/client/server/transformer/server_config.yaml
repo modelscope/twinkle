@@ -9,6 +9,12 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 8000            # Port number for the server
 
+# Telemetry configuration for observability (OpenTelemetry-based)
+telemetry_config:
+  enabled: true
+  debug: true
+  service_name: twinkle-server
+
 # Applications: each entry defines a service component deployed on the server
 applications:
 
@@ -20,6 +26,9 @@ applications:
     args:
       server_config:
         per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
+        persistence_config:
+          mode: file
+          file_path: /tmp/twinkle_state.json
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:

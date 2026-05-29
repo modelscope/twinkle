@@ -90,7 +90,6 @@ def build_server_app(deploy_options: dict[str, Any],
     Returns:
         Configured Ray Serve deployment bound with options
     """
-
     def get_self() -> GatewayServer:
         return serve.get_replica_context().servable_object
 
@@ -103,6 +102,17 @@ def build_server_app(deploy_options: dict[str, Any],
             pass
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.on_event('startup')
+    async def _init_telemetry_and_instrument():
+        """Initialize telemetry and instrument app in worker process (after deserialization)."""
+        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
+        ensure_telemetry_initialized()
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            FastAPIInstrumentor.instrument_app(app)
+        except ImportError:
+            pass  # OTEL instrumentation not installed
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
