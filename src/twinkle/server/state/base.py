@@ -1,51 +1,85 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
-from pydantic import BaseModel
+from datetime import datetime, timezone
 from typing import Generic, TypeVar
 
+from pydantic import BaseModel
+
+from twinkle.server.state.backend.base import StateBackend
+
 T = TypeVar('T', bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 class BaseManager(ABC, Generic[T]):
-    """
-    Abstract base class for resource managers.
+    """Abstract base class for resource managers using StateBackend.
 
-    Provides common CRUD operations and timestamp parsing.
+    Provides common async CRUD operations and timestamp parsing.
     Subclasses must implement `cleanup_expired`.
     """
 
-    def __init__(self, expiration_timeout: float) -> None:
-        self._store: dict[str, T] = {}
+    def __init__(self, backend: StateBackend, key_prefix: str, record_type: type[T], expiration_timeout: float):
+        self._backend = backend
+        self._prefix = key_prefix  # e.g. "session::", "model::", "sampling::", "future::"
+        self._record_type = record_type
         self.expiration_timeout = expiration_timeout
+
+    def _make_key(self, resource_id: str) -> str:
+        return f"{self._prefix}{resource_id}"
+
+    def _strip_prefix(self, key: str) -> str:
+        return key[len(self._prefix):]
 
     # ----- CRUD -----
 
-    def add(self, resource_id: str, record: T) -> None:
-        """Store a record under the given ID."""
-        self._store[resource_id] = record
+    async def add(self, resource_id: str, record: T) -> None:
+        """Store a record in the backend."""
+        await self._backend.set(self._make_key(resource_id), record.model_dump())
 
-    def get(self, resource_id: str) -> T | None:
-        """Return the record for the given ID, or None."""
-        return self._store.get(resource_id)
+    async def get(self, resource_id: str) -> T | None:
+        """Retrieve a record by ID."""
+        data = await self._backend.get(self._make_key(resource_id))
+        if data is None:
+            return None
+        return self._record_type.model_validate(data)
 
-    def remove(self, resource_id: str) -> bool:
-        """Remove a record by ID. Returns True if it existed."""
-        return self._store.pop(resource_id, None) is not None
+    async def remove(self, resource_id: str) -> bool:
+        """Remove a record. Returns True if it existed."""
+        key = self._make_key(resource_id)
+        exists = await self._backend.exists(key)
+        if exists:
+            await self._backend.delete(key)
+        return exists
 
-    def count(self) -> int:
-        """Return the number of stored records."""
-        return len(self._store)
+    async def count(self) -> int:
+        """Count all records managed by this manager."""
+        return await self._backend.count(f"{self._prefix}*")
+
+    async def keys(self) -> list[str]:
+        """Get all resource IDs (without prefix)."""
+        raw_keys = await self._backend.keys(f"{self._prefix}*")
+        return [self._strip_prefix(k) for k in raw_keys]
+
+    async def get_all(self) -> dict[str, T]:
+        """Load all records from backend. Used for index rebuilding."""
+        all_keys = await self._backend.keys(f"{self._prefix}*")
+        result = {}
+        for key in all_keys:
+            data = await self._backend.get(key)
+            if data is not None:
+                resource_id = self._strip_prefix(key)
+                result[resource_id] = self._record_type.model_validate(data)
+        return result
 
     # ----- Cleanup -----
 
     @abstractmethod
-    def cleanup_expired(self, cutoff_time: float) -> int:
-        """
-        Remove all records older than cutoff_time.
+    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
+        """Remove all records older than cutoff_time.
 
         Args:
             cutoff_time: Unix timestamp; records with activity before this are removed.
@@ -53,6 +87,7 @@ class BaseManager(ABC, Generic[T]):
         Returns:
             Number of records removed.
         """
+        ...
 
     # ----- Helpers -----
 
@@ -63,6 +98,9 @@ class BaseManager(ABC, Generic[T]):
         never accidentally kept alive forever.
         """
         try:
-            return datetime.fromisoformat(timestamp_str).timestamp()
-        except (ValueError, AttributeError):
+            dt = datetime.fromisoformat(timestamp_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (ValueError, TypeError, AttributeError):
             return time.time()

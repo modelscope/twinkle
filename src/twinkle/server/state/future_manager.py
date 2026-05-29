@@ -4,20 +4,23 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from .backend.base import StateBackend
 from .base import BaseManager
 from .models import FutureRecord
 
 
 class FutureManager(BaseManager[FutureRecord]):
-    """
-    Manages async task futures / request statuses.
+    """Manages async task futures / request statuses.
 
     Expiry is based on `updated_at` (falls back to `created_at`).
     """
 
+    def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
+        super().__init__(backend, "future::", FutureRecord, expiration_timeout)
+
     # ----- Future-specific operations -----
 
-    def store_status(
+    async def store_status(
         self,
         request_id: str,
         status: str,
@@ -45,7 +48,7 @@ class FutureManager(BaseManager[FutureRecord]):
             result = result.model_dump()
 
         now = datetime.now().isoformat()
-        existing = self._store.get(request_id)
+        existing = await self.get(request_id)
 
         if existing is not None:
             existing.status = status
@@ -59,8 +62,9 @@ class FutureManager(BaseManager[FutureRecord]):
                 existing.queue_state = queue_state
             if queue_state_reason is not None:
                 existing.queue_state_reason = queue_state_reason
+            await self.add(request_id, existing)
         else:
-            self._store[request_id] = FutureRecord(
+            record = FutureRecord(
                 status=status,
                 model_id=model_id,
                 reason=reason,
@@ -70,10 +74,11 @@ class FutureManager(BaseManager[FutureRecord]):
                 created_at=now,
                 updated_at=now,
             )
+            await self.add(request_id, record)
 
     # ----- Cleanup -----
 
-    def cleanup_expired(self, cutoff_time: float) -> int:
+    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
         """Remove futures whose last update is older than cutoff_time.
 
         Args:
@@ -82,14 +87,15 @@ class FutureManager(BaseManager[FutureRecord]):
         Returns:
             Number of futures removed.
         """
+        all_records = await self.get_all()
         expired_ids = []
-        for request_id, record in self._store.items():
+        for request_id, record in all_records.items():
             timestamp_str = record.updated_at or record.created_at
             timestamp = self._parse_timestamp(timestamp_str)
             if timestamp < cutoff_time:
                 expired_ids.append(request_id)
 
         for request_id in expired_ids:
-            del self._store[request_id]
+            await self.remove(request_id)
 
         return len(expired_ids)
