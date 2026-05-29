@@ -17,7 +17,7 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
 from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger

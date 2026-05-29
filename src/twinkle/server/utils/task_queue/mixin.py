@@ -22,7 +22,7 @@ from .types import QueuedTask, QueueState, TaskStatus
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
-    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.server.state import ServerStateProxy
 
 logger = get_logger()
 

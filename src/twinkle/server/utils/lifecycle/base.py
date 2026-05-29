@@ -13,7 +13,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from twinkle.server.utils.state import ServerStateProxy
+    from twinkle.server.state import ServerStateProxy
 
 from twinkle.utils.logger import get_logger
 

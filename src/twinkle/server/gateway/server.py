@@ -15,7 +15,7 @@ from typing import Any
 
 import twinkle_client.types as types
 from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.state import get_server_state
+from twinkle.server.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 from .proxy import ServiceProxy
