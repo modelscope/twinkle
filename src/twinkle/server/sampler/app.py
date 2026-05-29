@@ -7,12 +7,14 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
@@ -118,27 +120,25 @@ def build_sampler_app(model_id: str,
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Initialize telemetry in worker process (after deserialization)
+        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
+        ensure_telemetry_initialized()
+        yield
+
     app = FastAPI(
         title='Unified Sampler',
         description='REST API for distributed text generation inference (Tinker + Twinkle)',
-        version='1.0.0')
-
-    @app.on_event('startup')
-    async def _init_telemetry_and_instrument():
-        """Initialize telemetry and instrument app in worker process (after deserialization)."""
-        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
-        ensure_telemetry_initialized()
-        try:
-            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-            FastAPIInstrumentor.instrument_app(app)
-        except ImportError:
-            pass  # OTEL instrumentation not installed
+        version='1.0.0',
+        lifespan=lifespan)
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
     app.middleware('http')(create_metrics_middleware('Sampler'))
+    app.middleware('http')(create_tracing_middleware('Sampler'))
 
     def get_self() -> SamplerManagement:
         return serve.get_replica_context().servable_object

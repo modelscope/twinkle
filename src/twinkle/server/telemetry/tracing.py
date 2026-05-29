@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fastapi import Request
+
 try:
     from opentelemetry import trace
     from opentelemetry.propagate import inject, extract
@@ -55,3 +57,60 @@ class _NoopTracer:
         return _NoopSpan()
     def start_span(self, name, **kwargs):
         return _NoopSpan()
+
+
+def create_tracing_middleware(service_component: str):
+    """Create an HTTP tracing middleware that lazily acquires tracer at request time.
+
+    This approach is compatible with Ray Serve's pickle serialization, unlike
+    ``FastAPIInstrumentor.instrument_app`` which attaches unpicklable references
+    (e.g. ``_thread.lock``) to the FastAPI app and breaks deployment pickling.
+
+    The returned middleware is a plain async function with no captured state
+    other than the ``service_component`` string, so it can be safely pickled
+    along with the app when registered via ``app.middleware('http')`` inside a
+    Ray Serve build function.
+
+    Args:
+        service_component: Logical service name used as the tracer name suffix
+            and recorded as a span attribute (e.g. ``Gateway``, ``Model``,
+            ``Processor``, ``Sampler``).
+
+    Returns:
+        An async FastAPI HTTP middleware function.
+    """
+
+    async def tracing_middleware(request: Request, call_next):
+        # Lazy import to avoid holding any unpicklable module-level references
+        # at the time Ray Serve serializes the build function / app.
+        from opentelemetry import trace
+
+        tracer = trace.get_tracer(f'twinkle.server.{service_component}')
+
+        method = request.method
+        path = request.url.path
+        span_name = f'{method} {path}'
+
+        with tracer.start_as_current_span(
+                span_name,
+                kind=trace.SpanKind.SERVER,
+                attributes={
+                    'http.method': method,
+                    'http.url': str(request.url),
+                    'http.route': path,
+                    'http.scheme': request.url.scheme,
+                    'service.component': service_component,
+                },
+        ) as span:
+            try:
+                response = await call_next(request)
+                span.set_attribute('http.status_code', response.status_code)
+                if response.status_code >= 400:
+                    span.set_status(trace.Status(trace.StatusCode.ERROR))
+                return response
+            except Exception as exc:
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+                span.record_exception(exc)
+                raise
+
+    return tracing_middleware
