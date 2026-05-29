@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from twinkle.server.utils.metrics import get_resource_metrics
+from twinkle.server.telemetry import MetricsRegistry
 from twinkle.utils.logger import get_logger
 from .backend import MemoryBackend, StateBackend
 from .config_manager import ConfigManager
@@ -328,15 +328,29 @@ class ServerState:
                 continue
 
     async def _metrics_loop(self) -> None:
-        """Background task that updates resource gauge metrics every N seconds."""
-        resource_metrics = get_resource_metrics()
+        """Background task that updates resource gauge metrics every N seconds.
+
+        OTEL up/down counters take *deltas*, not absolute values, so we keep
+        track of the last reported count per resource and emit only the
+        difference on each tick.
+        """
+        registry = MetricsRegistry.get()
+        sources = (
+            ('active_sessions', self._session_mgr.count),
+            ('active_models', self._model_mgr.count),
+            ('active_sampling_sessions', self._sampling_mgr.count),
+            ('active_futures', self._future_mgr.count),
+        )
+        last_values: dict[str, int] = {name: 0 for name, _ in sources}
         while self._metrics_running:
             try:
                 await asyncio.sleep(self._metrics_update_interval)
-                resource_metrics.active_sessions.set(self._session_mgr.count())
-                resource_metrics.active_models.set(self._model_mgr.count())
-                resource_metrics.active_sampling_sessions.set(self._sampling_mgr.count())
-                resource_metrics.active_futures.set(self._future_mgr.count())
+                for name, counter in sources:
+                    current = counter()
+                    delta = current - last_values[name]
+                    if delta != 0:
+                        getattr(registry, name).add(delta)
+                    last_values[name] = current
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -2,57 +2,87 @@
 """
 Central metrics module for Twinkle server observability.
 
-Provides ray.util.metrics instruments that feed both the Ray Dashboard
-(port 8265) and Prometheus (via /api/prometheus).
+This module is a *thin adapter layer* over the OpenTelemetry instruments
+declared in :class:`twinkle.server.telemetry.metrics.MetricsRegistry`.
+It preserves the legacy Ray-style API (``.inc()`` / ``.set()`` / ``.observe()``
+with ``tags=`` keyword) so that existing call sites do not need to change
+their call patterns, while routing every measurement through OTEL.
 
-All metric names use the ``twinkle_`` prefix.  Metric instances are
-cached per deployment to avoid duplicate registration.
-
-Public entry-points:
+Public entry-points (unchanged signatures):
 
 * ``create_metrics_middleware(deployment)`` – FastAPI HTTP middleware
-* ``get_task_metrics(deployment)``          – task-queue / rate-limit gauges
-* ``get_resource_metrics()``               – ServerState resource gauges
+* ``get_task_metrics(deployment)``           – task-queue / rate-limit gauges
 """
 from __future__ import annotations
 
 import time
 from pydantic import BaseModel, ConfigDict
-from ray.util.metrics import Counter, Gauge, Histogram
 from typing import Any, Callable
 
+from twinkle.server.telemetry import MetricsRegistry
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
 # ---------------------------------------------------------------------------
-# Histogram bucket boundaries (seconds) – shared by all histograms
+# Lazy caches – populated on first call per deployment
 # ---------------------------------------------------------------------------
-_HISTOGRAM_BOUNDARIES = [
-    0.01,
-    0.05,
-    0.1,
-    0.25,
-    0.5,
-    1.0,
-    2.5,
-    5.0,
-    10.0,
-    30.0,
-    60.0,
-    120.0,
-    300.0,
-]
+_task_metrics_cache: dict[str, 'TaskMetrics'] = {}
+_request_metrics_cache: dict[str, '_RequestMetrics'] = {}
+
 
 # ---------------------------------------------------------------------------
-# Lazy caches – populated on first call per deployment / globally
+# Adapter classes – wrap OTEL instruments to expose the legacy Ray-style API
+# (``.inc(tags=...)`` / ``.set(value, tags=...)`` / ``.observe(value, tags=...)``)
+# while delegating all measurements to OpenTelemetry.
 # ---------------------------------------------------------------------------
-_task_metrics_cache: dict[str, TaskMetrics] = {}
-_resource_metrics_cache: ResourceMetrics | None = None
-_request_metrics_cache: dict[str, _RequestMetrics] = {}
+
+
+class _Counter:
+    """Adapter mapping ``.inc(value, tags=...)`` to ``otel_counter.add()``."""
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+
+    def inc(self, value: float = 1.0, tags: dict[str, str] | None = None) -> None:
+        self._instrument.add(value, attributes=tags or {})
+
+
+class _Histogram:
+    """Adapter mapping ``.observe(value, tags=...)`` to ``otel_histogram.record()``."""
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+
+    def observe(self, value: float, tags: dict[str, str] | None = None) -> None:
+        self._instrument.record(value, attributes=tags or {})
+
+
+class _Gauge:
+    """Adapter mapping ``.set(value, tags=...)`` onto an OTEL UpDownCounter.
+
+    OpenTelemetry up/down counters take *deltas*, not absolute values, so we
+    track the last reported value per attribute combination and emit the
+    incremental change. State is held per adapter instance (= per deployment),
+    keyed by the frozen attribute tuple.
+    """
+
+    def __init__(self, instrument: Any) -> None:
+        self._instrument = instrument
+        self._last: dict[tuple, float] = {}
+
+    def set(self, value: float, tags: dict[str, str] | None = None) -> None:
+        attrs = tags or {}
+        key = tuple(sorted(attrs.items()))
+        last = self._last.get(key, 0.0)
+        delta = value - last
+        if delta != 0:
+            self._instrument.add(delta, attributes=attrs)
+        self._last[key] = value
+
 
 # ---------------------------------------------------------------------------
-# Pydantic models for structured metric access
+# Pydantic containers for structured metric access
 # ---------------------------------------------------------------------------
 
 
@@ -60,40 +90,22 @@ class TaskMetrics(BaseModel):
     """Task queue metrics container.
 
     Attributes:
-        queue_depth: Current number of queued tasks.
-        tasks_total: Total task completions.
-        execution_seconds: Pure task execution time in seconds.
-        queue_wait_seconds: Time from enqueue to execution start.
-        rate_limit_rejections: Total rate-limit rejections.
-        rate_limiter_active_tokens: Tokens tracked by rate limiter.
+        queue_depth: Current number of queued tasks (gauge).
+        tasks_total: Total task completions (counter).
+        execution_seconds: Pure task execution time in seconds (histogram).
+        queue_wait_seconds: Time from enqueue to execution start (histogram).
+        rate_limit_rejections: Total rate-limit rejections (counter).
+        rate_limiter_active_tokens: Tokens tracked by rate limiter (gauge).
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    queue_depth: Gauge
-    tasks_total: Counter
-    execution_seconds: Histogram
-    queue_wait_seconds: Histogram
-    rate_limit_rejections: Counter
-    rate_limiter_active_tokens: Gauge
-
-
-class ResourceMetrics(BaseModel):
-    """Resource gauge metrics container.
-
-    Attributes:
-        active_sessions: Current active session count.
-        active_models: Current registered model count.
-        active_sampling_sessions: Current sampling session count.
-        active_futures: Current future/request count.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    active_sessions: Gauge
-    active_models: Gauge
-    active_sampling_sessions: Gauge
-    active_futures: Gauge
+    queue_depth: _Gauge
+    tasks_total: _Counter
+    execution_seconds: _Histogram
+    queue_wait_seconds: _Histogram
+    rate_limit_rejections: _Counter
+    rate_limiter_active_tokens: _Gauge
 
 
 class _RequestMetrics(BaseModel):
@@ -101,8 +113,8 @@ class _RequestMetrics(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    requests_total: Counter
-    request_duration_seconds: Histogram
+    requests_total: _Counter
+    request_duration_seconds: _Histogram
 
 
 # ---------------------------------------------------------------------------
@@ -111,22 +123,14 @@ class _RequestMetrics(BaseModel):
 
 
 def _get_request_metrics(deployment: str) -> _RequestMetrics:
-    """Return (or create) per-deployment HTTP request metrics."""
+    """Return (or create) per-deployment HTTP request metric adapters."""
     if deployment in _request_metrics_cache:
         return _request_metrics_cache[deployment]
 
+    reg = MetricsRegistry.get()
     metrics = _RequestMetrics(
-        requests_total=Counter(
-            'twinkle_requests_total',
-            description='Total HTTP requests.',
-            tag_keys=('deployment', 'method', 'status'),
-        ),
-        request_duration_seconds=Histogram(
-            'twinkle_request_duration_seconds',
-            description='End-to-end HTTP request latency in seconds.',
-            boundaries=_HISTOGRAM_BOUNDARIES,
-            tag_keys=('deployment', 'method'),
-        ),
+        requests_total=_Counter(reg.requests_total),
+        request_duration_seconds=_Histogram(reg.request_duration_seconds),
     )
     _request_metrics_cache[deployment] = metrics
     return metrics
@@ -174,94 +178,25 @@ def create_metrics_middleware(deployment: str) -> Callable:
 
 
 def get_task_metrics(deployment: str) -> TaskMetrics:
-    """Return (or create) per-deployment task-queue metrics.
+    """Return (or create) per-deployment task-queue metric adapters.
 
-    Returns a :class:`TaskMetrics` Pydantic model with:
-
-    - ``queue_depth``                – Gauge
-    - ``tasks_total``                – Counter
-    - ``execution_seconds``          – Histogram
-    - ``queue_wait_seconds``         – Histogram
-    - ``rate_limit_rejections``      – Counter
-    - ``rate_limiter_active_tokens`` – Gauge
+    Returns a :class:`TaskMetrics` container of adapter objects; the
+    adapters delegate every measurement to the OTEL instruments held by
+    :class:`twinkle.server.telemetry.metrics.MetricsRegistry`. A separate
+    adapter instance is cached per deployment so that gauge-state tracking
+    (last value per attribute set) stays isolated.
     """
     if deployment in _task_metrics_cache:
         return _task_metrics_cache[deployment]
 
+    reg = MetricsRegistry.get()
     metrics = TaskMetrics(
-        queue_depth=Gauge(
-            'twinkle_task_queue_depth',
-            description='Current number of queued tasks.',
-            tag_keys=('deployment', ),
-        ),
-        tasks_total=Counter(
-            'twinkle_tasks_total',
-            description='Total task completions.',
-            tag_keys=('deployment', 'task_type', 'status'),
-        ),
-        execution_seconds=Histogram(
-            'twinkle_task_execution_seconds',
-            description='Pure task execution time in seconds.',
-            boundaries=_HISTOGRAM_BOUNDARIES,
-            tag_keys=('deployment', 'task_type'),
-        ),
-        queue_wait_seconds=Histogram(
-            'twinkle_task_queue_wait_seconds',
-            description='Time from enqueue to execution start in seconds.',
-            boundaries=_HISTOGRAM_BOUNDARIES,
-            tag_keys=('deployment', 'task_type'),
-        ),
-        rate_limit_rejections=Counter(
-            'twinkle_rate_limit_rejections_total',
-            description='Total rate-limit rejections.',
-            tag_keys=('deployment', ),
-        ),
-        rate_limiter_active_tokens=Gauge(
-            'twinkle_rate_limiter_active_tokens',
-            description='Number of tokens tracked by the rate limiter.',
-            tag_keys=('deployment', ),
-        ),
+        queue_depth=_Gauge(reg.queue_depth),
+        tasks_total=_Counter(reg.tasks_total),
+        execution_seconds=_Histogram(reg.task_execution_seconds),
+        queue_wait_seconds=_Histogram(reg.task_wait_seconds),
+        rate_limit_rejections=_Counter(reg.rate_limit_rejections),
+        rate_limiter_active_tokens=_Gauge(reg.rate_limiter_active_tokens),
     )
     _task_metrics_cache[deployment] = metrics
-    return metrics
-
-
-# ---------------------------------------------------------------------------
-# D.  Resource gauges  (ServerState actor, updated every 15 s)
-# ---------------------------------------------------------------------------
-
-
-def get_resource_metrics() -> ResourceMetrics:
-    """Return (or create) global resource gauge metrics.
-
-    Returns a :class:`ResourceMetrics` Pydantic model with:
-
-    - ``active_sessions``           – Gauge
-    - ``active_models``             – Gauge
-    - ``active_sampling_sessions``  – Gauge
-    - ``active_futures``            – Gauge
-    """
-    global _resource_metrics_cache
-    if _resource_metrics_cache is not None:
-        return _resource_metrics_cache
-
-    metrics = ResourceMetrics(
-        active_sessions=Gauge(
-            'twinkle_active_sessions',
-            description='Current active session count.',
-        ),
-        active_models=Gauge(
-            'twinkle_active_models',
-            description='Current registered model count.',
-        ),
-        active_sampling_sessions=Gauge(
-            'twinkle_active_sampling_sessions',
-            description='Current sampling session count.',
-        ),
-        active_futures=Gauge(
-            'twinkle_active_futures',
-            description='Current future/request count.',
-        ),
-    )
-    _resource_metrics_cache = metrics
     return metrics
