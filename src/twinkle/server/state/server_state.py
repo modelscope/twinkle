@@ -513,26 +513,6 @@ class ServerStateProxy:
         await self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
                                                      queue_state_reason)
 
-    # ----- Configuration Management -----
-
-    async def add_config(self, key: str, value: Any) -> None:
-        await self._actor.add_config.remote(key, value)
-
-    async def add_or_get_config(self, key: str, value: Any) -> Any:
-        return await self._actor.add_or_get_config.remote(key, value)
-
-    async def get_config(self, key: str) -> Any | None:
-        return await self._actor.get_config.remote(key)
-
-    async def pop_config(self, key: str) -> Any | None:
-        return await self._actor.pop_config.remote(key)
-
-    async def clear_config(self) -> None:
-        await self._actor.clear_config.remote()
-
-    async def count_config(self) -> int:
-        return await self._actor.count_config.remote()
-
     # ----- Resource Cleanup -----
 
     async def cleanup_expired_resources(self) -> dict[str, int]:
