@@ -14,6 +14,7 @@ from ray import serve
 from typing import Any
 
 import twinkle_client.types as types
+from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
@@ -95,6 +96,9 @@ def build_server_app(deploy_options: dict[str, Any],
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Initialize telemetry in worker process (after deserialization)
+        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
+        ensure_telemetry_initialized()
         yield
         try:
             await get_self().proxy.close()
@@ -103,22 +107,12 @@ def build_server_app(deploy_options: dict[str, Any],
 
     app = FastAPI(lifespan=lifespan)
 
-    @app.on_event('startup')
-    async def _init_telemetry_and_instrument():
-        """Initialize telemetry and instrument app in worker process (after deserialization)."""
-        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
-        ensure_telemetry_initialized()
-        try:
-            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-            FastAPIInstrumentor.instrument_app(app)
-        except ImportError:
-            pass  # OTEL instrumentation not installed
-
     @app.middleware('http')
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
     app.middleware('http')(create_metrics_middleware('Gateway'))
+    app.middleware('http')(create_tracing_middleware('Gateway'))
 
     _register_tinker_routes(app, get_self)
     _register_twinkle_routes(app, get_self)
