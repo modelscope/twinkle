@@ -12,6 +12,7 @@ import httpx
 from fastapi import Request, Response
 from typing import Any
 
+from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -96,6 +97,10 @@ class ServiceProxy:
         body_bytes = await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers)
+
+        # Inject current trace context into outgoing headers for distributed tracing.
+        # When telemetry is not initialized, this is a noop.
+        inject_context(headers)
 
         try:
             logger.debug(
