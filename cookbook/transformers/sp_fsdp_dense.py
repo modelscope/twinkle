@@ -8,6 +8,8 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.utils.framework import Torch
+from twinkle.kernel import kernelize_model
 
 logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
@@ -68,7 +70,9 @@ def train():
         device_mesh=device_mesh,
         strategy='native_fsdp',
     )
-
+    # npu patch
+    if Torch.is_npu_available():
+        model = kernelize_model(model, mode='train', device='npu')
     lora_config = LoraConfig(target_modules='all-linear')
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
