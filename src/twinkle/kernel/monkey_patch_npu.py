@@ -510,6 +510,8 @@ def _patch_qwen3_5_fla(model=None) -> None:
                     continue
 
                 _module.chunk_gated_delta_rule = mindspeed_fla
+                # Mark as NPU-patched to prevent it from being overwritten by SP
+                _module._twinkle_npu_patched = True
                 patched_instances += 1
                 logger.debug(
                     '[NPU] [FLA] Replaced %s(%s).chunk_gated_delta_rule -> MindSpeed',
