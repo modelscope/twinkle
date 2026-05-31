@@ -159,7 +159,7 @@ class Dataset(TorchDataset):
                 dataset = load_dataset(file_type, **load_kwargs, **kwargs)
             else:
                 dataset = HubOperation.load_dataset(dataset_id, subset_name, split, **kwargs)
-
+        
         # fix: Some dataset sources return DatasetDict instead of Dataset, which breaks downstream select/map calls.
         # fix: Normalize split resolution here (target split first, then train) and fail early with a clear error.
         if isinstance(dataset, DatasetDict):
@@ -171,6 +171,9 @@ class Dataset(TorchDataset):
                 available_splits = list(dataset.keys())
                 raise KeyError(f"Split '{split}' not found for dataset '{dataset_id}'. "
                                f'Available splits: {available_splits}')
+
+        if hasattr(dataset, 'to_hf_dataset'):
+            dataset = dataset.to_hf_dataset()
 
         if isinstance(dataset_meta.data_slice, Iterable) and hasattr(dataset, '__len__'):
 

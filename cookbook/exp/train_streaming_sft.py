@@ -140,8 +140,6 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         token_soup_filter=True,
         special_chars_max_ratio=0.5,
         minhash_dedup=False,
-        # Phase 11: intent classification
-        intent_max_workers=8,
         # Phase 12: IFD hard-example filter
         ifd_tokenizer=MODEL_LOCAL_PATH,
         ifd_threshold=IFD_THRESHOLD,

@@ -17,17 +17,17 @@ from twinkle.model import TransformersModel
 logger = get_logger()
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-DATASET_PATH = str(Path(__file__).resolve().parent.parent.parent / 'ds_condensed.jsonl')
+DATASET_ID = 'ms://twinkle-kit/condense_300K'
 TEMPLATE_NAME = 'Qwen3_5Template'
 
 DP_SIZE = 8
 BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
 GRADIENT_ACCUMULATION_STEPS = 4
 LOG_INTERVAL = 20
 EVAL_INTERVAL = 200
 EVAL_SAMPLES = 100
-NUM_EPOCHS = 5
+NUM_EPOCHS = 1
 
 OUTPUT_DIR = './output/condenser_ddp'
 RESUME_FROM_CHECKPOINT = None
@@ -40,12 +40,12 @@ twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 
 
 def build_dataset(num_samples: int = None) -> Dataset:
-    meta_kwargs = {}
+    meta_kwargs = {'split': 'train'}
     if num_samples is not None:
         meta_kwargs['data_slice'] = range(num_samples)
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_PATH, **meta_kwargs))
-    dataset.set_template(TEMPLATE_NAME, model_id=MODEL_ID, max_length=4096)
-    dataset.encode(load_from_cache_file=True)
+    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, **meta_kwargs))
+    dataset.set_template(TEMPLATE_NAME, model_id=MODEL_ID, max_length=40000, enable_thinking=False, truncation_strategy='delete')
+    dataset.encode(load_from_cache_file=True, num_proc=16)
     return dataset
 
 
@@ -71,11 +71,11 @@ def train():
     dataset = build_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
 
-    model = TransformersModel(model_id=MODEL_ID)
+    model = TransformersModel(model_id=MODEL_ID, ddp_config={'find_unused_parameters': True})
     model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
 
     lora_config = LoraConfig(r=16, lora_alpha=32, target_modules='all-linear')
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+    # model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler', num_warmup_steps=50, num_training_steps=len(dataloader) * NUM_EPOCHS)
@@ -93,15 +93,12 @@ def train():
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
-
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
     best_loss = float('inf')
 
     for i in range(NUM_EPOCHS):
-        for batch in dataloader:
+        for cur_step, batch in enumerate(dataloader):
             model.forward_backward(inputs=batch)
             model.clip_grad_and_step()
-            cur_step = optimizer_group.cur_step
             if cur_step % LOG_INTERVAL == 0:
                 metric = model.calculate_metric(is_training=True)
                 logger.info(f'Step {cur_step}/{len(dataloader) * NUM_EPOCHS}, metric: {metric}')
