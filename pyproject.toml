@@ -14,7 +14,11 @@ dependencies = [
   "safetensors",
   "peft>=0.11.0,<=0.19.0",
   "transformers",
+  "typer>=0.9.0",
 ]
+
+[project.scripts]
+twinkle-server = "twinkle.server.cli:main"
 
 [project.optional-dependencies]
 transformers = [
