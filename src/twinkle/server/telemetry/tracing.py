@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Any, Iterator, Mapping
+
 from fastapi import Request
 
 try:
@@ -11,6 +14,9 @@ try:
     _OTEL_AVAILABLE = True
 except Exception:
     _OTEL_AVAILABLE = False
+
+
+from .correlation import set_correlation_attrs
 
 
 def get_tracer(name: str = "twinkle-server"):
@@ -57,6 +63,42 @@ class _NoopTracer:
         return _NoopSpan()
     def start_span(self, name, **kwargs):
         return _NoopSpan()
+
+
+@contextmanager
+def traced_operation(
+    name: str,
+    *,
+    attrs: Mapping[str, Any] | None = None,
+    tracer_name: str = 'twinkle.server.business',
+) -> Iterator[Any]:
+    """Run a business-layer block under one OTEL span (R10).
+
+    The span starts before the block runs and ends after it returns. If the
+    block raises, the exception is recorded on the span, the span status is
+    set to ERROR, the span is ended, and the original exception is re-raised
+    to the caller (R10.4). When the OTEL SDK is missing, the context manager
+    degrades to a NoOp that runs the block normally and returns the same
+    result it would return when tracing is active (R10.5 / R18.3).
+    """
+    if not _OTEL_AVAILABLE:
+        yield _NoopSpan()
+        return
+
+    tracer = trace.get_tracer(tracer_name)
+    with tracer.start_as_current_span(name) as span:
+        if attrs:
+            set_correlation_attrs(span, attrs)
+        try:
+            yield span
+        except Exception as exc:
+            try:
+                span.record_exception(exc)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+            except Exception:
+                # NEVER let a tracing error mask the underlying exception.
+                pass
+            raise
 
 
 def create_tracing_middleware(service_component: str):

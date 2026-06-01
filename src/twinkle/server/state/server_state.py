@@ -10,6 +10,15 @@ from typing import Any
 
 from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.telemetry import MetricsRegistry
+from twinkle.server.telemetry.correlation import (
+    BASE_MODEL,
+    MODEL_ID,
+    REPLICA_ID,
+    SAMPLING_SESSION_ID,
+    SESSION_ID,
+    TOKEN_ID,
+)
+from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
 from .backend.factory import PersistenceConfig, create_backend
@@ -86,13 +95,17 @@ class ServerState:
             The session_id for the created session.
         """
         session_id = payload.get('session_id') or f'session_{uuid.uuid4().hex}'
-        record = SessionRecord(
-            tags=list(payload.get('tags') or []),
-            user_metadata=payload.get('user_metadata') or {},
-            sdk_version=payload.get('sdk_version'),
-        )
-        await self._session_mgr.add(session_id, record)
-        return session_id
+        with traced_operation(
+            'server_state.create_session',
+            attrs={SESSION_ID: session_id},
+        ):
+            record = SessionRecord(
+                tags=list(payload.get('tags') or []),
+                user_metadata=payload.get('user_metadata') or {},
+                sdk_version=payload.get('sdk_version'),
+            )
+            await self._session_mgr.add(session_id, record)
+            return session_id
 
     async def touch_session(self, session_id: str) -> bool:
         """Update session heartbeat timestamp.
@@ -136,17 +149,27 @@ class ServerState:
             'model_id') or f"{_time}-{payload.get('base_model', 'model')}-{uuid.uuid4().hex[:8]}"
         _model_id = re.sub(r'[^\w\-]', '_', _model_id)
 
-        record = ModelRecord(
-            session_id=session_id or payload.get('session_id'),
-            model_seq_id=payload.get('model_seq_id'),
-            base_model=payload.get('base_model'),
-            user_metadata=payload.get('user_metadata') or {},
-            lora_config=payload.get('lora_config'),
-            token=token,
-            replica_id=replica_id,
-        )
-        await self._model_mgr.add(_model_id, record)
-        return _model_id
+        with traced_operation(
+            'server_state.register_model',
+            attrs={
+                MODEL_ID: _model_id,
+                BASE_MODEL: payload.get('base_model'),
+                REPLICA_ID: replica_id,
+                TOKEN_ID: token,
+                SESSION_ID: session_id or payload.get('session_id'),
+            },
+        ):
+            record = ModelRecord(
+                session_id=session_id or payload.get('session_id'),
+                model_seq_id=payload.get('model_seq_id'),
+                base_model=payload.get('base_model'),
+                user_metadata=payload.get('user_metadata') or {},
+                lora_config=payload.get('lora_config'),
+                token=token,
+                replica_id=replica_id,
+            )
+            await self._model_mgr.add(_model_id, record)
+            return _model_id
 
     async def unload_model(self, model_id: str) -> bool:
         """Remove a model from the registry.
@@ -170,7 +193,11 @@ class ServerState:
             replica_id: Unique identifier for the replica.
             max_loras: Maximum number of LoRA adapters the replica can hold.
         """
-        await self._model_mgr.register_replica(replica_id, max_loras)
+        with traced_operation(
+            'server_state.register_replica',
+            attrs={REPLICA_ID: replica_id},
+        ):
+            await self._model_mgr.register_replica(replica_id, max_loras)
 
     async def unregister_replica(self, replica_id: str) -> None:
         """Remove a replica from the registry.
@@ -205,14 +232,22 @@ class ServerState:
         """
         _sampling_session_id: str = sampling_session_id or payload.get(
             'sampling_session_id') or f'sampling_{uuid.uuid4().hex}'
-        record = SamplingSessionRecord(
-            session_id=payload.get('session_id'),
-            seq_id=payload.get('sampling_session_seq_id'),
-            base_model=payload.get('base_model'),
-            model_path=payload.get('model_path'),
-        )
-        await self._sampling_mgr.add(_sampling_session_id, record)
-        return _sampling_session_id
+        with traced_operation(
+            'server_state.create_sampling_session',
+            attrs={
+                SAMPLING_SESSION_ID: _sampling_session_id,
+                SESSION_ID: payload.get('session_id'),
+                BASE_MODEL: payload.get('base_model'),
+            },
+        ):
+            record = SamplingSessionRecord(
+                session_id=payload.get('session_id'),
+                seq_id=payload.get('sampling_session_seq_id'),
+                base_model=payload.get('base_model'),
+                model_path=payload.get('model_path'),
+            )
+            await self._sampling_mgr.add(_sampling_session_id, record)
+            return _sampling_session_id
 
     async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
         """Get a sampling session by ID as a plain dict."""
