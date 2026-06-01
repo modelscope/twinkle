@@ -350,6 +350,39 @@ class NativeFSDPStrategy:
 
         return state_dict
 
+    def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
+        """Collect only LoRA adapter parameters, with EP-aware all-gather."""
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+
+        ep_fsdp_mesh = self.ep_fsdp_device_mesh
+        ep_group = None
+        ep_world_size = 1
+        if ep_fsdp_mesh is not None:
+            ep_group = ep_fsdp_mesh['ep'].get_group()
+            ep_world_size = ep_fsdp_mesh['ep'].size()
+
+        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        adapter_suffix = f'.{adapter_name}.'
+
+        for name, param in unwrapped.named_parameters():
+            if not _is_lora_state_key(name) or adapter_suffix not in name:
+                continue
+
+            local_full = torch_util.to_local_tensor(param)
+            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+                local_full = local_full.contiguous().to(Platform.get_local_device())
+                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
+                dist.all_gather(gathered, local_full, group=ep_group)
+                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                state_dict[name] = local_full.cpu()
+                del gathered, local_full
+            else:
+                state_dict[name] = local_full.cpu()
+                del local_full
+
+        return state_dict
+
 
 def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
     candidate_names = set()

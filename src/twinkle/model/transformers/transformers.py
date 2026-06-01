@@ -912,15 +912,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save (EP-aware via strategy.get_full_state_dict)
-            full_state = self.strategy.get_full_state_dict(self.model)
-            adapter_marker = '.lora_'
+            # LoRA adapter save. Avoid collecting the full base model for large FSDP/EP jobs.
+            adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
             adapter_suffix = f'.{adapter_name}.'
-            for key, value in full_state.items():
-                if adapter_marker not in key:
-                    continue
-                if adapter_suffix not in key:
-                    continue
+            for key, value in adapter_state.items():
                 normalized = key.replace(adapter_suffix, '.')
                 processed_state_dict[normalized] = value
 

@@ -203,3 +203,21 @@ class AccelerateStrategy:
             state_dict[name] = local.cpu()
             del local
         return state_dict
+
+    def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
+        """Collect only LoRA adapter parameters."""
+        from twinkle.utils import torch_util
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+        adapter_suffix = f'.{adapter_name}.'
+        for name, param in unwrapped.named_parameters():
+            if not _is_lora_state_key(name) or adapter_suffix not in name:
+                continue
+            local = torch_util.to_local_tensor(param)
+            state_dict[name] = local.cpu()
+            del local
+        return state_dict
+
+
+def _is_lora_state_key(name: str) -> bool:
+    return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
