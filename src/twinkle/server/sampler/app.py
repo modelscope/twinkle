@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+from twinkle.server.exceptions import ConfigError
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.state import ServerStateProxy, get_server_state
@@ -25,6 +26,33 @@ from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 
 logger = get_logger()
+
+
+_SAMPLER_TYPES: tuple[str, ...] = ('mock', 'vllm', 'torch')
+
+
+def _dispatch_sampler_backend(sampler_type: str, ctor_kwargs: dict[str, Any]) -> Any:
+    """Instantiate the sampler selected by ``sampler_type`` (R3.4-3.6, R3.10)."""
+    if sampler_type is None or not isinstance(sampler_type, str) or sampler_type == '':
+        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
+    if sampler_type not in _SAMPLER_TYPES:
+        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
+    if sampler_type == 'mock':
+        from .backends.mock_sampler import MockSampler
+
+        # MockSampler accepts only model_id/seed/vocab_size — strip extras silently.
+        return MockSampler(
+            model_id=ctor_kwargs.get('model_id'),
+            seed=ctor_kwargs.get('seed', 0),
+            vocab_size=ctor_kwargs.get('vocab_size', 32),
+        )
+    if sampler_type == 'torch':
+        from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
+
+        return TorchSampler(**ctor_kwargs)
+    from twinkle.sampler import vLLMSampler
+
+    return vLLMSampler(**ctor_kwargs)
 
 
 class SamplerManagement(TaskQueueMixin):
@@ -46,29 +74,38 @@ class SamplerManagement(TaskQueueMixin):
                  engine_args: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
                  **kwargs):
-        self.device_group = DeviceGroup(**device_group)
-        twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
-        if 'mesh_dim_names' in device_mesh:
-            self.device_mesh = DeviceMesh(**device_mesh)
+        # Skip twinkle.initialize for the mock backend (R3.8) — start without
+        # CUDA/torch/vllm.
+        if sampler_type != 'mock':
+            self.device_group = DeviceGroup(**device_group)
+            twinkle.initialize(
+                mode='ray',
+                nproc_per_node=nproc_per_node,
+                groups=[self.device_group],
+                lazy_collect=False,
+            )
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
         else:
-            self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
+            self.device_group = None
+            self.device_mesh = None
         self.sampler_type = sampler_type
         self.model_id = model_id
         replica_context = serve.get_replica_context()
         replica_id = replica_context.replica_id.unique_id
 
-        from twinkle.sampler import vLLMSampler
-        sampler_kwargs = engine_args or {}
-        self.sampler = vLLMSampler(
-            model_id=model_id,
-            engine_args=sampler_kwargs,
-            device_mesh=self.device_mesh,
-            remote_group=self.device_group.name,
-            instance_id=replica_id,
-            **{
-                k: v
-                for k, v in kwargs.items() if k not in ['engine_args']
-            })
+        sampler_kwargs: dict[str, Any] = {'model_id': model_id}
+        if sampler_type != 'mock':
+            sampler_kwargs.update(
+                engine_args=engine_args or {},
+                device_mesh=self.device_mesh,
+                remote_group=self.device_group.name,
+                instance_id=replica_id,
+                **{k: v for k, v in kwargs.items() if k not in ('engine_args',)},
+            )
+        self.sampler = _dispatch_sampler_backend(sampler_type, sampler_kwargs)
 
         self.state: ServerStateProxy = get_server_state()
 

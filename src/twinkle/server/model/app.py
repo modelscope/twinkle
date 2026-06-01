@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+from twinkle.server.exceptions import ConfigError
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
@@ -28,6 +29,33 @@ from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 
 logger = get_logger()
+
+
+_MODEL_BACKENDS: tuple[str, ...] = ('mock', 'transformers', 'megatron')
+
+
+def _dispatch_model_backend(backend: str, ctor_kwargs: dict[str, Any]) -> Any:
+    """Instantiate the model backend selected by ``backend`` (R3.1-3.3, R3.9).
+
+    Raises :class:`ConfigError` *before* instantiating any backend if the
+    value is missing, empty, or not in the permitted set, so the deployment
+    never reaches a ready state with a bad backend.
+    """
+    if backend is None or not isinstance(backend, str) or backend == '':
+        raise ConfigError(field='backend', value=backend, allowed=list(_MODEL_BACKENDS))
+    if backend not in _MODEL_BACKENDS:
+        raise ConfigError(field='backend', value=backend, allowed=list(_MODEL_BACKENDS))
+    if backend == 'mock':
+        from .backends.mock_model import TwinkleCompatMockModel
+
+        return TwinkleCompatMockModel(**ctor_kwargs)
+    if backend == 'megatron':
+        from .backends.megatron_model import TwinkleCompatMegatronModel
+
+        return TwinkleCompatMegatronModel(**ctor_kwargs)
+    from .backends.transformers_model import TwinkleCompatTransformersModel
+
+    return TwinkleCompatTransformersModel(**ctor_kwargs)
 
 
 class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
@@ -51,41 +79,44 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  queue_config: dict[str, Any] | None = None,
                  backend: str | None = None,
                  **kwargs):
-        # Bridge: Phase 0c introduces ``backend`` as the canonical selector;
-        # Phase 1 replaces the use_megatron branch below with full dispatch
-        # on this field. Until then, derive use_megatron from backend when
-        # supplied so both YAML schemas keep working through the transition.
-        if backend is not None:
-            use_megatron = backend == 'megatron'
-        self.device_group = DeviceGroup(**device_group)
-        twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
-        if 'mesh_dim_names' in device_mesh:
-            self.device_mesh = DeviceMesh(**device_mesh)
+        # Backwards-compatible bridge: legacy callers passed ``use_megatron`` —
+        # derive ``backend`` from it when not supplied so we always go through
+        # the strict dispatch below.
+        if backend is None:
+            backend = 'megatron' if use_megatron else 'transformers'
+        self.backend = backend
+        self.use_megatron = backend == 'megatron'
+        # Skip twinkle.initialize for the mock backend (R3.7) — the largest
+        # startup-time saving and the only way to start without CUDA/torch.
+        if backend != 'mock':
+            self.device_group = DeviceGroup(**device_group)
+            twinkle.initialize(
+                mode='ray',
+                nproc_per_node=nproc_per_node,
+                groups=[self.device_group],
+                lazy_collect=False,
+            )
+            if 'mesh_dim_names' in device_mesh:
+                self.device_mesh = DeviceMesh(**device_mesh)
+            else:
+                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
         else:
-            self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
-        self.use_megatron = use_megatron
+            self.device_group = None
+            self.device_mesh = None
         self.replica_id = serve.get_replica_context().replica_id.unique_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
 
-        # Choose model backend
-        if use_megatron:
-            from ..model.backends.megatron_model import TwinkleCompatMegatronModel
-
-            self.model = TwinkleCompatMegatronModel(
-                model_id=model_id,
+        # Choose model backend (R3.1-3.3, R3.9). Validation runs before
+        # instantiation so an invalid value never produces a partial backend.
+        ctor_kwargs: dict[str, Any] = {'model_id': model_id, **kwargs}
+        if backend != 'mock':
+            ctor_kwargs.update(
                 device_mesh=self.device_mesh,
                 remote_group=self.device_group.name,
                 instance_id=self.replica_id,
-                **kwargs)
-        else:
-            from ..model.backends.transformers_model import TwinkleCompatTransformersModel
-            self.model = TwinkleCompatTransformersModel(
-                model_id=model_id,
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=self.replica_id,
-                **kwargs)
+            )
+        self.model = _dispatch_model_backend(backend, ctor_kwargs)
 
         self.state: ServerStateProxy = get_server_state()
         self._replica_registered = False
