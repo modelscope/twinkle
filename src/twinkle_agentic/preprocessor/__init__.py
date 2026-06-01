@@ -4,6 +4,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.preprocessor import Preprocessor
+from twinkle.template import Template
 from twinkle.utils import get_logger
 from twinkle.utils.parallel import PosixFileLock
 from .consistency_filter import ConsistencyFilter
@@ -130,9 +131,8 @@ class QualityPreprocessor(Preprocessor):
         # ── Phase 12: IFD hard-example filter (requires Phase 11) ───────────
         ifd_api_endpoint: str = '',          # '' = skip
         ifd_model: str = 'default',
-        ifd_tokenizer: str = '',
+        ifd_template: Optional[Template] = None,
         ifd_threshold: float = 0.8,
-        ifd_max_workers: int = 8,
         # ── Phase 13: response refinement (requires key_rounds) ─────────────
         refine_api_endpoint: str = '',       # '' = skip
         refine_model: str = 'default',
@@ -279,14 +279,13 @@ class QualityPreprocessor(Preprocessor):
         pipeline.append(ic.classify_intent)
 
         # Phase 12: IFD hard-example filter
-        if (backend or ifd_api_endpoint) and ifd_tokenizer:
+        if (backend or ifd_api_endpoint) and ifd_template is not None:
             ifd = IFDFilter(
                 backend=backend,
                 api_endpoint=ifd_api_endpoint,
                 model=ifd_model,
-                tokenizer_name_or_path=ifd_tokenizer,
+                template=ifd_template,
                 ifd_threshold=ifd_threshold,
-                max_workers=ifd_max_workers,
             )
             pipeline.append(ifd.ifd_filter)
 

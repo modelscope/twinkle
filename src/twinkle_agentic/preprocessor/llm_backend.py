@@ -40,14 +40,15 @@ class LLMBackend(ABC):
             is compatible with _extract_logprob helpers), or None on failure.
         """
 
-    def prompt_logprobs_ids(self, input_ids: List[int]) -> Optional[List]:
-        """Evaluate raw token-id prompt without chat template wrapping.
+    @abstractmethod
+    def prompt_logprobs_ids(self, input_ids_list: List[List[int]]) -> List[List]:
+        """Batched: evaluate raw token-id prompts without chat template wrapping.
 
-        Used for unconditional perplexity (e.g. IFD denominator) where any
-        chat-template prefix would contaminate the score. Default: not supported.
+        Used for unconditional perplexity (e.g. IFD denominator). Caller MUST
+        supply a list of token-id sequences; for distributed backends the list
+        length must satisfy backend-specific batching constraints (e.g.
+        ``len >= dp_world_size`` for SamplerBackend).
         """
-        raise NotImplementedError(
-            f'{type(self).__name__} does not support prompt_logprobs_ids')
 
     def embeddings(self, texts: List[str]) -> Any:
         """Compute text embeddings. Override in backends that support it."""
@@ -121,10 +122,10 @@ class OpenAIBackend(LLMBackend):
         except Exception:
             return None
 
-    def prompt_logprobs_ids(self, input_ids: List[int]) -> Optional[List]:
-        # vLLM /v1/completions accepts int-list prompt and returns per-token prompt_logprobs.
+    def prompt_logprobs_ids(self, input_ids_list: List[List[int]]) -> List[List]:
         endpoint = self._chat_endpoint.rsplit('/', 2)[0] + '/v1/completions'
-        try:
+        results: List[List] = []
+        for input_ids in input_ids_list:
             resp = self._client.post(endpoint, json={
                 'model': self._model,
                 'prompt': list(input_ids),
@@ -136,11 +137,10 @@ class OpenAIBackend(LLMBackend):
             data = resp.json()
             choices = data.get('choices') or []
             if choices and 'prompt_logprobs' in choices[0]:
-                return choices[0]['prompt_logprobs']
-            return data.get('prompt_logprobs')
-        except Exception as e:
-            logger.warning(f'[OpenAIBackend] prompt_logprobs_ids failed: {e}')
-            return None
+                results.append(choices[0]['prompt_logprobs'])
+            else:
+                results.append(data['prompt_logprobs'])
+        return results
 
     def embeddings(self, texts: List[str]):
         import numpy as np
@@ -157,7 +157,12 @@ class OpenAIBackend(LLMBackend):
 class SamplerBackend(LLMBackend):
     """Backend wrapping a Twinkle vLLMSampler (Ray actor, no HTTP overhead)."""
 
-    def __init__(self, sampler, embed_endpoint: str = '', embed_model: str = 'bge-m3'):
+    def __init__(
+        self,
+        sampler,
+        embed_endpoint: str = '',
+        embed_model: str = 'bge-m3',
+    ):
         """
         Args:
             sampler: A vLLMSampler instance (with template already set).
@@ -218,19 +223,21 @@ class SamplerBackend(LLMBackend):
             logger.warning(f'[SamplerBackend] prompt_logprobs failed: {e}')
             return None
 
-    def prompt_logprobs_ids(self, input_ids: List[int]) -> Optional[List]:
+    def prompt_logprobs_ids(self, input_ids_list: List[List[int]]) -> List[List]:
         from twinkle.data_format import SamplingParams
-        # InputFeature path bypasses template.encode -> no chat-template contamination.
-        feat = {'input_ids': list(input_ids)}
+        if not isinstance(input_ids_list, list) or not input_ids_list:
+            raise ValueError('prompt_logprobs_ids requires a non-empty List[List[int]].')
+        device_mesh = getattr(self._sampler, 'device_mesh', None)
+        dp_world_size = getattr(device_mesh, 'dp_world_size', 1) or 1
+        if len(input_ids_list) < dp_world_size:
+            raise ValueError(
+                f'SamplerBackend.prompt_logprobs_ids requires at least '
+                f'dp_world_size={dp_world_size} inputs to keep all DP workers busy, '
+                f'got {len(input_ids_list)}. Batch upstream before calling.')
+        feats = [{'input_ids': list(ids)} for ids in input_ids_list]
         params = SamplingParams(max_tokens=0, prompt_logprobs=1)
-        try:
-            responses = self._sampler.sample(feat, params)
-            if responses and responses[0].prompt_logprobs is not None:
-                return responses[0].prompt_logprobs
-            return None
-        except Exception as e:
-            logger.warning(f'[SamplerBackend] prompt_logprobs_ids failed: {e}')
-            return None
+        responses = self._sampler.sample(feats, params)
+        return [r.prompt_logprobs for r in responses]
 
     def embeddings(self, texts: List[str]):
         if self._embed_client is None:

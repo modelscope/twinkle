@@ -38,6 +38,54 @@ _name: Optional[str] = None
 _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
 
 
+def _capture_caller() -> Optional[str]:
+    """Return ``file:line`` of the first frame outside this module, or ``None``."""
+    this_file = __file__
+    frame = inspect.currentframe()
+    if frame is None:
+        return None
+    frame = frame.f_back  # skip _capture_caller itself
+    while frame is not None and frame.f_code.co_filename == this_file:
+        frame = frame.f_back
+    if frame is None:
+        return None
+    return f'{frame.f_code.co_filename}:{frame.f_lineno}'
+
+
+def _attach_caller_note(exc: BaseException, caller: Optional[str]) -> None:
+    """Append a driver-caller note to ``exc`` so it surfaces in traceback dumps (PY3.11+)."""
+    if not caller:
+        return
+    try:
+        marker = f'[twinkle] driver caller: {caller}'
+        notes = getattr(exc, '__notes__', None) or []
+        if marker not in notes:
+            exc.add_note(marker)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _augment_exc_with_caller(exc: BaseException, caller: Optional[str]) -> None:
+    """Prepend driver caller to ``exc.args[0]`` so ``f'{exc}'`` / ``str(exc)`` surfaces it.
+
+    ``add_note`` only shows up in ``traceback.format_exception``; downstream code that
+    logs via ``f'{e}'`` (e.g. ``SamplerBackend.prompt_logprobs``) would otherwise drop
+    the caller hint. Idempotent via a sentinel attribute so repeated re-raises in nested
+    wrappers don't stack the prefix.
+    """
+    if not caller or getattr(exc, '_twinkle_caller_augmented', False):
+        return
+    try:
+        prefix = f'[twinkle driver caller: {caller}] '
+        if exc.args:
+            exc.args = (prefix + str(exc.args[0]), *exc.args[1:])
+        else:
+            exc.args = (prefix.rstrip(),)
+        setattr(exc, '_twinkle_caller_augmented', True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _maybe_load_worker_notifier() -> None:
     """Lazily reconstruct notifier + name on ray workers from inherited env vars."""
     global _notifier, _name
@@ -489,15 +537,19 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
 
         @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
+            _caller = _capture_caller()
             _ctx = f'{cls.__name__}.__init__'
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 _maybe_load_worker_notifier()
-                _new_init_body(self, *args, **kwargs)
+                _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
+                _attach_caller_note(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
-        def _new_init_body(self, *args, **kwargs):
+        def _new_init_body(self, _caller, *args, **kwargs):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -521,10 +573,16 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 from ._ray import RayHelper
 
                 # In case the same class created twice in the same device group
-                # Try to get the caller's line
-                frame = inspect.currentframe().f_back
-                caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
-                caller_line = frame.f_lineno
+                # Try to get the caller's line (resolved in ``new_init`` so it points
+                # at user code, not at the wrapper itself).
+                if _caller:
+                    _cf, _, _cl = _caller.rpartition(':')
+                    caller_file = _cf.replace(os.sep, '_').replace('.', '_')
+                    caller_line = _cl
+                else:
+                    frame = inspect.currentframe().f_back
+                    caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
+                    caller_line = frame.f_lineno
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
@@ -689,7 +747,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
+            _caller = _capture_caller()
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
                 if _mode == 'local':
@@ -768,6 +829,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
+                                    _attach_caller_note(_e, _caller)
+                                    _augment_exc_with_caller(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
@@ -781,6 +844,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
+                _attach_caller_note(_e, _caller)
+                _augment_exc_with_caller(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
@@ -794,23 +859,27 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
     return decorator
 
 
-async def _wrap_async_iter_with_notify(gen: AsyncIterator, ctx: str) -> AsyncIterator:
+async def _wrap_async_iter_with_notify(gen: AsyncIterator, ctx: str, caller: Optional[str] = None) -> AsyncIterator:
     """Re-emit chunks from a local async generator and forward exceptions to the notifier."""
     try:
         async for chunk in gen:
             yield chunk
     except Exception as _e:  # noqa: BLE001
+        _attach_caller_note(_e, caller)
+        _augment_exc_with_caller(_e, caller)
         notify_exception(_notifier, ctx, _e, _name)
         raise
 
 
-async def _wrap_objrefgen_with_notify(ref_gen: Any, ctx: str) -> AsyncIterator:
+async def _wrap_objrefgen_with_notify(ref_gen: Any, ctx: str, caller: Optional[str] = None) -> AsyncIterator:
     """Drain a Ray ObjectRefGenerator chunk-by-chunk; forward exceptions to the notifier."""
     import ray
     try:
         async for ref in ref_gen:
             yield await ref
     except Exception as _e:  # noqa: BLE001
+        _attach_caller_note(_e, caller)
+        _augment_exc_with_caller(_e, caller)
         notify_exception(_notifier, ctx, _e, _name)
         raise
 
@@ -847,11 +916,14 @@ def remote_generator(execute: Literal['first', 'balanced', 'random'] = 'balanced
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> AsyncIterator[T1]:
+            _caller = _capture_caller()
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 if _mode == 'local' or not hasattr(self, '_actors'):
                     # Worker-side OR pure local mode: just invoke the async generator.
-                    return _wrap_async_iter_with_notify(func(self, *args, **kwargs), _ctx)
+                    return _wrap_async_iter_with_notify(func(self, *args, **kwargs), _ctx, _caller)
                 if _mode != 'ray':
                     raise NotImplementedError(f'Unsupported mode {_mode}')
 
@@ -869,8 +941,10 @@ def remote_generator(execute: Literal['first', 'balanced', 'random'] = 'balanced
                     raise ValueError(f'Unsupported execute mode for remote_generator: {execute}')
 
                 ref_gen = getattr(actor, func.__name__).remote(*args, **kwargs)
-                return _wrap_objrefgen_with_notify(ref_gen, _ctx)
+                return _wrap_objrefgen_with_notify(ref_gen, _ctx, _caller)
             except Exception as _e:  # noqa: BLE001
+                _attach_caller_note(_e, _caller)
+                _augment_exc_with_caller(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 

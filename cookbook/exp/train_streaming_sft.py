@@ -30,6 +30,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.sampler import vLLMSampler
+from twinkle.template import Qwen3_5Template
 from twinkle_agentic.preprocessor import QualityPreprocessor, SamplerBackend
 
 logger = get_logger()
@@ -38,7 +39,7 @@ logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 MODEL_LOCAL_PATH = os.environ.get('MODEL_LOCAL_PATH', 'Qwen/Qwen3.5-4B')
 TEMPLATE_NAME = 'Qwen3_5Template'
-MAX_LENGTH = 32000
+MAX_LENGTH = 40000
 
 # ── GPU allocation ───────────────────────────────────────────────────────────
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
@@ -125,6 +126,9 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         load_from_cache_file=DATASET_USE_CACHE,
         features=_TARGET_FEATURES,
     )
+    template = Qwen3_5Template(model_id=MODEL_ID, max_length=MAX_LENGTH,
+        truncation_strategy='delete',
+        enable_thinking=False)
 
     qp = QualityPreprocessor(
         # Shared LLM backend (vLLMSampler via Ray, no HTTP)
@@ -141,9 +145,8 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         special_chars_max_ratio=0.5,
         minhash_dedup=False,
         # Phase 12: IFD hard-example filter
-        ifd_tokenizer=MODEL_LOCAL_PATH,
+        ifd_template=template,
         ifd_threshold=IFD_THRESHOLD,
-        ifd_max_workers=8,
         # Phase 13: response refinement
         refine_temperature=REFINE_TEMPERATURE,
         refine_max_tokens=REFINE_MAX_TOKENS,
@@ -180,17 +183,17 @@ def train():
     # ── Ray mode: GPUs 0-3 for training, GPUs 4-7 for vLLMSampler ────────────
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=2),
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
-    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // 2, tp_size=2)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
     # ── vLLMSampler on GPUs 4-7 (Ray actor, no HTTP overhead) ────────────────
     sampler = vLLMSampler(
         model_id=MODEL_ID,
         engine_args={
-            'gpu_memory_utilization': 0.85,
+            'gpu_memory_utilization': 0.6,
             'max_model_len': MAX_LENGTH,
         },
         device_mesh=sampler_mesh,
