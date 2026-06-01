@@ -11,7 +11,13 @@ from .future_manager import FutureManager
 from .model_manager import ModelManager
 from .models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
 from .sampling_manager import SamplingSessionManager
-from .server_state import ServerState, ServerStateProxy, get_server_state
+from .replica_registry import ReplicaRegistry
+from .server_state import (
+    ServerState,
+    ServerStateProxy,
+    get_server_state,
+    reset_server_state_cache,
+)
 from .session_manager import SessionManager
 
 __all__ = [
@@ -31,7 +37,9 @@ __all__ = [
     # Server state
     'ServerState',
     'ServerStateProxy',
+    'ReplicaRegistry',
     'get_server_state',
+    'reset_server_state_cache',
     # Persistence backend factory
     'PersistenceConfig',
     'create_backend',

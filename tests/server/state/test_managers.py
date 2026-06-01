@@ -168,38 +168,39 @@ class TestModelManager:
 
     @pytest.mark.asyncio
     async def test_replica_registration(self, manager):
-        manager.register_replica("replica1", max_loras=5)
-        info = manager.get_capacity_info()
+        await manager.register_replica("replica1", max_loras=5)
+        info = await manager.get_capacity_info()
         assert info["max_loras"] == 5
         assert info["used_loras"] == 0
         assert info["free_loras"] == 5
 
     @pytest.mark.asyncio
     async def test_capacity_info_after_add(self, manager):
-        manager.register_replica("r1", max_loras=3)
+        await manager.register_replica("r1", max_loras=3)
         record = ModelRecord(token="tok1", replica_id="r1")
         await manager.add("m1", record)
-        info = manager.get_capacity_info()
+        info = await manager.get_capacity_info()
         assert info["used_loras"] == 1
         assert info["free_loras"] == 2
 
     @pytest.mark.asyncio
-    async def test_rebuild_indexes(self, manager):
-        """rebuild_indexes should reconstruct token and replica indexes from backend."""
+    async def test_indexes_derived_from_backend(self, manager):
+        """Per-token / per-replica counts are derived from the backend."""
         record1 = ModelRecord(token="tok1", replica_id="r1")
         record2 = ModelRecord(token="tok1", replica_id="r2")
         await manager.add("m1", record1)
         await manager.add("m2", record2)
 
-        # Clear in-memory indexes
-        manager._token_models.clear()
-        manager._replica_models.clear()
+        await manager.register_replica("r1", max_loras=5)
+        await manager.register_replica("r2", max_loras=5)
 
-        await manager.rebuild_indexes()
-        assert "m1" in manager._token_models.get("tok1", set())
-        assert "m2" in manager._token_models.get("tok1", set())
-        assert "m1" in manager._replica_models.get("r1", set())
-        assert "m2" in manager._replica_models.get("r2", set())
+        # Backend-derived availability reflects all persisted records.
+        avail = await manager.get_available_replica_ids(["r1", "r2"])
+        assert avail == ["r1", "r2"]
+
+        # Per-token count enforces the limit using the persisted records.
+        count = await manager._count_models_for_token("tok1")
+        assert count == 2
 
     @pytest.mark.asyncio
     async def test_cascade_cleanup_by_session(self, manager):
@@ -222,12 +223,12 @@ class TestModelManager:
 
     @pytest.mark.asyncio
     async def test_get_available_replica_ids(self, manager):
-        manager.register_replica("r1", max_loras=2)
-        manager.register_replica("r2", max_loras=1)
+        await manager.register_replica("r1", max_loras=2)
+        await manager.register_replica("r2", max_loras=1)
         # Fill r2
         await manager.add("m1", ModelRecord(token="t", replica_id="r2"))
 
-        available = manager.get_available_replica_ids(["r1", "r2", "r3_unknown"])
+        available = await manager.get_available_replica_ids(["r1", "r2", "r3_unknown"])
         # r1 has capacity, r2 is full, r3 unknown (conservative include)
         assert "r1" in available
         assert "r2" not in available
