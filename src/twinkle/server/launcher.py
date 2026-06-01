@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, NoReturn, Optional, Union
 
 from twinkle import get_logger
+from twinkle.server.config import ServerConfig
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 
 logger = get_logger()
@@ -53,17 +54,26 @@ class ServerLauncher:
 
     def __init__(
         self,
-        config: dict[str, Any] | None = None,
+        config: ServerConfig,
         ray_namespace: str | None = None,
     ):
         """
         Initialize the server launcher.
 
         Args:
-            config: Configuration dictionary
+            config: A validated :class:`ServerConfig` instance. Raw dicts are
+                rejected — operators must build ``ServerConfig`` via
+                ``ServerConfig.from_yaml`` or its constructor so cross-field
+                validation runs before the launcher consumes anything (R6.6).
             ray_namespace: Ray namespace (default: 'twinkle_cluster')
         """
-        self.config = config or {}
+        if not isinstance(config, ServerConfig):
+            raise TypeError(
+                'ServerLauncher requires a typed ServerConfig instance; '
+                f'got {type(config).__name__}. Build one with '
+                'ServerConfig.from_yaml(path) or ServerConfig(...).'
+            )
+        self.config: ServerConfig = config
         self.ray_namespace = ray_namespace
         self._builders: dict[str, Callable] = {}
         self._ray_initialized = False
@@ -159,7 +169,7 @@ class ServerLauncher:
 
         import ray
 
-        namespace = self.ray_namespace or self.config.get('ray_namespace') or 'twinkle_cluster'
+        namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
 
         if not ray.is_initialized():
             # Use runtime_env to apply patches in worker processes
@@ -197,30 +207,28 @@ class ServerLauncher:
             # Serve not running — nothing to shut down
             pass
 
-        http_options = self.config.get('http_options', {})
-        if isinstance(http_options, dict):
-            http_options = dict(http_options)
-        else:
-            http_options = dict(http_options) if http_options else {}
-
+        http_options = self.config.http_options.model_dump()
         serve.start(http_options=http_options)
         logger.info(f'Ray Serve started with http_options={http_options}')
 
         self._serve_started = True
 
-    def _deploy_application(self, app_config: dict[str, Any]) -> None:
+    def _deploy_application(self, app_spec: 'ApplicationSpec') -> None:
         """Deploy a single application.
 
         Args:
-            app_config: Application configuration dictionary
+            app_spec: Validated :class:`ApplicationSpec` from the typed config.
         """
         from ray import serve
 
-        name = app_config.get('name', 'app')
-        route_prefix = app_config.get('route_prefix', '/')
-        import_path = app_config.get('import_path', 'server')
-        args = app_config.get('args', {}) or {}
-        deployments = app_config.get('deployments', [])
+        name = app_spec.name
+        route_prefix = app_spec.route_prefix
+        import_path = app_spec.import_path
+        # Re-serialize the typed args back to a kwargs dict for the builder.
+        # Using ``mode='python'`` keeps nested Pydantic models as dicts (which
+        # the legacy builders expect) without losing field-level validation.
+        args = app_spec.args.model_dump(mode='python', exclude_none=True)
+        deployments = list(app_spec.deployments or [])
 
         logger.info(f'Starting {name} at {route_prefix}...')
 
@@ -252,11 +260,10 @@ class ServerLauncher:
             deploy_options['ray_actor_options'] = ray_actor_options
 
         # Pass http_options to server apps for internal proxy routing
-        http_options = self.config.get('http_options', {})
-        if import_path == 'server' and http_options:
-            args['http_options'] = http_options
+        if import_path == 'server':
+            args.setdefault('http_options', self.config.http_options.model_dump())
 
-        app = builder(deploy_options=deploy_options, **{k: v for k, v in args.items()})
+        app = builder(deploy_options=deploy_options, **args)
 
         serve.run(app, name=name, route_prefix=route_prefix)
         logger.info(f'Deployed {name} at {route_prefix}')
@@ -272,55 +279,45 @@ class ServerLauncher:
         apply_ray_serve_patches()
 
         # Initialize telemetry if configured
-        telemetry_config = self.config.get('telemetry_config', {})
-        if telemetry_config:
-            from twinkle.server.telemetry import TelemetryConfig, init_telemetry
-            config = TelemetryConfig(**telemetry_config)
-            init_telemetry(config)
+        telemetry = self.config.telemetry
+        if telemetry.enabled:
+            from twinkle.server.telemetry import init_telemetry
+            init_telemetry(telemetry)
             # Export config to env vars for Ray worker processes
             import os
             os.environ['TWINKLE_TELEMETRY_ENABLED'] = '1'
-            os.environ['TWINKLE_TELEMETRY_DEBUG'] = '1' if config.debug else '0'
-            os.environ['TWINKLE_TELEMETRY_SERVICE'] = config.service_name
-            os.environ['TWINKLE_TELEMETRY_ENDPOINT'] = config.otlp_endpoint
-            os.environ['TWINKLE_TELEMETRY_INTERVAL'] = str(config.export_interval_ms)
+            os.environ['TWINKLE_TELEMETRY_DEBUG'] = '1' if telemetry.debug else '0'
+            os.environ['TWINKLE_TELEMETRY_SERVICE'] = telemetry.service_name
+            os.environ['TWINKLE_TELEMETRY_ENDPOINT'] = telemetry.otlp_endpoint
+            os.environ['TWINKLE_TELEMETRY_INTERVAL'] = str(telemetry.export_interval_ms)
 
-        # Export top-level persistence_config to env vars so any worker
+        # Export top-level persistence to env vars so any worker
         # (not just Gateway) can build the same backend on first call to
         # get_server_state().
-        persistence_config_dict = self.config.get('persistence_config')
-        if persistence_config_dict:
-            import os
-            from twinkle.server.state.backend.factory import PersistenceConfig
-            pconfig = PersistenceConfig(**persistence_config_dict)
-            for k, v in pconfig.to_env_vars().items():
-                os.environ[k] = v
-            logger.info(f'Persistence backend configured: mode={pconfig.mode}')
+        persistence = self.config.persistence
+        import os
+        for k, v in persistence.to_env_vars().items():
+            os.environ[k] = v
+        logger.info(f'Persistence backend configured: mode={persistence.mode}')
 
         self._init_ray()
         self._start_serve()
 
-        applications = self.config.get('applications', [])
+        applications = self.config.applications
         if not applications:
             logger.warning('No applications configured')
             return
 
-        for app_config in applications:
-            if isinstance(app_config, dict):
-                self._deploy_application(app_config)
-            else:
-                self._deploy_application(dict(app_config))
+        for app_spec in applications:
+            self._deploy_application(app_spec)
 
-        http_options = self.config.get('http_options', {})
-        host = http_options.get('host', 'localhost')
-        port = http_options.get('port', 8000)
+        host = self.config.http_options.host
+        port = self.config.http_options.port
 
         print('\nAll applications started!')
         print('Endpoints:')
-        for app_config in applications:
-            route_prefix = app_config.get('route_prefix', '/') if isinstance(app_config,
-                                                                             dict) else app_config.route_prefix
-            print(f'  - http://{host}:{port}{route_prefix}')
+        for app_spec in applications:
+            print(f'  - http://{host}:{port}{app_spec.route_prefix}')
 
         # Graceful shutdown via signal handling
         shutdown_event = threading.Event()
@@ -349,59 +346,38 @@ class ServerLauncher:
         config_path: str | Path,
         ray_namespace: str | None = None,
     ) -> ServerLauncher:
+        """Build a ``ServerLauncher`` from a YAML config file.
+
+        Thin wrapper over :meth:`ServerConfig.from_yaml`. ``FileNotFoundError``
+        / ``ConfigParseError`` / ``pydantic.ValidationError`` propagate so the
+        caller can surface a precise message before the launcher is constructed.
         """
-        Create a ServerLauncher from a YAML config file.
-
-        Args:
-            config_path: Path to the YAML config file
-            ray_namespace: Override Ray namespace from config
-
-        Returns:
-            Configured ServerLauncher instance
-        """
-        from omegaconf import OmegaConf
-
-        config_path = Path(config_path)
-        if not config_path.exists():
-            raise FileNotFoundError(f'Config file not found: {config_path}')
-
-        config = OmegaConf.load(config_path)
-        config_dict = OmegaConf.to_container(config, resolve=True)
-
+        config = ServerConfig.from_yaml(config_path)
         return cls(
-            config=config_dict,
-            ray_namespace=ray_namespace or config_dict.get('ray_namespace'),
+            config=config,
+            ray_namespace=ray_namespace or config.ray_namespace,
         )
 
 
 def launch_server(
-    config: dict[str, Any] | None = None,
+    config: ServerConfig | None = None,
     config_path: str | Path | None = None,
     ray_namespace: str | None = None,
 ) -> None:
-    """
-    Launch a twinkle server with flexible configuration options.
+    """Launch a twinkle server.
 
-    This is the main entry point for launching servers programmatically.
-    The call blocks until a SIGINT/SIGTERM signal is received.
-
-    Args:
-        config: Configuration dictionary (takes precedence over config_path)
-        config_path: Path to YAML config file
-        ray_namespace: Ray namespace
+    Exactly one of ``config`` (a :class:`ServerConfig` instance) or
+    ``config_path`` (a YAML file) must be provided. The call blocks until a
+    SIGINT/SIGTERM signal is received.
 
     Raises:
-        ValueError: If neither config nor config_path is provided
+        ValueError: neither ``config`` nor ``config_path`` was provided.
+        TypeError: ``config`` is not a :class:`ServerConfig` instance — raw
+            dicts are no longer accepted (R6.6).
 
     Examples:
-        # From YAML config
         launch_server(config_path="server_config.yaml")
-
-        # From Python dict
-        launch_server(config={
-            "http_options": {"host": "0.0.0.0", "port": 8000},
-            "applications": [...]
-        })
+        launch_server(config=ServerConfig(...))
     """
     if config is None and config_path is None:
         raise ValueError("Either 'config' or 'config_path' must be provided")
@@ -409,7 +385,7 @@ def launch_server(
     if config is not None:
         launcher = ServerLauncher(
             config=config,
-            ray_namespace=ray_namespace or config.get('ray_namespace'),
+            ray_namespace=ray_namespace or config.ray_namespace,
         )
     else:
         launcher = ServerLauncher.from_yaml(
