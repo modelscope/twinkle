@@ -109,6 +109,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _lazy_wrap_model(self):
         return super()._lazy_wrap_model()
 
+    def _ensure_target_parameter_lora_installed(self, config: LoraConfig) -> None:
+        target_parameters = getattr(config, 'target_parameters', None)
+        if not target_parameters:
+            return
+        if self._model_wrapped:
+            raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
+        if getattr(self, '_enable_expert_parallel', False):
+            self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=True)
+            self._maybe_apply_expert_parallel()
+        self.multi_adapter.patch_target_parameters(self.model, target_parameters)
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
@@ -201,6 +212,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             config_or_dir, str
         ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
         assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
+        config_or_dir = self.strategy.prepare_adapter_config(
+            config_or_dir,
+            enable_ep=getattr(self, '_enable_expert_parallel', False),
+        )
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
@@ -213,6 +228,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
+        self._ensure_target_parameter_lora_installed(config_or_dir)
         self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
 
     @remote_function()
@@ -300,4 +316,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
-            return super()._get_trainable_parameters(real_adapter_name)
+            params = super()._get_trainable_parameters(real_adapter_name)
+            params.update(self.multi_adapter.get_target_parameter_trainable_parameters(adapter_name))
+            return params

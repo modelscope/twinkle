@@ -1,4 +1,6 @@
 import copy
+import sys
+import types
 
 import torch
 from peft import LoraConfig, get_peft_model
@@ -204,3 +206,51 @@ def test_multilora_state_dict_round_trips_target_parameters():
         actual = restored_model(inputs, expert_idx=0)
 
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_multilora_transformers_installs_target_parameters_once():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    if "zmq" not in sys.modules:
+        sys.modules["zmq"] = types.SimpleNamespace(
+            Context=object,
+            Socket=object,
+            RCVTIMEO=1,
+            SNDTIMEO=2,
+            LINGER=3,
+        )
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+
+    model = FakeModel()
+    instance = MultiLoraTransformersModel.__new__(MultiLoraTransformersModel)
+    nn.Module.__init__(instance)
+    instance.model = model
+    instance._model_wrapped = False
+    instance._enable_expert_parallel = False
+    instance.multi_adapter = MultiLora(max_loras=2, max_r=4)
+    instance.multi_adapter.module = model
+    instance.multi_adapter.loras = [
+        LoraTenant(index=0, adapter_name="lora_0", config=_make_target_cfg(r=4)),
+        LoraTenant(index=1, adapter_name="lora_1", config=_make_target_cfg(r=4)),
+    ]
+
+    cfg = _make_target_cfg(r=2)
+    instance._ensure_target_parameter_lora_installed(cfg)
+    instance.multi_adapter.acquire_lora("adapter_a", cfg)
+    instance._ensure_target_parameter_lora_installed(cfg)
+    instance.multi_adapter.acquire_lora("adapter_b", cfg)
+
+    assert len(instance.multi_adapter.target_parameter_manager.wrappers) == 2
+
+    different_cfg = LoraConfig(
+        r=2,
+        lora_alpha=4,
+        target_modules=[],
+        target_parameters=["mlp.experts.gate_up_proj"],
+    )
+    try:
+        instance._ensure_target_parameter_lora_installed(different_cfg)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("different target_parameters should be rejected")
