@@ -142,12 +142,16 @@ def create_metrics_middleware(deployment: str) -> Callable:
     Usage inside a ``build_*_app()`` function::
 
         from twinkle.server.utils.metrics import create_metrics_middleware
-        metrics_mw = create_metrics_middleware("Model")
-        app.middleware('http')(metrics_mw)
+        from twinkle.server.telemetry.tracing import create_tracing_middleware
 
-    Because FastAPI executes middleware in LIFO order, registering this
-    **after** ``verify_token`` means it wraps the outermost layer and
-    captures full end-to-end latency including auth.
+        app.middleware('http')(verify_token)
+        app.middleware('http')(create_tracing_middleware("Model"))
+        app.middleware('http')(create_metrics_middleware("Model"))   # outermost
+
+    FastAPI executes middleware in LIFO order, so the **last** middleware
+    registered is the outermost wrapper. Register metrics last so its
+    latency observation covers the full request path including tracing
+    overhead and authentication.
     """
 
     async def metrics_middleware(request: Any, call_next: Callable) -> Any:

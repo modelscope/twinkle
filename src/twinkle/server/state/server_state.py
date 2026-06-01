@@ -592,6 +592,12 @@ def get_server_state(
     if isinstance(persistence_config, dict):
         persistence_config = PersistenceConfig(**persistence_config)
 
+    # Fall back to env-var-propagated config so any worker (not just Gateway)
+    # can create the actor with the right backend regardless of deployment
+    # startup order. Explicit args still take precedence.
+    if backend is None and persistence_config is None:
+        persistence_config = PersistenceConfig.from_env()
+
     try:
         actor = ray.get_actor(actor_name)
     except ValueError:

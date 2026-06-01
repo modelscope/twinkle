@@ -9,11 +9,29 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 8000            # Port number for the server
 
-# Telemetry configuration for observability (OpenTelemetry-based)
+# Telemetry configuration for observability (OpenTelemetry-based).
+# Disabled by default — opentelemetry-* packages are optional dependencies.
+# To enable:
+#   1. pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp
+#   2. set enabled: true (and debug: true to dump exporters to console for local dev,
+#      or leave debug: false and point otlp_endpoint at an OTLP collector — see
+#      cookbook/observability/ for a docker-compose example).
 telemetry_config:
-  enabled: true
-  debug: true
+  enabled: false
+  debug: false
   service_name: twinkle-server
+  otlp_endpoint: http://localhost:4317
+
+# Persistence configuration for ServerState (sessions, models, futures, ...).
+# Top-level placement makes the launcher propagate this to every Ray worker
+# via env vars, so the configured backend is used regardless of which
+# deployment initializes the ServerState actor first.
+#   mode: memory | file | redis
+#   file_path: required for `file` mode
+#   redis_url / key_prefix: required for `redis` mode
+persistence_config:
+  mode: file
+  file_path: /tmp/twinkle_state.json
 
 # Applications: each entry defines a service component deployed on the server
 applications:
@@ -26,9 +44,6 @@ applications:
     args:
       server_config:
         per_token_model_limit: 3      # Maximum number of models (adapters) per token (server-globally enforced)
-        persistence_config:
-          mode: file
-          file_path: /tmp/twinkle_state.json
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
