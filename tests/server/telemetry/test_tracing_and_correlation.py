@@ -116,24 +116,6 @@ def _otel_available() -> bool:
     return True
 
 
-@pytest.fixture(scope='module')
-def in_memory_span_exporter():
-    """Module-scoped exporter — set once because OTEL global tracer provider
-    is one-shot per process."""
-    if not _otel_available():
-        pytest.skip('OTEL SDK not installed in test env')
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    yield exporter
-
-
 def test_property_19_span_lifecycle(in_memory_span_exporter) -> None:
     """When OTEL is present, a span is started before and ended after the block."""
     in_memory_span_exporter.clear()
