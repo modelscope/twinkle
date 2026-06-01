@@ -12,6 +12,7 @@ Twinkle DOCUMENTATION
    Usage Guide/Quick-Start.md
    Usage Guide/Installation.md
    Usage Guide/Server and Client/index.rst
+   Usage Guide/Observability.md
    Usage Guide/NPU-Support.md
    Usage Guide/Train-as-a-Service.md
    Usage Guide/Introduction-with-Qwen3.5.md
