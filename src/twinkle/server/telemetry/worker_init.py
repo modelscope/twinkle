@@ -27,7 +27,12 @@ def ensure_telemetry_initialized() -> None:
 
     _worker_initialized = True
 
-    if os.environ.get('TWINKLE_TELEMETRY_ENABLED') != '1':
+    telemetry_enabled = os.environ.get('TWINKLE_TELEMETRY_ENABLED') == '1'
+
+    if not telemetry_enabled:
+        # Even with telemetry disabled, register the resource collector so
+        # graceful-degradation behavior matches the enabled path (R12.2/R18.3).
+        _start_resource_collector()
         return
 
     try:
@@ -47,3 +52,20 @@ def ensure_telemetry_initialized() -> None:
         logger.info(f'Worker telemetry initialized (service={config.service_name}, debug={config.debug})')
     except Exception as e:
         logger.warning(f'Failed to initialize worker telemetry: {e}')
+
+    _start_resource_collector()
+
+
+def _start_resource_collector() -> None:
+    """Start the resource (CPU / Memory / GPU) metrics collector.
+
+    Safe to call even when telemetry init was skipped or failed — the
+    collector picks up the NoOp meter and silently records no observations
+    (R12.2 / R18.3).
+    """
+    try:
+        from twinkle.server.telemetry import resource_metrics
+
+        resource_metrics.get_collector().maybe_start()
+    except Exception as e:
+        logger.debug(f'Resource metrics collector start failed: {e}')
