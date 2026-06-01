@@ -87,6 +87,24 @@ class ServerLauncher:
         import os
         return {k: os.environ[k] for k in self._TELEMETRY_ENV_KEYS if k in os.environ}
 
+    def _build_persistence_env_vars(self) -> dict[str, str]:
+        """Collect persistence env vars from os.environ for propagation to Ray workers.
+
+        These vars are read by ``PersistenceConfig.from_env()`` inside any
+        worker that calls ``get_server_state()`` without an explicit config,
+        which makes the chosen backend independent of deployment startup order.
+        """
+        import os
+        from twinkle.server.state.backend.factory import PERSISTENCE_ENV_KEYS
+        return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
+
+    def _build_propagated_env_vars(self) -> dict[str, str]:
+        """Aggregate all env vars that must reach Ray worker processes."""
+        merged: dict[str, str] = {}
+        merged.update(self._build_telemetry_env_vars())
+        merged.update(self._build_persistence_env_vars())
+        return merged
+
     def _get_builders(self) -> dict[str, Callable]:
         """Get the builder functions for all app types."""
         if self._builders:
@@ -147,11 +165,11 @@ class ServerLauncher:
             # Use runtime_env to apply patches in worker processes
             # This is required because Ray Serve's ProxyActor runs in separate processes
             runtime_env = get_runtime_env_for_patches()
-            # Propagate telemetry env vars to all Ray workers spawned in this job
-            telemetry_env_vars = self._build_telemetry_env_vars()
-            if telemetry_env_vars:
+            # Propagate telemetry + persistence env vars to all Ray workers
+            propagated_env_vars = self._build_propagated_env_vars()
+            if propagated_env_vars:
                 merged_env_vars = dict(runtime_env.get('env_vars') or {})
-                merged_env_vars.update(telemetry_env_vars)
+                merged_env_vars.update(propagated_env_vars)
                 runtime_env['env_vars'] = merged_env_vars
             # Connect to existing cluster if available, otherwise start local instance
             ray.init(
@@ -217,15 +235,17 @@ class ServerLauncher:
             if isinstance(deploy_config, dict):
                 deploy_options = {k: v for k, v in deploy_config.items() if k != 'name'}
 
-        # Inject telemetry env vars into the deployment's runtime_env so that
-        # Ray Serve replicas (worker processes) can initialize telemetry.
-        # User-specified env_vars take precedence to avoid overriding existing config.
-        telemetry_env_vars = self._build_telemetry_env_vars()
-        if telemetry_env_vars:
+        # Inject telemetry + persistence env vars into the deployment's
+        # runtime_env so that Ray Serve replicas (worker processes) can
+        # initialize telemetry and resolve the configured persistence backend
+        # regardless of deployment startup order.
+        # User-specified env_vars take precedence over our defaults.
+        propagated_env_vars = self._build_propagated_env_vars()
+        if propagated_env_vars:
             ray_actor_options = dict(deploy_options.get('ray_actor_options') or {})
             runtime_env = dict(ray_actor_options.get('runtime_env') or {})
             env_vars = dict(runtime_env.get('env_vars') or {})
-            for k, v in telemetry_env_vars.items():
+            for k, v in propagated_env_vars.items():
                 env_vars.setdefault(k, v)
             runtime_env['env_vars'] = env_vars
             ray_actor_options['runtime_env'] = runtime_env
@@ -264,6 +284,18 @@ class ServerLauncher:
             os.environ['TWINKLE_TELEMETRY_SERVICE'] = config.service_name
             os.environ['TWINKLE_TELEMETRY_ENDPOINT'] = config.otlp_endpoint
             os.environ['TWINKLE_TELEMETRY_INTERVAL'] = str(config.export_interval_ms)
+
+        # Export top-level persistence_config to env vars so any worker
+        # (not just Gateway) can build the same backend on first call to
+        # get_server_state().
+        persistence_config_dict = self.config.get('persistence_config')
+        if persistence_config_dict:
+            import os
+            from twinkle.server.state.backend.factory import PersistenceConfig
+            pconfig = PersistenceConfig(**persistence_config_dict)
+            for k, v in pconfig.to_env_vars().items():
+                os.environ[k] = v
+            logger.info(f'Persistence backend configured: mode={pconfig.mode}')
 
         self._init_ray()
         self._start_serve()

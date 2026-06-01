@@ -111,8 +111,12 @@ def build_server_app(deploy_options: dict[str, Any],
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
-    app.middleware('http')(create_metrics_middleware('Gateway'))
+    # Registration order matters: FastAPI runs middleware in LIFO order, so the
+    # last-registered wraps the outermost layer. Tracing first → metrics last
+    # makes metrics the outermost wrapper and capture the full end-to-end
+    # latency including tracing overhead and auth.
     app.middleware('http')(create_tracing_middleware('Gateway'))
+    app.middleware('http')(create_metrics_middleware('Gateway'))
 
     _register_tinker_routes(app, get_self)
     _register_twinkle_routes(app, get_self)

@@ -60,16 +60,15 @@ class _NoopTracer:
 
 
 def create_tracing_middleware(service_component: str):
-    """Create an HTTP tracing middleware that lazily acquires tracer at request time.
+    """Create an HTTP tracing middleware compatible with Ray Serve pickling.
 
-    This approach is compatible with Ray Serve's pickle serialization, unlike
-    ``FastAPIInstrumentor.instrument_app`` which attaches unpicklable references
-    (e.g. ``_thread.lock``) to the FastAPI app and breaks deployment pickling.
+    Unlike ``FastAPIInstrumentor.instrument_app`` which attaches unpicklable
+    references (e.g. ``_thread.lock``) to the FastAPI app and breaks Ray Serve
+    deployment pickling, the returned middleware is a plain async function
+    closing only over the ``service_component`` string.
 
-    The returned middleware is a plain async function with no captured state
-    other than the ``service_component`` string, so it can be safely pickled
-    along with the app when registered via ``app.middleware('http')`` inside a
-    Ray Serve build function.
+    When OpenTelemetry is not installed, returns a passthrough middleware so
+    the server still works without the optional dependency.
 
     Args:
         service_component: Logical service name used as the tracer name suffix
@@ -79,12 +78,12 @@ def create_tracing_middleware(service_component: str):
     Returns:
         An async FastAPI HTTP middleware function.
     """
+    if not _OTEL_AVAILABLE:
+        async def passthrough_middleware(request: Request, call_next):
+            return await call_next(request)
+        return passthrough_middleware
 
     async def tracing_middleware(request: Request, call_next):
-        # Lazy import to avoid holding any unpicklable module-level references
-        # at the time Ray Serve serializes the build function / app.
-        from opentelemetry import trace
-
         tracer = trace.get_tracer(f'twinkle.server.{service_component}')
 
         method = request.method

@@ -135,8 +135,11 @@ def build_processor_app(ncpu_proc_per_node: int,
     async def verify_token(request: Request, call_next):
         return await verify_request_token(request=request, call_next=call_next)
 
-    app.middleware('http')(create_metrics_middleware('Processor'))
+    # Registration order: FastAPI runs middleware LIFO. Tracing first → metrics
+    # last makes metrics the outermost wrapper, so its latency observation
+    # covers the full request path including tracing overhead.
     app.middleware('http')(create_tracing_middleware('Processor'))
+    app.middleware('http')(create_metrics_middleware('Processor'))
 
     def get_self() -> ProcessorManagement:
         return serve.get_replica_context().servable_object
