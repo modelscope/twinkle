@@ -28,6 +28,20 @@ class ModelManager(BaseManager[ModelRecord]):
         # replica_id -> max_loras limit declared at registration time
         self._replica_max_loras: dict[str, int] = {}
 
+    def get_capacity_info(self) -> dict[str, int]:
+        """Return global LoRA capacity across all registered replicas.
+
+        Returns:
+            Dict containing 'max_loras', 'used_loras', and 'free_loras'.
+        """
+        total_max_loras = sum(self._replica_max_loras.values())
+        total_used_loras = sum(len(self._replica_models.get(rid, set())) for rid in self._replica_max_loras.keys())
+        return {
+            'max_loras': total_max_loras,
+            'used_loras': total_used_loras,
+            'free_loras': max(0, total_max_loras - total_used_loras),
+        }
+
     # ----- Replica Registration -----
 
     def register_replica(self, replica_id: str, max_loras: int) -> None:

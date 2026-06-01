@@ -66,12 +66,7 @@ def _apply_conv_activation(x: torch.Tensor, activation) -> torch.Tensor:
 
 
 def _ensure_linear_attention_kernels(mod: torch.nn.Module):
-    if _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None:
-        mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
-        mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
-        return False
-
-    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+    """Bind causal_conv1d_fn and chunk_gated_delta_rule for SP forward."""
 
     def _torch_causal_conv1d_fn(
         *,
@@ -110,6 +105,19 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         out = _apply_conv_activation(out[:, :, :seq_len], activation)
         return out.transpose(1, 2).contiguous()
 
+    # NPU: keep MindSpeed Triton chunk_gated_delta_rule (patched by
+    # monkey_patch_npu), use torch fallback for causal_conv1d to avoid
+    # UB overflow in FLA Triton backward kernels on Ascend NPU.
+    if getattr(mod, '_twinkle_npu_patched', False):
+        mod.causal_conv1d_fn = _torch_causal_conv1d_fn
+        return False
+
+    if _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None:
+        mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
+        mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
+        return False
+
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
     mod.causal_conv1d_fn = _torch_causal_conv1d_fn
     mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
     warnings.warn(_SP_LINEAR_KERNEL_FALLBACK_WARNING, stacklevel=2)
