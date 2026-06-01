@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import ray
 import re
 import time
 import uuid
@@ -73,7 +72,7 @@ class ServerState:
         self._metrics_update_interval: float = float(kwargs.get('metrics_update_interval', 15.0))
 
     async def get_capacity_info(self) -> dict[str, int]:
-        return self._model_mgr.get_capacity_info()
+        return await self._model_mgr.get_capacity_info()
 
     # ----- Session Management -----
 
@@ -171,7 +170,7 @@ class ServerState:
             replica_id: Unique identifier for the replica.
             max_loras: Maximum number of LoRA adapters the replica can hold.
         """
-        self._model_mgr.register_replica(replica_id, max_loras)
+        await self._model_mgr.register_replica(replica_id, max_loras)
 
     async def unregister_replica(self, replica_id: str) -> None:
         """Remove a replica from the registry.
@@ -190,7 +189,7 @@ class ServerState:
         Returns:
             Filtered list of replica IDs with remaining capacity.
         """
-        return self._model_mgr.get_available_replica_ids(candidate_ids)
+        return await self._model_mgr.get_available_replica_ids(candidate_ids)
 
     # ----- Sampling Session Management -----
 
@@ -440,127 +439,21 @@ class ServerState:
 
 
 # ---------------------------------------------------------------------------
-# Ray proxy
+# Direct-backend factory (R19)
 # ---------------------------------------------------------------------------
+#
+# ``ServerStateProxy`` is intentionally retained as a thin alias of
+# ``ServerState`` so call-site type hints (e.g. ``state: ServerStateProxy``)
+# keep working without import churn during this transition. The detached Ray
+# Actor and the per-method ``self._actor.X.remote(...)`` forwarding are gone:
+# every worker now binds a process-local :class:`ServerState` directly to the
+# shared :class:`StateBackend`, and the existing ``await state.X(...)`` call
+# sites awaited a coroutine before and still do.
+
+ServerStateProxy = ServerState  # type: ignore[assignment]
 
 
-class ServerStateProxy:
-    """
-    Proxy for interacting with a ServerState Ray actor.
-
-    Wraps Ray remote calls to provide a synchronous-looking API for
-    interacting with the distributed ServerState actor.
-    """
-
-    def __init__(self, actor_handle) -> None:
-        self._actor = actor_handle
-
-    async def get_capacity_info(self) -> dict[str, int]:
-        return await self._actor.get_capacity_info.remote()
-
-    # ----- Session Management -----
-
-    async def create_session(self, payload: dict[str, Any]) -> str:
-        return await self._actor.create_session.remote(payload)
-
-    async def touch_session(self, session_id: str) -> bool:
-        return await self._actor.touch_session.remote(session_id)
-
-    async def get_session_last_heartbeat(self, session_id: str) -> float | None:
-        return await self._actor.get_session_last_heartbeat.remote(session_id)
-
-    # ----- Model Registration -----
-
-    async def register_model(self,
-                             payload: dict[str, Any],
-                             token: str,
-                             model_id: str | None = None,
-                             replica_id: str | None = None,
-                             session_id: str | None = None) -> str:
-        return await self._actor.register_model.remote(payload, token, model_id, replica_id, session_id)
-
-    async def unload_model(self, model_id: str) -> bool:
-        return await self._actor.unload_model.remote(model_id)
-
-    async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
-        return await self._actor.get_model_metadata.remote(model_id)
-
-    # ----- Replica Management -----
-
-    async def register_replica(self, replica_id: str, max_loras: int) -> None:
-        await self._actor.register_replica.remote(replica_id, max_loras)
-
-    async def unregister_replica(self, replica_id: str) -> None:
-        await self._actor.unregister_replica.remote(replica_id)
-
-    async def get_available_replica_ids(self, candidate_ids: list[str]) -> list[str]:
-        return await self._actor.get_available_replica_ids.remote(candidate_ids)
-
-    # ----- Sampling Session Management -----
-
-    async def create_sampling_session(self, payload: dict[str, Any], sampling_session_id: str | None = None) -> str:
-        return await self._actor.create_sampling_session.remote(payload, sampling_session_id)
-
-    async def get_sampling_session(self, sampling_session_id: str) -> dict[str, Any] | None:
-        return await self._actor.get_sampling_session.remote(sampling_session_id)
-
-    # ----- Configuration Management -----
-
-    async def add_config(self, key: str, value: Any) -> None:
-        await self._actor.add_config.remote(key, value)
-
-    async def add_or_get_config(self, key: str, value: Any) -> Any:
-        return await self._actor.add_or_get_config.remote(key, value)
-
-    async def get_config(self, key: str) -> Any | None:
-        return await self._actor.get_config.remote(key)
-
-    async def pop_config(self, key: str) -> Any | None:
-        return await self._actor.pop_config.remote(key)
-
-    async def clear_config(self) -> None:
-        await self._actor.clear_config.remote()
-
-    async def count_config(self) -> int:
-        return await self._actor.count_config.remote()
-
-    # ----- Future Management -----
-
-    async def get_future(self, request_id: str) -> dict[str, Any] | None:
-        return await self._actor.get_future.remote(request_id)
-
-    async def store_future_status(
-        self,
-        request_id: str,
-        status: str,
-        model_id: str | None,
-        reason: str | None = None,
-        result: Any = None,
-        queue_state: str | None = None,
-        queue_state_reason: str | None = None,
-    ) -> None:
-        """Store task status with optional result."""
-        await self._actor.store_future_status.remote(request_id, status, model_id, reason, result, queue_state,
-                                                     queue_state_reason)
-
-    # ----- Resource Cleanup -----
-
-    async def cleanup_expired_resources(self) -> dict[str, int]:
-        return await self._actor.cleanup_expired_resources.remote()
-
-    async def start_cleanup_task(self) -> bool:
-        return await self._actor.start_cleanup_task.remote()
-
-    async def stop_cleanup_task(self) -> bool:
-        return await self._actor.stop_cleanup_task.remote()
-
-    async def get_cleanup_stats(self) -> dict[str, Any]:
-        return await self._actor.get_cleanup_stats.remote()
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+_PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 
 
 def get_server_state(
@@ -569,55 +462,71 @@ def get_server_state(
         persistence_config: PersistenceConfig | None = None,
         signature_config: dict[str, Any] | None = None,
         signature_policy: str = 'warn',
-        **kwargs) -> ServerStateProxy:
-    """Get or create the ServerState Ray actor.
+        **kwargs) -> ServerState:
+    """Return a process-local :class:`ServerState` bound directly to the backend.
 
-    Ensures only one ServerState actor exists with the given name.  Uses a
-    detached actor so the state persists across driver restarts.
+    No detached Ray Actor is created — every deployment / worker accesses the
+    shared persistence backend directly, which removes the actor as a
+    single-point bottleneck (R19.1, R19.2). Within one process the same
+    ``actor_name`` is cached so repeated callers share one ``ServerState``
+    instance and the cleanup loop is started exactly once.
 
     Args:
-        actor_name: Name for the Ray actor (default: 'twinkle_server_state').
-        backend: Optional :class:`StateBackend` injected into the ServerState
-            actor.  When ``None`` the actor falls back to ``persistence_config``
-            or an in-process :class:`MemoryBackend`.
-        persistence_config: Optional :class:`PersistenceConfig` used to build
-            a backend via :func:`create_backend` when ``backend`` is None.
-        **kwargs: Additional keyword arguments passed to ServerState constructor
-            (e.g., expiration_timeout, cleanup_interval).
-
-    Returns:
-        A ServerStateProxy for interacting with the actor.
+        actor_name: Cache key for the per-process ``ServerState`` instance.
+            The legacy parameter name is kept for call-site compatibility.
+        backend: Optional :class:`StateBackend` to inject. When ``None`` a
+            backend is built from ``persistence_config`` (or env vars) via
+            :func:`create_backend`.
+        persistence_config: Optional :class:`PersistenceConfig`. Accepted as a
+            raw dict for YAML compatibility.
+        signature_config: Optional dict whose hash is validated against the
+            stored config signature on first access.
+        signature_policy: ``warn`` | ``error`` | ``ignore`` for signature drift.
+        **kwargs: Forwarded to the :class:`ServerState` constructor
+            (``expiration_timeout``, ``cleanup_interval``, ...).
     """
-    # Support passing persistence_config as raw dict from YAML
     if isinstance(persistence_config, dict):
         persistence_config = PersistenceConfig(**persistence_config)
 
-    # Fall back to env-var-propagated config so any worker (not just Gateway)
-    # can create the actor with the right backend regardless of deployment
-    # startup order. Explicit args still take precedence.
     if backend is None and persistence_config is None:
         persistence_config = PersistenceConfig.from_env()
 
+    cached = _PROCESS_STATE_CACHE.get(actor_name)
+    if cached is not None:
+        return cached
+
+    state = ServerState(
+        backend=backend,
+        persistence_config=persistence_config,
+        signature_config=signature_config,
+        signature_policy=signature_policy,
+        **kwargs,
+    )
+    _PROCESS_STATE_CACHE[actor_name] = state
+
+    # Start the cleanup loop best-effort. The loop runs inside an asyncio task,
+    # so ``start_cleanup_task`` must be awaited from within a running loop.
+    # Schedule it lazily — when there's no running loop yet (sync constructor
+    # path), skip and let the first awaited handler call start it later.
     try:
-        actor = ray.get_actor(actor_name)
-    except ValueError:
-        try:
-            _ServerState = ray.remote(ServerState)
-            actor = _ServerState.options(name=actor_name, lifetime='detached').remote(
-                backend=backend,
-                persistence_config=persistence_config,
-                signature_config=signature_config,
-                signature_policy=signature_policy,
-                **kwargs)
-            try:
-                ray.get(actor.start_cleanup_task.remote())
-            except Exception as e:
-                # Ray wraps remote exceptions - check cause
-                cause = e.__cause__ if hasattr(e, '__cause__') and e.__cause__ else e
-                if isinstance(cause, ConfigMismatchError) or 'ConfigMismatchError' in type(e).__name__:
-                    raise
-                logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
-        except ValueError:
-            actor = ray.get_actor(actor_name)
-    assert actor is not None
-    return ServerStateProxy(actor)
+        loop = asyncio.get_running_loop()
+        loop.create_task(state.start_cleanup_task())
+    except RuntimeError:
+        # No running loop — handler bodies will start the loop on first await.
+        pass
+    except Exception as e:
+        cause = e.__cause__ if hasattr(e, '__cause__') and e.__cause__ else e
+        if isinstance(cause, ConfigMismatchError) or 'ConfigMismatchError' in type(e).__name__:
+            raise
+        logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
+
+    return state
+
+
+def reset_server_state_cache() -> None:
+    """Clear the per-process ServerState cache.
+
+    Test-only helper. Production code should never need to reset state across
+    requests — workers reuse one instance for the lifetime of the process.
+    """
+    _PROCESS_STATE_CACHE.clear()
