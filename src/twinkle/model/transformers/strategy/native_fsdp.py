@@ -856,7 +856,8 @@ def _broadcast_sharded_state_dict(
     rank, _, local_source_rank, local_ranks = _get_local_rank_info()
     is_rank0 = (rank == 0)
     is_source_rank = rank == local_source_rank
-    local_group = dist.new_group(ranks=local_ranks)
+    use_local_broadcast = Platform.device_backend() != 'hccl'
+    local_group = dist.new_group(ranks=local_ranks) if use_local_broadcast else None
     expert_shard_specs = expert_shard_specs or {}
     rank_to_ep_rank = rank_to_ep_rank or {}
     adapter_source_sd = adapter_source_sd or {}
@@ -886,7 +887,17 @@ def _broadcast_sharded_state_dict(
         if is_source_rank:
             if full_tensor is None:
                 raise RuntimeError(f'Local source rank {local_source_rank} does not have full state_dict tensor.')
-        dist.broadcast(full_tensor, src=local_source_rank, group=local_group)
+        if use_local_broadcast:
+            dist.broadcast(full_tensor, src=local_source_rank, group=local_group)
+            return full_tensor
+
+        if is_source_rank:
+            for target_rank in local_ranks:
+                if target_rank == rank:
+                    continue
+                dist.send(full_tensor, dst=target_rank)
+        else:
+            dist.recv(full_tensor, src=local_source_rank)
         return full_tensor
 
     def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
