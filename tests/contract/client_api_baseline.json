@@ -1,0 +1,7340 @@
+{
+  "gateway": {
+    "paths": {
+      "/asample": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SampleRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Asample Asample Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/create_model": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateModelRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Create Model Create Model Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/create_sampling_session": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSamplingSessionRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CreateSamplingSessionResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/create_session": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/tinker__types__create_session_request__CreateSessionRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__create_session_response__CreateSessionResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/forward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Forward Forward Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/forward_backward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardBackwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Forward Backward Forward Backward Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/get_info": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetInfoRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Get Info Get Info Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/get_server_capabilities": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__get_server_capabilities_response__GetServerCapabilitiesResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/healthz": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__health_response__HealthResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/load_weights": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadWeightsRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Load Weights Load Weights Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/optim_step": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OptimStepRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Optim Step Optim Step Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/retrieve_future": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FutureRetrieveRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Retrieve Future Retrieve Future Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/save_weights": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveWeightsRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Save Weights Save Weights Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/save_weights_for_sampler": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveWeightsForSamplerRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Save Weights For Sampler Save Weights For Sampler Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/session_heartbeat": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/tinker__types__session_heartbeat_request__SessionHeartbeatRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__session_heartbeat_response__SessionHeartbeatResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/telemetry": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetrySendRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/TelemetryResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/training_runs": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 20,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__training_runs_response__TrainingRunsResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/training_runs/{run_id}": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__training_run__TrainingRun"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/training_runs/{run_id}/checkpoints": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__checkpoints_list_response__CheckpointsListResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+        "DELETE": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Delete Run Checkpoint Training Runs  Run Id  Checkpoints  Checkpoint Id  Delete"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}/publish": {
+        "POST": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/capacity_info": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CapacityInfoResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/twinkle/checkpoint_path/{run_id}/{checkpoint_id}": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CheckpointPathResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/create_session": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/twinkle_client__types__session__CreateSessionRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__session__CreateSessionResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/get_server_capabilities": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__server__GetServerCapabilitiesResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/twinkle/healthz": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__server__HealthResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/twinkle/session_heartbeat": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/twinkle_client__types__session__SessionHeartbeatRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__session__SessionHeartbeatResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/status": {
+        "GET": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "additionalProperties": true,
+                    "title": "Response Status Twinkle Status Get",
+                    "type": "object"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/twinkle/training_runs": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 20,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__training__TrainingRunsResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/training_runs/{run_id}": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__training__TrainingRun"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/training_runs/{run_id}/checkpoints": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__training__CheckpointsListResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+        "DELETE": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/DeleteCheckpointResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/weights_info": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeightsInfoRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/twinkle_client__types__training__WeightsInfoResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/unload_model": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnloadModelRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "title": "Response Unload Model Unload Model Post"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/weights_info": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Body",
+                  "type": "object"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/tinker__types__weights_info_response__WeightsInfoResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AdamParams": {
+        "additionalProperties": false,
+        "properties": {
+          "beta1": {
+            "default": 0.9,
+            "title": "Beta1",
+            "type": "number"
+          },
+          "beta2": {
+            "default": 0.95,
+            "title": "Beta2",
+            "type": "number"
+          },
+          "eps": {
+            "default": 1e-12,
+            "title": "Eps",
+            "type": "number"
+          },
+          "grad_clip_norm": {
+            "default": 0.0,
+            "title": "Grad Clip Norm",
+            "type": "number"
+          },
+          "learning_rate": {
+            "default": 0.0001,
+            "title": "Learning Rate",
+            "type": "number"
+          },
+          "weight_decay": {
+            "default": 0.0,
+            "title": "Weight Decay",
+            "type": "number"
+          }
+        },
+        "title": "AdamParams",
+        "type": "object"
+      },
+      "CapacityInfoResponse": {
+        "description": "Response body for the /capacity_info endpoint.",
+        "properties": {
+          "free_loras": {
+            "title": "Free Loras",
+            "type": "integer"
+          },
+          "max_loras": {
+            "title": "Max Loras",
+            "type": "integer"
+          },
+          "used_loras": {
+            "title": "Used Loras",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_loras",
+          "used_loras",
+          "free_loras"
+        ],
+        "title": "CapacityInfoResponse",
+        "type": "object"
+      },
+      "CheckpointPathResponse": {
+        "description": "Response body for the /checkpoint_path endpoint.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "twinkle_path": {
+            "title": "Twinkle Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "twinkle_path"
+        ],
+        "title": "CheckpointPathResponse",
+        "type": "object"
+      },
+      "CreateModelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "lora_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LoraConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_seq_id": {
+            "title": "Model Seq Id",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "create_model",
+            "default": "create_model",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "session_id",
+          "model_seq_id",
+          "base_model"
+        ],
+        "title": "CreateModelRequest",
+        "type": "object"
+      },
+      "CreateSamplingSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Model"
+          },
+          "model_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Path"
+          },
+          "sampling_session_seq_id": {
+            "title": "Sampling Session Seq Id",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "create_sampling_session",
+            "default": "create_sampling_session",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "sampling_session_seq_id"
+        ],
+        "title": "CreateSamplingSessionRequest",
+        "type": "object"
+      },
+      "CreateSamplingSessionResponse": {
+        "properties": {
+          "sampling_session_id": {
+            "title": "Sampling Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "create_sampling_session",
+            "default": "create_sampling_session",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sampling_session_id"
+        ],
+        "title": "CreateSamplingSessionResponse",
+        "type": "object"
+      },
+      "Datum": {
+        "additionalProperties": false,
+        "properties": {
+          "loss_fn_inputs": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TensorData"
+            },
+            "title": "Loss Fn Inputs",
+            "type": "object"
+          },
+          "model_input": {
+            "$ref": "#/components/schemas/ModelInput"
+          }
+        },
+        "required": [
+          "loss_fn_inputs",
+          "model_input"
+        ],
+        "title": "Datum",
+        "type": "object"
+      },
+      "DeleteCheckpointResponse": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "message"
+        ],
+        "title": "DeleteCheckpointResponse",
+        "type": "object"
+      },
+      "EncodedTextChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Tokens",
+            "type": "array"
+          },
+          "type": {
+            "const": "encoded_text",
+            "default": "encoded_text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tokens"
+        ],
+        "title": "EncodedTextChunk",
+        "type": "object"
+      },
+      "ForwardBackwardInput": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Datum"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "loss_fn": {
+            "enum": [
+              "cross_entropy",
+              "importance_sampling",
+              "ppo",
+              "cispo",
+              "dro"
+            ],
+            "title": "Loss Fn",
+            "type": "string"
+          },
+          "loss_fn_config": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loss Fn Config"
+          }
+        },
+        "required": [
+          "data",
+          "loss_fn"
+        ],
+        "title": "ForwardBackwardInput",
+        "type": "object"
+      },
+      "ForwardBackwardRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "forward_backward_input": {
+            "$ref": "#/components/schemas/ForwardBackwardInput"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          }
+        },
+        "required": [
+          "forward_backward_input",
+          "model_id"
+        ],
+        "title": "ForwardBackwardRequest",
+        "type": "object"
+      },
+      "ForwardRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "forward_input": {
+            "$ref": "#/components/schemas/ForwardBackwardInput"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          }
+        },
+        "required": [
+          "forward_input",
+          "model_id"
+        ],
+        "title": "ForwardRequest",
+        "type": "object"
+      },
+      "FutureRetrieveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_metadata_only": {
+            "default": false,
+            "title": "Allow Metadata Only",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "FutureRetrieveRequest",
+        "type": "object"
+      },
+      "GenericEvent": {
+        "properties": {
+          "event": {
+            "enum": [
+              "SESSION_START",
+              "SESSION_END",
+              "UNHANDLED_EXCEPTION",
+              "GENERIC_EVENT"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "event_data": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Event Data",
+            "type": "object"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_name": {
+            "title": "Event Name",
+            "type": "string"
+          },
+          "event_session_index": {
+            "title": "Event Session Index",
+            "type": "integer"
+          },
+          "severity": {
+            "enum": [
+              "DEBUG",
+              "INFO",
+              "WARNING",
+              "ERROR",
+              "CRITICAL"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "event_id",
+          "event_name",
+          "event_session_index",
+          "severity",
+          "timestamp"
+        ],
+        "title": "GenericEvent",
+        "type": "object"
+      },
+      "GetInfoRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "get_info",
+            "default": "get_info",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "GetInfoRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ImageAssetPointerChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "type": {
+            "const": "image_asset_pointer",
+            "default": "image_asset_pointer",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "location"
+        ],
+        "title": "ImageAssetPointerChunk",
+        "type": "object"
+      },
+      "ImageChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "contentMediaType": "application/octet-stream",
+            "title": "Data",
+            "type": "string"
+          },
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "type": {
+            "const": "image",
+            "default": "image",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data",
+          "format"
+        ],
+        "title": "ImageChunk",
+        "type": "object"
+      },
+      "LoadWeightsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "optimizer": {
+            "title": "Optimizer",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "type": {
+            "const": "load_weights",
+            "default": "load_weights",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id",
+          "path",
+          "optimizer"
+        ],
+        "title": "LoadWeightsRequest",
+        "type": "object"
+      },
+      "LoraConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "rank": {
+            "title": "Rank",
+            "type": "integer"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "train_attn": {
+            "default": true,
+            "title": "Train Attn",
+            "type": "boolean"
+          },
+          "train_mlp": {
+            "default": true,
+            "title": "Train Mlp",
+            "type": "boolean"
+          },
+          "train_unembed": {
+            "default": true,
+            "title": "Train Unembed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "rank"
+        ],
+        "title": "LoraConfig",
+        "type": "object"
+      },
+      "ModelInput": {
+        "additionalProperties": false,
+        "properties": {
+          "chunks": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EncodedTextChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageAssetPointerChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageChunk"
+                }
+              ]
+            },
+            "title": "Chunks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chunks"
+        ],
+        "title": "ModelInput",
+        "type": "object"
+      },
+      "OptimStepRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "adam_params": {
+            "$ref": "#/components/schemas/AdamParams"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "type": {
+            "const": "optim_step",
+            "default": "optim_step",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adam_params",
+          "model_id"
+        ],
+        "title": "OptimStepRequest",
+        "type": "object"
+      },
+      "SampleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Model"
+          },
+          "model_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Path"
+          },
+          "num_samples": {
+            "default": 1,
+            "title": "Num Samples",
+            "type": "integer"
+          },
+          "prompt": {
+            "$ref": "#/components/schemas/ModelInput"
+          },
+          "prompt_logprobs": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt Logprobs"
+          },
+          "sampling_params": {
+            "$ref": "#/components/schemas/SamplingParams"
+          },
+          "sampling_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampling Session Id"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "topk_prompt_logprobs": {
+            "default": 0,
+            "title": "Topk Prompt Logprobs",
+            "type": "integer"
+          },
+          "type": {
+            "const": "sample",
+            "default": "sample",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "sampling_params"
+        ],
+        "title": "SampleRequest",
+        "type": "object"
+      },
+      "SamplingParams": {
+        "properties": {
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop"
+          },
+          "temperature": {
+            "default": 1,
+            "title": "Temperature",
+            "type": "number"
+          },
+          "top_k": {
+            "default": -1,
+            "title": "Top K",
+            "type": "integer"
+          },
+          "top_p": {
+            "default": 1,
+            "title": "Top P",
+            "type": "number"
+          }
+        },
+        "title": "SamplingParams",
+        "type": "object"
+      },
+      "SaveWeightsForSamplerRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "sampling_session_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampling Session Seq Id"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Seconds"
+          },
+          "type": {
+            "const": "save_weights_for_sampler",
+            "default": "save_weights_for_sampler",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "SaveWeightsForSamplerRequest",
+        "type": "object"
+      },
+      "SaveWeightsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Seconds"
+          },
+          "type": {
+            "const": "save_weights",
+            "default": "save_weights",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "SaveWeightsRequest",
+        "type": "object"
+      },
+      "SessionEndEvent": {
+        "properties": {
+          "duration": {
+            "title": "Duration",
+            "type": "string"
+          },
+          "event": {
+            "enum": [
+              "SESSION_START",
+              "SESSION_END",
+              "UNHANDLED_EXCEPTION",
+              "GENERIC_EVENT"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_session_index": {
+            "title": "Event Session Index",
+            "type": "integer"
+          },
+          "severity": {
+            "enum": [
+              "DEBUG",
+              "INFO",
+              "WARNING",
+              "ERROR",
+              "CRITICAL"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "duration",
+          "event",
+          "event_id",
+          "event_session_index",
+          "severity",
+          "timestamp"
+        ],
+        "title": "SessionEndEvent",
+        "type": "object"
+      },
+      "SessionStartEvent": {
+        "properties": {
+          "event": {
+            "enum": [
+              "SESSION_START",
+              "SESSION_END",
+              "UNHANDLED_EXCEPTION",
+              "GENERIC_EVENT"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_session_index": {
+            "title": "Event Session Index",
+            "type": "integer"
+          },
+          "severity": {
+            "enum": [
+              "DEBUG",
+              "INFO",
+              "WARNING",
+              "ERROR",
+              "CRITICAL"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "event_id",
+          "event_session_index",
+          "severity",
+          "timestamp"
+        ],
+        "title": "SessionStartEvent",
+        "type": "object"
+      },
+      "TelemetryResponse": {
+        "properties": {
+          "status": {
+            "const": "accepted",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "TelemetryResponse",
+        "type": "object"
+      },
+      "TelemetrySendRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionStartEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/SessionEndEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/UnhandledExceptionEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/GenericEvent"
+                }
+              ]
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "platform": {
+            "title": "Platform",
+            "type": "string"
+          },
+          "sdk_version": {
+            "title": "Sdk Version",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "events",
+          "platform",
+          "sdk_version",
+          "session_id"
+        ],
+        "title": "TelemetrySendRequest",
+        "type": "object"
+      },
+      "TensorData": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Data"
+          },
+          "dtype": {
+            "enum": [
+              "int64",
+              "float32"
+            ],
+            "title": "Dtype",
+            "type": "string"
+          },
+          "shape": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shape"
+          }
+        },
+        "required": [
+          "data",
+          "dtype"
+        ],
+        "title": "TensorData",
+        "type": "object"
+      },
+      "UnhandledExceptionEvent": {
+        "properties": {
+          "error_message": {
+            "title": "Error Message",
+            "type": "string"
+          },
+          "error_type": {
+            "title": "Error Type",
+            "type": "string"
+          },
+          "event": {
+            "enum": [
+              "SESSION_START",
+              "SESSION_END",
+              "UNHANDLED_EXCEPTION",
+              "GENERIC_EVENT"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_session_index": {
+            "title": "Event Session Index",
+            "type": "integer"
+          },
+          "severity": {
+            "enum": [
+              "DEBUG",
+              "INFO",
+              "WARNING",
+              "ERROR",
+              "CRITICAL"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "traceback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Traceback"
+          }
+        },
+        "required": [
+          "error_message",
+          "error_type",
+          "event",
+          "event_id",
+          "event_session_index",
+          "severity",
+          "timestamp"
+        ],
+        "title": "UnhandledExceptionEvent",
+        "type": "object"
+      },
+      "UnloadModelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "unload_model",
+            "default": "unload_model",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "UnloadModelRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WeightsInfoRequest": {
+        "properties": {
+          "twinkle_path": {
+            "title": "Twinkle Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "twinkle_path"
+        ],
+        "title": "WeightsInfoRequest",
+        "type": "object"
+      },
+      "tinker__types__checkpoint__Checkpoint": {
+        "properties": {
+          "checkpoint_id": {
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "checkpoint_type": {
+            "enum": [
+              "training",
+              "sampler"
+            ],
+            "title": "Checkpoint Type",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          },
+          "time": {
+            "format": "date-time",
+            "title": "Time",
+            "type": "string"
+          },
+          "tinker_path": {
+            "title": "Tinker Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "checkpoint_type",
+          "time",
+          "tinker_path"
+        ],
+        "title": "Checkpoint",
+        "type": "object"
+      },
+      "tinker__types__checkpoints_list_response__CheckpointsListResponse": {
+        "properties": {
+          "checkpoints": {
+            "items": {
+              "$ref": "#/components/schemas/tinker__types__checkpoint__Checkpoint"
+            },
+            "title": "Checkpoints",
+            "type": "array"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/tinker__types__cursor__Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "checkpoints"
+        ],
+        "title": "CheckpointsListResponse",
+        "type": "object"
+      },
+      "tinker__types__create_session_request__CreateSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "sdk_version": {
+            "title": "Sdk Version",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "type": {
+            "const": "create_session",
+            "default": "create_session",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "tags",
+          "user_metadata",
+          "sdk_version"
+        ],
+        "title": "CreateSessionRequest",
+        "type": "object"
+      },
+      "tinker__types__create_session_response__CreateSessionResponse": {
+        "properties": {
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "info_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Info Message"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "create_session",
+            "default": "create_session",
+            "title": "Type",
+            "type": "string"
+          },
+          "warning_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning Message"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "CreateSessionResponse",
+        "type": "object"
+      },
+      "tinker__types__cursor__Cursor": {
+        "properties": {
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "total_count": {
+            "title": "Total Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "offset",
+          "limit",
+          "total_count"
+        ],
+        "title": "Cursor",
+        "type": "object"
+      },
+      "tinker__types__get_server_capabilities_response__GetServerCapabilitiesResponse": {
+        "description": "Response containing the server's supported models and capabilities.",
+        "properties": {
+          "supported_models": {
+            "items": {
+              "$ref": "#/components/schemas/tinker__types__get_server_capabilities_response__SupportedModel"
+            },
+            "title": "Supported Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "supported_models"
+        ],
+        "title": "GetServerCapabilitiesResponse",
+        "type": "object"
+      },
+      "tinker__types__get_server_capabilities_response__SupportedModel": {
+        "description": "Information about a model supported by the server.",
+        "properties": {
+          "model_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Name"
+          }
+        },
+        "title": "SupportedModel",
+        "type": "object"
+      },
+      "tinker__types__health_response__HealthResponse": {
+        "properties": {
+          "status": {
+            "const": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "tinker__types__session_heartbeat_request__SessionHeartbeatRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "session_heartbeat",
+            "default": "session_heartbeat",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionHeartbeatRequest",
+        "type": "object"
+      },
+      "tinker__types__session_heartbeat_response__SessionHeartbeatResponse": {
+        "properties": {
+          "type": {
+            "const": "session_heartbeat",
+            "default": "session_heartbeat",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "title": "SessionHeartbeatResponse",
+        "type": "object"
+      },
+      "tinker__types__training_run__TrainingRun": {
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "corrupted": {
+            "default": false,
+            "title": "Corrupted",
+            "type": "boolean"
+          },
+          "is_lora": {
+            "title": "Is Lora",
+            "type": "boolean"
+          },
+          "last_checkpoint": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/tinker__types__checkpoint__Checkpoint"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_request_time": {
+            "format": "date-time",
+            "title": "Last Request Time",
+            "type": "string"
+          },
+          "last_sampler_checkpoint": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/tinker__types__checkpoint__Checkpoint"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "model_owner": {
+            "title": "Model Owner",
+            "type": "string"
+          },
+          "training_run_id": {
+            "title": "Training Run Id",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "training_run_id",
+          "base_model",
+          "model_owner",
+          "is_lora",
+          "last_request_time"
+        ],
+        "title": "TrainingRun",
+        "type": "object"
+      },
+      "tinker__types__training_runs_response__TrainingRunsResponse": {
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/tinker__types__cursor__Cursor"
+          },
+          "training_runs": {
+            "items": {
+              "$ref": "#/components/schemas/tinker__types__training_run__TrainingRun"
+            },
+            "title": "Training Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "training_runs",
+          "cursor"
+        ],
+        "title": "TrainingRunsResponse",
+        "type": "object"
+      },
+      "tinker__types__weights_info_response__WeightsInfoResponse": {
+        "description": "Minimal information for loading public checkpoints.",
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "is_lora": {
+            "title": "Is Lora",
+            "type": "boolean"
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "train_attn": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Attn"
+          },
+          "train_mlp": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Mlp"
+          },
+          "train_unembed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Unembed"
+          }
+        },
+        "required": [
+          "base_model",
+          "is_lora"
+        ],
+        "title": "WeightsInfoResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__server__GetServerCapabilitiesResponse": {
+        "description": "Response body for the /get_server_capabilities endpoint.",
+        "properties": {
+          "supported_models": {
+            "items": {
+              "$ref": "#/components/schemas/twinkle_client__types__server__SupportedModel"
+            },
+            "title": "Supported Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "supported_models"
+        ],
+        "title": "GetServerCapabilitiesResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__server__HealthResponse": {
+        "properties": {
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__server__SupportedModel": {
+        "description": "Information about a supported model.",
+        "properties": {
+          "model_name": {
+            "title": "Model Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_name"
+        ],
+        "title": "SupportedModel",
+        "type": "object"
+      },
+      "twinkle_client__types__session__CreateSessionRequest": {
+        "description": "Request body for POST /twinkle/create_session.",
+        "properties": {
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "title": "CreateSessionRequest",
+        "type": "object"
+      },
+      "twinkle_client__types__session__CreateSessionResponse": {
+        "description": "Response body for POST /twinkle/create_session.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "CreateSessionResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__session__SessionHeartbeatRequest": {
+        "description": "Request body for POST /twinkle/session_heartbeat.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionHeartbeatRequest",
+        "type": "object"
+      },
+      "twinkle_client__types__session__SessionHeartbeatResponse": {
+        "description": "Response body for POST /twinkle/session_heartbeat.",
+        "properties": {},
+        "title": "SessionHeartbeatResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__training__Checkpoint": {
+        "description": "Twinkle checkpoint model.",
+        "properties": {
+          "base_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Model"
+          },
+          "checkpoint_id": {
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "checkpoint_type": {
+            "title": "Checkpoint Type",
+            "type": "string"
+          },
+          "is_lora": {
+            "default": false,
+            "title": "Is Lora",
+            "type": "boolean"
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "time": {
+            "format": "date-time",
+            "title": "Time",
+            "type": "string"
+          },
+          "train_attn": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Attn"
+          },
+          "train_mlp": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Mlp"
+          },
+          "train_unembed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Train Unembed"
+          },
+          "twinkle_path": {
+            "title": "Twinkle Path",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "checkpoint_type",
+          "time",
+          "size_bytes",
+          "twinkle_path"
+        ],
+        "title": "Checkpoint",
+        "type": "object"
+      },
+      "twinkle_client__types__training__CheckpointsListResponse": {
+        "properties": {
+          "checkpoints": {
+            "items": {
+              "$ref": "#/components/schemas/twinkle_client__types__training__Checkpoint"
+            },
+            "title": "Checkpoints",
+            "type": "array"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/twinkle_client__types__training__Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "checkpoints"
+        ],
+        "title": "CheckpointsListResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__training__Cursor": {
+        "properties": {
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "total_count": {
+            "title": "Total Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "limit",
+          "offset",
+          "total_count"
+        ],
+        "title": "Cursor",
+        "type": "object"
+      },
+      "twinkle_client__types__training__TrainingRun": {
+        "description": "Twinkle training run model.",
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "corrupted": {
+            "default": false,
+            "title": "Corrupted",
+            "type": "boolean"
+          },
+          "is_lora": {
+            "default": false,
+            "title": "Is Lora",
+            "type": "boolean"
+          },
+          "last_checkpoint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Checkpoint"
+          },
+          "last_request_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Request Time"
+          },
+          "last_sampler_checkpoint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Sampler Checkpoint"
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "model_owner": {
+            "title": "Model Owner",
+            "type": "string"
+          },
+          "save_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Save Dir"
+          },
+          "training_run_id": {
+            "title": "Training Run Id",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "training_run_id",
+          "base_model",
+          "model_owner"
+        ],
+        "title": "TrainingRun",
+        "type": "object"
+      },
+      "twinkle_client__types__training__TrainingRunsResponse": {
+        "properties": {
+          "cursor": {
+            "$ref": "#/components/schemas/twinkle_client__types__training__Cursor"
+          },
+          "training_runs": {
+            "items": {
+              "$ref": "#/components/schemas/twinkle_client__types__training__TrainingRun"
+            },
+            "title": "Training Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "training_runs",
+          "cursor"
+        ],
+        "title": "TrainingRunsResponse",
+        "type": "object"
+      },
+      "twinkle_client__types__training__WeightsInfoResponse": {
+        "description": "Twinkle weights info response.",
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "is_lora": {
+            "default": false,
+            "title": "Is Lora",
+            "type": "boolean"
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "model_owner": {
+            "title": "Model Owner",
+            "type": "string"
+          },
+          "training_run_id": {
+            "title": "Training Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "training_run_id",
+          "base_model",
+          "model_owner"
+        ],
+        "title": "WeightsInfoResponse",
+        "type": "object"
+      }
+    }
+  },
+  "model": {
+    "paths": {
+      "/tinker/create_model": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateModelRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/forward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/tinker__types__forward_request__ForwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/forward_backward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardBackwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/get_info": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetInfoRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/GetInfoResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/load_weights": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadWeightsRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/optim_step": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OptimStepRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/save_weights": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveWeightsRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/save_weights_for_sampler": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveWeightsForSamplerRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/tinker/unload_model": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnloadModelRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/add_adapter_to_model": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddAdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AddAdapterResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/add_metric": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddMetricRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/apply_patch": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyPatchRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/backward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/calculate_loss": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CalculateLossResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/calculate_metric": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalculateMetricRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CalculateMetricResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/clip_grad_and_step": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipGradAndStepRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/clip_grad_norm": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ClipGradNormResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CreateResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/forward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/twinkle_client__types__model__ForwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ForwardResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/forward_backward": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/twinkle_client__types__model__ForwardRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ForwardBackwardResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/forward_only": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardOnlyRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ForwardResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/get_state_dict": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetStateDictRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/GetStateDictResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/get_train_configs": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/GetTrainConfigsResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/load": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/lr_step": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/resume_from_checkpoint": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResumeFromCheckpointRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/TrainingProgressResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/save": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SaveResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_loss": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetLossRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_lr_scheduler": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetLrSchedulerRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_optimizer": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetOptimizerRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_processor": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetProcessorRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_template": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetTemplateRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/step": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/upload_status/{request_id}": {
+        "GET": {
+          "parameters": [
+            {
+              "in": "path",
+              "name": "request_id",
+              "required": true,
+              "schema": {
+                "title": "Request Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UploadStatusResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/upload_to_hub": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadToHubRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UploadToHubResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/zero_grad": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AdamParams": {
+        "additionalProperties": false,
+        "properties": {
+          "beta1": {
+            "default": 0.9,
+            "title": "Beta1",
+            "type": "number"
+          },
+          "beta2": {
+            "default": 0.95,
+            "title": "Beta2",
+            "type": "number"
+          },
+          "eps": {
+            "default": 1e-12,
+            "title": "Eps",
+            "type": "number"
+          },
+          "grad_clip_norm": {
+            "default": 0.0,
+            "title": "Grad Clip Norm",
+            "type": "number"
+          },
+          "learning_rate": {
+            "default": 0.0001,
+            "title": "Learning Rate",
+            "type": "number"
+          },
+          "weight_decay": {
+            "default": 0.0,
+            "title": "Weight Decay",
+            "type": "number"
+          }
+        },
+        "title": "AdamParams",
+        "type": "object"
+      },
+      "AdapterRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "AdapterRequest",
+        "type": "object"
+      },
+      "AddAdapterRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "config": {
+            "title": "Config",
+            "type": "string"
+          },
+          "save_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Save Dir"
+          }
+        },
+        "required": [
+          "adapter_name",
+          "config"
+        ],
+        "title": "AddAdapterRequest",
+        "type": "object"
+      },
+      "AddAdapterResponse": {
+        "description": "Response body for the /add_adapter_to_sampler endpoint.",
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "AddAdapterResponse",
+        "type": "object"
+      },
+      "AddMetricRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "is_training": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Training"
+          },
+          "metric_cls": {
+            "title": "Metric Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric_cls",
+          "adapter_name"
+        ],
+        "title": "AddMetricRequest",
+        "type": "object"
+      },
+      "ApplyPatchRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "patch_cls": {
+            "title": "Patch Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch_cls",
+          "adapter_name"
+        ],
+        "title": "ApplyPatchRequest",
+        "type": "object"
+      },
+      "CalculateLossResponse": {
+        "description": "Response for /calculate_loss endpoint (returns float).",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "number"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "CalculateLossResponse",
+        "type": "object"
+      },
+      "CalculateMetricRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "is_training": {
+            "default": true,
+            "title": "Is Training",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "CalculateMetricRequest",
+        "type": "object"
+      },
+      "CalculateMetricResponse": {
+        "description": "Response for /calculate_metric endpoint (returns Dict).",
+        "properties": {
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "CalculateMetricResponse",
+        "type": "object"
+      },
+      "ClipGradAndStepRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "max_grad_norm": {
+            "default": 1.0,
+            "title": "Max Grad Norm",
+            "type": "number"
+          },
+          "norm_type": {
+            "default": 2,
+            "title": "Norm Type",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "ClipGradAndStepRequest",
+        "type": "object"
+      },
+      "ClipGradNormResponse": {
+        "description": "Response for /clip_grad_norm endpoint (returns float as str).",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "ClipGradNormResponse",
+        "type": "object"
+      },
+      "CreateModelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_model": {
+            "title": "Base Model",
+            "type": "string"
+          },
+          "lora_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LoraConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_seq_id": {
+            "title": "Model Seq Id",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "create_model",
+            "default": "create_model",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Metadata"
+          }
+        },
+        "required": [
+          "session_id",
+          "model_seq_id",
+          "base_model"
+        ],
+        "title": "CreateModelRequest",
+        "type": "object"
+      },
+      "CreateRequest": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "CreateRequest",
+        "type": "object"
+      },
+      "CreateResponse": {
+        "description": "Response for /create endpoint.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "CreateResponse",
+        "type": "object"
+      },
+      "Datum": {
+        "additionalProperties": false,
+        "properties": {
+          "loss_fn_inputs": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TensorData"
+            },
+            "title": "Loss Fn Inputs",
+            "type": "object"
+          },
+          "model_input": {
+            "$ref": "#/components/schemas/ModelInput"
+          }
+        },
+        "required": [
+          "loss_fn_inputs",
+          "model_input"
+        ],
+        "title": "Datum",
+        "type": "object"
+      },
+      "EncodedTextChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Tokens",
+            "type": "array"
+          },
+          "type": {
+            "const": "encoded_text",
+            "default": "encoded_text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tokens"
+        ],
+        "title": "EncodedTextChunk",
+        "type": "object"
+      },
+      "ForwardBackwardInput": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Datum"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "loss_fn": {
+            "enum": [
+              "cross_entropy",
+              "importance_sampling",
+              "ppo",
+              "cispo",
+              "dro"
+            ],
+            "title": "Loss Fn",
+            "type": "string"
+          },
+          "loss_fn_config": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loss Fn Config"
+          }
+        },
+        "required": [
+          "data",
+          "loss_fn"
+        ],
+        "title": "ForwardBackwardInput",
+        "type": "object"
+      },
+      "ForwardBackwardRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "forward_backward_input": {
+            "$ref": "#/components/schemas/ForwardBackwardInput"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          }
+        },
+        "required": [
+          "forward_backward_input",
+          "model_id"
+        ],
+        "title": "ForwardBackwardRequest",
+        "type": "object"
+      },
+      "ForwardBackwardResponse": {
+        "description": "Response for /forward_backward endpoint (returns ModelOutput).",
+        "properties": {
+          "result": {
+            "title": "Result"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "ForwardBackwardResponse",
+        "type": "object"
+      },
+      "ForwardOnlyRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter Name"
+          },
+          "inputs": {
+            "title": "Inputs"
+          }
+        },
+        "required": [
+          "inputs"
+        ],
+        "title": "ForwardOnlyRequest",
+        "type": "object"
+      },
+      "ForwardResponse": {
+        "description": "Response for /forward and /forward_only endpoints (returns ModelOutput).",
+        "properties": {
+          "result": {
+            "title": "Result"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "ForwardResponse",
+        "type": "object"
+      },
+      "GetInfoRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "get_info",
+            "default": "get_info",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "GetInfoRequest",
+        "type": "object"
+      },
+      "GetInfoResponse": {
+        "description": "Response containing information about a training client's model.",
+        "properties": {
+          "is_lora": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Lora"
+          },
+          "lora_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lora Rank"
+          },
+          "model_data": {
+            "$ref": "#/components/schemas/ModelData"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "model_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Name"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "const": "get_info",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "required": [
+          "model_data",
+          "model_id"
+        ],
+        "title": "GetInfoResponse",
+        "type": "object"
+      },
+      "GetStateDictRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "GetStateDictRequest",
+        "type": "object"
+      },
+      "GetStateDictResponse": {
+        "description": "Response for /get_state_dict endpoint (returns Dict).",
+        "properties": {
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "GetStateDictResponse",
+        "type": "object"
+      },
+      "GetTrainConfigsResponse": {
+        "description": "Response for /get_train_configs endpoint (returns str).",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "GetTrainConfigsResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ImageAssetPointerChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "type": {
+            "const": "image_asset_pointer",
+            "default": "image_asset_pointer",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "location"
+        ],
+        "title": "ImageAssetPointerChunk",
+        "type": "object"
+      },
+      "ImageChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "contentMediaType": "application/octet-stream",
+            "title": "Data",
+            "type": "string"
+          },
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "type": {
+            "const": "image",
+            "default": "image",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data",
+          "format"
+        ],
+        "title": "ImageChunk",
+        "type": "object"
+      },
+      "LoadRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "load_optimizer": {
+            "default": false,
+            "title": "Load Optimizer",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_name",
+          "name"
+        ],
+        "title": "LoadRequest",
+        "type": "object"
+      },
+      "LoadWeightsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "optimizer": {
+            "title": "Optimizer",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "type": {
+            "const": "load_weights",
+            "default": "load_weights",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id",
+          "path",
+          "optimizer"
+        ],
+        "title": "LoadWeightsRequest",
+        "type": "object"
+      },
+      "LoraConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "rank": {
+            "title": "Rank",
+            "type": "integer"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "train_attn": {
+            "default": true,
+            "title": "Train Attn",
+            "type": "boolean"
+          },
+          "train_mlp": {
+            "default": true,
+            "title": "Train Mlp",
+            "type": "boolean"
+          },
+          "train_unembed": {
+            "default": true,
+            "title": "Train Unembed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "rank"
+        ],
+        "title": "LoraConfig",
+        "type": "object"
+      },
+      "ModelData": {
+        "description": "Metadata about a model's architecture and configuration.",
+        "properties": {
+          "arch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arch"
+          },
+          "model_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Name"
+          },
+          "tokenizer_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokenizer Id"
+          }
+        },
+        "title": "ModelData",
+        "type": "object"
+      },
+      "ModelInput": {
+        "additionalProperties": false,
+        "properties": {
+          "chunks": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EncodedTextChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageAssetPointerChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageChunk"
+                }
+              ]
+            },
+            "title": "Chunks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chunks"
+        ],
+        "title": "ModelInput",
+        "type": "object"
+      },
+      "OptimStepRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "adam_params": {
+            "$ref": "#/components/schemas/AdamParams"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "type": {
+            "const": "optim_step",
+            "default": "optim_step",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adam_params",
+          "model_id"
+        ],
+        "title": "OptimStepRequest",
+        "type": "object"
+      },
+      "ResumeFromCheckpointRequest": {
+        "additionalProperties": true,
+        "description": "Request for /resume_from_checkpoint endpoint.",
+        "properties": {
+          "adapter_name": {
+            "default": "",
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "resume_only_model": {
+            "default": false,
+            "title": "Resume Only Model",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ResumeFromCheckpointRequest",
+        "type": "object"
+      },
+      "SaveRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "is_sampler": {
+            "default": false,
+            "title": "Is Sampler",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "save_optimizer": {
+            "default": false,
+            "title": "Save Optimizer",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "SaveRequest",
+        "type": "object"
+      },
+      "SaveResponse": {
+        "description": "Response for /save endpoint (returns twinkle path + checkpoint dir).",
+        "properties": {
+          "checkpoint_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpoint Dir"
+          },
+          "twinkle_path": {
+            "title": "Twinkle Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "twinkle_path"
+        ],
+        "title": "SaveResponse",
+        "type": "object"
+      },
+      "SaveWeightsForSamplerRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "sampling_session_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampling Session Seq Id"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Seconds"
+          },
+          "type": {
+            "const": "save_weights_for_sampler",
+            "default": "save_weights_for_sampler",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "SaveWeightsForSamplerRequest",
+        "type": "object"
+      },
+      "SaveWeightsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Seconds"
+          },
+          "type": {
+            "const": "save_weights",
+            "default": "save_weights",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "SaveWeightsRequest",
+        "type": "object"
+      },
+      "SetLossRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "loss_cls": {
+            "title": "Loss Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loss_cls",
+          "adapter_name"
+        ],
+        "title": "SetLossRequest",
+        "type": "object"
+      },
+      "SetLrSchedulerRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "scheduler_cls": {
+            "title": "Scheduler Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scheduler_cls",
+          "adapter_name"
+        ],
+        "title": "SetLrSchedulerRequest",
+        "type": "object"
+      },
+      "SetOptimizerRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "optimizer_cls": {
+            "title": "Optimizer Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "optimizer_cls",
+          "adapter_name"
+        ],
+        "title": "SetOptimizerRequest",
+        "type": "object"
+      },
+      "SetProcessorRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "processor_cls": {
+            "title": "Processor Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "processor_cls",
+          "adapter_name"
+        ],
+        "title": "SetProcessorRequest",
+        "type": "object"
+      },
+      "SetTemplateRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "template_cls": {
+            "title": "Template Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_cls",
+          "adapter_name"
+        ],
+        "title": "SetTemplateRequest",
+        "type": "object"
+      },
+      "TensorData": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Data"
+          },
+          "dtype": {
+            "enum": [
+              "int64",
+              "float32"
+            ],
+            "title": "Dtype",
+            "type": "string"
+          },
+          "shape": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shape"
+          }
+        },
+        "required": [
+          "data",
+          "dtype"
+        ],
+        "title": "TensorData",
+        "type": "object"
+      },
+      "TrainingProgressResponse": {
+        "description": "Response for /resume_from_checkpoint endpoint.",
+        "properties": {
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "TrainingProgressResponse",
+        "type": "object"
+      },
+      "UnloadModelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "unload_model",
+            "default": "unload_model",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "UnloadModelRequest",
+        "type": "object"
+      },
+      "UntypedAPIFuture": {
+        "properties": {
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "UntypedAPIFuture",
+        "type": "object"
+      },
+      "UploadStatusResponse": {
+        "description": "Response for /upload_status/{request_id} endpoint.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "status"
+        ],
+        "title": "UploadStatusResponse",
+        "type": "object"
+      },
+      "UploadToHubRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "async_upload": {
+            "default": false,
+            "title": "Async Upload",
+            "type": "boolean"
+          },
+          "checkpoint_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "title": "Checkpoint Dir"
+          },
+          "hub_model_id": {
+            "title": "Hub Model Id",
+            "type": "string"
+          },
+          "hub_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hub Token"
+          }
+        },
+        "required": [
+          "checkpoint_dir",
+          "hub_model_id"
+        ],
+        "title": "UploadToHubRequest",
+        "type": "object"
+      },
+      "UploadToHubResponse": {
+        "description": "Response for /upload_to_hub endpoint.",
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "UploadToHubResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "tinker__types__forward_request__ForwardRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "forward_input": {
+            "$ref": "#/components/schemas/ForwardBackwardInput"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          }
+        },
+        "required": [
+          "forward_input",
+          "model_id"
+        ],
+        "title": "ForwardRequest",
+        "type": "object"
+      },
+      "twinkle_client__types__model__ForwardRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "inputs": {
+            "title": "Inputs"
+          }
+        },
+        "required": [
+          "inputs",
+          "adapter_name"
+        ],
+        "title": "ForwardRequest",
+        "type": "object"
+      }
+    }
+  },
+  "processor": {
+    "paths": {
+      "/twinkle/call": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessorCallRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ProcessorCallResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessorCreateRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ProcessorCreateResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ProcessorCallRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "function": {
+            "title": "Function",
+            "type": "string"
+          },
+          "processor_id": {
+            "title": "Processor Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "processor_id",
+          "function"
+        ],
+        "title": "ProcessorCallRequest",
+        "type": "object"
+      },
+      "ProcessorCallResponse": {
+        "description": "Response body for the /call endpoint.",
+        "properties": {
+          "result": {
+            "title": "Result"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "ProcessorCallResponse",
+        "type": "object"
+      },
+      "ProcessorCreateRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "class_type": {
+            "title": "Class Type",
+            "type": "string"
+          },
+          "processor_type": {
+            "title": "Processor Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "processor_type",
+          "class_type"
+        ],
+        "title": "ProcessorCreateRequest",
+        "type": "object"
+      },
+      "ProcessorCreateResponse": {
+        "description": "Response body for the /create endpoint.",
+        "properties": {
+          "processor_id": {
+            "title": "Processor Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "processor_id"
+        ],
+        "title": "ProcessorCreateResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "sampler": {
+    "paths": {
+      "/tinker/asample": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/tinker__types__sample_request__SampleRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/UntypedAPIFuture"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/add_adapter_to_sampler": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddAdapterRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AddAdapterResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/apply_patch": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyPatchRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "parameters": [],
+          "requestBody": null,
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CreateResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            }
+          }
+        }
+      },
+      "/twinkle/sample": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/twinkle_client__types__sampler__SampleRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SampleResponseModelList"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      },
+      "/twinkle/set_template": {
+        "POST": {
+          "parameters": [],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetTemplateRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SetTemplateResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AddAdapterRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "config": {
+            "title": "Config",
+            "type": "string"
+          },
+          "save_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Save Dir"
+          }
+        },
+        "required": [
+          "adapter_name",
+          "config"
+        ],
+        "title": "AddAdapterRequest",
+        "type": "object"
+      },
+      "AddAdapterResponse": {
+        "description": "Response body for the /add_adapter_to_sampler endpoint.",
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_name"
+        ],
+        "title": "AddAdapterResponse",
+        "type": "object"
+      },
+      "ApplyPatchRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "patch_cls": {
+            "title": "Patch Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch_cls",
+          "adapter_name"
+        ],
+        "title": "ApplyPatchRequest",
+        "type": "object"
+      },
+      "CreateResponse": {
+        "description": "Response for /create endpoint.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "CreateResponse",
+        "type": "object"
+      },
+      "EncodedTextChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "tokens": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Tokens",
+            "type": "array"
+          },
+          "type": {
+            "const": "encoded_text",
+            "default": "encoded_text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tokens"
+        ],
+        "title": "EncodedTextChunk",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ImageAssetPointerChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "type": {
+            "const": "image_asset_pointer",
+            "default": "image_asset_pointer",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "location"
+        ],
+        "title": "ImageAssetPointerChunk",
+        "type": "object"
+      },
+      "ImageChunk": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "contentMediaType": "application/octet-stream",
+            "title": "Data",
+            "type": "string"
+          },
+          "expected_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tokens"
+          },
+          "format": {
+            "enum": [
+              "png",
+              "jpeg"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "type": {
+            "const": "image",
+            "default": "image",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data",
+          "format"
+        ],
+        "title": "ImageChunk",
+        "type": "object"
+      },
+      "ModelInput": {
+        "additionalProperties": false,
+        "properties": {
+          "chunks": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EncodedTextChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageAssetPointerChunk"
+                },
+                {
+                  "$ref": "#/components/schemas/ImageChunk"
+                }
+              ]
+            },
+            "title": "Chunks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chunks"
+        ],
+        "title": "ModelInput",
+        "type": "object"
+      },
+      "SampleResponseModel": {
+        "description": "Mirroring twinkle.data_format.SampleResponse.",
+        "properties": {
+          "prompt_logprobs": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt Logprobs"
+          },
+          "sequences": {
+            "description": "List of sampled sequences",
+            "items": {
+              "$ref": "#/components/schemas/SampledSequenceModel"
+            },
+            "title": "Sequences",
+            "type": "array"
+          },
+          "topk_prompt_logprobs": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "maxItems": 2,
+                        "minItems": 2,
+                        "prefixItems": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "number"
+                          }
+                        ],
+                        "type": "array"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topk Prompt Logprobs"
+          }
+        },
+        "required": [
+          "sequences"
+        ],
+        "title": "SampleResponseModel",
+        "type": "object"
+      },
+      "SampleResponseModelList": {
+        "description": "Response body for the /sample endpoint",
+        "properties": {
+          "samples": {
+            "description": "List of sample responses",
+            "items": {
+              "$ref": "#/components/schemas/SampleResponseModel"
+            },
+            "title": "Samples",
+            "type": "array"
+          }
+        },
+        "required": [
+          "samples"
+        ],
+        "title": "SampleResponseModelList",
+        "type": "object"
+      },
+      "SampledSequenceModel": {
+        "description": "A single sampled sequence, mirroring twinkle.data_format.SampledSequence.",
+        "properties": {
+          "decoded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Decoded text of the sampled sequence",
+            "title": "Decoded"
+          },
+          "logprobs": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "maxItems": 2,
+                        "minItems": 2,
+                        "prefixItems": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "number"
+                          }
+                        ],
+                        "type": "array"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-token log-probabilities",
+            "title": "Logprobs"
+          },
+          "new_input_feature": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Updated InputFeature after sampling (input_ids, labels, etc.)",
+            "title": "New Input Feature"
+          },
+          "stop_reason": {
+            "description": "Stop reason: 'length' or 'stop'",
+            "enum": [
+              "length",
+              "stop"
+            ],
+            "title": "Stop Reason",
+            "type": "string"
+          },
+          "tokens": {
+            "description": "Token IDs of the sampled sequence",
+            "items": {
+              "type": "integer"
+            },
+            "title": "Tokens",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stop_reason",
+          "tokens"
+        ],
+        "title": "SampledSequenceModel",
+        "type": "object"
+      },
+      "SamplingParams": {
+        "properties": {
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop"
+          },
+          "temperature": {
+            "default": 1,
+            "title": "Temperature",
+            "type": "number"
+          },
+          "top_k": {
+            "default": -1,
+            "title": "Top K",
+            "type": "integer"
+          },
+          "top_p": {
+            "default": 1,
+            "title": "Top P",
+            "type": "number"
+          }
+        },
+        "title": "SamplingParams",
+        "type": "object"
+      },
+      "SetTemplateRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "adapter_name": {
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "template_cls": {
+            "title": "Template Cls",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_cls",
+          "adapter_name"
+        ],
+        "title": "SetTemplateRequest",
+        "type": "object"
+      },
+      "SetTemplateResponse": {
+        "description": "Response for /set_template endpoint.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "SetTemplateResponse",
+        "type": "object"
+      },
+      "UntypedAPIFuture": {
+        "properties": {
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "UntypedAPIFuture",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "tinker__types__sample_request__SampleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Model"
+          },
+          "model_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Path"
+          },
+          "num_samples": {
+            "default": 1,
+            "title": "Num Samples",
+            "type": "integer"
+          },
+          "prompt": {
+            "$ref": "#/components/schemas/ModelInput"
+          },
+          "prompt_logprobs": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt Logprobs"
+          },
+          "sampling_params": {
+            "$ref": "#/components/schemas/SamplingParams"
+          },
+          "sampling_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampling Session Id"
+          },
+          "seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seq Id"
+          },
+          "topk_prompt_logprobs": {
+            "default": 0,
+            "title": "Topk Prompt Logprobs",
+            "type": "integer"
+          },
+          "type": {
+            "const": "sample",
+            "default": "sample",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "sampling_params"
+        ],
+        "title": "SampleRequest",
+        "type": "object"
+      },
+      "twinkle_client__types__sampler__SampleRequest": {
+        "description": "Request body for the /sample endpoint.",
+        "properties": {
+          "adapter_name": {
+            "default": "",
+            "description": "Adapter name for LoRA inference",
+            "title": "Adapter Name",
+            "type": "string"
+          },
+          "adapter_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Adapter URI (twinkle:// path or local path) for LoRA inference",
+            "title": "Adapter Uri"
+          },
+          "inputs": {
+            "description": "List of Trajectory or InputFeature dicts",
+            "title": "Inputs"
+          },
+          "sampling_params": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sampling parameters (max_tokens, temperature, num_samples, etc.)",
+            "title": "Sampling Params"
+          }
+        },
+        "required": [
+          "inputs"
+        ],
+        "title": "SampleRequest",
+        "type": "object"
+      }
+    }
+  }
+}
