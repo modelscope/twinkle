@@ -49,7 +49,14 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  use_megatron: bool = False,
                  adapter_config: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
+                 backend: str | None = None,
                  **kwargs):
+        # Bridge: Phase 0c introduces ``backend`` as the canonical selector;
+        # Phase 1 replaces the use_megatron branch below with full dispatch
+        # on this field. Until then, derive use_megatron from backend when
+        # supplied so both YAML schemas keep working through the transition.
+        if backend is not None:
+            use_megatron = backend == 'megatron'
         self.device_group = DeviceGroup(**device_group)
         twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
         if 'mesh_dim_names' in device_mesh:
@@ -137,6 +144,7 @@ def build_model_app(model_id: str,
                     use_megatron: bool = False,
                     adapter_config: dict[str, Any] | None = None,
                     queue_config: dict[str, Any] | None = None,
+                    backend: str | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -200,7 +208,8 @@ def build_model_app(model_id: str,
     )(
         ModelManagementWithIngress)
     return DeploymentClass.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh,
-                                                          use_megatron, adapter_config, queue_config, **kwargs)
+                                                          use_megatron, adapter_config, queue_config,
+                                                          backend=backend, **kwargs)
 
 
 build_model_app = wrap_builder_with_device_group_env(build_model_app)
