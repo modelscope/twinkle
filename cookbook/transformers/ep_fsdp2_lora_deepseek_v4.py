@@ -35,11 +35,12 @@ RESUME_FROM_CHECKPOINT = os.environ.get('RESUME_FROM_CHECKPOINT') or None
 RESUME_ONLY_MODEL = os.environ.get('RESUME_ONLY_MODEL', '0') == '1'
 IGNORE_DATA_SKIP = os.environ.get('IGNORE_DATA_SKIP', '0') == '1'
 ADAPTER_NAME = os.environ.get('ADAPTER_NAME', 'default')
+NUM_GPUS = int(os.environ.get('NUM_GPUS', '8'))
 
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=8,
+    fsdp_size=NUM_GPUS,
     dp_size=1,
-    ep_size=8,
+    ep_size=NUM_GPUS,
     device_type=Platform.get_platform().device_prefix(),
 )
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
