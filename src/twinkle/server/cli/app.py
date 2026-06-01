@@ -1,0 +1,167 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Typer-based operations CLI (R14, R15).
+
+Provides four subcommands:
+
+- ``launch``           — start the Twinkle Server from a YAML config.
+                        Validates the persistence config signature against
+                        the persistence backend BEFORE ``ray.init`` so a
+                        configuration drift fails fast (R15.1).
+- ``check-config``     — validate a config file; exit 0 on success, non-zero
+                        with the validation error on failure (R14.3, R14.4).
+- ``print-config``     — emit the fully resolved + normalized ``ServerConfig``
+                        as YAML (R14.5).
+- ``clear persistence``— delete persisted state for the namespace derived
+                        from a config file (R14.2).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+import typer
+import yaml
+
+from twinkle.server.config import ServerConfig
+from twinkle.server.exceptions import ConfigMismatchError, ConfigParseError
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help='Operations CLI for Twinkle Server.',
+)
+
+clear_app = typer.Typer(
+    no_args_is_help=True,
+    help='Clear server-side state.',
+)
+app.add_typer(clear_app, name='clear')
+
+
+CONFIG_OPTION = typer.Option(
+    ...,
+    '--config',
+    '-c',
+    envvar='TWINKLE_SERVER_CONFIG',
+    help='Path to the YAML configuration file.',
+    metavar='PATH',
+)
+NAMESPACE_OPTION = typer.Option(
+    None,
+    '--namespace',
+    envvar='TWINKLE_RAY_NAMESPACE',
+    help="Ray namespace (overrides ray_namespace in the config).",
+)
+
+
+def _load_config(path: Path) -> ServerConfig:
+    """Load + validate ``path``; print typed errors and exit non-zero on failure."""
+    try:
+        return ServerConfig.from_yaml(path)
+    except FileNotFoundError as e:
+        typer.echo(f'error: {e}', err=True)
+        raise typer.Exit(code=2)
+    except ConfigParseError as e:
+        typer.echo(f'error: {e}', err=True)
+        raise typer.Exit(code=2)
+    except Exception as e:  # pydantic.ValidationError + cross-field
+        typer.echo(f'error: invalid configuration\n{e}', err=True)
+        raise typer.Exit(code=2)
+
+
+def _signature_payload(config: ServerConfig) -> dict:
+    """The dict whose hash drives signature validation.
+
+    Restricted to the persistence-relevant fields so unrelated edits don't
+    invalidate the persisted state. Future phases can broaden this.
+    """
+    return {'persistence': config.persistence.model_dump(mode='json')}
+
+
+@app.command('launch')
+def launch_cmd(
+    config: Path = CONFIG_OPTION,
+    namespace: Optional[str] = NAMESPACE_OPTION,
+) -> None:
+    """Start the Twinkle Server from a YAML config file (R14.1, R15.1)."""
+    cfg = _load_config(config)
+
+    # Validate the persistence config signature BEFORE we touch Ray (R15.1).
+    try:
+        from twinkle.server.state.config_signature import validate_against_backend
+
+        asyncio.run(validate_against_backend(cfg.persistence, _signature_payload(cfg)))
+    except ConfigMismatchError as e:
+        typer.echo(f'error: {e}', err=True)
+        raise typer.Exit(code=3)
+
+    # Defer the heavy launcher import until after drift validation passes so
+    # the failure path stays cheap (and a missing Ray install doesn't block
+    # `check-config`).
+    from twinkle.server.launcher import ServerLauncher
+
+    launcher = ServerLauncher(config=cfg, ray_namespace=namespace or cfg.ray_namespace)
+    launcher.launch()
+
+
+@app.command('check-config')
+def check_config_cmd(config: Path = CONFIG_OPTION) -> None:
+    """Validate ``config`` and exit 0 on success, non-zero on failure (R14.3, R14.4)."""
+    _load_config(config)
+    typer.echo('ok')
+
+
+@app.command('print-config')
+def print_config_cmd(
+    config: Path = CONFIG_OPTION,
+    fmt: str = typer.Option('yaml', '--format', envvar='TWINKLE_PRINT_FORMAT', help='yaml|json'),
+) -> None:
+    """Emit the validated, normalized ``ServerConfig`` (R14.5)."""
+    cfg = _load_config(config)
+    payload = cfg.to_yaml_dict()
+    if fmt == 'json':
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(yaml.safe_dump(payload, sort_keys=True).rstrip())
+
+
+@clear_app.command('persistence')
+def clear_persistence_cmd(config: Path = CONFIG_OPTION) -> None:
+    """Remove persisted state for the namespace derived from ``config`` (R14.2)."""
+    cfg = _load_config(config)
+    from twinkle.server.state.backend.factory import create_backend
+
+    async def _clear() -> int:
+        backend = create_backend(cfg.persistence)
+        keys = await backend.keys('*')
+        removed = 0
+        for k in keys:
+            await backend.delete(k)
+            removed += 1
+        return removed
+
+    n = asyncio.run(_clear())
+    typer.echo(f'cleared {n} keys from persistence backend (mode={cfg.persistence.mode})')
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Programmatic entry point used by ``__main__.py`` and tests.
+
+    Runs the typer app in standalone mode and converts its ``SystemExit``
+    into a plain return code so callers can react without re-trapping.
+    """
+    try:
+        app(args=argv, standalone_mode=True)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            return 0
+        return int(code) if not isinstance(code, int) else code
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
