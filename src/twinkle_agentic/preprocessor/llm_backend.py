@@ -6,7 +6,7 @@ Supports two modes:
   - SamplerBackend: direct calls to Twinkle vLLMSampler Ray actor (no HTTP)
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.utils import get_logger
 
@@ -30,6 +30,24 @@ class LLMBackend(ABC):
         Returns:
             List of n choices, each a dict with keys 'content' and 'reasoning_content'.
         """
+
+    def chat_batch(
+        self,
+        messages_list: List[List[Dict[str, Any]]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 16,
+        n: int = 1,
+    ) -> List[List[Dict[str, str]]]:
+        """Batched chat completion. Returns one List[choice] per input messages list.
+
+        Default impl loops over `chat`; backends should override to fan out concurrently
+        (HTTP) or pass the full list to the underlying sampler in a single call (vLLM DP).
+        """
+        return [
+            self.chat(m, temperature=temperature, max_tokens=max_tokens, n=n)
+            for m in messages_list
+        ]
 
     @abstractmethod
     def prompt_logprobs(self, messages: List[Dict[str, Any]]) -> Optional[List]:
@@ -108,6 +126,30 @@ class OpenAIBackend(LLMBackend):
         except Exception as e:
             logger.warning(f'[OpenAIBackend] chat failed: {e}')
             return []
+
+    def chat_batch(
+        self,
+        messages_list: List[List[Dict[str, Any]]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 16,
+        n: int = 1,
+        max_workers: int = 16,
+    ) -> List[List[Dict[str, str]]]:
+        """Concurrent chat: vLLM HTTP server multiplexes requests; httpx.Client is thread-safe."""
+        from concurrent.futures import ThreadPoolExecutor
+        if not messages_list:
+            return []
+        workers = max(1, min(max_workers, len(messages_list)))
+        results: List[List[Dict[str, str]]] = [[] for _ in messages_list]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(self.chat, m, temperature=temperature, max_tokens=max_tokens, n=n): i
+                for i, m in enumerate(messages_list)
+            }
+            for fut in futs:
+                results[futs[fut]] = fut.result()
+        return results
 
     def prompt_logprobs(self, messages: List[Dict[str, Any]]) -> Optional[List]:
         try:
@@ -209,6 +251,50 @@ class SamplerBackend(LLMBackend):
         except Exception as e:
             logger.warning(f'[SamplerBackend] chat failed: {e}')
             return []
+
+    @staticmethod
+    def _split_think(text: str) -> Tuple[str, str]:
+        if '</think>' in text:
+            parts = text.split('</think>', 1)
+            return parts[1].strip(), parts[0].split('<think>')[-1].strip()
+        return text, ''
+
+    def chat_batch(
+        self,
+        messages_list: List[List[Dict[str, Any]]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 16,
+        n: int = 1,
+    ) -> List[List[Dict[str, str]]]:
+        """One sampler dispatch over the full list; lets vLLM DP workers stay saturated."""
+        from twinkle.data_format import SamplingParams
+        if not messages_list:
+            return []
+        device_mesh = getattr(self._sampler, 'device_mesh', None)
+        dp_world_size = getattr(device_mesh, 'dp_world_size', 1) or 1
+        n_inputs = len(messages_list)
+        feats = [{'messages': m} for m in messages_list]
+        # Pad the dispatch so every DP worker has at least one item; trim duplicates after.
+        if n_inputs < dp_world_size:
+            feats = feats + [feats[-1]] * (dp_world_size - n_inputs)
+        params = SamplingParams(temperature=temperature, max_tokens=max_tokens, num_samples=n)
+        try:
+            responses = self._sampler.sample(feats, params)
+        except Exception as e:
+            logger.warning(f'[SamplerBackend] chat_batch failed: {e}')
+            return [[] for _ in range(n_inputs)]
+        responses = list(responses)[:n_inputs]
+        out: List[List[Dict[str, str]]] = []
+        for resp in responses:
+            choices: List[Dict[str, str]] = []
+            for seq in (getattr(resp, 'sequences', None) or []):
+                text, reasoning = self._split_think(seq.decoded or '')
+                choices.append({'content': text, 'reasoning_content': reasoning})
+            out.append(choices)
+        while len(out) < n_inputs:
+            out.append([])
+        return out
 
     def prompt_logprobs(self, messages: List[Dict[str, Any]]) -> Optional[List]:
         from twinkle.data_format import SamplingParams

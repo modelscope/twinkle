@@ -133,6 +133,17 @@ class QualityPreprocessor(Preprocessor):
         ifd_model: str = 'default',
         ifd_template: Optional[Template] = None,
         ifd_threshold: float = 0.8,
+        # Diagnostic re-sampling: which intents to re-answer; [] disables (no extra inference cost).
+        ifd_diagnostic_sample_intents: Optional[List[str]] = None,
+        ifd_diagnostic_sample_n: int = 4,
+        ifd_diagnostic_sample_temperature: float = 0.7,
+        ifd_diagnostic_sample_max_tokens: int = 4096,
+        # Paraphrase mode: 'both' dumps GT+paraphrase, True=paraphrase only, False=GT only.
+        ifd_paraphrase_mode='both',
+        ifd_paraphrase_intents: Optional[List[str]] = None,
+        ifd_paraphrase_temperature: float = 0.7,
+        ifd_paraphrase_max_tokens: int = 4096,
+        ifd_paraphrase_prompt_budget: int = 4096,
         # ── Phase 13: response refinement (requires key_rounds) ─────────────
         refine_api_endpoint: str = '',       # '' = skip
         refine_model: str = 'default',
@@ -286,6 +297,15 @@ class QualityPreprocessor(Preprocessor):
                 model=ifd_model,
                 template=ifd_template,
                 ifd_threshold=ifd_threshold,
+                diagnostic_sample_intents=ifd_diagnostic_sample_intents,
+                diagnostic_sample_n=ifd_diagnostic_sample_n,
+                diagnostic_sample_temperature=ifd_diagnostic_sample_temperature,
+                diagnostic_sample_max_tokens=ifd_diagnostic_sample_max_tokens,
+                paraphrase_mode=ifd_paraphrase_mode,
+                paraphrase_intents=ifd_paraphrase_intents,
+                paraphrase_temperature=ifd_paraphrase_temperature,
+                paraphrase_max_tokens=ifd_paraphrase_max_tokens,
+                paraphrase_prompt_budget=ifd_paraphrase_prompt_budget,
             )
             pipeline.append(ifd.ifd_filter)
 

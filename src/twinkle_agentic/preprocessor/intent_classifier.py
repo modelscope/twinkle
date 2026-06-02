@@ -229,7 +229,11 @@ class CodeDetector(_RegexDetector):
 
 class MathDetector(_RegexDetector):
     intent = INTENT_MATH
-    threshold = 2
+    # Threshold 4 (not 2): asst replies in chemistry/biology/materials describe formulas
+    # like CH₂/H₂O whose subscript-digit chars match `_MATH_LATEX_RE`. Bumping to 4 keeps
+    # genuine math (which has many more matches) while rejecting incidental sub/superscript
+    # noise from non-math knowledge questions.
+    threshold = 4
 
     def _match(self, text):
         return len(_MATH_LATEX_RE.findall(text)) >= self.threshold

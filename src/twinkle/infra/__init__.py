@@ -434,13 +434,17 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         # Comment this because remote_class supports `first``
         # assert device_mesh.world_size == len(workers)
         length = len(workers)
+        # Map actor index to global_rank: with gpus_per_worker>1, consecutive
+        # global ranks belong to the same actor (TP peers).
+        _mesh_world = device_mesh.world_size if device_mesh is not None else length
+        _rank_stride = max(1, _mesh_world // length)
 
         def dispatch_func(arg, n):
             import torch
             if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
                 for i in range(n):
-                    _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
+                    _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])
                 return _args
             elif isinstance(arg, dict):
                 _args = [{} for _ in range(n)]

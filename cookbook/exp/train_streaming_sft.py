@@ -147,6 +147,10 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         # Phase 12: IFD hard-example filter
         ifd_template=template,
         ifd_threshold=IFD_THRESHOLD,
+        ifd_diagnostic_sample_intents=['math', 'code'],
+        ifd_diagnostic_sample_n=4,
+        ifd_diagnostic_sample_temperature=0.7,
+        ifd_diagnostic_sample_max_tokens=4096,
         # Phase 13: response refinement
         refine_temperature=REFINE_TEMPERATURE,
         refine_max_tokens=REFINE_MAX_TOKENS,
