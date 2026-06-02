@@ -19,7 +19,6 @@ TOKEN_ID = f'{PREFIX}token_id'
 SAMPLING_SESSION_ID = f'{PREFIX}sampling_session_id'
 BASE_MODEL = f'{PREFIX}base_model'
 
-
 CORRELATION_KEYS: tuple[str, ...] = (
     SESSION_ID,
     MODEL_ID,

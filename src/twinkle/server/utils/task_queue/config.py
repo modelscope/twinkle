@@ -9,9 +9,8 @@ state.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Any
 
 
 class TaskQueueConfig(BaseModel):
@@ -42,7 +41,7 @@ class TaskQueueConfig(BaseModel):
     max_input_tokens: int = Field(default=16000, ge=1)
 
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any] | None = None) -> 'TaskQueueConfig':
+    def from_dict(cls, config_dict: dict[str, Any] | None = None) -> TaskQueueConfig:
         """Validate ``config_dict`` (or ``{}``) into a ``TaskQueueConfig``.
 
         Equivalent to ``cls.model_validate(config_dict or {})`` — kept for

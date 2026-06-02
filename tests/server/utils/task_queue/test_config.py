@@ -11,11 +11,11 @@ Covers:
 from __future__ import annotations
 
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
-
 
 # ---------- defaults snapshot used by Property 18 (R9.8) ------------------- #
 
@@ -28,9 +28,7 @@ DEFAULTS = {
     'max_input_tokens': 16000,
 }
 
-
 # ---------- Property 16: constraint enforcement (R9.2-9.5, 9.7) ------------ #
-
 
 _CONSTRAINED_GE0_FLOATS = ['rps_limit', 'tps_limit', 'queue_timeout', 'token_cleanup_interval']
 
@@ -74,9 +72,8 @@ def test_property_16_max_input_tokens_rejects_lt_1(bad_value: int) -> None:
     cleanup=st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
     mit=st.integers(min_value=1, max_value=10_000_000),
 )
-def test_property_16_valid_values_accepted(
-    rps: float, tps: float, win: float, qt: float, cleanup: float, mit: int
-) -> None:
+def test_property_16_valid_values_accepted(rps: float, tps: float, win: float, qt: float, cleanup: float,
+                                           mit: int) -> None:
     """Any value satisfying the constraints constructs successfully."""
     cfg = TaskQueueConfig(
         rps_limit=rps,
@@ -93,7 +90,6 @@ def test_property_16_valid_values_accepted(
 
 # ---------- Property 17: from_dict equivalence (R9.6) ---------------------- #
 
-
 _INPUT_DICT_STRATEGY = st.fixed_dictionaries(
     {},
     optional={
@@ -101,14 +97,11 @@ _INPUT_DICT_STRATEGY = st.fixed_dictionaries(
         'tps_limit': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
         'window_seconds': st.floats(min_value=1e-6, max_value=1e6, allow_nan=False, allow_infinity=False),
         'queue_timeout': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'token_cleanup_interval': st.floats(
-            min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
+        'token_cleanup_interval': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
         'max_input_tokens': st.integers(min_value=1, max_value=10_000_000),
         'enabled': st.booleans(),
-        'execution_timeout': st.floats(
-            min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'token_cleanup_multiplier': st.floats(
-            min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
+        'execution_timeout': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
+        'token_cleanup_multiplier': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
     },
 )
 

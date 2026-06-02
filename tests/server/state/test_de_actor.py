@@ -9,20 +9,14 @@ Covers:
 """
 from __future__ import annotations
 
+import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from unittest import mock
 
-import pytest
-from hypothesis import HealthCheck, given, settings, strategies as st
-
-from twinkle.server.state import (
-    PersistenceConfig,
-    ReplicaRegistry,
-    ServerState,
-    get_server_state,
-    reset_server_state_cache,
-)
+from twinkle.server.state import (PersistenceConfig, ReplicaRegistry, ServerState, get_server_state,
+                                  reset_server_state_cache)
 from twinkle.server.state.backend.memory_backend import MemoryBackend
-
 
 # ---------- 4.6: de-Actor wiring + in-process persistence ------------------ #
 
@@ -40,13 +34,9 @@ def test_no_detached_actor_in_source() -> None:
     Static check: searching the file is enough — the dynamic check below also
     confirms ``ray.remote`` is never invoked when ``get_server_state`` runs.
     """
-    assert not _ray_attr_used('ray.remote('), (
-        'state/server_state.py still references ray.remote(...) — '
-        'detached actor must not be created (R19.1).'
-    )
-    assert not _ray_attr_used("lifetime='detached'"), (
-        "state/server_state.py still uses lifetime='detached' (R19.1)."
-    )
+    assert not _ray_attr_used('ray.remote('), ('state/server_state.py still references ray.remote(...) — '
+                                               'detached actor must not be created (R19.1).')
+    assert not _ray_attr_used("lifetime='detached'"), ("state/server_state.py still uses lifetime='detached' (R19.1).")
 
 
 def test_get_server_state_does_not_call_ray_remote() -> None:
@@ -87,7 +77,6 @@ def test_in_process_persistence_no_redis_required() -> None:
 
 
 # ---------- 4.5: state-operation equivalence under direct-backend ---------- #
-
 
 _OP_STRATEGY = st.lists(
     st.one_of(

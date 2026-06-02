@@ -7,29 +7,22 @@ Properties covered:
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from unittest import mock
-
 import pytest
 import yaml
+from pathlib import Path
 from typer.testing import CliRunner
+from unittest import mock
 
 from twinkle.server.cli.app import app, main
 from twinkle.server.config import ServerConfig
 from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.state.backend.factory import PersistenceConfig
 from twinkle.server.state.backend.memory_backend import MemoryBackend
-from twinkle.server.state.config_signature import (
-    _SIGNATURE_KEY,
-    compute_signature,
-    validate_against_backend,
-)
-
+from twinkle.server.state.config_signature import _SIGNATURE_KEY, compute_signature, validate_against_backend
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE = REPO_ROOT / 'cookbook' / 'client' / 'server' / 'server_config.example.yaml'
 MOCK_CFG = REPO_ROOT / 'cookbook' / 'client' / 'server' / 'mock' / 'server_config.yaml'
-
 
 # ---------- 9.5 CLI subcommand existence + exit codes (R14.3, R14.4) ------ #
 
@@ -101,8 +94,8 @@ def test_launch_validates_drift_before_ray_init() -> None:
         raise ConfigMismatchError('drift sentinel')
 
     with mock.patch(
-        'twinkle.server.state.config_signature.validate_against_backend',
-        side_effect=_abort_drift,
+            'twinkle.server.state.config_signature.validate_against_backend',
+            side_effect=_abort_drift,
     ):
         # Should never reach the launcher import — patch it to a sentinel that
         # would make the test fail loudly if reached.
@@ -124,9 +117,7 @@ async def test_property_29_first_run_stores_signature() -> None:
     pcfg = PersistenceConfig(mode='memory')
     # Patch create_backend to return our shared in-process backend so we can
     # inspect the stored signature afterwards.
-    with mock.patch(
-        'twinkle.server.state.backend.factory.create_backend', return_value=backend
-    ):
+    with mock.patch('twinkle.server.state.backend.factory.create_backend', return_value=backend):
         await validate_against_backend(pcfg, cfg_payload)
         assert await backend.get(_SIGNATURE_KEY) == compute_signature(cfg_payload)
         # Second run with same payload is a no-op.
@@ -140,9 +131,7 @@ async def test_property_29_drift_raises_with_diff_and_remediation() -> None:
     initial = {'persistence': {'mode': 'memory'}}
     later = {'persistence': {'mode': 'file', 'file_path': '/tmp/x.json'}}
 
-    with mock.patch(
-        'twinkle.server.state.backend.factory.create_backend', return_value=backend
-    ):
+    with mock.patch('twinkle.server.state.backend.factory.create_backend', return_value=backend):
         await validate_against_backend(pcfg, initial)
         with pytest.raises(ConfigMismatchError) as exc:
             await validate_against_backend(pcfg, later)

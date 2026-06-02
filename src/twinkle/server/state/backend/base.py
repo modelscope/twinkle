@@ -7,7 +7,8 @@ from typing import Any
 class StateBackend(ABC):
     """Unified interface for state storage backends.
 
-    All state management operations go through this interface, supporting multiple backend implementations (memory, file, Redis).
+    All state management operations go through this interface, supporting
+    multiple backend implementations (memory, file, Redis).
     """
 
     @abstractmethod

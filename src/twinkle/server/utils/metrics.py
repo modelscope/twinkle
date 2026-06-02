@@ -27,9 +27,8 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 # Lazy caches – populated on first call per deployment
 # ---------------------------------------------------------------------------
-_task_metrics_cache: dict[str, 'TaskMetrics'] = {}
-_request_metrics_cache: dict[str, '_RequestMetrics'] = {}
-
+_task_metrics_cache: dict[str, TaskMetrics] = {}
+_request_metrics_cache: dict[str, _RequestMetrics] = {}
 
 # ---------------------------------------------------------------------------
 # Adapter classes – wrap OTEL instruments to expose the legacy Ray-style API

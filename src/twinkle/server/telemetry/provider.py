@@ -13,9 +13,8 @@ exposes:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
-
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,39 +26,24 @@ try:
     from opentelemetry import metrics, trace
     from opentelemetry._logs import set_logger_provider
     from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-    from opentelemetry.sdk._logs.export import (
-        BatchLogRecordProcessor,
-        ConsoleLogExporter,
-    )
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogExporter
     from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import (
-        ConsoleMetricExporter,
-        PeriodicExportingMetricReader,
-    )
+    from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import (
-        BatchSpanProcessor,
-        ConsoleSpanExporter,
-    )
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
     _OTEL_AVAILABLE = True
-    _OTEL_IMPORT_ERROR: Optional[BaseException] = None
+    _OTEL_IMPORT_ERROR: BaseException | None = None
 except Exception as exc:  # pragma: no cover - defensive fallback
     _OTEL_AVAILABLE = False
     _OTEL_IMPORT_ERROR = exc
 
 # OTLP exporters are a separate optional dependency from the SDK itself.
 try:
-    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
-        OTLPLogExporter,
-    )
-    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
-        OTLPMetricExporter,
-    )
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-        OTLPSpanExporter,
-    )
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
     _OTLP_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fallback
@@ -73,14 +57,13 @@ try:
 except Exception:  # pragma: no cover - defensive fallback
     _LOGGING_INSTRUMENTOR_AVAILABLE = False
 
-
 # ---------------------------------------------------------------------------
 # Module-level state for shutdown.
 # ---------------------------------------------------------------------------
-_tracer_provider: Optional[Any] = None
-_meter_provider: Optional[Any] = None
-_logger_provider: Optional[Any] = None
-_logging_handler: Optional[Any] = None
+_tracer_provider: Any | None = None
+_meter_provider: Any | None = None
+_logger_provider: Any | None = None
+_logging_handler: Any | None = None
 _initialized: bool = False
 
 
@@ -113,8 +96,8 @@ class TelemetryConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     enabled: bool = False
-    service_name: str = "twinkle-server"
-    otlp_endpoint: str = "http://localhost:4317"
+    service_name: str = 'twinkle-server'
+    otlp_endpoint: str = 'http://localhost:4317'
     debug: bool = False  # True: Console Exporter; False: OTLP Exporter
     export_interval_ms: int = 30000
     resource_attributes: dict = Field(default_factory=dict)
@@ -133,26 +116,24 @@ def init_telemetry(config: TelemetryConfig) -> None:
 
     if not _OTEL_AVAILABLE:
         logger.warning(
-            "OpenTelemetry SDK not available, skipping telemetry init: %s",
+            'OpenTelemetry SDK not available, skipping telemetry init: %s',
             _OTEL_IMPORT_ERROR,
         )
         return
 
     if _initialized:
-        logger.debug("Telemetry already initialized; skipping re-init.")
+        logger.debug('Telemetry already initialized; skipping re-init.')
         return
 
     # ---- Resource -------------------------------------------------------
-    resource_attrs: dict = {"service.name": config.service_name}
+    resource_attrs: dict = {'service.name': config.service_name}
     if config.resource_attributes:
         resource_attrs.update(config.resource_attributes)
     resource = Resource.create(resource_attrs)
 
     use_console = config.debug or not _OTLP_AVAILABLE
     if config.debug is False and not _OTLP_AVAILABLE:
-        logger.warning(
-            "OTLP exporters not available; falling back to console exporters."
-        )
+        logger.warning('OTLP exporters not available; falling back to console exporters.')
 
     # When using console exporters, route their output through the Python
     # logging system so that Ray Serve workers actually surface the data.
@@ -193,9 +174,7 @@ def init_telemetry(config: TelemetryConfig) -> None:
         log_exporter = OTLPLogExporter(endpoint=config.otlp_endpoint)
 
     logger_provider = LoggerProvider(resource=resource)
-    logger_provider.add_log_record_processor(
-        BatchLogRecordProcessor(log_exporter)
-    )
+    logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
     set_logger_provider(logger_provider)
     _logger_provider = logger_provider
 
@@ -204,11 +183,9 @@ def init_telemetry(config: TelemetryConfig) -> None:
         try:
             LoggingInstrumentor().instrument(set_logging_format=True)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("LoggingInstrumentor failed to instrument: %s", exc)
+            logger.warning('LoggingInstrumentor failed to instrument: %s', exc)
 
-    handler = LoggingHandler(
-        level=logging.NOTSET, logger_provider=logger_provider
-    )
+    handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
     # Attach to BOTH the root logger and the ``twinkle`` namespace logger.
     # ``twinkle.utils.logger`` configures the ``twinkle`` logger with
     # ``propagate=False`` and its own StreamHandler, so log records emitted
@@ -220,7 +197,7 @@ def init_telemetry(config: TelemetryConfig) -> None:
 
     _initialized = True
     logger.info(
-        "Telemetry initialized (service=%s, debug=%s, otlp_endpoint=%s)",
+        'Telemetry initialized (service=%s, debug=%s, otlp_endpoint=%s)',
         config.service_name,
         config.debug,
         config.otlp_endpoint,
@@ -237,28 +214,28 @@ def shutdown_telemetry() -> None:
             try:
                 logging.getLogger(logger_name).removeHandler(_logging_handler)
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Failed to detach logging handler from %r: %s", logger_name, exc)
+                logger.warning('Failed to detach logging handler from %r: %s', logger_name, exc)
         _logging_handler = None
 
     if _tracer_provider is not None:
         try:
             _tracer_provider.shutdown()
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("TracerProvider shutdown failed: %s", exc)
+            logger.warning('TracerProvider shutdown failed: %s', exc)
         _tracer_provider = None
 
     if _meter_provider is not None:
         try:
             _meter_provider.shutdown()
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("MeterProvider shutdown failed: %s", exc)
+            logger.warning('MeterProvider shutdown failed: %s', exc)
         _meter_provider = None
 
     if _logger_provider is not None:
         try:
             _logger_provider.shutdown()
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("LoggerProvider shutdown failed: %s", exc)
+            logger.warning('LoggerProvider shutdown failed: %s', exc)
         _logger_provider = None
 
     _initialized = False
@@ -266,21 +243,31 @@ def shutdown_telemetry() -> None:
 
 class _NoopInstrument:
     """No-op instrument for when OTEL SDK is not available."""
-    def add(self, *args, **kwargs): pass
-    def record(self, *args, **kwargs): pass
+
+    def add(self, *args, **kwargs):
+        pass
+
+    def record(self, *args, **kwargs):
+        pass
 
 
 class _NoopMeter:
     """No-op meter for when OTEL SDK is not available."""
-    def create_counter(self, *args, **kwargs): return _NoopInstrument()
-    def create_up_down_counter(self, *args, **kwargs): return _NoopInstrument()
-    def create_histogram(self, *args, **kwargs): return _NoopInstrument()
+
+    def create_counter(self, *args, **kwargs):
+        return _NoopInstrument()
+
+    def create_up_down_counter(self, *args, **kwargs):
+        return _NoopInstrument()
+
+    def create_histogram(self, *args, **kwargs):
+        return _NoopInstrument()
 
 
 _noop_meter = _NoopMeter()
 
 
-def get_meter(name: str = "twinkle-server"):
+def get_meter(name: str = 'twinkle-server'):
     """Return an OTEL meter. Returns NoOp meter if OTEL SDK is not available."""
     if not _OTEL_AVAILABLE:
         return _noop_meter

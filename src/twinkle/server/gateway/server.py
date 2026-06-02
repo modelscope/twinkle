@@ -14,9 +14,9 @@ from ray import serve
 from typing import Any
 
 import twinkle_client.types as types
+from twinkle.server.state import get_server_state
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.state import get_server_state
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 from .proxy import ServiceProxy
@@ -91,6 +91,7 @@ def build_server_app(deploy_options: dict[str, Any],
     Returns:
         Configured Ray Serve deployment bound with options
     """
+
     def get_self() -> GatewayServer:
         return serve.get_replica_context().servable_object
 

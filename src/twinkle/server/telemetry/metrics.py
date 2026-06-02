@@ -14,63 +14,63 @@ class MetricsRegistry:
     _instance: MetricsRegistry | None = None
 
     def __init__(self) -> None:
-        meter = get_meter("twinkle-server")
+        meter = get_meter('twinkle-server')
 
         # === HTTP Requests ===
         self.requests_total = meter.create_counter(
-            "twinkle.http.requests.total",
-            description="Total HTTP requests received",
+            'twinkle.http.requests.total',
+            description='Total HTTP requests received',
         )
         self.request_duration_seconds = meter.create_histogram(
-            "twinkle.http.request.duration_seconds",
-            description="HTTP request duration in seconds",
-            unit="s",
+            'twinkle.http.request.duration_seconds',
+            description='HTTP request duration in seconds',
+            unit='s',
         )
 
         # === Task Queue ===
         self.queue_depth = meter.create_up_down_counter(
-            "twinkle.queue.depth",
-            description="Current task queue depth",
+            'twinkle.queue.depth',
+            description='Current task queue depth',
         )
         self.task_execution_seconds = meter.create_histogram(
-            "twinkle.task.execution_seconds",
-            description="Task execution duration in seconds",
-            unit="s",
+            'twinkle.task.execution_seconds',
+            description='Task execution duration in seconds',
+            unit='s',
         )
         self.task_wait_seconds = meter.create_histogram(
-            "twinkle.task.wait_seconds",
-            description="Task wait time in queue before execution",
-            unit="s",
+            'twinkle.task.wait_seconds',
+            description='Task wait time in queue before execution',
+            unit='s',
         )
         self.rate_limit_rejections = meter.create_counter(
-            "twinkle.rate_limit.rejections.total",
-            description="Total requests rejected by rate limiter",
+            'twinkle.rate_limit.rejections.total',
+            description='Total requests rejected by rate limiter',
         )
         self.tasks_total = meter.create_counter(
-            "twinkle.tasks.total",
-            description="Total task completions, partitioned by status",
+            'twinkle.tasks.total',
+            description='Total task completions, partitioned by status',
         )
         self.rate_limiter_active_tokens = meter.create_up_down_counter(
-            "twinkle.rate_limiter.active_tokens",
-            description="Number of tokens currently tracked by the rate limiter",
+            'twinkle.rate_limiter.active_tokens',
+            description='Number of tokens currently tracked by the rate limiter',
         )
 
         # === Resources ===
         self.active_sessions = meter.create_up_down_counter(
-            "twinkle.sessions.active",
-            description="Number of active client sessions",
+            'twinkle.sessions.active',
+            description='Number of active client sessions',
         )
         self.active_models = meter.create_up_down_counter(
-            "twinkle.models.active",
-            description="Number of registered models",
+            'twinkle.models.active',
+            description='Number of registered models',
         )
         self.active_sampling_sessions = meter.create_up_down_counter(
-            "twinkle.sampling_sessions.active",
-            description="Number of active sampling sessions",
+            'twinkle.sampling_sessions.active',
+            description='Number of active sampling sessions',
         )
         self.active_futures = meter.create_up_down_counter(
-            "twinkle.futures.active",
-            description="Number of pending futures/tasks",
+            'twinkle.futures.active',
+            description='Number of pending futures/tasks',
         )
 
     @classmethod

@@ -14,7 +14,7 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
-        super().__init__(backend, "sampling::", SamplingSessionRecord, expiration_timeout)
+        super().__init__(backend, 'sampling::', SamplingSessionRecord, expiration_timeout)
 
     # ----- Cleanup -----
 

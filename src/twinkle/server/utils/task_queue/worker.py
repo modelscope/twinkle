@@ -19,8 +19,8 @@ from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
-    from twinkle.server.utils.metrics import TaskMetrics
     from twinkle.server.state import ServerStateProxy
+    from twinkle.server.utils.metrics import TaskMetrics
 
 logger = get_logger()
 

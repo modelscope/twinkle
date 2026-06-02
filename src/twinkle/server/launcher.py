@@ -69,11 +69,9 @@ class ServerLauncher:
             ray_namespace: Ray namespace (default: 'twinkle_cluster')
         """
         if not isinstance(config, ServerConfig):
-            raise TypeError(
-                'ServerLauncher requires a typed ServerConfig instance; '
-                f'got {type(config).__name__}. Build one with '
-                'ServerConfig.from_yaml(path) or ServerConfig(...).'
-            )
+            raise TypeError('ServerLauncher requires a typed ServerConfig instance; '
+                            f'got {type(config).__name__}. Build one with '
+                            'ServerConfig.from_yaml(path) or ServerConfig(...).')
         self.config: ServerConfig = config
         self.ray_namespace = ray_namespace
         self._builders: dict[str, Callable] = {}
@@ -212,7 +210,7 @@ class ServerLauncher:
 
         self._serve_started = True
 
-    def _deploy_application(self, app_spec: 'ApplicationSpec') -> None:
+    def _deploy_application(self, app_spec: ApplicationSpec) -> None:
         """Deploy a single application.
 
         Args:

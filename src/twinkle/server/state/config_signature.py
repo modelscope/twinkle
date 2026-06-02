@@ -12,14 +12,14 @@ from twinkle.server.state.backend.base import StateBackend
 
 logger = logging.getLogger(__name__)
 
-_SIGNATURE_KEY = "_meta::config_signature"
+_SIGNATURE_KEY = '_meta::config_signature'
 
 
 class SignatureMismatchPolicy(str, Enum):
     """Policy for handling config signature mismatches."""
-    WARN = "warn"  # Log warning and continue
-    CLEAR = "clear"  # Clear all backend data and continue
-    ABORT = "abort"  # Raise error, refuse to start
+    WARN = 'warn'  # Log warning and continue
+    CLEAR = 'clear'  # Clear all backend data and continue
+    ABORT = 'abort'  # Raise error, refuse to start
 
 
 def compute_signature(config: dict[str, Any]) -> str:
@@ -62,12 +62,12 @@ async def validate_config_signature(
 
     if stored_sig is None:
         # First run — store signature
-        logger.info("No previous config signature found. Storing current signature.")
+        logger.info('No previous config signature found. Storing current signature.')
         await backend.set(_SIGNATURE_KEY, current_sig)
         return True
 
     if stored_sig == current_sig:
-        logger.debug("Config signature matches stored value.")
+        logger.debug('Config signature matches stored value.')
         return True
 
     # Mismatch detected
@@ -82,19 +82,18 @@ async def validate_config_signature(
 
     elif policy == SignatureMismatchPolicy.CLEAR:
         # Clear all data except meta keys, store new signature
-        logger.warning("Clearing all backend data due to config signature mismatch.")
-        all_keys = await backend.keys("*")
+        logger.warning('Clearing all backend data due to config signature mismatch.')
+        all_keys = await backend.keys('*')
         for key in all_keys:
-            if not key.startswith("_meta::"):
+            if not key.startswith('_meta::'):
                 await backend.delete(key)
         await backend.set(_SIGNATURE_KEY, current_sig)
         return False
 
     elif policy == SignatureMismatchPolicy.ABORT:
-        raise ConfigMismatchError(
-            f"Configuration signature mismatch. "
-            f"Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... "
-            f"Use policy='warn' or 'clear' to allow startup with changed config.")
+        raise ConfigMismatchError(f"Configuration signature mismatch. "
+                                  f"Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... "
+                                  f"Use policy='warn' or 'clear' to allow startup with changed config.")
 
     return False
 
@@ -145,11 +144,9 @@ async def validate_against_backend(persistence_config: Any, current_config: dict
 
     stored_payload = await backend.get('_meta::config_payload')
     diff = _format_diff(stored_payload if isinstance(stored_payload, dict) else None, current_config)
-    raise ConfigMismatchError(
-        'Persistence configuration drifted since the last launch. '
-        f'Stored signature: {stored_sig[:12]}..., current signature: {current_sig[:12]}...\n'
-        f'Differences:\n{diff}\n'
-        'Remediation: either revert the persistence section to match the stored '
-        'value, or clear the persisted state with '
-        '`python -m twinkle.server clear persistence --config <yaml>` and relaunch.'
-    )
+    raise ConfigMismatchError('Persistence configuration drifted since the last launch. '
+                              f'Stored signature: {stored_sig[:12]}..., current signature: {current_sig[:12]}...\n'
+                              f'Differences:\n{diff}\n'
+                              'Remediation: either revert the persistence section to match the stored '
+                              'value, or clear the persisted state with '
+                              '`python -m twinkle.server clear persistence --config <yaml>` and relaunch.')

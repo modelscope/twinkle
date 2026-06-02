@@ -14,19 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import os
-import uuid
-
 import pytest
+import uuid
 
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.factory import PersistenceConfig, create_backend
 from twinkle.server.state.backend.redis_backend import RedisBackend
 
-
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
 
 def _can_reach_redis() -> bool:
+
     async def _check() -> bool:
         backend = RedisBackend(REDIS_URL)
         try:
@@ -81,9 +80,7 @@ def make_state(isolation_prefix: str):
     created: list[ServerState] = []
 
     def _make() -> ServerState:
-        backend = create_backend(
-            PersistenceConfig(mode='redis', redis_url=REDIS_URL, key_prefix=isolation_prefix)
-        )
+        backend = create_backend(PersistenceConfig(mode='redis', redis_url=REDIS_URL, key_prefix=isolation_prefix))
         state = ServerState(backend=backend)
         created.append(state)
         return state
@@ -123,9 +120,7 @@ async def test_property_26_model_write_visible(make_state) -> None:
     b = make_state()
     rid = f'r-{uuid.uuid4().hex[:6]}'
     await a.register_replica(rid, max_loras=2)
-    mid = await a.register_model(
-        {'base_model': 'mock'}, token='tok-A', model_id='mid-A', replica_id=rid
-    )
+    mid = await a.register_model({'base_model': 'mock'}, token='tok-A', model_id='mid-A', replica_id=rid)
 
     meta = await b.get_model_metadata(mid)
     assert meta is not None
@@ -159,7 +154,7 @@ async def test_property_27_concurrent_config_writes_no_torn_records(make_state) 
     async def writer(state: ServerState, items: dict) -> None:
         await asyncio.gather(*(state.add_config(k, v) for k, v in items.items()))
 
-    half = list(payload.items())[: n // 2]
+    half = list(payload.items())[:n // 2]
     other = list(payload.items())[n // 2:]
     await asyncio.gather(writer(a, dict(half)), writer(b, dict(other)))
 

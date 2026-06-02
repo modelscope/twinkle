@@ -5,9 +5,8 @@
 """
 from __future__ import annotations
 
-from unittest import mock
-
 import pytest
+from unittest import mock
 
 from twinkle.server.telemetry import context_carrier
 from twinkle.server.telemetry.context_carrier import activate_carrier, make_carrier

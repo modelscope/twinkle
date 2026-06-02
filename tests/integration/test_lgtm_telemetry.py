@@ -27,15 +27,14 @@ hop is OTel SDK code, not Twinkle code, so it has no separate Twinkle test.
 """
 from __future__ import annotations
 
+import httpx
 import os
+import pytest
 import socket
 import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
-
-import httpx
-import pytest
 
 OTLP_ENDPOINT = os.environ.get('TWINKLE_TEST_OTLP_ENDPOINT', 'http://localhost:4317')
 GRAFANA_URL = os.environ.get('TWINKLE_TEST_GRAFANA_URL', 'http://localhost:3000')
@@ -85,13 +84,10 @@ _BACKEND = _detect_backend()
 
 pytestmark = pytest.mark.skipif(
     _BACKEND is None,
-    reason=(
-        f'No trace backend reachable. OTLP at {OTLP_ENDPOINT}, Grafana at {GRAFANA_URL}, '
-        f'Jaeger at {JAEGER_URL}. Start one (cookbook/observability/docker-compose.yaml '
-        'or `docker run jaegertracing/all-in-one:1.62.0`).'
-    ),
+    reason=(f'No trace backend reachable. OTLP at {OTLP_ENDPOINT}, Grafana at {GRAFANA_URL}, '
+            f'Jaeger at {JAEGER_URL}. Start one (cookbook/observability/docker-compose.yaml '
+            'or `docker run jaegertracing/all-in-one:1.62.0`).'),
 )
-
 
 # ---------- helpers ------------------------------------------------------- #
 
@@ -186,24 +182,22 @@ def _spans_in_trace(payload: dict) -> list[dict]:
         for batch in payload.get('batches', []):
             for scope in batch.get('scopeSpans', []):
                 for span in scope.get('spans', []):
-                    out.append(
-                        {
-                            'name': span.get('name'),
-                            'attributes': {
-                                a['key']: a.get('value', {}).get('stringValue')
-                                for a in span.get('attributes', [])
-                            },
-                        }
-                    )
+                    out.append({
+                        'name': span.get('name'),
+                        'attributes': {
+                            a['key']: a.get('value', {}).get('stringValue')
+                            for a in span.get('attributes', [])
+                        },
+                    })
         return out
     # Jaeger trace JSON: top-level "spans" with operationName + tags.
-    return [
-        {
-            'name': s['operationName'],
-            'attributes': {t['key']: t.get('value') for t in s.get('tags', [])},
-        }
-        for s in payload.get('spans', [])
-    ]
+    return [{
+        'name': s['operationName'],
+        'attributes': {
+            t['key']: t.get('value')
+            for t in s.get('tags', [])
+        },
+    } for s in payload.get('spans', [])]
 
 
 # ---------- 7.15: trace + correlation visible in the trace store --------- #
@@ -226,8 +220,11 @@ def test_business_span_with_correlation_visible_e2e() -> None:
         tracer = trace.get_tracer('twinkle.test.trace')
         with tracer.start_as_current_span('integration.parent') as parent:
             with traced_operation(
-                'server_state.register_model',
-                attrs={SESSION_ID: session_id, MODEL_ID: model_id},
+                    'server_state.register_model',
+                    attrs={
+                        SESSION_ID: session_id,
+                        MODEL_ID: model_id
+                    },
             ):
                 pass
             trace_id_hex = format(parent.get_span_context().trace_id, '032x')
@@ -236,12 +233,10 @@ def test_business_span_with_correlation_visible_e2e() -> None:
     assert payload is not None, f'trace {trace_id_hex} not found in {_BACKEND}'
 
     attrs_per_span = [s['attributes'] for s in _spans_in_trace(payload)]
-    assert any(a.get(SESSION_ID) == session_id for a in attrs_per_span), (
-        f'{SESSION_ID} not on any span in {_BACKEND}: {attrs_per_span}'
-    )
-    assert any(a.get(MODEL_ID) == model_id for a in attrs_per_span), (
-        f'{MODEL_ID} not on any span in {_BACKEND}: {attrs_per_span}'
-    )
+    assert any(a.get(SESSION_ID) == session_id
+               for a in attrs_per_span), (f'{SESSION_ID} not on any span in {_BACKEND}: {attrs_per_span}')
+    assert any(a.get(MODEL_ID) == model_id
+               for a in attrs_per_span), (f'{MODEL_ID} not on any span in {_BACKEND}: {attrs_per_span}')
 
 
 # ---------- 10.4: single-trace-id fan-out across deployments (R13.3) ----- #

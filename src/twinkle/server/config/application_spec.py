@@ -11,12 +11,10 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
-
 
 # ---------- shared helpers ------------------------------------------------- #
 
@@ -101,7 +99,6 @@ _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
     'sampler': SamplerArgs,
     'processor': ProcessorArgs,
 }
-
 
 # ---------- ApplicationSpec ------------------------------------------------ #
 

@@ -73,9 +73,7 @@ class ModelManager(BaseManager[ModelRecord]):
         if not candidate_ids:
             return []
         replicas = await self._replicas.get_all()
-        loaded_per_replica = await self._loaded_per_replica(
-            replica_filter=set(candidate_ids) | replicas.keys()
-        )
+        loaded_per_replica = await self._loaded_per_replica(replica_filter=set(candidate_ids) | replicas.keys())
         available: list[str] = []
         for rid in candidate_ids:
             max_loras = replicas.get(rid)
@@ -99,9 +97,7 @@ class ModelManager(BaseManager[ModelRecord]):
         token = record.token
         current = await self._count_models_for_token(token)
         if current >= self._per_token_model_limit:
-            raise RuntimeError(
-                f'Model limit exceeded: {current}/{self._per_token_model_limit} models'
-            )
+            raise RuntimeError(f'Model limit exceeded: {current}/{self._per_token_model_limit} models')
         await super().add(model_id, record)
 
     async def remove(self, model_id: str) -> bool:
@@ -142,9 +138,7 @@ class ModelManager(BaseManager[ModelRecord]):
         all_records = await self.get_all()
         return [mid for mid, r in all_records.items() if r.replica_id == replica_id]
 
-    async def _loaded_per_replica(
-        self, replica_filter: set[str] | None = None
-    ) -> dict[str, int]:
+    async def _loaded_per_replica(self, replica_filter: set[str] | None = None) -> dict[str, int]:
         all_records = await self.get_all()
         counts: dict[str, int] = {}
         for record in all_records.values():

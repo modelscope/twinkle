@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterator, Mapping
-
 from fastapi import Request
+from typing import Any, Iterator, Mapping
 
 try:
     from opentelemetry import trace
-    from opentelemetry.propagate import inject, extract
     from opentelemetry.context import Context
+    from opentelemetry.propagate import extract, inject
     _OTEL_AVAILABLE = True
 except Exception:
     _OTEL_AVAILABLE = False
 
-
 from .correlation import set_correlation_attrs
 
 
-def get_tracer(name: str = "twinkle-server"):
+def get_tracer(name: str = 'twinkle-server'):
     """Retrieve tracer instance. Returns NoOp tracer when OTEL is not installed."""
     if not _OTEL_AVAILABLE:
         return _NoopTracer()
@@ -49,18 +47,32 @@ def get_current_span():
 
 class _NoopSpan:
     """Minimal noop span for when OTEL is not available."""
-    def set_attribute(self, *args, **kwargs): pass
-    def set_status(self, *args, **kwargs): pass
-    def add_event(self, *args, **kwargs): pass
-    def end(self, *args, **kwargs): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
+
+    def set_attribute(self, *args, **kwargs):
+        pass
+
+    def set_status(self, *args, **kwargs):
+        pass
+
+    def add_event(self, *args, **kwargs):
+        pass
+
+    def end(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
 
 
 class _NoopTracer:
     """Minimal noop tracer for when OTEL is not available."""
+
     def start_as_current_span(self, name, **kwargs):
         return _NoopSpan()
+
     def start_span(self, name, **kwargs):
         return _NoopSpan()
 
@@ -121,8 +133,10 @@ def create_tracing_middleware(service_component: str):
         An async FastAPI HTTP middleware function.
     """
     if not _OTEL_AVAILABLE:
+
         async def passthrough_middleware(request: Request, call_next):
             return await call_next(request)
+
         return passthrough_middleware
 
     async def tracing_middleware(request: Request, call_next):

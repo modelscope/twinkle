@@ -2,15 +2,12 @@
 """Smoke checks for the Phase 5 documentation set (R8.3, R11.4, R17)."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-
 # ---------- file presence ------------------------------------------------- #
-
 
 OBSERVABILITY_EN = REPO_ROOT / 'docs' / 'source_en' / 'Usage Guide' / 'Observability.md'
 OBSERVABILITY_ZH = REPO_ROOT / 'docs' / 'source_zh' / '使用指引' / '可观测化.md'
@@ -29,7 +26,6 @@ def test_doc_exists(path: Path) -> None:
 
 
 # ---------- observability guide content (R11.4, R17.1, R17.2) ------------ #
-
 
 _CORRELATION_KEYS = (
     'twinkle.session_id',

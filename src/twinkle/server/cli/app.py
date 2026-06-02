@@ -19,11 +19,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from pathlib import Path
-from typing import Optional
-
 import typer
 import yaml
+from pathlib import Path
+from typing import Optional
 
 from twinkle.server.config import ServerConfig
 from twinkle.server.exceptions import ConfigMismatchError, ConfigParseError
@@ -40,7 +39,6 @@ clear_app = typer.Typer(
 )
 app.add_typer(clear_app, name='clear')
 
-
 CONFIG_OPTION = typer.Option(
     ...,
     '--config',
@@ -53,7 +51,7 @@ NAMESPACE_OPTION = typer.Option(
     None,
     '--namespace',
     envvar='TWINKLE_RAY_NAMESPACE',
-    help="Ray namespace (overrides ray_namespace in the config).",
+    help='Ray namespace (overrides ray_namespace in the config).',
 )
 
 
@@ -84,7 +82,7 @@ def _signature_payload(config: ServerConfig) -> dict:
 @app.command('launch')
 def launch_cmd(
     config: Path = CONFIG_OPTION,
-    namespace: Optional[str] = NAMESPACE_OPTION,
+    namespace: str | None = NAMESPACE_OPTION,
 ) -> None:
     """Start the Twinkle Server from a YAML config file (R14.1, R15.1)."""
     cfg = _load_config(config)
@@ -116,8 +114,8 @@ def check_config_cmd(config: Path = CONFIG_OPTION) -> None:
 
 @app.command('print-config')
 def print_config_cmd(
-    config: Path = CONFIG_OPTION,
-    fmt: str = typer.Option('yaml', '--format', envvar='TWINKLE_PRINT_FORMAT', help='yaml|json'),
+        config: Path = CONFIG_OPTION,
+        fmt: str = typer.Option('yaml', '--format', envvar='TWINKLE_PRINT_FORMAT', help='yaml|json'),
 ) -> None:
     """Emit the validated, normalized ``ServerConfig`` (R14.5)."""
     cfg = _load_config(config)

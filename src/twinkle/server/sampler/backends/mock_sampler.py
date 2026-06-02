@@ -13,12 +13,11 @@ produce identical token sequences and logprobs (R2.5).
 """
 from __future__ import annotations
 
+import numpy as np
 from typing import Any, List, Optional
 
-import numpy as np
-
 # These data containers don't pull torch / vllm.
-from twinkle.data_format import SampleResponse, SampledSequence, SamplingParams
+from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 
 
 class MockSampler:
@@ -42,17 +41,15 @@ class MockSampler:
     def sample(
         self,
         inputs: Any,
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: SamplingParams | None = None,
         adapter_name: str = '',
         *,
         num_samples: int = 1,
-    ) -> List[SampleResponse]:
+    ) -> list[SampleResponse]:
         max_tokens = self._resolve_max_tokens(sampling_params)
         if max_tokens is None or max_tokens < 1:
-            raise ValueError(
-                f'max_tokens must be >= 1, got {max_tokens!r} '
-                '(set sampling_params.max_tokens to a positive integer)'
-            )
+            raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r} '
+                             '(set sampling_params.max_tokens to a positive integer)')
 
         normalized = self._normalize_inputs(inputs)
         responses: list[SampleResponse] = []
@@ -60,21 +57,20 @@ class MockSampler:
             sequences: list[SampledSequence] = []
             for sample_idx in range(num_samples):
                 seed = (
-                    abs(hash((str(self.model_id), str(adapter_name), int(self._seed), int(prompt_idx), int(sample_idx))))
-                    & 0xFFFFFFFF
-                )
+                    abs(
+                        hash(
+                            (str(self.model_id), str(adapter_name), int(self._seed), int(prompt_idx), int(sample_idx))))
+                    & 0xFFFFFFFF)
                 rng = np.random.default_rng(seed)
                 tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
                 logprobs_per_token = rng.uniform(-2.0, 0.0, size=max_tokens).astype(float).tolist()
                 # One logprob entry per emitted token (R2.4) — list of (id, logprob).
                 logprobs = [[(tok, float(lp))] for tok, lp in zip(tokens, logprobs_per_token)]
-                sequences.append(
-                    SampledSequence(
-                        stop_reason='length',
-                        tokens=tokens,
-                        logprobs=logprobs,
-                    )
-                )
+                sequences.append(SampledSequence(
+                    stop_reason='length',
+                    tokens=tokens,
+                    logprobs=logprobs,
+                ))
             responses.append(SampleResponse(sequences=sequences))
         return responses
 
@@ -100,7 +96,7 @@ class MockSampler:
         return [inputs]
 
     @staticmethod
-    def _resolve_max_tokens(params: Optional[SamplingParams]) -> Optional[int]:
+    def _resolve_max_tokens(params: SamplingParams | None) -> int | None:
         if params is None:
             return None
         return getattr(params, 'max_tokens', None)

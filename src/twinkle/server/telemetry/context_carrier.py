@@ -20,7 +20,8 @@ from typing import Any, Iterator, Mapping
 
 try:
     from opentelemetry import context as _otel_context  # type: ignore
-    from opentelemetry.propagate import extract as _otel_extract, inject as _otel_inject  # type: ignore
+    from opentelemetry.propagate import extract as _otel_extract  # type: ignore
+    from opentelemetry.propagate import inject as _otel_inject
 
     _OTEL_AVAILABLE = True
 except Exception:

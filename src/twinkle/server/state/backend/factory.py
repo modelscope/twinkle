@@ -3,15 +3,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Literal
-
 from pydantic import BaseModel, ConfigDict
+from typing import Literal
 
 from .base import StateBackend
 from .memory_backend import MemoryBackend
 
 logger = logging.getLogger(__name__)
-
 
 # Env var keys propagated by the launcher so that any Ray worker can rebuild
 # the same PersistenceConfig regardless of which deployment initializes the

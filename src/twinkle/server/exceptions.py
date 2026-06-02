@@ -14,7 +14,12 @@ class StateBackendError(TwinkleServerError):
 
 
 class ConfigMismatchError(TwinkleServerError):
-    """Configuration signature mismatch — config changes detected after restart, persisted data may be incompatible with current configuration."""
+    """Configuration signature mismatch — config changed since last launch.
+
+    Persisted data may be incompatible with the current configuration; the
+    operator must reconcile (revert the config change or clear persisted
+    state) before the server can start.
+    """
     pass
 
 

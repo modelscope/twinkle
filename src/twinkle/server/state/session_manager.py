@@ -16,7 +16,7 @@ class SessionManager(BaseManager[SessionRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
-        super().__init__(backend, "session::", SessionRecord, expiration_timeout)
+        super().__init__(backend, 'session::', SessionRecord, expiration_timeout)
 
     # ----- Session-specific operations -----
 

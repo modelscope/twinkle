@@ -11,23 +11,17 @@ Properties covered:
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from pathlib import Path
 
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.sampler.app import (
-    _SAMPLER_TYPES,
-    _dispatch_sampler_backend,
-    _validate_sampler_type,
-)
+from twinkle.server.sampler.app import _SAMPLER_TYPES, _dispatch_sampler_backend, _validate_sampler_type
 from twinkle.server.sampler.backends.mock_sampler import MockSampler
 
-
 # ---------- Property 5: interface conformance (R2.1) ---------------------- #
-
 
 _REQUIRED_METHODS = ('sample', 'apply_patch', 'add_adapter_to_sampler', 'has_adapter')
 
@@ -99,7 +93,9 @@ def test_property_8_no_sampling_params_raises() -> None:
 
 
 @settings(max_examples=100)
-@given(name=st.text(min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
+@given(
+    name=st.text(
+        min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
 def test_property_9_add_adapter_to_sampler(name: str) -> None:
     s = MockSampler('mid')
     assert not s.has_adapter(name)
@@ -139,7 +135,8 @@ def test_property_11_absent_or_empty_sampler_type_raises(value) -> None:
 
 def test_mock_sampler_module_does_not_directly_import_vllm() -> None:
     """Static check: ``mock_sampler.py`` must not import ``vllm`` directly."""
-    src = Path(__file__).resolve().parents[3] / 'src' / 'twinkle' / 'server' / 'sampler' / 'backends' / 'mock_sampler.py'
+    src = Path(
+        __file__).resolve().parents[3] / 'src' / 'twinkle' / 'server' / 'sampler' / 'backends' / 'mock_sampler.py'
     text = src.read_text()
     for forbidden in ('import vllm', 'from vllm'):
         assert forbidden not in text, f'mock_sampler.py contains {forbidden!r}'
@@ -154,7 +151,10 @@ def test_mock_example_config_loads_via_server_config() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     cfg_path = repo_root / 'cookbook' / 'client' / 'server' / 'mock' / 'server_config.yaml'
     cfg = ServerConfig.from_yaml(cfg_path)
-    backends = {a.name: getattr(a.args, 'backend', None) or getattr(a.args, 'sampler_type', None) for a in cfg.applications}
+    backends = {
+        a.name: getattr(a.args, 'backend', None) or getattr(a.args, 'sampler_type', None)
+        for a in cfg.applications
+    }
     assert backends.get('models-mock') == 'mock'
     assert backends.get('sampler-mock') == 'mock'
 
