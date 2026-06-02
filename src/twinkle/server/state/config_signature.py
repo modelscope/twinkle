@@ -71,9 +71,9 @@ async def validate_config_signature(
         return True
 
     # Mismatch detected
-    logger.warning(f"Config signature mismatch! "
-                   f"Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... "
-                   f"Policy: {policy.value}")
+    logger.warning(f'Config signature mismatch! '
+                   f'Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... '
+                   f'Policy: {policy.value}')
 
     if policy == SignatureMismatchPolicy.WARN:
         # Update to new signature and continue
@@ -91,8 +91,8 @@ async def validate_config_signature(
         return False
 
     elif policy == SignatureMismatchPolicy.ABORT:
-        raise ConfigMismatchError(f"Configuration signature mismatch. "
-                                  f"Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... "
+        raise ConfigMismatchError(f'Configuration signature mismatch. '
+                                  f'Stored: {stored_sig[:12]}..., Current: {current_sig[:12]}... '
                                   f"Use policy='warn' or 'clear' to allow startup with changed config.")
 
     return False

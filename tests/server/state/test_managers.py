@@ -147,7 +147,7 @@ class TestModelManager:
     async def test_token_limit_enforced(self, manager):
         """Adding more models than per_token_model_limit should raise RuntimeError."""
         for i in range(3):
-            await manager.add(f"m{i}", ModelRecord(token='tok1'))
+            await manager.add(f'm{i}', ModelRecord(token='tok1'))
 
         with pytest.raises(RuntimeError, match='Model limit exceeded'):
             await manager.add('m3', ModelRecord(token='tok1'))
@@ -156,7 +156,7 @@ class TestModelManager:
     async def test_token_limit_per_token(self, manager):
         """Limit is per-token, different tokens have separate limits."""
         for i in range(3):
-            await manager.add(f"a{i}", ModelRecord(token='tokenA'))
+            await manager.add(f'a{i}', ModelRecord(token='tokenA'))
         # Different token should work
         await manager.add('b0', ModelRecord(token='tokenB'))
         assert await manager.get('b0') is not None

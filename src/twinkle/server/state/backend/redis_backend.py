@@ -28,7 +28,7 @@ class RedisBackend(StateBackend):
 
     def _make_key(self, key: str) -> str:
         """Add namespace prefix to key."""
-        return f"{self._prefix}{key}" if self._prefix else key
+        return f'{self._prefix}{key}' if self._prefix else key
 
     def _strip_prefix(self, key: str) -> str:
         """Remove namespace prefix from full key."""

@@ -23,12 +23,12 @@ class BaseManager(ABC, Generic[T]):
 
     def __init__(self, backend: StateBackend, key_prefix: str, record_type: type[T], expiration_timeout: float):
         self._backend = backend
-        self._prefix = key_prefix  # e.g. "session::", "model::", "sampling::", "future::"
+        self._prefix = key_prefix  # e.g. 'session::', 'model::', 'sampling::', 'future::'
         self._record_type = record_type
         self.expiration_timeout = expiration_timeout
 
     def _make_key(self, resource_id: str) -> str:
-        return f"{self._prefix}{resource_id}"
+        return f'{self._prefix}{resource_id}'
 
     def _strip_prefix(self, key: str) -> str:
         return key[len(self._prefix):]
@@ -56,16 +56,16 @@ class BaseManager(ABC, Generic[T]):
 
     async def count(self) -> int:
         """Count all records managed by this manager."""
-        return await self._backend.count(f"{self._prefix}*")
+        return await self._backend.count(f'{self._prefix}*')
 
     async def keys(self) -> list[str]:
         """Get all resource IDs (without prefix)."""
-        raw_keys = await self._backend.keys(f"{self._prefix}*")
+        raw_keys = await self._backend.keys(f'{self._prefix}*')
         return [self._strip_prefix(k) for k in raw_keys]
 
     async def get_all(self) -> dict[str, T]:
         """Load all records from backend. Used for index rebuilding."""
-        all_keys = await self._backend.keys(f"{self._prefix}*")
+        all_keys = await self._backend.keys(f'{self._prefix}*')
         result = {}
         for key in all_keys:
             data = await self._backend.get(key)
