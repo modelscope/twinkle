@@ -210,13 +210,15 @@ class AccelerateStrategy:
         unwrapped = self.unwrap_model(model)
         state_dict = {}
         adapter_suffix = f'.{adapter_name}.'
+        fallback_state_dict = {}
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not _is_lora_state_key(name):
                 continue
             local = torch_util.to_local_tensor(param)
-            state_dict[name] = local.cpu()
+            target_dict = state_dict if adapter_suffix in name else fallback_state_dict
+            target_dict[name] = local.cpu()
             del local
-        return state_dict
+        return state_dict or fallback_state_dict
 
 
 def _is_lora_state_key(name: str) -> bool:
