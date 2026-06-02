@@ -33,6 +33,7 @@ class SwanLabTracker(ExperimentTracker):
         output_dir: Optional[str] = None,
         **kwargs,
     ):
+
         import swanlab
 
         api_key = kwargs.pop('api_key', None) or os.environ.get('SWANLAB_API_KEY')
@@ -40,7 +41,13 @@ class SwanLabTracker(ExperimentTracker):
         mode = kwargs.pop('mode', None) or os.environ.get('SWANLAB_MODE', 'cloud')
 
         if api_key:
-            swanlab.login(api_key)
+            try:
+                swanlab.login(api_key)
+            except RuntimeError as _e:
+                if 'already called' in str(_e).lower() or 'after calling' in str(_e).lower():
+                    logger.debug('swanlab.login already called, skipping')
+                else:
+                    raise
 
         self._run = swanlab.init(
             project=project,

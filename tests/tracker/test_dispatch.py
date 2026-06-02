@@ -44,10 +44,11 @@ sys.modules.setdefault('twinkle.utils.platforms', MagicMock())
 sys.modules.setdefault('twinkle.utils.logger', MagicMock())
 sys.modules.setdefault('swanlab', MagicMock())
 
-import twinkle.tracker as tracker_mod
-from twinkle.tracker import clear_trackers, dispatch, dispatch_hyperparams, list_trackers, register_tracker, set_rank
+import twinkle.tracker as tracker_mod  # noqa: E402
+from twinkle.tracker import (clear_trackers, dispatch, dispatch_hyperparams, list_trackers,  # noqa: E402
+                             register_tracker, set_rank)
 # Now safe to import
-from twinkle.tracker.base import ExperimentTracker
+from twinkle.tracker.base import ExperimentTracker  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +100,8 @@ class ErrorTracker(ExperimentTracker):
 @pytest.fixture(autouse=True)
 def _reset_global_state():
     """Reset module-level state before every test."""
-    tracker_mod._trackers.clear()
+    tracker_mod._global_trackers.clear()
+    tracker_mod._adapter_trackers.clear()
     tracker_mod._rank = 0
     tracker_mod._hparams_dispatched.clear()
     yield
@@ -416,7 +418,8 @@ class TestAutoInitFromEnv:
     def _reset_auto_init(self):
         """Allow _auto_init_from_env to run again."""
         tracker_mod._AUTO_INIT_DONE = False
-        tracker_mod._trackers.clear()
+        tracker_mod._global_trackers.clear()
+        tracker_mod._adapter_trackers.clear()
 
     def test_env_empty_is_noop(self):
         """No TWINKLE_TRACKERS → nothing registered."""

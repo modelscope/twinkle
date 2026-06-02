@@ -5,7 +5,12 @@ Usage::
 
     from twinkle.tracker import SwanLabTracker, register_tracker
 
+    # Global tracker — receives metrics from all adapters.
     register_tracker(SwanLabTracker(project="my-project"))
+
+    # Per-adapter tracker — receives metrics only from a specific adapter.
+    register_tracker(SwanLabTracker(project="adapter-a"), adapter_name="lora_a")
+
     # training loop unchanged — dispatch happens automatically.
 
 Or via environment variables (no code change)::
@@ -28,7 +33,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-_trackers: List[ExperimentTracker] = []
+# Trackers that receive metrics from ALL adapters.
+_global_trackers: List[ExperimentTracker] = []
+# Trackers that receive metrics only from a specific adapter.
+# Key: adapter_name. Value: list of trackers.
+_adapter_trackers: Dict[str, List[ExperimentTracker]] = {}
 _rank: int = 0
 _hparams_dispatched: set = set()  # track which adapters have sent hyperparams
 
@@ -37,14 +46,23 @@ _hparams_dispatched: set = set()  # track which adapters have sent hyperparams
 # ---------------------------------------------------------------------------
 
 
-def register_tracker(tracker: ExperimentTracker) -> None:
+def register_tracker(tracker: ExperimentTracker, adapter_name: Optional[str] = None) -> None:
     """Register an experiment tracker.
+
+    Args:
+        tracker: An ``ExperimentTracker`` instance.
+        adapter_name: If provided, the tracker receives metrics only
+            from the training loop of *adapter_name*.  If ``None``
+            (default), the tracker receives metrics from **all** adapters.
 
     Multiple trackers can be registered — ``dispatch`` will send metric
     data to each one in order.  Trackers are cleaned up automatically on
     normal interpreter exit via ``atexit``.
     """
-    _trackers.append(tracker)
+    if adapter_name is not None:
+        _adapter_trackers.setdefault(adapter_name, []).append(tracker)
+    else:
+        _global_trackers.append(tracker)
 
 
 def set_rank(rank: int) -> None:
@@ -58,9 +76,21 @@ def set_rank(rank: int) -> None:
     _rank = rank
 
 
-def list_trackers() -> List[ExperimentTracker]:
-    """Return a snapshot of currently registered trackers."""
-    return list(_trackers)
+def list_trackers(adapter_name: Optional[str] = None) -> List[ExperimentTracker]:
+    """Return a snapshot of currently registered trackers.
+
+    Args:
+        adapter_name: If provided, returns only trackers registered
+            for that specific adapter (plus global trackers).  If
+            ``None``, returns all trackers.
+    """
+    result = list(_global_trackers)
+    if adapter_name is not None:
+        result.extend(_adapter_trackers.get(adapter_name, []))
+    else:
+        for ts in _adapter_trackers.values():
+            result.extend(ts)
+    return result
 
 
 def clear_trackers() -> None:
@@ -68,12 +98,16 @@ def clear_trackers() -> None:
 
     Registered automatically via ``atexit``; may also be called manually.
     """
-    for t in _trackers:
+    all_trackers = list(_global_trackers)
+    for ts in _adapter_trackers.values():
+        all_trackers.extend(ts)
+    for t in all_trackers:
         try:
             t.cleanup()
         except Exception:
             logger.warning('Tracker %s.cleanup() failed', type(t).__name__, exc_info=True)
-    _trackers.clear()
+    _global_trackers.clear()
+    _adapter_trackers.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +115,20 @@ def clear_trackers() -> None:
 # ---------------------------------------------------------------------------
 
 
-def dispatch(data: Dict[str, float], step: int) -> None:
-    """Send computed metrics to all registered trackers.
+def _target_trackers(adapter_name: Optional[str] = None) -> List[ExperimentTracker]:
+    """Resolve the list of trackers that should receive data for *adapter_name*.
+
+    Global trackers always receive data.  If *adapter_name* is given,
+    per-adapter trackers for that name also receive data.
+    """
+    result = list(_global_trackers)
+    if adapter_name is not None:
+        result.extend(_adapter_trackers.get(adapter_name, []))
+    return result
+
+
+def dispatch(data: Dict[str, float], step: int, adapter_name: Optional[str] = None) -> None:
+    """Send computed metrics to registered trackers.
 
     Metric values are normalized to ``float`` via :func:`clean_metrics`
     before dispatching.  Only the rank-0 process performs the dispatch;
@@ -91,8 +137,12 @@ def dispatch(data: Dict[str, float], step: int) -> None:
     Args:
         data: Raw metric dict (may contain strings, ints, floats).
         step: Current training step (``cur_step`` from optimizer group).
+        adapter_name: Optional adapter identifier.  If provided, metrics
+            are sent to both global trackers and any trackers registered
+            specifically for this adapter.
     """
-    if not _trackers:
+    targets = _target_trackers(adapter_name)
+    if not targets:
         return
     if _rank != 0:
         return
@@ -101,7 +151,7 @@ def dispatch(data: Dict[str, float], step: int) -> None:
     if not cleaned:
         return
 
-    for tracker in _trackers:
+    for tracker in targets:
         try:
             tracker.log(cleaned, step=step)
         except Exception:
@@ -109,7 +159,7 @@ def dispatch(data: Dict[str, float], step: int) -> None:
 
 
 def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = None) -> None:
-    """Send hyperparameters to all registered trackers (call once at training start).
+    """Send hyperparameters to registered trackers (call once at training start).
 
     Idempotent per ``(adapter_name,)`` — repeated calls with the same
     *adapter_name* are silently ignored so that this can safely be called
@@ -120,9 +170,12 @@ def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = N
         params: Flat or nested dict of hyperparameters (e.g. model config,
             training args, LoRA config).
         adapter_name: Optional adapter identifier.  If omitted, the params
-            are dispatched unconditionally on every call.
+            are dispatched unconditionally to global trackers on every
+            call.  If provided, dispatched to both global and per-adapter
+            trackers, with idempotency guard.
     """
-    if not _trackers or _rank != 0:
+    targets = _target_trackers(adapter_name)
+    if not targets or _rank != 0:
         return
 
     # Idempotency guard: only dispatch once per adapter
@@ -131,7 +184,7 @@ def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = N
             return
         _hparams_dispatched.add(adapter_name)
 
-    for tracker in _trackers:
+    for tracker in targets:
         try:
             tracker.log_hyperparams(params)
         except Exception:
@@ -171,7 +224,7 @@ def _auto_init_from_env() -> None:
     for name in (t.strip().lower() for t in trackers_str.split(',') if t.strip()):
         try:
             if name == 'wandb':
-                _trackers.append(
+                _global_trackers.append(
                     WandbTracker(
                         project=project,
                         experiment_name=experiment_name,
@@ -179,7 +232,7 @@ def _auto_init_from_env() -> None:
                     ))
                 logger.info('Auto-registered WandbTracker from TWINKLE_TRACKERS env var')
             elif name == 'swanlab':
-                _trackers.append(
+                _global_trackers.append(
                     SwanLabTracker(
                         project=project,
                         experiment_name=experiment_name,

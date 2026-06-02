@@ -90,10 +90,10 @@ class BaseOptimizerGroup:
         status.inputs = None
         status.outputs = None
 
-        # Dispatch to registered experiment trackers
+        # Dispatch to registered experiment trackers (adapter-aware)
         if is_training:
             from twinkle.tracker import dispatch, dispatch_hyperparams
-            dispatch(results, step=self.cur_step)
+            dispatch(results, step=self.cur_step, adapter_name=self.adapter_name)
             # Lazily log hyperparams on the first training metrics call
             dispatch_hyperparams(
                 {
