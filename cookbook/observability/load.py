@@ -19,23 +19,31 @@ are caused by:
 
 Pre-reqs
 --------
-1.  Observability stack running::
+1.  Observability stack + Redis running::
 
         docker compose -f cookbook/observability/docker-compose.yaml up -d
+        docker run -d --name twinkle-redis -p 6379:6379 redis:7
 
-2.  Mock server running with telemetry **enabled**. The shipped
-    ``cookbook/client/server/mock/server_config.yaml`` has
-    ``telemetry.enabled: false``; override via env vars before launching.
-    NB: the worker-side flag is read as the literal string ``"1"`` (see
-    ``twinkle.server.telemetry.worker_init.ensure_telemetry_initialized``),
-    NOT ``"true"`` / ``"yes"``::
+2.  Mock server running with telemetry **enabled** and a SHARED persistence
+    backend. The shipped ``cookbook/client/server/mock/server_config.yaml``
+    ships ``mode: memory`` which is per-process — Gateway-worker sessions
+    are invisible to Model worker, the adapter countdown loop sees "session
+    not found" and expires registered adapters within ~10s (which empties
+    the ``twinkle_models_active`` gauge). For this load script to populate
+    every panel, switch persistence to redis::
+
+        persistence: { mode: redis, redis_url: redis://localhost:6379 }
+
+    Telemetry: the worker reads the env flag as the literal string ``"1"``
+    (see ``telemetry.worker_init.ensure_telemetry_initialized``), NOT
+    ``"true"``::
 
         TWINKLE_TELEMETRY_ENABLED=1 \\
         TWINKLE_TELEMETRY_ENDPOINT=http://localhost:4317 \\
         python -m twinkle.server launch \\
             --config cookbook/client/server/mock/server_config.yaml
 
-    Also start Ray first (the launcher does ``ray.init(address='auto')`` and
+    Start Ray first (the launcher does ``ray.init(address='auto')`` and
     will refuse to spin one up locally)::
 
         ray start --head --num-cpus=4 --disable-usage-stats
@@ -119,18 +127,57 @@ def _lora_config_payload(rank: int = 8) -> str:
     })
 
 
-async def create_session(client: httpx.AsyncClient, session_id: str) -> bool:
-    """POST /api/v1/twinkle/create_session — moves ``active_sessions`` gauge."""
+async def create_session(client: httpx.AsyncClient) -> str | None:
+    """POST /api/v1/twinkle/create_session — returns the SERVER-issued
+    ``session_id`` so subsequent ``X-Twinkle-Session-Id`` headers reference
+    a session the server actually persisted. Using a client-side string
+    would silently fail liveness checks (the adapter countdown loop in
+    ``utils/lifecycle/base.py`` calls ``state.get_session_last_heartbeat``
+    and expires adapters within ~10s when the ID isn't found)."""
     r = await client.post(
         f'{GATEWAY_ROUTE}/twinkle/create_session',
-        headers=_headers(session_id, request_id=uuid.uuid4().hex),
+        headers=_headers('', request_id=uuid.uuid4().hex),
         json={'metadata': {'source': 'load.py'}},
         timeout=10.0,
     )
     if r.status_code != 200:
         print(f'  create_session -> {r.status_code} {r.text[:160]}')
-        return False
-    return True
+        return None
+    return r.json().get('session_id')
+
+
+async def create_sampling_session(client: httpx.AsyncClient, session_id: str, model_path: str) -> None:
+    """POST /api/v1/create_sampling_session — bumps ``active_sampling_sessions``.
+    This is a Tinker route mounted at the gateway root (NOT under
+    ``/twinkle/``); the Twinkle gateway handlers only expose ``create_session``."""
+    try:
+        await client.post(
+            f'{GATEWAY_ROUTE}/create_sampling_session',
+            headers=_headers(session_id, request_id=uuid.uuid4().hex),
+            json={
+                'session_id': session_id,
+                'sampling_session_seq_id': 0,
+                'model_path': model_path,
+                'base_model': 'mock-model',
+            },
+            timeout=10.0,
+        )
+    except Exception:
+        pass
+
+
+async def session_heartbeat(client: httpx.AsyncClient, session_id: str) -> None:
+    """POST /api/v1/twinkle/session_heartbeat — refreshes the session so
+    the adapter countdown loop doesn't expire registered adapters mid-load."""
+    try:
+        await client.post(
+            f'{GATEWAY_ROUTE}/twinkle/session_heartbeat',
+            headers=_headers(session_id, request_id=uuid.uuid4().hex),
+            json={'session_id': session_id},
+            timeout=5.0,
+        )
+    except Exception:
+        pass
 
 
 async def add_adapter(client: httpx.AsyncClient, adapter_name: str, session_id: str, request_id: str) -> bool:
@@ -197,28 +244,37 @@ async def user_loop(
     max_tokens: int,
 ) -> None:
     """Per-user driver: create_session + add_adapter once, then loop sample
-    (and occasional forward_only) until the deadline."""
-    session_id = f'load-user-{user_id}-{uuid.uuid4().hex[:6]}'
+    (and occasional forward_only) until the deadline. Periodically heartbeats
+    the session so the adapter countdown loop doesn't expire registered
+    adapters mid-load (default adapter_timeout is 1800s, but a missing
+    heartbeat trips ``_is_session_alive`` long before that)."""
     adapter_name = f'adapter-u{user_id}-{uuid.uuid4().hex[:6]}'
-    # Pinned per-user request id for the sticky-LoRA path (forward_only against
-    # the adapter we register in this loop iteration).
     sticky_request_id = uuid.uuid4().hex
+    heartbeat_interval = 5.0
 
     async with httpx.AsyncClient(base_url=base_url) as client:
-        sess_ok = await create_session(client, session_id)
+        # IMPORTANT: use the SERVER-issued session_id; sending our own client-
+        # side string would never match a stored session and registered
+        # adapters would expire within ~10s.
+        session_id = await create_session(client)
         adapter_ok = False
-        if sess_ok:
+        if session_id:
             adapter_ok = await add_adapter(client, adapter_name, session_id, sticky_request_id)
+            # Best-effort: bump the active_sampling_sessions gauge.
+            await create_sampling_session(client, session_id, model_path=f'mock://{adapter_name}')
 
         ok_n = err_n = 0
+        last_hb = time.monotonic()
         while time.monotonic() < deadline:
-            # 80% sample (no adapter), 20% forward_only (uses registered adapter).
+            if session_id and time.monotonic() - last_hb >= heartbeat_interval:
+                await session_heartbeat(client, session_id)
+                last_hb = time.monotonic()
             use_forward = adapter_ok and random.random() < 0.2
             try:
                 if use_forward:
                     status = await forward_only(client, adapter_name, session_id, sticky_request_id)
                 else:
-                    status = await sample(client, session_id, max_tokens=max_tokens)
+                    status = await sample(client, session_id or '', max_tokens=max_tokens)
             except Exception as exc:
                 err_n += 1
                 print(f'  user {user_id} request error: {exc!r}')
@@ -228,11 +284,10 @@ async def user_loop(
                 ok_n += 1
             else:
                 err_n += 1
-            # Jittered interval keeps requests from clumping into the same scrape window.
             await asyncio.sleep(max(0.01, interval + random.uniform(-interval / 4, interval / 4)))
 
         print(f'  user {user_id:>2}  ok={ok_n:>4}  err={err_n}  '
-              f'session={session_id}  adapter={adapter_name if adapter_ok else "<skip>"}')
+              f'session={session_id or "<none>"}  adapter={adapter_name if adapter_ok else "<skip>"}')
 
 
 async def main_async(args: argparse.Namespace) -> None:
