@@ -232,12 +232,36 @@ def train_with_tracker(cfg: dict[str, Any]):
         print('[tracker] Will use mock tracker for testing')
         # 提供一个简易 mock 以便仍可运行
         from unittest.mock import MagicMock
-        register_tracker = lambda t: None
-        dispatch = lambda data, step: print(f"[mock dispatch] step={step}, data={data}")
-        dispatch_hyperparams = lambda params, adapter_name=None: print(f"[mock hparams] {params}")
-        list_trackers = lambda: []
-        set_rank = lambda r: None
-        clear_trackers = lambda: None
+
+        def _mock_register(t):
+            None  # noqa: E704
+
+        register_tracker = _mock_register
+
+        def _mock_dispatch(data, step):
+            print(f"[mock dispatch] step={step}, data={data}")  # noqa: E704
+
+        dispatch = _mock_dispatch
+
+        def _mock_hparams(params, adapter_name=None):
+            print(f"[mock hparams] {params}")  # noqa: E704
+
+        dispatch_hyperparams = _mock_hparams
+
+        def _mock_list():
+            return []  # noqa: E704
+
+        list_trackers = _mock_list
+
+        def _mock_set_rank(r):
+            None  # noqa: E704
+
+        set_rank = _mock_set_rank
+
+        def _mock_clear():
+            None  # noqa: E704
+
+        clear_trackers = _mock_clear
         SwanLabTracker = None
 
     # 确保 rank 0 （单卡测试）
@@ -314,9 +338,9 @@ def train_with_tracker(cfg: dict[str, Any]):
     accum_tokens = 0
     optimizer.zero_grad()
 
-    print(f"\n{'='*60}")
+    print('\n' + '=' * 60)
     print(f"Starting training for {cfg['max_steps']} steps...")
-    print(f"{'='*60}\n")
+    print('=' * 60 + '\n')
 
     epoch = 0
     while global_step < cfg['max_steps']:
@@ -370,9 +394,9 @@ def train_with_tracker(cfg: dict[str, Any]):
                 accum_tokens = 0
 
     # ---- 2h) 清理 ----
-    print(f"\n{'='*60}")
+    print('\n' + '=' * 60)
     print(f"Training complete ({global_step} steps)")
-    print(f"{'='*60}")
+    print('=' * 60)
 
     # 保存模型（可选）
     save_path = Path(cfg['output_dir']) / 'final_model'

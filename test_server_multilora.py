@@ -56,7 +56,7 @@ def main():
     if result.returncode != 0 and 'already' not in result.stderr:
         print(f"[ray] Already running or started: {result.stderr[:200]}")
     else:
-        print("[ray] Ray head node ready")
+        print('[ray] Ray head node ready')
 
     # ------------------------------------------------------------------
     # 2. 在 Ray worker 进程中启动训练 (包含 SwanLab tracker auto-init)
@@ -231,14 +231,14 @@ def main():
             print(f"  [{name}] done")
 
         clear_trackers()
-        print("\n[worker] ALL DONE")
+        print('\n[worker] ALL DONE')
         return f"Trained {list(adapters.keys())} adapters"
 
     # 启动 worker
-    print("\n" + "=" * 60)
-    print("Launching Ray worker with TWINKLE_TRACKERS=swanlab")
-    print("SwanLab project: twinkle-server-multilora")
-    print("=" * 60 + "\n")
+    print('\n' + '=' * 60)
+    print('Launching Ray worker with TWINKLE_TRACKERS=swanlab')
+    print('SwanLab project: twinkle-server-multilora')
+    print('=' * 60 + '\n')
 
     result = ray.get(train_in_worker.remote())
     print(f"\n[main] Worker result: {result}")
@@ -248,10 +248,10 @@ def main():
     subprocess.run(['ray', 'stop', '--force'], capture_output=True, timeout=15)
     print('[ray] Ray stopped.')
 
-    print("\n" + "=" * 60)
-    print("SwanLab: https://swanlab.cn/@supertpx/twinkle-server-multilora")
-    print("Server-mode (Ray actor) MultiLoRA test complete")
-    print("=" * 60)
+    print('\n' + '=' * 60)
+    print('SwanLab: https://swanlab.cn/@supertpx/twinkle-server-multilora')
+    print('Server-mode (Ray actor) MultiLoRA test complete')
+    print('=' * 60)
 
 
 if __name__ == '__main__':

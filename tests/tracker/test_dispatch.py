@@ -44,10 +44,10 @@ sys.modules.setdefault('twinkle.utils.platforms', MagicMock())
 sys.modules.setdefault('twinkle.utils.logger', MagicMock())
 sys.modules.setdefault('swanlab', MagicMock())
 
+# isort: split
 import twinkle.tracker as tracker_mod  # noqa: E402
 from twinkle.tracker import (clear_trackers, dispatch, dispatch_hyperparams, list_trackers,  # noqa: E402
                              register_tracker, set_rank)
-# Now safe to import
 from twinkle.tracker.base import ExperimentTracker  # noqa: E402
 
 

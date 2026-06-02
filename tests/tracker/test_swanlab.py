@@ -55,7 +55,7 @@ sys.modules.setdefault('twinkle.utils.logger', MagicMock())
 sys.modules.setdefault('swanlab', MagicMock())
 
 # Now that all heavy deps are mocked, the import should succeed.
-from twinkle.tracker.swanlab import SwanLabTracker
+from twinkle.tracker.swanlab import SwanLabTracker  # noqa: E402
 
 # ===================================================================
 #  Helpers

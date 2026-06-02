@@ -173,7 +173,7 @@ def train_adapters(model, dls):
         # dispatch_hyperparams with adapter_name (幂等守卫: 第二次被忽略)
         dispatch_hyperparams({f"{name}/lr": TRAIN_CFG['lr']}, adapter_name=name)
         dispatch_hyperparams({f"{name}/IGNORED": True}, adapter_name=name)
-        print("  hyperparams idempotent OK")
+        print('  hyperparams idempotent OK')
 
         opt.zero_grad()
         step = 0
@@ -200,9 +200,9 @@ def train_adapters(model, dls):
 
         print(f"  [{name}] done ({step} steps)")
 
-    print("\nclear_trackers() ...")
+    print('\nclear_trackers() ...')
     clear_trackers()
-    print("[tracker] Done.")
+    print('[tracker] Done.')
 
 
 if __name__ == '__main__':
@@ -215,5 +215,5 @@ if __name__ == '__main__':
     setup_tracker()
     model, dls = create_model_and_data()
     train_adapters(model, dls)
-    print("\nDONE -> https://swanlab.cn/@supertpx/twinkle-multilora-test")
-    print("  lora_a/loss vs lora_b/loss on same chart")
+    print('\nDONE -> https://swanlab.cn/@supertpx/twinkle-multilora-test')
+    print('  lora_a/loss vs lora_b/loss on same chart')
