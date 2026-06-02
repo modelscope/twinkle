@@ -43,10 +43,6 @@ class HttpOptions(BaseModel):
 # ---------- per-deployment args schemas (R3.x) ----------------------------- #
 
 
-_BACKEND_VALUES: tuple[str, ...] = ('mock', 'transformers', 'megatron')
-_SAMPLER_TYPE_VALUES: tuple[str, ...] = ('mock', 'vllm', 'torch')
-
-
 class ModelArgs(_ArgsBase):
     """Args for the ``model`` deployment.
 
@@ -115,7 +111,11 @@ class ApplicationSpec(BaseModel):
 
     The ``args`` block is validated against the schema selected by
     ``import_path``: ``server`` → ``ServerArgs``, ``model`` → ``ModelArgs``,
-    etc. Unknown keys at this level (or inside ``args``) are rejected.
+    etc. Unknown keys at this level (or inside ``args``) are rejected. A
+    missing ``args`` block is treated as ``{}`` and validated against the
+    matching schema, so any required field (e.g. ``backend`` on a model
+    deployment) raises with the offending field path instead of silently
+    falling back to a different schema's default.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -123,25 +123,35 @@ class ApplicationSpec(BaseModel):
     name: str
     route_prefix: str = '/'
     import_path: Literal['server', 'model', 'sampler', 'processor']
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs = Field(
-        default_factory=lambda: ServerArgs(),
-    )
+    # ``args`` is filled in by the ``mode='before'`` validator below; the
+    # default of ``{}`` is only meaningful for kinds whose schema has no
+    # required fields (currently ``server``).
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs = Field(default=None)  # type: ignore[assignment]
     deployments: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode='before')
     @classmethod
     def _coerce_args_to_schema(cls, data: Any) -> Any:
-        """Validate the raw ``args`` dict against the schema for ``import_path``.
+        """Validate the raw ``args`` block against the schema for ``import_path``.
 
-        Pydantic's union resolution would also work here, but keying off
-        ``import_path`` makes the failure messages point at the right schema
-        and avoids ambiguity when two schemas share field names.
+        Keying off ``import_path`` makes the failure messages point at the
+        right schema and avoids the ambiguity Pydantic's structural Union
+        resolution would introduce when two schemas share field names.
         """
         if not isinstance(data, dict):
             return data
         import_path = data.get('import_path')
-        args = data.get('args')
-        if import_path in _ARGS_SCHEMA and isinstance(args, dict):
-            schema = _ARGS_SCHEMA[import_path]
-            data = {**data, 'args': schema.model_validate(args)}
-        return data
+        if import_path not in _ARGS_SCHEMA:
+            # Let Pydantic's Literal validator handle bad import_path values.
+            return data
+        schema = _ARGS_SCHEMA[import_path]
+        raw_args = data.get('args')
+        if isinstance(raw_args, schema):
+            return data
+        if raw_args is None:
+            raw_args = {}
+        if not isinstance(raw_args, dict):
+            # Non-dict, non-instance args is a hard schema error — surface
+            # it through the matching schema for a clean error message.
+            raw_args = dict(raw_args) if hasattr(raw_args, 'keys') else raw_args
+        return {**data, 'args': schema.model_validate(raw_args)}

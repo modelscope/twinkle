@@ -99,6 +99,11 @@ def build_server_app(deploy_options: dict[str, Any],
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
+        # Start the ServerState cleanup loop now that we have a running loop.
+        try:
+            await get_self().state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
         yield
         try:
             await get_self().proxy.close()

@@ -43,7 +43,10 @@ class ServerState:
     - FutureManager        — async task futures
     - ConfigManager        — key-value configuration
 
-    All methods are designed to be used with Ray actors for distributed state.
+    Bound directly to a shared :class:`StateBackend` (R19); no detached
+    Ray Actor is created. Each Ray Serve worker owns one process-local
+    instance and the cleanup loop is started from the deployment's
+    FastAPI ``lifespan`` startup hook.
     """
 
     def __init__(
@@ -538,23 +541,10 @@ def get_server_state(
         **kwargs,
     )
     _PROCESS_STATE_CACHE[actor_name] = state
-
-    # Start the cleanup loop best-effort. The loop runs inside an asyncio task,
-    # so ``start_cleanup_task`` must be awaited from within a running loop.
-    # Schedule it lazily — when there's no running loop yet (sync constructor
-    # path), skip and let the first awaited handler call start it later.
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(state.start_cleanup_task())
-    except RuntimeError:
-        # No running loop — handler bodies will start the loop on first await.
-        pass
-    except Exception as e:
-        cause = e.__cause__ if hasattr(e, '__cause__') and e.__cause__ else e
-        if isinstance(cause, ConfigMismatchError) or 'ConfigMismatchError' in type(e).__name__:
-            raise
-        logger.debug(f'[ServerState] Warning: Failed to start cleanup task: {e}')
-
+    # Cleanup task is started by the deployment's FastAPI ``lifespan`` hook
+    # via ``await state.start_cleanup_task()`` — that's the single async
+    # entry point each worker has, so we don't need any sync-context
+    # detection here.
     return state
 
 

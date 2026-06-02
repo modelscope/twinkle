@@ -16,7 +16,11 @@ import pytest
 from hypothesis import given, settings, strategies as st
 
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.model.app import _MODEL_BACKENDS, _dispatch_model_backend
+from twinkle.server.model.app import (
+    _MODEL_BACKENDS,
+    _dispatch_model_backend,
+    _validate_model_backend,
+)
 from twinkle.server.model.backends.mock_model import TwinkleCompatMockModel
 
 
@@ -108,24 +112,25 @@ def test_property_4_remove_absent_raises(name: str) -> None:
 
 
 def test_property_10_mock_dispatch_returns_mock_model() -> None:
-    m = _dispatch_model_backend('mock', {'model_id': 'mid'})
+    m = _dispatch_model_backend(_validate_model_backend('mock'), {'model_id': 'mid'})
     assert isinstance(m, TwinkleCompatMockModel)
 
 
 @settings(max_examples=100)
 @given(bad=st.text(min_size=1, max_size=10).filter(lambda s: s not in _MODEL_BACKENDS))
 def test_property_10_invalid_backend_raises_config_error(bad: str) -> None:
+    """Validation runs BEFORE any backend import / instantiation (R3.9)."""
     with pytest.raises(ConfigError) as exc:
-        _dispatch_model_backend(bad, {'model_id': 'mid'})
+        _validate_model_backend(bad)
     assert exc.value.field == 'backend'
     assert exc.value.value == bad
-    assert exc.value.allowed == sorted(_MODEL_BACKENDS) or set(exc.value.allowed) == set(_MODEL_BACKENDS)
+    assert set(exc.value.allowed) == set(_MODEL_BACKENDS)
 
 
 @pytest.mark.parametrize('value', [None, ''])
 def test_property_10_absent_or_empty_backend_raises(value) -> None:
     with pytest.raises(ConfigError) as exc:
-        _dispatch_model_backend(value, {'model_id': 'mid'})
+        _validate_model_backend(value)
     assert exc.value.field == 'backend'
 
 

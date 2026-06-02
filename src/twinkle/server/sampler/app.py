@@ -31,12 +31,26 @@ logger = get_logger()
 _SAMPLER_TYPES: tuple[str, ...] = ('mock', 'vllm', 'torch')
 
 
+def _validate_sampler_type(sampler_type: Any) -> str:
+    """Pure validation of the ``sampler_type`` selector (R3.10).
+
+    Raises :class:`ConfigError` (naming the field, value, and allowed set)
+    when the value is missing, empty, non-string, or not exactly one of the
+    permitted values. No imports or side effects.
+    """
+    if (
+        not isinstance(sampler_type, str)
+        or sampler_type == ''
+        or sampler_type not in _SAMPLER_TYPES
+    ):
+        raise ConfigError(
+            field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES)
+        )
+    return sampler_type
+
+
 def _dispatch_sampler_backend(sampler_type: str, ctor_kwargs: dict[str, Any]) -> Any:
-    """Instantiate the sampler selected by ``sampler_type`` (R3.4-3.6, R3.10)."""
-    if sampler_type is None or not isinstance(sampler_type, str) or sampler_type == '':
-        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
-    if sampler_type not in _SAMPLER_TYPES:
-        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
+    """Instantiate the sampler selected by an already-validated ``sampler_type``."""
     if sampler_type == 'mock':
         from .backends.mock_sampler import MockSampler
 
@@ -70,10 +84,12 @@ class SamplerManagement(TaskQueueMixin):
                  nproc_per_node: int,
                  device_group: dict[str, Any],
                  device_mesh: dict[str, Any],
-                 sampler_type: str = 'vllm',
+                 sampler_type: str,
                  engine_args: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
                  **kwargs):
+        # R3.10: validate ``sampler_type`` BEFORE any side effect.
+        sampler_type = _validate_sampler_type(sampler_type)
         # Skip twinkle.initialize for the mock backend (R3.8) — start without
         # CUDA/torch/vllm.
         if sampler_type != 'mock':
@@ -131,7 +147,7 @@ def build_sampler_app(model_id: str,
                       device_group: dict[str, Any],
                       device_mesh: dict[str, Any],
                       deploy_options: dict[str, Any],
-                      sampler_type: str = 'vllm',
+                      sampler_type: str,
                       engine_args: dict[str, Any] | None = None,
                       queue_config: dict[str, Any] | None = None,
                       **kwargs):
@@ -146,7 +162,9 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Type of sampler to use ('vllm' or 'torch')
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``torch`` (R3.4-3.6,
+            R3.10). Validated up front; bad values raise :class:`ConfigError`
+            before any side effect.
         engine_args: Additional engine arguments for the sampler
         queue_config: Task queue configuration dict (rps_limit, tps_limit, etc.)
         **kwargs: Additional arguments passed to the sampler
@@ -154,14 +172,24 @@ def build_sampler_app(model_id: str,
     Returns:
         Ray Serve deployment bound with configuration
     """
+    # Fail fast at builder time on bad sampler_type values.
+    sampler_type = _validate_sampler_type(sampler_type)
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
+
+    def get_self() -> SamplerManagement:
+        return serve.get_replica_context().servable_object
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
+        # Start the ServerState cleanup loop now that we have a running loop.
+        try:
+            await get_self().state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
         yield
 
     app = FastAPI(
@@ -179,9 +207,6 @@ def build_sampler_app(model_id: str,
     # covers the full request path including tracing overhead.
     app.middleware('http')(create_tracing_middleware('Sampler'))
     app.middleware('http')(create_metrics_middleware('Sampler'))
-
-    def get_self() -> SamplerManagement:
-        return serve.get_replica_context().servable_object
 
     # Register routes BEFORE @serve.ingress so Ray Serve captures them at decoration time
     _register_tinker_sampler_routes(app, get_self)

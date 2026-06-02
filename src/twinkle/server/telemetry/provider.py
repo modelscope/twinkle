@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,8 @@ class _LoggingWriter:
 
 class TelemetryConfig(BaseModel):
     """Configuration for the OpenTelemetry pipeline."""
+
+    model_config = ConfigDict(extra='forbid')
 
     enabled: bool = False
     service_name: str = "twinkle-server"
