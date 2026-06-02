@@ -1,12 +1,28 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 from .utils import deep_getattr
 
 if TYPE_CHECKING:
     import torch
     import torch.nn as nn
+
+LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
+
+
+def is_lora_state_key(name: str) -> bool:
+    return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
+
+
+def get_peft_adapter_names(model: 'nn.Module') -> Set[str]:
+    peft_config = getattr(model, 'peft_config', None)
+    return set(peft_config.keys()) if isinstance(peft_config, Mapping) else set()
+
+
+def has_adapter_suffix(name: str, adapter_names: Set[str]) -> bool:
+    return any(f'.{adapter_name}.' in name or name.endswith(f'.{adapter_name}') for adapter_name in adapter_names)
 
 
 def align_logps_to_mask(

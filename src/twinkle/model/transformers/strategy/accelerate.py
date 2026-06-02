@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, Literal, Mapping, Optional
 
 from twinkle import DeviceMesh
+from twinkle.utils.transformers_utils import get_peft_adapter_names, has_adapter_suffix, is_lora_state_key
 from .load_context import fsdp_pretrained_load_context
 
 
@@ -209,15 +210,20 @@ class AccelerateStrategy:
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
         state_dict = {}
+        adapter_suffixless_state_dict = {}
+        adapter_names = get_peft_adapter_names(unwrapped)
+        other_adapter_names = adapter_names - {adapter_name}
         adapter_suffix = f'.{adapter_name}.'
+        adapter_tail = f'.{adapter_name}'
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not is_lora_state_key(name):
+                continue
+            is_adapter_param = adapter_suffix in name or name.endswith(adapter_tail)
+            is_other_adapter_param = has_adapter_suffix(name, other_adapter_names)
+            if not is_adapter_param and is_other_adapter_param:
                 continue
             local = torch_util.to_local_tensor(param)
-            state_dict[name] = local.cpu()
+            target_dict = state_dict if is_adapter_param else adapter_suffixless_state_dict
+            target_dict[name] = local.cpu()
             del local
-        return state_dict
-
-
-def _is_lora_state_key(name: str) -> bool:
-    return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
+        return {**adapter_suffixless_state_dict, **state_dict}

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, S
 
 from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
 from twinkle.utils.torch_utils import clone_state_dict_to_cpu
+from twinkle.utils.transformers_utils import get_peft_adapter_names, has_adapter_suffix, is_lora_state_key
 from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
@@ -16,7 +17,6 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 
-LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
 PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
@@ -354,6 +354,7 @@ class NativeFSDPStrategy:
         """Collect only LoRA adapter parameters, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)
         state_dict = {}
+        adapter_suffixless_state_dict = {}
 
         ep_fsdp_mesh = self.ep_fsdp_device_mesh
         ep_group = None
@@ -363,25 +364,32 @@ class NativeFSDPStrategy:
             ep_world_size = ep_fsdp_mesh['ep'].size()
 
         ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        adapter_names = get_peft_adapter_names(unwrapped)
+        other_adapter_names = adapter_names - {adapter_name}
         adapter_suffix = f'.{adapter_name}.'
-
+        adapter_tail = f'.{adapter_name}'
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not is_lora_state_key(name):
+                continue
+            is_adapter_param = adapter_suffix in name or name.endswith(adapter_tail)
+            is_other_adapter_param = has_adapter_suffix(name, other_adapter_names)
+            if not is_adapter_param and is_other_adapter_param:
                 continue
 
             local_full = torch_util.to_local_tensor(param)
+            target_dict = state_dict if is_adapter_param else adapter_suffixless_state_dict
             if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
                 local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
-                state_dict[name] = local_full.cpu()
+                target_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
-                state_dict[name] = local_full.cpu()
+                target_dict[name] = local_full.cpu()
                 del local_full
 
-        return state_dict
+        return {**adapter_suffixless_state_dict, **state_dict}
 
 
 def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
@@ -695,10 +703,6 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
     return optimizer
 
 
-def _is_lora_state_key(name: str) -> bool:
-    return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
-
-
 def _strip_peft_base_prefix(name: str) -> str:
     while name.startswith(PEFT_BASE_PREFIX):
         name = name[len(PEFT_BASE_PREFIX):]
@@ -725,7 +729,7 @@ def _source_key_candidates(param_name: str) -> List[str]:
 
 
 def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, Any]) -> str:
-    if _is_lora_state_key(param_name):
+    if is_lora_state_key(param_name):
         raise KeyError(f"LoRA parameter '{param_name}' must be loaded from adapter source state.")
 
     candidates = _source_key_candidates(param_name)
@@ -739,7 +743,7 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
 def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
     adapter_state = {}
     for name, tensor in state_dict.items():
-        if not _is_lora_state_key(name) or not hasattr(tensor, 'detach'):
+        if not is_lora_state_key(name) or not hasattr(tensor, 'detach'):
             continue
         if getattr(tensor, 'is_meta', False):
             continue
@@ -869,7 +873,7 @@ def _broadcast_sharded_state_dict(
         source_metadata = {}
         source_keys = {}
         for param_name in meta_sharded_sd:
-            if _is_lora_state_key(param_name):
+            if is_lora_state_key(param_name):
                 continue
             source_key = _resolve_full_state_source_key(param_name, full_sd)
             source_tensor = full_sd[source_key]
@@ -1001,7 +1005,7 @@ def _broadcast_sharded_state_dict(
 
     for param_name, sharded_param in meta_sharded_sd.items():
         shape = sharded_param.size()
-        is_adapter_param = _is_lora_state_key(param_name)
+        is_adapter_param = is_lora_state_key(param_name)
         is_ep_expert_param = param_name in expert_shard_specs and not is_adapter_param
         if is_adapter_param:
             adapter_tensor, source_shape, source_dtype = _get_adapter_source(param_name)
