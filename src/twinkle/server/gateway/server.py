@@ -43,6 +43,24 @@ class GatewayServer:
             types.SupportedModel(model_name='Qwen/Qwen3.6-27B'),
         ]
         self._modelscope_config_lock = asyncio.Lock()
+        self._state_cleanup_started = False
+
+    async def _ensure_state_cleanup_started(self) -> None:
+        """Start ServerState cleanup + metrics loops on the first request.
+
+        Ray Serve binds ``serve.get_replica_context().servable_object`` AFTER
+        FastAPI ``lifespan`` startup, so the cleanup task cannot run there
+        (``get_self()`` returns ``None`` during lifespan). Lazy-init here on
+        the first request instead. ``start_cleanup_task`` is idempotent via
+        its internal ``_cleanup_running`` guard.
+        """
+        if self._state_cleanup_started:
+            return
+        try:
+            await self.state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        self._state_cleanup_started = True
 
     def _normalize_models(self, supported_models):
         if not supported_models:
@@ -100,11 +118,9 @@ def build_server_app(deploy_options: dict[str, Any],
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
-        # Start the ServerState cleanup loop now that we have a running loop.
-        try:
-            await get_self().state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        # NOTE: ``state.start_cleanup_task()`` cannot run here — Ray Serve binds
+        # ``servable_object`` AFTER lifespan startup. Lazy-started from the
+        # first request via the ``ensure_state_cleanup_started`` middleware.
         yield
         try:
             await get_self().proxy.close()
@@ -112,6 +128,17 @@ def build_server_app(deploy_options: dict[str, Any],
             pass
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.middleware('http')
+    async def ensure_state_cleanup_started(request: Request, call_next):
+        # Lazy-init the state cleanup + metrics loops on first request — see
+        # GatewayServer._ensure_state_cleanup_started. Gateway has no per-
+        # handler hook, so a tiny middleware covers every route.
+        try:
+            await get_self()._ensure_state_cleanup_started()
+        except Exception as e:
+            logger.debug(f'state cleanup lazy-init skipped: {e}')
+        return await call_next(request)
 
     @app.middleware('http')
     async def verify_token(request: Request, call_next):

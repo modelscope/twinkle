@@ -132,8 +132,24 @@ class SamplerManagement(TaskQueueMixin):
         sticky_key = serve.get_multiplexed_model_id()
         await self._sticky_entry(sticky_key)
 
+    async def _ensure_state_cleanup_started(self) -> None:
+        """Start ServerState cleanup + metrics loops on the first request.
+
+        See the matching helper in ``model/app.py`` for the lifespan-timing
+        rationale: ``servable_object`` is unbound during lifespan, so we lazy-
+        init here.
+        """
+        if getattr(self, '_state_cleanup_started', False):
+            return
+        try:
+            await self.state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        self._state_cleanup_started = True
+
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
+        await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
         return token
 
@@ -182,11 +198,9 @@ def build_sampler_app(model_id: str,
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
-        # Start the ServerState cleanup loop now that we have a running loop.
-        try:
-            await get_self().state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        # NOTE: ``state.start_cleanup_task()`` cannot run here — Ray Serve binds
+        # ``servable_object`` AFTER lifespan startup. Lazy-started from the
+        # first request via ``_on_request_start`` → ``_ensure_state_cleanup_started``.
         yield
 
     app = FastAPI(

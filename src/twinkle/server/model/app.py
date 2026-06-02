@@ -129,6 +129,24 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
             await self.state.register_replica(self.replica_id, self.max_loras)
             self._replica_registered = True
 
+    async def _ensure_state_cleanup_started(self) -> None:
+        """Start ServerState cleanup + metrics loops on the first request.
+
+        Cannot run in FastAPI ``lifespan``: Ray Serve binds
+        ``serve.get_replica_context().servable_object`` AFTER the lifespan
+        startup phase, so a lifespan call has no ``self`` to reach. By the
+        time a request arrives, the binding exists. ``state.start_cleanup_task``
+        is itself idempotent via ``_cleanup_running``, but the per-instance
+        flag avoids the await on every subsequent request.
+        """
+        if getattr(self, '_state_cleanup_started', False):
+            return
+        try:
+            await self.state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        self._state_cleanup_started = True
+
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
         return sticky_key
@@ -142,6 +160,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
         await self._ensure_replica_registered()
+        await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
         return token
 
@@ -208,16 +227,12 @@ def build_model_app(model_id: str,
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
-        # Start the ServerState cleanup loop now that we have a running loop;
-        # idempotent across replicas in the same process.
-        try:
-            await get_self().state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
-        try:
-            await get_self()._ensure_replica_registered()
-        except Exception as e:
-            logger.warning(f'Failed to register replica at startup: {e}')
+        # NOTE: ``state.start_cleanup_task()`` and ``_ensure_replica_registered()``
+        # cannot run here — Ray Serve binds ``servable_object`` AFTER lifespan
+        # startup, so ``get_self()`` returns ``None`` and the call would crash.
+        # They are lazy-started from the first request via
+        # ``_on_request_start`` → ``_ensure_state_cleanup_started`` and
+        # ``_ensure_replica_registered`` respectively.
         yield
         try:
             await get_self().shutdown()

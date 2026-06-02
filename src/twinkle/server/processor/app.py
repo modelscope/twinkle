@@ -83,6 +83,22 @@ class ProcessorManagement(ProcessorManagerMixin):
         await self._sticky_entry(sticky_key)
         # Lazy-start countdown task on first request (requires running event loop)
         self._ensure_countdown_started()
+        await self._ensure_state_cleanup_started()
+
+    async def _ensure_state_cleanup_started(self) -> None:
+        """Start ServerState cleanup + metrics loops on the first request.
+
+        See ``model/app.py``: ``servable_object`` is unbound during lifespan,
+        so we lazy-init here. Processor has no ``_on_request_start`` hook;
+        every routed request flows through ``_ensure_sticky`` first.
+        """
+        if getattr(self, '_state_cleanup_started', False):
+            return
+        try:
+            await self.state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        self._state_cleanup_started = True
 
     def _on_processor_expired(self, processor_id: str) -> None:
         """Called by the countdown thread when a processor's session expires."""
@@ -131,11 +147,9 @@ def build_processor_app(ncpu_proc_per_node: int,
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
-        # Start the ServerState cleanup loop now that we have a running loop.
-        try:
-            await get_self().state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+        # NOTE: ``state.start_cleanup_task()`` cannot run here — Ray Serve binds
+        # ``servable_object`` AFTER lifespan startup. Lazy-started from the
+        # first request via ``_ensure_sticky`` → ``_ensure_state_cleanup_started``.
         yield
 
     app = FastAPI(lifespan=lifespan)
