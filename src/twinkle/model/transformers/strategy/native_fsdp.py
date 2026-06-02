@@ -354,6 +354,7 @@ class NativeFSDPStrategy:
         """Collect only LoRA adapter parameters, with EP-aware all-gather."""
         unwrapped = self.unwrap_model(model)
         state_dict = {}
+        fallback_state_dict = {}
 
         ep_fsdp_mesh = self.ep_fsdp_device_mesh
         ep_group = None
@@ -366,7 +367,7 @@ class NativeFSDPStrategy:
         adapter_suffix = f'.{adapter_name}.'
 
         for name, param in unwrapped.named_parameters():
-            if not _is_lora_state_key(name) or adapter_suffix not in name:
+            if not _is_lora_state_key(name):
                 continue
 
             local_full = torch_util.to_local_tensor(param)
@@ -375,13 +376,15 @@ class NativeFSDPStrategy:
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
                 local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
-                state_dict[name] = local_full.cpu()
+                target_dict = state_dict if adapter_suffix in name else fallback_state_dict
+                target_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
-                state_dict[name] = local_full.cpu()
+                target_dict = state_dict if adapter_suffix in name else fallback_state_dict
+                target_dict[name] = local_full.cpu()
                 del local_full
+        return state_dict or fallback_state_dict
 
-        return state_dict
 
 
 def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
