@@ -157,6 +157,7 @@ class QualityPreprocessor(Preprocessor):
         ifd_paraphrase_temperature: float = 0.7,
         ifd_paraphrase_max_tokens: int = 4096,
         ifd_paraphrase_prompt_budget: int = 4096,
+        ifd_exclude_prompt_echoed_ids: bool = False,
         # ── Phase 13: response refinement (requires key_rounds) ─────────────
         refine_api_endpoint: str = '',       # '' = skip
         refine_model: str = 'default',
@@ -328,6 +329,7 @@ class QualityPreprocessor(Preprocessor):
                 paraphrase_temperature=ifd_paraphrase_temperature,
                 paraphrase_max_tokens=ifd_paraphrase_max_tokens,
                 paraphrase_prompt_budget=ifd_paraphrase_prompt_budget,
+                exclude_prompt_echoed_ids=ifd_exclude_prompt_echoed_ids,
             )
             pipeline.append(ifd.ifd_filter)
 

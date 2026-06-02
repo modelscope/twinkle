@@ -16,7 +16,7 @@ both factual correctness AND reasoning/style similarity. The aggregate count
 (0..n) is dumped as ``pass4`` alongside the chr_min score.
 """
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.template import Template
@@ -69,12 +69,17 @@ def _chr_min_distinct(
     cond_lp: List, asst_lp: List,
     cond_ids: List[int], asst_ids: List[int],
     n_prompt: int,
+    exclude_ids: Optional[Set[int]] = None,
 ) -> Optional[float]:
     """Compute chr_dist_min_pos: fraction of distinct A-token ids whose
     per-occurrence min(cond_lp - asst_lp) is strictly positive.
 
     Mirrors ``aligned_pairs_with_token`` + ``distinct_chr`` from
     ``distinct_token_chr.py`` but operates on raw logprob lists (no JSON I/O).
+
+    If ``exclude_ids`` is given, asst tokens whose id is in this set are
+    dropped from the distinct-token statistics (experiment: exclude tokens
+    that the asst literally echoes from the prompt vocabulary).
     """
     if not asst_lp or not cond_lp or not asst_ids:
         return None
@@ -87,6 +92,8 @@ def _chr_min_distinct(
             break
         tid = asst_ids[i]
         if tid is None:
+            continue
+        if exclude_ids is not None and int(tid) in exclude_ids:
             continue
         a = _extract_logprob(asst_lp[i], tid)
         c_tok = cond_ids[ci] if ci < len(cond_ids) else None
@@ -231,6 +238,9 @@ class IFDFilter(Preprocessor):
         # Token budget for the augmented (GT-injected) prompt sent to chat_batch.
         # Must be <= max_model_len - paraphrase_max_tokens to avoid vLLM rejection.
         paraphrase_prompt_budget: int = 4096,
+        # Experiment: drop asst tokens whose id appears anywhere in the prompt
+        # from chr_min's distinct-token statistics (isolates novel-vocab signal).
+        exclude_prompt_echoed_ids: bool = False,
         # Legacy params (used to create OpenAIBackend if backend is None).
         api_endpoint: str = '',
         model: str = 'default',
@@ -285,6 +295,11 @@ class IFDFilter(Preprocessor):
         self._paraphrase_max_tokens = int(paraphrase_max_tokens)
         self._paraphrase_intents = set(paraphrase_intents or [])
         self._paraphrase_prompt_budget = int(paraphrase_prompt_budget)
+        self._exclude_prompt_echoed_ids = bool(exclude_prompt_echoed_ids)
+        if self._exclude_prompt_echoed_ids:
+            logger.info(
+                '[IFDFilter] exclude_prompt_echoed_ids=True: chr_min will skip asst '
+                'tokens whose id appears in the prompt.')
 
     @staticmethod
     def _build_judge_api(api, model, base_url, api_key, client_kwargs):
@@ -807,7 +822,14 @@ class IFDFilter(Preprocessor):
         asst_logprobs = self._backend.prompt_logprobs_ids(asst_padded)[:asst_n]
         for key, cond_lp, asst_lp in zip(keys, cond_logprobs, asst_logprobs):
             cond_ids, n_prompt, asst_ids = prepared[key]
-            chr_min = _chr_min_distinct(cond_lp, asst_lp, cond_ids, asst_ids, n_prompt)
+            exclude_ids = (
+                set(int(t) for t in cond_ids[:n_prompt] if t is not None)
+                if self._exclude_prompt_echoed_ids else None
+            )
+            chr_min = _chr_min_distinct(
+                cond_lp, asst_lp, cond_ids, asst_ids, n_prompt,
+                exclude_ids=exclude_ids,
+            )
             if chr_min is not None:
                 scores[key] = chr_min
             fam = _ifd_family_metrics(cond_lp, asst_lp, cond_ids, asst_ids, n_prompt)
