@@ -19,7 +19,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 from twinkle.server.model.backends.common import clean_metrics
-
 from .base import ExperimentTracker
 from .swanlab import SwanLabTracker
 from .wandb import WandbTracker
@@ -73,7 +72,7 @@ def clear_trackers() -> None:
         try:
             t.cleanup()
         except Exception:
-            logger.warning("Tracker %s.cleanup() failed", type(t).__name__, exc_info=True)
+            logger.warning('Tracker %s.cleanup() failed', type(t).__name__, exc_info=True)
     _trackers.clear()
 
 
@@ -106,7 +105,7 @@ def dispatch(data: Dict[str, float], step: int) -> None:
         try:
             tracker.log(cleaned, step=step)
         except Exception:
-            logger.warning("Tracker %s.log() failed", type(tracker).__name__, exc_info=True)
+            logger.warning('Tracker %s.log() failed', type(tracker).__name__, exc_info=True)
 
 
 def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = None) -> None:
@@ -136,7 +135,7 @@ def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = N
         try:
             tracker.log_hyperparams(params)
         except Exception:
-            logger.warning("Tracker %s.log_hyperparams() failed", type(tracker).__name__, exc_info=True)
+            logger.warning('Tracker %s.log_hyperparams() failed', type(tracker).__name__, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,38 +161,39 @@ def _auto_init_from_env() -> None:
         return
     _AUTO_INIT_DONE = True
 
-    trackers_str = os.environ.get("TWINKLE_TRACKERS", "").strip()
+    trackers_str = os.environ.get('TWINKLE_TRACKERS', '').strip()
     if not trackers_str:
         return
 
-    project = os.environ.get("TWINKLE_TRACKER_PROJECT", "twinkle-training")
-    experiment_name = os.environ.get("TWINKLE_TRACKER_EXPERIMENT", None)
+    project = os.environ.get('TWINKLE_TRACKER_PROJECT', 'twinkle-training')
+    experiment_name = os.environ.get('TWINKLE_TRACKER_EXPERIMENT', None)
 
-    for name in (t.strip().lower() for t in trackers_str.split(",") if t.strip()):
+    for name in (t.strip().lower() for t in trackers_str.split(',') if t.strip()):
         try:
-            if name == "wandb":
-                _trackers.append(WandbTracker(
-                    project=project,
-                    experiment_name=experiment_name,
-                    entity=os.environ.get("WANDB_ENTITY"),
-                ))
-                logger.info("Auto-registered WandbTracker from TWINKLE_TRACKERS env var")
-            elif name == "swanlab":
-                _trackers.append(SwanLabTracker(
-                    project=project,
-                    experiment_name=experiment_name,
-                    output_dir=os.environ.get("TWINKLE_OUTPUT_DIR"),
-                ))
-                logger.info("Auto-registered SwanLabTracker from TWINKLE_TRACKERS env var")
+            if name == 'wandb':
+                _trackers.append(
+                    WandbTracker(
+                        project=project,
+                        experiment_name=experiment_name,
+                        entity=os.environ.get('WANDB_ENTITY'),
+                    ))
+                logger.info('Auto-registered WandbTracker from TWINKLE_TRACKERS env var')
+            elif name == 'swanlab':
+                _trackers.append(
+                    SwanLabTracker(
+                        project=project,
+                        experiment_name=experiment_name,
+                        output_dir=os.environ.get('TWINKLE_OUTPUT_DIR'),
+                    ))
+                logger.info('Auto-registered SwanLabTracker from TWINKLE_TRACKERS env var')
             else:
-                logger.warning("Unknown tracker backend in TWINKLE_TRACKERS: %s", name)
+                logger.warning('Unknown tracker backend in TWINKLE_TRACKERS: %s', name)
         except Exception:
             logger.warning("Failed to auto-init tracker '%s' from env", name, exc_info=True)
 
 
 # Run auto-init once at import time (before user code or atexit runs)
 _auto_init_from_env()
-
 
 # ---------------------------------------------------------------------------
 # At-exit cleanup

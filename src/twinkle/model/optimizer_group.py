@@ -96,8 +96,10 @@ class BaseOptimizerGroup:
             dispatch(results, step=self.cur_step)
             # Lazily log hyperparams on the first training metrics call
             dispatch_hyperparams(
-                {'adapter_name': self.adapter_name,
-                 'gradient_accumulation_steps': self.gradient_accumulation_steps},
+                {
+                    'adapter_name': self.adapter_name,
+                    'gradient_accumulation_steps': self.gradient_accumulation_steps
+                },
                 adapter_name=self.adapter_name)
 
         return results

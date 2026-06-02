@@ -35,9 +35,9 @@ class SwanLabTracker(ExperimentTracker):
     ):
         import swanlab
 
-        api_key = kwargs.pop("api_key", None) or os.environ.get("SWANLAB_API_KEY")
-        logdir = kwargs.pop("logdir", None) or os.environ.get("SWANLAB_LOG_DIR", "swanlog")
-        mode = kwargs.pop("mode", None) or os.environ.get("SWANLAB_MODE", "cloud")
+        api_key = kwargs.pop('api_key', None) or os.environ.get('SWANLAB_API_KEY')
+        logdir = kwargs.pop('logdir', None) or os.environ.get('SWANLAB_LOG_DIR', 'swanlog')
+        mode = kwargs.pop('mode', None) or os.environ.get('SWANLAB_MODE', 'cloud')
 
         if api_key:
             swanlab.login(api_key)
@@ -45,7 +45,10 @@ class SwanLabTracker(ExperimentTracker):
         self._run = swanlab.init(
             project=project,
             experiment_name=experiment_name,
-            config={"framework": "\u2728Twinkle", **(config or {})},
+            config={
+                'framework': '\u2728Twinkle',
+                **(config or {})
+            },
             logdir=logdir,
             mode=mode,
             **kwargs,
@@ -64,12 +67,12 @@ class SwanLabTracker(ExperimentTracker):
         try:
             self._run.finish()
         except Exception:
-            logger.warning("SwanLab finish() failed", exc_info=True)
+            logger.warning('SwanLab finish() failed', exc_info=True)
 
     def _save_experiment_info(self, output_dir: str) -> None:
         try:
-            info = {"swanlab_experiment_url": self._run.get_run().url}
-            out = Path(output_dir) / "swanlab_config.json"
+            info = {'swanlab_experiment_url': self._run.get_run().url}
+            out = Path(output_dir) / 'swanlab_config.json'
             out.write_text(json.dumps(info, indent=2))
         except Exception:
             pass

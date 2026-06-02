@@ -29,9 +29,9 @@ class WandbTracker(ExperimentTracker):
     ):
         import wandb
 
-        entity = kwargs.pop("entity", None) or os.environ.get("WANDB_ENTITY")
+        entity = kwargs.pop('entity', None) or os.environ.get('WANDB_ENTITY')
         settings = None
-        proxy = kwargs.pop("wandb_proxy", None) or os.environ.get("WANDB_PROXY")
+        proxy = kwargs.pop('wandb_proxy', None) or os.environ.get('WANDB_PROXY')
         if proxy:
             settings = wandb.Settings(https_proxy=proxy)
 
@@ -39,7 +39,10 @@ class WandbTracker(ExperimentTracker):
             project=project,
             name=experiment_name,
             entity=entity,
-            config={"framework": "\u2728Twinkle", **(config or {})},
+            config={
+                'framework': '\u2728Twinkle',
+                **(config or {})
+            },
             settings=settings,
             **kwargs,
         )
@@ -54,4 +57,4 @@ class WandbTracker(ExperimentTracker):
         try:
             self._run.finish(exit_code=0)
         except Exception:
-            logger.warning("WandB finish() failed", exc_info=True)
+            logger.warning('WandB finish() failed', exc_info=True)
