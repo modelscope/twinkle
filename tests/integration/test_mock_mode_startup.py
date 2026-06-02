@@ -20,6 +20,7 @@ import os
 import pytest
 import time
 
+from tests.server.fixtures import MOCK_SERVER_CONFIG
 from twinkle.server.config import ServerConfig
 
 pytestmark = pytest.mark.skipif(
@@ -72,7 +73,7 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
     from twinkle.server.model import build_model_app
     from twinkle.server.sampler import build_sampler_app
 
-    cfg = ServerConfig.from_yaml('cookbook/client/server/mock/server_config.yaml')
+    cfg = ServerConfig.from_yaml(MOCK_SERVER_CONFIG)
 
     # Use a randomized port so concurrent runs / leftover processes don't collide.
     port = 18000 + (os.getpid() % 1000)

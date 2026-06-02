@@ -1,32 +1,20 @@
-# Twinkle Server Configuration — Mock backend (CPU-only / no GPU)
+# Test-only Twinkle Server config — CPU-only mock backends.
 #
-# NOT FOR PRODUCTION. This config wires the all-mock model + sampler backends
-# so the server starts in seconds on a CPU-only host with no torch /
-# transformers / vllm / megatron installed. Mock backends return fixed
-# numpy-derived results without performing real model computation or
-# sampling — use it for local development, CI smoke tests, and HTTP-surface
-# debugging. For real training/inference use one of the GPU configs in
-# ../transformer/ or ../megatron/.
+# This file is the single fixture consumed by CLI tests and the in-process
+# Ray Serve e2e test. Mock model + mock sampler need no GPU / torch / vllm /
+# megatron, so the launch path can run on any CI host. Not for production.
 
 proxy_location: EveryNode
 
 http_options:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8000
 
-telemetry:
-  enabled: false
-  debug: false
-  service_name: twinkle-server
-  otlp_endpoint: http://localhost:4317
-
-# In-process MemoryBackend — no Redis required for the mock workflow.
 persistence:
   mode: memory
 
 applications:
 
-  # 1. Tinker-compatible gateway
   - name: server
     route_prefix: /api/v1
     import_path: server
@@ -45,18 +33,17 @@ applications:
         ray_actor_options:
           num_cpus: 0.1
 
-  # 2. Mock model — numpy-only, deterministic. Skips twinkle.initialize.
   - name: models-mock
     route_prefix: /api/v1/model/mock
     import_path: model
     args:
-      backend: mock                          # Mock backend: numpy-only, CPU-only
+      backend: mock
       model_id: mock-model
       nproc_per_node: 1
       device_group:
         name: model
         ranks: 1
-        device_type: cpu                     # No GPU required
+        device_type: cpu
       device_mesh:
         device_type: cpu
         dp_size: 1
@@ -72,12 +59,11 @@ applications:
         ray_actor_options:
           num_cpus: 0.1
 
-  # 3. Mock sampler — numpy-only, deterministic. No vllm import.
   - name: sampler-mock
     route_prefix: /api/v1/sampler/mock
     import_path: sampler
     args:
-      sampler_type: mock                     # Mock sampler: numpy-only, CPU-only
+      sampler_type: mock
       model_id: mock-model
       nproc_per_node: 1
       device_group:

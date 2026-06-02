@@ -142,26 +142,3 @@ def test_mock_sampler_module_does_not_directly_import_vllm() -> None:
         assert forbidden not in text, f'mock_sampler.py contains {forbidden!r}'
 
 
-# ---------- Mock example config loads (R5.4) ------------------------------ #
-
-
-def test_mock_example_config_loads_via_server_config() -> None:
-    from twinkle.server.config import ServerConfig
-
-    repo_root = Path(__file__).resolve().parents[3]
-    cfg_path = repo_root / 'cookbook' / 'client' / 'server' / 'mock' / 'server_config.yaml'
-    cfg = ServerConfig.from_yaml(cfg_path)
-    backends = {
-        a.name: getattr(a.args, 'backend', None) or getattr(a.args, 'sampler_type', None)
-        for a in cfg.applications
-    }
-    assert backends.get('models-mock') == 'mock'
-    assert backends.get('sampler-mock') == 'mock'
-
-
-def test_mock_readme_documents_launch_and_targets() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    readme = (repo_root / 'cookbook' / 'client' / 'server' / 'mock' / 'README.md').read_text()
-    assert 'python -m twinkle.server' in readme
-    assert '30 seconds' in readme or '30s' in readme
-    assert 'Not for production' in readme or 'NOT FOR PRODUCTION' in readme.upper()

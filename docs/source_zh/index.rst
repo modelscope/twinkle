@@ -13,7 +13,6 @@ Twinkle DOCUMENTATION
    使用指引/安装.md
    使用指引/服务端和客户端/index.rst
    使用指引/服务配置.md
-   使用指引/可观测化.md
    使用指引/NPU的支持.md
    使用指引/训练服务.md
    使用指引/Qwen3.5最佳实践.md

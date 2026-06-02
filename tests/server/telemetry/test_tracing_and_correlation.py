@@ -261,27 +261,3 @@ def test_pyproject_declares_telemetry_extras() -> None:
     assert 'telemetry =' in text
     assert 'psutil' in text
     assert 'pynvml' in text
-
-
-def test_grafana_dashboard_includes_resource_panels() -> None:
-    """Grafana dashboard JSON ships CPU / Memory / GPU panels (R12.5)."""
-    import json
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[3]
-    dashboard = json.loads(
-        (repo_root / 'cookbook' / 'observability' / 'grafana' / 'dashboards' / 'twinkle-overview.json').read_text())
-    titles = ' | '.join(p['title'].lower() for p in dashboard['panels'])
-    for required in ('cpu', 'memory', 'gpu utilization', 'gpu memory'):
-        assert required in titles, f'dashboard missing panel containing {required!r}'
-
-    # Each resource gauge name must be referenced by at least one panel target.
-    targets = ' | '.join(t.get('expr', '') for p in dashboard['panels'] for t in p.get('targets', []))
-    for metric in (
-            'twinkle_system_cpu_utilization',
-            'twinkle_system_memory_usage_bytes',
-            'twinkle_process_memory_usage_bytes',
-            'twinkle_gpu_utilization',
-            'twinkle_gpu_memory_usage_bytes',
-    ):
-        assert metric in targets, f'dashboard does not query metric {metric!r}'

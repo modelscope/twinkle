@@ -13,6 +13,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 from unittest import mock
 
+from tests.server.fixtures import MOCK_SERVER_CONFIG
 from twinkle.server.cli.app import app, main
 from twinkle.server.config import ServerConfig
 from twinkle.server.exceptions import ConfigMismatchError
@@ -20,9 +21,8 @@ from twinkle.server.state.backend.factory import PersistenceConfig
 from twinkle.server.state.backend.memory_backend import MemoryBackend
 from twinkle.server.state.config_signature import _SIGNATURE_KEY, compute_signature, validate_against_backend
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-EXAMPLE = REPO_ROOT / 'cookbook' / 'client' / 'server' / 'server_config.example.yaml'
-MOCK_CFG = REPO_ROOT / 'cookbook' / 'client' / 'server' / 'mock' / 'server_config.yaml'
+EXAMPLE = MOCK_SERVER_CONFIG
+MOCK_CFG = MOCK_SERVER_CONFIG
 
 # ---------- 9.5 CLI subcommand existence + exit codes (R14.3, R14.4) ------ #
 
