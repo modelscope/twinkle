@@ -205,6 +205,64 @@ def test_worker_init_starts_collector() -> None:
     assert sentinel.maybe_start.call_count == 1
 
 
+def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
+    """``init_telemetry`` must attach the OTLP ``LoggingHandler`` to BOTH
+    the root logger AND the ``twinkle`` logger.
+
+    The ``twinkle.utils.logger`` module configures the ``twinkle`` namespace
+    with ``propagate=False`` and its own StreamHandler — so an OTLP handler
+    bound only to root would never see any ``twinkle.*`` log records, and
+    the entire server's logs would be invisible in Loki / OTLP backends.
+    """
+    import logging
+    from opentelemetry import _logs as _otel_logs, metrics, trace
+    from opentelemetry.sdk._logs import LoggingHandler
+    from opentelemetry.util._once import Once
+
+    from twinkle.server.telemetry import provider
+
+    # Reset all OTel global guards so init_telemetry runs cleanly.
+    trace._TRACER_PROVIDER_SET_ONCE = Once()
+    trace._TRACER_PROVIDER = None
+    metrics._METER_PROVIDER_SET_ONCE = Once()
+    metrics._METER_PROVIDER = None
+    if hasattr(_otel_logs, '_LOGGER_PROVIDER_SET_ONCE'):
+        _otel_logs._LOGGER_PROVIDER_SET_ONCE = Once()
+        _otel_logs._LOGGER_PROVIDER = None
+    provider._initialized = False
+
+    # Clear stale handlers that might be attached from prior tests.
+    for name in ('', 'twinkle'):
+        for h in list(logging.getLogger(name).handlers):
+            if isinstance(h, LoggingHandler):
+                logging.getLogger(name).removeHandler(h)
+
+    try:
+        provider.init_telemetry(provider.TelemetryConfig(
+            enabled=True, debug=True,  # debug=True → console exporter, no real OTLP needed
+            service_name='twinkle-server-test',
+        ))
+        root_handlers = [
+            h for h in logging.getLogger().handlers if isinstance(h, LoggingHandler)
+        ]
+        twinkle_handlers = [
+            h for h in logging.getLogger('twinkle').handlers if isinstance(h, LoggingHandler)
+        ]
+        assert len(root_handlers) == 1, root_handlers
+        assert len(twinkle_handlers) == 1, twinkle_handlers
+        assert root_handlers[0] is twinkle_handlers[0], (
+            'root and twinkle should share the same handler instance'
+        )
+    finally:
+        provider.shutdown_telemetry()
+        # shutdown should detach from both
+        assert all(
+            not isinstance(h, LoggingHandler)
+            for name in ('', 'twinkle')
+            for h in logging.getLogger(name).handlers
+        )
+
+
 def test_pyproject_declares_telemetry_extras() -> None:
     """``pyproject.toml`` declares ``psutil`` and ``pynvml`` as telemetry extras (R12.4)."""
     from pathlib import Path
