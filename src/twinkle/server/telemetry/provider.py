@@ -209,7 +209,13 @@ def init_telemetry(config: TelemetryConfig) -> None:
     handler = LoggingHandler(
         level=logging.NOTSET, logger_provider=logger_provider
     )
+    # Attach to BOTH the root logger and the ``twinkle`` namespace logger.
+    # ``twinkle.utils.logger`` configures the ``twinkle`` logger with
+    # ``propagate=False`` and its own StreamHandler, so log records emitted
+    # under ``twinkle.*`` (which is the entire server codebase) never bubble
+    # up to root and would be invisible to an OTLP handler bound there only.
     logging.getLogger().addHandler(handler)
+    logging.getLogger('twinkle').addHandler(handler)
     _logging_handler = handler
 
     _initialized = True
@@ -227,10 +233,11 @@ def shutdown_telemetry() -> None:
     global _logging_handler, _initialized
 
     if _logging_handler is not None:
-        try:
-            logging.getLogger().removeHandler(_logging_handler)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to detach logging handler: %s", exc)
+        for logger_name in ('', 'twinkle'):
+            try:
+                logging.getLogger(logger_name).removeHandler(_logging_handler)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to detach logging handler from %r: %s", logger_name, exc)
         _logging_handler = None
 
     if _tracer_provider is not None:
