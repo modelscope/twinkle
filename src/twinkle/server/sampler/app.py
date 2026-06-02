@@ -15,9 +15,9 @@ from typing import Any, Dict, Optional
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.exceptions import ConfigError
+from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.state import ServerStateProxy, get_server_state
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
@@ -26,7 +26,6 @@ from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 
 logger = get_logger()
-
 
 _SAMPLER_TYPES: tuple[str, ...] = ('mock', 'vllm', 'torch')
 
@@ -38,14 +37,8 @@ def _validate_sampler_type(sampler_type: Any) -> str:
     when the value is missing, empty, non-string, or not exactly one of the
     permitted values. No imports or side effects.
     """
-    if (
-        not isinstance(sampler_type, str)
-        or sampler_type == ''
-        or sampler_type not in _SAMPLER_TYPES
-    ):
-        raise ConfigError(
-            field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES)
-        )
+    if (not isinstance(sampler_type, str) or sampler_type == '' or sampler_type not in _SAMPLER_TYPES):
+        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
     return sampler_type
 
 
@@ -119,7 +112,10 @@ class SamplerManagement(TaskQueueMixin):
                 device_mesh=self.device_mesh,
                 remote_group=self.device_group.name,
                 instance_id=replica_id,
-                **{k: v for k, v in kwargs.items() if k not in ('engine_args',)},
+                **{
+                    k: v
+                    for k, v in kwargs.items() if k not in ('engine_args', )
+                },
             )
         self.sampler = _dispatch_sampler_backend(sampler_type, sampler_kwargs)
 
@@ -174,6 +170,7 @@ def build_sampler_app(model_id: str,
     """
     # Fail fast at builder time on bad sampler_type values.
     sampler_type = _validate_sampler_type(sampler_type)
+
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
 

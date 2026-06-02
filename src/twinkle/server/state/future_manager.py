@@ -16,7 +16,7 @@ class FutureManager(BaseManager[FutureRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
-        super().__init__(backend, "future::", FutureRecord, expiration_timeout)
+        super().__init__(backend, 'future::', FutureRecord, expiration_timeout)
 
     # ----- Future-specific operations -----
 

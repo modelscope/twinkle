@@ -16,10 +16,10 @@ from typing import Any, Dict, Optional
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.utils.lifecycle import AdapterManagerMixin
-from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.telemetry.tracing import create_tracing_middleware
+from twinkle.server.utils.lifecycle import AdapterManagerMixin
+from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request, verify_request_token
 from twinkle.utils.logger import get_logger
@@ -29,7 +29,6 @@ from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 
 logger = get_logger()
-
 
 _MODEL_BACKENDS: tuple[str, ...] = ('mock', 'transformers', 'megatron')
 
@@ -247,8 +246,14 @@ def build_model_app(model_id: str,
     )(
         ModelManagementWithIngress)
     return DeploymentClass.options(**deploy_options).bind(
-        model_id, nproc_per_node, device_group, device_mesh, backend,
-        adapter_config, queue_config, **kwargs,
+        model_id,
+        nproc_per_node,
+        device_group,
+        device_mesh,
+        backend,
+        adapter_config,
+        queue_config,
+        **kwargs,
     )
 
 

@@ -18,23 +18,15 @@ explicitly approved.
 from __future__ import annotations
 
 import json
-
 import pytest
 
-from tests.contract.client_api_harness import (
-    APP_BUILDERS,
-    BASELINE_PATH,
-    extract_full_surface,
-    load_baseline,
-)
+from tests.contract.client_api_harness import APP_BUILDERS, BASELINE_PATH, extract_full_surface, load_baseline
 
 
 def test_baseline_file_exists() -> None:
-    assert BASELINE_PATH.exists(), (
-        f'Baseline {BASELINE_PATH} missing. Generate it with '
-        '`python -m tests.contract.update_baseline` after confirming the '
-        'current client-facing surface is correct.'
-    )
+    assert BASELINE_PATH.exists(), (f'Baseline {BASELINE_PATH} missing. Generate it with '
+                                    '`python -m tests.contract.update_baseline` after confirming the '
+                                    'current client-facing surface is correct.')
 
 
 @pytest.mark.parametrize('app_name', sorted(APP_BUILDERS.keys()))
@@ -50,22 +42,18 @@ def test_app_surface_matches_baseline(app_name: str) -> None:
 
     if actual != expected:
         diff = _surface_diff(expected, actual)
-        pytest.fail(
-            f'Client-API surface for {app_name!r} drifted from the baseline.\n'
-            f'{diff}\n'
-            f'If the change is intentional, regenerate the baseline with '
-            f'`python -m tests.contract.update_baseline`.'
-        )
+        pytest.fail(f'Client-API surface for {app_name!r} drifted from the baseline.\n'
+                    f'{diff}\n'
+                    f'If the change is intentional, regenerate the baseline with '
+                    f'`python -m tests.contract.update_baseline`.')
 
 
 def test_full_surface_matches_baseline() -> None:
     """Whole-surface equality — the cross-cutting freeze guard."""
     baseline = load_baseline()
     current = extract_full_surface()
-    assert current == baseline, (
-        'Full client-API surface drifted from the baseline. '
-        'See per-app failures for details.'
-    )
+    assert current == baseline, ('Full client-API surface drifted from the baseline. '
+                                 'See per-app failures for details.')
 
 
 def _surface_diff(expected: dict, actual: dict) -> str:
@@ -92,6 +80,9 @@ def _surface_diff(expected: dict, actual: dict) -> str:
     if changed:
         parts.append('  changed paths:\n' + '\n'.join(changed))
     return '\n'.join(parts) if parts else json.dumps(
-        {'expected_keys': sorted(expected.keys()), 'actual_keys': sorted(actual.keys())},
+        {
+            'expected_keys': sorted(expected.keys()),
+            'actual_keys': sorted(actual.keys())
+        },
         indent=2,
     )

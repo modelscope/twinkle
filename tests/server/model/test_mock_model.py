@@ -10,32 +10,48 @@ Properties covered:
 """
 from __future__ import annotations
 
-import sys
-
 import pytest
-from hypothesis import given, settings, strategies as st
+import sys
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.model.app import (
-    _MODEL_BACKENDS,
-    _dispatch_model_backend,
-    _validate_model_backend,
-)
+from twinkle.server.model.app import _MODEL_BACKENDS, _dispatch_model_backend, _validate_model_backend
 from twinkle.server.model.backends.mock_model import TwinkleCompatMockModel
-
 
 # ---------- Property 1: interface conformance (R1.1, R1.4) ---------------- #
 
-
 _REQUIRED_METHODS = (
-    'tinker_forward_only', 'tinker_forward_backward', 'tinker_step',
-    'tinker_calculate_metric', 'tinker_load',
-    'forward_only', 'forward_backward', 'forward', 'calculate_loss',
-    'backward', 'step', 'zero_grad', 'lr_step', 'clip_grad_norm',
-    'set_loss', 'set_optimizer', 'set_lr_scheduler', 'set_template',
-    'set_processor', 'add_metric', 'apply_patch',
-    'save', 'load', 'resume_from_checkpoint', 'get_state_dict', 'get_train_configs',
-    'add_adapter', 'add_adapter_to_model', 'remove_adapter', 'has_adapter',
+    'tinker_forward_only',
+    'tinker_forward_backward',
+    'tinker_step',
+    'tinker_calculate_metric',
+    'tinker_load',
+    'forward_only',
+    'forward_backward',
+    'forward',
+    'calculate_loss',
+    'backward',
+    'step',
+    'zero_grad',
+    'lr_step',
+    'clip_grad_norm',
+    'set_loss',
+    'set_optimizer',
+    'set_lr_scheduler',
+    'set_template',
+    'set_processor',
+    'add_metric',
+    'apply_patch',
+    'save',
+    'load',
+    'resume_from_checkpoint',
+    'get_state_dict',
+    'get_train_configs',
+    'add_adapter',
+    'add_adapter_to_model',
+    'remove_adapter',
+    'has_adapter',
 )
 
 
@@ -85,7 +101,9 @@ def test_property_2_tinker_forward_backward_loss_is_finite(seq_lens: list) -> No
 
 
 @settings(max_examples=100)
-@given(name=st.text(min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
+@given(
+    name=st.text(
+        min_size=1, max_size=12, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='_-')))
 def test_property_3_adapter_add_remove_round_trip(name: str) -> None:
     m = TwinkleCompatMockModel('mid')
     assert not m.has_adapter(name)

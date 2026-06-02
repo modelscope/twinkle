@@ -21,10 +21,10 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
-from twinkle.server.utils.lifecycle import ProcessorManagerMixin
-from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.telemetry.tracing import create_tracing_middleware
+from twinkle.server.utils.lifecycle import ProcessorManagerMixin
+from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.validation import verify_request_token
 from .twinkle_handlers import _register_processor_routes
 
@@ -119,6 +119,7 @@ def build_processor_app(ncpu_proc_per_node: int,
     Returns:
         Ray Serve deployment bound with configuration.
     """
+
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
 

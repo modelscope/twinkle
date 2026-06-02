@@ -15,12 +15,10 @@ cluster) and is gated behind ``TWINKLE_TEST_INTEGRATION=1`` so plain
 """
 from __future__ import annotations
 
-import os
-import time
-import uuid
-
 import httpx
+import os
 import pytest
+import time
 
 from twinkle.server.config import ServerConfig
 
@@ -97,7 +95,10 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
         deploy_options: dict = {}
         for raw in app_spec.deployments:
             if isinstance(raw, dict):
-                deploy_options = {k: v for k, v in raw.items() if k not in ('name', 'ray_actor_options', 'autoscaling_config')}
+                deploy_options = {
+                    k: v
+                    for k, v in raw.items() if k not in ('name', 'ray_actor_options', 'autoscaling_config')
+                }
                 break
         bound = builder(deploy_options=deploy_options, **args)
         serve.run(bound, name=app_spec.name, route_prefix=app_spec.route_prefix)
@@ -115,8 +116,6 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
     assert r.status_code == 200, r.text
 
     # Mock model + sampler determinism via the gateway's exposed routes.
-    sampling_session = f'sess-{uuid.uuid4().hex[:8]}'
-    payload = {'session_id': sampling_session}
     r1 = _http(f'{base}/api/v1/twinkle/healthz')
     r2 = _http(f'{base}/api/v1/twinkle/healthz')
     assert r1.status_code == 200 and r2.status_code == 200

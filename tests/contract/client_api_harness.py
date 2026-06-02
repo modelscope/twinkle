@@ -27,12 +27,10 @@ Notes:
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Callable
-
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
-
+from pathlib import Path
+from typing import Any, Callable
 
 # ----- App build helpers --------------------------------------------------- #
 
@@ -86,9 +84,7 @@ APP_BUILDERS: dict[str, Callable[[], FastAPI]] = {
     'processor': build_processor_app,
 }
 
-
 # ----- Surface extraction -------------------------------------------------- #
-
 
 _HTTP_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}
 
@@ -134,7 +130,6 @@ def extract_full_surface() -> dict[str, Any]:
 
 
 # ----- Baseline I/O -------------------------------------------------------- #
-
 
 BASELINE_PATH = Path(__file__).parent / 'client_api_baseline.json'
 

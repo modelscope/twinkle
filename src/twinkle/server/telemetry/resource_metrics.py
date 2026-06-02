@@ -30,7 +30,6 @@ try:
 except Exception:
     _PYNVML_AVAILABLE = False
 
-
 _NVML_INITIALIZED = False
 
 

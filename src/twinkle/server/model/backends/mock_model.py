@@ -17,9 +17,8 @@ import-isolation requirement (R1.2).
 """
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
+from typing import Any
 
 
 def _seed_for(model_id: str, adapter_name: str | None, seed: int, *extra: Any) -> int:

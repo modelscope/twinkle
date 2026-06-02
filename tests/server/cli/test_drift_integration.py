@@ -12,31 +12,26 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pytest
 import re
 import uuid
-from pathlib import Path
-from unittest import mock
-
-import pytest
 import yaml
+from pathlib import Path
 from typer.testing import CliRunner
+from unittest import mock
 
 from twinkle.server.cli.app import app
 from twinkle.server.config import ServerConfig
 from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.state.backend.factory import PersistenceConfig, create_backend
 from twinkle.server.state.backend.redis_backend import RedisBackend
-from twinkle.server.state.config_signature import (
-    _SIGNATURE_KEY,
-    compute_signature,
-    validate_against_backend,
-)
-
+from twinkle.server.state.config_signature import _SIGNATURE_KEY, compute_signature, validate_against_backend
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
 
 def _can_reach_redis() -> bool:
+
     async def _check() -> bool:
         backend = RedisBackend(REDIS_URL)
         try:
@@ -72,17 +67,23 @@ def write_config(tmp_path: Path):
 
     def _write(persistence: dict) -> Path:
         payload = {
-            'http_options': {'host': 'localhost', 'port': 8000},
-            'telemetry': {'enabled': False},
-            'persistence': persistence,
-            'applications': [
-                {
-                    'name': 'server',
-                    'route_prefix': '/api/v1',
-                    'import_path': 'server',
-                    'args': {'supported_models': ['mock']},
-                }
-            ],
+            'http_options': {
+                'host': 'localhost',
+                'port': 8000
+            },
+            'telemetry': {
+                'enabled': False
+            },
+            'persistence':
+            persistence,
+            'applications': [{
+                'name': 'server',
+                'route_prefix': '/api/v1',
+                'import_path': 'server',
+                'args': {
+                    'supported_models': ['mock']
+                },
+            }],
         }
         path = tmp_path / f'config-{uuid.uuid4().hex[:6]}.yaml'
         path.write_text(yaml.safe_dump(payload))
@@ -206,9 +207,7 @@ def test_check_config_does_not_touch_redis(fresh_prefix: str, write_config) -> N
     assert res.exit_code == 0
 
     async def _read_signature() -> object:
-        backend = create_backend(
-            PersistenceConfig(mode='redis', redis_url=REDIS_URL, key_prefix=fresh_prefix)
-        )
+        backend = create_backend(PersistenceConfig(mode='redis', redis_url=REDIS_URL, key_prefix=fresh_prefix))
         try:
             return await backend.get(_SIGNATURE_KEY)
         finally:

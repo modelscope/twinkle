@@ -211,7 +211,7 @@ def main() -> None:
     for r in results:
         print(f"  user{r['user_idx']}  token={r['token']:14s}  session={r['session_id']}  "
               f"model={r['model_id']}  base={r['base_model']:20s}  "
-              f"final_loss={r['final_loss']:.3f}" if r['final_loss'] else "")
+              f"final_loss={r['final_loss']:.3f}" if r['final_loss'] else '')
 
     # Drive resource gauges + flush everything
     time.sleep(3)

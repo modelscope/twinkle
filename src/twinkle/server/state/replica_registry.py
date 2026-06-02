@@ -27,7 +27,7 @@ def _make_key(replica_id: str) -> str:
 def _replica_id_from_key(key: str) -> str | None:
     if not key.startswith(REPLICA_PREFIX) or not key.endswith(_MAX_LORAS_SUFFIX):
         return None
-    return key[len(REPLICA_PREFIX): -len(_MAX_LORAS_SUFFIX)]
+    return key[len(REPLICA_PREFIX):-len(_MAX_LORAS_SUFFIX)]
 
 
 class ReplicaRegistry:

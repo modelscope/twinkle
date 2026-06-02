@@ -15,9 +15,11 @@ from .base import StateBackend
 class FileBackend(StateBackend):
     """Local JSON file-based persistent state backend implementation.
 
-    Storage format is a single JSON file: ``{key: {"value": ..., "expire_at": float|null}}``.
-    File I/O is wrapped with ``asyncio.to_thread`` to avoid blocking the event loop.
-    Writes use temp file + ``os.replace`` for atomic replacement, protected by ``fcntl.flock`` against multi-process concurrent writes.
+    Storage format is a single JSON file:
+    ``{key: {"value": ..., "expire_at": float|null}}``.
+    File I/O is wrapped with ``asyncio.to_thread`` to avoid blocking the
+    event loop. Writes use temp file + ``os.replace`` for atomic replacement,
+    protected by ``fcntl.flock`` against multi-process concurrent writes.
     """
 
     def __init__(self, file_path: str) -> None:
@@ -36,7 +38,7 @@ class FileBackend(StateBackend):
     def _load_sync(self) -> dict[str, dict[str, Any]]:
         """Synchronously read JSON file, return complete data dict."""
         try:
-            with open(self._file_path, 'r', encoding='utf-8') as f:
+            with open(self._file_path, encoding='utf-8') as f:
                 data = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
             data = {}
@@ -46,10 +48,7 @@ class FileBackend(StateBackend):
         """Synchronous write: clean expired keys -> write temp file -> flock -> os.replace."""
         # Clean expired keys before writing
         now = time.time()
-        data = {
-            k: v for k, v in data.items()
-            if v.get('expire_at') is None or v['expire_at'] > now
-        }
+        data = {k: v for k, v in data.items() if v.get('expire_at') is None or v['expire_at'] > now}
 
         dir_path = os.path.dirname(self._file_path) or '.'
         fd = tempfile.NamedTemporaryFile(
@@ -66,7 +65,7 @@ class FileBackend(StateBackend):
             fd.close()
 
             # Apply exclusive lock to temp file then atomic replace
-            with open(fd.name, 'r') as lock_f:
+            with open(fd.name) as lock_f:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
                 os.replace(fd.name, self._file_path)
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)

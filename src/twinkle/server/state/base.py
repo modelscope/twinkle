@@ -5,9 +5,8 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Generic, TypeVar
-
 from pydantic import BaseModel
+from typing import Generic, TypeVar
 
 from twinkle.server.state.backend.base import StateBackend
 

@@ -11,19 +11,14 @@ Properties covered:
 """
 from __future__ import annotations
 
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from unittest import mock
 
-import pytest
-from hypothesis import given, settings, strategies as st
-
 from twinkle.server.telemetry import correlation
-from twinkle.server.telemetry.correlation import (
-    CORRELATION_KEYS,
-    PREFIX,
-    set_correlation_attrs,
-)
+from twinkle.server.telemetry.correlation import CORRELATION_KEYS, PREFIX, set_correlation_attrs
 from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
-
 
 # ---------- Property 23: prefix invariant (R11.3) ------------------------- #
 
@@ -49,6 +44,7 @@ def test_property_23_helper_constants_complete() -> None:
 
 
 class _RecordingSpan:
+
     def __init__(self) -> None:
         self.attrs: dict[str, object] = {}
 
@@ -66,8 +62,7 @@ class _RecordingSpan:
             correlation.REPLICA_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
             correlation.TOKEN_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
         },
-    )
-)
+    ))
 def test_property_22_set_correlation_attrs_skips_none(payload: dict) -> None:
     span = _RecordingSpan()
     set_correlation_attrs(span, payload)
@@ -215,7 +210,8 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
     the entire server's logs would be invisible in Loki / OTLP backends.
     """
     import logging
-    from opentelemetry import _logs as _otel_logs, metrics, trace
+    from opentelemetry import _logs as _otel_logs
+    from opentelemetry import metrics, trace
     from opentelemetry.sdk._logs import LoggingHandler
     from opentelemetry.util._once import Once
 
@@ -238,29 +234,22 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
                 logging.getLogger(name).removeHandler(h)
 
     try:
-        provider.init_telemetry(provider.TelemetryConfig(
-            enabled=True, debug=True,  # debug=True → console exporter, no real OTLP needed
-            service_name='twinkle-server-test',
-        ))
-        root_handlers = [
-            h for h in logging.getLogger().handlers if isinstance(h, LoggingHandler)
-        ]
-        twinkle_handlers = [
-            h for h in logging.getLogger('twinkle').handlers if isinstance(h, LoggingHandler)
-        ]
+        provider.init_telemetry(
+            provider.TelemetryConfig(
+                enabled=True,
+                debug=True,  # debug=True → console exporter, no real OTLP needed
+                service_name='twinkle-server-test',
+            ))
+        root_handlers = [h for h in logging.getLogger().handlers if isinstance(h, LoggingHandler)]
+        twinkle_handlers = [h for h in logging.getLogger('twinkle').handlers if isinstance(h, LoggingHandler)]
         assert len(root_handlers) == 1, root_handlers
         assert len(twinkle_handlers) == 1, twinkle_handlers
-        assert root_handlers[0] is twinkle_handlers[0], (
-            'root and twinkle should share the same handler instance'
-        )
+        assert root_handlers[0] is twinkle_handlers[0], ('root and twinkle should share the same handler instance')
     finally:
         provider.shutdown_telemetry()
         # shutdown should detach from both
-        assert all(
-            not isinstance(h, LoggingHandler)
-            for name in ('', 'twinkle')
-            for h in logging.getLogger(name).handlers
-        )
+        assert all(not isinstance(h, LoggingHandler) for name in ('', 'twinkle')
+                   for h in logging.getLogger(name).handlers)
 
 
 def test_pyproject_declares_telemetry_extras() -> None:
@@ -281,24 +270,18 @@ def test_grafana_dashboard_includes_resource_panels() -> None:
 
     repo_root = Path(__file__).resolve().parents[3]
     dashboard = json.loads(
-        (repo_root / 'cookbook' / 'observability' / 'grafana' / 'dashboards'
-         / 'twinkle-overview.json').read_text()
-    )
+        (repo_root / 'cookbook' / 'observability' / 'grafana' / 'dashboards' / 'twinkle-overview.json').read_text())
     titles = ' | '.join(p['title'].lower() for p in dashboard['panels'])
     for required in ('cpu', 'memory', 'gpu utilization', 'gpu memory'):
         assert required in titles, f'dashboard missing panel containing {required!r}'
 
     # Each resource gauge name must be referenced by at least one panel target.
-    targets = ' | '.join(
-        t.get('expr', '')
-        for p in dashboard['panels']
-        for t in p.get('targets', [])
-    )
+    targets = ' | '.join(t.get('expr', '') for p in dashboard['panels'] for t in p.get('targets', []))
     for metric in (
-        'twinkle_system_cpu_utilization',
-        'twinkle_system_memory_usage_bytes',
-        'twinkle_process_memory_usage_bytes',
-        'twinkle_gpu_utilization',
-        'twinkle_gpu_memory_usage_bytes',
+            'twinkle_system_cpu_utilization',
+            'twinkle_system_memory_usage_bytes',
+            'twinkle_process_memory_usage_bytes',
+            'twinkle_gpu_utilization',
+            'twinkle_gpu_memory_usage_bytes',
     ):
         assert metric in targets, f'dashboard does not query metric {metric!r}'

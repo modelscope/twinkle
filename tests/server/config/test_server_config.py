@@ -2,63 +2,69 @@
 """Property + unit tests for the typed ``ServerConfig`` (R6, R7, R8).
 
 Properties covered:
-- # Feature: server-config-observability-refactor, Property 12: Valid configuration yields a fully validated instance
-- # Feature: server-config-observability-refactor, Property 13: Any constraint violation is rejected with the offending field named
-- # Feature: server-config-observability-refactor, Property 14: Configuration round-trip fidelity
-- # Feature: server-config-observability-refactor, Property 15: Legacy / unknown field names are rejected
+- # Feature: server-config-observability-refactor,
+  Property 12: Valid configuration yields a fully validated instance
+- # Feature: server-config-observability-refactor,
+  Property 13: Any constraint violation is rejected with the offending field named
+- # Feature: server-config-observability-refactor,
+  Property 14: Configuration round-trip fidelity
+- # Feature: server-config-observability-refactor,
+  Property 15: Legacy / unknown field names are rejected
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import yaml
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from pathlib import Path
 from pydantic import ValidationError
 
 from twinkle.server.config import ApplicationSpec, ServerConfig
 from twinkle.server.exceptions import ConfigParseError
 from twinkle.server.launcher import ServerLauncher
 
-
 # ---------- minimal valid config strategy ---------------------------------- #
-
 
 _PERSISTENCE_VARIANTS = st.one_of(
     st.fixed_dictionaries({'mode': st.just('memory')}),
-    st.fixed_dictionaries(
-        {'mode': st.just('file'), 'file_path': st.just('/tmp/state.json')}
-    ),
-    st.fixed_dictionaries(
-        {'mode': st.just('redis'), 'redis_url': st.just('redis://localhost:6379/0')}
-    ),
+    st.fixed_dictionaries({
+        'mode': st.just('file'),
+        'file_path': st.just('/tmp/state.json')
+    }),
+    st.fixed_dictionaries({
+        'mode': st.just('redis'),
+        'redis_url': st.just('redis://localhost:6379/0')
+    }),
 )
 
+_MODEL_APP = st.fixed_dictionaries({
+    'name':
+    st.just('m'),
+    'route_prefix':
+    st.just('/api/v1/m'),
+    'import_path':
+    st.just('model'),
+    'args':
+    st.fixed_dictionaries({
+        'model_id': st.just('model-id'),
+        'device_group': st.just({
+            'name': 'g',
+            'ranks': 1,
+            'device_type': 'CPU'
+        }),
+        'device_mesh': st.just({
+            'device_type': 'CPU',
+            'dp_size': 1
+        }),
+        'backend': st.sampled_from(['mock', 'transformers', 'megatron']),
+    }),
+})
 
-_MODEL_APP = st.fixed_dictionaries(
-    {
-        'name': st.just('m'),
-        'route_prefix': st.just('/api/v1/m'),
-        'import_path': st.just('model'),
-        'args': st.fixed_dictionaries(
-            {
-                'model_id': st.just('model-id'),
-                'device_group': st.just({'name': 'g', 'ranks': 1, 'device_type': 'CPU'}),
-                'device_mesh': st.just({'device_type': 'CPU', 'dp_size': 1}),
-                'backend': st.sampled_from(['mock', 'transformers', 'megatron']),
-            }
-        ),
-    }
-)
-
-
-_VALID_CONFIG = st.fixed_dictionaries(
-    {
-        'persistence': _PERSISTENCE_VARIANTS,
-        'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
-    }
-)
-
+_VALID_CONFIG = st.fixed_dictionaries({
+    'persistence': _PERSISTENCE_VARIANTS,
+    'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
+})
 
 # ---------- Property 12: valid → fully validated (R6.2, R7.3) -------------- #
 
@@ -92,23 +98,19 @@ def test_property_13_file_mode_missing_path() -> None:
 
 
 @settings(max_examples=100)
-@given(bad_backend=st.text(min_size=1, max_size=8).filter(
-    lambda s: s not in ('mock', 'transformers', 'megatron')
-))
+@given(bad_backend=st.text(min_size=1, max_size=8).filter(lambda s: s not in ('mock', 'transformers', 'megatron')))
 def test_property_13_bad_backend_names_field(bad_backend: str) -> None:
     payload = {
-        'applications': [
-            {
-                'name': 'm',
-                'import_path': 'model',
-                'args': {
-                    'model_id': 'x',
-                    'device_group': {},
-                    'device_mesh': {},
-                    'backend': bad_backend,
-                },
-            }
-        ]
+        'applications': [{
+            'name': 'm',
+            'import_path': 'model',
+            'args': {
+                'model_id': 'x',
+                'device_group': {},
+                'device_mesh': {},
+                'backend': bad_backend,
+            },
+        }]
     }
     with pytest.raises(ValidationError) as exc:
         ServerConfig.model_validate(payload)
@@ -123,9 +125,7 @@ def test_property_13_nested_field_constraint_violation_named(bad_max_input_token
     enforced together with cross-field ones (R7.3) and the offending path is
     visible in the error."""
     with pytest.raises(ValidationError) as exc:
-        ServerConfig.model_validate(
-            {'task_queue': {'max_input_tokens': bad_max_input_tokens}}
-        )
+        ServerConfig.model_validate({'task_queue': {'max_input_tokens': bad_max_input_tokens}})
     errors = exc.value.errors()
     assert any('max_input_tokens' in err['loc'] for err in errors)
 
@@ -163,8 +163,13 @@ def test_property_15_legacy_field_rejected(legacy_field: str) -> None:
 @given(unknown=st.text(min_size=1, max_size=20).filter(lambda s: not s.startswith('_')))
 def test_property_15_unknown_field_rejected(unknown: str) -> None:
     known = {
-        'ray_namespace', 'proxy_location', 'http_options',
-        'telemetry', 'persistence', 'task_queue', 'applications',
+        'ray_namespace',
+        'proxy_location',
+        'http_options',
+        'telemetry',
+        'persistence',
+        'task_queue',
+        'applications',
     }
     if unknown in known:
         return
@@ -209,7 +214,12 @@ def test_from_yaml_top_level_must_be_mapping(tmp_path: Path) -> None:
 def test_from_yaml_valid_minimal(tmp_path: Path) -> None:
     p = tmp_path / 'mini.yaml'
     yaml.safe_dump(
-        {'persistence': {'mode': 'memory'}, 'applications': []},
+        {
+            'persistence': {
+                'mode': 'memory'
+            },
+            'applications': []
+        },
         p.open('w'),
     )
     cfg = ServerConfig.from_yaml(p)

@@ -10,14 +10,8 @@ from typing import Any
 
 from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.telemetry import MetricsRegistry
-from twinkle.server.telemetry.correlation import (
-    BASE_MODEL,
-    MODEL_ID,
-    REPLICA_ID,
-    SAMPLING_SESSION_ID,
-    SESSION_ID,
-    TOKEN_ID,
-)
+from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
+                                                  TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
@@ -99,8 +93,8 @@ class ServerState:
         """
         session_id = payload.get('session_id') or f'session_{uuid.uuid4().hex}'
         with traced_operation(
-            'server_state.create_session',
-            attrs={SESSION_ID: session_id},
+                'server_state.create_session',
+                attrs={SESSION_ID: session_id},
         ):
             record = SessionRecord(
                 tags=list(payload.get('tags') or []),
@@ -153,14 +147,14 @@ class ServerState:
         _model_id = re.sub(r'[^\w\-]', '_', _model_id)
 
         with traced_operation(
-            'server_state.register_model',
-            attrs={
-                MODEL_ID: _model_id,
-                BASE_MODEL: payload.get('base_model'),
-                REPLICA_ID: replica_id,
-                TOKEN_ID: token,
-                SESSION_ID: session_id or payload.get('session_id'),
-            },
+                'server_state.register_model',
+                attrs={
+                    MODEL_ID: _model_id,
+                    BASE_MODEL: payload.get('base_model'),
+                    REPLICA_ID: replica_id,
+                    TOKEN_ID: token,
+                    SESSION_ID: session_id or payload.get('session_id'),
+                },
         ):
             record = ModelRecord(
                 session_id=session_id or payload.get('session_id'),
@@ -197,8 +191,8 @@ class ServerState:
             max_loras: Maximum number of LoRA adapters the replica can hold.
         """
         with traced_operation(
-            'server_state.register_replica',
-            attrs={REPLICA_ID: replica_id},
+                'server_state.register_replica',
+                attrs={REPLICA_ID: replica_id},
         ):
             await self._model_mgr.register_replica(replica_id, max_loras)
 
@@ -236,12 +230,12 @@ class ServerState:
         _sampling_session_id: str = sampling_session_id or payload.get(
             'sampling_session_id') or f'sampling_{uuid.uuid4().hex}'
         with traced_operation(
-            'server_state.create_sampling_session',
-            attrs={
-                SAMPLING_SESSION_ID: _sampling_session_id,
-                SESSION_ID: payload.get('session_id'),
-                BASE_MODEL: payload.get('base_model'),
-            },
+                'server_state.create_sampling_session',
+                attrs={
+                    SAMPLING_SESSION_ID: _sampling_session_id,
+                    SESSION_ID: payload.get('session_id'),
+                    BASE_MODEL: payload.get('base_model'),
+                },
         ):
             record = SamplingSessionRecord(
                 session_id=payload.get('session_id'),
@@ -350,7 +344,8 @@ class ServerState:
         # Perform actual cleanup in dependency order
         sessions_removed = await self._session_mgr.cleanup_expired(cutoff_time)
         models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
-        samplings_removed = await self._sampling_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
+        samplings_removed = await self._sampling_mgr.cleanup_expired(
+            cutoff_time, expired_session_ids=expired_session_ids)
         futures_removed = await self._future_mgr.cleanup_expired(cutoff_time)
 
         return {
@@ -429,10 +424,7 @@ class ServerState:
         """
         # Validate config signature if provided
         if self._signature_config is not None:
-            from twinkle.server.state.config_signature import (
-                SignatureMismatchPolicy,
-                validate_config_signature,
-            )
+            from twinkle.server.state.config_signature import SignatureMismatchPolicy, validate_config_signature
             policy = SignatureMismatchPolicy(self._signature_policy)
             await validate_config_signature(self._backend, self._signature_config, policy)
 
@@ -490,17 +482,15 @@ class ServerState:
 
 ServerStateProxy = ServerState  # type: ignore[assignment]
 
-
 _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 
 
-def get_server_state(
-        actor_name: str = 'twinkle_server_state',
-        backend: StateBackend | None = None,
-        persistence_config: PersistenceConfig | None = None,
-        signature_config: dict[str, Any] | None = None,
-        signature_policy: str = 'warn',
-        **kwargs) -> ServerState:
+def get_server_state(actor_name: str = 'twinkle_server_state',
+                     backend: StateBackend | None = None,
+                     persistence_config: PersistenceConfig | None = None,
+                     signature_config: dict[str, Any] | None = None,
+                     signature_policy: str = 'warn',
+                     **kwargs) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
     No detached Ray Actor is created — every deployment / worker accesses the

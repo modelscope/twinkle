@@ -20,11 +20,9 @@ class RedisBackend(StateBackend):
     TTL is managed by Redis native EXPIRE mechanism.
     """
 
-    def __init__(self, redis_url: str, key_prefix: str = "") -> None:
+    def __init__(self, redis_url: str, key_prefix: str = '') -> None:
         if not _REDIS_AVAILABLE:
-            raise ImportError(
-                "redis package required. Install with: pip install redis"
-            )
+            raise ImportError('redis package required. Install with: pip install redis')
         self._client = aioredis.from_url(redis_url, decode_responses=True)
         self._prefix = key_prefix
 
