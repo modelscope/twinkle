@@ -84,6 +84,7 @@ def list_trackers(adapter_name: Optional[str] = None) -> List[ExperimentTracker]
             for that specific adapter (plus global trackers).  If
             ``None``, returns all trackers.
     """
+    _auto_init_from_env()
     result = list(_global_trackers)
     if adapter_name is not None:
         result.extend(_adapter_trackers.get(adapter_name, []))
@@ -127,7 +128,7 @@ def _target_trackers(adapter_name: Optional[str] = None) -> List[ExperimentTrack
     return result
 
 
-def dispatch(data: Dict[str, float], step: int, adapter_name: Optional[str] = None) -> None:
+def dispatch(data: Dict[str, Any], step: int, adapter_name: Optional[str] = None) -> None:
     """Send computed metrics to registered trackers.
 
     Metric values are normalized to ``float`` via :func:`clean_metrics`
@@ -141,6 +142,7 @@ def dispatch(data: Dict[str, float], step: int, adapter_name: Optional[str] = No
             are sent to both global trackers and any trackers registered
             specifically for this adapter.
     """
+    _auto_init_from_env()
     targets = _target_trackers(adapter_name)
     if not targets:
         return
@@ -166,23 +168,26 @@ def dispatch_hyperparams(params: Dict[str, Any], adapter_name: Optional[str] = N
     from ``calculate_metrics`` on its first invocation without
     flooding trackers with redundant config updates.
 
+    When *adapter_name* is ``None`` (single-adapter / full fine-tuning),
+    a default guard key ``"_default_"`` is used so that hyperparams
+    are still dispatched only once.
+
     Args:
         params: Flat or nested dict of hyperparameters (e.g. model config,
             training args, LoRA config).
-        adapter_name: Optional adapter identifier.  If omitted, the params
-            are dispatched unconditionally to global trackers on every
-            call.  If provided, dispatched to both global and per-adapter
-            trackers, with idempotency guard.
+        adapter_name: Optional adapter identifier.  If provided, dispatched
+            to both global and per-adapter trackers, with idempotency guard.
     """
+    _auto_init_from_env()
     targets = _target_trackers(adapter_name)
     if not targets or _rank != 0:
         return
 
-    # Idempotency guard: only dispatch once per adapter
-    if adapter_name is not None:
-        if adapter_name in _hparams_dispatched:
-            return
-        _hparams_dispatched.add(adapter_name)
+    # Idempotency guard: only dispatch once per adapter (or once globally)
+    guard_key = adapter_name if adapter_name is not None else '_default_'
+    if guard_key in _hparams_dispatched:
+        return
+    _hparams_dispatched.add(guard_key)
 
     for tracker in targets:
         try:
@@ -245,8 +250,10 @@ def _auto_init_from_env() -> None:
             logger.warning("Failed to auto-init tracker '%s' from env", name, exc_info=True)
 
 
-# Run auto-init once at import time (before user code or atexit runs)
-_auto_init_from_env()
+# Auto-init from environment variables runs lazily on first call to
+# ``dispatch()``, ``dispatch_hyperparams()``, or ``list_trackers()``.
+# This ensures ``set_rank()`` is called first in distributed training,
+# preventing every rank from initializing its own tracking run.
 
 # ---------------------------------------------------------------------------
 # At-exit cleanup

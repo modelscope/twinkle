@@ -80,6 +80,7 @@ class SwanLabTracker(ExperimentTracker):
         try:
             info = {'swanlab_experiment_url': self._run.get_run().url}
             out = Path(output_dir) / 'swanlab_config.json'
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(info, indent=2))
         except Exception:
             pass

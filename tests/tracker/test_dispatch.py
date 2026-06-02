@@ -288,8 +288,8 @@ class TestDispatchHyperparams:
         assert t.hyperparams[0] == {'lr': 1e-4}
         assert t.hyperparams[1] == {'lr': 2e-4}
 
-    def test_without_adapter_sends_every_time(self):
-        """When adapter_name is None, every call dispatches."""
+    def test_without_adapter_sends_once(self):
+        """When adapter_name is None, only the first call dispatches (idempotent via _default_)."""
         t = SpyTracker()
         register_tracker(t)
         set_rank(0)
@@ -298,7 +298,8 @@ class TestDispatchHyperparams:
         dispatch_hyperparams({'lr': 2e-4})
         dispatch_hyperparams({'lr': 3e-4})
 
-        assert len(t.hyperparams) == 3
+        assert len(t.hyperparams) == 1
+        assert t.hyperparams[0] == {'lr': 1e-4}
 
     def test_mixed_adapter_and_no_adapter(self):
         """Calls with and without adapter_name interact correctly."""
@@ -307,11 +308,11 @@ class TestDispatchHyperparams:
         set_rank(0)
 
         dispatch_hyperparams({'a': 1}, adapter_name='adp')  # sent
-        dispatch_hyperparams({'b': 2})  # sent (no adapter)
+        dispatch_hyperparams({'b': 2})  # sent (no adapter, first call)
         dispatch_hyperparams({'c': 3}, adapter_name='adp')  # ignored (idempotent)
-        dispatch_hyperparams({'d': 4})  # sent (no adapter again)
+        dispatch_hyperparams({'d': 4})  # ignored (no adapter, idempotent via _default_)
 
-        assert len(t.hyperparams) == 3
+        assert len(t.hyperparams) == 2
 
     def test_skipped_on_non_zero_rank(self):
         t = SpyTracker()

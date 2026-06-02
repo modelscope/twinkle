@@ -30,7 +30,7 @@ class WandbTracker(ExperimentTracker):
         import wandb
 
         entity = kwargs.pop('entity', None) or os.environ.get('WANDB_ENTITY')
-        settings = None
+        settings = kwargs.pop('settings', None)
         proxy = kwargs.pop('wandb_proxy', None) or os.environ.get('WANDB_PROXY')
         if proxy:
             settings = wandb.Settings(https_proxy=proxy)
