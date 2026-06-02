@@ -31,6 +31,8 @@ from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.sampler import vLLMSampler
 from twinkle.preprocessor.llm import GSM8KProcessor
+from twinkle.tracker import register_tracker, dispatch
+from twinkle.tracker.swanlab import SwanLabTracker
 
 logger = get_logger()
 
@@ -58,12 +60,6 @@ LORA_SYNC_DIR = os.environ.get('LORA_SYNC_DIR', 'output/lora_sync')
 
 SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minimal but correct reasoning '
                  'and put your final answer within \\boxed{}.')
-
-import swanlab
-swanlab.init(
-    project='twinkle',
-)
-
 
 # ========== Reward Functions ==========
 class GSM8KBrevityReward(Reward):
@@ -122,6 +118,11 @@ def compute_rewards(
 
 # ========== Main ==========
 def main():
+    # Register SwanLab tracker
+    register_tracker(SwanLabTracker(
+        project='twinkle',
+    ))
+
     # Device groups: 8 GPUs for model (tp=2 x ep=2 x pp=2), 4 GPUs for sampler (dp=2 x tp=2)
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
@@ -292,7 +293,9 @@ def main():
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME))
-        swanlab.log(log_dict)
+        # model.calculate_metric() already dispatches model metrics internally;
+        # this dispatch sends the full merged set for reward coverage.
+        dispatch(log_dict, step=optim_step)
         metrics.reset()
         logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
 

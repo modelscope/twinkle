@@ -20,9 +20,9 @@ import torch
 from tqdm import tqdm
 from typing import Any, Dict, List
 
-import swanlab
-
 from tinker import types
+from twinkle.tracker import register_tracker, dispatch
+from twinkle.tracker.swanlab import SwanLabTracker
 from twinkle import init_tinker_client, get_logger
 from twinkle.dataset import Dataset, DatasetMeta, LazyDataset
 from twinkle.dataloader import DataLoader
@@ -96,10 +96,9 @@ def prepare_dpo_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def train():
-    # Step 0: Initialize SwanLab if enabled
+    # Step 0: Register tracker if enabled
     if use_swanlab:
-        swanlab.login(api_key=os.environ['SWANLAB_API_KEY'])
-        swanlab.init(
+        register_tracker(SwanLabTracker(
             project='twinkle-dpo',
             experiment_name='dpo-lora-training',
             config={
@@ -111,8 +110,9 @@ def train():
                 'max_length': max_length,
                 'lora_rank': lora_rank,
             },
-        )
-        logger.info('SwanLab initialized')
+            api_key=os.environ.get('SWANLAB_API_KEY'),
+        ))
+        logger.info('SwanLabTracker registered')
 
     # Step 1: Prepare dataset & dataloader
     logger.info('Loading DPO dataset...')
@@ -188,9 +188,9 @@ def train():
 
         logger.info(f'[Step {step}] metrics={optim_result.metrics}')
 
-        # Log metrics to SwanLab
+        # Dispatch metrics to registered trackers
         if use_swanlab and optim_result.metrics:
-            swanlab.log(optim_result.metrics, step=step)
+            dispatch(optim_result.metrics, step=step)
 
     # Step 4: Save checkpoint
     save_result = training_client.save_state('dpo-lora-final').result()

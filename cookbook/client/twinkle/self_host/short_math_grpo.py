@@ -29,9 +29,9 @@ import re
 from peft import LoraConfig
 from typing import List, Tuple, Dict, Any
 
-import swanlab
-
 from twinkle import get_logger
+from twinkle.tracker import register_tracker, dispatch
+from twinkle.tracker.swanlab import SwanLabTracker
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward.base import Reward
 from twinkle.advantage import GRPOAdvantage
@@ -119,10 +119,9 @@ def compute_rewards(
 
 
 def train():
-    # Step 0: Initialize SwanLab if enabled
+    # Step 0: Register tracker if enabled
     if USE_SWANLAB:
-        swanlab.login(api_key=os.environ.get('SWANLAB_API_KEY', ''))
-        swanlab.init(
+        register_tracker(SwanLabTracker(
             project=SWANLAB_PROJECT,
             experiment_name=SWANLAB_EXPERIMENT_NAME,
             config={
@@ -136,8 +135,9 @@ def train():
                 'sync_interval': SYNC_INTERVAL,
                 'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
             },
-        )
-        logger.info('SwanLab initialized')
+            api_key=os.environ.get('SWANLAB_API_KEY', ''),
+        ))
+        logger.info('SwanLabTracker registered')
 
     # Step 1: Initialize the Twinkle client
     client = init_twinkle_client(
@@ -286,9 +286,9 @@ def train():
         log_dict['train/frac_reward_zero_std'] = frac_zero_std
         logger.info(f'Step {step}: {log_dict}')
 
-        # Log metrics to SwanLab
+        # Dispatch metrics to registered trackers
         if USE_SWANLAB and log_dict:
-            swanlab.log(log_dict, step=step)
+            dispatch(log_dict, step=step)
 
         step += 1
         metrics.reset()
