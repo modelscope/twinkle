@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, NoReturn, Optional, Union
 
 from twinkle import get_logger
 from twinkle.server.config import ServerConfig
+from twinkle.server.config.application_spec import ApplicationSpec
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 
 logger = get_logger()
@@ -205,8 +206,15 @@ class ServerLauncher:
             pass
 
         http_options = self.config.http_options.model_dump()
-        serve.start(http_options=http_options)
-        logger.info(f'Ray Serve started with http_options={http_options}')
+        serve_kwargs: dict[str, Any] = {'http_options': http_options}
+        # ``proxy_location`` controls where the Ray Serve HTTP proxy runs
+        # (``EveryNode`` / ``HeadOnly`` / ``Disabled``). The example configs
+        # set this field, so honour it here instead of silently ignoring.
+        if self.config.proxy_location:
+            serve_kwargs['proxy_location'] = self.config.proxy_location
+        serve.start(**serve_kwargs)
+        logger.info(f'Ray Serve started with http_options={http_options}, '
+                    f'proxy_location={self.config.proxy_location!r}')
 
         self._serve_started = True
 

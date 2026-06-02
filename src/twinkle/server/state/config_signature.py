@@ -13,6 +13,7 @@ from twinkle.server.state.backend.base import StateBackend
 logger = logging.getLogger(__name__)
 
 _SIGNATURE_KEY = '_meta::config_signature'
+_PAYLOAD_KEY = '_meta::config_payload'
 
 
 class SignatureMismatchPolicy(str, Enum):
@@ -136,13 +137,16 @@ async def validate_against_backend(persistence_config: Any, current_config: dict
 
     if stored_sig is None:
         await backend.set(_SIGNATURE_KEY, current_sig)
+        # Persist the payload alongside the signature so a future drift diff can
+        # render real ``stored vs current`` field-level differences (R15.3).
+        await backend.set(_PAYLOAD_KEY, current_config)
         logger.info('No previous config signature found. Stored current signature.')
         return
 
     if stored_sig == current_sig:
         return
 
-    stored_payload = await backend.get('_meta::config_payload')
+    stored_payload = await backend.get(_PAYLOAD_KEY)
     diff = _format_diff(stored_payload if isinstance(stored_payload, dict) else None, current_config)
     raise ConfigMismatchError('Persistence configuration drifted since the last launch. '
                               f'Stored signature: {stored_sig[:12]}..., current signature: {current_sig[:12]}...\n'

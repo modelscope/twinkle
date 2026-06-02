@@ -14,6 +14,8 @@ import traceback
 from collections import deque
 from typing import TYPE_CHECKING, Any, Deque
 
+from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
+from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
@@ -198,14 +200,30 @@ class ComputeWorker:
         exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
+        # R10.2: one span per queued task execution; R10.3: a nested span tagged
+        # `<deployment>.<task_type>` (e.g. `model.forward`, `sampler.sample`) so
+        # the handler's primary op has its own span carrying token/model
+        # correlation. The nested span is started inside the try/except so
+        # span lifecycle stays correctly scoped on timeout / exceptions.
+        queue_attrs = {
+            TOKEN_ID: task.token,
+            MODEL_ID: task.model_id,
+            'twinkle.task_type': task_type,
+            'twinkle.deployment': self._deployment_name or 'unknown',
+            'twinkle.queue_key': queue_key,
+        }
+        handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
+        handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
         try:
-            coro = task.coro_factory()
-            logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
-                         f'type={task_type}, queue_key={queue_key}')
-            if self._config.execution_timeout > 0:
-                result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
-            else:
-                result = await coro
+            with traced_operation('task_queue.execute', attrs=queue_attrs):
+                logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
+                             f'type={task_type}, queue_key={queue_key}')
+                with traced_operation(handler_span_name, attrs=handler_attrs):
+                    coro = task.coro_factory()
+                    if self._config.execution_timeout > 0:
+                        result = await asyncio.wait_for(coro, timeout=self._config.execution_timeout)
+                    else:
+                        result = await coro
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             await self._state.store_future_status(

@@ -17,15 +17,24 @@ import-isolation requirement (R1.2).
 """
 from __future__ import annotations
 
+import hashlib
 import numpy as np
 from typing import Any
 
 
 def _seed_for(model_id: str, adapter_name: str | None, seed: int, *extra: Any) -> int:
-    """Deterministic per-request RNG seed derived from string/int components."""
-    h = hash((str(model_id), str(adapter_name), int(seed), tuple(map(repr, extra))))
-    # numpy seeds must fit in uint32.
-    return h & 0xFFFFFFFF
+    """Deterministic per-request RNG seed derived from string/int components.
+
+    Uses SHA-256 over a canonical string form rather than Python's built-in
+    ``hash()``: the latter is salted per process (PYTHONHASHSEED) for tuples
+    containing strings, which would make identical requests on different
+    replicas / restarts produce different outputs and break R2.5 / R4.4 / R4.5
+    across processes.
+    """
+    parts = (str(model_id), str(adapter_name), str(int(seed)), *(repr(x) for x in extra))
+    digest = hashlib.sha256('\x1f'.join(parts).encode('utf-8')).digest()
+    # numpy seeds must fit in uint32; take the first 4 bytes of the digest.
+    return int.from_bytes(digest[:4], 'big')
 
 
 class TwinkleCompatMockModel:

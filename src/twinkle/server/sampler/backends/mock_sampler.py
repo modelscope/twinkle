@@ -13,11 +13,25 @@ produce identical token sequences and logprobs (R2.5).
 """
 from __future__ import annotations
 
+import hashlib
 import numpy as np
 from typing import Any, List, Optional
 
 # These data containers don't pull torch / vllm.
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+
+
+def _stable_seed(*parts: Any) -> int:
+    """Cross-process-stable numpy seed (uint32) derived from string parts.
+
+    Python's built-in ``hash()`` of a tuple containing strings is salted per
+    process (PYTHONHASHSEED), which would make identical sample requests on
+    different replicas / restarts produce different outputs and violate R2.5.
+    Use a stable digest instead.
+    """
+    canonical = '\x1f'.join(str(p) for p in parts).encode('utf-8')
+    digest = hashlib.sha256(canonical).digest()
+    return int.from_bytes(digest[:4], 'big')
 
 
 class MockSampler:
@@ -56,11 +70,7 @@ class MockSampler:
         for prompt_idx, _ in enumerate(normalized):
             sequences: list[SampledSequence] = []
             for sample_idx in range(num_samples):
-                seed = (
-                    abs(
-                        hash(
-                            (str(self.model_id), str(adapter_name), int(self._seed), int(prompt_idx), int(sample_idx))))
-                    & 0xFFFFFFFF)
+                seed = _stable_seed(self.model_id, adapter_name, self._seed, prompt_idx, sample_idx)
                 rng = np.random.default_rng(seed)
                 tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
                 logprobs_per_token = rng.uniform(-2.0, 0.0, size=max_tokens).astype(float).tolist()

@@ -12,6 +12,17 @@ context.
 When the OTEL SDK is missing, both helpers degrade to a NoOp: ``make_carrier``
 returns an empty dict and ``activate_carrier`` is a no-op context manager
 that runs the body without raising (R13.4 / R18.3).
+
+Note on current wiring (R13.3): the present server topology routes every
+cross-deployment hop through the Gateway's localhost HTTP proxy, which already
+carries the trace context in HTTP headers via :func:`twinkle.server.telemetry.
+tracing.inject_context`. There are therefore no in-process ``DeploymentHandle``
+call sites in ``src/`` today to thread the carrier through. These helpers are
+the supported integration point for any future deployment-to-deployment handle
+calls (e.g. Model → Sampler over a non-HTTP path); add ``trace_context: dict |
+None = None`` to the handle signature, build it on the caller with
+:func:`make_carrier`, and wrap the receiver body in :func:`activate_carrier`
+to preserve a single trace id across the hop.
 """
 from __future__ import annotations
 

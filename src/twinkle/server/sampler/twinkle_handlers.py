@@ -19,6 +19,8 @@ import numpy as np
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
+from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -165,7 +167,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> types.SetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
         extra_kwargs = body.model_extra or {}
-        self.sampler.set_template(body.template_cls, **extra_kwargs)
+        with traced_operation('sampler.set_template'):
+            self.sampler.set_template(body.template_cls, **extra_kwargs)
         return types.SetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
@@ -181,7 +184,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         from peft import LoraConfig
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
-        self.sampler.add_adapter_to_sampler(full_adapter_name, config)
+        with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: full_adapter_name}):
+            self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)
 
@@ -193,4 +197,5 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> None:
         extra_kwargs = body.model_extra or {}
         patch_cls = deserialize_object(body.patch_cls)
-        self.sampler.apply_patch(patch_cls, **extra_kwargs)
+        with traced_operation('sampler.apply_patch'):
+            self.sampler.apply_patch(patch_cls, **extra_kwargs)
