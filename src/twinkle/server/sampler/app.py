@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
@@ -119,7 +119,7 @@ class SamplerManagement(TaskQueueMixin):
             )
         self.sampler = _dispatch_sampler_backend(sampler_type, sampler_kwargs)
 
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
 
         # Initialize task queue mixin
         self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Sampler')

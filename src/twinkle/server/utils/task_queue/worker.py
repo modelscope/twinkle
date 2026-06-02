@@ -21,7 +21,7 @@ from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
-    from twinkle.server.state import ServerStateProxy
+    from twinkle.server.state import ServerState
     from twinkle.server.utils.metrics import TaskMetrics
 
 logger = get_logger()
@@ -41,7 +41,7 @@ class ComputeWorker:
 
     def __init__(
         self,
-        state: ServerStateProxy,
+        state: ServerState,
         config: TaskQueueConfig,
         task_metrics: TaskMetrics | None,
         deployment_name: str,

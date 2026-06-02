@@ -472,15 +472,11 @@ class ServerState:
 # Direct-backend factory (R19)
 # ---------------------------------------------------------------------------
 #
-# ``ServerStateProxy`` is intentionally retained as a thin alias of
-# ``ServerState`` so call-site type hints (e.g. ``state: ServerStateProxy``)
-# keep working without import churn during this transition. The detached Ray
-# Actor and the per-method ``self._actor.X.remote(...)`` forwarding are gone:
-# every worker now binds a process-local :class:`ServerState` directly to the
-# shared :class:`StateBackend`, and the existing ``await state.X(...)`` call
-# sites awaited a coroutine before and still do.
-
-ServerStateProxy = ServerState  # type: ignore[assignment]
+# The detached Ray Actor and the per-method ``self._actor.X.remote(...)``
+# forwarding are gone: every worker now binds a process-local
+# :class:`ServerState` directly to the shared :class:`StateBackend`, and the
+# existing ``await state.X(...)`` call sites awaited a coroutine before and
+# still do.
 
 _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 

@@ -22,7 +22,7 @@ from .types import QueuedTask, QueueState, TaskStatus
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
-    from twinkle.server.state import ServerStateProxy
+    from twinkle.server.state import ServerState
 
 logger = get_logger()
 
@@ -43,11 +43,11 @@ class TaskQueueMixin:
 
     Requirements
     ------------
-    Inheriting class must expose self.state: ServerStateProxy and call
+    Inheriting class must expose self.state: ServerState and call
     _init_task_queue() during __init__.
     """
 
-    state: ServerStateProxy
+    state: ServerState
 
     def _init_task_queue(self, config: TaskQueueConfig | None = None, deployment_name: str = '') -> None:
         """Initialise the task queue, rate limiter, and compute worker."""

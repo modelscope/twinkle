@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
 from twinkle.server.utils.metrics import create_metrics_middleware
@@ -115,7 +115,7 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
             )
         self.model = _dispatch_model_backend(backend, ctor_kwargs)
 
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
         self._replica_registered = False
 
         # Initialize mixins

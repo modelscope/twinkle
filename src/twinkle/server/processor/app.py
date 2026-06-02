@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
-from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.lifecycle import ProcessorManagerMixin
 from twinkle.server.utils.metrics import create_metrics_middleware
@@ -64,7 +64,7 @@ class ProcessorManagement(ProcessorManagerMixin):
 
         # processor objects keyed by processor_id
         self.resource_dict: dict[str, Any] = {}
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
 
         _cfg = processor_config or {}
         _env_limit = int(os.environ.get('TWINKLE_PER_USER_PROCESSOR_LIMIT', 20))

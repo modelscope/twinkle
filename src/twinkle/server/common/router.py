@@ -4,7 +4,7 @@ from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest,
                                       RequestRouter, RunningReplica)
 from typing import Dict, List, Optional
 
-from twinkle.server.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -15,7 +15,7 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
 
     async def choose_replicas(
         self,
