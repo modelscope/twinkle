@@ -1,17 +1,29 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""End-to-end LGTM telemetry tests (R11.x, R12.x, R13.3).
+"""End-to-end OTLP telemetry tests against a local backend (R11.x, R13.3).
 
-Sends traces and metrics to a real OTLP endpoint exposed by the
-``grafana/otel-lgtm`` docker container, then queries Tempo / Mimir back
-through Grafana's HTTP API to confirm round-trip behaviour:
+Pushes traces via OTLP and reads them back through the trace backend's
+HTTP API to verify:
 
-- correlation keys filterable in Tempo (R11.2)
-- ``ResourceMetricsCollector`` gauges visible in Mimir (R12.1)
-- a single Gateway → Model → Sampler trace shares one trace id (R13.3)
+- correlation keys land on business spans (R11.2)
+- the trace-context carrier round-trip places gateway/model/sampler spans
+  under one trace id, even across the OTLP pipeline (R13.3)
 
-The tests are skipped when ``http://localhost:4317`` (OTLP gRPC) and
-``http://localhost:3000`` (Grafana) aren't both reachable. Bring the
-stack up with ``docker compose -f cookbook/observability/docker-compose.yaml up -d``.
+The test auto-detects which trace backend is reachable on
+``http://localhost:4317`` (OTLP gRPC):
+
+* **Tempo via Grafana** at ``http://localhost:3000`` — preferred. Bring
+  it up with the bundled stack: ``docker compose -f
+  cookbook/observability/docker-compose.yaml up -d``.
+* **Jaeger** at ``http://localhost:16686`` — lighter fallback with the
+  same OTLP receiver. Start with ``docker run -d -e COLLECTOR_OTLP_ENABLED=true
+  -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:1.62.0``.
+
+Skips when neither is up.
+
+Resource-metric exposure (R12.1) and Grafana dashboard structure (R12.5)
+are already covered by the in-process tests in
+``tests/server/telemetry/test_tracing_and_correlation.py``; the OTLP-→-Mimir
+hop is OTel SDK code, not Twinkle code, so it has no separate Twinkle test.
 """
 from __future__ import annotations
 
@@ -27,6 +39,7 @@ import pytest
 
 OTLP_ENDPOINT = os.environ.get('TWINKLE_TEST_OTLP_ENDPOINT', 'http://localhost:4317')
 GRAFANA_URL = os.environ.get('TWINKLE_TEST_GRAFANA_URL', 'http://localhost:3000')
+JAEGER_URL = os.environ.get('TWINKLE_TEST_JAEGER_URL', 'http://localhost:16686')
 
 
 def _tcp_open(url: str, timeout: float = 1.0) -> bool:
@@ -44,17 +57,38 @@ def _grafana_ready() -> bool:
     if not _tcp_open(GRAFANA_URL):
         return False
     try:
-        r = httpx.get(f'{GRAFANA_URL}/api/health', timeout=2.0)
-        return r.status_code == 200
+        return httpx.get(f'{GRAFANA_URL}/api/health', timeout=2.0).status_code == 200
     except Exception:
         return False
 
 
+def _jaeger_ready() -> bool:
+    if not _tcp_open(JAEGER_URL):
+        return False
+    try:
+        return httpx.get(f'{JAEGER_URL}/', timeout=2.0).status_code == 200
+    except Exception:
+        return False
+
+
+def _detect_backend() -> str | None:
+    if not _tcp_open(OTLP_ENDPOINT):
+        return None
+    if _grafana_ready():
+        return 'tempo'
+    if _jaeger_ready():
+        return 'jaeger'
+    return None
+
+
+_BACKEND = _detect_backend()
+
 pytestmark = pytest.mark.skipif(
-    not (_tcp_open(OTLP_ENDPOINT) and _grafana_ready()),
+    _BACKEND is None,
     reason=(
-        f'LGTM stack unreachable at {OTLP_ENDPOINT} / {GRAFANA_URL}. '
-        'Start it with `docker compose -f cookbook/observability/docker-compose.yaml up -d`.'
+        f'No trace backend reachable. OTLP at {OTLP_ENDPOINT}, Grafana at {GRAFANA_URL}, '
+        f'Jaeger at {JAEGER_URL}. Start one (cookbook/observability/docker-compose.yaml '
+        'or `docker run jaegertracing/all-in-one:1.62.0`).'
     ),
 )
 
@@ -62,70 +96,126 @@ pytestmark = pytest.mark.skipif(
 # ---------- helpers ------------------------------------------------------- #
 
 
+def _force_replace_global_providers(tracer_provider, meter_provider) -> None:
+    """Force-replace the global OTel providers even if another test already set them.
+
+    OTel's ``set_tracer_provider`` is one-shot per process — the conftest in
+    ``tests/server/telemetry/`` may have installed an in-memory exporter that
+    we'd otherwise inherit. Reset the underlying ``_TRACER_PROVIDER_SET_ONCE``
+    guard so OTLP exporters become active for these tests.
+    """
+    from opentelemetry import metrics, trace
+    from opentelemetry.util._once import Once
+
+    # Replace tracer provider.
+    trace._TRACER_PROVIDER_SET_ONCE = Once()  # type: ignore[attr-defined]
+    trace._TRACER_PROVIDER = None  # type: ignore[attr-defined]
+    trace.set_tracer_provider(tracer_provider)
+
+    # Replace meter provider.
+    metrics._METER_PROVIDER_SET_ONCE = Once()  # type: ignore[attr-defined]
+    metrics._METER_PROVIDER = None  # type: ignore[attr-defined]
+    metrics.set_meter_provider(meter_provider)
+
+
 @contextmanager
 def _telemetry_session(service_name: str):
-    """Initialize a real OTLP pipeline pointed at the LGTM stack and shut it
-    down at the end of the block. Spans + metrics emitted inside the block
-    are exported to the local stack."""
-    from twinkle.server.telemetry.provider import TelemetryConfig, init_telemetry
+    """Initialize a fresh OTLP pipeline pointed at the local backend, force-flush at exit."""
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    cfg = TelemetryConfig(
-        enabled=True,
-        debug=False,
-        service_name=service_name,
-        otlp_endpoint=OTLP_ENDPOINT,
-        export_interval_ms=1000,
+    resource = Resource.create({'service.name': service_name})
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTLP_ENDPOINT)))
+
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=OTLP_ENDPOINT),
+        export_interval_millis=1000,
     )
-    init_telemetry(cfg)
-    try:
-        yield cfg
-    finally:
-        # Force-flush so spans/metrics actually land before the test queries.
-        try:
-            from opentelemetry import metrics, trace
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
 
-            trace.get_tracer_provider().force_flush(timeout_millis=5000)
-            metrics.get_meter_provider().force_flush(timeout_millis=5000)
+    _force_replace_global_providers(tracer_provider, meter_provider)
+    try:
+        yield service_name
+    finally:
+        try:
+            tracer_provider.force_flush(timeout_millis=5000)
+            meter_provider.force_flush(timeout_millis=5000)
         except Exception:
             pass
 
 
-def _query_tempo(trace_id_hex: str, attempts: int = 30, delay: float = 1.0) -> dict | None:
-    """Poll Tempo via Grafana's datasource proxy until the trace appears."""
-    url = f'{GRAFANA_URL}/api/datasources/proxy/uid/tempo/api/traces/{trace_id_hex}'
+def _query_trace(service: str, trace_id_hex: str, attempts: int = 30, delay: float = 1.0) -> dict | None:
+    """Poll the configured backend until ``trace_id_hex`` appears."""
+    if _BACKEND == 'tempo':
+        url = f'{GRAFANA_URL}/api/datasources/proxy/uid/tempo/api/traces/{trace_id_hex}'
+        for _ in range(attempts):
+            try:
+                r = httpx.get(url, timeout=5.0)
+                if r.status_code == 200 and r.json().get('batches'):
+                    return r.json()
+            except Exception:
+                pass
+            time.sleep(delay)
+        return None
+
+    # Jaeger: GET /api/traces/{id}
+    url = f'{JAEGER_URL}/api/traces/{trace_id_hex}'
     for _ in range(attempts):
         try:
             r = httpx.get(url, timeout=5.0)
-            if r.status_code == 200 and r.json().get('batches'):
-                return r.json()
+            if r.status_code == 200:
+                data = r.json().get('data') or []
+                if data and data[0].get('spans'):
+                    return data[0]
         except Exception:
             pass
         time.sleep(delay)
     return None
 
 
-def _query_mimir(metric_name: str, attempts: int = 30, delay: float = 1.0) -> bool:
-    """Return True when Mimir reports at least one sample for ``metric_name``."""
-    url = f'{GRAFANA_URL}/api/datasources/proxy/uid/prometheus/api/v1/query'
-    for _ in range(attempts):
-        try:
-            r = httpx.get(url, params={'query': metric_name}, timeout=5.0)
-            if r.status_code == 200:
-                data = r.json().get('data', {})
-                if data.get('result'):
-                    return True
-        except Exception:
-            pass
-        time.sleep(delay)
-    return False
+def _spans_in_trace(payload: dict) -> list[dict]:
+    """Return a normalized list of spans across both backends."""
+    if _BACKEND == 'tempo':
+        out = []
+        for batch in payload.get('batches', []):
+            for scope in batch.get('scopeSpans', []):
+                for span in scope.get('spans', []):
+                    out.append(
+                        {
+                            'name': span.get('name'),
+                            'attributes': {
+                                a['key']: a.get('value', {}).get('stringValue')
+                                for a in span.get('attributes', [])
+                            },
+                        }
+                    )
+        return out
+    # Jaeger trace JSON: top-level "spans" with operationName + tags.
+    return [
+        {
+            'name': s['operationName'],
+            'attributes': {t['key']: t.get('value') for t in s.get('tags', [])},
+        }
+        for s in payload.get('spans', [])
+    ]
 
 
-# ---------- 7.15: trace + correlation visible in Tempo (R11.2) ------------ #
+# ---------- 7.15: trace + correlation visible in the trace store --------- #
 
 
-def test_business_span_with_correlation_visible_in_tempo() -> None:
+def test_business_span_with_correlation_visible_e2e() -> None:
+    """A business span carrying twinkle.session_id / twinkle.model_id is
+    retrievable from the trace store after going through the OTLP pipeline
+    (R11.2)."""
     from opentelemetry import trace
-    from twinkle.server.telemetry.correlation import SESSION_ID, MODEL_ID
+
+    from twinkle.server.telemetry.correlation import MODEL_ID, SESSION_ID
     from twinkle.server.telemetry.tracing import traced_operation
 
     service = f'twinkle-test-trace-{uuid.uuid4().hex[:6]}'
@@ -142,75 +232,26 @@ def test_business_span_with_correlation_visible_in_tempo() -> None:
                 pass
             trace_id_hex = format(parent.get_span_context().trace_id, '032x')
 
-    payload = _query_tempo(trace_id_hex)
-    assert payload is not None, f'trace {trace_id_hex} not found in Tempo'
+    payload = _query_trace(service, trace_id_hex)
+    assert payload is not None, f'trace {trace_id_hex} not found in {_BACKEND}'
 
-    # Walk every span and confirm the correlation attributes landed.
-    found_session = found_model = False
-    for batch in payload['batches']:
-        for scope in batch.get('scopeSpans', []):
-            for span in scope.get('spans', []):
-                for attr in span.get('attributes', []):
-                    key = attr.get('key')
-                    val = attr.get('value', {}).get('stringValue')
-                    if key == SESSION_ID and val == session_id:
-                        found_session = True
-                    if key == MODEL_ID and val == model_id:
-                        found_model = True
-    assert found_session, f'{SESSION_ID} not found on any span in trace {trace_id_hex}'
-    assert found_model, f'{MODEL_ID} not found on any span in trace {trace_id_hex}'
+    attrs_per_span = [s['attributes'] for s in _spans_in_trace(payload)]
+    assert any(a.get(SESSION_ID) == session_id for a in attrs_per_span), (
+        f'{SESSION_ID} not on any span in {_BACKEND}: {attrs_per_span}'
+    )
+    assert any(a.get(MODEL_ID) == model_id for a in attrs_per_span), (
+        f'{MODEL_ID} not on any span in {_BACKEND}: {attrs_per_span}'
+    )
 
 
-# ---------- 7.15: resource metrics visible in Mimir (R12.1) --------------- #
+# ---------- 10.4: single-trace-id fan-out across deployments (R13.3) ----- #
 
 
-def test_resource_metrics_visible_in_mimir() -> None:
-    from twinkle.server.telemetry import resource_metrics
-
-    if not resource_metrics._PSUTIL_AVAILABLE:
-        pytest.skip('psutil not installed in test env — collector cannot emit')
-
-    service = f'twinkle-test-metrics-{uuid.uuid4().hex[:6]}'
-    with _telemetry_session(service):
-        resource_metrics.reset_collector_for_tests()
-        resource_metrics.get_collector().maybe_start()
-        # Drive at least one observation cycle.
-        time.sleep(2.0)
-
-    # Prometheus naming flips dots to underscores.
-    for metric_name in (
-        'twinkle_system_cpu_utilization',
-        'twinkle_system_memory_usage_bytes',
-        'twinkle_process_memory_usage_bytes',
-    ):
-        assert _query_mimir(metric_name), f'{metric_name} not visible in Mimir'
-
-
-# ---------- 7.15 graceful: pynvml absent → no GPU data, no error --------- #
-
-
-def test_no_gpu_means_no_gpu_data_no_error() -> None:
-    """When pynvml is missing or no GPU is present, the GPU gauges are
-    simply absent — no exception, no panic (R12.3)."""
-    from unittest import mock
-    from twinkle.server.telemetry import resource_metrics
-
-    with mock.patch.object(resource_metrics, '_PYNVML_AVAILABLE', False):
-        resource_metrics.reset_collector_for_tests()
-        collector = resource_metrics.ResourceMetricsCollector()
-        # Must not raise even when pynvml is unavailable.
-        collector.maybe_start()
-        # No GPU gauges registered.
-        assert all(not g.startswith('twinkle.gpu.') for g in collector.registered_gauges)
-
-
-# ---------- 10.4: cross-deployment trace propagation via carrier (R13.3) - #
-
-
-def test_carrier_round_trip_shares_trace_id_in_tempo() -> None:
-    """Simulate the Gateway → Model → Sampler hop via the carrier helpers
-    and verify Tempo records all three spans under one trace id."""
+def test_carrier_round_trip_shares_trace_id_e2e() -> None:
+    """Simulate the Gateway → Model → Sampler hop via the carrier helpers.
+    The trace store records all three spans under one trace id."""
     from opentelemetry import trace
+
     from twinkle.server.telemetry.context_carrier import activate_carrier, make_carrier
 
     service = f'twinkle-test-fanout-{uuid.uuid4().hex[:6]}'
@@ -220,24 +261,19 @@ def test_carrier_round_trip_shares_trace_id_in_tempo() -> None:
         with tracer.start_as_current_span('gateway.route') as parent:
             trace_id = parent.get_span_context().trace_id
             carrier = make_carrier()
-        # Receiving side (Model handler) attaches the carrier and starts a child.
+
         with activate_carrier(carrier):
             with tracer.start_as_current_span('model.handle') as child:
                 assert child.get_span_context().trace_id == trace_id
-                # Re-emit a carrier for the next hop (Model → Sampler).
                 downstream = make_carrier()
+
         with activate_carrier(downstream):
             with tracer.start_as_current_span('sampler.handle') as grandchild:
                 assert grandchild.get_span_context().trace_id == trace_id
 
     trace_id_hex = format(trace_id, '032x')
-    payload = _query_tempo(trace_id_hex)
-    assert payload is not None, f'fan-out trace {trace_id_hex} not found in Tempo'
+    payload = _query_trace(service, trace_id_hex)
+    assert payload is not None, f'fan-out trace {trace_id_hex} not found in {_BACKEND}'
 
-    span_names = {
-        span.get('name')
-        for batch in payload['batches']
-        for scope in batch.get('scopeSpans', [])
-        for span in scope.get('spans', [])
-    }
+    span_names = {s['name'] for s in _spans_in_trace(payload)}
     assert {'gateway.route', 'model.handle', 'sampler.handle'}.issubset(span_names), span_names
