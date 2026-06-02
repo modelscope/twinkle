@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .base import StateBackend
 from .memory_backend import MemoryBackend
@@ -26,6 +26,9 @@ PERSISTENCE_ENV_KEYS: tuple[str, ...] = (
 
 class PersistenceConfig(BaseModel):
     """Configuration for state persistence backend."""
+
+    model_config = ConfigDict(extra='forbid')
+
     mode: Literal['memory', 'file', 'redis'] = 'memory'
     file_path: str | None = None  # required for file mode
     redis_url: str | None = None  # required for redis mode

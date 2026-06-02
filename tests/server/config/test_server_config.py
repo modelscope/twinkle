@@ -172,6 +172,16 @@ def test_property_15_unknown_field_rejected(unknown: str) -> None:
         ServerConfig.model_validate({unknown: 'x'})
 
 
+@pytest.mark.parametrize('section', ['telemetry', 'persistence'])
+def test_property_15_unknown_nested_field_rejected(section: str) -> None:
+    """Nested config sections also reject unknown keys (defends against typos
+    inside ``telemetry: {...}`` / ``persistence: {...}``)."""
+    payload = {section: {'unknown_typo': 1}}
+    with pytest.raises(ValidationError) as exc:
+        ServerConfig.model_validate(payload)
+    assert any('unknown_typo' in err['loc'] for err in exc.value.errors())
+
+
 # ---------- 3.11: from_yaml error paths + launcher dict rejection ---------- #
 
 

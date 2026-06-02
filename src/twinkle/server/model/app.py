@@ -34,17 +34,20 @@ logger = get_logger()
 _MODEL_BACKENDS: tuple[str, ...] = ('mock', 'transformers', 'megatron')
 
 
-def _dispatch_model_backend(backend: str, ctor_kwargs: dict[str, Any]) -> Any:
-    """Instantiate the model backend selected by ``backend`` (R3.1-3.3, R3.9).
+def _validate_model_backend(backend: Any) -> str:
+    """Pure validation of the ``backend`` selector (R3.9).
 
-    Raises :class:`ConfigError` *before* instantiating any backend if the
-    value is missing, empty, or not in the permitted set, so the deployment
-    never reaches a ready state with a bad backend.
+    Raises :class:`ConfigError` (naming the field, value, and allowed set)
+    when ``backend`` is missing, empty, non-string, or not exactly one of
+    the permitted values. No imports or side effects.
     """
-    if backend is None or not isinstance(backend, str) or backend == '':
+    if not isinstance(backend, str) or backend == '' or backend not in _MODEL_BACKENDS:
         raise ConfigError(field='backend', value=backend, allowed=list(_MODEL_BACKENDS))
-    if backend not in _MODEL_BACKENDS:
-        raise ConfigError(field='backend', value=backend, allowed=list(_MODEL_BACKENDS))
+    return backend
+
+
+def _dispatch_model_backend(backend: str, ctor_kwargs: dict[str, Any]) -> Any:
+    """Instantiate the model backend selected by an already-validated ``backend``."""
     if backend == 'mock':
         from .backends.mock_model import TwinkleCompatMockModel
 
@@ -74,18 +77,15 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  nproc_per_node: int,
                  device_group: dict[str, Any],
                  device_mesh: dict[str, Any],
-                 use_megatron: bool = False,
+                 backend: str,
                  adapter_config: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
-                 backend: str | None = None,
                  **kwargs):
-        # Backwards-compatible bridge: legacy callers passed ``use_megatron`` —
-        # derive ``backend`` from it when not supplied so we always go through
-        # the strict dispatch below.
-        if backend is None:
-            backend = 'megatron' if use_megatron else 'transformers'
+        # R3.9: validate ``backend`` BEFORE any side effect (twinkle.initialize,
+        # DeviceGroup construction, replica registration). An invalid value
+        # never produces a partial backend nor reaches a ready state.
+        backend = _validate_model_backend(backend)
         self.backend = backend
-        self.use_megatron = backend == 'megatron'
         # Skip twinkle.initialize for the mock backend (R3.7) — the largest
         # startup-time saving and the only way to start without CUDA/torch.
         if backend != 'mock':
@@ -107,8 +107,6 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
 
-        # Choose model backend (R3.1-3.3, R3.9). Validation runs before
-        # instantiation so an invalid value never produces a partial backend.
         ctor_kwargs: dict[str, Any] = {'model_id': model_id, **kwargs}
         if backend != 'mock':
             ctor_kwargs.update(
@@ -172,10 +170,9 @@ def build_model_app(model_id: str,
                     device_group: dict[str, Any],
                     device_mesh: dict[str, Any],
                     deploy_options: dict[str, Any],
-                    use_megatron: bool = False,
+                    backend: str,
                     adapter_config: dict[str, Any] | None = None,
                     queue_config: dict[str, Any] | None = None,
-                    backend: str | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -187,7 +184,9 @@ def build_model_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for tensor parallelism
         deploy_options: Ray Serve deployment options
-        use_megatron: Whether to use Megatron backend (vs Transformers)
+        backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``
+            (R3.1-3.3, R3.9). Validated up front; bad values raise
+            :class:`ConfigError` before any side effect.
         adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration (rate limiting, etc.)
         **kwargs: Additional model initialization arguments
@@ -195,6 +194,9 @@ def build_model_app(model_id: str,
     Returns:
         Configured Ray Serve deployment bound with parameters
     """
+    # Fail fast on bad backend values at builder time (the launcher imports
+    # this builder at startup, so the error surfaces before deployment).
+    backend = _validate_model_backend(backend)
 
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
@@ -207,6 +209,12 @@ def build_model_app(model_id: str,
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
+        # Start the ServerState cleanup loop now that we have a running loop;
+        # idempotent across replicas in the same process.
+        try:
+            await get_self().state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
         try:
             await get_self()._ensure_replica_registered()
         except Exception as e:
@@ -238,9 +246,10 @@ def build_model_app(model_id: str,
         request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
     )(
         ModelManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh,
-                                                          use_megatron, adapter_config, queue_config,
-                                                          backend=backend, **kwargs)
+    return DeploymentClass.options(**deploy_options).bind(
+        model_id, nproc_per_node, device_group, device_mesh, backend,
+        adapter_config, queue_config, **kwargs,
+    )
 
 
 build_model_app = wrap_builder_with_device_group_env(build_model_app)

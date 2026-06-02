@@ -21,6 +21,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import signal
 import threading
 from pathlib import Path
@@ -94,7 +95,6 @@ class ServerLauncher:
         These vars are read by ``ensure_telemetry_initialized()`` inside the
         FastAPI startup hook running in each worker process.
         """
-        import os
         return {k: os.environ[k] for k in self._TELEMETRY_ENV_KEYS if k in os.environ}
 
     def _build_persistence_env_vars(self) -> dict[str, str]:
@@ -104,7 +104,6 @@ class ServerLauncher:
         worker that calls ``get_server_state()`` without an explicit config,
         which makes the chosen backend independent of deployment startup order.
         """
-        import os
         from twinkle.server.state.backend.factory import PERSISTENCE_ENV_KEYS
         return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
 
@@ -284,7 +283,6 @@ class ServerLauncher:
             from twinkle.server.telemetry import init_telemetry
             init_telemetry(telemetry)
             # Export config to env vars for Ray worker processes
-            import os
             os.environ['TWINKLE_TELEMETRY_ENABLED'] = '1'
             os.environ['TWINKLE_TELEMETRY_DEBUG'] = '1' if telemetry.debug else '0'
             os.environ['TWINKLE_TELEMETRY_SERVICE'] = telemetry.service_name
@@ -295,7 +293,6 @@ class ServerLauncher:
         # (not just Gateway) can build the same backend on first call to
         # get_server_state().
         persistence = self.config.persistence
-        import os
         for k, v in persistence.to_env_vars().items():
             os.environ[k] = v
         logger.info(f'Persistence backend configured: mode={persistence.mode}')

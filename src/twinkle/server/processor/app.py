@@ -122,11 +122,19 @@ def build_processor_app(ncpu_proc_per_node: int,
     # Build the FastAPI app and register all routes BEFORE serve.ingress so that
     # the frozen app contains the complete route table (visible to ProxyActor).
 
+    def get_self() -> ProcessorManagement:
+        return serve.get_replica_context().servable_object
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Initialize telemetry in worker process (after deserialization)
         from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
         ensure_telemetry_initialized()
+        # Start the ServerState cleanup loop now that we have a running loop.
+        try:
+            await get_self().state.start_cleanup_task()
+        except Exception as e:
+            logger.warning(f'Failed to start ServerState cleanup task: {e}')
         yield
 
     app = FastAPI(lifespan=lifespan)
@@ -140,9 +148,6 @@ def build_processor_app(ncpu_proc_per_node: int,
     # covers the full request path including tracing overhead.
     app.middleware('http')(create_tracing_middleware('Processor'))
     app.middleware('http')(create_metrics_middleware('Processor'))
-
-    def get_self() -> ProcessorManagement:
-        return serve.get_replica_context().servable_object
 
     _register_processor_routes(app, get_self)
 
