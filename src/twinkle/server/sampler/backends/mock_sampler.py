@@ -59,7 +59,13 @@ class MockSampler:
         adapter_name: str = '',
         *,
         num_samples: int = 1,
+        **kwargs: Any,
     ) -> list[SampleResponse]:
+        # The real ``vLLMSampler.sample`` accepts extra keyword arguments
+        # (``adapter_path``, ``adapter_uri``, etc.) that the Tinker / Twinkle
+        # handlers always forward. Swallow them here so the mock backend
+        # stays callable through the same handler call sites without a
+        # TypeError.
         max_tokens = self._resolve_max_tokens(sampling_params)
         if max_tokens is None or max_tokens < 1:
             raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r} '

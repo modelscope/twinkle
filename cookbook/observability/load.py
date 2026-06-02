@@ -23,14 +23,22 @@ Pre-reqs
 
         docker compose -f cookbook/observability/docker-compose.yaml up -d
 
-2.  Mock server running with telemetry **enabled** (the shipped
+2.  Mock server running with telemetry **enabled**. The shipped
     ``cookbook/client/server/mock/server_config.yaml`` has
-    ``telemetry.enabled: false`` — flip it to ``true`` or override via env
-    before launching)::
+    ``telemetry.enabled: false``; override via env vars before launching.
+    NB: the worker-side flag is read as the literal string ``"1"`` (see
+    ``twinkle.server.telemetry.worker_init.ensure_telemetry_initialized``),
+    NOT ``"true"`` / ``"yes"``::
 
-        TWINKLE_TELEMETRY_ENABLED=true \\
+        TWINKLE_TELEMETRY_ENABLED=1 \\
+        TWINKLE_TELEMETRY_ENDPOINT=http://localhost:4317 \\
         python -m twinkle.server launch \\
             --config cookbook/client/server/mock/server_config.yaml
+
+    Also start Ray first (the launcher does ``ray.init(address='auto')`` and
+    will refuse to spin one up locally)::
+
+        ray start --head --num-cpus=4 --disable-usage-stats
 
 Usage
 -----
@@ -66,7 +74,7 @@ SAMPLER_ROUTE = '/api/v1/sampler/mock'
 TOKEN = 'load-test-token'
 
 
-def _headers(session_id: str, *, request_id: str) -> dict[str, str]:
+def _headers(session_id: str, *, request_id: str, multiplex_key: str | None = None) -> dict[str, str]:
     """Build the per-request header set the server middleware expects.
 
     The server's ``verify_request_token`` middleware requires:
@@ -74,16 +82,26 @@ def _headers(session_id: str, *, request_id: str) -> dict[str, str]:
     - ``X-Ray-Serve-Request-Id`` for sticky routing (any unique string ok)
     - ``X-Twinkle-Session-Id`` for session correlation (optional)
 
+    Model + sampler deployments additionally call
+    ``serve.get_multiplexed_model_id()`` for sticky-LoRA replica routing —
+    Ray Serve raises ``ValueError("The model ID cannot be empty.")`` if the
+    ``serve_multiplexed_model_id`` header is absent. Always set
+    ``multiplex_key`` for model / sampler calls; the Gateway endpoint
+    (``/api/v1/twinkle/create_session``) does not need it.
+
     Pass the SAME ``request_id`` for every call against the same registered
     adapter so the sticky-LoRA key (``request_id + '-' + adapter_name``)
     resolves to the registered resource on subsequent ``/forward_only`` calls.
     """
-    return {
+    headers = {
         'Twinkle-Authorization': f'Bearer {TOKEN}',
         'X-Ray-Serve-Request-Id': request_id,
         'X-Twinkle-Session-Id': session_id,
         'Content-Type': 'application/json',
     }
+    if multiplex_key is not None:
+        headers['serve_multiplexed_model_id'] = multiplex_key
+    return headers
 
 
 def _lora_config_payload(rank: int = 8) -> str:
@@ -123,7 +141,7 @@ async def add_adapter(client: httpx.AsyncClient, adapter_name: str, session_id: 
     body = {'adapter_name': adapter_name, 'config': _lora_config_payload()}
     r = await client.post(
         f'{MODEL_ROUTE}/twinkle/add_adapter_to_model',
-        headers=_headers(session_id, request_id=request_id),
+        headers=_headers(session_id, request_id=request_id, multiplex_key=adapter_name),
         json=body,
         timeout=30.0,
     )
@@ -143,7 +161,7 @@ async def sample(client: httpx.AsyncClient, session_id: str, *, max_tokens: int)
     }
     r = await client.post(
         f'{SAMPLER_ROUTE}/twinkle/sample',
-        headers=_headers(session_id, request_id=uuid.uuid4().hex),
+        headers=_headers(session_id, request_id=uuid.uuid4().hex, multiplex_key=session_id),
         json=body,
         timeout=60.0,
     )
@@ -164,7 +182,7 @@ async def forward_only(client: httpx.AsyncClient, adapter_name: str, session_id:
     }
     r = await client.post(
         f'{MODEL_ROUTE}/twinkle/forward_only',
-        headers=_headers(session_id, request_id=request_id),
+        headers=_headers(session_id, request_id=request_id, multiplex_key=adapter_name),
         json=body,
         timeout=30.0,
     )
