@@ -18,7 +18,6 @@ Launch:
 """
 import os
 import sys
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -30,11 +29,8 @@ from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.loss import InfonceLoss
-from twinkle.preprocessor import Preprocessor
 from twinkle.processor import InputProcessor
 from twinkle.sampler import vLLMSampler
-from twinkle.template import Template
-from twinkle.utils import Platform
 
 # allow importing the sibling dataset_think module without packaging
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -73,7 +69,7 @@ TOTAL_SAMPLES: Optional[int] = None
 # -- Online-compression knobs (CM-v2 inference) -------------------------------
 MIN_COT_CHARS = 256                           # skip too-short cot rows entirely
 COMPRESS_RATIO = 2.0                          # used to derive the prompt char budget
-COMPRESS_MAX_TOKENS = 2048
+COMPRESS_MAX_TOKENS = 32768
 COMPRESS_TEMPERATURE = 0.4
 COMPRESS_TOP_P = 0.9
 COMPRESS_MAX_MODEL_LEN = 32768
@@ -123,137 +119,6 @@ CONDENSER_USER = (
     '## Passage\n{text}')
 
 
-# ------------------------------------------------------------------- Dataset
-class FlattenForEmbeddingProcessor(Preprocessor):
-    """``{id, source, messages}`` (from dataset_think) → ``{id, source, query, cot}``.
-
-    Drops rows whose ``cot`` is shorter than ``min_cot_chars`` (compression
-    is a no-op below that, and InfoNCE quality drops on near-empty positives).
-    """
-
-    def __init__(self, min_cot_chars: int = MIN_COT_CHARS):
-        self.min_cot_chars = min_cot_chars
-
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            messages = row.get('messages') or []
-            query, cot = '', ''
-            for m in messages:
-                if not isinstance(m, dict):
-                    continue
-                role = m.get('role') or ''
-                if role == 'user' and not query:
-                    query = (m.get('content') or '').strip()
-                elif role == 'assistant':
-                    cot = (m.get('reasoning_content') or '').strip()
-                    break
-            if not query or len(cot) < self.min_cot_chars:
-                continue
-            out.append({
-                'id': row.get('id', ''),
-                'source': row.get('source', ''),
-                'query': query,
-                'cot': cot,
-            })
-        return self.map_row_to_col(out, keys=['id', 'source', 'query', 'cot'])
-
-
-# ------------------------------------------------------------------ Embedding
-class EmbeddingTemplate(Template):
-    """Flatten ``{query, positive, negatives}`` into per-sentence ``InputFeature`` rows.
-
-    Order within each row is ``anchor → positive → negatives`` — the layout
-    :class:`InfonceLoss` requires (``group_start=1`` marks each anchor).
-    """
-
-    def batch_encode(self, trajectories, add_generation_prompt=False, **kwargs):
-        columnar = isinstance(trajectories, Mapping)
-        if columnar:
-            trajectories = self.map_col_to_row(trajectories)
-
-        out: List[InputFeature] = []
-        for row in trajectories:
-            anchor = row['query']
-            positives = row['positive']
-            if isinstance(positives, str):
-                positives = [positives]
-            negatives = list(row.get('negatives') or row.get('negative') or [])
-            sentences = [anchor, *positives, *negatives]
-            for i, text in enumerate(sentences):
-                ids = self.processor(
-                    text,
-                    max_length=self.max_length,
-                    truncation=True,
-                    add_special_tokens=True,
-                )['input_ids']
-                out.append(InputFeature(
-                    input_ids=ids,
-                    attention_mask=[1] * len(ids),
-                    group_start=int(i == 0),
-                ))
-
-        if columnar:
-            out = self.map_row_to_col(out)
-        return out
-
-
-class EmbeddingProcessor(InputProcessor):
-    """Single-step collator producing the flat embedding batch.
-
-    ``labels`` here is the 1-D group-start mask consumed by :class:`InfonceLoss`,
-    not token-level labels — so it must NOT pass through the standard pipeline
-    (which would pad with ``-100`` and stack as a 2-D tensor).
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.process_pipeline = [self._embed_collate, self._maybe_wrap_microbatch]
-
-    def _embed_collate(self, inputs, **kwargs):
-        device = Platform.get_local_device()
-        max_len = max(len(row['input_ids']) for row in inputs)
-        n = len(inputs)
-        # default pad id 0 is harmless: only the last valid (attention_mask=1) position is read.
-        input_ids = torch.zeros(n, max_len, dtype=torch.long)
-        attention_mask = torch.zeros(n, max_len, dtype=torch.long)
-        labels = torch.zeros(n, dtype=torch.long)
-        for i, row in enumerate(inputs):
-            ids = row['input_ids']
-            ids = ids if isinstance(ids, torch.Tensor) else torch.as_tensor(ids, dtype=torch.long)
-            seq_len = ids.shape[0]
-            input_ids[i, :seq_len] = ids
-            am = row.get('attention_mask')
-            if am is None:
-                attention_mask[i, :seq_len] = 1
-            else:
-                am = am if isinstance(am, torch.Tensor) else torch.as_tensor(am, dtype=torch.long)
-                attention_mask[i, :seq_len] = am[:seq_len]
-            labels[i] = int(row.get('group_start', 0))
-
-        return InputFeature(
-            input_ids=input_ids.to(device),
-            attention_mask=attention_mask.to(device),
-            labels=labels.to(device),
-        )
-
-    def _maybe_wrap_microbatch(self, feature, **kwargs):
-        # Megatron's forward_backward iterates a list of microbatch dicts;
-        # treat the whole flat embedding batch as one microbatch.
-        if self.framework == 'megatron':
-            return [feature]
-        return feature
-
-
-# ------------------------------------------------------------------- Builders
-def build_dataset():
-    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True, dropped_log='output/emb')
-    dataset.map(FlattenForEmbeddingProcessor(), remove_columns=['messages'],
-                num_proc=16, load_from_cache_file=True)
-    return dataset
-
-
 def build_model(device_mesh: DeviceMesh):
     if BACKEND == 'transformers':
         from twinkle.model import TransformersModel
@@ -263,7 +128,8 @@ def build_model(device_mesh: DeviceMesh):
             remote_group='model',
             ddp_config={'find_unused_parameters': True},
         )
-        model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
+        from twinkle.patch.no_split_modules import NoSplitModulesPatch
+        model.apply_patch(NoSplitModulesPatch({'Qwen3_5DecoderLayer'}))
         return model
     if BACKEND == 'megatron':
         from twinkle.model import MegatronModel
@@ -302,24 +168,63 @@ def save_checkpoint(model, name: str):
 
 
 # --------------------------------------------------------------------- Loop
-def _build_compress_prompts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+EMBED_QUERY_Q = (
+    'What problem does this passage need to solve, and what kind of skill or '
+    'method is required? Compress into a retrieval-friendly need description.')
+EMBED_QUERY_COT = (
+    'Extract the reusable skill: trigger conditions, key steps, and expected '
+    'output. Compress into a standardized procedure for retrieval.')
+
+
+def _extract_query_cot(row: Dict[str, Any]):
+    """Extract (user_content, reasoning_content) from a messages-format row."""
+    messages = row.get('messages') or []
+    query, cot = '', ''
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get('role') or ''
+        if role == 'user' and not query:
+            query = (m.get('content') or '').strip()
+        elif role == 'assistant':
+            cot = (m.get('reasoning_content') or '').strip()
+            break
+    return query, cot
+
+
+def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
+    """Build prompts for compressing both query and cot per row.
+
+    Returns (prompts, valid_indices) where prompts is flat-interleaved
+    [query_0, cot_0, query_1, cot_1, ...] and valid_indices tracks which
+    rows passed the min-length filter.
+    """
     prompts: List[Dict[str, Any]] = []
-    for row in rows:
-        cot = row['cot']
-        budget = max(1, int(len(cot) / COMPRESS_RATIO))
-        user = CONDENSER_USER.format(query=row['query'], budget=budget, text=cot)
-        prompts.append({'messages': [
-            {'role': 'system', 'content': CONDENSER_SYSTEM},
-            {'role': 'user', 'content': user},
-        ]})
-    return prompts
+    valid_indices: List[int] = []
+    for i, row in enumerate(rows):
+        query, cot = _extract_query_cot(row)
+        if not query or len(cot) < MIN_COT_CHARS:
+            continue
+        valid_indices.append(i)
+        for text, qtpl in ((query, EMBED_QUERY_Q), (cot, EMBED_QUERY_COT)):
+            budget = max(1, int(len(text) / COMPRESS_RATIO))
+            user = CONDENSER_USER.format(query=qtpl, budget=budget, text=text)
+            prompts.append({'messages': [
+                {'role': 'system', 'content': CONDENSER_SYSTEM},
+                {'role': 'user', 'content': user},
+            ]})
+    return prompts, valid_indices
 
 
-def _decode_first_sequence(response) -> str:
+def _get_first_feature(response) -> Optional[Dict[str, Any]]:
+    """Extract new_input_feature from first sampled sequence (only embedding-relevant keys)."""
     seqs = getattr(response, 'sequences', None) or []
     if not seqs:
-        return ''
-    return getattr(seqs[0], 'decoded', '') or ''
+        return None
+    feat = getattr(seqs[0], 'new_input_feature', None)
+    if feat is None:
+        return None
+    return {k: feat[k] for k in ('input_ids', 'attention_mask') if k in feat}
 
 
 def train():
@@ -335,7 +240,7 @@ def train():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
 
     # -------- Data -----------------------------------------------------------
-    dataset = build_dataset()
+    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True, dropped_log='output/emb')
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, shuffle=True)
     total_steps = len(dataloader) * NUM_EPOCHS // GRADIENT_ACCUMULATION_STEPS
 
@@ -348,8 +253,7 @@ def train():
         ADAPTER_NAME, lora_config,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
 
-    model.set_template(EmbeddingTemplate, model_id=MODEL_ID, max_length=EMB_MAX_LENGTH)
-    model.set_processor(EmbeddingProcessor)
+    model.set_processor(InputProcessor)
     model.set_loss(
         InfonceLoss,
         temperature=TEMPERATURE,
@@ -369,7 +273,7 @@ def train():
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template(TEMPLATE_NAME, model_id=MODEL_ID, enable_thinking=False)
+    sampler.set_template(TEMPLATE_NAME, model_id=MODEL_ID, enable_thinking=False, truncation_strategy='delete', max_length=COMPRESS_MAX_TOKENS)
     compress_params = SamplingParams(
         max_tokens=COMPRESS_MAX_TOKENS,
         temperature=COMPRESS_TEMPERATURE,
@@ -382,44 +286,43 @@ def train():
     logger.info(f'Total steps: {total_steps}')
 
     # -------- Train loop -----------------------------------------------------
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
+    cur_step = 0
     for epoch in range(NUM_EPOCHS):
         for raw_batch in dataloader:
-            # raw_batch: List[{id, source, query, cot}]
-            compress_prompts = _build_compress_prompts(raw_batch)
+            # raw_batch: List[{id, source, messages}]
+            compress_prompts, valid_indices = _build_compress_prompts(raw_batch)
+            if not compress_prompts:
+                continue
             responses = sampler.sample(compress_prompts, compress_params)
-            compressed = [_decode_first_sequence(r) for r in responses]
 
-            # Drop rows where compression yielded empty text (vLLM sequence loss / OOM).
-            emb_rows: List[Dict[str, Any]] = []
-            for row, comp in zip(raw_batch, compressed):
-                comp = (comp or '').strip()
-                if not comp:
+            # De-interleave: [q0, c0, q1, c1, ...] → pairs
+            emb_features: List[Dict[str, Any]] = []
+            for i in range(0, len(responses), 2):
+                feat_q = _get_first_feature(responses[i])
+                feat_c = _get_first_feature(responses[i + 1]) if i + 1 < len(responses) else None
+                if not feat_q or not feat_c:
                     continue
-                emb_rows.append({
-                    'query': row['query'],
-                    'positive': comp,
-                    'negatives': [],
-                })
+                feat_q['labels'] = [1]
+                feat_c['labels'] = [0]
+                emb_features.append(feat_q)
+                emb_features.append(feat_c)
 
-            if len(emb_rows) < 2:
-                # InfoNCE needs ≥2 anchors for a meaningful in-batch loss.
-                logger.warning('Skipping step: only %d valid compressions in batch of %d',
-                               len(emb_rows), len(raw_batch))
+            if len(emb_features) < 4:
+                # InfoNCE needs ≥2 anchors (≥4 features) for meaningful in-batch loss.
+                logger.warning('Skipping step: only %d valid pairs in batch of %d',
+                               len(emb_features) // 2, len(raw_batch))
                 continue
 
-            # ``task='embedding'`` swaps lm_head → identity and writes pooled
-            # per-sequence vectors to ``outputs['embeddings']`` for InfonceLoss.
-            model.forward_backward(inputs=emb_rows, task='embedding')
+            model.forward_backward(inputs=emb_features, task='embedding')
             model.clip_grad_and_step()
-            cur_step = optimizer_group.cur_step
+            cur_step += 1
 
             if cur_step % LOG_INTERVAL == 0:
                 metric = model.calculate_metric(is_training=True)
                 logger.info(
                     f'Epoch {epoch} Step {cur_step}/{total_steps}, '
                     f'kept={len(emb_rows)}/{len(raw_batch)}, metric: {metric}')
-            if cur_step and cur_step % SAVE_INTERVAL == 0:
+            if cur_step % SAVE_INTERVAL == 0:
                 save_checkpoint(model, f'step_{cur_step}')
 
         save_checkpoint(model, f'epoch-{epoch}')

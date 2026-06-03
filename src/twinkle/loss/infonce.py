@@ -161,7 +161,7 @@ class InfonceLoss(Loss):
         return torch.cat(all_sentences, dim=0), torch.cat(all_labels, dim=0)
 
     def __call__(self, inputs, outputs, **kwargs) -> LossOutput:
-        labels = inputs['labels']
+        labels = inputs['labels'].view(-1)
         sentences = _extract_sentences(outputs)
 
         if self.use_batch:
