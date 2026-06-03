@@ -8,12 +8,6 @@ from twinkle.preprocessor import Preprocessor
 
 from .llm_backend import LLMBackend, OpenAIBackend
 
-_DEFAULT_N_ROLLOUTS = 8
-_DEFAULT_C_THRESH = 0.7
-_DEFAULT_D_THRESH = 0.3
-_DEFAULT_TEMPERATURE = 0.7
-_DEFAULT_MIN_DENSITY_RATIO = 0.4
-
 
 def _get_assistant_text(messages: List[Dict[str, Any]]) -> Optional[str]:
     for m in reversed(messages):
@@ -142,15 +136,15 @@ class ConsistencyFilter(Preprocessor):
         self,
         backend: LLMBackend = None,
         embed_backend: LLMBackend = None,
-        n_rollouts: int = _DEFAULT_N_ROLLOUTS,
-        c_thresh: float = _DEFAULT_C_THRESH,
-        d_thresh: float = _DEFAULT_D_THRESH,
-        temperature: float = _DEFAULT_TEMPERATURE,
+        n_rollouts: int = 8,
+        c_thresh: float = 0.7,
+        d_thresh: float = 0.3,
+        temperature: float = 0.7,
         max_workers: int = 4,
         source: str = 'auto',
         annotate: bool = False,
         replace: bool = False,
-        min_density_ratio: float = _DEFAULT_MIN_DENSITY_RATIO,
+        min_density_ratio: float = 0.4,
         # Legacy params
         sampler_endpoint: str = '',
         embed_endpoint: str = '',

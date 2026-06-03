@@ -4,17 +4,6 @@ from typing import Any, Dict, List
 
 from twinkle.preprocessor import Preprocessor
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-
-# User message: below this many chars is unconditionally trivial
-_MIN_USER_CHARS = 10
-
-# For CJK text, one char ≈ one word — scale threshold down accordingly
-_MIN_USER_CHARS_CJK = 6
-
-# 2-turn filter: assistant reply below this length with no thinking → filtered
-_MIN_ASSISTANT_CHARS_2TURN = 80
-
 # ── Language detection ────────────────────────────────────────────────────────
 
 _CJK_RE = re.compile(
@@ -70,8 +59,8 @@ _ZH_SIMPLE_RE = re.compile(
     r'(什么|啥|哪|谁|何|怎么|怎样|为什么|为啥|几|多少|何时|何地).{0,7}[？?。]?|'
     # single-verb imperative with no substantive object
     r'(介绍|解释|说明|告诉我|帮我说说|请问|能说说|讲讲).{0,5}|'
-    # short open-ended knowledge prompt: "请给出/请介绍/能否设计…" with ≤30-char body
-    r'(请\s*(给出|介绍|解释|说明|提供|列举|讲讲|阐述|描述|概述|举例|分析|说一下)|能否\s*(给出|设计|提供|介绍|解释|说明)).{0,30}'
+    # short open-ended knowledge prompt with no substantive body
+    r'(请\s*(给出|介绍|解释|说明|提供|列举|讲讲|阐述|描述|概述|举例|分析|说一下)|能否\s*(给出|设计|提供|介绍|解释|说明)).{0,10}'
     r')\s*[？?！!。]?$',
     re.UNICODE,
 )
@@ -112,15 +101,14 @@ _KO_SIMPLE_RE = re.compile(
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
-def _is_simple_query(text: str) -> bool:
+def _is_simple_query(text: str, min_user_chars: int = 10, min_user_chars_cjk: int = 6) -> bool:
     """Return True if ``text`` is a greeting or trivially simple question."""
     t = text.strip()
     if not t:
         return True
 
     if _cjk_ratio(t) >= 0.3:
-        # CJK branch: lower char threshold + language-specific patterns
-        if len(t) < _MIN_USER_CHARS_CJK:
+        if len(t) < min_user_chars_cjk:
             return True
         return bool(
             _ZH_GREETING_RE.match(t) or _ZH_SIMPLE_RE.match(t) or
@@ -128,8 +116,7 @@ def _is_simple_query(text: str) -> bool:
             _KO_GREETING_RE.match(t) or _KO_SIMPLE_RE.match(t)
         )
 
-    # Latin / mixed branch
-    if len(t) < _MIN_USER_CHARS:
+    if len(t) < min_user_chars:
         return True
     return bool(_EN_GREETING_RE.match(t) or _EN_SIMPLE_RE.match(t))
 
@@ -144,8 +131,17 @@ def _has_thinking(msg: Dict[str, Any]) -> bool:
 
 class HardFilter(Preprocessor):
 
-    def __init__(self, allow_incomplete_role: bool = False) -> None:
+    def __init__(
+        self,
+        min_user_chars: int = 10,
+        min_user_chars_cjk: int = 6,
+        min_assistant_chars_2turn: int = 80,
+        allow_incomplete_role: bool = False,
+    ) -> None:
         super().__init__()
+        self._min_user_chars = min_user_chars
+        self._min_user_chars_cjk = min_user_chars_cjk
+        self._min_assistant_chars_2turn = min_assistant_chars_2turn
         self.allow_incomplete_role = allow_incomplete_role
 
     def __call__(self, rows) -> List[Dict[str, Any]]:
@@ -175,14 +171,14 @@ class HardFilter(Preprocessor):
             # Rule 1: single-turn trivial query
             if len(user_msgs) == 1:
                 user_text = (user_msgs[0].get('content') or '').strip()
-                if _is_simple_query(user_text):
+                if _is_simple_query(user_text, self._min_user_chars, self._min_user_chars_cjk):
                     continue
 
             # Rule 2: two-turn shallow reply without thinking
             if len(user_msgs) == 1 and len(asst_msgs) == 1:
                 asst = asst_msgs[0]
                 asst_text = (asst.get('content') or '').strip()
-                if len(asst_text) < _MIN_ASSISTANT_CHARS_2TURN and not _has_thinking(asst):
+                if len(asst_text) < self._min_assistant_chars_2turn and not _has_thinking(asst):
                     continue
 
             out.append(row)

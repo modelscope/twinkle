@@ -13,8 +13,6 @@ _DEFAULT_SYSTEM_PROMPT = (
     'Reply with EXACTLY one word: PASS or FAIL.'
 )
 
-_DEFAULT_TIMEOUT = 120.0
-
 
 class JudgeSource:
     """One LLM judge backend."""
@@ -25,7 +23,7 @@ class JudgeSource:
         api_endpoint: str = '',
         model: str = 'default',
         api_key: str = '',
-        timeout: float = _DEFAULT_TIMEOUT,
+        timeout: float = 120.0,
     ):
         if backend is not None:
             self.backend = backend

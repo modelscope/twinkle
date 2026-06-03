@@ -7,10 +7,6 @@ from twinkle.preprocessor import Preprocessor
 
 from .llm_backend import LLMBackend, OpenAIBackend
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-
-_DEFAULT_PPL_MIN = 2.0
-_DEFAULT_PPL_MAX = 100.0
 _MIN_RESPONSE_TOKENS = 5
 
 
@@ -100,8 +96,8 @@ class PerplexityFilter(Preprocessor):
         self,
         backend: LLMBackend = None,
         tokenizer_name_or_path: str = '',
-        ppl_min: float = _DEFAULT_PPL_MIN,
-        ppl_max: float = _DEFAULT_PPL_MAX,
+        ppl_min: float = 2.0,
+        ppl_max: float = 100.0,
         max_workers: int = 8,
         # Legacy params
         api_endpoint: str = '',

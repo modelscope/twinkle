@@ -6,16 +6,6 @@ from typing import Any, Dict, List
 
 from twinkle.preprocessor import Preprocessor
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-
-_REPLACEMENT_CHAR_RATIO = 0.02   # \ufffd (UTF-8 decode failure)
-_CONTROL_CHAR_RATIO     = 0.01   # non-printable control chars
-_PRIVATE_USE_RATIO      = 0.03   # Unicode private-use-area glyphs
-# Raised from 4 → 20: NLP tutorials legitimately quote <|endoftext|>/[CLS] up to ~15 times.
-_SPECIAL_TOKEN_COUNT    = 20     # repeated chat special tokens in one reply
-_SCRIPT_CHAOS_THRESHOLD = 0.55   # fraction of adjacent non-space char pairs that switch script
-_SCRIPT_CHAOS_MIN_CHARS = 40     # skip chaos check for very short text
-
 # ── Pre-compiled patterns ─────────────────────────────────────────────────────
 
 # Unicode replacement character
@@ -66,15 +56,10 @@ def _script_of(cp: int) -> str:
     return 'other'
 
 
-def _script_chaos(text: str) -> float:
-    """Return the fraction of adjacent non-space char pairs that switch script.
-
-    Legitimate multilingual text keeps each script in contiguous blocks.
-    Garbled output switches scripts randomly at the character level.
-    """
-    # Only examine letter/digit characters (skip punctuation, space)
+def _script_chaos(text: str, min_chars: int = 40) -> float:
+    """Return the fraction of adjacent non-space char pairs that switch script."""
     chars = [c for c in text if unicodedata.category(c)[0] in ('L', 'N')]
-    if len(chars) < _SCRIPT_CHAOS_MIN_CHARS:
+    if len(chars) < min_chars:
         return 0.0
     scripts = [_script_of(ord(c)) for c in chars]
     switches = sum(a != b for a, b in zip(scripts, scripts[1:]))
@@ -87,29 +72,30 @@ def _ratio(pattern: re.Pattern, text: str) -> float:
     return len(pattern.findall(text)) / max(len(text), 1)
 
 
-def _is_token_soup(text: str) -> bool:
+def _is_token_soup(
+    text: str,
+    replacement_char_ratio: float = 0.02,
+    control_char_ratio: float = 0.01,
+    private_use_ratio: float = 0.03,
+    special_token_count: int = 20,
+    script_chaos_threshold: float = 0.55,
+    script_chaos_min_chars: int = 40,
+) -> bool:
     """Return True if the text exhibits any garbled-output signal."""
     if not text:
         return False
-
-    # Tier-1: near-certain encoding / decoding failure
-    if _ratio(_REPLACEMENT_CHAR_RE, text) > _REPLACEMENT_CHAR_RATIO:
+    if _ratio(_REPLACEMENT_CHAR_RE, text) > replacement_char_ratio:
         return True
-    if _ratio(_CONTROL_CHAR_RE, text) > _CONTROL_CHAR_RATIO:
+    if _ratio(_CONTROL_CHAR_RE, text) > control_char_ratio:
         return True
-    if _ratio(_PRIVATE_USE_RE, text) > _PRIVATE_USE_RATIO:
+    if _ratio(_PRIVATE_USE_RE, text) > private_use_ratio:
         return True
-
-    # Tier-2: structural / token-level corruption
-    if len(_SPECIAL_TOKEN_RE.findall(text)) >= _SPECIAL_TOKEN_COUNT:
+    if len(_SPECIAL_TOKEN_RE.findall(text)) >= special_token_count:
         return True
     if _SINGLE_CHAR_REPEAT_RE.search(text):
         return True
-
-    # Tier-3: statistical — random script interleaving
-    if _script_chaos(text) > _SCRIPT_CHAOS_THRESHOLD:
+    if _script_chaos(text, script_chaos_min_chars) > script_chaos_threshold:
         return True
-
     return False
 
 
@@ -117,8 +103,24 @@ def _is_token_soup(text: str) -> bool:
 
 class TokenSoupFilter(Preprocessor):
 
+    def __init__(
+        self,
+        replacement_char_ratio: float = 0.02,
+        control_char_ratio: float = 0.01,
+        private_use_ratio: float = 0.03,
+        special_token_count: int = 20,
+        script_chaos_threshold: float = 0.55,
+        script_chaos_min_chars: int = 40,
+    ) -> None:
+        super().__init__()
+        self._replacement_char_ratio = replacement_char_ratio
+        self._control_char_ratio = control_char_ratio
+        self._private_use_ratio = private_use_ratio
+        self._special_token_count = special_token_count
+        self._script_chaos_threshold = script_chaos_threshold
+        self._script_chaos_min_chars = script_chaos_min_chars
+
     def __call__(self, rows) -> List[Dict[str, Any]]:
-        """Drop rows where any assistant message contains garbled/token-soup content."""
         out = []
         for row in rows:
             messages = row.get('messages') or []
@@ -129,8 +131,18 @@ class TokenSoupFilter(Preprocessor):
             if not asst_msgs:
                 out.append(row)
                 continue
-            # Check all assistant turns; drop if any is garbled
-            if any(_is_token_soup((m.get('content') or '').strip()) for m in asst_msgs):
+            if any(
+                _is_token_soup(
+                    (m.get('content') or '').strip(),
+                    replacement_char_ratio=self._replacement_char_ratio,
+                    control_char_ratio=self._control_char_ratio,
+                    private_use_ratio=self._private_use_ratio,
+                    special_token_count=self._special_token_count,
+                    script_chaos_threshold=self._script_chaos_threshold,
+                    script_chaos_min_chars=self._script_chaos_min_chars,
+                )
+                for m in asst_msgs
+            ):
                 continue
             out.append(row)
         return out

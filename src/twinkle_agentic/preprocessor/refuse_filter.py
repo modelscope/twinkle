@@ -4,10 +4,6 @@ from typing import Any, Dict, List
 
 from twinkle.preprocessor import Preprocessor
 
-# Only inspect the opening window of the first assistant reply;
-# refusals almost always appear in the first sentence(s).
-_CHECK_WINDOW = 600
-
 # ── English refusal patterns ──────────────────────────────────────────────────
 #
 # Design principle: require a SELF-REFERENTIAL subject (I/we) + a task-directed
@@ -114,15 +110,19 @@ _ALL_PATTERNS = _EN_PATTERNS + _ZH_PATTERNS + _JA_PATTERNS + _KO_PATTERNS
 
 # ── Core helper ───────────────────────────────────────────────────────────────
 
-def _is_refusal(text: str) -> bool:
+def _is_refusal(text: str, check_window: int = 600) -> bool:
     """Return True if the text contains a self-referential refusal signal."""
-    window = text[:_CHECK_WINDOW]
+    window = text[:check_window]
     return any(p.search(window) for p in _ALL_PATTERNS)
 
 
 # ── Preprocessor ─────────────────────────────────────────────────────────────
 
 class RefuseFilter(Preprocessor):
+
+    def __init__(self, check_window: int = 600) -> None:
+        super().__init__()
+        self._check_window = check_window
 
     def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows where the first assistant reply expresses a refusal or inability."""
@@ -137,11 +137,7 @@ class RefuseFilter(Preprocessor):
                 out.append(row)
                 continue
             first_reply = (asst_msgs[0].get('content') or '').strip()
-            # Strip <think> blocks: refusal phrasing inside CoT is reasoning, not a refusal.
             response = re.sub(r'<think>.*?</think>\s*', '', first_reply, flags=re.DOTALL).strip()
-            # Think-only data has no response to judge — keep it.
-            if not response or not _is_refusal(response):
+            if not response or not _is_refusal(response, self._check_window):
                 out.append(row)
-            else:
-                continue
         return out

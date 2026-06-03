@@ -72,14 +72,8 @@ ADAPTER_NAME = 'default'
 
 # ── Data source ──────────────────────────────────────────────────────────────
 CN_R1_DISTILL_REPO = 'ms://AI-ModelScope/Chinese-DeepSeek-R1-Distill-data-110k'
-DATASET_TOTAL = int(os.environ.get('DATASET_TOTAL', 0))  # 0 = all
+DATASET_TOTAL = int(os.environ.get('DATASET_TOTAL', 1000))  # 0 = all
 DATASET_USE_CACHE = os.environ.get('DATASET_USE_CACHE', '0') == '1'
-
-_TARGET_FEATURES = Features({
-    'id': Value('string'),
-    'source': Value('string'),
-    'messages': [{'role': Value('string'), 'content': Value('string')}],
-})
 _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 
@@ -165,13 +159,11 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
             # Phase 8-10: repetition & character quality
             WordRepeatFilter(),
             CharRepeatFilter(),
-            SpecialCharsFilter(),
+            SpecialCharsFilter(max_ratio=0.6),
             AlphanumericFilter(),
             FlaggedWordsFilter(),
-            MinHashDedupFilter(),
-            # Phase 11: intent classification
+            # MinHashDedupFilter(),
             IntentClassifier(),
-            # Phase 12: ScoreFilter (chr_min)
             ScoreFilter(
                 template=template,
                 backend=backend,
@@ -180,12 +172,12 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
                 ],
             ),
             # Phase 13: response refinement
-            ResponseRefiner(
-                backend=backend,
-                temperature=REFINE_TEMPERATURE,
-                max_tokens=REFINE_MAX_TOKENS,
-                max_workers=8,
-            ),
+            # ResponseRefiner(
+            #     backend=backend,
+            #     temperature=REFINE_TEMPERATURE,
+            #     max_tokens=REFINE_MAX_TOKENS,
+            #     max_workers=8,
+            # ),
         ],
         dropped_log_path=DROPPED_DATA_PATH,
     )

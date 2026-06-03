@@ -49,11 +49,14 @@ class QualityPreprocessor(Preprocessor):
     """
 
     def __init__(self, pipeline: List[Callable], dropped_log_path: str = ''):
+        import os
         super().__init__()
         self._pipelines = list(pipeline)
         self._dropped_log_path = dropped_log_path
         self._lock: Optional[PosixFileLock] = (
             PosixFileLock(dropped_log_path + '.lock') if dropped_log_path else None)
+        if dropped_log_path and os.path.exists(dropped_log_path):
+            os.remove(dropped_log_path)
 
     def __call__(self, rows):
         rows_list = self.map_col_to_row(rows)

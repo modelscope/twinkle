@@ -4,25 +4,6 @@ from typing import List, Dict, Any
 
 from twinkle.preprocessor import Preprocessor
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-
-# Hesitation markers per 1000 chars above which the reply is likely stuck
-_HESITATION_DENSITY_THRESHOLD = 5.0
-
-# Number of self-correction signals within a sliding window (chars) to flag a cascade
-_CASCADE_WINDOW = 800
-_CASCADE_THRESHOLD = 5
-
-# Fraction of repeated n-grams above which the reply is considered looping
-_REPETITION_THRESHOLD = 0.45
-_NGRAM_SIZE = 8        # word n-gram size for repetition check
-_NGRAM_MIN_WORDS = 30  # skip check for very short texts
-
-# Relaxed thresholds for <think> sections where hesitation is expected
-_THINK_HESITATION_DENSITY_THRESHOLD = 15.0
-_THINK_CASCADE_THRESHOLD = 20
-_THINK_REPETITION_THRESHOLD = 0.65
-
 # ── Hesitation-marker regexes ─────────────────────────────────────────────────
 #
 # Matches thinking-aloud / self-interruption signals.
@@ -113,62 +94,58 @@ def _hesitation_density(text: str) -> float:
     return count / max(len(text), 1) * 1000
 
 
-def _has_correction_cascade(text: str) -> bool:
-    """True if CASCADE_THRESHOLD signals appear within any CASCADE_WINDOW-char span."""
-    return _has_correction_cascade_with_threshold(text, _CASCADE_THRESHOLD)
-
-
-def _has_correction_cascade_with_threshold(text: str, threshold: int) -> bool:
+def _has_correction_cascade_with_threshold(text: str, threshold: int, window: int = 800) -> bool:
     matches = [m.start() for m in _CASCADE_RE.finditer(text)]
     if len(matches) < threshold:
         return False
     for i in range(len(matches) - threshold + 1):
-        if matches[i + threshold - 1] - matches[i] <= _CASCADE_WINDOW:
+        if matches[i + threshold - 1] - matches[i] <= window:
             return True
     return False
 
 
-def _high_repetition(text: str) -> bool:
-    """True if repeated word n-grams dominate the text (content looping)."""
-    return _high_repetition_with_threshold(text, _REPETITION_THRESHOLD)
-
-
-def _high_repetition_with_threshold(text: str, threshold: float) -> bool:
+def _high_repetition_with_threshold(text: str, threshold: float, ngram_size: int = 8, ngram_min_words: int = 30) -> bool:
     words = text.split()
-    if len(words) < _NGRAM_MIN_WORDS:
+    if len(words) < ngram_min_words:
         return False
-    ngrams = [' '.join(words[i:i + _NGRAM_SIZE]) for i in range(len(words) - _NGRAM_SIZE + 1)]
+    ngrams = [' '.join(words[i:i + ngram_size]) for i in range(len(words) - ngram_size + 1)]
     unique_ratio = len(set(ngrams)) / len(ngrams)
     return (1.0 - unique_ratio) > threshold
 
 
-def _is_stuck(text: str) -> bool:
-    """Return True if the text exhibits signs of a hesitation / dead-loop.
-
-    Uses relaxed thresholds for <think> sections.
-    """
+def _is_stuck(
+    text: str,
+    hesitation_density_threshold: float = 5.0,
+    cascade_window: int = 800,
+    cascade_threshold: int = 5,
+    repetition_threshold: float = 0.45,
+    ngram_size: int = 8,
+    ngram_min_words: int = 30,
+    think_hesitation_density_threshold: float = 15.0,
+    think_cascade_threshold: int = 20,
+    think_repetition_threshold: float = 0.65,
+) -> bool:
+    """Return True if the text exhibits signs of a hesitation / dead-loop."""
     import re as _re
     think_match = _re.search(r'<think>(.*?)</think>', text, _re.DOTALL)
     if think_match:
         think_part = think_match.group(1)
         response_part = text[think_match.end():]
-        # Check think part with relaxed thresholds
         think_stuck = (
-            _hesitation_density(think_part) > _THINK_HESITATION_DENSITY_THRESHOLD
-            or _has_correction_cascade_with_threshold(think_part, _THINK_CASCADE_THRESHOLD)
-            or _high_repetition_with_threshold(think_part, _THINK_REPETITION_THRESHOLD)
+            _hesitation_density(think_part) > think_hesitation_density_threshold
+            or _has_correction_cascade_with_threshold(think_part, think_cascade_threshold, cascade_window)
+            or _high_repetition_with_threshold(think_part, think_repetition_threshold, ngram_size, ngram_min_words)
         )
-        # Check response part with normal thresholds
         response_stuck = response_part.strip() and (
-            _hesitation_density(response_part) > _HESITATION_DENSITY_THRESHOLD
-            or _has_correction_cascade(response_part)
-            or _high_repetition(response_part)
+            _hesitation_density(response_part) > hesitation_density_threshold
+            or _has_correction_cascade_with_threshold(response_part, cascade_threshold, cascade_window)
+            or _high_repetition_with_threshold(response_part, repetition_threshold, ngram_size, ngram_min_words)
         )
         return think_stuck or response_stuck
     return (
-        _hesitation_density(text) > _HESITATION_DENSITY_THRESHOLD
-        or _has_correction_cascade(text)
-        or _high_repetition(text)
+        _hesitation_density(text) > hesitation_density_threshold
+        or _has_correction_cascade_with_threshold(text, cascade_threshold, cascade_window)
+        or _high_repetition_with_threshold(text, repetition_threshold, ngram_size, ngram_min_words)
     )
 
 
@@ -176,14 +153,30 @@ def _is_stuck(text: str) -> bool:
 
 class DeadLoopFilter(Preprocessor):
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
-        """Drop rows where the assistant reply shows signs of hesitation or dead-loop.
+    def __init__(
+        self,
+        hesitation_density_threshold: float = 5.0,
+        cascade_window: int = 800,
+        cascade_threshold: int = 5,
+        repetition_threshold: float = 0.45,
+        ngram_size: int = 8,
+        ngram_min_words: int = 30,
+        think_hesitation_density_threshold: float = 15.0,
+        think_cascade_threshold: int = 20,
+        think_repetition_threshold: float = 0.65,
+    ) -> None:
+        super().__init__()
+        self._hesitation_density_threshold = hesitation_density_threshold
+        self._cascade_window = cascade_window
+        self._cascade_threshold = cascade_threshold
+        self._repetition_threshold = repetition_threshold
+        self._ngram_size = ngram_size
+        self._ngram_min_words = ngram_min_words
+        self._think_hesitation_density_threshold = think_hesitation_density_threshold
+        self._think_cascade_threshold = think_cascade_threshold
+        self._think_repetition_threshold = think_repetition_threshold
 
-        Three independent signals, any one of which triggers the filter:
-          1. High hesitation-marker density (>5 per 1000 chars)
-          2. Self-correction cascade (≥5 signals within an 800-char window)
-          3. High n-gram repetition ratio (>45% of 8-grams are duplicates)
-        """
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         out = []
         for row in rows:
             messages = row.get('messages') or []
@@ -194,8 +187,21 @@ class DeadLoopFilter(Preprocessor):
             if not asst_msgs:
                 out.append(row)
                 continue
-            if not any(_is_stuck((m.get('content') or '').strip()) for m in asst_msgs):
+            stuck = any(
+                _is_stuck(
+                    (m.get('content') or '').strip(),
+                    hesitation_density_threshold=self._hesitation_density_threshold,
+                    cascade_window=self._cascade_window,
+                    cascade_threshold=self._cascade_threshold,
+                    repetition_threshold=self._repetition_threshold,
+                    ngram_size=self._ngram_size,
+                    ngram_min_words=self._ngram_min_words,
+                    think_hesitation_density_threshold=self._think_hesitation_density_threshold,
+                    think_cascade_threshold=self._think_cascade_threshold,
+                    think_repetition_threshold=self._think_repetition_threshold,
+                )
+                for m in asst_msgs
+            )
+            if not stuck:
                 out.append(row)
-            else:
-                continue
         return out
