@@ -1,12 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import json
+import re
 import torch
 from transformers import AutoConfig, PreTrainedTokenizerFast
 from typing import Any, Dict, List, Literal, Optional
 
 from twinkle.hub import HubOperation
 from .base import Template
-from .deepseek_v4_encoding import encode_messages
+from .deepseek_v4_encoding import (dsml_token, encode_messages, eos_token, parse_message_from_completion_text,
+                                   tool_calls_block_name)
 
 
 def get_deepseek_v4_tokenizer(tokenizer):
@@ -99,6 +102,9 @@ def get_deepseek_v4_tokenizer(tokenizer):
 
 class DeepseekV4Template(Template):
 
+    _TOOL_CALLS_START = f'<{dsml_token}{tool_calls_block_name}>'
+    _TOOL_CALLS_END = f'</{dsml_token}{tool_calls_block_name}>'
+
     def __init__(
         self,
         model_id: str,
@@ -109,6 +115,7 @@ class DeepseekV4Template(Template):
         enable_thinking: bool = True,
         **kwargs,
     ):
+        self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
         base_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, **kwargs)
         self.processor = get_deepseek_v4_tokenizer(base_tokenizer)
@@ -120,13 +127,70 @@ class DeepseekV4Template(Template):
         self.truncation_strategy = truncation_strategy
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
-        self.pre_pipeline = [
-            self._add_default_system,
-            self._to_standard_reasoning_content,
-            self._build_standard_messages,
+
+        self.pre_pipeline_names = [
+            '_add_default_system',
+            '_to_standard_reasoning_content',
+            '_build_standard_messages',
         ]
-        self.post_pipeline = [
-            self._check_max_length,
-            self._add_attention_fields,
-            self._roll_labels,
+        self.post_pipeline_names = [
+            '_check_max_length',
+            '_add_attention_fields',
+            '_roll_labels',
         ]
+
+    def parse(self, decoded: str) -> List[Dict[str, Any]]:
+        text = decoded or ''
+        if DeepseekV4Template._TOOL_CALLS_START not in text:
+            return []
+
+        parse_text = re.sub(
+            r'\s*' + re.escape(DeepseekV4Template._TOOL_CALLS_START),
+            '\n\n' + DeepseekV4Template._TOOL_CALLS_START,
+            text,
+            count=1,
+        )
+        if eos_token not in parse_text:
+            parse_text += eos_token
+
+        for thinking_mode in ('chat', 'thinking'):
+            try:
+                message = parse_message_from_completion_text(parse_text, thinking_mode=thinking_mode)
+            except ValueError:
+                continue
+            tool_calls = message.get('tool_calls', []) or []
+            for tool_call in tool_calls:
+                function = tool_call.get('function', {})
+                arguments = function.get('arguments')
+                if isinstance(arguments, str):
+                    try:
+                        function['arguments'] = json.loads(arguments) if arguments.strip() else {}
+                    except json.JSONDecodeError:
+                        function['arguments'] = {}
+            return tool_calls
+
+        return []
+
+    def clean(self, decoded: str) -> str:
+        text = decoded or ''
+        while True:
+            start = text.find(DeepseekV4Template._TOOL_CALLS_START)
+            if start < 0:
+                return text.rstrip()
+
+            end = text.find(
+                DeepseekV4Template._TOOL_CALLS_END,
+                start + len(DeepseekV4Template._TOOL_CALLS_START),
+            )
+            if end < 0:
+                text = text[:start]
+                continue
+
+            end += len(DeepseekV4Template._TOOL_CALLS_END)
+            text = text[:start] + text[end:]
+
+    def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
+        return self.parse(decoded)
+
+    def clean_tool_call(self, decoded: str) -> str:
+        return self.clean(decoded)

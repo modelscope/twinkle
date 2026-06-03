@@ -79,6 +79,9 @@ class Template:
         if 'qwen' in mid:
             from .qwen import QwenTemplate
             return QwenTemplate.parse(self, decoded)
+        if 'deepseek' in mid:
+            from .deepseek_v4 import DeepseekV4Template
+            return DeepseekV4Template.parse(self, decoded)
         # TODO: Other models (Llama3, OpenAI JSON, …) — add a parser in
         # ``tool_call_parser.py`` and extend this dispatch.
         return []
@@ -89,6 +92,9 @@ class Template:
         if 'qwen' in mid:
             from .qwen import QwenTemplate
             return QwenTemplate.clean(self, decoded)
+        if 'deepseek' in mid:
+            from .deepseek_v4 import DeepseekV4Template
+            return DeepseekV4Template.clean(self, decoded)
         # TODO: Other models
         return (decoded or '').rstrip()
 
@@ -714,9 +720,10 @@ class Template:
 
     def format_trajectory(self, trajectory: Trajectory, add_default_system: bool = False) -> Trajectory:
         current = [trajectory]
-        for pipeline in self.pre_pipeline:
-            if not add_default_system and pipeline == self._add_default_system:
+        for pipeline_name in self.pre_pipeline_names:
+            if not add_default_system and pipeline_name == '_add_default_system':
                 continue
+            pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
             next_batch = []
             for traj in current:
                 next_batch.extend(pipeline(traj))
