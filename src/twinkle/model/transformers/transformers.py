@@ -912,12 +912,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save. Avoid collecting the full base model for large FSDP/EP jobs.
-            adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
-            adapter_suffix = f'.{adapter_name}.'
-            for key, value in adapter_state.items():
-                normalized = key.replace(adapter_suffix, '.')
-                processed_state_dict[normalized] = value
+            processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
@@ -937,6 +932,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             )
 
         return checkpoint_dir
+
+    def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
+        """Return PEFT-normalized adapter state dict for saving."""
+        # Avoid collecting the full base model for large FSDP/EP jobs.
+        adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
+        adapter_suffix = f'.{adapter_name}.'
+        processed_state_dict = {}
+        for key, value in adapter_state.items():
+            normalized = key.replace(adapter_suffix, '.')
+            processed_state_dict[normalized] = value
+        return processed_state_dict
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
