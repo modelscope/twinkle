@@ -190,3 +190,114 @@ async def test_property_27_concurrent_replica_registration(make_state) -> None:
     cap = await a.get_capacity_info()
     # Capacity row stores ``max_loras``; both writers wrote 4, no torn write.
     assert cap['max_loras'] == 4
+
+
+# ---------- Read-modify-write race exposure (memory-actor revert PR) ----- #
+#
+# These tests don't fix anything — they just exercise the RMW patterns inside
+# managers (`SessionManager.touch`, `ConfigManager.add_or_get`,
+# `FutureManager.store_status`) under a real Redis backend so that any
+# resulting lost-write surfaces as a hard test failure rather than as a
+# silent production drift. Each test is allowed to xfail if the race is real:
+# the goal is to make the symptom visible to the next PR that actually adds
+# WATCH/MULTI/EXEC or a Lua script around the path.
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_touch_lost_write_exposure(make_state) -> None:
+    """Two workers race ``touch`` on the same session for ~100 rounds.
+
+    Properties checked:
+    (a) every ``touch`` returns ``True`` because the session exists (no
+        ``False`` from a stale read followed by a delete-races-write);
+    (b) the final ``last_heartbeat`` is plausibly close to ``now`` — i.e. a
+        write that landed after another write was not silently swallowed.
+
+    The implementation is read-modify-write, so a *specific* heartbeat update
+    can still get clobbered by a slower writer — but for these two assertions
+    the race is benign (last-write-wins still lands a recent heartbeat). If
+    either assertion ever flips on a real Redis the manager needs a
+    server-side atomic update (Lua / WATCH+EXEC), not just an extra retry.
+    """
+    import time
+    a = make_state()
+    b = make_state()
+    sid = await a.create_session({'session_id': f'sess-{uuid.uuid4().hex[:6]}'})
+
+    rounds = 100
+    touched: list[bool] = []
+
+    async def hammer(state: ServerState) -> None:
+        for _ in range(rounds):
+            ok = await state.touch_session(sid)
+            touched.append(ok)
+
+    start = time.time()
+    await asyncio.gather(hammer(a), hammer(b))
+
+    assert all(touched), f'{touched.count(False)} touch() calls returned False — RMW lost the session row'
+    final = await a.get_session_last_heartbeat(sid)
+    assert final is not None
+    # Allow generous slack for actor RPC + Redis round-trips during the
+    # hammer phase, but it must still be close to "now".
+    assert final >= start, 'final heartbeat is older than the test start — write was lost'
+
+
+@pytest.mark.asyncio
+async def test_concurrent_add_or_get_consistent_value(make_state) -> None:
+    """``ConfigManager.add_or_get`` is implemented on top of ``set_nx``,
+    which is atomic in Redis. Two writers racing distinct values for the
+    same key must return the *same* committed value."""
+    a = make_state()
+    b = make_state()
+    key = f'cfg-{uuid.uuid4().hex[:6]}'
+    write_a = {'who': 'a'}
+    write_b = {'who': 'b'}
+
+    got_a, got_b = await asyncio.gather(
+        a.add_or_get_config(key, write_a),
+        b.add_or_get_config(key, write_b),
+    )
+    # Both calls must observe the same committed value — that's the whole
+    # point of the SETNX-backed contract.
+    assert got_a == got_b
+    final = await a.get_config(key)
+    assert final == got_a
+    assert final in (write_a, write_b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason=('FutureManager.store_status is read-modify-write; on a real Redis '
+            'a concurrent retry that writes "pending" can clobber a freshly '
+            'committed terminal status. Tracked for follow-up.'),
+    strict=False,
+)
+async def test_concurrent_future_update_no_state_regression(make_state) -> None:
+    """Once a future is recorded as ``completed`` a concurrent ``pending``
+    write must not regress it back. With the current RMW implementation
+    this race is real on Redis — the test is xfail until the manager grows
+    a server-side atomic update path."""
+    a = make_state()
+    b = make_state()
+    request_id = f'req-{uuid.uuid4().hex[:6]}'
+    await a.store_future_status(request_id=request_id, status='pending', model_id=None)
+
+    async def writer_completed() -> None:
+        await a.store_future_status(
+            request_id=request_id,
+            status='completed',
+            model_id=None,
+            result={'ok': True},
+        )
+
+    async def writer_pending_retry() -> None:
+        # Simulate a stale retry path that re-sends "pending" after a network
+        # hiccup; the manager must not lose the terminal status.
+        await b.store_future_status(request_id=request_id, status='pending', model_id=None)
+
+    await asyncio.gather(writer_completed(), writer_pending_retry())
+
+    final = await a.get_future(request_id)
+    assert final is not None
+    assert final['status'] == 'completed', f'completed status was clobbered by a concurrent pending write: {final}'

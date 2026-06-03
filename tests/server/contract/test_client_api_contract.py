@@ -8,10 +8,10 @@ methods, and request/response schemas of the Tinker (`/*`, `/tinker/*`) and
 Twinkle (`/twinkle/*`) endpoints MUST be identical before and after each
 phase. This test rebuilds the FastAPI apps from the current sources, extracts
 their OpenAPI surface, and asserts equality with the committed baseline at
-``tests/contract/client_api_baseline.json``.
+``tests/server/contract/client_api_baseline.json``.
 
 Updating the baseline is intentionally a manual step: run
-``python -m tests.contract.update_baseline`` (or call
+``python -m tests.server.contract.update_baseline`` (or call
 ``client_api_harness.write_baseline()``) only when an API change has been
 explicitly approved.
 """
@@ -20,12 +20,12 @@ from __future__ import annotations
 import json
 import pytest
 
-from tests.contract.client_api_harness import APP_BUILDERS, BASELINE_PATH, extract_full_surface, load_baseline
+from tests.server.contract.client_api_harness import APP_BUILDERS, BASELINE_PATH, extract_full_surface, load_baseline
 
 
 def test_baseline_file_exists() -> None:
     assert BASELINE_PATH.exists(), (f'Baseline {BASELINE_PATH} missing. Generate it with '
-                                    '`python -m tests.contract.update_baseline` after confirming the '
+                                    '`python -m tests.server.contract.update_baseline` after confirming the '
                                     'current client-facing surface is correct.')
 
 
@@ -45,7 +45,7 @@ def test_app_surface_matches_baseline(app_name: str) -> None:
         pytest.fail(f'Client-API surface for {app_name!r} drifted from the baseline.\n'
                     f'{diff}\n'
                     f'If the change is intentional, regenerate the baseline with '
-                    f'`python -m tests.contract.update_baseline`.')
+                    f'`python -m tests.server.contract.update_baseline`.')
 
 
 def test_full_surface_matches_baseline() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import pytest
+import ray
 import tempfile
 
 from twinkle.server.state.backend.factory import PersistenceConfig, create_backend
@@ -19,10 +20,41 @@ def test_create_backend_none_returns_memory():
 
 
 def test_create_backend_memory_mode():
-    """Explicit memory mode should return MemoryBackend."""
+    """Explicit memory mode should return MemoryBackend backed by a detached actor."""
     config = PersistenceConfig(mode='memory')
     backend = create_backend(config)
     assert isinstance(backend, MemoryBackend)
+    # The detached actor must exist so that other workers in the same Ray
+    # cluster forward through the same canonical store.
+    assert ray.get_actor('twinkle_state_actor') is not None
+
+
+def test_create_backend_memory_mode_namespaced_by_prefix():
+    """``key_prefix`` must namespace the detached actor to avoid collisions
+    when multiple Twinkle deployments share one Ray cluster."""
+    config = PersistenceConfig(mode='memory', key_prefix='ns1')
+    backend = create_backend(config)
+    assert isinstance(backend, MemoryBackend)
+    assert ray.get_actor('twinkle_state_actor::ns1') is not None
+
+
+def test_create_backend_memory_mode_requires_ray_initialized():
+    """Without an initialized Ray runtime memory mode must fail loudly,
+    rather than silently fall back to a per-process dict."""
+    # Tear down the session-scoped Ray runtime so we can verify the guard.
+    ray.shutdown()
+    try:
+        config = PersistenceConfig(mode='memory')
+        with pytest.raises(RuntimeError, match='Ray'):
+            create_backend(config)
+    finally:
+        # Restore the session fixture's runtime so subsequent tests can run.
+        ray.init(
+            ignore_reinit_error=True,
+            num_cpus=2,
+            log_to_driver=False,
+            namespace='twinkle_test',
+        )
 
 
 # ---- File Mode ----
