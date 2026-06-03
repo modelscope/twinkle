@@ -12,6 +12,7 @@ logger = get_logger(only_local_master=False)
 INTENT_TOOL_CALL = 'tool_call'
 INTENT_CODE = 'code'
 INTENT_MATH = 'math'
+INTENT_COMPLEX_LOGIC = 'complex_logic'
 INTENT_USER_DISSATISFACTION = 'user_dissatisfaction'
 INTENT_OTHER = 'other'
 
@@ -74,6 +75,36 @@ _MATH_LATEX_RE = re.compile(
     r'radius|diameter|circumference|perimeter|hypotenuse|congruent|parallel|perpendicular)\b|'
     r'\w_\{[^}]+\}|\w\^\{[^}]+\})',
     re.DOTALL,
+)
+
+# ── Complex logic patterns ────────────────────────────────────────────────────
+_LOGIC_STRUCTURE_RE = re.compile(
+    # Sequential reasoning markers (Chinese)
+    r'首先.{4,}其次|其次.{4,}最后|第一.{4,}第二.{4,}第三|'
+    r'一方面.{4,}另一方面|从.{1,6}角度|'
+    # Conditional / branching (Chinese)
+    r'如果.{2,30}那么|假设.{2,30}则|若.{2,20}则|'
+    r'分(为|成).{0,5}(种|类|个).{0,10}(情况|情形|场景|类型)|分情况讨论|'
+    # Causal chains (Chinese)
+    r'因为.{2,40}所以|由于.{2,40}因此|既然.{2,30}那么|'
+    r'导致.{2,30}进而|之所以.{2,30}是因为|'
+    # Synthesis / conclusion (Chinese)
+    r'综上(所述)?|综合(以上|来看|分析)|总[的而]言之|由此可[得见知]|'
+    # Comparison / trade-off (Chinese)
+    r'优缺点|利弊|优劣|权衡|对比分析|相比之下|'
+    # Multi-constraint reasoning (Chinese)
+    r'需要同时满足|同时考虑|兼顾|约束条件|'
+    # Sequential reasoning markers (English)
+    r'\b(first(ly)?|second(ly)?|third(ly)?|finally|furthermore|moreover|in addition|'  # noqa: E501
+    r'on (the )?one hand|on the other hand|'  # noqa: E501
+    r'as a result|consequently|therefore|hence|thus|accordingly)\b|'
+    # Conditional / branching (English)
+    r'\b(if .{5,30} then|assuming .{5,30} then|in (case|scenario) .{2,10}(A|B|1|2)|'  # noqa: E501
+    r'case \d|scenario \d)\b|'
+    # Synthesis (English)
+    r'\b(in (conclusion|summary)|to (summarize|conclude)|overall|all things considered|'  # noqa: E501
+    r'weighing .{3,20} against|pros and cons|trade-?offs?|advantages .{0,10} disadvantages)\b',
+    re.DOTALL | re.IGNORECASE,
 )
 
 _DISSATISFACTION_ZH_RE = re.compile(
@@ -218,7 +249,9 @@ class ToolCallDetector(IntentDetector):
 
 class CodeDetector(_RegexDetector):
     intent = INTENT_CODE
-    threshold = 3
+
+    def __init__(self, threshold: int = 3) -> None:
+        self.threshold = threshold
 
     def _match(self, text):
         blocks = _CODE_BLOCK_RE.findall(text)
@@ -229,14 +262,23 @@ class CodeDetector(_RegexDetector):
 
 class MathDetector(_RegexDetector):
     intent = INTENT_MATH
-    # Threshold 4 (not 2): asst replies in chemistry/biology/materials describe formulas
-    # like CH₂/H₂O whose subscript-digit chars match `_MATH_LATEX_RE`. Bumping to 4 keeps
-    # genuine math (which has many more matches) while rejecting incidental sub/superscript
-    # noise from non-math knowledge questions.
-    threshold = 4
+
+    def __init__(self, threshold: int = 4) -> None:
+        self.threshold = threshold
 
     def _match(self, text):
         return len(_MATH_LATEX_RE.findall(text)) >= self.threshold
+
+
+class ComplexLogicDetector(_RegexDetector):
+    intent = INTENT_COMPLEX_LOGIC
+    role_filter = 'assistant'
+
+    def __init__(self, threshold: int = 6) -> None:
+        self.threshold = threshold
+
+    def _match(self, text):
+        return len(_LOGIC_STRUCTURE_RE.findall(text)) >= self.threshold
 
 
 class UserDissatisfactionDetector(_RegexDetector):
@@ -286,6 +328,7 @@ class IntentClassifier(Preprocessor):
         ToolCallDetector(),
         CodeDetector(),
         MathDetector(),
+        ComplexLogicDetector(),
         UserDissatisfactionDetector(),
     ]
 
