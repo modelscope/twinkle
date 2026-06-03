@@ -1,17 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Persistence topology tests for the actor-wrapped MemoryBackend (R19 revert).
+"""Persistence topology tests for the actor-wrapped MemoryBackend.
 
-The original "de-Actor" assertions (``ray.remote`` is never called, source
-must not contain ``lifetime='detached'``) intentionally don't apply anymore:
-``MemoryBackend`` now owns a detached actor on purpose so all Ray Serve
-workers share one consistent in-memory store. What we still need is that
-``get_server_state`` is process-local cache + that two ``ServerState``
-instances on the same backend agree under the same op stream.
+``MemoryBackend`` owns a detached Ray actor on purpose so all Ray Serve
+workers share one consistent in-memory store. These tests assert that
+``get_server_state`` returns a process-local cached instance and that two
+``ServerState`` instances on the same backend agree under the same op stream.
 
-Covers:
-- # Feature: server-config-observability-refactor, Property 25: State operation
-  equivalence under shared backend access
-- in-process MemoryBackend works without Redis (R19.6) — now via the actor
+Also pins in-process MemoryBackend behaviour — no external Redis is required;
+sharing happens through the detached actor.
 """
 from __future__ import annotations
 
@@ -40,7 +36,7 @@ def test_get_server_state_separate_keys_yield_separate_instances() -> None:
 
 def test_in_process_persistence_no_redis_required() -> None:
     """``PersistenceConfig`` defaults to memory mode and ``ServerState`` works
-    without an external Redis (R19.6).
+    without an external Redis.
 
     The mode now reaches the shared ``_StateActor`` over Ray, but from the
     caller's perspective it remains "no external service needed".
@@ -92,8 +88,7 @@ async def test_property_25_state_operation_equivalence(ops: list[tuple]) -> None
 
     Two instances bound to the same backend (i.e. forwarding to the same
     detached actor) must agree on every read after the same sequence of
-    writes — this is the equivalence the in-actor implementation used to
-    enforce, now provided by the shared backend itself (R19.3).
+    writes — the shared backend itself is the coordination point.
     """
     backend = MemoryBackend()
     # Hypothesis reuses the same function scope across all examples, so the
@@ -145,10 +140,9 @@ async def test_replica_registry_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_two_states_share_backend_in_process() -> None:
-    """Two ``ServerState`` instances on one shared MemoryBackend see the same writes (R19.4 in-process).
+    """Two ``ServerState`` instances on one shared MemoryBackend see each other's writes.
 
-    Now the sharing is via the detached ``_StateActor`` rather than a single
-    in-process dict, but the contract is unchanged.
+    Sharing is via the detached ``_StateActor`` rather than an in-process dict.
     """
     backend = MemoryBackend()
     a = ServerState(backend=backend)

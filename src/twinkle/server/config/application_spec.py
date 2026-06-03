@@ -38,15 +38,15 @@ class HttpOptions(BaseModel):
     port: int = 8000
 
 
-# ---------- per-deployment args schemas (R3.x) ----------------------------- #
+# ---------- per-deployment args schemas ------------------------------------ #
 
 
 class ModelArgs(_ArgsBase):
     """Args for the ``model`` deployment.
 
-    The ``backend`` field selects the model implementation and replaces the
-    legacy ``use_megatron: bool`` flag. Phase 0c introduces this field; the
-    actual dispatch on its value is wired up in Phase 1 (R3.1-3.3, R3.9).
+    The ``backend`` field selects the model implementation (transformers /
+    megatron / mock) — see ``model/app.py`` for the dispatch site that picks
+    the runtime class based on this value.
     """
 
     model_id: str

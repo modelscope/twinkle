@@ -66,7 +66,7 @@ class ServerLauncher:
             config: A validated :class:`ServerConfig` instance. Raw dicts are
                 rejected — operators must build ``ServerConfig`` via
                 ``ServerConfig.from_yaml`` or its constructor so cross-field
-                validation runs before the launcher consumes anything (R6.6).
+                validation runs before the launcher consumes anything.
             ray_namespace: Ray namespace (default: 'twinkle_cluster')
         """
         if not isinstance(config, ServerConfig):
@@ -376,7 +376,7 @@ def launch_server(
     Raises:
         ValueError: neither ``config`` nor ``config_path`` was provided.
         TypeError: ``config`` is not a :class:`ServerConfig` instance — raw
-            dicts are no longer accepted (R6.6).
+            dicts are not accepted.
 
     Examples:
         launch_server(config_path="server_config.yaml")

@@ -84,14 +84,14 @@ def traced_operation(
     attrs: Mapping[str, Any] | None = None,
     tracer_name: str = 'twinkle.server.business',
 ) -> Iterator[Any]:
-    """Run a business-layer block under one OTEL span (R10).
+    """Run a business-layer block under one OTEL span.
 
     The span starts before the block runs and ends after it returns. If the
     block raises, the exception is recorded on the span, the span status is
     set to ERROR, the span is ended, and the original exception is re-raised
-    to the caller (R10.4). When the OTEL SDK is missing, the context manager
-    degrades to a NoOp that runs the block normally and returns the same
-    result it would return when tracing is active (R10.5 / R18.3).
+    to the caller. When the OTEL SDK is missing, the context manager degrades
+    to a NoOp that runs the block normally and returns the same result it
+    would return when tracing is active.
     """
     if not _OTEL_AVAILABLE:
         yield _NoopSpan()

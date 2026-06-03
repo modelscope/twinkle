@@ -100,7 +100,7 @@ async def validate_config_signature(
 
 
 # ---------------------------------------------------------------------------
-# CLI startup hook (R15)
+# CLI startup hook
 # ---------------------------------------------------------------------------
 
 
@@ -117,17 +117,17 @@ def _format_diff(stored: dict[str, Any] | None, current: dict[str, Any]) -> str:
 
 
 async def validate_against_backend(persistence_config: Any, current_config: dict[str, Any]) -> None:
-    """Validate the persistence config signature on launcher startup (R15).
+    """Validate the persistence config signature on launcher startup.
 
     Builds a backend from ``persistence_config`` (a :class:`PersistenceConfig`),
     computes the current signature, and compares it to the stored value:
-    - if no signature is stored, store the current one and continue (R15.4);
+    - if no signature is stored, store the current one and continue;
     - if signatures match, return cleanly;
     - if they differ, raise :class:`ConfigMismatchError` with a stored-vs-
-      current diff and a remediation hint (R15.2, R15.3).
+      current diff and a remediation hint.
 
     Designed to be called BEFORE ``ray.init`` so the launcher can fail fast
-    without spinning up the cluster (R15.1).
+    without spinning up the cluster.
     """
     from twinkle.server.state.backend.factory import create_backend
 
@@ -138,7 +138,7 @@ async def validate_against_backend(persistence_config: Any, current_config: dict
     if stored_sig is None:
         await backend.set(_SIGNATURE_KEY, current_sig)
         # Persist the payload alongside the signature so a future drift diff can
-        # render real ``stored vs current`` field-level differences (R15.3).
+        # render real ``stored vs current`` field-level differences.
         await backend.set(_PAYLOAD_KEY, current_config)
         logger.info('No previous config signature found. Stored current signature.')
         return

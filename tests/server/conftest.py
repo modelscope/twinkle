@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared Ray runtime + per-test isolation for ``tests/server`` (state, cli, ...).
 
-After R19's revert ``MemoryBackend`` is implemented as a forwarding wrapper
-around a detached Ray actor — instantiating one without an initialized Ray
-runtime raises :class:`RuntimeError`. The vast majority of server tests just
-construct ``MemoryBackend()`` somewhere in their fixtures, so we boot a small
-Ray cluster once per test session here instead of opting in module by module.
+``MemoryBackend`` is a forwarding wrapper around a detached Ray actor;
+instantiating one without an initialized Ray runtime raises
+:class:`RuntimeError`. The vast majority of server tests just construct
+``MemoryBackend()`` somewhere in their fixtures, so we boot a small Ray
+cluster once per test session here instead of opting in module by module.
 
 Two ``MemoryBackend()`` instances created in the same test session share one
 canonical actor (``twinkle_state_actor``) by design — that is the whole point

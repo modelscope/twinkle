@@ -1,18 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Typer-based operations CLI (R14, R15).
+"""Typer-based operations CLI.
 
 Provides four subcommands:
 
-- ``launch``           — start the Twinkle Server from a YAML config.
-                        Validates the persistence config signature against
-                        the persistence backend BEFORE ``ray.init`` so a
-                        configuration drift fails fast (R15.1).
+- ``launch``           — start the Twinkle Server from a YAML config. Validates
+                        the persistence config signature against the persistence
+                        backend BEFORE ``ray.init`` so a configuration drift
+                        fails fast.
 - ``check-config``     — validate a config file; exit 0 on success, non-zero
-                        with the validation error on failure (R14.3, R14.4).
+                        with the validation error on failure.
 - ``print-config``     — emit the fully resolved + normalized ``ServerConfig``
-                        as YAML (R14.5).
+                        as YAML or JSON.
 - ``clear persistence``— delete persisted state for the namespace derived
-                        from a config file (R14.2).
+                        from a config file.
 """
 from __future__ import annotations
 
@@ -84,10 +84,11 @@ def launch_cmd(
     config: Path = CONFIG_OPTION,
     namespace: str | None = NAMESPACE_OPTION,
 ) -> None:
-    """Start the Twinkle Server from a YAML config file (R14.1, R15.1)."""
+    """Start the Twinkle Server from a YAML config file."""
     cfg = _load_config(config)
 
-    # Validate the persistence config signature BEFORE we touch Ray (R15.1).
+    # Validate the persistence config signature BEFORE we touch Ray so a
+    # config drift fails fast without spinning up the cluster.
     try:
         from twinkle.server.state.config_signature import validate_against_backend
 
@@ -107,7 +108,7 @@ def launch_cmd(
 
 @app.command('check-config')
 def check_config_cmd(config: Path = CONFIG_OPTION) -> None:
-    """Validate ``config`` and exit 0 on success, non-zero on failure (R14.3, R14.4)."""
+    """Validate ``config`` and exit 0 on success, non-zero on failure."""
     _load_config(config)
     typer.echo('ok')
 
@@ -117,7 +118,7 @@ def print_config_cmd(
         config: Path = CONFIG_OPTION,
         fmt: str = typer.Option('yaml', '--format', envvar='TWINKLE_PRINT_FORMAT', help='yaml|json'),
 ) -> None:
-    """Emit the validated, normalized ``ServerConfig`` (R14.5)."""
+    """Emit the validated, normalized ``ServerConfig`` as YAML or JSON."""
     cfg = _load_config(config)
     payload = cfg.to_yaml_dict()
     if fmt == 'json':
@@ -128,7 +129,7 @@ def print_config_cmd(
 
 @clear_app.command('persistence')
 def clear_persistence_cmd(config: Path = CONFIG_OPTION) -> None:
-    """Remove persisted state for the namespace derived from ``config`` (R14.2)."""
+    """Remove persisted state for the namespace derived from ``config``."""
     cfg = _load_config(config)
     from twinkle.server.state.backend.factory import create_backend
 

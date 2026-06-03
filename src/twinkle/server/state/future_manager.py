@@ -1,12 +1,69 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import functools
 from datetime import datetime
 from typing import Any
 
 from .backend.base import StateBackend
 from .base import BaseManager
 from .models import FutureRecord
+
+# Status sets used by the do-not-regress guard inside the atomic transform.
+_TERMINAL_STATUSES = frozenset({'completed', 'failed'})
+_NON_TERMINAL_STATUSES = frozenset({'pending', 'queued', 'running'})
+
+
+def _future_record_transform(
+    existing: dict | None,
+    *,
+    new_status: str,
+    model_id: str | None,
+    reason: str | None,
+    result: Any,
+    queue_state: str | None,
+    queue_state_reason: str | None,
+    now: str,
+) -> dict | None:
+    """Atomic transform body for :meth:`FutureManager.store_status`.
+
+    Module-level so it remains picklable when forwarded across the Ray actor
+    boundary (closures and lambdas cannot be).
+
+    Drops the write entirely (returns ``None``) when ``new_status`` would
+    regress a terminal status — the StateBackend.update_atomic contract treats
+    a ``None`` return as "keep the current value", which is what stops stale
+    retries from clobbering a freshly committed terminal state.
+    """
+    if (existing is not None and existing.get('status') in _TERMINAL_STATUSES and new_status in _NON_TERMINAL_STATUSES):
+        return None
+
+    if existing is None:
+        record = FutureRecord(
+            status=new_status,
+            model_id=model_id,
+            reason=reason,
+            result=result,
+            queue_state=queue_state,
+            queue_state_reason=queue_state_reason,
+            created_at=now,
+            updated_at=now,
+        )
+        return record.model_dump()
+
+    updated = dict(existing)
+    updated['status'] = new_status
+    updated['model_id'] = model_id
+    updated['updated_at'] = now
+    if reason is not None:
+        updated['reason'] = reason
+    if result is not None:
+        updated['result'] = result
+    if queue_state is not None:
+        updated['queue_state'] = queue_state
+    if queue_state_reason is not None:
+        updated['queue_state_reason'] = queue_state_reason
+    return updated
 
 
 class FutureManager(BaseManager[FutureRecord]):
@@ -32,49 +89,30 @@ class FutureManager(BaseManager[FutureRecord]):
     ) -> None:
         """Create or update a future record with the latest status.
 
-        If the result object has a `model_dump` method (i.e. it is a Pydantic
-        model) it is serialized to a plain dict before storage.
+        Uses :meth:`StateBackend.update_atomic` so that a slow retry writing
+        ``pending`` cannot clobber a freshly committed terminal status — the
+        backend serializes the read-transform-write triple for us.
 
-        Args:
-            request_id: Unique identifier for the request.
-            status: Task status string (pending/queued/running/completed/failed/rate_limited).
-            model_id: Optional associated model_id.
-            reason: Optional reason string (used for rate_limited status).
-            result: Optional result data (used for completed/failed status).
-            queue_state: Optional queue state (active/paused_rate_limit/paused_capacity).
-            queue_state_reason: Optional reason for the queue state.
+        If the result object has a ``model_dump`` method (i.e. it is a Pydantic
+        model) it is serialized to a plain dict before storage.
         """
         if result is not None and hasattr(result, 'model_dump'):
             result = result.model_dump()
 
         now = datetime.now().isoformat()
-        existing = await self.get(request_id)
-
-        if existing is not None:
-            existing.status = status
-            existing.model_id = model_id
-            existing.updated_at = now
-            if reason is not None:
-                existing.reason = reason
-            if result is not None:
-                existing.result = result
-            if queue_state is not None:
-                existing.queue_state = queue_state
-            if queue_state_reason is not None:
-                existing.queue_state_reason = queue_state_reason
-            await self.add(request_id, existing)
-        else:
-            record = FutureRecord(
-                status=status,
+        await self._backend.update_atomic(
+            self._make_key(request_id),
+            functools.partial(
+                _future_record_transform,
+                new_status=status,
                 model_id=model_id,
                 reason=reason,
                 result=result,
                 queue_state=queue_state,
                 queue_state_reason=queue_state_reason,
-                created_at=now,
-                updated_at=now,
-            )
-            await self.add(request_id, record)
+                now=now,
+            ),
+        )
 
     # ----- Cleanup -----
 

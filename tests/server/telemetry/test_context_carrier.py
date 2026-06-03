@@ -1,8 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Trace context carrier round-trip tests (R13).
-
-# Feature: server-config-observability-refactor, Property 24: Trace context carrier round-trip
-"""
+"""Trace context carrier round-trip tests."""
 from __future__ import annotations
 
 import pytest
@@ -71,7 +68,7 @@ def test_property_24_carrier_round_trip(in_memory_span_exporter) -> None:
 
 
 def test_property_24_empty_carrier_starts_fresh_trace(in_memory_span_exporter) -> None:
-    """An empty / None carrier means: start a new trace (R13.4)."""
+    """An empty / None carrier means: start a new trace."""
     from opentelemetry import trace
 
     in_memory_span_exporter.clear()

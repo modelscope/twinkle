@@ -1,0 +1,362 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "HTTP request rate (per deployment)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (deployment, status) (rate(twinkle_http_requests_total[1m]))",
+          "legendFormat": "{{deployment}} {{status}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "title": "HTTP latency P95 (per deployment)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, deployment) (rate(twinkle_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "title": "Active resources",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "twinkle_sessions_active",
+          "legendFormat": "sessions",
+          "refId": "A"
+        },
+        {
+          "expr": "twinkle_models_active",
+          "legendFormat": "models",
+          "refId": "B"
+        },
+        {
+          "expr": "twinkle_sampling_sessions_active",
+          "legendFormat": "sampling sessions",
+          "refId": "C"
+        },
+        {
+          "expr": "twinkle_futures_active",
+          "legendFormat": "futures",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "title": "Task queue depth (per deployment)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (deployment) (twinkle_queue_depth)",
+          "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "title": "Task execution P95",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, deployment) (rate(twinkle_task_execution_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "title": "Task wait time P95",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, deployment) (rate(twinkle_task_wait_seconds_bucket[5m])))",
+          "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "title": "Rate-limit rejections",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (deployment) (rate(twinkle_rate_limit_rejections_total[1m]))",
+          "legendFormat": "{{deployment}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "title": "Task completions by status",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (deployment, status) (rate(twinkle_tasks_total[1m]))",
+          "legendFormat": "{{deployment}} {{status}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "title": "CPU utilization",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "twinkle_system_cpu_utilization",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "title": "Memory utilization (system)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "twinkle_system_memory_usage_bytes",
+          "legendFormat": "system used",
+          "refId": "A"
+        },
+        {
+          "expr": "twinkle_process_memory_usage_bytes",
+          "legendFormat": "{{instance}} process RSS",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 11,
+      "title": "GPU utilization",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "twinkle_gpu_utilization",
+          "legendFormat": "gpu {{gpu_index}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 12,
+      "title": "GPU memory used",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "twinkle_gpu_memory_usage_bytes",
+          "legendFormat": "gpu {{gpu_index}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "twinkle"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Twinkle Server Overview",
+  "uid": "twinkle-overview",
+  "version": 1,
+  "weekStart": ""
+}

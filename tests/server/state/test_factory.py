@@ -38,24 +38,10 @@ def test_create_backend_memory_mode_namespaced_by_prefix():
     assert ray.get_actor('twinkle_state_actor::ns1') is not None
 
 
-def test_create_backend_memory_mode_requires_ray_initialized():
-    """Without an initialized Ray runtime memory mode must fail loudly,
-    rather than silently fall back to a per-process dict."""
-    # Tear down the session-scoped Ray runtime so we can verify the guard.
-    ray.shutdown()
-    try:
-        config = PersistenceConfig(mode='memory')
-        with pytest.raises(RuntimeError, match='Ray'):
-            create_backend(config)
-    finally:
-        # Restore the session fixture's runtime so subsequent tests can run.
-        ray.init(
-            ignore_reinit_error=True,
-            num_cpus=2,
-            log_to_driver=False,
-            namespace='twinkle_test',
-        )
-
+# Note: ``test_create_backend_memory_mode_requires_ray_initialized`` lives in
+# ``test_memory_backend_requires_ray.py`` — it tears down the session-scoped
+# Ray runtime managed by ``tests/server/conftest.py`` and so cannot share a
+# pytest collection with tests that need it.
 
 # ---- File Mode ----
 

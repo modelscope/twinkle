@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Phase 3 config-drift integration tests against Docker Redis (R15).
+"""Config-drift integration tests against Docker Redis.
 
 Verifies the launch-time signature gate end-to-end:
 1. First launch with persistence: redis stores the signature on a fresh DB.

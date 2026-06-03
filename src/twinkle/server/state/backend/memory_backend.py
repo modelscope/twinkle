@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import ray
 import time
 from fnmatch import fnmatch
-from typing import Any
-
-import ray
+from typing import Any, Callable
 
 from .base import StateBackend
 
@@ -23,8 +22,8 @@ class _StateActor:
     """Single-threaded asyncio actor that owns the canonical in-memory store.
 
     Ray's actor concurrency model serializes calls into one asyncio loop, so
-    every operation here is atomic against every other — ``set_nx`` and the
-    read-modify-write paths in :class:`MemoryBackend` cannot race.
+    every operation here is atomic against every other — ``set_nx`` and
+    ``update_atomic`` cannot race against any other op on this actor.
     """
 
     def __init__(self) -> None:
@@ -72,11 +71,26 @@ class _StateActor:
     async def count(self, pattern: str) -> int:
         return len(await self.keys(pattern))
 
-    async def set_nx(self, key: str, value: Any) -> bool:
+    async def set_nx(self, key: str, value: Any, ttl: int | None = None) -> bool:
         if not self._is_expired(key):
             return False
-        self._store[key] = (value, None)
+        expire_at = (time.time() + ttl) if ttl is not None else None
+        self._store[key] = (value, expire_at)
         return True
+
+    async def update_atomic(
+        self,
+        key: str,
+        transform: Callable[[Any | None], Any | None],
+        ttl: int | None = None,
+    ) -> Any | None:
+        current = None if self._is_expired(key) else self._store[key][0]
+        new_value = transform(current)
+        if new_value is None:
+            return current
+        expire_at = (time.time() + ttl) if ttl is not None else None
+        self._store[key] = (new_value, expire_at)
+        return new_value
 
     async def close(self) -> None:
         self._store.clear()
@@ -88,24 +102,17 @@ class _StateActor:
 class MemoryBackend(StateBackend):
     """Cross-process state backend backed by a detached Ray actor.
 
-    The legacy in-process ``dict`` implementation made the "memory" mode
-    silently broken under Ray Serve, where ``server`` / ``model`` / ``processor``
-    each live in their own worker process and would each get an empty dict.
-    This implementation holds the canonical store inside a detached
-    ``_StateActor`` and forwards every method as ``await actor.X.remote(...)``,
-    so all workers share one consistent view.
-
-    Memory mode requires an initialized Ray runtime — there is no fallback to
-    a process-local dict; the alternative would be the silent split-brain we
-    just removed.
+    The canonical store lives inside a detached ``_StateActor`` and every
+    method forwards as ``await actor.X.remote(...)`` so all Ray Serve workers
+    share one consistent view. Memory mode requires an initialized Ray
+    runtime — there is no fallback to a process-local dict.
     """
 
     def __init__(self, key_prefix: str = '') -> None:
         if not ray.is_initialized():
-            raise RuntimeError(
-                'MemoryBackend requires an initialized Ray runtime — call '
-                'ray.init() first, switch persistence to "file"/"redis", or '
-                'rely on the deployment launcher to start Ray.')
+            raise RuntimeError('MemoryBackend requires an initialized Ray runtime — call '
+                               'ray.init() first, switch persistence to "file"/"redis", or '
+                               'rely on the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)
         try:
             self._actor = ray.get_actor(name)
@@ -135,11 +142,25 @@ class MemoryBackend(StateBackend):
     async def count(self, pattern: str) -> int:
         return await self._actor.count.remote(pattern)
 
-    async def set_nx(self, key: str, value: Any) -> bool:
-        return await self._actor.set_nx.remote(key, value)
+    async def set_nx(self, key: str, value: Any, ttl: int | None = None) -> bool:
+        return await self._actor.set_nx.remote(key, value, ttl)
+
+    async def update_atomic(
+        self,
+        key: str,
+        transform: Callable[[Any | None], Any | None],
+        ttl: int | None = None,
+    ) -> Any | None:
+        return await self._actor.update_atomic.remote(key, transform, ttl)
 
     async def close(self) -> None:
         await self._actor.close.remote()
 
     async def health_check(self) -> bool:
-        return await self._actor.health_check.remote()
+        try:
+            return await self._actor.health_check.remote()
+        except ray.exceptions.RayActorError:
+            # The actor crashed (OOM, node died). Don't silently re-create
+            # it — that would lose all in-memory state. Let readiness probes
+            # see False and the deployment owner decide to restart.
+            return False

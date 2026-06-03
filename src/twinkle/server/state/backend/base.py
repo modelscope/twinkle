@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
+
+
+class ConcurrencyError(RuntimeError):
+    """Raised by ``StateBackend.update_atomic`` when contention exhausts retries."""
 
 
 class StateBackend(ABC):
@@ -42,8 +46,37 @@ class StateBackend(ABC):
         ...
 
     @abstractmethod
-    async def set_nx(self, key: str, value: Any) -> bool:
-        """Set if not exists. Return True if successfully set, False if key already exists."""
+    async def set_nx(self, key: str, value: Any, ttl: int | None = None) -> bool:
+        """Set if not exists. Return True if successfully set, False if key already exists.
+
+        Optional ``ttl`` (seconds) gives the new value a bounded lifetime; required
+        for lease-style leader election (see ``ServerState`` cleanup leader).
+        """
+        ...
+
+    @abstractmethod
+    async def update_atomic(
+        self,
+        key: str,
+        transform: Callable[[Any | None], Any | None],
+        ttl: int | None = None,
+    ) -> Any | None:
+        """Read key, call ``transform(current_value)``, write the result atomically.
+
+        Semantics:
+        - If ``transform`` returns ``None`` the key is left unchanged and the
+          current value (which may itself be ``None``) is returned.
+        - Otherwise the returned value is written (with optional ``ttl``) and
+          itself returned.
+        - The read/transform/write triple is atomic against concurrent callers
+          on the same backend; Redis-backed implementations use WATCH+MULTI+EXEC
+          and may raise :class:`ConcurrencyError` after exhausting internal
+          retries (default 3).
+
+        ``transform`` must be picklable when running against a Ray-backed
+        backend — pass module-level functions wrapped with ``functools.partial``,
+        not lambdas or local closures.
+        """
         ...
 
     @abstractmethod

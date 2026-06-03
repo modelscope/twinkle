@@ -1,11 +1,29 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import functools
+import logging
 import time
 
-from .backend.base import StateBackend
+from .backend.base import ConcurrencyError, StateBackend
 from .base import BaseManager
 from .models import SessionRecord
+
+logger = logging.getLogger(__name__)
+
+
+def _session_touch_transform(existing: dict | None, *, now: float) -> dict | None:
+    """Atomic transform body for :meth:`SessionManager.touch`.
+
+    Module-level for pickling across the Ray actor boundary. Returns ``None``
+    when the session does not exist so :meth:`StateBackend.update_atomic`
+    treats it as a no-op (matching the legacy ``False`` return).
+    """
+    if existing is None:
+        return None
+    updated = dict(existing)
+    updated['last_heartbeat'] = now
+    return updated
 
 
 class SessionManager(BaseManager[SessionRecord]):
@@ -24,14 +42,23 @@ class SessionManager(BaseManager[SessionRecord]):
         """Update the heartbeat timestamp for a session.
 
         Returns:
-            True if the session exists and was updated, False otherwise.
+            True if the session exists and was updated, False if the session
+            is absent OR the backend's atomic-update path failed under sustained
+            contention. The next heartbeat from the same client will retry.
         """
-        record = await self.get(session_id)
-        if record is None:
+        # _session_touch_transform returns None only when the session is
+        # absent; in that case update_atomic also returns None.
+        try:
+            result = await self._backend.update_atomic(
+                self._make_key(session_id),
+                functools.partial(_session_touch_transform, now=time.time()),
+            )
+        except ConcurrencyError as e:
+            # touch() is per-heartbeat best-effort — losing one round under
+            # contention is recoverable as soon as the next heartbeat arrives.
+            logger.warning('SessionManager.touch dropped due to contention: %s', e)
             return False
-        record.last_heartbeat = time.time()
-        await self.add(session_id, record)
-        return True
+        return result is not None
 
     async def get_last_heartbeat(self, session_id: str) -> float | None:
         """Return the last heartbeat timestamp, or None if the session does not exist."""

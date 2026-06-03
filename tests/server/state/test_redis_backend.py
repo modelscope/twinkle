@@ -11,6 +11,20 @@ redis = pytest.importorskip('redis')
 from twinkle.server.state.backend.redis_backend import RedisBackend  # noqa: E402
 
 
+def _make_scan_iter(keys: list[str]):
+    """Build a plain (sync) callable that returns an async iterator yielding ``keys``."""
+
+    def _scan(*args, **kwargs):
+
+        async def _gen():
+            for k in keys:
+                yield k
+
+        return _gen()
+
+    return _scan
+
+
 @pytest.fixture
 def mock_redis_client():
     """Create a mock redis.asyncio client."""
@@ -19,9 +33,11 @@ def mock_redis_client():
     client.get = AsyncMock(return_value=None)
     client.delete = AsyncMock(return_value=1)
     client.exists = AsyncMock(return_value=1)
-    client.keys = AsyncMock(return_value=[])
     client.ping = AsyncMock(return_value=True)
     client.aclose = AsyncMock()
+    # scan_iter is a regular generator function (not awaited), so attach a
+    # MagicMock and let individual tests override its return via _make_scan_iter.
+    client.scan_iter = MagicMock(side_effect=_make_scan_iter([]))
     return client
 
 
@@ -126,17 +142,17 @@ async def test_exists_false(backend_no_prefix, mock_redis_client):
 
 @pytest.mark.asyncio
 async def test_keys_pattern(backend_no_prefix, mock_redis_client):
-    mock_redis_client.keys.return_value = ['session::a', 'session::b']
+    mock_redis_client.scan_iter = MagicMock(side_effect=_make_scan_iter(['session::a', 'session::b']))
     result = await backend_no_prefix.keys('session::*')
-    mock_redis_client.keys.assert_called_once_with('session::*')
+    mock_redis_client.scan_iter.assert_called_once_with(match='session::*', count=500)
     assert result == ['session::a', 'session::b']
 
 
 @pytest.mark.asyncio
 async def test_keys_with_prefix(backend_with_prefix, mock_redis_client):
-    mock_redis_client.keys.return_value = ['twinkle:session::a', 'twinkle:session::b']
+    mock_redis_client.scan_iter = MagicMock(side_effect=_make_scan_iter(['twinkle:session::a', 'twinkle:session::b']))
     result = await backend_with_prefix.keys('session::*')
-    mock_redis_client.keys.assert_called_once_with('twinkle:session::*')
+    mock_redis_client.scan_iter.assert_called_once_with(match='twinkle:session::*', count=500)
     # Result should have prefix stripped
     assert result == ['session::a', 'session::b']
 
@@ -146,7 +162,7 @@ async def test_keys_with_prefix(backend_with_prefix, mock_redis_client):
 
 @pytest.mark.asyncio
 async def test_count(backend_no_prefix, mock_redis_client):
-    mock_redis_client.keys.return_value = ['a', 'b', 'c']
+    mock_redis_client.scan_iter = MagicMock(side_effect=_make_scan_iter(['a', 'b', 'c']))
     result = await backend_no_prefix.count('*')
     assert result == 3
 

@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Backend-backed model manager (R19).
+"""Backend-backed model manager.
 
 Every index this manager exposes — token → model count, replica → loaded model
 count, replica capacity — is computed from the persisted ``model::*`` and
 ``replica::*`` records in the shared :class:`StateBackend`. There is no
 in-process cache, so two workers connected to the same backend see one
-consistent view of the cluster's model registry without going through a
-detached Ray Actor.
+consistent view of the cluster's model registry without an extra coordination
+actor in front.
 """
 from __future__ import annotations
 
@@ -67,8 +67,8 @@ class ModelManager(BaseManager[ModelRecord]):
 
         A replica has capacity when its persisted loaded-model count is strictly
         less than its declared ``max_loras``. Unknown replicas (no capacity row
-        in the backend) are included conservatively, matching the previous
-        actor-based behavior (R19.3).
+        in the backend) are included conservatively — callers may not have
+        registered every candidate up front.
         """
         if not candidate_ids:
             return []

@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Resource (CPU / Memory / GPU) observable gauges (R12).
+"""Resource (CPU / Memory / GPU) observable gauges.
 
 Registers OTEL ``observable_gauge`` instruments for CPU utilization, memory
 usage (system + process), GPU utilization, and GPU memory. The data sources
 (``psutil`` for CPU/memory, ``pynvml`` for GPU) are **optional telemetry
 dependencies** — when either is missing, the corresponding gauges report no
-data and the collector does not raise (R12.3, R18.3).
+data and the collector does not raise.
 
 The collector is started by :func:`worker_init.ensure_telemetry_initialized`
 in each Ray Serve worker process so per-replica resource usage shows up in

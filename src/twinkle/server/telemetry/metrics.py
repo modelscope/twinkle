@@ -4,11 +4,30 @@ from __future__ import annotations
 
 from .provider import get_meter
 
+try:
+    from opentelemetry.metrics import Observation
+except Exception:  # pragma: no cover - OTEL not installed; NoopMeter never invokes the callback below.
+    Observation = None  # type: ignore[assignment, misc]
+
+_RESOURCE_GAUGES: tuple[tuple[str, str, str], ...] = (
+    ('active_sessions', 'twinkle.sessions.active', 'Number of active client sessions'),
+    ('active_models', 'twinkle.models.active', 'Number of registered models'),
+    ('active_sampling_sessions', 'twinkle.sampling_sessions.active', 'Number of active sampling sessions'),
+    ('active_futures', 'twinkle.futures.active', 'Number of pending futures/tasks'),
+)
+
 
 class MetricsRegistry:
     """Centrally declares all metrics. Business code retrieves singleton via MetricsRegistry.get().
 
-    When telemetry is not initialized, OTEL returns a NoOp meter and all recording operations are silently no-op.
+    Resource counters (sessions/models/sampling_sessions/futures) are
+    ObservableGauges fed from a cache dict. Whichever ``ServerState`` instance
+    holds the cleanup leader lease is responsible for pushing fresh values via
+    :meth:`set_resource_count`; non-leader instances stay silent so the four
+    Ray Serve worker processes do not multiply the reported counts.
+
+    When telemetry is not initialized, OTEL returns a NoOp meter and all
+    recording operations are silently no-op.
     """
 
     _instance: MetricsRegistry | None = None
@@ -55,23 +74,40 @@ class MetricsRegistry:
             description='Number of tokens currently tracked by the rate limiter',
         )
 
-        # === Resources ===
-        self.active_sessions = meter.create_up_down_counter(
-            'twinkle.sessions.active',
-            description='Number of active client sessions',
-        )
-        self.active_models = meter.create_up_down_counter(
-            'twinkle.models.active',
-            description='Number of registered models',
-        )
-        self.active_sampling_sessions = meter.create_up_down_counter(
-            'twinkle.sampling_sessions.active',
-            description='Number of active sampling sessions',
-        )
-        self.active_futures = meter.create_up_down_counter(
-            'twinkle.futures.active',
-            description='Number of pending futures/tasks',
-        )
+        # === Resources (ObservableGauge backed by the push cache) ===
+        # OTEL holds its own references to the gauges via the meter, so we
+        # only need to keep the cache the callbacks read from.
+        self._resource_cache: dict[str, int] = {name: 0 for name, _, _ in _RESOURCE_GAUGES}
+        for attr_name, otel_name, description in _RESOURCE_GAUGES:
+            meter.create_observable_gauge(
+                otel_name,
+                callbacks=[self._make_gauge_callback(attr_name)],
+                description=description,
+            )
+
+    def _make_gauge_callback(self, name: str):
+        """Build the sync OTEL callback that reads ``_resource_cache[name]``."""
+
+        def _callback(options):  # noqa: ARG001 -- OTEL signature
+            return [Observation(self._resource_cache.get(name, 0))]
+
+        return _callback
+
+    # ----- Push API for the cleanup leader -----
+
+    def set_resource_count(self, name: str, value: int) -> None:
+        """Update the cached value the matching ObservableGauge will report next."""
+        if name in self._resource_cache:
+            self._resource_cache[name] = int(value)
+
+    def clear_resource_counts(self) -> None:
+        """Reset every resource gauge to 0. Called when a worker loses leadership."""
+        for name in self._resource_cache:
+            self._resource_cache[name] = 0
+
+    def get_resource_count(self, name: str) -> int:
+        """Return the most recently pushed value for ``name`` (0 if never set)."""
+        return self._resource_cache.get(name, 0)
 
     @classmethod
     def get(cls) -> MetricsRegistry:

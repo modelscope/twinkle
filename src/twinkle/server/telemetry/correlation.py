@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Correlation key constants for business-layer spans (R11).
+"""Correlation key constants for business-layer spans.
 
 All correlation attributes share the ``twinkle.`` prefix so operators can
 filter Tempo / Loki by ``twinkle.session_id``, ``twinkle.model_id``, etc.

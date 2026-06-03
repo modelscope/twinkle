@@ -65,19 +65,17 @@ class ServerConfig(BaseModel):
             raise ConfigParseError(f'Top-level YAML in {p} must be a mapping, got {type(raw).__name__}', )
         return cls.model_validate(raw)
 
-    # ---- cross-field validation (R7) ------------------------------------- #
+    # ---- cross-field validation ------------------------------------------ #
 
     @model_validator(mode='after')
     def _validate_cross_field(self) -> ServerConfig:
-        # R7.1: redis mode requires redis_url
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
-        # R7.2: file mode requires file_path
         if self.persistence.mode == 'file' and not self.persistence.file_path:
             raise ValueError("persistence.file_path is required when persistence.mode == 'file'", )
         return self
 
-    # ---- round-trip / serialization (R6.7) ------------------------------- #
+    # ---- round-trip / serialization -------------------------------------- #
 
     def to_yaml_dict(self) -> dict[str, Any]:
         """Return a JSON-mode dict suitable for ``yaml.safe_dump`` / round-trip."""

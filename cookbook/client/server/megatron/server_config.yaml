@@ -14,6 +14,8 @@ http_options:
 # via env vars, so the configured backend is used regardless of which
 # deployment initializes the ServerState actor first.
 #   mode: memory | file | redis
+#     memory: requires an initialized Ray runtime (the launcher handles this
+#             automatically; standalone scripts must call ray.init() first)
 #   file_path: required for `file` mode
 #   redis_url / key_prefix: required for `redis` mode
 # persistence:

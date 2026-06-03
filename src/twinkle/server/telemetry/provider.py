@@ -263,6 +263,9 @@ class _NoopMeter:
     def create_histogram(self, *args, **kwargs):
         return _NoopInstrument()
 
+    def create_observable_gauge(self, *args, **kwargs):
+        return _NoopInstrument()
+
 
 _noop_meter = _NoopMeter()
 

@@ -31,7 +31,7 @@ _SAMPLER_TYPES: tuple[str, ...] = ('mock', 'vllm', 'torch')
 
 
 def _validate_sampler_type(sampler_type: Any) -> str:
-    """Pure validation of the ``sampler_type`` selector (R3.10).
+    """Pure validation of the ``sampler_type`` selector.
 
     Raises :class:`ConfigError` (naming the field, value, and allowed set)
     when the value is missing, empty, non-string, or not exactly one of the
@@ -81,9 +81,9 @@ class SamplerManagement(TaskQueueMixin):
                  engine_args: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
                  **kwargs):
-        # R3.10: validate ``sampler_type`` BEFORE any side effect.
+        # Validate ``sampler_type`` BEFORE any side effect.
         sampler_type = _validate_sampler_type(sampler_type)
-        # Skip twinkle.initialize for the mock backend (R3.8) — start without
+        # Skip twinkle.initialize for the mock backend — start without
         # CUDA/torch/vllm.
         if sampler_type != 'mock':
             self.device_group = DeviceGroup(**device_group)

@@ -34,7 +34,7 @@ _MODEL_BACKENDS: tuple[str, ...] = ('mock', 'transformers', 'megatron')
 
 
 def _validate_model_backend(backend: Any) -> str:
-    """Pure validation of the ``backend`` selector (R3.9).
+    """Pure validation of the ``backend`` selector.
 
     Raises :class:`ConfigError` (naming the field, value, and allowed set)
     when ``backend`` is missing, empty, non-string, or not exactly one of
@@ -80,12 +80,12 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  adapter_config: dict[str, Any] | None = None,
                  queue_config: dict[str, Any] | None = None,
                  **kwargs):
-        # R3.9: validate ``backend`` BEFORE any side effect (twinkle.initialize,
-        # DeviceGroup construction, replica registration). An invalid value
+        # Validate ``backend`` BEFORE any side effect (twinkle.initialize,
+        # DeviceGroup construction, replica registration) so an invalid value
         # never produces a partial backend nor reaches a ready state.
         backend = _validate_model_backend(backend)
         self.backend = backend
-        # Skip twinkle.initialize for the mock backend (R3.7) — the largest
+        # Skip twinkle.initialize for the mock backend — the largest
         # startup-time saving and the only way to start without CUDA/torch.
         if backend != 'mock':
             self.device_group = DeviceGroup(**device_group)

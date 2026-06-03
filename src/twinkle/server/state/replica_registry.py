@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Backend-backed registry of replica capacity (R19).
+"""Backend-backed registry of replica capacity.
 
-Replaces the in-process ``_replica_max_loras`` dict that lived inside the
-detached Ray Actor. Each entry persists to ``replica::<replica_id>::max_loras``
-in the configured :class:`StateBackend` (Redis or the actor-wrapped
-MemoryBackend), so every Ray Serve worker sees one consistent view of the
-cluster's capacity even though each worker holds its own ``ServerState``
-instance.
+Each entry persists to ``replica::<replica_id>::max_loras`` in the configured
+:class:`StateBackend` (Redis or the actor-wrapped MemoryBackend), so every
+Ray Serve worker sees one consistent view of the cluster's capacity even
+though each worker holds its own ``ServerState`` instance.
 
 The registry knows *only* about declared capacity. The current loaded-model
 count is derived by querying the persisted ``model::*`` records directly —

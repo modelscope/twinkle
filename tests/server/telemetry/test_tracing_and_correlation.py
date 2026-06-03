@@ -20,7 +20,7 @@ from twinkle.server.telemetry import correlation
 from twinkle.server.telemetry.correlation import CORRELATION_KEYS, PREFIX, set_correlation_attrs
 from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
 
-# ---------- Property 23: prefix invariant (R11.3) ------------------------- #
+# ---------- correlation-key prefix invariant ----------------------------- #
 
 
 @pytest.mark.parametrize('key', CORRELATION_KEYS)
@@ -139,11 +139,11 @@ def test_property_20_exception_recorded_and_reraised(in_memory_span_exporter) ->
     assert any('exception' in evt.name.lower() for evt in span.events)
 
 
-# ---------- ResourceMetricsCollector wiring (R12.1, R12.2, R12.3, R18.4) -- #
+# ---------- ResourceMetricsCollector wiring ------------------------------ #
 
 
 def test_resource_metrics_collector_does_not_raise_without_pynvml() -> None:
-    """Collector starts cleanly even when pynvml/GPU is absent (R12.3)."""
+    """Collector starts cleanly even when pynvml/GPU is absent."""
     from twinkle.server.telemetry import resource_metrics
 
     with mock.patch.object(resource_metrics, '_PYNVML_AVAILABLE', False):
@@ -182,7 +182,7 @@ def test_resource_metrics_collector_idempotent() -> None:
 def test_worker_init_starts_collector() -> None:
     """``ensure_telemetry_initialized`` calls the resource collector even when
     telemetry is disabled — the collector silently records to a NoOp meter
-    in that case (R12.2)."""
+    in that case."""
     from twinkle.server.telemetry import resource_metrics, worker_init
 
     # Force the worker_init guard to re-run and clear the global collector
@@ -253,7 +253,7 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
 
 
 def test_pyproject_declares_telemetry_extras() -> None:
-    """``pyproject.toml`` declares ``psutil`` and ``pynvml`` as telemetry extras (R12.4)."""
+    """``pyproject.toml`` declares ``psutil`` and ``pynvml`` as telemetry extras."""
     from pathlib import Path
 
     repo_root = Path(__file__).resolve().parents[3]

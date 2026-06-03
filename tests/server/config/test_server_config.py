@@ -122,7 +122,7 @@ def test_property_13_bad_backend_names_field(bad_backend: str) -> None:
 @given(bad_max_input_tokens=st.integers(max_value=0, min_value=-1000))
 def test_property_13_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> None:
     """Nested-section constraints (here ``task_queue.max_input_tokens``) are
-    enforced together with cross-field ones (R7.3) and the offending path is
+    enforced together with cross-field ones and the offending path is
     visible in the error."""
     with pytest.raises(ValidationError) as exc:
         ServerConfig.model_validate({'task_queue': {'max_input_tokens': bad_max_input_tokens}})
@@ -130,7 +130,7 @@ def test_property_13_nested_field_constraint_violation_named(bad_max_input_token
     assert any('max_input_tokens' in err['loc'] for err in errors)
 
 
-# ---------- Property 14: round-trip fidelity (R6.7) ------------------------ #
+# ---------- round-trip fidelity ----------------------------------------- #
 
 
 @settings(max_examples=100)

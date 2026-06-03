@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any
+import random
+from typing import Any, Callable
 
-from .base import StateBackend
+from .base import ConcurrencyError, StateBackend
 
 try:
     import redis.asyncio as aioredis
+    from redis.exceptions import WatchError
 
     _REDIS_AVAILABLE = True
 except ImportError:
     _REDIS_AVAILABLE = False
+
+# Bound on WATCH+MULTI+EXEC retries. Tuned for the worst real-world contender
+# we expect on a single key (cleanup-leader lease + cascading session touches
+# at burst); each retry adds an extra round-trip so going higher than ~16
+# just delays the error without making it less likely.
+_UPDATE_ATOMIC_MAX_RETRIES = 16
+# Jittered exponential backoff cap; first retry sleeps ~5 ms, last around 80 ms.
+_UPDATE_ATOMIC_BASE_BACKOFF_SECONDS = 0.005
+_UPDATE_ATOMIC_MAX_BACKOFF_SECONDS = 0.080
 
 
 class RedisBackend(StateBackend):
@@ -62,13 +74,17 @@ class RedisBackend(StateBackend):
         return bool(await self._client.exists(real_key))
 
     async def keys(self, pattern: str) -> list[str]:
-        """Return all key names matching the pattern. Supports * wildcard.
+        """Return all key names matching the pattern using SCAN.
 
-        Note: For high key volumes in production, consider using SCAN to avoid blocking.
+        SCAN is non-blocking — production Redis instances may hold millions of
+        keys; the KEYS command walks the keyspace in one step and can stall
+        the server for seconds. ``scan_iter`` cursors through in batches.
         """
         real_pattern = self._make_key(pattern)
-        raw_keys = await self._client.keys(real_pattern)
-        return [self._strip_prefix(k) for k in raw_keys]
+        out: list[str] = []
+        async for key in self._client.scan_iter(match=real_pattern, count=500):
+            out.append(self._strip_prefix(key))
+        return out
 
     async def count(self, pattern: str) -> int:
         """Count keys matching the pattern."""
@@ -83,6 +99,47 @@ class RedisBackend(StateBackend):
         else:
             result = await self._client.set(real_key, data, nx=True)
         return result is not None
+
+    async def update_atomic(
+        self,
+        key: str,
+        transform: Callable[[Any | None], Any | None],
+        ttl: int | None = None,
+    ) -> Any | None:
+        """WATCH/GET/MULTI/SET/EXEC with bounded retries + jittered backoff on WatchError.
+
+        Under sustained contention each retry waits a jittered exponential
+        backoff so concurrent writers spread out and stop trampling the same
+        WATCH window. After the retry budget is spent we surface
+        :class:`ConcurrencyError`; callers must decide whether to skip (touch
+        / heartbeat) or reraise (lease renewal).
+        """
+        real_key = self._make_key(key)
+        for attempt in range(_UPDATE_ATOMIC_MAX_RETRIES):
+            async with self._client.pipeline() as pipe:
+                try:
+                    await pipe.watch(real_key)
+                    raw = await pipe.get(real_key)
+                    current = json.loads(raw) if raw is not None else None
+                    new_value = transform(current)
+                    if new_value is None:
+                        await pipe.unwatch()
+                        return current
+                    pipe.multi()
+                    if ttl is not None:
+                        pipe.set(real_key, json.dumps(new_value), ex=ttl)
+                    else:
+                        pipe.set(real_key, json.dumps(new_value))
+                    await pipe.execute()
+                    return new_value
+                except WatchError:
+                    backoff = min(
+                        _UPDATE_ATOMIC_BASE_BACKOFF_SECONDS * (2**attempt),
+                        _UPDATE_ATOMIC_MAX_BACKOFF_SECONDS,
+                    )
+                    await asyncio.sleep(backoff * random.random())
+                    continue
+        raise ConcurrencyError(f'update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}')
 
     async def close(self) -> None:
         """Close Redis connection."""

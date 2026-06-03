@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property + unit tests for the Pydantic ``TaskQueueConfig`` (R9).
+"""Property + unit tests for the Pydantic ``TaskQueueConfig``.
 
-Covers:
-- # Feature: server-config-observability-refactor, Property 16: TaskQueueConfig constraint enforcement
-- # Feature: server-config-observability-refactor, Property 17: from_dict equivalence
-- # Feature: server-config-observability-refactor, Property 18: TaskQueueConfig defaulting
-- Unit checks that the call sites in model/sampler/processor apps still construct the config
-  through ``TaskQueueConfig.from_dict``.
+Pins constraint enforcement, ``from_dict`` equivalence against
+``model_validate``, default-value defaulting, and that the call sites in
+model/sampler/processor apps still construct the config through
+``TaskQueueConfig.from_dict``.
 """
 from __future__ import annotations
 
@@ -17,7 +15,7 @@ from pydantic import ValidationError
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
 
-# ---------- defaults snapshot used by Property 18 (R9.8) ------------------- #
+# ---------- defaults snapshot used by the default-value test -------------- #
 
 DEFAULTS = {
     'rps_limit': 100.0,
@@ -88,7 +86,7 @@ def test_property_16_valid_values_accepted(rps: float, tps: float, win: float, q
     assert cfg.max_input_tokens == mit
 
 
-# ---------- Property 17: from_dict equivalence (R9.6) ---------------------- #
+# ---------- from_dict equivalence ---------------------------------------- #
 
 _INPUT_DICT_STRATEGY = st.fixed_dictionaries(
     {},
@@ -115,7 +113,7 @@ def test_property_17_from_dict_equivalence(payload: dict) -> None:
     assert via_factory.model_dump() == via_validate.model_dump()
 
 
-# ---------- Property 18: defaulting (R9.8) --------------------------------- #
+# ---------- defaulting --------------------------------------------------- #
 
 
 def test_property_18_from_dict_with_no_argument() -> None:

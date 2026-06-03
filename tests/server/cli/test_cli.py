@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Phase 3 — typer CLI + config-drift validation tests (R14, R15, R16).
+"""Typer CLI + config-drift validation tests.
 
-Properties covered:
-- # Feature: server-config-observability-refactor, Property 29: Config-drift detection and first-run storage
+Pins the behaviour of the launcher CLI (``twinkle.server.cli.app``): config
+loading, env-var overrides, and the persistence-signature drift gate that
+runs before Ray is initialized.
 """
 from __future__ import annotations
 
@@ -59,7 +60,7 @@ def test_check_config_nonzero_on_invalid(tmp_path: Path) -> None:
     assert 'invalid configuration' in res.output.lower() or 'redis_url' in res.output
 
 
-# ---------- 9.5 print-config round-trip (R14.5) --------------------------- #
+# ---------- print-config round-trip -------------------------------------- #
 
 
 def test_print_config_round_trip(tmp_path: Path) -> None:
@@ -72,7 +73,7 @@ def test_print_config_round_trip(tmp_path: Path) -> None:
     assert rebuilt == original
 
 
-# ---------- 9.5 env-var override (R14.6) ---------------------------------- #
+# ---------- env-var override --------------------------------------------- #
 
 
 def test_env_var_overrides_when_flag_omitted(monkeypatch) -> None:
@@ -82,7 +83,7 @@ def test_env_var_overrides_when_flag_omitted(monkeypatch) -> None:
     assert res.exit_code == 0
 
 
-# ---------- 9.5 launch validates drift BEFORE ray.init (R15.1) ------------ #
+# ---------- launch validates drift BEFORE ray.init ----------------------- #
 
 
 def test_launch_validates_drift_before_ray_init() -> None:
@@ -106,12 +107,12 @@ def test_launch_validates_drift_before_ray_init() -> None:
             assert launcher_spy.call_count == 0
 
 
-# ---------- Property 29: drift detection + first-run storage (R15.2/4) ---- #
+# ---------- drift detection + first-run storage --------------------------- #
 
 
 @pytest.mark.asyncio
 async def test_property_29_first_run_stores_signature() -> None:
-    """First run with no stored signature stores it and returns silently (R15.4)."""
+    """First run with no stored signature stores it and returns silently."""
     backend = MemoryBackend()
     cfg_payload = {'persistence': {'mode': 'memory'}}
     pcfg = PersistenceConfig(mode='memory')
@@ -141,7 +142,7 @@ async def test_property_29_drift_raises_with_diff_and_remediation() -> None:
     assert 'Remediation' in msg
 
 
-# ---------- 9.8 example config loads (R16.3) ------------------------------ #
+# ---------- example config loads ----------------------------------------- #
 
 
 def test_example_config_loads_via_server_config() -> None:
