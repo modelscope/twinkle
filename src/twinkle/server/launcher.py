@@ -55,6 +55,12 @@ def _normalize_supported_model_item(item: Any) -> dict[str, Any] | None:
             return None
         return dict(item)
     if hasattr(item, 'model_name'):
+        if hasattr(item, 'model_dump'):
+            normalized = item.model_dump()
+            return normalized if normalized.get('model_name') else None
+        if hasattr(item, 'dict'):
+            normalized = item.dict()
+            return normalized if normalized.get('model_name') else None
         model_name = getattr(item, 'model_name', None)
         if not model_name:
             return None

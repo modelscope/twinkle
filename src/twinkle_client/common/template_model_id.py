@@ -12,6 +12,7 @@ def _get_server_capabilities(refresh: bool = False) -> GetServerCapabilitiesResp
     base_url = get_base_url()
     if refresh or base_url not in _SERVER_CAPABILITIES_CACHE:
         response = http_get(f'{base_url}/twinkle/get_server_capabilities')
+        response.raise_for_status()
         _SERVER_CAPABILITIES_CACHE[base_url] = GetServerCapabilitiesResponse(**response.json())
     return _SERVER_CAPABILITIES_CACHE[base_url]
 
@@ -28,7 +29,10 @@ def resolve_template_model_id(model_name: str, explicit_model_id: str | None = N
     if explicit_model_id is not None:
         return explicit_model_id
 
-    supported_model = get_supported_model_by_name(model_name)
-    if supported_model and supported_model.template_init_model_id:
-        return supported_model.template_init_model_id
+    try:
+        supported_model = get_supported_model_by_name(model_name)
+        if supported_model and supported_model.template_init_model_id:
+            return supported_model.template_init_model_id
+    except Exception:
+        pass
     return model_name

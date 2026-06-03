@@ -91,6 +91,8 @@ class vLLMSampler(Sampler):
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
         explicit_model_id = kwargs.pop('model_id', None)
+        if explicit_model_id and '://' in explicit_model_id:
+            explicit_model_id = explicit_model_id.split('://')[1]
         model_id = resolve_template_model_id(self.model_id, explicit_model_id)
         response = http_post(
             url=f'{self.server_url}/set_template',

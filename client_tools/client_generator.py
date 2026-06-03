@@ -467,9 +467,9 @@ class MultiLoraTransformersModel:
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
-        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
@@ -652,6 +652,8 @@ class MultiLoraTransformersModel:
     def set_template(self, template_cls: str, **kwargs) -> None:
         """Set the template for data processing."""
         explicit_model_id = kwargs.pop('model_id', None)
+        if explicit_model_id and '://' in explicit_model_id:
+            explicit_model_id = explicit_model_id.split('://')[1]
         model_id = resolve_template_model_id(self.model_id, explicit_model_id)
         response = http_post(
             url=f'{self.server_url}/set_template',
@@ -844,6 +846,8 @@ class vLLMSampler(Sampler):
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
         explicit_model_id = kwargs.pop('model_id', None)
+        if explicit_model_id and '://' in explicit_model_id:
+            explicit_model_id = explicit_model_id.split('://')[1]
         model_id = resolve_template_model_id(self.model_id, explicit_model_id)
         response = http_post(
             url=f'{self.server_url}/set_template',
