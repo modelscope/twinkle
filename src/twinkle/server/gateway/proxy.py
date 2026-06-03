@@ -71,9 +71,16 @@ class ServiceProxy:
         headers = dict(request_headers)
         headers.pop('host', None)
         headers.pop('content-length', None)
-        request_id = request_headers.get('X-Ray-Serve-Request-Id')
+        request_id = request_headers.get('X-Ray-Serve-Request-Id') or request_headers.get('x-request-id')
         if request_id is not None and not request_headers.get('Serve-Multiplexed-Model-Id'):
             headers['Serve-Multiplexed-Model-Id'] = request_id
+        # Ray Serve 2.55+ reads ``x-request-id`` / ``serve_multiplexed_model_id``
+        # (constants from ``ray/serve/_private/constants.py``); the legacy
+        # ``X-Ray-Serve-Request-Id`` / ``Serve-Multiplexed-Model-Id`` names
+        # are kept for Twinkle's own ``verify_request_token`` middleware.
+        if request_id is not None:
+            headers.setdefault('x-request-id', request_id)
+            headers.setdefault('serve_multiplexed_model_id', request_id)
         return headers
 
     async def proxy_request(

@@ -1,8 +1,8 @@
-# Test-only Twinkle Server config — CPU-only mock backends.
-#
-# This file is the single fixture consumed by CLI tests and the in-process
-# Ray Serve e2e test. Mock model + mock sampler need no GPU / torch / vllm /
-# megatron, so the launch path can run on any CI host. Not for production.
+# Test-only Twinkle Server config — CPU-only mock backends, redis-backed
+# persistence. Use this fixture when you want to exercise the redis state
+# backend end-to-end (e.g. ``TWINKLE_TEST_REDIS_PERSISTENCE=1`` in the
+# in-process Ray Serve e2e). Requires a redis at the URL below; start one
+# with ``docker run -d --rm -p 6379:6379 redis:7-alpine``. Not for production.
 
 proxy_location: EveryNode
 
@@ -11,11 +11,9 @@ http_options:
   port: 8000
 
 persistence:
-  # Gateway and Model run as separate Ray Serve replicas (separate
-  # processes); the tinker future flow needs cross-process visibility.
-  # ``memory`` mode is per-process; file (or redis) is required.
-  mode: file
-  file_path: /tmp/twinkle_state_mock.json
+  mode: redis
+  redis_url: "redis://127.0.0.1:6379/0"
+  key_prefix: "twinkle-test:"
 
 applications:
 

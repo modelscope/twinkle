@@ -1,15 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Numpy-only mock sampler backend (R2, R3).
+"""Numpy-only mock sampler backend.
 
 Implements the same surface as :class:`twinkle.sampler.base.Sampler` —
 ``sample``, ``apply_patch``, ``add_adapter_to_sampler`` — using only numpy.
 The class is intentionally **duck-typed** rather than subclassed because
 ``twinkle.sampler.__init__`` eagerly imports the vLLM engine, which would
-defeat the no-vllm-import requirement (R2.2) on a CPU-only host.
+pull torch/CUDA on a CPU-only host.
 
 Outputs are deterministic — keyed by ``(model_id, adapter_name, seed,
 prompt_index, sample_index)`` — so repeated calls with the same parameters
-produce identical token sequences and logprobs (R2.5).
+produce identical token sequences and logprobs.
 """
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ def _stable_seed(*parts: Any) -> int:
 
     Python's built-in ``hash()`` of a tuple containing strings is salted per
     process (PYTHONHASHSEED), which would make identical sample requests on
-    different replicas / restarts produce different outputs and violate R2.5.
-    Use a stable digest instead.
+    different replicas / restarts produce different outputs. Use a stable
+    digest instead.
     """
     canonical = '\x1f'.join(str(p) for p in parts).encode('utf-8')
     digest = hashlib.sha256(canonical).digest()
@@ -50,7 +50,7 @@ class MockSampler:
         self.engine = None
         self.template = None
 
-    # ----- Sampler interface (R2.1, R2.3, R2.4, R2.5, R2.6) -------------- #
+    # ----- Sampler interface --------------------------------------------- #
 
     def sample(
         self,
@@ -80,7 +80,10 @@ class MockSampler:
                 rng = np.random.default_rng(seed)
                 tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
                 logprobs_per_token = rng.uniform(-2.0, 0.0, size=max_tokens).astype(float).tolist()
-                # One logprob entry per emitted token (R2.4) — list of (id, logprob).
+                # twinkle ``SampledSequence.logprobs`` is
+                # ``List[List[Tuple[int, float]]]`` (top-k per position) — the
+                # mock returns top-1 with the chosen token. The tinker handler
+                # flattens this to a single chosen-token logprob.
                 logprobs = [[(tok, float(lp))] for tok, lp in zip(tokens, logprobs_per_token)]
                 sequences.append(SampledSequence(
                     stop_reason='length',
@@ -93,7 +96,13 @@ class MockSampler:
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None
 
-    # ----- Adapter management (R2.7) ------------------------------------- #
+    def set_template(self, template_cls: Any, **kwargs: Any) -> None:
+        self.template = template_cls
+
+    def reset_prefix_cache(self) -> None:
+        return None
+
+    # ----- Adapter management -------------------------------------------- #
 
     def add_adapter_to_sampler(self, adapter_name: str, config: Any) -> None:
         self._adapters[adapter_name] = config

@@ -123,6 +123,16 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
 
+    @property
+    def data_world_size(self) -> int:
+        """Effective data-parallel world size.
+
+        Returns the real ``device_mesh.data_world_size`` for distributed
+        backends; falls back to 1 on the ``mock`` backend, which intentionally
+        leaves ``device_mesh = None`` to avoid pulling torch/CUDA.
+        """
+        return self.device_mesh.data_world_size if self.device_mesh is not None else 1
+
     async def _ensure_replica_registered(self):
         """Lazily register replica on first async request."""
         if not self._replica_registered:

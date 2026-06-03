@@ -760,13 +760,15 @@ def generate_samplers():
 
     sampler_code = AUTO_GEN_WARNING + '''from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
-from twinkle.sampler.base import Sampler
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 
 
-class vLLMSampler(Sampler):
+# Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
+# that base pulls ``twinkle.sampler.__init__`` → ``VLLMEngine`` → torch + zmq,
+# which the mock / CPU-only client environments don't have.
+class vLLMSampler:
     """Client wrapper for Sampler that calls server HTTP endpoints.
 
     This client manages sampling operations and adapter synchronization with the sampler server.

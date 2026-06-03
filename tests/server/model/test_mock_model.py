@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property + unit tests for the numpy-only mock model backend (R1, R3, R4).
+"""Property + unit tests for the numpy-only mock model backend.
 
-Properties covered:
-- # Feature: server-config-observability-refactor, Property 1: Mock model interface conformance
-- # Feature: server-config-observability-refactor, Property 2: Mock model forward determinism and shape
-- # Feature: server-config-observability-refactor, Property 3: Mock model adapter add/remove round-trip
-- # Feature: server-config-observability-refactor, Property 4: Mock model remove-absent raises and preserves record
-- # Feature: server-config-observability-refactor, Property 10: Model backend dispatch
+Covers:
+- Interface conformance: every required method is present and callable
+- Forward determinism + shape match input lengths
+- Adapter add/remove round-trip
+- Remove-absent raises ``KeyError`` and leaves the record intact
+- Model backend dispatch / config validation
+- Import isolation: module loads with torch/transformers/vllm blocked
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from twinkle.server.exceptions import ConfigError
 from twinkle.server.model.app import _MODEL_BACKENDS, _dispatch_model_backend, _validate_model_backend
 from twinkle.server.model.backends.mock_model import TwinkleCompatMockModel
 
-# ---------- Property 1: interface conformance (R1.1, R1.4) ---------------- #
+# ---------- Interface conformance ----------------------------------------- #
 
 _REQUIRED_METHODS = (
     'tinker_forward_only',
@@ -52,6 +53,7 @@ _REQUIRED_METHODS = (
     'add_adapter_to_model',
     'remove_adapter',
     'has_adapter',
+    'upload_to_hub',
 )
 
 
@@ -65,7 +67,7 @@ def test_property_1_constructor_does_not_raise() -> None:
     TwinkleCompatMockModel('mid')
 
 
-# ---------- Property 2: forward determinism + shape (R1.3, R4.4) ---------- #
+# ---------- Forward determinism + shape ----------------------------------- #
 
 
 @settings(max_examples=100)
@@ -97,7 +99,7 @@ def test_property_2_tinker_forward_backward_loss_is_finite(seq_lens: list) -> No
     assert len(result) == len(inputs)
 
 
-# ---------- Property 3: adapter round-trip (R1.5, R1.6) ------------------- #
+# ---------- Adapter round-trip -------------------------------------------- #
 
 
 @settings(max_examples=100)
@@ -113,7 +115,7 @@ def test_property_3_adapter_add_remove_round_trip(name: str) -> None:
     assert not m.has_adapter(name)
 
 
-# ---------- Property 4: remove-absent raises + preserves (R1.7) ----------- #
+# ---------- Remove-absent raises + preserves record ----------------------- #
 
 
 @settings(max_examples=100)
@@ -126,7 +128,7 @@ def test_property_4_remove_absent_raises(name: str) -> None:
     assert m._adapters == pre
 
 
-# ---------- Property 10: Model backend dispatch (R3.1-3.3, R3.7, R3.9) ---- #
+# ---------- Model backend dispatch ---------------------------------------- #
 
 
 def test_property_10_mock_dispatch_returns_mock_model() -> None:
@@ -137,7 +139,7 @@ def test_property_10_mock_dispatch_returns_mock_model() -> None:
 @settings(max_examples=100)
 @given(bad=st.text(min_size=1, max_size=10).filter(lambda s: s not in _MODEL_BACKENDS))
 def test_property_10_invalid_backend_raises_config_error(bad: str) -> None:
-    """Validation runs BEFORE any backend import / instantiation (R3.9)."""
+    """Validation runs BEFORE any backend import / instantiation."""
     with pytest.raises(ConfigError) as exc:
         _validate_model_backend(bad)
     assert exc.value.field == 'backend'
@@ -152,7 +154,7 @@ def test_property_10_absent_or_empty_backend_raises(value) -> None:
     assert exc.value.field == 'backend'
 
 
-# ---------- Import isolation (R1.2) --------------------------------------- #
+# ---------- Import isolation ---------------------------------------------- #
 
 
 def test_import_isolation_no_torch_required() -> None:

@@ -14,11 +14,18 @@ def _build_headers(additional_headers: Optional[Dict[str, str]] = None) -> Dict[
     Returns:
         Dictionary of headers
     """
+    rid = get_request_id()
+    # Ray Serve 2.55+ reads ``x-request-id`` / ``serve_multiplexed_model_id``
+    # (constants from ``ray/serve/_private/constants.py``); the legacy
+    # ``X-Ray-Serve-Request-Id`` / ``Serve-Multiplexed-Model-Id`` names
+    # are kept for Twinkle's own ``verify_request_token`` middleware.
     headers = {
-        'X-Ray-Serve-Request-Id': get_request_id(),
-        'Serve-Multiplexed-Model-Id': get_request_id(),  # For model multiplexing
+        'x-request-id': rid,
+        'serve_multiplexed_model_id': rid,
+        'X-Ray-Serve-Request-Id': rid,
+        'Serve-Multiplexed-Model-Id': rid,
         'Authorization': 'Bearer ' + get_api_key(),
-        'Twinkle-Authorization': 'Bearer ' + get_api_key(),  # For server compatibility
+        'Twinkle-Authorization': 'Bearer ' + get_api_key(),
     }
 
     if session_id := get_session_id():

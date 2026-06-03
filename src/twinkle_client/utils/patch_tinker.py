@@ -127,8 +127,16 @@ def _make_patched_service_client_init(original):
         if api_key is None:
             api_key = get_api_key()
 
+        rid = get_request_id()
+        # Ray Serve 2.55+ reads ``x-request-id`` / ``serve_multiplexed_model_id``
+        # (exact underscored constants from ``ray/serve/_private/constants.py``);
+        # the legacy ``X-Ray-Serve-Request-Id`` / ``Serve-Multiplexed-Model-Id``
+        # are kept for Twinkle's own ``verify_request_token`` middleware.
         twinkle_headers = {
-            'X-Ray-Serve-Request-Id': get_request_id(),
+            'x-request-id': rid,
+            'serve_multiplexed_model_id': rid,
+            'X-Ray-Serve-Request-Id': rid,
+            'Serve-Multiplexed-Model-Id': rid,
             'Authorization': 'Bearer ' + api_key,
             'Twinkle-Authorization': 'Bearer ' + api_key,
         }

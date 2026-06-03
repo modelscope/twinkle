@@ -94,14 +94,20 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
 
                 tinker_sequences = []
                 for response in responses:
-                    # Convert twinkle SampleResponse to tinker types
+                    # twinkle logprobs are ``List[List[Tuple[int, float]]]``
+                    # (top-k per position); tinker wants ``List[float]``
+                    # (chosen-token logprob per position).
                     for seq in response.sequences:
                         logprobs = None
                         if seq.logprobs is not None:
-                            if any(lp is None for lp in seq.logprobs):
-                                logprobs = None
-                            else:
-                                logprobs = list(seq.logprobs)
+                            try:
+                                flattened = [
+                                    float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list
+                                ]
+                            except (IndexError, TypeError):
+                                flattened = []
+                            if flattened and len(flattened) == len(seq.logprobs):
+                                logprobs = flattened
                         tinker_sequences.append(
                             types.SampledSequence(
                                 stop_reason=seq.stop_reason,

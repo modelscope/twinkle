@@ -88,19 +88,22 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         while True:
             record = await self.state.get_future(request_id)
 
-            if record is None:
-                return {'type': 'try_again'}
+            if record is not None:
+                status = record.get('status')
+                if status not in ('pending', 'queued', 'running', 'rate_limited'):
+                    break
 
-            status = record.get('status')
-            if status not in ('pending', 'queued', 'running', 'rate_limited'):
-                break
-
+            # ``record is None`` here means the future hasn't been written yet
+            # (cross-replica visibility lag) — fold into the long-poll loop
+            # rather than short-circuit ``try_again``: returning immediately
+            # lets the SDK hammer this endpoint at ~150 Hz.
             if asyncio.get_running_loop().time() - start >= max_wait:
-                response_data = {'type': 'try_again'}
-                if queue_state := record.get('queue_state'):
-                    response_data['queue_state'] = queue_state
-                if queue_state_reason := record.get('queue_state_reason'):
-                    response_data['queue_state_reason'] = queue_state_reason
+                response_data: dict[str, Any] = {'type': 'try_again'}
+                if record is not None:
+                    if queue_state := record.get('queue_state'):
+                        response_data['queue_state'] = queue_state
+                    if queue_state_reason := record.get('queue_state_reason'):
+                        response_data['queue_state_reason'] = queue_state_reason
                 return response_data
 
             await asyncio.sleep(poll_interval)

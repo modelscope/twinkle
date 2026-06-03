@@ -104,7 +104,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward',
             ))
 
@@ -202,7 +202,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward_backward',
             ))
 

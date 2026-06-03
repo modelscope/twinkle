@@ -139,7 +139,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             token=token,
             input_tokens=input_tokens,
             batch_size=batch_size,
-            data_world_size=self.device_mesh.data_world_size,
+            data_world_size=self.data_world_size,
             task_type='forward',
         )
 
@@ -184,7 +184,7 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
             token=token,
             input_tokens=input_tokens,
             batch_size=batch_size,
-            data_world_size=self.device_mesh.data_world_size,
+            data_world_size=self.data_world_size,
             task_type='forward_backward',
         )
 
@@ -269,7 +269,11 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
                 if metadata.get('base_model'):
                     payload['base_model'] = metadata['base_model']
                 sampling_session_id = await self.state.create_sampling_session(payload)
-                return types.SaveWeightsForSamplerResponseInternal(path=None, sampling_session_id=sampling_session_id)
+                # Return ``tinker_path`` (not None): tinker SDK's
+                # ``_save_weights_for_sampler_async`` asserts ``result.path is not None``.
+                # ``sampling_session_id`` is still the canonical handle.
+                return types.SaveWeightsForSamplerResponseInternal(
+                    path=tinker_path, sampling_session_id=sampling_session_id)
             except Exception:
                 logger.error(traceback.format_exc())
                 return types.RequestFailedResponse(
