@@ -49,32 +49,21 @@ _MIN_RESPONSE_TOKENS = 5
 # ============================================================================
 
 class ChrMinScorer:
-    """chr_dist_min_pos. LOW = hard = keep."""
+    """chr_dist_min_pos. Dual-threshold: keep samples in [low, high)."""
     name = 'chr_min'
     requires_logprobs = True
 
-    def __init__(
-        self,
-        threshold: float = 0.5,
-        exclude_prompt_echoed_ids: bool = False,
-    ):
+    def __init__(self, threshold: float = 0.47):
         self._threshold = float(threshold)
-        self._exclude_prompt_echoed_ids = bool(exclude_prompt_echoed_ids)
 
     def score(self, contexts: List[RoundContext]) -> List[ScoreResult]:
         out: List[ScoreResult] = []
         for ctx in contexts:
             cond_lp = ctx.features.get('cond_lp')
             asst_lp = ctx.features.get('asst_lp')
-            exclude = (
-                set(int(t) for t in ctx.cond_ids[:ctx.n_prompt] if t is not None)
-                if self._exclude_prompt_echoed_ids else None
-            )
             score = _chr_min_distinct(
                 cond_lp, asst_lp, ctx.cond_ids, ctx.asst_ids, ctx.n_prompt,
-                exclude_ids=exclude,
             )
-            # Unscored (failed prepare) → keep conservatively (passed=True).
             passed = (score is None) or (score < self._threshold)
             out.append(ScoreResult(
                 score=score, passed=passed,
@@ -106,6 +95,7 @@ class SIFDScorer:
                 passed = score >= self._ifd_threshold
             out.append(ScoreResult(score=score, passed=passed, extras=dict(fam)))
         return out
+
 
 
 _JUDGE_SYSTEM_PROMPT = (
@@ -500,6 +490,9 @@ class ScoreFilter(Preprocessor):
         self._trace_callback = trace_callback
         self._success_callback = success_callback
         if self._trace_dir:
+            import shutil
+            if os.path.exists(self._trace_dir):
+                shutil.rmtree(self._trace_dir)
             os.makedirs(self._trace_dir, exist_ok=True)
 
     def __call__(self, rows):
@@ -507,10 +500,40 @@ class ScoreFilter(Preprocessor):
         contexts = self._build_contexts(rows_list)
         if contexts:
             score_table = self._score_contexts(contexts)
+            self._log_score_summary(contexts, score_table)
             if self._trace_dir:
                 self._write_traces(contexts, score_table)
             rows_list = self._apply_filter(rows_list, contexts, score_table)
         return self.map_row_to_col(rows_list)
+
+    def _log_score_summary(self, contexts, score_table):
+        for scorer in self._scorers:
+            scores = [t[scorer.name].score for t in score_table
+                      if scorer.name in t and t[scorer.name].score is not None]
+            if not scores:
+                continue
+            n_pass = sum(1 for t in score_table
+                         if scorer.name in t and t[scorer.name].passed)
+            extras_sample = {}
+            for t in score_table:
+                if scorer.name in t and t[scorer.name].extras:
+                    extras_sample = t[scorer.name].extras
+                    break
+            extra_keys = [k for k in extras_sample if k != 'threshold']
+            extra_stats = ''
+            for k in extra_keys:
+                vals = [t[scorer.name].extras.get(k) for t in score_table
+                        if scorer.name in t and t[scorer.name].extras
+                        and t[scorer.name].extras.get(k) is not None]
+                if vals and isinstance(vals[0], (int, float)):
+                    avg = sum(vals) / len(vals)
+                    extra_stats += f', {k}_avg={avg:.4f}'
+            logger.info(
+                f'[ScoreFilter/{scorer.name}] n={len(scores)}, '
+                f'mean={sum(scores)/len(scores):.4f}, '
+                f'min={min(scores):.4f}, max={max(scores):.4f}, '
+                f'pass={n_pass}/{len(score_table)}'
+                f'{extra_stats}')
 
     # ---- scoring (inlined DefaultScoreCalculator) --------------------------
 

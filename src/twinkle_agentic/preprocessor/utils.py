@@ -71,6 +71,46 @@ def _chr_min_distinct(
     return pos / len(by_tok)
 
 
+def _chr_min_weighted(
+    cond_lp: List, asst_lp: List,
+    cond_ids: List[int], asst_ids: List[int],
+    n_prompt: int,
+) -> Optional[float]:
+    """Magnitude-weighted chr_min: each distinct token contributes |min_delta|
+    as weight; returns sum(pos_weights) / sum(all_weights)."""
+    if not asst_lp or not cond_lp or not asst_ids:
+        return None
+    n_a = min(len(asst_lp), len(asst_ids))
+    n_c = len(cond_lp)
+    by_tok: Dict[int, List[float]] = {}
+    for i in range(n_a):
+        ci = n_prompt + i
+        if ci >= n_c:
+            break
+        tid = asst_ids[i]
+        if tid is None:
+            continue
+        a = _extract_logprob(asst_lp[i], tid)
+        c_tok = cond_ids[ci] if ci < len(cond_ids) else None
+        c = _extract_logprob(cond_lp[ci], c_tok)
+        if a is None or c is None:
+            continue
+        by_tok.setdefault(int(tid), []).append(c - a)
+    if not by_tok:
+        return None
+    total_w = 0.0
+    pos_w = 0.0
+    for diffs in by_tok.values():
+        md = min(diffs)
+        w = abs(md)
+        total_w += w
+        if md > 0:
+            pos_w += w
+    if total_w == 0:
+        return None
+    return pos_w / total_w
+
+
 def _ifd_family_metrics(
     cond_lp: List, asst_lp: List,
     cond_ids: List[int], asst_ids: List[int],
@@ -110,6 +150,35 @@ def _ifd_family_metrics(
         sub = [deltas[i] for i in abs_sorted[:keep]]
         out[f's_ifd_{k_pct}'] = math.exp(-sum(sub) / len(sub))
     return out
+
+
+def _mean_logprob_delta(
+    cond_lp: List, asst_lp: List,
+    cond_ids: List[int], asst_ids: List[int],
+    n_prompt: int,
+) -> Optional[float]:
+    """Mean per-token (cond_lp - asst_lp) over the response span."""
+    if not asst_lp or not cond_lp or not asst_ids:
+        return None
+    n_a = min(len(asst_lp), len(asst_ids))
+    n_c = len(cond_lp)
+    deltas: List[float] = []
+    for i in range(n_a):
+        ci = n_prompt + i
+        if ci >= n_c:
+            break
+        tid = asst_ids[i]
+        if tid is None:
+            continue
+        a = _extract_logprob(asst_lp[i], tid)
+        c_tok = cond_ids[ci] if ci < len(cond_ids) else None
+        c = _extract_logprob(cond_lp[ci], c_tok)
+        if a is None or c is None:
+            continue
+        deltas.append(c - a)
+    if not deltas:
+        return None
+    return sum(deltas) / len(deltas)
 
 
 def _lp_to_jsonable(lp_list):

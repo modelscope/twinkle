@@ -40,7 +40,7 @@ from twinkle_agentic.preprocessor import (
     FlaggedWordsFilter, MinHashDedupFilter,
 )
 from twinkle_agentic.preprocessor.score_filter import (
-    ChrMinScorer,
+    ChrMinScorer, PassNScorer, ParaphraseScorer,
 )
 
 logger = get_logger()
@@ -57,9 +57,9 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 4))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 # ── Training ─────────────────────────────────────────────────────────────────
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 16))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))
-GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRAD_ACCUM', 2))
+GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRAD_ACCUM', 8))
 LOG_INTERVAL = 20
 SAVE_INTERVAL = 500
 NUM_STEPS = int(os.environ.get('NUM_STEPS', 5000))
@@ -169,7 +169,25 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
                 backend=backend,
                 scorers=[
                     ChrMinScorer(),
+                    # PassNScorer(
+                    #     backend=backend,
+                    #     judge_model=JUDGE_MODEL or None,
+                    #     judge_base_url=JUDGE_BASE_URL,
+                    #     judge_api_key=JUDGE_API_KEY,
+                    #     n=4,
+                    #     min_pass=0,
+                    #     sample_temperature=0.7,
+                    #     sample_max_tokens=4096,
+                    #     judge_temperature=JUDGE_TEMPERATURE,
+                    #     judge_max_tokens=JUDGE_MAX_TOKENS,
+                    #     judge_max_workers=JUDGE_MAX_WORKERS,
+                    # ),
+                    # ParaphraseScorer(
+                    #     backend=backend,
+                    #     template=template,
+                    # ),
                 ],
+                # trace_dir=os.path.join(OUTPUT_DIR, 'score_traces'),
             ),
             # Phase 13: response refinement
             # ResponseRefiner(
@@ -212,7 +230,7 @@ def train():
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=2),
     ]
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS // 2, fsdp_size=2)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // 2, tp_size=2)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
 
@@ -235,8 +253,6 @@ def train():
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=BATCH_SIZE,
-        device_mesh=model_mesh,
-        remote_group='model',
     )
 
     # ── Model (LoRA on 4 GPUs) ────────────────────────────────────────────────
@@ -260,12 +276,9 @@ def train():
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {NUM_STEPS}, model GPUs: {MODEL_GPUS}, sampler GPUs: {SAMPLER_GPUS}')
 
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
-
-    for batch in dataloader:
+    for cur_step, batch in enumerate(dataloader):
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
-        cur_step = optimizer_group.cur_step
 
         if cur_step % LOG_INTERVAL == 0:
             metric = model.calculate_metric(is_training=True)
@@ -278,7 +291,6 @@ def train():
             break
 
     save_checkpoint(model, 'last-checkpoint', dataloader)
-    dataset.flush_save()
     logger.info(f'Training complete. Trained data saved to: {TRAINED_DATA_PATH}')
     logger.info(f'Dropped data saved to: {DROPPED_DATA_PATH}')
 

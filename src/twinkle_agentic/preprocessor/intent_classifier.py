@@ -336,9 +336,11 @@ class IntentClassifier(Preprocessor):
         self,
         detectors: Optional[List[IntentDetector]] = None,
         intent_field: str = 'intent',
+        drop_no_key_rounds: bool = True,
     ) -> None:
         super().__init__()
         self._intent_field = intent_field
+        self._drop_no_key_rounds = drop_no_key_rounds
         self._detectors = list(detectors) if detectors is not None else list(self.DEFAULT_DETECTORS)
 
     def _detect(self, messages: List[Dict[str, Any]]) -> Dict[int, str]:
@@ -370,9 +372,11 @@ class IntentClassifier(Preprocessor):
                 primary = Counter(round_intents.values()).most_common(1)[0][0]
                 user_data = dict(row.get('user_data') or {})
                 user_data['key_rounds'] = sorted(round_intents)
-                user_data['intents'] = dict(round_intents)
+                user_data['intents'] = {str(k): v for k, v in round_intents.items()}
                 row['user_data'] = user_data
             else:
+                if self._drop_no_key_rounds:
+                    continue
                 primary = INTENT_OTHER
 
             row[self._intent_field] = primary

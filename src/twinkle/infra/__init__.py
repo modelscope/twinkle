@@ -751,8 +751,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
-            _caller = _capture_caller()
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            # Only capture caller on driver side; worker frames are Ray internals
+            _caller = _capture_caller() if hasattr(self, '_actors') else None
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             try:
@@ -920,8 +921,8 @@ def remote_generator(execute: Literal['first', 'balanced', 'random'] = 'balanced
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> AsyncIterator[T1]:
-            _caller = _capture_caller()
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            _caller = _capture_caller() if hasattr(self, '_actors') else None
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             try:
