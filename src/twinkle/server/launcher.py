@@ -24,12 +24,91 @@ from __future__ import annotations
 import signal
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, NoReturn, Optional, Union
+from typing import Any, Callable
 
 from twinkle import get_logger
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
 
 logger = get_logger()
+
+
+def _extract_logical_model_name(route_prefix: str, import_path: str) -> str | None:
+    """Extract the logical model name from a model/sampler route prefix."""
+    route_parts = [part for part in str(route_prefix or '').strip('/').split('/') if part]
+    service_part = 'model' if import_path == 'model' else 'sampler' if import_path == 'sampler' else None
+    if service_part is None:
+        return None
+    if service_part not in route_parts:
+        return None
+    service_index = route_parts.index(service_part)
+    logical_parts = route_parts[service_index + 1:]
+    return '/'.join(logical_parts) or None
+
+
+def _normalize_supported_model_item(item: Any) -> dict[str, Any] | None:
+    """Normalize supported model config entries to plain dicts."""
+    if isinstance(item, str):
+        return {'model_name': item}
+    if isinstance(item, dict):
+        model_name = item.get('model_name')
+        if not model_name:
+            return None
+        return dict(item)
+    if hasattr(item, 'model_name'):
+        model_name = getattr(item, 'model_name', None)
+        if not model_name:
+            return None
+        template_init_model_id = getattr(item, 'template_init_model_id', None)
+        return {
+            'model_name': model_name,
+            'template_init_model_id': template_init_model_id,
+        }
+    return None
+
+
+def _derive_supported_models_from_applications(applications: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Build logical-model capabilities from model/sampler application config."""
+    deduped: dict[str, dict[str, Any]] = {}
+    for app_config in applications or []:
+        if not isinstance(app_config, dict):
+            app_config = dict(app_config)
+        import_path = app_config.get('import_path')
+        if import_path not in {'model', 'sampler'}:
+            continue
+        args = app_config.get('args', {}) or {}
+        template_init_model_id = args.get('model_id')
+        logical_model_name = _extract_logical_model_name(app_config.get('route_prefix', ''), import_path)
+        if not logical_model_name:
+            continue
+        existing = deduped.setdefault(logical_model_name, {'model_name': logical_model_name})
+        # Prefer sampler model_id when available because self_host set_template targets sampler.
+        if import_path == 'sampler' and template_init_model_id:
+            existing['template_init_model_id'] = template_init_model_id
+        elif not existing.get('template_init_model_id') and template_init_model_id:
+            existing['template_init_model_id'] = template_init_model_id
+    return list(deduped.values())
+
+
+def _merge_supported_models(configured_supported_models: list[Any] | None,
+                            applications: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Merge explicit supported_models with model/sampler-derived capabilities."""
+    derived_models = _derive_supported_models_from_applications(applications)
+    derived_by_name = {item['model_name']: item for item in derived_models}
+    merged: dict[str, dict[str, Any]] = {}
+
+    for item in configured_supported_models or []:
+        normalized = _normalize_supported_model_item(item)
+        if not normalized:
+            continue
+        derived = derived_by_name.get(normalized['model_name'])
+        if derived and not normalized.get('template_init_model_id'):
+            normalized['template_init_model_id'] = derived.get('template_init_model_id')
+        merged[normalized['model_name']] = normalized
+
+    for item in derived_models:
+        merged.setdefault(item['model_name'], item)
+
+    return list(merged.values())
 
 
 class ServerLauncher:
@@ -177,7 +256,7 @@ class ServerLauncher:
         name = app_config.get('name', 'app')
         route_prefix = app_config.get('route_prefix', '/')
         import_path = app_config.get('import_path', 'server')
-        args = app_config.get('args', {}) or {}
+        args = dict(app_config.get('args', {}) or {})
         deployments = app_config.get('deployments', [])
 
         logger.info(f'Starting {name} at {route_prefix}...')
@@ -197,6 +276,9 @@ class ServerLauncher:
         http_options = self.config.get('http_options', {})
         if import_path == 'server' and http_options:
             args['http_options'] = http_options
+        if import_path == 'server':
+            args['supported_models'] = _merge_supported_models(
+                args.get('supported_models'), self.config.get('applications', []))
 
         app = builder(deploy_options=deploy_options, **{k: v for k, v in args.items()})
 

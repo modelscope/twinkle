@@ -10,6 +10,7 @@
 # ============================================================================
 from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
+from twinkle_client.common.template_model_id import resolve_template_model_id
 from twinkle.sampler.base import Sampler
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
@@ -31,6 +32,7 @@ class vLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
@@ -88,9 +90,11 @@ class vLLMSampler(Sampler):
 
     def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SetTemplateResponse:
         """Set the template for encoding trajectories."""
+        explicit_model_id = kwargs.pop('model_id', None)
+        model_id = resolve_template_model_id(self.model_id, explicit_model_id)
         response = http_post(
             url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': adapter_name, **kwargs}
+            json_data={'template_cls': template_cls, 'adapter_name': adapter_name, 'model_id': model_id, **kwargs}
         )
         response.raise_for_status()
         return SetTemplateResponse(**response.json())

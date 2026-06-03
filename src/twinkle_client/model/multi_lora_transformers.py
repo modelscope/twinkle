@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 import time
 from twinkle_client.http import http_get, http_post
+from twinkle_client.common.template_model_id import resolve_template_model_id
 from twinkle_client.types.model import (
     CalculateLossResponse,
     CalculateMetricResponse,
@@ -221,9 +222,11 @@ class MultiLoraTransformersModel:
 
     def set_template(self, template_cls: str, **kwargs) -> None:
         """Set the template for data processing."""
+        explicit_model_id = kwargs.pop('model_id', None)
+        model_id = resolve_template_model_id(self.model_id, explicit_model_id)
         response = http_post(
             url=f'{self.server_url}/set_template',
-            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': self.model_id, **kwargs}
+            json_data={'template_cls': template_cls, 'adapter_name': self.adapter_name, 'model_id': model_id, **kwargs}
         )
         response.raise_for_status()
 

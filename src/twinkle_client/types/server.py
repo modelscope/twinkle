@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 class SupportedModel(BaseModel):
     """Information about a supported model."""
     model_name: str
+    template_init_model_id: Optional[str] = None
 
 
 class GetServerCapabilitiesResponse(BaseModel):
