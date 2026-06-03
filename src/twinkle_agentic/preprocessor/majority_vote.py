@@ -106,11 +106,6 @@ class MajorityVoteFilter(Preprocessor):
         self._max_workers = max_workers
         self._skip_on_error = skip_on_error
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.majority_vote_filter(rows)
-        return self.map_row_to_col(rows)
-
     def _judge_row(self, messages: List[Dict[str, Any]]) -> Optional[bool]:
         """Collect votes from all sources for one row. Returns pass/fail/None."""
         judge_msgs = _build_judge_messages(messages, self._system_prompt)
@@ -130,7 +125,7 @@ class MajorityVoteFilter(Preprocessor):
             return None
         return sum(votes) / len(votes) > self._pass_threshold
 
-    def majority_vote_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Filter rows by majority vote across configured judge sources."""
         if not rows:
             return rows

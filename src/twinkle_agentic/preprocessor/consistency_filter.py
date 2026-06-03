@@ -177,11 +177,6 @@ class ConsistencyFilter(Preprocessor):
         self._replace = replace
         self._min_density_ratio = min_density_ratio
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.consistency_filter(rows)
-        return self.map_row_to_col(rows)
-
     def _assign_quadrant(self, c: float, d: float) -> str:
         if c >= self._c_thresh:
             return 'A' if d < self._d_thresh else 'B'
@@ -230,7 +225,7 @@ class ConsistencyFilter(Preprocessor):
                 m['content'] = text
                 return
 
-    def consistency_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         if not rows:
             return rows
 

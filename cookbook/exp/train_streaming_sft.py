@@ -31,7 +31,17 @@ from twinkle.model import TransformersModel
 from twinkle.preprocessor import Preprocessor
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Qwen3_5Template
-from twinkle_agentic.preprocessor import QualityPreprocessor, SamplerBackend
+from twinkle_agentic.preprocessor import (
+    QualityPreprocessor, SamplerBackend,
+    IntentClassifier, ResponseRefiner, ScoreFilter,
+    HardFilter, RefuseFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
+    FixUnicodeFilter, RemoveRepeatSentencesFilter,
+    WordRepeatFilter, CharRepeatFilter, SpecialCharsFilter, AlphanumericFilter,
+    FlaggedWordsFilter, MinHashDedupFilter,
+)
+from twinkle_agentic.preprocessor.score_filter import (
+    ChrMinScorer,
+)
 
 logger = get_logger()
 
@@ -60,9 +70,9 @@ TRAINED_DATA_PATH = os.path.join(OUTPUT_DIR, 'trained_data.jsonl')
 DROPPED_DATA_PATH = os.path.join(OUTPUT_DIR, 'dropped_data.jsonl')
 ADAPTER_NAME = 'default'
 
-# ── Data source (test mode: bad_samples.jsonl — IFDFilter metric-only test) ───
-BAD_SAMPLES_PATH = str(
-    Path(__file__).resolve().parent.parent.parent / 'bad_samples.jsonl')
+# ── Data source ──────────────────────────────────────────────────────────────
+CN_R1_DISTILL_REPO = 'ms://AI-ModelScope/Chinese-DeepSeek-R1-Distill-data-110k'
+DATASET_TOTAL = int(os.environ.get('DATASET_TOTAL', 0))  # 0 = all
 DATASET_USE_CACHE = os.environ.get('DATASET_USE_CACHE', '0') == '1'
 
 _TARGET_FEATURES = Features({
@@ -74,27 +84,34 @@ _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 
 class CNR1DistillSFTProcessor(Preprocessor):
-    """bad_samples.jsonl pass-through: keep messages, pre-set ``user_data.key_rounds=[1]``
-    so IntentClassifier's empty-result path doesn't strand rows without key_rounds."""
+    """Chinese-DeepSeek-R1-Distill-data-110k → SFT messages format."""
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows_list = self.map_col_to_row(rows)
         out: List[Dict[str, Any]] = []
         for row in rows_list:
-            messages = row.get('messages') or []
-            if not (isinstance(messages, list) and len(messages) >= 2
-                    and isinstance(messages[1], dict)
-                    and messages[1].get('role') == 'assistant'):
+            query = (row.get('input') or '').strip()
+            cot = (row.get('reasoning_content') or '').strip()
+            response = (row.get('content') or '').strip()
+            if not query or not response:
                 continue
-            user_data = dict(row.get('user_data') or {})
-            user_data.setdefault('key_rounds', [1])
+            if cot:
+                response = _THINK_RE.sub('', response).strip()
+                assistant_content = f'<think>{cot}</think>{response}'
+            else:
+                assistant_content = response
+            messages = [
+                {'role': 'user', 'content': query},
+                {'role': 'assistant', 'content': assistant_content},
+            ]
+            rid = hashlib.md5(query.encode()).hexdigest()[:16]
             out.append({
-                'id': row.get('id') or '',
-                'category': row.get('category') or '',
+                'id': f'cnr1__{rid}',
+                'source': 'Chinese-DeepSeek-R1-Distill-data-110k',
                 'messages': messages,
-                'user_data': user_data,
+                'user_data': {'key_rounds': [1]},
             })
-        return self.map_row_to_col(out, keys=['id', 'category', 'messages', 'user_data'])
+        return self.map_row_to_col(out, keys=['id', 'source', 'messages', 'user_data'])
 
 # ── QualityPreprocessor config ───────────────────────────────────────────────
 SENSITIVE_WORDS_FILE = str(
@@ -115,11 +132,13 @@ JUDGE_MAX_WORKERS = int(os.environ.get('JUDGE_MAX_WORKERS', 16))
 
 
 def build_dataset(backend: SamplerBackend) -> Dataset:
-    """Load bad_samples.jsonl, pre-annotate key_rounds=[1], then run IFD-only QualityPreprocessor."""
+    """Load CN-R1-Distill from ModelScope, convert to SFT format, run QualityPreprocessor."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     dataset = Dataset()
-    meta = DatasetMeta(dataset_id=BAD_SAMPLES_PATH, split='train')
+    data_slice = range(DATASET_TOTAL) if DATASET_TOTAL > 0 else None
+    meta = DatasetMeta(dataset_id=CN_R1_DISTILL_REPO, split='train',
+                       data_slice=data_slice)
     dataset.add_dataset(meta)
     cols = list(dataset.datasets[meta.get_id()].column_names)
     dataset.map(
@@ -133,49 +152,41 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         enable_thinking=False)
 
     qp = QualityPreprocessor(
-        # Shared LLM backend (vLLMSampler via Ray, no HTTP)
-        backend=backend,
-        # ── Skip every phase before IFDFilter (bad_samples.jsonl metric-only test) ──
-        # Phase 1: text normalisation (off — keep raw bad-sample bytes)
-        fix_unicode=False,
-        remove_repeat_sentences=False,
-        # Phase 1.5: message sanity
-        message_sanity_filter=False,
-        # Phase 2: structural
-        hard_filter=False,
-        refuse_filter=False,
-        dead_loop_filter=False,
-        # Phase 3: character quality — flags off; non-flag filters set permissive so they no-op.
-        token_soup_filter=False,
-        word_repeat_max_ratio=1.0,
-        char_repeat_max_ratio=1.0,
-        alphanumeric_min_ratio=0.0,
-        flagged_words_max_ratio=1.0,
-        # Phase 4
-        token_num_filter=False,
-        # Phase 8
-        minhash_dedup=False,
-        # Phase 12: chr_min hard-example filter + pass@4 judge
-        ifd_template=template,
-        ifd_chr_min_threshold=CHR_MIN_THRESHOLD,
-        ifd_exclude_prompt_echoed_ids=True,
-        ifd_diagnostic_sample_intents=[],
-        ifd_diagnostic_sample_n=4,
-        ifd_diagnostic_sample_temperature=0.7,
-        ifd_diagnostic_sample_max_tokens=4096,
-        # Pass@4 LLM-as-judge: graded only when JUDGE_MODEL is set.
-        ifd_enable_pass4_judge=bool(JUDGE_MODEL),
-        ifd_judge_model=JUDGE_MODEL or None,
-        ifd_judge_base_url=JUDGE_BASE_URL or None,
-        ifd_judge_api_key=JUDGE_API_KEY or None,
-        ifd_judge_temperature=JUDGE_TEMPERATURE,
-        ifd_judge_max_tokens=JUDGE_MAX_TOKENS,
-        ifd_judge_max_workers=JUDGE_MAX_WORKERS,
-        # Phase 13: response refinement
-        refine_temperature=REFINE_TEMPERATURE,
-        refine_max_tokens=REFINE_MAX_TOKENS,
-        refine_max_workers=8,
-        # Diagnostics
+        pipeline=[
+            # Phase 1-5: deterministic structural filters
+            HardFilter(),
+            RefuseFilter(),
+            DeadLoopFilter(),
+            TokenSoupFilter(),
+            MessageSanityFilter(),
+            # Phase 6-7: text normalization (mappers)
+            FixUnicodeFilter(),
+            RemoveRepeatSentencesFilter(),
+            # Phase 8-10: repetition & character quality
+            WordRepeatFilter(),
+            CharRepeatFilter(),
+            SpecialCharsFilter(),
+            AlphanumericFilter(),
+            FlaggedWordsFilter(),
+            MinHashDedupFilter(),
+            # Phase 11: intent classification
+            IntentClassifier(),
+            # Phase 12: ScoreFilter (chr_min)
+            ScoreFilter(
+                template=template,
+                backend=backend,
+                scorers=[
+                    ChrMinScorer(),
+                ],
+            ),
+            # Phase 13: response refinement
+            ResponseRefiner(
+                backend=backend,
+                temperature=REFINE_TEMPERATURE,
+                max_tokens=REFINE_MAX_TOKENS,
+                max_workers=8,
+            ),
+        ],
         dropped_log_path=DROPPED_DATA_PATH,
     )
     dataset.map(qp, load_from_cache_file=False)

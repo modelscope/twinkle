@@ -118,13 +118,7 @@ class PerplexityFilter(Preprocessor):
         self.ppl_max      = ppl_max
         self._max_workers = max_workers
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.ppl_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def ppl_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Parallel-score rows via chat completions; keep rows with PPL in [ppl_min, ppl_max]."""
         scoreable: List[Tuple[int, List[Dict[str, Any]], int]] = []  # (row_idx, messages, n_prompt)
         for i, row in enumerate(rows):

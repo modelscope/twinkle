@@ -117,13 +117,7 @@ def _is_token_soup(text: str) -> bool:
 
 class TokenSoupFilter(Preprocessor):
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.token_soup_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def token_soup_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows where any assistant message contains garbled/token-soup content."""
         out = []
         for row in rows:

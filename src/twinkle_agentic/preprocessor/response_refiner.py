@@ -135,12 +135,7 @@ class ResponseRefiner(Preprocessor):
         self._max_tokens = max_tokens
         self._max_workers = max_workers
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.refine(rows)
-        return self.map_row_to_col(rows)
-
-    def refine(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Refine key round responses in parallel."""
         if not rows:
             return rows

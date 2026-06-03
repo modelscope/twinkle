@@ -176,13 +176,7 @@ def _is_stuck(text: str) -> bool:
 
 class DeadLoopFilter(Preprocessor):
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.dead_loop_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def dead_loop_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows where the assistant reply shows signs of hesitation or dead-loop.
 
         Three independent signals, any one of which triggers the filter:

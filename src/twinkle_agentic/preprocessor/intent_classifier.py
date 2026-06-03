@@ -298,11 +298,6 @@ class IntentClassifier(Preprocessor):
         self._intent_field = intent_field
         self._detectors = list(detectors) if detectors is not None else list(self.DEFAULT_DETECTORS)
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.classify_intent(rows)
-        return self.map_row_to_col(rows)
-
     def _detect(self, messages: List[Dict[str, Any]]) -> Dict[int, str]:
         """Run detector pipeline; later detectors never override earlier intent on the same round."""
         round_intents: Dict[int, str] = {}
@@ -316,7 +311,7 @@ class IntentClassifier(Preprocessor):
                 break
         return round_intents
 
-    def classify_intent(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         if not rows:
             return rows
 

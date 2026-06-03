@@ -260,13 +260,7 @@ class MessageSanityFilter(Preprocessor):
             all_words.update(w.strip() for w in extra_sensitive_words if w and w.strip())
         self._sensitive_re = _build_sensitive_regex(all_words)
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.message_sanity_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def message_sanity_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         out = []
         for row in rows:
             messages = row.get('messages')

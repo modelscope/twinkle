@@ -124,13 +124,7 @@ def _is_refusal(text: str) -> bool:
 
 class RefuseFilter(Preprocessor):
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.refuse_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def refuse_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows where the first assistant reply expresses a refusal or inability."""
         out = []
         for row in rows:

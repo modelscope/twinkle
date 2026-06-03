@@ -7,7 +7,9 @@ from twinkle.data_format import Trajectory
 class Preprocessor:
 
     @staticmethod
-    def map_col_to_row(rows: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    def map_col_to_row(rows) -> List[Dict[str, Any]]:
+        if isinstance(rows, list):
+            return rows
         if not rows:
             return []
         _new_rows = []
@@ -20,7 +22,9 @@ class Preprocessor:
         return _new_rows
 
     @staticmethod
-    def map_row_to_col(rows: List[Dict[str, Any]], keys: List[str] = None) -> Dict[str, List[Any]]:
+    def map_row_to_col(rows, keys: List[str] = None) -> Dict[str, List[Any]]:
+        if isinstance(rows, dict):
+            return rows
         if not rows:
             return {k: [] for k in keys} if keys else {}
 

@@ -148,13 +148,7 @@ class HardFilter(Preprocessor):
         super().__init__()
         self.allow_incomplete_role = allow_incomplete_role
 
-    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
-        rows = self.map_col_to_row(rows)
-        rows = self.hard_filter(rows)
-        rows = self.map_row_to_col(rows)
-        return rows
-
-    def hard_filter(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows that are trivially low-quality by two rules:
 
         Rule 1 — Single-turn simple query:
