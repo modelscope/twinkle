@@ -19,8 +19,10 @@ from pathlib import Path
 
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.sampler.app import _SAMPLER_TYPES, _dispatch_sampler_backend, _validate_sampler_type
+from twinkle.server.sampler.app import SAMPLER_SELECTOR
 from twinkle.server.sampler.backends.mock_sampler import MockSampler
+
+_SAMPLER_TYPES = tuple(SAMPLER_SELECTOR.builders)
 
 # ---------- Interface conformance ----------------------------------------- #
 
@@ -110,7 +112,7 @@ def test_property_9_add_adapter_to_sampler(name: str) -> None:
 
 
 def test_property_11_mock_dispatch_returns_mock_sampler() -> None:
-    s = _dispatch_sampler_backend(_validate_sampler_type('mock'), {'model_id': 'mid'})
+    s = SAMPLER_SELECTOR.construct(SAMPLER_SELECTOR.validate('mock'), {'model_id': 'mid'})
     assert isinstance(s, MockSampler)
 
 
@@ -119,7 +121,7 @@ def test_property_11_mock_dispatch_returns_mock_sampler() -> None:
 def test_property_11_invalid_sampler_type_raises_config_error(bad: str) -> None:
     """Validation runs BEFORE any sampler import / instantiation."""
     with pytest.raises(ConfigError) as exc:
-        _validate_sampler_type(bad)
+        SAMPLER_SELECTOR.validate(bad)
     assert exc.value.field == 'sampler_type'
     assert exc.value.value == bad
     assert set(exc.value.allowed) == set(_SAMPLER_TYPES)
@@ -128,7 +130,7 @@ def test_property_11_invalid_sampler_type_raises_config_error(bad: str) -> None:
 @pytest.mark.parametrize('value', [None, ''])
 def test_property_11_absent_or_empty_sampler_type_raises(value) -> None:
     with pytest.raises(ConfigError) as exc:
-        _validate_sampler_type(value)
+        SAMPLER_SELECTOR.validate(value)
     assert exc.value.field == 'sampler_type'
 
 

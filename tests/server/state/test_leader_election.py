@@ -11,13 +11,13 @@ import asyncio
 import pytest
 
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.server_state import LEADER_KEY, LEASE_RENEW
 
 
 @pytest.mark.asyncio
 async def test_only_one_of_many_instances_becomes_leader() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     instances = [ServerState(backend=backend, cleanup_interval=600.0) for _ in range(4)]
     try:
         for s in instances:
@@ -36,7 +36,7 @@ async def test_leader_publishes_resource_counts() -> None:
     from twinkle.server.telemetry import MetricsRegistry
 
     MetricsRegistry.reset()
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(
         backend=backend,
         cleanup_interval=600.0,
@@ -57,7 +57,7 @@ async def test_leader_publishes_resource_counts() -> None:
 
 @pytest.mark.asyncio
 async def test_leader_handover_after_stop() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     a = ServerState(backend=backend, cleanup_interval=600.0)
     b = ServerState(backend=backend, cleanup_interval=600.0)
     try:
@@ -82,7 +82,7 @@ async def test_leader_handover_after_stop() -> None:
 
 @pytest.mark.asyncio
 async def test_renew_keeps_leader() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, cleanup_interval=600.0)
     try:
         await state.start_cleanup_task()
@@ -104,7 +104,7 @@ async def test_leader_recovers_after_renewal_failure() -> None:
     On unfixed code ``_is_leader`` flips to False while the lease value lingers
     in the backend, so ``set_nx`` keeps returning False for up to LEASE_TTL.
     """
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, cleanup_interval=600.0)
 
     # Become leader via the normal path.
@@ -138,7 +138,7 @@ async def test_leader_recovers_after_renewal_failure() -> None:
 async def test_renewal_failure_does_not_steal_other_leader_lease() -> None:
     """A non-leader whose election attempt raises must NOT delete a lease that
     another replica legitimately holds (Requirement 19.3)."""
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     leader = ServerState(backend=backend, cleanup_interval=600.0)
     follower = ServerState(backend=backend, cleanup_interval=600.0)
 

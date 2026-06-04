@@ -1,23 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Unified Server Launcher for Twinkle.
+"""``ServerLauncher`` and the ``launch_server`` entry point.
 
-This module provides a unified way to launch the server with support for
-YAML config files, Python dict config, and CLI.
-
-Usage:
-    # From YAML config
-    from twinkle.server import launch_server
-    launch_server(config_path="server_config.yaml")
-
-    # From Python dict
-    launch_server(config={
-        "http_options": {"host": "0.0.0.0", "port": 8000},
-        "applications": [...]
-    })
-
-    # CLI
-    python -m twinkle.server --config server_config.yaml
+The real launcher module. It lives here (rather than in the package
+``__init__.py``) so the package's ``__init__`` stays a thin aggregator; the
+public dotted paths ``twinkle.server.launcher.ServerLauncher`` /
+``launch_server`` are preserved by the ``__init__`` re-export.
 """
 from __future__ import annotations
 
@@ -25,12 +12,14 @@ import os
 import signal
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, NoReturn, Optional, Union
+from typing import Any, Callable
 
 from twinkle import get_logger
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
 from twinkle.server.utils.ray_serve_patch import apply_ray_serve_patches, get_runtime_env_for_patches
+from .builder_registry import get_builders, resolve_builder
+from .env_propagation import build_propagated_env_vars
 
 logger = get_logger()
 
@@ -45,14 +34,6 @@ class ServerLauncher:
         config: The server configuration dictionary
         ray_namespace: The Ray namespace for the cluster
     """
-
-    # Mapping of simplified import_path names to builder function names
-    _BUILDERS: dict[str, str] = {
-        'server': 'build_server_app',
-        'model': 'build_model_app',
-        'sampler': 'build_sampler_app',
-        'processor': 'build_processor_app',
-    }
 
     def __init__(
         self,
@@ -79,86 +60,23 @@ class ServerLauncher:
         self._ray_initialized = False
         self._serve_started = False
 
-    # Telemetry env var keys that need to be propagated to Ray worker processes
-    _TELEMETRY_ENV_KEYS: tuple[str, ...] = (
-        'TWINKLE_TELEMETRY_ENABLED',
-        'TWINKLE_TELEMETRY_DEBUG',
-        'TWINKLE_TELEMETRY_SERVICE',
-        'TWINKLE_TELEMETRY_ENDPOINT',
-        'TWINKLE_TELEMETRY_INTERVAL',
-    )
-
-    def _build_telemetry_env_vars(self) -> dict[str, str]:
-        """Collect telemetry env vars from os.environ for propagation to Ray workers.
-
-        These vars are read by ``ensure_telemetry_initialized()`` inside the
-        FastAPI startup hook running in each worker process.
-        """
-        return {k: os.environ[k] for k in self._TELEMETRY_ENV_KEYS if k in os.environ}
-
-    def _build_persistence_env_vars(self) -> dict[str, str]:
-        """Collect persistence env vars from os.environ for propagation to Ray workers.
-
-        These vars are read by ``PersistenceConfig.from_env()`` inside any
-        worker that calls ``get_server_state()`` without an explicit config,
-        which makes the chosen backend independent of deployment startup order.
-        """
-        from twinkle.server.state.backend.factory import PERSISTENCE_ENV_KEYS
-        return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
-
     def _build_propagated_env_vars(self) -> dict[str, str]:
         """Aggregate all env vars that must reach Ray worker processes."""
-        merged: dict[str, str] = {}
-        merged.update(self._build_telemetry_env_vars())
-        merged.update(self._build_persistence_env_vars())
-        return merged
+        return build_propagated_env_vars()
 
     def _get_builders(self) -> dict[str, Callable]:
-        """Get the builder functions for all app types."""
-        if self._builders:
-            return self._builders
-
-        from twinkle.server.gateway import build_server_app
-        from twinkle.server.model import build_model_app
-        from twinkle.server.processor import build_processor_app
-        from twinkle.server.sampler import build_sampler_app
-
-        self._builders = {
-            'build_server_app': build_server_app,
-            'build_model_app': build_model_app,
-            'build_sampler_app': build_sampler_app,
-            'build_processor_app': build_processor_app,
-        }
-
+        """Get (and cache) the builder functions for all app types."""
+        if not self._builders:
+            self._builders = get_builders()
         return self._builders
 
     def _resolve_builder(self, import_path: str) -> Callable:
-        """
-        Resolve an import_path to a builder function.
-
-        Args:
-            import_path: The import path from config (e.g., 'server', 'model')
-
-        Returns:
-            The builder function
+        """Resolve an import_path to a builder function.
 
         Raises:
-            ValueError: If the import_path cannot be resolved
+            ValueError: If the import_path cannot be resolved.
         """
-        builders = self._get_builders()
-
-        # Try to resolve through the simplified name mapping
-        if import_path in self._BUILDERS:
-            builder_name = self._BUILDERS[import_path]
-            if builder_name in builders:
-                return builders[builder_name]
-
-        # Direct builder name
-        if import_path in builders:
-            return builders[import_path]
-
-        raise ValueError(f"Unknown import_path '{import_path}'. "
-                         f'Available: {list(self._BUILDERS.keys())}')
+        return resolve_builder(import_path, self._get_builders())
 
     def _init_ray(self) -> None:
         """Initialize Ray if not already initialized."""
@@ -229,10 +147,13 @@ class ServerLauncher:
         name = app_spec.name
         route_prefix = app_spec.route_prefix
         import_path = app_spec.import_path
-        # Re-serialize the typed args back to a kwargs dict for the builder.
-        # Using ``mode='python'`` keeps nested Pydantic models as dicts (which
-        # the legacy builders expect) without losing field-level validation.
-        args = app_spec.args.model_dump(mode='python', exclude_none=True)
+        # Shallow-dump the typed args to a kwargs dict WITHOUT recursing into
+        # nested models: ``dict(model)`` yields top-level (field, value) pairs
+        # with nested models left as instances, so ``queue_config`` stays a
+        # typed ``TaskQueueConfig`` and is not re-serialized to a dict only to be
+        # revived via ``from_dict`` inside the builder (the prior triple
+        # validation). ``None`` values are dropped to match ``exclude_none``.
+        args = {k: v for k, v in dict(app_spec.args).items() if v is not None}
         deployments = list(app_spec.deployments or [])
 
         logger.info(f'Starting {name} at {route_prefix}...')
@@ -356,35 +277,19 @@ class ServerLauncher:
         from twinkle.server.telemetry import flush_telemetry_safely
         flush_telemetry_safely()
 
-    @classmethod
-    def from_yaml(
-        cls,
-        config_path: str | Path,
-        ray_namespace: str | None = None,
-    ) -> ServerLauncher:
-        """Build a ``ServerLauncher`` from a YAML config file.
-
-        Thin wrapper over :meth:`ServerConfig.from_yaml`. ``FileNotFoundError``
-        / ``ConfigParseError`` / ``pydantic.ValidationError`` propagate so the
-        caller can surface a precise message before the launcher is constructed.
-        """
-        config = ServerConfig.from_yaml(config_path)
-        return cls(
-            config=config,
-            ray_namespace=ray_namespace or config.ray_namespace,
-        )
-
 
 def launch_server(
     config: ServerConfig | None = None,
     config_path: str | Path | None = None,
     ray_namespace: str | None = None,
 ) -> None:
-    """Launch a twinkle server.
+    """Launch a twinkle server — the single launch choke point.
 
     Exactly one of ``config`` (a :class:`ServerConfig` instance) or
-    ``config_path`` (a YAML file) must be provided. The call blocks until a
-    SIGINT/SIGTERM signal is received.
+    ``config_path`` (a YAML file) must be provided. When a path is given the
+    config is loaded via :meth:`ServerConfig.from_yaml` here, so there is one
+    construction path: load config → ``ServerLauncher(config=...)`` →
+    ``launch()``. The call blocks until a SIGINT/SIGTERM signal is received.
 
     Raises:
         ValueError: neither ``config`` nor ``config_path`` was provided.
@@ -398,15 +303,13 @@ def launch_server(
     if config is None and config_path is None:
         raise ValueError("Either 'config' or 'config_path' must be provided")
 
-    if config is not None:
-        launcher = ServerLauncher(
-            config=config,
-            ray_namespace=ray_namespace or config.ray_namespace,
-        )
-    else:
-        launcher = ServerLauncher.from_yaml(
-            config_path=config_path,
-            ray_namespace=ray_namespace,
-        )
+    if config is None:
+        # ``FileNotFoundError`` / ``ConfigParseError`` / ``pydantic.ValidationError``
+        # propagate so the caller can surface a precise message.
+        config = ServerConfig.from_yaml(config_path)
 
+    launcher = ServerLauncher(
+        config=config,
+        ray_namespace=ray_namespace or config.ray_namespace,
+    )
     launcher.launch()

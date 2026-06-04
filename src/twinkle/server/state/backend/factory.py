@@ -78,12 +78,12 @@ def create_backend(config: PersistenceConfig | None = None) -> StateBackend:
 
     match config.mode:
         case 'memory':
-            # Deferred import: MemoryBackend pulls in ``ray``, which is an
+            # Deferred import: RayActorBackend pulls in ``ray``, which is an
             # optional dependency. Importing it lazily means callers that
             # never select memory mode (e.g. file/redis users) do not need
             # ray installed just to load this factory.
-            from .memory_backend import MemoryBackend
-            return MemoryBackend(key_prefix=config.key_prefix)
+            from .memory_backend import RayActorBackend
+            return RayActorBackend(key_prefix=config.key_prefix)
         case 'file':
             if not config.file_path:
                 raise ValueError('file_path is required for file persistence mode')

@@ -19,6 +19,9 @@ from typing import Any, List, Optional
 
 # These data containers don't pull torch / vllm.
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.utils.logger import get_logger
+
+logger = get_logger()
 
 
 def _stable_seed(*parts: Any) -> int:
@@ -46,6 +49,11 @@ class MockSampler:
         self._seed = int(seed)
         self._vocab_size = int(vocab_size)
         self._adapters: dict[str, Any] = {}
+        # Surface (rather than silently swallow) extra ctor kwargs: a real
+        # backend signature drift then shows up as a visible DEBUG warning in
+        # the mock e2e instead of being discarded without trace.
+        if kwargs:
+            logger.debug('MockSampler ignoring unknown ctor kwargs: %s', sorted(kwargs))
         # Match the Sampler base attributes so duck-typed callers don't surprise.
         self.engine = None
         self.template = None

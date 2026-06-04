@@ -40,8 +40,8 @@ def _noop_self() -> None:
 
 
 def build_gateway_app() -> FastAPI:
-    from twinkle.server.gateway.tinker_gateway_handlers import _register_tinker_routes
-    from twinkle.server.gateway.twinkle_gateway_handlers import _register_twinkle_routes
+    from twinkle.server.gateway.tinker_handlers import _register_tinker_routes
+    from twinkle.server.gateway.twinkle_handlers import _register_twinkle_routes
 
     app = FastAPI()
     _register_tinker_routes(app, _noop_self)
@@ -90,11 +90,14 @@ _HTTP_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}
 
 
 def _extract_app_surface(app: FastAPI) -> dict[str, Any]:
-    """Return the OpenAPI ``paths`` and ``components.schemas`` of ``app``.
+    """Return a SLIM client-contract view of ``app``'s OpenAPI surface.
 
-    The output is a stable, JSON-serializable view restricted to standard HTTP
-    methods. Per-operation metadata is reduced to fields that affect the
-    client contract: ``requestBody``, ``responses``, and ``parameters``.
+    Snapshots, per path and HTTP method, only the stable client-facing contract:
+    the ``operationId``, the ``parameters``, and the set of response status
+    codes. The full ``components.schemas`` body and per-operation ``requestBody``
+    schema are intentionally NOT snapshotted — they churn on Pydantic / FastAPI
+    version bumps without representing a real client-contract change. Route
+    paths, HTTP methods, and response status codes remain frozen (R27).
     """
     spec = get_openapi(
         title='contract',
@@ -109,15 +112,14 @@ def _extract_app_surface(app: FastAPI) -> dict[str, Any]:
             if method.upper() not in _HTTP_METHODS:
                 continue
             clean_ops[method.upper()] = {
+                'operationId': op.get('operationId'),
                 'parameters': op.get('parameters', []),
-                'requestBody': op.get('requestBody'),
-                'responses': op.get('responses', {}),
+                'responses': sorted((op.get('responses') or {}).keys()),
             }
         if clean_ops:
             paths[path] = clean_ops
 
-    components = (spec.get('components') or {}).get('schemas', {})
-    return {'paths': paths, 'schemas': components}
+    return {'paths': paths}
 
 
 def extract_full_surface() -> dict[str, Any]:

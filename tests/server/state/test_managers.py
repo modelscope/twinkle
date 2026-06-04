@@ -1,11 +1,11 @@
-"""Tests for state managers using MemoryBackend as integration backend."""
+"""Tests for state managers using RayActorBackend as integration backend."""
 from __future__ import annotations
 
 import pytest
 import time
 from datetime import datetime, timezone
 
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.future_manager import FutureManager
 from twinkle.server.state.model_manager import ModelManager
 from twinkle.server.state.models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
@@ -21,7 +21,7 @@ class TestSessionManager:
 
     @pytest.fixture
     def backend(self):
-        return MemoryBackend()
+        return RayActorBackend()
 
     @pytest.fixture
     def manager(self, backend):
@@ -120,7 +120,7 @@ class TestModelManager:
 
     @pytest.fixture
     def backend(self):
-        return MemoryBackend()
+        return RayActorBackend()
 
     @pytest.fixture
     def manager(self, backend):
@@ -239,7 +239,7 @@ class TestSamplingSessionManager:
 
     @pytest.fixture
     def backend(self):
-        return MemoryBackend()
+        return RayActorBackend()
 
     @pytest.fixture
     def manager(self, backend):
@@ -293,7 +293,7 @@ class TestFutureManager:
 
     @pytest.fixture
     def backend(self):
-        return MemoryBackend()
+        return RayActorBackend()
 
     @pytest.fixture
     def manager(self, backend):

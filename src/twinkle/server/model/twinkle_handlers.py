@@ -21,8 +21,8 @@ if TYPE_CHECKING:
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
-from twinkle.server.utils.checkpoint_base import _resolve_client_save_dir, validate_user_path
+from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
+                                       validate_user_path)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object

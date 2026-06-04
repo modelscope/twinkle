@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared Ray runtime + per-test isolation for ``tests/server`` (state, cli, ...).
 
-``MemoryBackend`` is a forwarding wrapper around a detached Ray actor;
+``RayActorBackend`` is a forwarding wrapper around a detached Ray actor;
 instantiating one without an initialized Ray runtime raises
 :class:`RuntimeError`. The vast majority of server tests just construct
-``MemoryBackend()`` somewhere in their fixtures, so we boot a small Ray
+``RayActorBackend()`` somewhere in their fixtures, so we boot a small Ray
 cluster once per test session here instead of opting in module by module.
 
-Two ``MemoryBackend()`` instances created in the same test session share one
+Two ``RayActorBackend()`` instances created in the same test session share one
 canonical actor (``twinkle_state_actor``) by design — that is the whole point
 of the actor wrapper. To keep tests independent we clear that actor's store
 before each test function. Tests that pin a non-default ``key_prefix`` get
@@ -20,7 +20,7 @@ import pytest
 
 @pytest.fixture(scope='session', autouse=True)
 def _ray_runtime():
-    """Boot a session-scoped Ray runtime so MemoryBackend can attach actors."""
+    """Boot a session-scoped Ray runtime so RayActorBackend can attach actors."""
     ray = pytest.importorskip('ray')
     already_running = ray.is_initialized()
     if not already_running:

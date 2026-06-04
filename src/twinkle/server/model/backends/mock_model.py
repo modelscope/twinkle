@@ -21,6 +21,10 @@ import os
 import numpy as np
 from typing import Any
 
+from twinkle.utils.logger import get_logger
+
+logger = get_logger()
+
 
 def _seed_for(model_id: str, adapter_name: str | None, seed: int, *extra: Any) -> int:
     """Deterministic per-request RNG seed derived from string/int components.
@@ -59,6 +63,8 @@ class TwinkleCompatMockModel:
         self._rng_seed = int(seed)
         # adapter_name -> arbitrary config payload
         self._adapters: dict[str, dict[str, Any]] = {}
+        if kwargs:
+            logger.debug('MockModel ignoring unknown ctor kwargs: %s', sorted(kwargs))
 
     # ----- Forward family ------------------------------------------------ #
 

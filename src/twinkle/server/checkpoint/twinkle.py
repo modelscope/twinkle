@@ -7,8 +7,8 @@ Uses ``twinkle_client.types.training`` models for all serialization and response
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.utils.checkpoint_base import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager,
-                                                  BaseTrainingRunManager, validate_ownership)
+from twinkle.server.checkpoint.base import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager,
+                                            validate_ownership)
 from twinkle_client.types.training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor,
                                            ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse,
                                            WeightsInfoResponse)

@@ -14,7 +14,7 @@ import traceback
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
-from twinkle.server.utils.metrics import get_task_metrics
+from twinkle.server.utils.metrics_middleware import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
@@ -50,8 +50,13 @@ class TaskQueueMixin:
     state: ServerState
 
     def _init_task_queue(self, config: TaskQueueConfig | None = None, deployment_name: str = '') -> None:
-        """Initialise the task queue, rate limiter, and compute worker."""
-        self._task_queue_config = config or TaskQueueConfig()
+        """Initialise the task queue, rate limiter, and compute worker.
+
+        ``config`` must be a typed :class:`TaskQueueConfig` (the launcher
+        passes the instance straight through). ``None`` constructs a default
+        config.
+        """
+        self._task_queue_config = config if config is not None else TaskQueueConfig()
         self._deployment_name = deployment_name
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
 

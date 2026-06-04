@@ -12,12 +12,12 @@ import pytest
 import time
 
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 
 @pytest.mark.asyncio
 async def test_concurrent_touch_no_lost_write() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state_a = ServerState(backend=backend)
     state_b = ServerState(backend=backend)
     sid = await state_a.create_session({})

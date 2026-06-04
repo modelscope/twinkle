@@ -99,18 +99,19 @@ class _StateActor:
         return True
 
 
-class MemoryBackend(StateBackend):
+class RayActorBackend(StateBackend):
     """Cross-process state backend backed by a detached Ray actor.
 
     The canonical store lives inside a detached ``_StateActor`` and every
     method forwards as ``await actor.X.remote(...)`` so all Ray Serve workers
-    share one consistent view. Memory mode requires an initialized Ray
-    runtime — there is no fallback to a process-local dict.
+    share one consistent view. This backend requires an initialized Ray
+    runtime — there is no fallback to a process-local dict. (The operator-facing
+    persistence mode literal for this backend is still ``"memory"``.)
     """
 
     def __init__(self, key_prefix: str = '') -> None:
         if not ray.is_initialized():
-            raise RuntimeError('MemoryBackend requires an initialized Ray runtime — call '
+            raise RuntimeError('RayActorBackend requires an initialized Ray runtime — call '
                                'ray.init() first, switch persistence to "file"/"redis", or '
                                'rely on the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)

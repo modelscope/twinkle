@@ -2,11 +2,15 @@
 """
 Central metrics module for Twinkle server observability.
 
-This module is a *thin adapter layer* over the OpenTelemetry instruments
-declared in :class:`twinkle.server.telemetry.metrics.MetricsRegistry`.
-It preserves the legacy Ray-style API (``.inc()`` / ``.set()`` / ``.observe()``
-with ``tags=`` keyword) so that existing call sites do not need to change
-their call patterns, while routing every measurement through OTEL.
+This module is a **back-compat keyword shim plus a real ``_Gauge`` adapter** over
+the OpenTelemetry instruments declared in
+:class:`twinkle.server.telemetry.metrics.MetricsRegistry`. ``_Counter`` and
+``_Histogram`` are thin pass-throughs whose only role is to accept the legacy
+Ray-style ``tags=`` keyword and forward it as OTEL's ``attributes=``; ``_Gauge``
+does real work — it translates the legacy ``set(value)`` API onto OTEL's
+delta-based UpDownCounter by tracking the last reported value per attribute set.
+Routing every measurement through OTEL while preserving the legacy call API
+means existing call sites do not need to change.
 
 Public entry-points (unchanged signatures):
 
@@ -140,7 +144,7 @@ def create_metrics_middleware(deployment: str) -> Callable:
 
     Usage inside a ``build_*_app()`` function::
 
-        from twinkle.server.utils.metrics import create_metrics_middleware
+        from twinkle.server.utils.metrics_middleware import create_metrics_middleware
         from twinkle.server.telemetry.tracing import create_tracing_middleware
 
         app.middleware('http')(verify_token)

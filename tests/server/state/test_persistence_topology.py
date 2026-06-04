@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Persistence topology tests for the actor-wrapped MemoryBackend.
+"""Persistence topology tests for the actor-wrapped RayActorBackend.
 
-``MemoryBackend`` owns a detached Ray actor on purpose so all Ray Serve
+``RayActorBackend`` owns a detached Ray actor on purpose so all Ray Serve
 workers share one consistent in-memory store. These tests assert that
 ``get_server_state`` returns a process-local cached instance and that two
 ``ServerState`` instances on the same backend agree under the same op stream.
 
-Also pins in-process MemoryBackend behaviour — no external Redis is required;
+Also pins in-process RayActorBackend behaviour — no external Redis is required;
 sharing happens through the detached actor.
 """
 from __future__ import annotations
@@ -17,20 +17,20 @@ from hypothesis import strategies as st
 
 from twinkle.server.state import (PersistenceConfig, ReplicaRegistry, ServerState, get_server_state,
                                   reset_server_state_cache)
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 
 def test_get_server_state_caches_per_process() -> None:
     reset_server_state_cache()
-    a = get_server_state(actor_name='cache-a', backend=MemoryBackend())
+    a = get_server_state(actor_name='cache-a', backend=RayActorBackend())
     b = get_server_state(actor_name='cache-a')
     assert a is b
 
 
 def test_get_server_state_separate_keys_yield_separate_instances() -> None:
     reset_server_state_cache()
-    a = get_server_state(actor_name='k1', backend=MemoryBackend())
-    b = get_server_state(actor_name='k2', backend=MemoryBackend())
+    a = get_server_state(actor_name='k1', backend=RayActorBackend())
+    b = get_server_state(actor_name='k2', backend=RayActorBackend())
     assert a is not b
 
 
@@ -90,7 +90,7 @@ async def test_property_25_state_operation_equivalence(ops: list[tuple]) -> None
     detached actor) must agree on every read after the same sequence of
     writes — the shared backend itself is the coordination point.
     """
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     # Hypothesis reuses the same function scope across all examples, so the
     # autouse conftest fixture only clears the actor once. Reset between
     # examples here to keep this test independent (per-token model limit
@@ -125,7 +125,7 @@ async def test_property_25_state_operation_equivalence(ops: list[tuple]) -> None
 
 @pytest.mark.asyncio
 async def test_replica_registry_round_trip() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     reg = ReplicaRegistry(backend)
     await reg.register('r1', 4)
     await reg.register('r2', 7)
@@ -140,11 +140,11 @@ async def test_replica_registry_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_two_states_share_backend_in_process() -> None:
-    """Two ``ServerState`` instances on one shared MemoryBackend see each other's writes.
+    """Two ``ServerState`` instances on one shared RayActorBackend see each other's writes.
 
     Sharing is via the detached ``_StateActor`` rather than an in-process dict.
     """
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     a = ServerState(backend=backend)
     b = ServerState(backend=backend)
     await a.register_replica('r1', 3)

@@ -16,7 +16,7 @@ import time
 from unittest import mock
 
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 
 @pytest.mark.asyncio
@@ -24,7 +24,7 @@ async def test_cascade_set_matches_removed_sessions() -> None:
     """The sessions removed in a pass are exactly the ones whose children are
     cascade-deleted — no session is removed for cascade purposes but retained
     in the store, or vice versa."""
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     # expiration_timeout=0 → every session is immediately past the cutoff.
     state = ServerState(backend=backend, expiration_timeout=0.0)
 
@@ -53,7 +53,7 @@ async def test_touch_between_scans_cannot_orphan_children() -> None:
     removal, so the session and its model are removed together — there is no
     second scan that could spare the session yet keep cascading its model.
     """
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, expiration_timeout=0.0)
 
     sid = await state.create_session({'session_id': 's-race'})
@@ -93,7 +93,7 @@ async def test_touch_between_scans_cannot_orphan_children() -> None:
 @pytest.mark.asyncio
 async def test_collect_and_remove_expired_returns_single_authoritative_set() -> None:
     """``collect_and_remove_expired`` returns the one set of IDs it removed."""
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, expiration_timeout=0.0)
     await state.create_session({'session_id': 's1'})
     await state.create_session({'session_id': 's2'})

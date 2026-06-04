@@ -64,3 +64,56 @@ def test_launcher_shutdown_flushes_even_if_serve_shutdown_raises() -> None:
             launcher._shutdown()
 
     assert flush_spy.call_count == 1
+
+
+def test_scaffold_lifespan_shutdown_flushes_telemetry() -> None:
+    """End-to-end: the scaffold's FastAPI lifespan shutdown invokes the flush.
+
+    Drives ``build_deployment_app``'s lifespan via Starlette's lifespan
+    protocol so the test covers the actual code path used by every worker
+    deployment (Gateway/Model/Sampler/Processor) after the Task 13–16
+    scaffold consolidation. Without this, the worker-side flush is only
+    covered transitively (helper test + scaffold assumed to call it); this
+    pins the connection.
+    """
+    from fastapi import FastAPI
+
+    from twinkle.server.app_scaffold import build_deployment_app
+
+    def _no_routes(app: FastAPI, get_self) -> None:
+        return None
+
+    with mock.patch('twinkle.server.telemetry.worker_init.ensure_telemetry_initialized'):
+        with mock.patch('twinkle.server.telemetry.shutdown_telemetry') as shutdown_spy:
+            app = build_deployment_app('Test', _no_routes)
+            # Run the lifespan through Starlette's TestClient context manager,
+            # which is the documented public surface for exercising lifespan
+            # startup + shutdown end-to-end without booting a real server.
+            from fastapi.testclient import TestClient
+            with TestClient(app):
+                pass  # startup runs on enter, shutdown on exit.
+
+    assert shutdown_spy.call_count == 1, (
+        f'scaffold lifespan shutdown did not invoke shutdown_telemetry '
+        f'(call_count={shutdown_spy.call_count})')
+
+
+def test_scaffold_lifespan_shutdown_swallows_telemetry_errors() -> None:
+    """Telemetry-flush failure during scaffold shutdown must not propagate."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from twinkle.server.app_scaffold import build_deployment_app
+
+    def _no_routes(app: FastAPI, get_self) -> None:
+        return None
+
+    with mock.patch('twinkle.server.telemetry.worker_init.ensure_telemetry_initialized'):
+        with mock.patch(
+                'twinkle.server.telemetry.shutdown_telemetry',
+                side_effect=RuntimeError('flush boom'),
+        ):
+            app = build_deployment_app('Test', _no_routes)
+            # Must not raise.
+            with TestClient(app):
+                pass

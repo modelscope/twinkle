@@ -75,10 +75,28 @@ class SamplerArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
+class ServerStateArgs(_ArgsBase):
+    """Typed args for the gateway's ``ServerState`` configuration.
+
+    Replaces the former untyped ``server_config: dict[str, Any] | None`` so a
+    misspelled key fails validation (``extra='forbid'``) instead of being
+    silently forwarded. Named ``ServerStateArgs`` to avoid colliding with the
+    ``ServerConfig`` aggregate root. All fields are optional (default ``None``)
+    so unset values fall back to ``ServerState``'s own defaults; the
+    operator-facing YAML key stays ``server_config``.
+    """
+
+    expiration_timeout: float | None = None
+    cleanup_interval: float | None = None
+    per_token_model_limit: int | None = None
+    metrics_update_interval: float | None = None
+    actor_name: str | None = None
+
+
 class ServerArgs(_ArgsBase):
     """Args for the gateway ``server`` deployment."""
 
-    server_config: dict[str, Any] | None = None
+    server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
     supported_models: list[Any] | None = None
     http_options: HttpOptions | None = None
     route_prefix: str | None = None
@@ -120,10 +138,11 @@ class ApplicationSpec(BaseModel):
     name: str
     route_prefix: str = '/'
     import_path: Literal['server', 'model', 'sampler', 'processor']
-    # ``args`` is filled in by the ``mode='before'`` validator below; the
-    # default of ``{}`` is only meaningful for kinds whose schema has no
-    # required fields (currently ``server``).
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs = Field(default=None)  # type: ignore[assignment]
+    # ``args`` is always populated by the ``mode='before'`` validator below
+    # (which validates the raw block against the schema selected by
+    # ``import_path`` and defaults a missing block to ``{}``), so the field is
+    # required here — the validator runs first and fills it.
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs
     deployments: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode='before')
@@ -147,8 +166,6 @@ class ApplicationSpec(BaseModel):
             return data
         if raw_args is None:
             raw_args = {}
-        if not isinstance(raw_args, dict):
-            # Non-dict, non-instance args is a hard schema error — surface
-            # it through the matching schema for a clean error message.
-            raw_args = dict(raw_args) if hasattr(raw_args, 'keys') else raw_args
+        # ``schema.model_validate`` rejects a non-dict itself with a clean
+        # error, so no separate non-dict guard is needed here.
         return {**data, 'args': schema.model_validate(raw_args)}

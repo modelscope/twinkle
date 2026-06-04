@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Property + unit tests for the Pydantic ``TaskQueueConfig``.
 
-Pins constraint enforcement, ``from_dict`` equivalence against
-``model_validate``, default-value defaulting, and that the call sites in
-model/sampler/processor apps still construct the config through
-``TaskQueueConfig.from_dict``.
+Pins constraint enforcement, default-value defaulting, and ``extra='forbid'``
+behavior. The class is constructed directly from validated YAML by
+``ApplicationSpec`` (typed end-to-end after Task 27), so there is no
+``from_dict`` revival path to exercise.
 """
 from __future__ import annotations
 
@@ -86,85 +86,30 @@ def test_property_16_valid_values_accepted(rps: float, tps: float, win: float, q
     assert cfg.max_input_tokens == mit
 
 
-# ---------- from_dict equivalence ---------------------------------------- #
-
-_INPUT_DICT_STRATEGY = st.fixed_dictionaries(
-    {},
-    optional={
-        'rps_limit': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'tps_limit': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'window_seconds': st.floats(min_value=1e-6, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'queue_timeout': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'token_cleanup_interval': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'max_input_tokens': st.integers(min_value=1, max_value=10_000_000),
-        'enabled': st.booleans(),
-        'execution_timeout': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-        'token_cleanup_multiplier': st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
-    },
-)
-
-
-@settings(max_examples=100)
-@given(payload=_INPUT_DICT_STRATEGY)
-def test_property_17_from_dict_equivalence(payload: dict) -> None:
-    """``from_dict`` returns the same instance as ``model_validate``."""
-    via_factory = TaskQueueConfig.from_dict(payload)
-    via_validate = TaskQueueConfig.model_validate(payload)
-    assert via_factory.model_dump() == via_validate.model_dump()
-
-
 # ---------- defaulting --------------------------------------------------- #
 
 
-def test_property_18_from_dict_with_no_argument() -> None:
-    """``from_dict()`` with no argument returns the documented defaults."""
-    cfg = TaskQueueConfig.from_dict()
-    for field, value in DEFAULTS.items():
-        assert getattr(cfg, field) == value, field
-
-
-def test_property_18_from_dict_with_none() -> None:
-    cfg = TaskQueueConfig.from_dict(None)
-    for field, value in DEFAULTS.items():
-        assert getattr(cfg, field) == value, field
-
-
-def test_property_18_from_dict_with_empty_dict() -> None:
-    cfg = TaskQueueConfig.from_dict({})
+def test_default_construction_uses_documented_defaults() -> None:
+    """``TaskQueueConfig()`` with no args returns the documented defaults."""
+    cfg = TaskQueueConfig()
     for field, value in DEFAULTS.items():
         assert getattr(cfg, field) == value, field
 
 
 @settings(max_examples=100)
 @given(present=st.sets(st.sampled_from(sorted(DEFAULTS.keys())), max_size=len(DEFAULTS)))
-def test_property_18_omitted_fields_take_defaults(present: set) -> None:
-    """Fields absent from the dict adopt their documented defaults."""
+def test_omitted_fields_take_defaults(present: set) -> None:
+    """Fields absent from the kwargs adopt their documented defaults."""
     payload = {f: DEFAULTS[f] for f in present}
-    cfg = TaskQueueConfig.from_dict(payload)
+    cfg = TaskQueueConfig(**payload)
     for field, value in DEFAULTS.items():
         assert getattr(cfg, field) == value, field
 
 
-# ---------- Unit: extra=forbid + call-site usage --------------------------- #
+# ---------- Unit: extra=forbid -------------------------------------------- #
 
 
 def test_extra_field_rejected() -> None:
     """``extra='forbid'`` rejects unknown keys (defends R8.2 scoped to this model)."""
     with pytest.raises(ValidationError):
-        TaskQueueConfig.from_dict({'unknown_field': 1})
-
-
-def test_call_site_imports_resolve() -> None:
-    """``TaskQueueConfig.from_dict`` is what the apps call — keep that import alive.
-
-    We don't instantiate the deployments (those need Ray Serve runtime); we just
-    confirm the call sites import the same name and the factory still produces
-    valid configs for the dicts they pass.
-    """
-    from twinkle.server.utils.task_queue import TaskQueueConfig as Exported
-
-    assert Exported is TaskQueueConfig
-    # Mimic the queue_config dicts shipped in cookbook/client/server YAMLs.
-    cfg = TaskQueueConfig.from_dict({'rps_limit': 100, 'tps_limit': 100000})
-    assert cfg.rps_limit == 100.0
-    assert cfg.tps_limit == 100000.0
+        TaskQueueConfig(unknown_field=1)

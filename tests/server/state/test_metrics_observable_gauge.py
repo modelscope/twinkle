@@ -14,7 +14,7 @@ import asyncio
 import pytest
 
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.telemetry import MetricsRegistry
 
 
@@ -53,7 +53,7 @@ async def test_four_instances_no_4x_inflation() -> None:
     against one backend, five sessions created. The leader pushes the gauge
     once and the others stay silent — the cache reads back 5, not 20.
     """
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     instances = [ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.5) for _ in range(4)]
     try:
         for s in instances:
@@ -85,7 +85,7 @@ async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
     """
     from twinkle.server.state.server_state import LEADER_KEY
 
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     a = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
     b = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
     try:

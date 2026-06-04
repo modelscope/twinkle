@@ -45,7 +45,7 @@ def ray_cluster():
     Bypasses ``twinkle.server.launcher`` (which would normally inject
     ``TWINKLE_PERSISTENCE_*`` into the cluster), so we mirror that injection
     by hand into both ``os.environ`` and ``ray.init(runtime_env=...)``.
-    Without it, each replica defaults to ``MemoryBackend`` and the tinker
+    Without it, each replica defaults to ``RayActorBackend`` and the tinker
     future flow can't resolve across replicas.
     """
     import ray
@@ -98,7 +98,7 @@ def _http(url: str, method: str = 'GET', json: dict | None = None) -> httpx.Resp
 def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> None:
     from ray import serve
 
-    from twinkle.server.gateway import build_server_app
+    from twinkle.server.gateway import build_gateway_app
     from twinkle.server.model import build_model_app
     from twinkle.server.sampler import build_sampler_app
 
@@ -112,13 +112,19 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
     started = time.monotonic()
     deploys: list[tuple[str, str]] = []
     builders = {
-        'server': build_server_app,
+        'server': build_gateway_app,
         'model': build_model_app,
         'sampler': build_sampler_app,
     }
     for app_spec in cfg.applications:
         builder = builders[app_spec.import_path]
-        args = app_spec.args.model_dump(mode='python', exclude_none=True)
+        # Shallow-dump so nested typed models (notably ``queue_config``) stay as
+        # ``TaskQueueConfig`` instances instead of being serialized back to a
+        # dict — this mirrors what the production launcher does at
+        # ``launcher/server_launcher.py:161`` and is required since the
+        # builders + deployment ``__init__`` accept ``TaskQueueConfig`` directly
+        # (Task 27 removed the ``from_dict`` revival path).
+        args = {k: v for k, v in dict(app_spec.args).items() if v is not None}
         if app_spec.import_path == 'server':
             # Gateway's ServiceProxy reads http_options.port to build internal
             # proxy targets; the fixture hard-codes 8000 but the test runs on
@@ -127,14 +133,20 @@ def test_mock_mode_reaches_ready_under_30s_and_is_deterministic(ray_cluster) -> 
             http_opts['host'] = host
             http_opts['port'] = port
             args.setdefault('http_options', http_opts)
-        # Strip ray_actor_options runtime_env to keep the test light.
-        deploy_options: dict = {}
+        # Strip ray_actor_options runtime_env to keep the test light, BUT keep
+        # ``num_cpus`` low so the three deployments fit on a small local Ray
+        # cluster — Ray Serve defaults to ``num_cpus=1`` per replica when the
+        # field is absent, so without this each replica would need a full CPU
+        # and the cluster (2 CPUs after ``ignore_reinit_error=True`` silently
+        # accepts the existing one) would deadlock waiting for resources.
+        deploy_options: dict = {'ray_actor_options': {'num_cpus': 0.1}}
         for raw in app_spec.deployments:
             if isinstance(raw, dict):
                 deploy_options = {
                     k: v
                     for k, v in raw.items() if k not in ('name', 'ray_actor_options', 'autoscaling_config')
                 }
+                deploy_options['ray_actor_options'] = {'num_cpus': 0.1}
                 break
         bound = builder(deploy_options=deploy_options, **args)
         serve.run(bound, name=app_spec.name, route_prefix=app_spec.route_prefix)

@@ -1,4 +1,4 @@
-"""Isolated test for the ``ray.is_initialized()`` guard inside MemoryBackend.
+"""Isolated test for the ``ray.is_initialized()`` guard inside RayActorBackend.
 
 The test has to tear the Ray runtime down to verify the guard, which would
 clobber every other server-side test running in the same session if it

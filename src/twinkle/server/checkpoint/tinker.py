@@ -8,7 +8,7 @@ from datetime import datetime
 from tinker import types as tinker_types
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.utils.checkpoint_base import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
+from twinkle.server.checkpoint.base import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
 
 
 class TinkerTrainingRunManager(BaseTrainingRunManager):

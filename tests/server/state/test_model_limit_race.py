@@ -13,12 +13,12 @@ import asyncio
 import pytest
 
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 
 @pytest.mark.asyncio
 async def test_concurrent_adds_same_token_respect_limit() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     limit = 5
     state = ServerState(backend=backend, per_token_model_limit=limit)
 
@@ -44,7 +44,7 @@ async def test_concurrent_adds_same_token_respect_limit() -> None:
 
 @pytest.mark.asyncio
 async def test_remove_frees_token_slot() -> None:
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, per_token_model_limit=1)
 
     await state.register_model({'base_model': 'b'}, token='tok', model_id='m1')
@@ -63,7 +63,7 @@ async def test_remove_frees_token_slot() -> None:
 async def test_rebuild_indexes_recovers_counter_from_records() -> None:
     """The per-token counter is rebuilt from the persisted records on start, so
     a stale/cleared counter is corrected rather than blocking or over-counting."""
-    backend = MemoryBackend()
+    backend = RayActorBackend()
     state = ServerState(backend=backend, per_token_model_limit=3)
 
     await state.register_model({'base_model': 'b'}, token='tok', model_id='m1')

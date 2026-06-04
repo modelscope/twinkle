@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import pydantic
 import typer
 import yaml
 from pathlib import Path
@@ -62,7 +63,9 @@ def _load_config(path: Path) -> ServerConfig:
     except ConfigParseError as e:
         typer.echo(f'error: {e}', err=True)
         raise typer.Exit(code=2)
-    except Exception as e:  # pydantic.ValidationError + cross-field
+    except pydantic.ValidationError as e:
+        # Narrowed from a bare ``except Exception`` so unrelated errors are not
+        # mislabelled as "invalid configuration".
         typer.echo(f'error: invalid configuration\n{e}', err=True)
         raise typer.Exit(code=2)
 
@@ -77,11 +80,10 @@ def launch_cmd(
 
     # Defer the heavy launcher import until after config validation so the
     # failure path stays cheap (and a missing Ray install doesn't block
-    # `check-config`).
-    from twinkle.server.launcher import ServerLauncher
+    # `check-config`). ``launch_server`` is the single launch choke point.
+    from twinkle.server.launcher import launch_server
 
-    launcher = ServerLauncher(config=cfg, ray_namespace=namespace or cfg.ray_namespace)
-    launcher.launch()
+    launch_server(config=cfg, ray_namespace=namespace or cfg.ray_namespace)
 
 
 @app.command('check-config')
@@ -97,6 +99,8 @@ def print_config_cmd(
         fmt: str = typer.Option('yaml', '--format', envvar='TWINKLE_PRINT_FORMAT', help='yaml|json'),
 ) -> None:
     """Emit the validated, normalized ``ServerConfig`` as YAML or JSON."""
+    if fmt not in ('yaml', 'json'):
+        raise typer.BadParameter("must be 'yaml' or 'json'", param_hint='--format')
     cfg = _load_config(config)
     payload = cfg.to_yaml_dict()
     if fmt == 'json':

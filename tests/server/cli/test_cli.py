@@ -65,6 +65,14 @@ def test_print_config_round_trip(tmp_path: Path) -> None:
     assert rebuilt == original
 
 
+def test_print_config_rejects_unknown_format() -> None:
+    """``--format=xml`` is rejected instead of silently emitting YAML (R29.4)."""
+    runner = CliRunner()
+    res = runner.invoke(app, ['print-config', '--config', str(EXAMPLE), '--format', 'xml'])
+    assert res.exit_code != 0
+    assert 'format' in res.output.lower()
+
+
 # ---------- env-var override --------------------------------------------- #
 
 

@@ -70,7 +70,7 @@ class ServerState:
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
             cleanup_interval: float = 3600.0,  # 1 hour in seconds
             per_token_model_limit: int = 30,
-            **kwargs) -> None:
+            metrics_update_interval: float = 15.0) -> None:
         if backend is not None:
             self._backend: StateBackend = backend
         else:
@@ -87,16 +87,16 @@ class ServerState:
         self._cleanup_running = False
 
         # Leader election + metrics-publish loop state. ``metrics_update_interval``
-        # is accepted for back-compat with deployment configs that pass it;
-        # the value still controls how often the leader pushes counts into the
-        # MetricsRegistry cache.
+        # is a typed parameter (a misspelled key now fails loudly rather than
+        # being silently ignored); it controls how often the leader pushes counts
+        # into the MetricsRegistry cache.
         self._leader_id = uuid.uuid4().hex
         self._is_leader = False
         self._leader_task: asyncio.Task | None = None
         self._leader_running = False
         self._metrics_publish_task: asyncio.Task | None = None
         self._metrics_publish_running = False
-        self._metrics_update_interval: float = float(kwargs.get('metrics_update_interval', 15.0))
+        self._metrics_update_interval: float = float(metrics_update_interval)
 
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
@@ -582,7 +582,10 @@ _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 def get_server_state(actor_name: str = 'twinkle_server_state',
                      backend: StateBackend | None = None,
                      persistence_config: PersistenceConfig | None = None,
-                     **kwargs) -> ServerState:
+                     expiration_timeout: float = 86400.0,
+                     cleanup_interval: float = 3600.0,
+                     per_token_model_limit: int = 30,
+                     metrics_update_interval: float = 15.0) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
     Within one process the same ``actor_name`` returns the same cached instance
@@ -598,8 +601,10 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
             :func:`create_backend`.
         persistence_config: Optional :class:`PersistenceConfig`. Accepted as a
             raw dict for YAML compatibility.
-        **kwargs: Forwarded to the :class:`ServerState` constructor
-            (``expiration_timeout``, ``cleanup_interval``, ...).
+        expiration_timeout: Forwarded to :class:`ServerState`.
+        cleanup_interval: Forwarded to :class:`ServerState`.
+        per_token_model_limit: Forwarded to :class:`ServerState`.
+        metrics_update_interval: Forwarded to :class:`ServerState`.
     """
     if isinstance(persistence_config, dict):
         persistence_config = PersistenceConfig(**persistence_config)
@@ -614,7 +619,10 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     state = ServerState(
         backend=backend,
         persistence_config=persistence_config,
-        **kwargs,
+        expiration_timeout=expiration_timeout,
+        cleanup_interval=cleanup_interval,
+        per_token_model_limit=per_token_model_limit,
+        metrics_update_interval=metrics_update_interval,
     )
     _PROCESS_STATE_CACHE[actor_name] = state
     # Cleanup task is started by the deployment's FastAPI ``lifespan`` hook

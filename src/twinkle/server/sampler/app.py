@@ -7,19 +7,17 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.exceptions import ConfigError
+from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.metrics import create_metrics_middleware
+from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request, verify_request_token
+from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 from ..utils import wrap_builder_with_device_group_env
 from .tinker_handlers import _register_tinker_sampler_routes
@@ -27,42 +25,42 @@ from .twinkle_handlers import _register_twinkle_sampler_routes
 
 logger = get_logger()
 
-_SAMPLER_TYPES: tuple[str, ...] = ('mock', 'vllm', 'torch')
+
+def _make_mock_sampler(kw: dict[str, Any]) -> Any:
+    from .backends.mock_sampler import MockSampler
+
+    # Forward ctor kwargs verbatim; MockSampler keeps model_id/seed/vocab_size
+    # and logs any unknown keys at DEBUG (so a real-backend signature drift is
+    # visible in the mock e2e instead of being silently stripped here).
+    return MockSampler(**kw)
 
 
-def _validate_sampler_type(sampler_type: Any) -> str:
-    """Pure validation of the ``sampler_type`` selector.
-
-    Raises :class:`ConfigError` (naming the field, value, and allowed set)
-    when the value is missing, empty, non-string, or not exactly one of the
-    permitted values. No imports or side effects.
-    """
-    if (not isinstance(sampler_type, str) or sampler_type == '' or sampler_type not in _SAMPLER_TYPES):
-        raise ConfigError(field='sampler_type', value=sampler_type, allowed=list(_SAMPLER_TYPES))
-    return sampler_type
-
-
-def _dispatch_sampler_backend(sampler_type: str, ctor_kwargs: dict[str, Any]) -> Any:
-    """Instantiate the sampler selected by an already-validated ``sampler_type``."""
-    if sampler_type == 'mock':
-        from .backends.mock_sampler import MockSampler
-
-        # MockSampler accepts only model_id/seed/vocab_size — strip extras silently.
-        return MockSampler(
-            model_id=ctor_kwargs.get('model_id'),
-            seed=ctor_kwargs.get('seed', 0),
-            vocab_size=ctor_kwargs.get('vocab_size', 32),
-        )
-    if sampler_type == 'torch':
-        from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
-
-        return TorchSampler(**ctor_kwargs)
+def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
     from twinkle.sampler import vLLMSampler
 
-    return vLLMSampler(**ctor_kwargs)
+    return vLLMSampler(**kw)
 
 
-class SamplerManagement(TaskQueueMixin):
+def _make_torch_sampler(kw: dict[str, Any]) -> Any:
+    from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
+
+    return TorchSampler(**kw)
+
+
+# Single validate-then-dispatch selector for the sampler backend. Insertion
+# order defines the reported permitted set; lazy imports stay local to the
+# callbacks so a CPU-only host never pulls in vllm/torch.
+SAMPLER_SELECTOR = BackendSelector(
+    'sampler_type',
+    {
+        'mock': _make_mock_sampler,
+        'vllm': _make_vllm_sampler,
+        'torch': _make_torch_sampler,
+    },
+)
+
+
+class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     """Unified sampler management service.
 
     Manages:
@@ -79,10 +77,10 @@ class SamplerManagement(TaskQueueMixin):
                  device_mesh: dict[str, Any],
                  sampler_type: str,
                  engine_args: dict[str, Any] | None = None,
-                 queue_config: dict[str, Any] | None = None,
+                 queue_config: TaskQueueConfig | None = None,
                  **kwargs):
         # Validate ``sampler_type`` BEFORE any side effect.
-        sampler_type = _validate_sampler_type(sampler_type)
+        sampler_type = SAMPLER_SELECTOR.validate(sampler_type)
         # Skip twinkle.initialize for the mock backend — start without
         # CUDA/torch/vllm.
         if sampler_type != 'mock':
@@ -117,12 +115,17 @@ class SamplerManagement(TaskQueueMixin):
                     for k, v in kwargs.items() if k not in ('engine_args', )
                 },
             )
-        self.sampler = _dispatch_sampler_backend(sampler_type, sampler_kwargs)
+        else:
+            # Forward extra ctor kwargs verbatim to the mock backend so a real-
+            # backend signature drift surfaces as a visible DEBUG log there
+            # instead of being silently stripped at the dispatch boundary.
+            sampler_kwargs.update(kwargs)
+        self.sampler = SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
 
         self.state: ServerState = get_server_state()
 
         # Initialize task queue mixin
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Sampler')
+        self._init_task_queue(queue_config, deployment_name='Sampler')
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -131,21 +134,6 @@ class SamplerManagement(TaskQueueMixin):
     async def _ensure_sticky(self):
         sticky_key = serve.get_multiplexed_model_id()
         await self._sticky_entry(sticky_key)
-
-    async def _ensure_state_cleanup_started(self) -> None:
-        """Start ServerState cleanup + metrics loops on the first request.
-
-        See the matching helper in ``model/app.py`` for the lifespan-timing
-        rationale: ``servable_object`` is unbound during lifespan, so we lazy-
-        init here.
-        """
-        if getattr(self, '_state_cleanup_started', False):
-            return
-        try:
-            await self.state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
-        self._state_cleanup_started = True
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
@@ -161,7 +149,7 @@ def build_sampler_app(model_id: str,
                       deploy_options: dict[str, Any],
                       sampler_type: str,
                       engine_args: dict[str, Any] | None = None,
-                      queue_config: dict[str, Any] | None = None,
+                      queue_config: TaskQueueConfig | None = None,
                       **kwargs):
     """Build a unified sampler application for text generation inference.
 
@@ -178,60 +166,40 @@ def build_sampler_app(model_id: str,
             R3.10). Validated up front; bad values raise :class:`ConfigError`
             before any side effect.
         engine_args: Additional engine arguments for the sampler
-        queue_config: Task queue configuration dict (rps_limit, tps_limit, etc.)
+        queue_config: Validated :class:`TaskQueueConfig` (rps_limit, tps_limit, etc.)
         **kwargs: Additional arguments passed to the sampler
 
     Returns:
         Ray Serve deployment bound with configuration
     """
     # Fail fast at builder time on bad sampler_type values.
-    sampler_type = _validate_sampler_type(sampler_type)
+    sampler_type = SAMPLER_SELECTOR.validate(sampler_type)
 
-    # Build the FastAPI app and register all routes BEFORE serve.ingress so that
-    # the frozen app contains the complete route table (visible to ProxyActor).
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. The Sampler passes its FastAPI
+    # title/description/version through ``fastapi_kwargs``.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_tinker_sampler_routes(app, get_self)
+        _register_twinkle_sampler_routes(app, get_self)
 
-    def get_self() -> SamplerManagement:
-        return serve.get_replica_context().servable_object
+    app = build_deployment_app(
+        'Sampler',
+        register_routes,
+        fastapi_kwargs={
+            'title': 'Unified Sampler',
+            'description': 'REST API for distributed text generation inference (Tinker + Twinkle)',
+            'version': '1.0.0',
+        },
+    )
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        # Initialize telemetry in worker process (after deserialization)
-        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
-        ensure_telemetry_initialized()
-        # NOTE: ``state.start_cleanup_task()`` cannot run here — Ray Serve binds
-        # ``servable_object`` AFTER lifespan startup. Lazy-started from the
-        # first request via ``_on_request_start`` → ``_ensure_state_cleanup_started``.
-        yield
-        # Flush buffered OTLP batches on graceful replica termination.
-        import asyncio
-
-        from twinkle.server.telemetry import flush_telemetry_safely
-        await asyncio.to_thread(flush_telemetry_safely)
-
-    app = FastAPI(
-        title='Unified Sampler',
-        description='REST API for distributed text generation inference (Tinker + Twinkle)',
-        version='1.0.0',
-        lifespan=lifespan)
-
-    @app.middleware('http')
-    async def verify_token(request: Request, call_next):
-        return await verify_request_token(request=request, call_next=call_next)
-
-    # Registration order: FastAPI runs middleware LIFO. Tracing first → metrics
-    # last makes metrics the outermost wrapper, so its latency observation
-    # covers the full request path including tracing overhead.
-    app.middleware('http')(create_tracing_middleware('Sampler'))
-    app.middleware('http')(create_metrics_middleware('Sampler'))
-
-    # Register routes BEFORE @serve.ingress so Ray Serve captures them at decoration time
-    _register_tinker_sampler_routes(app, get_self)
-    _register_twinkle_sampler_routes(app, get_self)
-
-    SamplerManagementWithIngress = serve.ingress(app)(SamplerManagement)
-    DeploymentClass = serve.deployment(name='SamplerManagement')(SamplerManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(model_id, nproc_per_node, device_group, device_mesh,
-                                                          sampler_type, engine_args, queue_config, **kwargs)
+    return bind_deployment(
+        app,
+        SamplerManagement,
+        deploy_options,
+        deployment_name='SamplerManagement',
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config),
+        bind_kwargs=kwargs,
+    )
 
 
 build_sampler_app = wrap_builder_with_device_group_env(build_sampler_app)

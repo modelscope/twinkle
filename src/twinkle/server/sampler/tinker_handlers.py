@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .app import SamplerManagement
 
 from twinkle.data_format import SamplingParams
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 

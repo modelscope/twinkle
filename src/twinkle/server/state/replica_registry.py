@@ -2,7 +2,7 @@
 """Backend-backed registry of replica capacity.
 
 Each entry persists to ``replica::<replica_id>::max_loras`` in the configured
-:class:`StateBackend` (Redis or the actor-wrapped MemoryBackend), so every
+:class:`StateBackend` (Redis or the actor-wrapped RayActorBackend), so every
 Ray Serve worker sees one consistent view of the cluster's capacity even
 though each worker holds its own ``ServerState`` instance.
 

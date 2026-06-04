@@ -8,22 +8,22 @@ import tempfile
 
 from twinkle.server.state.backend.factory import PersistenceConfig, create_backend
 from twinkle.server.state.backend.file_backend import FileBackend
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 # ---- Memory Mode ----
 
 
 def test_create_backend_none_returns_memory():
-    """Passing None should return MemoryBackend (default mode)."""
+    """Passing None should return RayActorBackend (default mode)."""
     backend = create_backend(None)
-    assert isinstance(backend, MemoryBackend)
+    assert isinstance(backend, RayActorBackend)
 
 
 def test_create_backend_memory_mode():
-    """Explicit memory mode should return MemoryBackend backed by a detached actor."""
+    """Explicit memory mode should return RayActorBackend backed by a detached actor."""
     config = PersistenceConfig(mode='memory')
     backend = create_backend(config)
-    assert isinstance(backend, MemoryBackend)
+    assert isinstance(backend, RayActorBackend)
     # The detached actor must exist so that other workers in the same Ray
     # cluster forward through the same canonical store.
     assert ray.get_actor('twinkle_state_actor') is not None
@@ -34,7 +34,7 @@ def test_create_backend_memory_mode_namespaced_by_prefix():
     when multiple Twinkle deployments share one Ray cluster."""
     config = PersistenceConfig(mode='memory', key_prefix='ns1')
     backend = create_backend(config)
-    assert isinstance(backend, MemoryBackend)
+    assert isinstance(backend, RayActorBackend)
     assert ray.get_actor('twinkle_state_actor::ns1') is not None
 
 

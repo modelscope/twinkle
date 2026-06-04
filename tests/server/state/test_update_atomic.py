@@ -23,7 +23,7 @@ import uuid
 from typing import Any
 
 from twinkle.server.state.backend.file_backend import FileBackend
-from twinkle.server.state.backend.memory_backend import MemoryBackend
+from twinkle.server.state.backend.memory_backend import RayActorBackend
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
@@ -85,8 +85,8 @@ def _redis_backend():
 
 
 @pytest.fixture
-def memory_backend() -> MemoryBackend:
-    return MemoryBackend()
+def memory_backend() -> RayActorBackend:
+    return RayActorBackend()
 
 
 @pytest.fixture

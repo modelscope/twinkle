@@ -20,8 +20,10 @@ class ConfigManager:
     storage is delegated to the injected backend.
 
     Methods are ``async`` because :class:`StateBackend` operations are async.
-    ConfigManager is expected to run inside a single-threaded Ray Actor, so
-    there is no need to add additional locking on top of the backend.
+    Atomicity for read-modify-write entries comes from the backend's own
+    primitives (``set_nx`` / ``update_atomic``), not from any single-threaded
+    actor assumption — each worker holds its own ``ConfigManager`` bound to the
+    shared backend, so no additional locking is layered on top of the backend.
     """
 
     def __init__(self, backend: StateBackend) -> None:

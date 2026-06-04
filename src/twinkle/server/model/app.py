@@ -7,7 +7,6 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
@@ -15,13 +14,12 @@ from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
-from twinkle.server.exceptions import ConfigError
+from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.telemetry.tracing import create_tracing_middleware
+from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
-from twinkle.server.utils.metrics import create_metrics_middleware
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.utils.validation import get_token_from_request, verify_request_token
+from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
 from ..common.router import StickyLoraRequestRouter
 from ..utils import wrap_builder_with_device_group_env
@@ -30,37 +28,39 @@ from .twinkle_handlers import _register_twinkle_routes
 
 logger = get_logger()
 
-_MODEL_BACKENDS: tuple[str, ...] = ('mock', 'transformers', 'megatron')
+
+def _make_mock_model(kw: dict[str, Any]) -> Any:
+    from .backends.mock_model import TwinkleCompatMockModel
+
+    return TwinkleCompatMockModel(**kw)
 
 
-def _validate_model_backend(backend: Any) -> str:
-    """Pure validation of the ``backend`` selector.
-
-    Raises :class:`ConfigError` (naming the field, value, and allowed set)
-    when ``backend`` is missing, empty, non-string, or not exactly one of
-    the permitted values. No imports or side effects.
-    """
-    if not isinstance(backend, str) or backend == '' or backend not in _MODEL_BACKENDS:
-        raise ConfigError(field='backend', value=backend, allowed=list(_MODEL_BACKENDS))
-    return backend
-
-
-def _dispatch_model_backend(backend: str, ctor_kwargs: dict[str, Any]) -> Any:
-    """Instantiate the model backend selected by an already-validated ``backend``."""
-    if backend == 'mock':
-        from .backends.mock_model import TwinkleCompatMockModel
-
-        return TwinkleCompatMockModel(**ctor_kwargs)
-    if backend == 'megatron':
-        from .backends.megatron_model import TwinkleCompatMegatronModel
-
-        return TwinkleCompatMegatronModel(**ctor_kwargs)
+def _make_transformers_model(kw: dict[str, Any]) -> Any:
     from .backends.transformers_model import TwinkleCompatTransformersModel
 
-    return TwinkleCompatTransformersModel(**ctor_kwargs)
+    return TwinkleCompatTransformersModel(**kw)
 
 
-class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
+def _make_megatron_model(kw: dict[str, Any]) -> Any:
+    from .backends.megatron_model import TwinkleCompatMegatronModel
+
+    return TwinkleCompatMegatronModel(**kw)
+
+
+# Single validate-then-dispatch selector for the model backend. Insertion order
+# defines the reported permitted set; the lazy imports stay local to the
+# callbacks so a CPU-only host never pulls in torch/megatron.
+MODEL_SELECTOR = BackendSelector(
+    'backend',
+    {
+        'mock': _make_mock_model,
+        'transformers': _make_transformers_model,
+        'megatron': _make_megatron_model,
+    },
+)
+
+
+class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     """Unified model management service.
 
     Handles:
@@ -78,12 +78,12 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                  device_mesh: dict[str, Any],
                  backend: str,
                  adapter_config: dict[str, Any] | None = None,
-                 queue_config: dict[str, Any] | None = None,
+                 queue_config: TaskQueueConfig | None = None,
                  **kwargs):
         # Validate ``backend`` BEFORE any side effect (twinkle.initialize,
         # DeviceGroup construction, replica registration) so an invalid value
         # never produces a partial backend nor reaches a ready state.
-        backend = _validate_model_backend(backend)
+        backend = MODEL_SELECTOR.validate(backend)
         self.backend = backend
         # Skip twinkle.initialize for the mock backend — the largest
         # startup-time saving and the only way to start without CUDA/torch.
@@ -113,13 +113,13 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
                 remote_group=self.device_group.name,
                 instance_id=self.replica_id,
             )
-        self.model = _dispatch_model_backend(backend, ctor_kwargs)
+        self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
 
         self.state: ServerState = get_server_state()
         self._replica_registered = False
 
         # Initialize mixins
-        self._init_task_queue(TaskQueueConfig.from_dict(queue_config), deployment_name='Model')
+        self._init_task_queue(queue_config, deployment_name='Model')
         self._init_adapter_manager(**(adapter_config or {}))
         # Note: countdown task is started lazily in _ensure_sticky()
 
@@ -138,24 +138,6 @@ class ModelManagement(TaskQueueMixin, AdapterManagerMixin):
         if not self._replica_registered:
             await self.state.register_replica(self.replica_id, self.max_loras)
             self._replica_registered = True
-
-    async def _ensure_state_cleanup_started(self) -> None:
-        """Start ServerState cleanup + metrics loops on the first request.
-
-        Cannot run in FastAPI ``lifespan``: Ray Serve binds
-        ``serve.get_replica_context().servable_object`` AFTER the lifespan
-        startup phase, so a lifespan call has no ``self`` to reach. By the
-        time a request arrives, the binding exists. ``state.start_cleanup_task``
-        is itself idempotent via ``_cleanup_running``, but the per-instance
-        flag avoids the await on every subsequent request.
-        """
-        if getattr(self, '_state_cleanup_started', False):
-            return
-        try:
-            await self.state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
-        self._state_cleanup_started = True
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -200,7 +182,7 @@ def build_model_app(model_id: str,
                     deploy_options: dict[str, Any],
                     backend: str,
                     adapter_config: dict[str, Any] | None = None,
-                    queue_config: dict[str, Any] | None = None,
+                    queue_config: TaskQueueConfig | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -224,66 +206,29 @@ def build_model_app(model_id: str,
     """
     # Fail fast on bad backend values at builder time (the launcher imports
     # this builder at startup, so the error surfaces before deployment).
-    backend = _validate_model_backend(backend)
+    backend = MODEL_SELECTOR.validate(backend)
 
-    # Build the FastAPI app and register all routes BEFORE serve.ingress so that
-    # the frozen app contains the complete route table (visible to ProxyActor).
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. The Model passes its ``shutdown()``
+    # teardown via ``on_shutdown`` and its sticky-LoRA router via
+    # ``request_router_config``.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_tinker_routes(app, get_self)
+        _register_twinkle_routes(app, get_self)
 
-    def get_self() -> ModelManagement:
-        return serve.get_replica_context().servable_object
+    async def _on_shutdown(servable: Any) -> None:
+        await servable.shutdown()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        # Initialize telemetry in worker process (after deserialization)
-        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
-        ensure_telemetry_initialized()
-        # NOTE: ``state.start_cleanup_task()`` and ``_ensure_replica_registered()``
-        # cannot run here — Ray Serve binds ``servable_object`` AFTER lifespan
-        # startup, so ``get_self()`` returns ``None`` and the call would crash.
-        # They are lazy-started from the first request via
-        # ``_on_request_start`` → ``_ensure_state_cleanup_started`` and
-        # ``_ensure_replica_registered`` respectively.
-        yield
-        try:
-            await get_self().shutdown()
-        except Exception:
-            pass
-        # Flush buffered OTLP batches on graceful replica termination.
-        import asyncio
+    app = build_deployment_app('Model', register_routes, on_shutdown=_on_shutdown)
 
-        from twinkle.server.telemetry import flush_telemetry_safely
-        await asyncio.to_thread(flush_telemetry_safely)
-
-    app = FastAPI(lifespan=lifespan)
-
-    @app.middleware('http')
-    async def verify_token(request: Request, call_next):
-        return await verify_request_token(request=request, call_next=call_next)
-
-    # Registration order: FastAPI runs middleware LIFO. Tracing first → metrics
-    # last makes metrics the outermost wrapper, so its latency observation
-    # covers the full request path including tracing overhead.
-    app.middleware('http')(create_tracing_middleware('Model'))
-    app.middleware('http')(create_metrics_middleware('Model'))
-
-    _register_tinker_routes(app, get_self)
-    _register_twinkle_routes(app, get_self)
-
-    ModelManagementWithIngress = serve.ingress(app)(ModelManagement)
-    DeploymentClass = serve.deployment(
-        name='ModelManagement',
+    return bind_deployment(
+        app,
+        ModelManagement,
+        deploy_options,
+        deployment_name='ModelManagement',
         request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
-    )(
-        ModelManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(
-        model_id,
-        nproc_per_node,
-        device_group,
-        device_mesh,
-        backend,
-        adapter_config,
-        queue_config,
-        **kwargs,
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config),
+        bind_kwargs=kwargs,
     )
 
 

@@ -95,7 +95,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
-                from twinkle.server.common.checkpoint_factory import create_checkpoint_manager
+                from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
                 # Reset prefix cache only when new weights are loaded

@@ -14,24 +14,21 @@ Follows the same structural pattern as model/app.py:
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from ray import serve
 from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.lifecycle import ProcessorManagerMixin
-from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.validation import verify_request_token
 from .twinkle_handlers import _register_processor_routes
 
 logger = get_logger()
 
 
-class ProcessorManagement(ProcessorManagerMixin):
+class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
     """Processor management service.
 
     Manages lifecycle and invocation of distributed processor objects
@@ -85,21 +82,6 @@ class ProcessorManagement(ProcessorManagerMixin):
         self._ensure_countdown_started()
         await self._ensure_state_cleanup_started()
 
-    async def _ensure_state_cleanup_started(self) -> None:
-        """Start ServerState cleanup + metrics loops on the first request.
-
-        See ``model/app.py``: ``servable_object`` is unbound during lifespan,
-        so we lazy-init here. Processor has no ``_on_request_start`` hook;
-        every routed request flows through ``_ensure_sticky`` first.
-        """
-        if getattr(self, '_state_cleanup_started', False):
-            return
-        try:
-            await self.state.start_cleanup_task()
-        except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
-        self._state_cleanup_started = True
-
     def _on_processor_expired(self, processor_id: str) -> None:
         """Called by the countdown thread when a processor's session expires."""
         self.resource_dict.pop(processor_id, None)
@@ -136,42 +118,18 @@ def build_processor_app(ncpu_proc_per_node: int,
         Ray Serve deployment bound with configuration.
     """
 
-    # Build the FastAPI app and register all routes BEFORE serve.ingress so that
-    # the frozen app contains the complete route table (visible to ProxyActor).
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. No per-builder copy of the lifespan /
+    # middleware construction remains here.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_processor_routes(app, get_self)
 
-    def get_self() -> ProcessorManagement:
-        return serve.get_replica_context().servable_object
+    app = build_deployment_app('Processor', register_routes)
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        # Initialize telemetry in worker process (after deserialization)
-        from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
-        ensure_telemetry_initialized()
-        # NOTE: ``state.start_cleanup_task()`` cannot run here — Ray Serve binds
-        # ``servable_object`` AFTER lifespan startup. Lazy-started from the
-        # first request via ``_ensure_sticky`` → ``_ensure_state_cleanup_started``.
-        yield
-        # Flush buffered OTLP batches on graceful replica termination.
-        import asyncio
-
-        from twinkle.server.telemetry import flush_telemetry_safely
-        await asyncio.to_thread(flush_telemetry_safely)
-
-    app = FastAPI(lifespan=lifespan)
-
-    @app.middleware('http')
-    async def verify_token(request: Request, call_next):
-        return await verify_request_token(request=request, call_next=call_next)
-
-    # Registration order: FastAPI runs middleware LIFO. Tracing first → metrics
-    # last makes metrics the outermost wrapper, so its latency observation
-    # covers the full request path including tracing overhead.
-    app.middleware('http')(create_tracing_middleware('Processor'))
-    app.middleware('http')(create_metrics_middleware('Processor'))
-
-    _register_processor_routes(app, get_self)
-
-    ProcessorManagementWithIngress = serve.ingress(app)(ProcessorManagement)
-    DeploymentClass = serve.deployment(name='ProcessorManagement')(ProcessorManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(ncpu_proc_per_node, device_group, device_mesh, nproc_per_node,
-                                                          processor_config)
+    return bind_deployment(
+        app,
+        ProcessorManagement,
+        deploy_options,
+        deployment_name='ProcessorManagement',
+        bind_args=(ncpu_proc_per_node, device_group, device_mesh, nproc_per_node, processor_config),
+    )
