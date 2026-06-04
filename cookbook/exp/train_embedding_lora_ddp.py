@@ -16,6 +16,7 @@ the script is backend-agnostic.
 Launch:
     python cookbook/exp/train_embedding_lora_ddp.py
 """
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,7 @@ from twinkle.metric import EmbeddingMetric
 from twinkle.processor import InputProcessor
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Template
+from twinkle.utils.parallel import PosixFileLock
 
 # allow importing the sibling dataset_think module without packaging
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -79,6 +81,34 @@ COMPRESS_TOP_P = 0.5
 COMPRESS_MAX_MODEL_LEN = 32768
 
 OUTPUT_DIR = f'./output/embedding_lora_{BACKEND}'
+RESPONSE_LOG = os.environ.get('RESPONSE_LOG', f'./output/embedding_lora_{BACKEND}/responses.jsonl')
+
+_response_lock: Optional[PosixFileLock] = None
+
+
+def _log_responses(query_resp, cot_resp, idx: int, query_raw: str = '', cot_raw: str = ''):
+    """Append a (query_compressed, cot_compressed) pair to the JSONL log file.
+
+    Uses PosixFileLock for multi-process safety.
+    """
+    global _response_lock
+    if _response_lock is None:
+        os.makedirs(os.path.dirname(RESPONSE_LOG) or '.', exist_ok=True)
+        _response_lock = PosixFileLock(RESPONSE_LOG + '.lock')
+
+    q_seq = query_resp.sequences[0] if query_resp.sequences else None
+    c_seq = cot_resp.sequences[0] if cot_resp.sequences else None
+    record = {
+        'idx': idx,
+        'query_raw': query_raw,
+        'cot_raw': cot_raw,
+        'query_compressed': q_seq.decoded if q_seq else None,
+        'cot_compressed': c_seq.decoded if c_seq else None,
+    }
+    line = json.dumps(record, ensure_ascii=False, default=str) + '\n'
+    with _response_lock:
+        with open(RESPONSE_LOG, 'a', encoding='utf-8') as f:
+            f.write(line)
 
 # Production CM-v2 prompt (kept verbatim — same as cookbook/sample/sample.py).
 CONDENSER_SYSTEM = """You are a text compression assistant. A downstream model will read your compressed output to decide whether the detail it needs is inside this block; if yes, it will fetch and read the original passage.
@@ -199,17 +229,19 @@ def _extract_query_cot(row: Dict[str, Any]):
 def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
     """Build prompts for compressing both query and cot per row.
 
-    Returns (prompts, valid_indices) where prompts is flat-interleaved
-    [query_0, cot_0, query_1, cot_1, ...] and valid_indices tracks which
-    rows passed the min-length filter.
+    Returns (prompts, valid_indices, raw_pairs) where prompts is flat-interleaved
+    [query_0, cot_0, query_1, cot_1, ...], valid_indices tracks which
+    rows passed the min-length filter, and raw_pairs is [(query, cot), ...].
     """
     prompts: List[Dict[str, Any]] = []
     valid_indices: List[int] = []
+    raw_pairs: List[tuple] = []
     for i, row in enumerate(rows):
         query, cot = _extract_query_cot(row)
         if not query or len(cot) < MIN_COT_CHARS:
             continue
         valid_indices.append(i)
+        raw_pairs.append((query, cot))
         for text, qtpl in ((query, EMBED_QUERY_Q), (cot, EMBED_QUERY_COT)):
             budget = max(1, int(len(text) / COMPRESS_RATIO))
             user = CONDENSER_USER.format(query=qtpl, budget=budget, text=text)
@@ -217,7 +249,7 @@ def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
                 {'role': 'system', 'content': CONDENSER_SYSTEM},
                 {'role': 'user', 'content': user},
             ]})
-    return prompts, valid_indices
+    return prompts, valid_indices, raw_pairs
 
 
 def _get_first_feature(response, template: Template, role: str) -> Optional[Dict[str, Any]]:
@@ -250,7 +282,7 @@ def train():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
 
     # -------- Data -----------------------------------------------------------
-    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True, dropped_log='output/emb')
+    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True)
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, shuffle=True)
     total_steps = len(dataloader) * NUM_EPOCHS // GRADIENT_ACCUMULATION_STEPS
 
@@ -312,7 +344,7 @@ def train():
     # -------- Train loop -----------------------------------------------------
     def _sample_batch(raw_batch):
         """Sample compress prompts and build embedding features. Runs in prefetch thread."""
-        compress_prompts, valid_indices = _build_compress_prompts(raw_batch)
+        compress_prompts, valid_indices, raw_pairs = _build_compress_prompts(raw_batch)
         if not compress_prompts:
             return None
         responses = sampler.sample(compress_prompts, compress_params)
@@ -353,6 +385,9 @@ def train():
 
         emb_features: List[Dict[str, Any]] = []
         for i in range(0, len(responses), 2):
+            q_raw, c_raw = raw_pairs[i // 2]
+            _log_responses(responses[i], responses[i + 1], valid_indices[i // 2],
+                           query_raw=q_raw, cot_raw=c_raw)
             feat_q = _get_first_feature(responses[i], emb_template, role='anchor')
             feat_c = _get_first_feature(responses[i + 1], emb_template, role='positive')
             emb_features.append(feat_q)
