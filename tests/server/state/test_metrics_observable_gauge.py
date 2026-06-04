@@ -71,3 +71,45 @@ async def test_four_instances_no_4x_inflation() -> None:
     finally:
         for s in instances:
             await s.stop_cleanup_task()
+
+
+@pytest.mark.asyncio
+async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
+    """Regression (Requirement 20): when a leader loses leadership its
+    resource-gauge cache is zeroed, so a former leader stops emitting the
+    counts it published while it held the lease.
+
+    On unfixed code ``_on_lose_leader`` left the cache intact, so after handover
+    (when the publish loop is cancelled and never overwrites again) the stale
+    worker would keep emitting its last counts forever.
+    """
+    from twinkle.server.state.server_state import LEADER_KEY
+
+    backend = MemoryBackend()
+    a = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
+    b = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
+    try:
+        await a.start_cleanup_task()
+        await b.start_cleanup_task()
+
+        # Create resources and let the leader publish them.
+        for _ in range(3):
+            await a.create_session({})
+        await asyncio.sleep(1.0)
+
+        leader, other = (a, b) if a._is_leader else (b, a)
+        registry = MetricsRegistry.get()
+        assert registry.get_resource_count('active_sessions') == 3
+
+        # Force a handover: overwrite the lease with another owner, then let the
+        # current leader run one election tick. Its renew sees a foreign owner
+        # and it drops leadership, triggering the cache clear.
+        await backend.set(LEADER_KEY, 'someone-else')
+        await leader._try_acquire_or_renew()
+        assert leader._is_leader is False
+
+        # The former leader zeroed its cache on losing leadership.
+        assert registry.get_resource_count('active_sessions') == 0
+    finally:
+        await a.stop_cleanup_task()
+        await b.stop_cleanup_task()

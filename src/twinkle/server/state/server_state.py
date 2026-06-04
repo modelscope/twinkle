@@ -9,7 +9,6 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from twinkle.server.exceptions import ConfigMismatchError
 from twinkle.server.telemetry import MetricsRegistry
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
@@ -71,8 +70,6 @@ class ServerState:
             expiration_timeout: float = 86400.0,  # 24 hours in seconds
             cleanup_interval: float = 3600.0,  # 1 hour in seconds
             per_token_model_limit: int = 30,
-            signature_config: dict[str, Any] | None = None,
-            signature_policy: str = 'warn',
             **kwargs) -> None:
         if backend is not None:
             self._backend: StateBackend = backend
@@ -88,10 +85,6 @@ class ServerState:
         self.cleanup_interval = cleanup_interval
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_running = False
-
-        # Config signature validation state
-        self._signature_config = signature_config
-        self._signature_policy = signature_policy
 
         # Leader election + metrics-publish loop state. ``metrics_update_interval``
         # is accepted for back-compat with deployment configs that pass it;
@@ -366,11 +359,13 @@ class ServerState:
         current_time = time.time()
         cutoff_time = current_time - self.expiration_timeout
 
-        # Collect expired session IDs first for cascade logic
-        expired_session_ids = await self._session_mgr.get_expired_ids(cutoff_time)
+        # Determine expired sessions and remove them in a SINGLE pass, then
+        # cascade the SAME set to dependent resources. Using one authoritative
+        # set (rather than a separate expiry scan followed by a second scan in
+        # cleanup) closes the TOCTOU window where a session touched mid-cleanup
+        # could survive removal while its children were cascade-deleted.
+        expired_session_ids, sessions_removed = await self._session_mgr.collect_and_remove_expired(cutoff_time)
 
-        # Perform actual cleanup in dependency order
-        sessions_removed = await self._session_mgr.cleanup_expired(cutoff_time)
         models_removed = await self._model_mgr.cleanup_expired(cutoff_time, expired_session_ids=expired_session_ids)
         samplings_removed = await self._sampling_mgr.cleanup_expired(
             cutoff_time, expired_session_ids=expired_session_ids)
@@ -433,6 +428,18 @@ class ServerState:
         except Exception as e:
             logger.warning(f'[ServerState Leader] backend error during election: {e}')
             self._is_leader = False
+            if was_leader:
+                # Our renewal failed but our lease value may still be sitting in
+                # the backend, so a plain ``set_nx`` would keep returning False
+                # for up to LEASE_TTL and leadership would stall unclaimed.
+                # Best-effort delete ONLY when we were the leader (never steal a
+                # lease another replica legitimately holds), swallowing errors so
+                # a delete failure cannot escape the election loop. The next tick
+                # can then re-acquire immediately.
+                try:
+                    await self._backend.delete(LEADER_KEY)
+                except Exception:
+                    pass
 
         if self._is_leader and not was_leader:
             await self._on_become_leader()
@@ -457,9 +464,13 @@ class ServerState:
             except (asyncio.CancelledError, Exception):
                 pass
             self._metrics_publish_task = None
-        # Intentionally NOT clearing the MetricsRegistry cache: the new leader
-        # will overwrite within metrics_update_interval, and zeroing here would
-        # produce a fake gauge dip that Prometheus scrapes mid-handover.
+        # Clear this worker's resource-gauge cache after cancelling the publish
+        # task. Across replicas the old leader's MetricsRegistry cache lives in
+        # a different process, and after handover its publish loop is cancelled
+        # and never overwrites the cache again — so without this zeroing the
+        # stale worker would keep emitting its last counts forever. The new
+        # leader publishes the authoritative counts from its own process.
+        MetricsRegistry.get().clear_resource_counts()
 
     async def _metrics_publish_loop(self) -> None:
         """Push resource counts into the MetricsRegistry cache every N seconds.
@@ -505,17 +516,7 @@ class ServerState:
         return True
 
     async def _rebuild_indexes(self) -> None:
-        """Rebuild in-memory indexes from backend data after startup.
-
-        Also validates config signature when ``signature_config`` was provided
-        at construction time.
-        """
-        # Validate config signature if provided
-        if self._signature_config is not None:
-            from twinkle.server.state.config_signature import SignatureMismatchPolicy, validate_config_signature
-            policy = SignatureMismatchPolicy(self._signature_policy)
-            await validate_config_signature(self._backend, self._signature_config, policy)
-
+        """Rebuild in-memory indexes from backend data after startup."""
         # Rebuild model indexes
         await self._model_mgr.rebuild_indexes()
 
@@ -581,8 +582,6 @@ _PROCESS_STATE_CACHE: dict[str, ServerState] = {}
 def get_server_state(actor_name: str = 'twinkle_server_state',
                      backend: StateBackend | None = None,
                      persistence_config: PersistenceConfig | None = None,
-                     signature_config: dict[str, Any] | None = None,
-                     signature_policy: str = 'warn',
                      **kwargs) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
@@ -599,9 +598,6 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
             :func:`create_backend`.
         persistence_config: Optional :class:`PersistenceConfig`. Accepted as a
             raw dict for YAML compatibility.
-        signature_config: Optional dict whose hash is validated against the
-            stored config signature on first access.
-        signature_policy: ``warn`` | ``error`` | ``ignore`` for signature drift.
         **kwargs: Forwarded to the :class:`ServerState` constructor
             (``expiration_timeout``, ``cleanup_interval``, ...).
     """
@@ -618,8 +614,6 @@ def get_server_state(actor_name: str = 'twinkle_server_state',
     state = ServerState(
         backend=backend,
         persistence_config=persistence_config,
-        signature_config=signature_config,
-        signature_policy=signature_policy,
         **kwargs,
     )
     _PROCESS_STATE_CACHE[actor_name] = state

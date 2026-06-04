@@ -2,7 +2,6 @@
 from .backend import PersistenceConfig, create_backend
 from .base import BaseManager
 from .config_manager import ConfigManager
-from .config_signature import SignatureMismatchPolicy, compute_signature, validate_config_signature
 from .future_manager import FutureManager
 from .model_manager import ModelManager
 from .models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
@@ -33,8 +32,4 @@ __all__ = [
     # Persistence backend factory
     'PersistenceConfig',
     'create_backend',
-    # Config signature validation
-    'compute_signature',
-    'validate_config_signature',
-    'SignatureMismatchPolicy',
 ]

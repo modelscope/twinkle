@@ -69,41 +69,40 @@ class SessionManager(BaseManager[SessionRecord]):
 
     # ----- Cleanup -----
 
-    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
-        """Remove sessions whose last activity is older than cutoff_time.
+    def _is_expired(self, record: SessionRecord, cutoff_time: float) -> bool:
+        """Whether a session's last activity is older than ``cutoff_time``."""
+        last_activity = record.last_heartbeat
+        if last_activity == 0.0:
+            last_activity = self._parse_timestamp(record.created_at)
+        return last_activity < cutoff_time
 
-        Args:
-            cutoff_time: Unix timestamp threshold.
+    async def collect_and_remove_expired(self, cutoff_time: float) -> tuple[list[str], int]:
+        """Determine expired sessions in ONE pass and remove exactly those.
+
+        Returns ``(expired_ids, removed_count)``. The returned ``expired_ids``
+        is the single authoritative set used by :class:`ServerState` to cascade
+        the same sessions' child models and sampling sessions, so a session
+        touched between two separate scans can no longer survive removal while
+        its children are cascade-deleted (the prior TOCTOU window).
+        """
+        all_records = await self.get_all()
+        expired_ids = [sid for sid, record in all_records.items() if self._is_expired(record, cutoff_time)]
+        removed = await self.remove_many(expired_ids)
+        return expired_ids, removed
+
+    async def remove_many(self, ids: list[str]) -> int:
+        """Remove the supplied session IDs. Returns the number actually removed."""
+        removed = 0
+        for session_id in ids:
+            if await self.remove(session_id):
+                removed += 1
+        return removed
+
+    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
+        """Remove sessions whose last activity is older than ``cutoff_time``.
 
         Returns:
             Number of sessions removed.
         """
-        all_records = await self.get_all()
-        expired_ids = []
-        for session_id, record in all_records.items():
-            last_activity = record.last_heartbeat
-            if last_activity == 0.0:
-                last_activity = self._parse_timestamp(record.created_at)
-            if last_activity < cutoff_time:
-                expired_ids.append(session_id)
-
-        for session_id in expired_ids:
-            await self.remove(session_id)
-
-        return len(expired_ids)
-
-    async def get_expired_ids(self, cutoff_time: float) -> list[str]:
-        """Return IDs of sessions that would be removed at the given cutoff.
-
-        Used by ServerState to cascade-expire dependent resources before
-        actually deleting the sessions.
-        """
-        all_records = await self.get_all()
-        expired_ids = []
-        for session_id, record in all_records.items():
-            last_activity = record.last_heartbeat
-            if last_activity == 0.0:
-                last_activity = self._parse_timestamp(record.created_at)
-            if last_activity < cutoff_time:
-                expired_ids.append(session_id)
-        return expired_ids
+        _, removed = await self.collect_and_remove_expired(cutoff_time)
+        return removed

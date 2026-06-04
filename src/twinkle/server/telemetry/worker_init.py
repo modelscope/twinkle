@@ -69,3 +69,19 @@ def _start_resource_collector() -> None:
         resource_metrics.get_collector().maybe_start()
     except Exception as e:
         logger.debug(f'Resource metrics collector start failed: {e}')
+
+
+def flush_telemetry_safely() -> None:
+    """Flush + shut down telemetry, swallowing any error.
+
+    Called from the launcher driver after ``serve.shutdown()`` and from each
+    worker deployment's FastAPI lifespan shutdown so buffered OTLP batches
+    (traces / metrics / logs) flush on graceful termination. A
+    telemetry-shutdown failure MUST NOT mask the user-facing shutdown path,
+    so every error here is swallowed (Requirement 21.3).
+    """
+    try:
+        from twinkle.server.telemetry import shutdown_telemetry
+        shutdown_telemetry()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f'Telemetry shutdown failed: {e}')

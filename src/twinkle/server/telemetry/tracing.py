@@ -146,9 +146,17 @@ def create_tracing_middleware(service_component: str):
         path = request.url.path
         span_name = f'{method} {path}'
 
+        # Continue an upstream trace when the inbound request carries trace
+        # headers (e.g. a Gateway -> Model / Gateway -> Sampler hop), so the
+        # SERVER span attaches to the propagated context instead of starting a
+        # fresh, disconnected trace. A request with no trace headers yields an
+        # empty context and a new trace is started normally.
+        ctx = extract(dict(request.headers))
+
         with tracer.start_as_current_span(
                 span_name,
                 kind=trace.SpanKind.SERVER,
+                context=ctx,
                 attributes={
                     'http.method': method,
                     'http.url': str(request.url),

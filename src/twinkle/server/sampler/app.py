@@ -202,6 +202,11 @@ def build_sampler_app(model_id: str,
         # ``servable_object`` AFTER lifespan startup. Lazy-started from the
         # first request via ``_on_request_start`` → ``_ensure_state_cleanup_started``.
         yield
+        # Flush buffered OTLP batches on graceful replica termination.
+        import asyncio
+
+        from twinkle.server.telemetry import flush_telemetry_safely
+        await asyncio.to_thread(flush_telemetry_safely)
 
     app = FastAPI(
         title='Unified Sampler',

@@ -1,13 +1,15 @@
 from .base import StateBackend
 from .factory import PersistenceConfig, create_backend
 from .file_backend import FileBackend
-from .memory_backend import MemoryBackend
 from .redis_backend import RedisBackend
 
+# NOTE: ``MemoryBackend`` is intentionally NOT imported here. It top-level
+# imports ``ray`` (an optional dependency), so importing this package must not
+# pull Ray in at package-import time. Callers that need it import it directly
+# from ``.memory_backend`` — as ``create_backend`` does lazily for memory mode.
 __all__ = [
     'StateBackend',
     'FileBackend',
-    'MemoryBackend',
     'RedisBackend',
     'PersistenceConfig',
     'create_backend',

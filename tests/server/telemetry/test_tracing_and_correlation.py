@@ -245,6 +245,9 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
         assert len(root_handlers) == 1, root_handlers
         assert len(twinkle_handlers) == 1, twinkle_handlers
         assert root_handlers[0] is twinkle_handlers[0], ('root and twinkle should share the same handler instance')
+        # R22: the OTLP handler carries the transport-stack feedback-loop filter.
+        assert any(isinstance(flt, provider._OTLPTransportFilter) for flt in root_handlers[0].filters), \
+            'OTLP transport filter not attached to the handler'
     finally:
         provider.shutdown_telemetry()
         # shutdown should detach from both
@@ -261,3 +264,76 @@ def test_pyproject_declares_telemetry_extras() -> None:
     assert 'telemetry =' in text
     assert 'psutil' in text
     assert 'pynvml' in text
+
+
+# ---------- inbound HTTP trace-context continuity ------------------ #
+
+
+def test_inbound_traceparent_continues_trace() -> None:
+    """The tracing middleware extracts the inbound ``traceparent`` and starts
+    its SERVER span within that context, so a Gateway -> Model / Gateway ->
+    Sampler hop continues one trace instead of starting a fresh one.
+
+    The active span's ``trace_id`` is captured inside the request handler (it
+    runs nested inside the middleware's SERVER span), which makes the assertion
+    independent of whichever global tracer provider another test may have
+    installed.
+
+    Validates Requirement 15: inbound HTTP trace-context continuity.
+    """
+    if not _otel_available():
+        pytest.skip('OTEL SDK not installed in test env')
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from opentelemetry import trace as otel_trace
+
+    from twinkle.server.telemetry.tracing import create_tracing_middleware
+
+    app = FastAPI()
+    app.middleware('http')(create_tracing_middleware('Model'))
+
+    @app.get('/ping')
+    async def ping() -> dict:
+        ctx = otel_trace.get_current_span().get_span_context()
+        return {'trace_id': format(ctx.trace_id, '032x')}
+
+    # traceparent = version(00)-trace_id(32 hex)-span_id(16 hex)-flags(01)
+    injected_trace_id = '0af7651916cd43dd8448eb211c80319c'
+    parent_span_id = 'b7ad6b7169203331'
+    traceparent = f'00-{injected_trace_id}-{parent_span_id}-01'
+
+    client = TestClient(app)
+    resp = client.get('/ping', headers={'traceparent': traceparent})
+    assert resp.status_code == 200
+    recorded = resp.json()['trace_id']
+    assert recorded == injected_trace_id, (
+        f'span trace_id {recorded} does not match injected {injected_trace_id}; '
+        'the middleware started a fresh trace instead of continuing the upstream one')
+
+
+def test_inbound_without_traceparent_starts_new_trace() -> None:
+    """A request with no trace headers still completes without raising and runs
+    the handler under a span on a fresh trace (Requirement 15.3)."""
+    if not _otel_available():
+        pytest.skip('OTEL SDK not installed in test env')
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from opentelemetry import trace as otel_trace
+
+    from twinkle.server.telemetry.tracing import create_tracing_middleware
+
+    app = FastAPI()
+    app.middleware('http')(create_tracing_middleware('Gateway'))
+
+    @app.get('/ping')
+    async def ping() -> dict:
+        ctx = otel_trace.get_current_span().get_span_context()
+        return {'trace_id': format(ctx.trace_id, '032x')}
+
+    client = TestClient(app)
+    resp = client.get('/ping')
+    assert resp.status_code == 200
+    # A trace id is assigned; it is not the injected one from the other test.
+    assert resp.json()['trace_id'] != '0af7651916cd43dd8448eb211c80319c'

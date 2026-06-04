@@ -18,6 +18,25 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Loggers belonging to the OTLP transport stack. Their own records must never
+# be routed back through the OTLP LoggingHandler: an exporter error logged
+# under ``opentelemetry.*`` (or its gRPC / urllib3 transport) would be
+# re-handled and re-exported, amplifying into a feedback loop. The filter below
+# drops records originating from these logger trees.
+_OTLP_TRANSPORT_LOGGER_PREFIXES = ('opentelemetry', 'grpc', 'urllib3')
+
+
+class _OTLPTransportFilter(logging.Filter):
+    """Drop log records emitted by the OTLP transport stack (feedback-loop guard)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - logging API
+        name = record.name or ''
+        for prefix in _OTLP_TRANSPORT_LOGGER_PREFIXES:
+            if name == prefix or name.startswith(prefix + '.'):
+                return False
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Optional OTEL imports — keep them lazy/guarded so that a missing optional
 # dependency does not break the rest of the server.
@@ -186,6 +205,11 @@ def init_telemetry(config: TelemetryConfig) -> None:
             logger.warning('LoggingInstrumentor failed to instrument: %s', exc)
 
     handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+    # Drop OTLP transport-stack records BEFORE they reach the OTLP exporter, so
+    # an exporter error logged under ``opentelemetry.*`` / ``grpc`` / ``urllib3``
+    # is not re-handled and re-exported into a feedback loop. Attach the filter
+    # to the handler before the handler is added to any logger.
+    handler.addFilter(_OTLPTransportFilter())
     # Attach to BOTH the root logger and the ``twinkle`` namespace logger.
     # ``twinkle.utils.logger`` configures the ``twinkle`` logger with
     # ``propagate=False`` and its own StreamHandler, so log records emitted

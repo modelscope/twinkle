@@ -1,26 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Typer CLI + config-drift validation tests.
+"""Typer CLI tests.
 
 Pins the behaviour of the launcher CLI (``twinkle.server.cli.app``): config
-loading, env-var overrides, and the persistence-signature drift gate that
-runs before Ray is initialized.
+loading and env-var overrides.
 """
 from __future__ import annotations
 
 import json
-import pytest
-import yaml
 from pathlib import Path
 from typer.testing import CliRunner
-from unittest import mock
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG
-from twinkle.server.cli.app import app, main
+from twinkle.server.cli.app import app
 from twinkle.server.config import ServerConfig
-from twinkle.server.exceptions import ConfigMismatchError
-from twinkle.server.state.backend.factory import PersistenceConfig
-from twinkle.server.state.backend.memory_backend import MemoryBackend
-from twinkle.server.state.config_signature import _SIGNATURE_KEY, compute_signature, validate_against_backend
 
 EXAMPLE = MOCK_SERVER_CONFIG
 MOCK_CFG = MOCK_SERVER_CONFIG
@@ -81,65 +73,6 @@ def test_env_var_overrides_when_flag_omitted(monkeypatch) -> None:
     monkeypatch.setenv('TWINKLE_SERVER_CONFIG', str(EXAMPLE))
     res = runner.invoke(app, ['check-config'])
     assert res.exit_code == 0
-
-
-# ---------- launch validates drift BEFORE ray.init ----------------------- #
-
-
-def test_launch_validates_drift_before_ray_init() -> None:
-    """Order check: ``validate_against_backend`` is called before
-    ``ServerLauncher`` is even imported (and thus before ray.init)."""
-    runner = CliRunner()
-
-    def _abort_drift(*args, **kwargs):
-        raise ConfigMismatchError('drift sentinel')
-
-    with mock.patch(
-            'twinkle.server.state.config_signature.validate_against_backend',
-            side_effect=_abort_drift,
-    ):
-        # Should never reach the launcher import — patch it to a sentinel that
-        # would make the test fail loudly if reached.
-        with mock.patch('twinkle.server.launcher.ServerLauncher') as launcher_spy:
-            res = runner.invoke(app, ['launch', '--config', str(MOCK_CFG)])
-            assert res.exit_code == 3, res.output
-            assert 'drift sentinel' in res.output
-            assert launcher_spy.call_count == 0
-
-
-# ---------- drift detection + first-run storage --------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_property_29_first_run_stores_signature() -> None:
-    """First run with no stored signature stores it and returns silently."""
-    backend = MemoryBackend()
-    cfg_payload = {'persistence': {'mode': 'memory'}}
-    pcfg = PersistenceConfig(mode='memory')
-    # Patch create_backend to return our shared in-process backend so we can
-    # inspect the stored signature afterwards.
-    with mock.patch('twinkle.server.state.backend.factory.create_backend', return_value=backend):
-        await validate_against_backend(pcfg, cfg_payload)
-        assert await backend.get(_SIGNATURE_KEY) == compute_signature(cfg_payload)
-        # Second run with same payload is a no-op.
-        await validate_against_backend(pcfg, cfg_payload)
-
-
-@pytest.mark.asyncio
-async def test_property_29_drift_raises_with_diff_and_remediation() -> None:
-    backend = MemoryBackend()
-    pcfg = PersistenceConfig(mode='memory')
-    initial = {'persistence': {'mode': 'memory'}}
-    later = {'persistence': {'mode': 'file', 'file_path': '/tmp/x.json'}}
-
-    with mock.patch('twinkle.server.state.backend.factory.create_backend', return_value=backend):
-        await validate_against_backend(pcfg, initial)
-        with pytest.raises(ConfigMismatchError) as exc:
-            await validate_against_backend(pcfg, later)
-
-    msg = str(exc.value)
-    assert 'drifted' in msg.lower() or 'mismatch' in msg.lower()
-    assert 'Remediation' in msg
 
 
 # ---------- example config loads ----------------------------------------- #

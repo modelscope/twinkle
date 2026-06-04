@@ -93,3 +93,64 @@ async def test_renew_keeps_leader() -> None:
         assert state._is_leader
     finally:
         await state.stop_cleanup_task()
+
+
+@pytest.mark.asyncio
+async def test_leader_recovers_after_renewal_failure() -> None:
+    """Regression (Requirement 19): when a leader's renewal raises, it releases
+    the lease best-effort so the very next election tick re-acquires leadership
+    without waiting LEASE_TTL.
+
+    On unfixed code ``_is_leader`` flips to False while the lease value lingers
+    in the backend, so ``set_nx`` keeps returning False for up to LEASE_TTL.
+    """
+    backend = MemoryBackend()
+    state = ServerState(backend=backend, cleanup_interval=600.0)
+
+    # Become leader via the normal path.
+    await state._try_acquire_or_renew()
+    assert state._is_leader is True
+    assert await backend.get(LEADER_KEY) == state._leader_id
+
+    # Next renewal raises — simulate a transient backend error during renew.
+    real_update_atomic = backend.update_atomic
+    calls = {'n': 0}
+
+    async def flaky_update_atomic(*args, **kwargs):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('transient backend error during renew')
+        return await real_update_atomic(*args, **kwargs)
+
+    from unittest import mock
+    with mock.patch.object(backend, 'update_atomic', side_effect=flaky_update_atomic):
+        await state._try_acquire_or_renew()
+        # Renewal failed → no longer leader, and the stale lease was released.
+        assert state._is_leader is False
+
+    # The lease key was deleted best-effort, so the next tick re-acquires
+    # immediately (no LEASE_TTL wait, no lingering self-owned lease).
+    await state._try_acquire_or_renew()
+    assert state._is_leader is True
+
+
+@pytest.mark.asyncio
+async def test_renewal_failure_does_not_steal_other_leader_lease() -> None:
+    """A non-leader whose election attempt raises must NOT delete a lease that
+    another replica legitimately holds (Requirement 19.3)."""
+    backend = MemoryBackend()
+    leader = ServerState(backend=backend, cleanup_interval=600.0)
+    follower = ServerState(backend=backend, cleanup_interval=600.0)
+
+    await leader._try_acquire_or_renew()
+    assert leader._is_leader is True
+    leader_value = await backend.get(LEADER_KEY)
+
+    # Follower's set_nx raises; since it was NOT leader, it must not delete the
+    # lease the real leader owns.
+    from unittest import mock
+    with mock.patch.object(backend, 'set_nx', side_effect=RuntimeError('boom')):
+        await follower._try_acquire_or_renew()
+        assert follower._is_leader is False
+
+    assert await backend.get(LEADER_KEY) == leader_value, 'follower stole the real leader lease'

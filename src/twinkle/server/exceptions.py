@@ -13,16 +13,6 @@ class StateBackendError(TwinkleServerError):
     pass
 
 
-class ConfigMismatchError(TwinkleServerError):
-    """Configuration signature mismatch — config changed since last launch.
-
-    Persisted data may be incompatible with the current configuration; the
-    operator must reconcile (revert the config change or clear persisted
-    state) before the server can start.
-    """
-    pass
-
-
 class ConfigError(TwinkleServerError):
     """Invalid configuration value for a known field.
 

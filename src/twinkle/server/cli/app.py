@@ -3,10 +3,7 @@
 
 Provides four subcommands:
 
-- ``launch``           — start the Twinkle Server from a YAML config. Validates
-                        the persistence config signature against the persistence
-                        backend BEFORE ``ray.init`` so a configuration drift
-                        fails fast.
+- ``launch``           — start the Twinkle Server from a YAML config.
 - ``check-config``     — validate a config file; exit 0 on success, non-zero
                         with the validation error on failure.
 - ``print-config``     — emit the fully resolved + normalized ``ServerConfig``
@@ -25,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from twinkle.server.config import ServerConfig
-from twinkle.server.exceptions import ConfigMismatchError, ConfigParseError
+from twinkle.server.exceptions import ConfigParseError
 
 app = typer.Typer(
     add_completion=False,
@@ -70,15 +67,6 @@ def _load_config(path: Path) -> ServerConfig:
         raise typer.Exit(code=2)
 
 
-def _signature_payload(config: ServerConfig) -> dict:
-    """The dict whose hash drives signature validation.
-
-    Restricted to the persistence-relevant fields so unrelated edits don't
-    invalidate the persisted state. Future phases can broaden this.
-    """
-    return {'persistence': config.persistence.model_dump(mode='json')}
-
-
 @app.command('launch')
 def launch_cmd(
     config: Path = CONFIG_OPTION,
@@ -87,18 +75,8 @@ def launch_cmd(
     """Start the Twinkle Server from a YAML config file."""
     cfg = _load_config(config)
 
-    # Validate the persistence config signature BEFORE we touch Ray so a
-    # config drift fails fast without spinning up the cluster.
-    try:
-        from twinkle.server.state.config_signature import validate_against_backend
-
-        asyncio.run(validate_against_backend(cfg.persistence, _signature_payload(cfg)))
-    except ConfigMismatchError as e:
-        typer.echo(f'error: {e}', err=True)
-        raise typer.Exit(code=3)
-
-    # Defer the heavy launcher import until after drift validation passes so
-    # the failure path stays cheap (and a missing Ray install doesn't block
+    # Defer the heavy launcher import until after config validation so the
+    # failure path stays cheap (and a missing Ray install doesn't block
     # `check-config`).
     from twinkle.server.launcher import ServerLauncher
 

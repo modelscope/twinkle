@@ -248,6 +248,11 @@ def build_model_app(model_id: str,
             await get_self().shutdown()
         except Exception:
             pass
+        # Flush buffered OTLP batches on graceful replica termination.
+        import asyncio
+
+        from twinkle.server.telemetry import flush_telemetry_safely
+        await asyncio.to_thread(flush_telemetry_safely)
 
     app = FastAPI(lifespan=lifespan)
 

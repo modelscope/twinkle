@@ -10,10 +10,30 @@ actor in front.
 """
 from __future__ import annotations
 
+import functools
+
 from .backend.base import StateBackend
 from .base import BaseManager
 from .models import ModelRecord
 from .replica_registry import ReplicaRegistry
+
+# Per-token model-count keys live in their own keyspace so they are never
+# picked up by ``model::*`` scans. The count is maintained atomically via
+# ``StateBackend.update_atomic`` so two concurrent adds with the same token
+# cannot both pass the limit check (the prior count-then-add race).
+_TOKEN_COUNT_PREFIX = 'token_count::'
+
+
+def _counter_delta_transform(existing: object, *, delta: int) -> int:
+    """Atomic transform body for the per-token counter (module-level for pickling).
+
+    Treats a missing/!int value as 0 and never lets the stored count go
+    negative. Always returns an int, so ``update_atomic`` writes and returns
+    the new value (it never no-ops here).
+    """
+    current = existing if isinstance(existing, int) else 0
+    new = current + delta
+    return new if new > 0 else 0
 
 
 class ModelManager(BaseManager[ModelRecord]):
@@ -31,9 +51,28 @@ class ModelManager(BaseManager[ModelRecord]):
 
     # ----- Index Rebuild -------------------------------------------------- #
 
+    def _token_count_key(self, token: str) -> str:
+        return f'{_TOKEN_COUNT_PREFIX}{token}'
+
     async def rebuild_indexes(self) -> None:
-        """Compatibility shim — indexes are now derived from the backend per call."""
-        return None
+        """Rebuild the per-token model counters from the persisted ``model::*`` records.
+
+        Called on cleanup-task start. The atomic ``token_count::<token>`` keys
+        are derived data; rebuilding them from the authoritative model records
+        keeps them correct after a restart or a crash that left them stale.
+        """
+        all_records = await self.get_all()
+        counts: dict[str, int] = {}
+        for record in all_records.values():
+            if record.token:
+                counts[record.token] = counts.get(record.token, 0) + 1
+
+        # Reset any stale counters, then write the recomputed ones.
+        stale_keys = await self._backend.keys(f'{_TOKEN_COUNT_PREFIX}*')
+        for key in stale_keys:
+            await self._backend.delete(key)
+        for token, count in counts.items():
+            await self._backend.set(self._token_count_key(token), count)
 
     # ----- Capacity ------------------------------------------------------- #
 
@@ -88,24 +127,56 @@ class ModelManager(BaseManager[ModelRecord]):
     # ----- CRUD ----------------------------------------------------------- #
 
     async def add(self, model_id: str, record: ModelRecord) -> None:
-        """Store a record, enforcing the per-token model limit.
+        """Store a record, enforcing the per-token model limit atomically.
+
+        The per-token count is incremented through ``update_atomic`` BEFORE the
+        record is written, so two concurrent adds with the same token cannot
+        both observe ``limit - 1`` and both succeed (the prior count-then-add
+        race). If the increment would exceed the limit, it is rolled back and a
+        ``RuntimeError`` is raised; if the record write fails, the increment is
+        rolled back too so the counter never drifts above the real model count.
 
         Raises:
             RuntimeError: when adding ``record`` would exceed
                 ``per_token_model_limit`` for ``record.token``.
         """
         token = record.token
-        current = await self._count_models_for_token(token)
-        if current >= self._per_token_model_limit:
-            raise RuntimeError(f'Model limit exceeded: {current}/{self._per_token_model_limit} models')
-        await super().add(model_id, record)
+        if not token:
+            # No token → no per-token limit to enforce.
+            await super().add(model_id, record)
+            return
+
+        key = self._token_count_key(token)
+        # The transform always returns an int, so update_atomic always writes
+        # and returns the new count (it never no-ops here).
+        new_count = await self._backend.update_atomic(
+            key,
+            functools.partial(_counter_delta_transform, delta=1),
+        )
+        if new_count > self._per_token_model_limit:
+            # Roll the speculative increment back and reject. ``new_count - 1``
+            # is the count that was already present before this add.
+            await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
+            raise RuntimeError(f'Model limit exceeded: {new_count - 1}/{self._per_token_model_limit} models')
+
+        try:
+            await super().add(model_id, record)
+        except Exception:
+            # Keep the counter consistent with the persisted records.
+            await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
+            raise
 
     async def remove(self, model_id: str) -> bool:
-        """Remove a record by ID."""
+        """Remove a record by ID, decrementing its owning token's counter."""
         record = await self.get(model_id)
         if record is None:
             return False
         await super().remove(model_id)
+        if record.token:
+            await self._backend.update_atomic(
+                self._token_count_key(record.token),
+                functools.partial(_counter_delta_transform, delta=-1),
+            )
         return True
 
     # ----- Cleanup -------------------------------------------------------- #

@@ -151,6 +151,11 @@ def build_processor_app(ncpu_proc_per_node: int,
         # ``servable_object`` AFTER lifespan startup. Lazy-started from the
         # first request via ``_ensure_sticky`` → ``_ensure_state_cleanup_started``.
         yield
+        # Flush buffered OTLP batches on graceful replica termination.
+        import asyncio
+
+        from twinkle.server.telemetry import flush_telemetry_safely
+        await asyncio.to_thread(flush_telemetry_safely)
 
     app = FastAPI(lifespan=lifespan)
 

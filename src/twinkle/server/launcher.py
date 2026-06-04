@@ -336,12 +336,25 @@ class ServerLauncher:
         # Block until a termination signal is received
         shutdown_event.wait()
 
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Tear down Serve and flush telemetry on graceful termination.
+
+        Telemetry flush runs AFTER ``serve.shutdown()`` and is wrapped so a
+        telemetry-shutdown failure cannot mask the user-facing shutdown path.
+        """
         from ray import serve
         try:
             serve.shutdown()
             logger.info('Ray Serve shut down successfully')
         except Exception:
             logger.warning('Error during Ray Serve shutdown', exc_info=True)
+
+        # Flush buffered OTLP batches (traces / metrics / logs) on the driver
+        # after Serve is down. Errors are swallowed by the helper.
+        from twinkle.server.telemetry import flush_telemetry_safely
+        flush_telemetry_safely()
 
     @classmethod
     def from_yaml(
