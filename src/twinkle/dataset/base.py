@@ -30,20 +30,28 @@ class DatasetMeta:
     The dataset meta-information, used to describe a dataset.
     """
     # The dataset id or local path
-    dataset_id: str
+    dataset_id: str = ''
     # The subset name
     subset_name: str = 'default'
     # The split
     split: str = 'train'
     # Pick a data slice
     data_slice: Iterable = None
+    # In-memory data: List[Dict] (row-oriented) or Dict[str, List] (column-oriented)
+    data: Any = None
 
     def get_id(self):
+        if self.data is not None:
+            return f'__memory_{self._uid}__:' + self.subset_name + ':' + self.split
         return self.dataset_id.replace(os.sep, '_').replace('.', '_') + ':' + self.subset_name + ':' + self.split
 
     def __post_init__(self):
+        import uuid
+        self._uid = uuid.uuid4().hex[:8]
         if self.data_slice is not None and not isinstance(self.data_slice, Iterable):
             raise ValueError('data_slice must be an iterable')
+        if not self.dataset_id and self.data is None:
+            raise ValueError('Either dataset_id or data must be provided')
 
 
 @remote_class(execute='first')
@@ -130,6 +138,16 @@ class Dataset(TorchDataset):
 
     @staticmethod
     def _load_dataset(dataset_meta: DatasetMeta, **kwargs):
+        # In-memory data path
+        if dataset_meta.data is not None:
+            from datasets import Dataset as HFDataset
+            d = dataset_meta.data
+            if isinstance(d, list):
+                return HFDataset.from_list(d)
+            elif isinstance(d, dict):
+                return HFDataset.from_dict(d)
+            raise ValueError(f'DatasetMeta.data must be list or dict, got {type(d).__name__}')
+
         dataset_id = dataset_meta.dataset_id
         subset_name = dataset_meta.subset_name
         split = dataset_meta.split

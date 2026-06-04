@@ -122,6 +122,9 @@ class CheckpointEngineManager:
         if self._model_keys is None:
             if hasattr(self.sampler, 'get_state_keys'):
                 self._model_keys = self.sampler.get_state_keys()
+                # remote_function with lazy_collect returns a callable
+                if callable(self._model_keys):
+                    self._model_keys = self._model_keys()
 
             if self._model_keys is None:
                 self._model_keys = []
