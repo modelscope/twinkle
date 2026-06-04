@@ -63,10 +63,10 @@ LORA_RANK = 16
 ADAPTER_NAME = 'default'
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
-LEARNING_RATE = 1e-5
-GRADIENT_ACCUMULATION_STEPS = 1
+LEARNING_RATE = 5e-6
+GRADIENT_ACCUMULATION_STEPS = 8
 LOG_INTERVAL = 2
-SAVE_INTERVAL = 4000
+SAVE_INTERVAL = 1000
 NUM_EPOCHS = 1
 
 # None → use full _BASE_SIZES from dataset_think; int to subsample.
@@ -198,7 +198,7 @@ def setup_optimizer(model, total_steps: int):
 
 
 def save_checkpoint(model, name: str):
-    model.save(name, output_dir=OUTPUT_DIR, adapter_name=ADAPTER_NAME)
+    model.save(name, output_dir=OUTPUT_DIR)
 
 
 # --------------------------------------------------------------------- Loop
@@ -288,12 +288,12 @@ def train():
 
     # -------- Trainable embedding model + LoRA -------------------------------
     model = build_model(model_mesh)
-    lora_config = LoraConfig(
-        r=LORA_RANK, lora_alpha=LORA_RANK * 2, lora_dropout=0.05,
-        target_modules='all-linear')
-    model.add_adapter_to_model(
-        ADAPTER_NAME, lora_config,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+    # lora_config = LoraConfig(
+    #     r=LORA_RANK, lora_alpha=LORA_RANK * 2, lora_dropout=0.05,
+    #     target_modules='all-linear')
+    # model.add_adapter_to_model(
+    #     ADAPTER_NAME, lora_config,
+    #     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
 
     model.set_processor(InputProcessor)
     model.set_loss(
@@ -437,8 +437,6 @@ def train():
                 model.forward_backward(inputs=emb_features, task='embedding')
                 model.clip_grad_and_step()
                 cur_step += 1
-
-        save_checkpoint(model, f'epoch-{epoch}')
     prefetch_executor.shutdown(wait=False)
     save_checkpoint(model, 'last-checkpoint')
 
