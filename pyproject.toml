@@ -32,8 +32,15 @@ vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 tinker = ["tinker==0.14.0"]
 test = ["hypothesis>=6.0"]
-telemetry = ["psutil>=5.9.0", "pynvml>=11.0.0"]
-redis = ["redis>=5.0"]
+server = [
+  "redis>=5.0",
+  "psutil>=5.9.0",
+  "pynvml>=11.0.0",
+  "opentelemetry-api",
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-instrumentation-logging",
+]
 docs = [
   "sphinx>=5.3.0,<6.0.0",
   "docutils>=0.16.0,<0.17.0",
