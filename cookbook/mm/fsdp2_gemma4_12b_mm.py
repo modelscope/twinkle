@@ -148,7 +148,7 @@ def train():
 
     ### eval dataset and dataloader
     EVAL_LENGTH = 100
-    eval_dataset = Dataset(dataset_meta=DatasetMeta(DATASET_PATH, data_slice=range(EVAL_LENGTH)))
+    eval_dataset = Dataset(features=writer_features, dataset_meta=DatasetMeta(DATASET_PATH, subset_name="default", data_slice=range(EVAL_LENGTH)))
     eval_dataset.set_template('Template', model_id=MODEL_PATH)
     # eval_dataset.map(preprocess_func=SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     eval_dataset.map(preprocess_func=LatexOCRProcessor)
