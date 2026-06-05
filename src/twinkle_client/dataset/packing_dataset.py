@@ -17,7 +17,7 @@ from .base import Dataset
 class PackingDataset(Dataset):
     """Client wrapper for PackingDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta, packing_num_proc: int = 1, **kwargs):
+    def __init__(self, dataset_meta: DatasetMeta = None, packing_num_proc: int = 1, **kwargs):
         from twinkle_client.http import get_base_url
 
         self.server_url = f'{get_base_url()}/processor/twinkle'

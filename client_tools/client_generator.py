@@ -466,9 +466,9 @@ class MultiLoraTransformersModel:
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
-        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
@@ -783,6 +783,7 @@ class vLLMSampler:
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',

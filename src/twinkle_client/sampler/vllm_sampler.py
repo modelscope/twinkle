@@ -33,6 +33,7 @@ class vLLMSampler:
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',
