@@ -69,17 +69,17 @@ def train():
     # from being incorrectly serialized into JSON during Arrow persistence via Dataset.map writer
     from datasets import Features, Value, Image, List
     sub_msg_feat = Features({
-        "role": Value("string"),
-        "content": Value("string"),
-        "images": List(Image(decode=True))
+        'role': Value('string'),
+        'content': Value('string'),
+        'images': List(Image(decode=True))
     })
     writer_features = Features({
-        "image": Image(decode=True),
-        "text": Value("string"),
-        "messages": List(sub_msg_feat)
+        'image': Image(decode=True),
+        'text': Value('string'),
+        'messages': List(sub_msg_feat)
     })
     ### prepare dataset and dataloader
-    dataset = Dataset(features=writer_features, dataset_meta=DatasetMeta(DATASET_PATH, subset_name="default", data_slice=range(TRAIN_LEN)))
+    dataset = Dataset(features=writer_features, dataset_meta=DatasetMeta(DATASET_PATH, subset_name='default', data_slice=range(TRAIN_LEN)))
     # Set template to prepare encoding
     dataset.set_template('Template', model_id=MODEL_PATH)
     # Preprocess the dataset to standard format
@@ -148,7 +148,7 @@ def train():
 
     ### eval dataset and dataloader
     EVAL_LENGTH = 100
-    eval_dataset = Dataset(features=writer_features, dataset_meta=DatasetMeta(DATASET_PATH, subset_name="default", data_slice=range(EVAL_LENGTH)))
+    eval_dataset = Dataset(features=writer_features, dataset_meta=DatasetMeta(DATASET_PATH, subset_name='default', data_slice=range(EVAL_LENGTH)))
     eval_dataset.set_template('Template', model_id=MODEL_PATH)
     # eval_dataset.map(preprocess_func=SelfCognitionProcessor('twinkle大模型', 'ModelScope社区'))
     eval_dataset.map(preprocess_func=LatexOCRProcessor)
