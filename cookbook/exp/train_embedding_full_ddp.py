@@ -68,8 +68,8 @@ HARD_NEGATIVES = None
 TEMPERATURE = 0.03
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 32))
-LEARNING_RATE = 2e-5
-GRADIENT_ACCUMULATION_STEPS = 16
+LEARNING_RATE = 1e-5
+GRADIENT_ACCUMULATION_STEPS = 1
 LOG_INTERVAL = 2
 SAVE_INTERVAL = 4000
 NUM_EPOCHS = 2
@@ -77,7 +77,9 @@ NUM_EPOCHS = 2
 TOTAL_SAMPLES: Optional[int] = None
 
 # -- Online-compression knobs -------------------------------------------------
-MIN_COT_CHARS = 256
+# Below this length, condenser fabricates content for open-ended short prompts;
+# query passes through as qr verbatim and cot rows are dropped from training.
+MIN_TEXT_CHARS = 256
 DATASET_MAX_TOKENS = 32768
 COMPRESS_TEMPERATURE = 0.2
 COMPRESS_TOP_P = 0.5
@@ -105,7 +107,7 @@ FAILURE_LOG = os.environ.get('FAILURE_LOG', f'./output/embedding_lora_{BACKEND}/
 # =============================================================================
 
 COMPRESS_SYSTEM = """\
-You are a compression assistant. For the (query, source) pair, emit a Markdown \
+You are a compression and summary assistant. For the (query, source) pair, emit a Markdown \
 answer with TWO sections, designed to pair with the `extract_compressed` tool: \
 the reader absorbs `## Summary` directly, then calls `extract_compressed` \
 on any topic-key listed under `## More` to recover its \
@@ -174,7 +176,19 @@ fits inline, write a single line `- (none)`.
 Now begin.\
 """
 
-COMPRESS_USER = "## Query\n{query}\n\n## Source\n{text}"
+COMPRESS_USER = (
+    'Downstream model will read your compressed block to decide whether to '
+    'expand it. Compress faithfully: preserve the passage topic + core facts. '
+    'Do NOT invent facts. Do NOT drop major facts. Do NOT write meta-commentary '
+    'about the Query (never write "Query info: absent", "no X mention", etc.); '
+    'if the passage does not address the Query, still summarize the passage. '
+    'CRITICAL LANGUAGE RULE: detect the dominant language of the Passage '
+    '(NOT the Query, NOT this instruction) and write the ENTIRE output in that '
+    'same language; English passage → English output, Chinese passage → '
+    'Chinese output, Japanese passage → Japanese output. NEVER translate, '
+    'NEVER mix languages, NEVER copy these instructions into the output.\n\n'
+    '## Query (ordering hint only — still summarize the whole passage)\n{query}\n\n'
+    '## Passage\n{text}')
 
 
 # =============================================================================
@@ -183,6 +197,18 @@ COMPRESS_USER = "## Query\n{query}\n\n## Source\n{text}"
 
 _response_lock: Optional[PosixFileLock] = None
 _failure_lock: Optional[PosixFileLock] = None
+
+# Monotonic global sample id; per-batch index would alias across batches.
+_sample_counter = 0
+_sample_counter_lock = threading.Lock()
+
+
+def _next_sample_id() -> int:
+    global _sample_counter
+    with _sample_counter_lock:
+        sid = _sample_counter
+        _sample_counter += 1
+        return sid
 
 
 def _log_responses(query_resp_text: str, cot_resp_text: str, idx: int,
@@ -262,7 +288,7 @@ def setup_optimizer(model, total_steps: int):
         model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
         model.set_lr_scheduler(
             scheduler_cls='CosineWarmupScheduler',
-            num_warmup_steps=50,
+            num_warmup_steps=200,
             num_training_steps=total_steps,
         )
         return
@@ -313,30 +339,45 @@ def _extract_query_cot(row: Dict[str, Any]):
 def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
     """Build prompts for compressing both query and cot per row.
 
-    Returns (prompts, valid_indices, raw_pairs, prompt_queries) where:
-    - prompts: flat-interleaved [query_0, cot_0, query_1, cot_1, ...]
+    Returns (prompts, valid_indices, raw_pairs, prompt_queries, passthrough) where:
+    - prompts: flat-interleaved [query_0, cot_0, query_1, cot_1, ...]; ``None`` means
+      passthrough (use raw text directly, do not call sampler)
     - valid_indices: which rows passed the min-length filter
     - raw_pairs: [(query, cot), ...]
     - prompt_queries: the query string used for each prompt (for failure logging)
+    - passthrough: parallel to prompts; non-None text means "use this verbatim as qc"
     """
-    prompts: List[Dict[str, Any]] = []
+    prompts: List[Optional[Dict[str, Any]]] = []
     valid_indices: List[int] = []
     raw_pairs: List[tuple] = []
     prompt_queries: List[str] = []
+    passthrough: List[Optional[str]] = []
     for i, row in enumerate(rows):
         query, cot = _extract_query_cot(row)
-        if not query or len(cot) < MIN_COT_CHARS:
+        if not query or len(cot) < MIN_TEXT_CHARS:
             continue
         valid_indices.append(i)
         raw_pairs.append((query, cot))
-        for text, qtpl in ((query, EMBED_QUERY_Q), (cot, EMBED_QUERY_COT)):
-            user = COMPRESS_USER.format(query=qtpl, text=text)
+        # Short query bypasses condenser to avoid skeleton-induced hallucination.
+        if len(query) < MIN_TEXT_CHARS:
+            prompts.append(None)
+            passthrough.append(query)
+        else:
+            user = COMPRESS_USER.format(query=EMBED_QUERY_Q, text=query)
             prompts.append({'messages': [
                 {'role': 'system', 'content': COMPRESS_SYSTEM},
                 {'role': 'user', 'content': user},
             ]})
-            prompt_queries.append(qtpl)
-    return prompts, valid_indices, raw_pairs, prompt_queries
+            passthrough.append(None)
+        prompt_queries.append(EMBED_QUERY_Q)
+        user = COMPRESS_USER.format(query=EMBED_QUERY_COT, text=cot)
+        prompts.append({'messages': [
+            {'role': 'system', 'content': COMPRESS_SYSTEM},
+            {'role': 'user', 'content': user},
+        ]})
+        prompt_queries.append(EMBED_QUERY_COT)
+        passthrough.append(None)
+    return prompts, valid_indices, raw_pairs, prompt_queries, passthrough
 
 
 def _get_first_feature(decoded_text: str, template: Template, role: str) -> Optional[Dict[str, Any]]:
@@ -446,90 +487,9 @@ class CondenserRetrainer:
             except Exception as exc:
                 logger.error(f'[condenser_retrain] crashed: {exc}')
 
-    def _load_condense_300k(self):
-        if self._condense_300k_cache is None:
-            dataset = Dataset(dataset_meta=DatasetMeta(CONDENSER_DATASET_ID, split='train'))
-            dataset.set_template(TEMPLATE_NAME, model_id=CONDENSE_MODEL_ID,
-                                 max_length=DATASET_MAX_TOKENS, enable_thinking=False,
-                                 truncation_strategy='delete')
-            self._condense_300k_cache = dataset
-        return self._condense_300k_cache
-
-    def _load_all_failures(self) -> List[Dict[str, Any]]:
-        """Read the cumulative failure pool (all rounds so far).
-
-        Each retrain round samples from the full history rather than only the
-        new failures, so when few fresh failures have accumulated the random
-        subset still reflects a stable distribution. Held under _failure_lock
-        so we never observe a half-written line from a concurrent _log_failure.
-        """
-        global _failure_lock
-        if not os.path.exists(FAILURE_LOG):
-            return []
-        if _failure_lock is None:
-            os.makedirs(os.path.dirname(FAILURE_LOG) or '.', exist_ok=True)
-            _failure_lock = PosixFileLock(FAILURE_LOG + '.lock')
-        rows: List[Dict[str, Any]] = []
-        with _failure_lock:
-            with open(FAILURE_LOG, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        return rows
-
     def _retrain_and_sync(self):
-        failures = self._load_all_failures()
-        if not failures:
-            logger.info('[condenser_retrain] no failures to train on, skipping')
-            return
-
-        n_target = CONDENSER_RETRAIN_SAMPLES
-        random.shuffle(failures)
-
-        if len(failures) >= n_target:
-            train_rows = failures[:n_target]
-        else:
-            condense_300k = self._load_condense_300k()
-            n_fill = n_target - len(failures)
-            indices = random.sample(range(len(condense_300k)), min(n_fill, len(condense_300k)))
-            fill_rows = [condense_300k[i] for i in indices]
-            train_rows = failures + fill_rows
-            random.shuffle(train_rows)
-
-        # Build dataset from failure rows (already have 'messages' field)
-        dataset = Dataset()
-        dataset.add_dataset(DatasetMeta(data=train_rows))
-        dataset.set_template(TEMPLATE_NAME, model_id=CONDENSE_MODEL_ID,
-                             max_length=DATASET_MAX_TOKENS, enable_thinking=False,
-                             truncation_strategy='delete')
-        dataset.encode(load_from_cache_file=False)
-
-        dataloader = DataLoader(dataset=dataset, batch_size=8, shuffle=True)
-
-        self._retrain_count += 1
-        logger.info(f'[condenser_retrain] round {self._retrain_count}: '
-                    f'{len(failures)} failures, {len(train_rows)} total samples, '
-                    f'{CONDENSER_RETRAIN_EPOCHS} epochs')
-
-        for epoch in range(CONDENSER_RETRAIN_EPOCHS):
-            for batch in dataloader:
-                self._model.forward_backward(inputs=batch)
-                self._model.clip_grad_and_step()
-
-        # Sync weights to sampler (exclusive with sampling)
-        with self.sampler_lock:
-            self._ckpt_manager.sync_weights()
-            self._sampler.reset_prefix_cache()
-
-        # Save checkpoint
-        ckpt_name = f'condenser_retrain_{self._retrain_count}'
-        self._model.save(ckpt_name, output_dir=OUTPUT_DIR)
-        logger.info(f'[condenser_retrain] round {self._retrain_count} done, synced to sampler')
+        # Retrain + sync temporarily disabled; failures.jsonl is written directly by _log_failure.
+        pass
 
 
 # =============================================================================
@@ -639,18 +599,31 @@ def train():
     # -------- Train loop -----------------------------------------------------
     def _sample_batch(raw_batch):
         """Compress via vLLM sampler; fall back to API on truncation."""
-        compress_prompts, valid_indices, raw_pairs, prompt_queries = \
+        compress_prompts, valid_indices, raw_pairs, prompt_queries, passthrough = \
             _build_compress_prompts(raw_batch)
         if not compress_prompts:
             return None
 
-        with retrainer.sampler_lock:
-            responses = condenser_sampler.sample(compress_prompts, compress_params)
+        # Only submit non-passthrough prompts to the sampler.
+        sampler_input = [p for p in compress_prompts if p is not None]
+        sampler_pos = [ri for ri, p in enumerate(compress_prompts) if p is not None]
+        if sampler_input:
+            with retrainer.sampler_lock:
+                sampler_responses = condenser_sampler.sample(sampler_input, compress_params)
+        else:
+            sampler_responses = []
+        responses = [None] * len(compress_prompts)
+        for resp, pos in zip(sampler_responses, sampler_pos):
+            responses[pos] = resp
 
         # Extract decoded texts; detect truncations and fall back to API
         decoded_texts: List[str] = []
-        for ri, resp in enumerate(responses):
-            seq = resp.sequences[0] if resp.sequences else None
+        for ri in range(len(compress_prompts)):
+            if passthrough[ri] is not None:
+                decoded_texts.append(passthrough[ri])
+                continue
+            resp = responses[ri]
+            seq = resp.sequences[0] if resp and resp.sequences else None
             text = ''
             if seq and seq.stop_reason != 'length' and seq.decoded:
                 text = seq.decoded
@@ -686,7 +659,7 @@ def train():
             q_text = decoded_texts[i]
             c_text = decoded_texts[i + 1]
             q_raw, c_raw = raw_pairs[i // 2]
-            _log_responses(q_text, c_text, valid_indices[i // 2],
+            _log_responses(q_text, c_text, _next_sample_id(),
                            query_raw=q_raw, cot_raw=c_raw)
             feat_q = _get_first_feature(q_text, emb_template, role='anchor')
             feat_c = _get_first_feature(c_text, emb_template, role='positive')
