@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from twinkle.preprocessor import Preprocessor
@@ -70,9 +71,13 @@ class QualityPreprocessor(Preprocessor):
             step_name = getattr(step, '__name__', None) or type(step).__name__
             before = len(rows_list)
             prev = rows_list
+            t0 = time.perf_counter()
             rows_list = self.map_col_to_row(step(rows_list))
+            elapsed = time.perf_counter() - t0
             after = len(rows_list)
-            logger.info(f'[QualityPreprocessor] {step_name}: {before} -> {after} (dropped {before - after})')
+            logger.info(
+                f'[QualityPreprocessor] {step_name}: {before} -> {after} '
+                f'(dropped {before - after}, {elapsed:.3f}s)')
             self._log_dropped(step_name, prev, rows_list)
         return self.map_row_to_col(rows_list)
 

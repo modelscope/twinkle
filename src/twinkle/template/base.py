@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import json
 import numpy as np
 import os
 from collections.abc import Mapping
@@ -265,6 +266,10 @@ class Template:
 
                             message['reasoning_content'] = reasoning_content
                             message['content'] = new_content
+                    # Always emit string (never None/missing) — keeps PyArrow struct schema
+                    # stable across shards; empty string renders identically to None in jinja.
+                    if not isinstance(message.get('reasoning_content'), str):
+                        message['reasoning_content'] = ''
 
                 result.append(message)
 
@@ -515,6 +520,20 @@ class Template:
                 k: v
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
+        for msg in messages:
+            tcs = msg.get('tool_calls')
+            if isinstance(tcs, str):
+                tcs = json.loads(tcs) if tcs else []
+                msg['tool_calls'] = tcs
+            if not tcs:
+                continue
+            new_tcs = []
+            for tc in tcs:
+                fn = tc['function']
+                args = fn['arguments']
+                decoded = json.loads(args) if args.strip() else {}
+                new_tcs.append({**tc, 'function': {**fn, 'arguments': decoded}})
+            msg['tool_calls'] = new_tcs
         # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
         # :mod:`twinkle.data_format.message`); pass them through verbatim.
         tools = list(trajectory.get('tools') or [])

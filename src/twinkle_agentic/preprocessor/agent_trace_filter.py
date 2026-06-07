@@ -65,7 +65,9 @@ class AgentTraceFilter(Preprocessor):
     """Tag rows that look like agent rollouts; never drops rows."""
 
     def __call__(self, rows) -> List[Dict[str, Any]]:
+        # Set is_agent on every row (not just matches) so map_row_to_col sees a
+        # uniform schema; otherwise rows[0].keys() may miss 'is_agent' and KeyError later.
         return [
-            dict(row, is_agent=True) if _is_agent_row(row.get('messages')) else row
+            dict(row, is_agent=_is_agent_row(row.get('messages')))
             for row in rows
         ]

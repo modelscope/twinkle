@@ -49,6 +49,11 @@ class Qwen3_5Template(QwenTemplate):
         apply_patch(self.tokenizer, Qwen3ChatTemplate)
         # Allow ScoreFilter to render multi-turn agent prefixes ending in `tool`.
         apply_patch(self.tokenizer, Qwen3AllowToolTailTemplate)
+        # Qwen3VLProcessor carries its own chat_template; _apply_chat_template
+        # routes through self.processor, so the patch must be applied there too.
+        if self.processor is not self.tokenizer:
+            apply_patch(self.processor, Qwen3ChatTemplate)
+            apply_patch(self.processor, Qwen3AllowToolTailTemplate)
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()

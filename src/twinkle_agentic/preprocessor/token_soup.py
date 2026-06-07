@@ -80,10 +80,15 @@ def _is_token_soup(
     special_token_count: int = 20,
     script_chaos_threshold: float = 0.55,
     script_chaos_min_chars: int = 40,
+    max_chars: int = 0,
 ) -> bool:
     """Return True if the text exhibits any garbled-output signal."""
     if not text:
         return False
+    # Token-soup signals are statistical/uniform; sampling the head captures them
+    # at near-constant cost regardless of full-text length.
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
     if _ratio(_REPLACEMENT_CHAR_RE, text) > replacement_char_ratio:
         return True
     if _ratio(_CONTROL_CHAR_RE, text) > control_char_ratio:
@@ -111,6 +116,7 @@ class TokenSoupFilter(Preprocessor):
         special_token_count: int = 20,
         script_chaos_threshold: float = 0.55,
         script_chaos_min_chars: int = 40,
+        max_chars: int = 0,
     ) -> None:
         super().__init__()
         self._replacement_char_ratio = replacement_char_ratio
@@ -119,6 +125,7 @@ class TokenSoupFilter(Preprocessor):
         self._special_token_count = special_token_count
         self._script_chaos_threshold = script_chaos_threshold
         self._script_chaos_min_chars = script_chaos_min_chars
+        self._max_chars = max_chars
 
     def __call__(self, rows) -> List[Dict[str, Any]]:
         out = []
@@ -140,6 +147,7 @@ class TokenSoupFilter(Preprocessor):
                     special_token_count=self._special_token_count,
                     script_chaos_threshold=self._script_chaos_threshold,
                     script_chaos_min_chars=self._script_chaos_min_chars,
+                    max_chars=self._max_chars,
                 )
                 for m in asst_msgs
             ):

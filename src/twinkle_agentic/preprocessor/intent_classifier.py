@@ -223,6 +223,10 @@ class _RegexDetector(IntentDetector):
             if not isinstance(m, dict):
                 continue
             role = m.get('role')
+            # tool/system messages can never resolve to a key round (see _pair_assistant)
+            # and tool outputs are often multi-MB — skip to avoid wasted regex scans.
+            if role not in ('assistant', 'user'):
+                continue
             if self.role_filter and role != self.role_filter:
                 continue
             text = _msg_text(m)

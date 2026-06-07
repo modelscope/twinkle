@@ -16,16 +16,15 @@ Launch:
 """
 import json
 import os
-from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
-
+from functools import partial
 from peft import LoraConfig
 
 import twinkle
 from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
-from twinkle.dataset import IterableDataset
+from twinkle.dataset import Dataset
 from twinkle.dataset.base import DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.sampler import vLLMSampler
@@ -34,7 +33,6 @@ from twinkle_agentic.preprocessor import (
     QualityPreprocessor, SamplerBackend,
     IntentClassifier, ResponseRefiner, ScoreFilter,
     HardFilter, RefuseFilter, AgentTraceFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
-    FixUnicodeFilter, RemoveRepeatSentencesFilter,
     WordRepeatFilter, CharRepeatFilter, SpecialCharsFilter, AlphanumericFilter,
     FlaggedWordsFilter, MinHashDedupFilter, PIIPresidioFilter,
 )
@@ -59,7 +57,7 @@ NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 4))
 LEARNING_RATE = float(os.environ.get('LR', 1e-4))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRAD_ACCUM', 8))
-LOG_INTERVAL = 20
+LOG_INTERVAL = 1
 SAVE_INTERVAL = 500
 NUM_STEPS = int(os.environ.get('NUM_STEPS', 5000))
 
@@ -72,18 +70,64 @@ ADAPTER_NAME = 'default'
 # ── Data source ──────────────────────────────────────────────────────────────
 CSV_PATH = os.environ.get(
     'CSV_PATH', '/mnt/workspace/yzhao/tastelikefeet/bc/ds_csv/data/20260531.csv')
-DATASET_TOTAL = int(os.environ.get('DATASET_TOTAL', 1000))  # 0 = unbounded stream
+DATASET_TOTAL = int(os.environ.get('DATASET_TOTAL', 3000))  # 0 = full materialized dataset
+# Worker count for HF Dataset.map(num_proc=N); spawn start method is forced in twinkle.dataset.base.
+MAP_NUM_PROC = int(os.environ.get('MAP_NUM_PROC', 64))
 
 
-def _stream_csv_rows(csv_path: str) -> Iterator[Dict[str, Any]]:
+def _canonicalize_tool_call(tc: Any) -> Dict[str, Any]:
+    """Coerce ``tool_calls[i]`` to a fixed-schema dict for stable Arrow inference.
+
+    Keeps ``function.arguments`` as the OpenAI-native JSON string so every row
+    sees a uniform ``string`` field; any string→dict decoding is the
+    chat_template's concern (see ``Template._apply_chat_template``).
+
+    The decoded form is enforced to be a JSON object so the chat_template's
+    ``|items`` filter never receives list/scalar/null — those originate from
+    dirty CSV rows and are coerced to ``{}`` here, the ingestion boundary.
+    """
+    tc = tc if isinstance(tc, dict) else {}
+    fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+    args = fn.get('arguments')
+    if isinstance(args, dict):
+        args_str = json.dumps(args, ensure_ascii=False)
+    elif isinstance(args, str) and args.strip():
+        try:
+            decoded = json.loads(args)
+        except json.JSONDecodeError:
+            decoded = {}
+        if not isinstance(decoded, dict):
+            decoded = {}
+        args_str = json.dumps(decoded, ensure_ascii=False)
+    else:
+        args_str = '{}'
+    return {
+        'id': str(tc.get('id') or ''),
+        'type': str(tc.get('type') or 'function'),
+        'function': {
+            'name': str(fn.get('name') or ''),
+            'arguments': args_str,
+        },
+    }
+
+
+def _stream_csv_rows(csv_path: str, max_rows: int = 0) -> Iterator[Dict[str, Any]]:
     """Stream the custom CSV: each line is `ts,model,req_id,messages_json` (no quoting).
 
     The first 3 fields are scalar; the remainder of the line is a JSON array of
     chat messages, possibly containing commas — so we split on the first 3 commas only.
+    ``max_rows`` caps the yielded rows at ingestion time so Arrow never materializes
+    the unused tail.
     """
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.rstrip('\n').rstrip('\r')
+    emitted = 0
+    with open(csv_path, 'rb') as f:
+        bad_bytes = 0
+        for raw in f:
+            try:
+                line = raw.decode('utf-8').rstrip('\n').rstrip('\r')
+            except UnicodeDecodeError:
+                bad_bytes += 1
+                continue
             if not line:
                 continue
             parts = line.split(',', 3)
@@ -94,7 +138,7 @@ def _stream_csv_rows(csv_path: str) -> Iterator[Dict[str, Any]]:
                 raw_msgs = json.loads(msgs_raw)
             except json.JSONDecodeError:
                 continue
-            messages: List[Dict[str, str]] = []
+            messages: List[Dict[str, Any]] = []
             for m in raw_msgs:
                 role = m.get('role', '')
                 content = m.get('content')
@@ -103,20 +147,42 @@ def _stream_csv_rows(csv_path: str) -> Iterator[Dict[str, Any]]:
                     content = ''.join(
                         p.get('text', '') for p in content
                         if isinstance(p, dict) and p.get('type') == 'text')
-                if not isinstance(content, str) or not content:
+                if content is None:
+                    content = ''
+                if not isinstance(content, str):
                     continue
-                if role == 'assistant' and m.get('reasoning_content'):
-                    content = f"<think>{m['reasoning_content']}</think>{content}"
-                messages.append({'role': role, 'content': content})
+                raw_tcs = m.get('tool_calls') if role == 'assistant' else None
+                tc_list = [_canonicalize_tool_call(tc) for tc in raw_tcs] if raw_tcs else []
+                if role == 'assistant':
+                    if not content and not tc_list:
+                        continue
+                    if m.get('reasoning_content'):
+                        content = f"<think>{m['reasoning_content']}</think>{content}"
+                elif role == 'tool':
+                    pass
+                elif not content:
+                    continue
+                # tool_calls stored as JSON string (empty -> ''): keeps Arrow schema as a
+                # stable Value(string) regardless of empty-list / heterogeneous-struct shards.
+                # Template._apply_chat_template decodes it back to list before jinja render.
+                messages.append({
+                    'role': role,
+                    'content': content,
+                    'tool_calls': json.dumps(tc_list, ensure_ascii=False) if tc_list else '',
+                    'tool_call_id': str(m.get('tool_call_id') or '') if role == 'tool' else '',
+                })
             if not messages:
                 continue
-            n_assistant = sum(1 for m in messages if m['role'] == 'assistant')
             yield {
                 'id': f'csv__{ts}__{req_id}',
                 'source': Path(csv_path).stem,
                 'messages': messages,
-                'user_data': {'key_rounds': list(range(1, n_assistant + 1))},
+                'user_data': {},
             }
+            emitted += 1
+            if max_rows and emitted >= max_rows:
+                break
+
 
 # ── QualityPreprocessor config ───────────────────────────────────────────────
 SENSITIVE_WORDS_FILE = str(
@@ -136,19 +202,22 @@ JUDGE_MAX_TOKENS = int(os.environ.get('JUDGE_MAX_TOKENS', 32000))
 JUDGE_MAX_WORKERS = int(os.environ.get('JUDGE_MAX_WORKERS', 16))
 
 
-def build_dataset(backend: SamplerBackend) -> IterableDataset:
-    """Stream the local CSV, convert to SFT messages format, run QualityPreprocessor."""
+def build_dataset(backend: SamplerBackend) -> Dataset:
+    """Materialize the local CSV, convert to SFT messages format, run QualityPreprocessor.
+
+    Switched from streaming IterableDataset to in-memory Dataset so HF
+    `Dataset.map(num_proc=N)` can parallelize the QualityPreprocessor pipeline.
+    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Custom CSV format (commas inside JSON) — feed framework via callable, not csv loader.
     meta = DatasetMeta(
         dataset_id=Path(CSV_PATH).stem,
-        data=partial(_stream_csv_rows, csv_path=CSV_PATH),
+        data=partial(_stream_csv_rows, csv_path=CSV_PATH, max_rows=DATASET_TOTAL),
     )
-    dataset = IterableDataset(meta)
-    if DATASET_TOTAL > 0:
-        dataset.dataset = dataset.dataset.take(DATASET_TOTAL)
-    template = Qwen3_5Template(model_id=MODEL_ID, max_length=MAX_LENGTH,
+    dataset = Dataset(meta)
+    # template kept for future re-enablement of ScoreFilter; unused in current pipeline.
+    _ = Qwen3_5Template(model_id=MODEL_ID, max_length=MAX_LENGTH,
         truncation_strategy='delete',
         enable_thinking=False)
 
@@ -161,45 +230,45 @@ def build_dataset(backend: SamplerBackend) -> IterableDataset:
             # / sanity rules can adapt instead of mass-dropping them.
             AgentTraceFilter(),
             DeadLoopFilter(),
-            TokenSoupFilter(),
-            MessageSanityFilter(max_msg_chars=200000),
-            # Phase 6-7: text normalization (mappers)
-            FixUnicodeFilter(),
-            RemoveRepeatSentencesFilter(),
+            MessageSanityFilter(max_msg_chars=30000),
             # Phase 8-10: repetition & character quality
             WordRepeatFilter(),
             CharRepeatFilter(),
             SpecialCharsFilter(max_ratio=0.6),
+            # TokenSoupFilter samples head only — signals are uniform/statistical, no need to scan multi-MB tool payloads.
+            TokenSoupFilter(max_chars=8000),
             AlphanumericFilter(),
             FlaggedWordsFilter(),
             # MinHashDedupFilter(),
             IntentClassifier(),
-            ScoreFilter(
-                template=template,
-                backend=backend,
-                scorers=[
-                    ChrMinScorer(),
-                    # PassNScorer(
-                    #     backend=backend,
-                    #     judge_model=JUDGE_MODEL or None,
-                    #     judge_base_url=JUDGE_BASE_URL,
-                    #     judge_api_key=JUDGE_API_KEY,
-                    #     n=4,
-                    #     min_pass=0,
-                    #     sample_temperature=0.7,
-                    #     sample_max_tokens=4096,
-                    #     judge_temperature=JUDGE_TEMPERATURE,
-                    #     judge_max_tokens=JUDGE_MAX_TOKENS,
-                    #     judge_max_workers=JUDGE_MAX_WORKERS,
-                    # ),
-                    # ParaphraseScorer(
-                    #     backend=backend,
-                    #     template=template,
-                    # ),
-                ],
-                # trace_dir=os.path.join(OUTPUT_DIR, 'score_traces'),
-            ),
-            PIIPresidioFilter(languages=('en', 'zh')),
+            # ScoreFilter temporarily disabled — reuses Ray vLLMSampler backend
+            # which is incompatible with HF Dataset.map(num_proc>1) workers.
+            # ScoreFilter(
+            #     template=template,
+            #     backend=backend,
+            #     scorers=[
+            #         ChrMinScorer(),
+            #         # PassNScorer(
+            #         #     backend=backend,
+            #         #     judge_model=JUDGE_MODEL or None,
+            #         #     judge_base_url=JUDGE_BASE_URL,
+            #         #     judge_api_key=JUDGE_API_KEY,
+            #         #     n=4,
+            #         #     min_pass=0,
+            #         #     sample_temperature=0.7,
+            #         #     sample_max_tokens=4096,
+            #         #     judge_temperature=JUDGE_TEMPERATURE,
+            #         #     judge_max_tokens=JUDGE_MAX_TOKENS,
+            #         #     judge_max_workers=JUDGE_MAX_WORKERS,
+            #         # ),
+            #         # ParaphraseScorer(
+            #         #     backend=backend,
+            #         #     template=template,
+            #         # ),
+            #     ],
+            #     # trace_dir=os.path.join(OUTPUT_DIR, 'score_traces'),
+            # ),
+            # PIIPresidioFilter(languages=('en', 'zh')),
             # Phase 13: response refinement
             # ResponseRefiner(
             #     backend=backend,
@@ -210,7 +279,7 @@ def build_dataset(backend: SamplerBackend) -> IterableDataset:
         ],
         dropped_log_path=DROPPED_DATA_PATH,
     )
-    dataset.map(qp)
+    dataset.map(qp, num_proc=MAP_NUM_PROC, load_from_cache_file=False)
 
     dataset.set_template(
         TEMPLATE_NAME,
@@ -219,7 +288,7 @@ def build_dataset(backend: SamplerBackend) -> IterableDataset:
         truncation_strategy='delete',
         enable_thinking=False,
     )
-    dataset.encode()
+    dataset.encode(num_proc=MAP_NUM_PROC, load_from_cache_file=False)
 
     return dataset
 
@@ -287,6 +356,11 @@ def train():
     logger.info(f'Total steps: {NUM_STEPS}, model GPUs: {MODEL_GPUS}, sampler GPUs: {SAMPLER_GPUS}')
 
     for cur_step, batch in enumerate(dataloader):
+        
+        print([len(m['input_ids']) for m in batch])
+        if cur_step == 17:
+            print()
+        
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
 

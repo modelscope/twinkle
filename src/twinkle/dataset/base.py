@@ -122,11 +122,13 @@ class Dataset(TorchDataset):
         kwargs = self._normalize_cache_kwargs(self.dataset, kwargs)
         from functools import partial
         encode_fn = partial(self.template.batch_encode, add_generation_prompt=add_generation_prompt)
+        # Dataset.filter() does not accept map-only kwargs (e.g. remove_columns); split them off.
+        filter_kwargs = {k: v for k, v in kwargs.items() if k != 'remove_columns'}
         with processing_lock('dataset'):
             # use a default lock because encode is to all datasets
             self.dataset = self.dataset.map(encode_fn, **kwargs).filter(
                 lambda batch: [True] * len(next(iter(batch.values())))
-                if 'input_ids' not in batch else [len(x) > 0 for x in batch['input_ids']], **kwargs)
+                if 'input_ids' not in batch else [len(x) > 0 for x in batch['input_ids']], **filter_kwargs)
 
     @remote_function()
     def check(self, **kwargs):
