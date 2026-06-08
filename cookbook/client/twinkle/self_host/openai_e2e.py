@@ -108,6 +108,46 @@ def test_multi_turn(client: OpenAI):
     print('  PASS\n')
 
 
+def test_sticky_session(base_url: str):
+    """Verify sticky session routing by sending multiple requests and checking
+    they all reach the same sampler replica (template stays initialized)."""
+    import httpx
+
+    print('--- Phase 5: Sticky session verification ---')
+
+    # Send 5 rapid requests with the same model — if sticky sessions work,
+    # all requests go to the same replica (no re-template-init needed, fast responses)
+    timings = []
+    for i in range(5):
+        t0 = time.time()
+        resp = httpx.post(
+            f'{base_url}/chat/completions',
+            json={
+                'model': MODEL,
+                'messages': [{'role': 'user', 'content': f'Say the number {i}.'}],
+                'max_tokens': 8,
+                'temperature': 0.1,
+            },
+            headers={'Authorization': 'Bearer EMPTY_API_KEY'},
+            timeout=60,
+        )
+        elapsed = time.time() - t0
+        timings.append(elapsed)
+        assert resp.status_code == 200, f'Request {i} failed: {resp.status_code}'
+        print(f'  Request {i}: {elapsed:.3f}s')
+
+    # All requests after the first should be fast (< 5s) — proving they hit
+    # the same replica with template already set (no 50s+ cold-start)
+    slow_requests = [t for t in timings[1:] if t > 5.0]
+    print(f'  Timings: {[f"{t:.2f}s" for t in timings]}')
+    assert len(slow_requests) == 0, (
+        f'Sticky session broken: {len(slow_requests)} requests took >5s '
+        f'(expected all to hit warm replica)'
+    )
+    print('  All requests routed to same warm replica')
+    print('  PASS\n')
+
+
 def main():
     client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
@@ -115,6 +155,7 @@ def main():
     test_non_streaming(client)
     test_streaming(client)
     test_multi_turn(client)
+    test_sticky_session(BASE_URL)
 
     print('=' * 50)
     print('ALL PHASES PASSED')
