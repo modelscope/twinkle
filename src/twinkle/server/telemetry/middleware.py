@@ -19,8 +19,8 @@ Public entry-points (unchanged signatures):
 """
 from __future__ import annotations
 import time
-from typing import Any
 from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -29,9 +29,7 @@ from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
-# ---------------------------------------------------------------------------
-# Lazy caches – populated on first call per deployment
-# ---------------------------------------------------------------------------
+# Per-process caches; each Ray Serve worker holds its own instance.
 _task_metrics_cache: dict[str, TaskMetrics] = {}
 _request_metrics_cache: dict[str, _RequestMetrics] = {}
 

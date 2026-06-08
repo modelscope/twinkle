@@ -17,6 +17,14 @@ from twinkle.server.gateway.openai_bridge import translate_response
 # ---------- Fixtures ------------------------------------------------------- #
 
 
+@pytest.fixture(autouse=True)
+def _reset_template_cache():
+    from twinkle.server.gateway.openai_handlers import _template_initialized
+    _template_initialized.clear()
+    yield
+    _template_initialized.clear()
+
+
 @pytest.fixture
 def mock_gateway():
     """Build a minimal FastAPI app with OpenAI routes and a mock GatewayServer."""

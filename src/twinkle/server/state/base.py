@@ -102,4 +102,5 @@ class BaseManager(ABC, Generic[T]):
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
         except (ValueError, TypeError, AttributeError):
+            logger.warning('Failed to parse timestamp %r, treating as current time', timestamp_str)
             return time.time()

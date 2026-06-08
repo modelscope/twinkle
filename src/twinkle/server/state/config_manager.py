@@ -63,7 +63,12 @@ class ConfigManager:
         return await self._backend.get(self._make_key(key))
 
     async def pop(self, key: str) -> Any | None:
-        """Remove and return the configuration value for key, or None."""
+        """Remove and return the configuration value for key, or None.
+
+        Note: get-then-delete is not atomic (TOCTOU); a concurrent pop may
+        return the same value twice. This is acceptable for config entries
+        where double-return is harmless.
+        """
         backend_key = self._make_key(key)
         value = await self._backend.get(backend_key)
         if value is None:

@@ -6,7 +6,7 @@ Builds a single Ray Serve deployment (ModelManagement) that simultaneously handl
 both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import FastAPI, Request
 from ray import serve
@@ -14,15 +14,15 @@ from ray.serve.config import RequestRouterConfig
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh
+from twinkle.server.common.router import StickyLoraRequestRouter
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.lifecycle import AdapterManagerMixin
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-from ..common.router import StickyLoraRequestRouter
-from ..utils import wrap_builder_with_device_group_env
 from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 

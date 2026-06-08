@@ -81,9 +81,9 @@ def translate_response(
     choices = []
     total_tokens = 0
 
-    for sample_idx, sample in enumerate(samples):
+    for _sample_idx, sample in enumerate(samples):
         sequences = sample.get('sequences', [])
-        for seq_idx, seq in enumerate(sequences):
+        for _seq_idx, seq in enumerate(sequences):
             decoded = seq.get('decoded') or ''
             finish_reason = _map_stop_reason(seq.get('stop_reason'))
             tokens = seq.get('tokens', [])
@@ -145,14 +145,14 @@ def translate_stream_chunk(
 
 def make_error(
     message: str,
-    type: str = 'invalid_request_error',
+    error_type: str = 'invalid_request_error',
     param: str | None = None,
     code: str | None = None,
 ) -> dict[str, Any]:
     """Build an OpenAI-shaped error response body."""
     error: dict[str, Any] = {
         'message': message,
-        'type': type,
+        'type': error_type,
     }
     if param is not None:
         error['param'] = param

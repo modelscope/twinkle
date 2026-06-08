@@ -25,12 +25,12 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
     ) -> list[list[RunningReplica]]:
         """
         This method chooses the best replica for the request based on
-        multiplexed and avaliable lora count. The algorithm
+        multiplexed and available lora count. The algorithm
         works as follows:
 
         1. Populate top_ranked_replicas based on available replicas based on
           multiplex_id (only one replica is chosen)
-        2. Populate and override top_ranked_replicas info based on avalible lora
+        2. Populate and override top_ranked_replicas info based on available lora
           slots of the replica.
         """
 

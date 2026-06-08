@@ -13,7 +13,7 @@ Follows the same structural pattern as model/app.py:
 """
 from __future__ import annotations
 import os
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import FastAPI
 from ray import serve

@@ -198,7 +198,7 @@ class TestTranslateStreamChunk:
 
 class TestMakeError:
     def test_basic_error(self):
-        err = make_error('something broke', type='server_error')
+        err = make_error('something broke', error_type='server_error')
         assert err == {'error': {'message': 'something broke', 'type': 'server_error'}}
 
     def test_with_param(self):
@@ -206,5 +206,5 @@ class TestMakeError:
         assert err['error']['param'] == 'model'
 
     def test_with_code(self):
-        err = make_error('not found', type='model_not_found', code='model_not_found')
+        err = make_error('not found', error_type='model_not_found', code='model_not_found')
         assert err['error']['code'] == 'model_not_found'

@@ -6,7 +6,7 @@ Builds a single Ray Serve deployment (SamplerManagement) that simultaneously han
 both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import FastAPI, Request
 from ray import serve
@@ -15,11 +15,11 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import ServerState, get_server_state
+from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-from ..utils import wrap_builder_with_device_group_env
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 

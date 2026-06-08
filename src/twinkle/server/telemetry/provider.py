@@ -132,7 +132,7 @@ def init_telemetry(config: TelemetryConfig) -> None:
         return
 
     # ---- Resource -------------------------------------------------------
-    resource_attrs: dict = {'service.name': config.service_name}
+    resource_attrs: dict[str, str] = {'service.name': config.service_name}
     if config.resource_attributes:
         resource_attrs.update(config.resource_attributes)
     resource = Resource.create(resource_attrs)

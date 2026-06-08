@@ -40,9 +40,7 @@ class GatewayServer(LazyCleanupMixin):
         self.route_prefix = kwargs.get('route_prefix', '/api/v1')
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
-        self.supported_models = self._normalize_models(supported_models) or [
-            types.SupportedModel(model_name='Qwen/Qwen3.6-27B'),
-        ]
+        self.supported_models = self._normalize_models(supported_models)
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
 

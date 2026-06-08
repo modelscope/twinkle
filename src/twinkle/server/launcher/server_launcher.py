@@ -10,9 +10,9 @@ from __future__ import annotations
 import os
 import signal
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 from twinkle import get_logger
 from twinkle.server.config import ServerConfig
@@ -238,10 +238,9 @@ class ServerLauncher:
         host = self.config.http_options.host
         port = self.config.http_options.port
 
-        print('\nAll applications started!')
-        print('Endpoints:')
+        logger.info('All applications started!')
         for app_spec in applications:
-            print(f'  - http://{host}:{port}{app_spec.route_prefix}')
+            logger.info('  Endpoint: http://%s:%s%s', host, port, app_spec.route_prefix)
 
         # Graceful shutdown via signal handling
         shutdown_event = threading.Event()

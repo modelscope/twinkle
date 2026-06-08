@@ -9,8 +9,8 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 from __future__ import annotations
 import json
 import uuid
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -64,7 +64,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 status_code=404,
                 content=make_error(
                     message=f"Model '{model}' not found. Register it as an adapter or use a supported base model.",
-                    type='model_not_found',
+                    error_type='model_not_found',
                     param='model',
                 ),
             )
@@ -94,7 +94,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                     status_code=response.status_code,
                     content=make_error(
                         message=f'Sampler error: {response.body.decode()[:500]}',
-                        type='server_error',
+                        error_type='server_error',
                     ),
                 )
 
@@ -141,7 +141,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                     error_body = e.response.content.decode()[:500]
                     error_chunk = make_error(
                         message=f'Streaming error: {error_body}',
-                        type='server_error',
+                        error_type='server_error',
                     )
                     yield f'data: {json.dumps(error_chunk)}\n\n'
                     yield 'data: [DONE]\n\n'
@@ -214,6 +214,7 @@ def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
     }
 
 
+# Per-process cache; each Ray Serve worker holds its own instance.
 _template_initialized: set[str] = set()
 
 
