@@ -5,7 +5,7 @@ import atexit
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from twinkle import get_logger
-from twinkle_client.types.server import (DeleteCheckpointResponse, GetServerCapabilitiesResponse)
+from twinkle_client.types.server import (CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse)
 from twinkle_client.types.session import (CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest,
                                            SessionHeartbeatResponse)
 from twinkle_client.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
@@ -75,6 +75,21 @@ class TwinkleClient:
         )
         self._heartbeat_thread.start()
         atexit.register(self.close)
+
+    def get_capacity_info(self) -> CapacityInfoResponse:
+        """
+        Get the server's global LoRA capacity information.
+
+        Returns:
+            :class:`~twinkle_client.types.server.CapacityInfoResponse` with
+            ``max_loras``, ``used_loras``, and ``free_loras`` fields.
+
+        Raises:
+            TwinkleClientError: If the request fails.
+        """
+        response = http_get(self._get_url('/capacity_info'))
+        data = self._handle_response(response)
+        return CapacityInfoResponse(**data)
 
     # ------------------------------------------------------------------
     # Internal helpers

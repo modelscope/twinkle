@@ -165,7 +165,6 @@ class TwinkleModel(ABC):
                 'init_method': 'env://',
                 'rank': Platform.get_rank(),
                 'world_size': Platform.get_world_size(),
-                'timeout': timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))),
             }
             if self._should_bind_device_id_for_process_group(backend):
                 init_kwargs['device_id'] = torch.device(Platform.get_local_device())

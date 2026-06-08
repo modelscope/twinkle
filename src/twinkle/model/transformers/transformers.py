@@ -209,7 +209,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
-        return bool(use_rank0_broadcast() and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+        if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
+            return False
+        local_rank = Platform.get_local_rank()
+        if local_rank < 0:
+            raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')
+        return local_rank != 0
 
     def _init_empty_model_from_config(self, model_cls, **kwargs):
         from accelerate import init_empty_weights
@@ -907,17 +912,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Full model save
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
-            # LoRA adapter save (EP-aware via strategy.get_full_state_dict)
-            full_state = self.strategy.get_full_state_dict(self.model)
-            adapter_marker = '.lora_'
-            adapter_suffix = f'.{adapter_name}.'
-            for key, value in full_state.items():
-                if adapter_marker not in key:
-                    continue
-                if adapter_suffix not in key:
-                    continue
-                normalized = key.replace(adapter_suffix, '.')
-                processed_state_dict[normalized] = value
+            processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
 
         if isinstance(model, PeftModel):
             if Platform.is_master():
@@ -937,6 +932,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             )
 
         return checkpoint_dir
+
+    def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
+        """Return PEFT-normalized adapter state dict for saving."""
+        # Avoid collecting the full base model for large FSDP/EP jobs.
+        adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
+        adapter_suffix = f'.{adapter_name}.'
+        processed_state_dict = {}
+        for key, value in adapter_state.items():
+            normalized = key.replace(adapter_suffix, '.')
+            processed_state_dict[normalized] = value
+        return processed_state_dict
 
     def _save_optimizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)

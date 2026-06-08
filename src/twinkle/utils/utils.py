@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import fnmatch
 import glob
+import inspect
 import os
 import shutil
+from functools import lru_cache
 
 
 def deep_getattr(obj, attr: str, default=None):
@@ -15,6 +17,24 @@ def deep_getattr(obj, attr: str, default=None):
         else:
             obj = getattr(obj, a, default)
     return obj
+
+
+@lru_cache(maxsize=None)
+def signature_info(fn):
+    signature = inspect.signature(fn)
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+    return accepts_kwargs, frozenset(signature.parameters)
+
+
+def has_signature_parameter(fn, name: str) -> bool:
+    return name in signature_info(fn)[1]
+
+
+def call_with_supported_kwargs(fn, *args, **kwargs):
+    accepts_kwargs, parameters = signature_info(fn)
+    if not accepts_kwargs:
+        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return fn(*args, **kwargs)
 
 
 def copy_files_by_pattern(source_dir, dest_dir, patterns, exclude_patterns=None):
