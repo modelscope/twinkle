@@ -76,6 +76,7 @@ from .server import (
     SupportedModel,
     WeightsInfoRequest,
     WeightsInfoResponse as ServerWeightsInfoResponse,
+    CapacityInfoResponse,
 )
 from .session import CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest, SessionHeartbeatResponse
 from .training import (

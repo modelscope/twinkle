@@ -496,8 +496,6 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             config = deserialize_object(body.config)
             extra_kwargs = body.model_extra or {}
             training_run_manager = create_training_run_manager(token, client_type='twinkle')
-            self.register_resource(adapter_name, token, session_id)
-            self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
 
             lora_config = None
             if isinstance(config, LoraConfig):
@@ -507,6 +505,20 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 lora_config=lora_config,
                 save_dir=resolved_save_dir,
                 user_metadata={'adapter_name': body.adapter_name})
+            await self.state.register_model(
+                run_config.model_dump(),
+                token=token,
+                model_id=adapter_name,
+                replica_id=self.replica_id,
+                session_id=session_id,
+            )
+            try:
+                self.register_resource(adapter_name, token, session_id)
+                self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
+            except Exception:
+                self.unregister_resource(adapter_name)
+                await self.state.unload_model(adapter_name)
+                raise
             training_run_manager.save(adapter_name, run_config)
             return {'status': 'ok', 'adapter_name': adapter_name}
 

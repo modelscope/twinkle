@@ -1,16 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
-from twinkle.utils import DeviceMesh, Platform, torch_util
+from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
+from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
+
+logger = get_logger()
+
+LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
+PEFT_BASE_PREFIX = 'base_model.model.'
+PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
 class NativeFSDPStrategy:
@@ -29,6 +37,8 @@ class NativeFSDPStrategy:
         self.enable_ep = enable_ep
         self.ep_fsdp_device_mesh = self._build_ep_fsdp_device_mesh(ep_size) if enable_ep else None
         self._rank0_pre_ep_full_state_dict = None
+        self._adapter_full_state_dict = None
+        self._pre_ep_state_captured = False
 
     def pretrained_load_context(self):
         # Native FSDP loads pretrained weights via rank0 broadcast during wrap_model().
@@ -39,8 +49,57 @@ class NativeFSDPStrategy:
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
 
+    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
+        if self._pre_ep_state_captured:
+            return
+        if not (enable_ep and self.use_rank0_pretrained_broadcast()):
+            return
+        local_rank = Platform.get_local_rank()
+        if local_rank < 0:
+            raise RuntimeError('Native FSDP node-local pre-EP state capture requires LOCAL_RANK.')
+        is_source_rank = dist.is_available() and dist.is_initialized() and local_rank == 0
+        self.set_rank0_pre_ep_full_state_dict(clone_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
+        self._pre_ep_state_captured = True
+
+    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
+        if not enable_ep:
+            return config_or_dir
+
+        from peft import LoraConfig
+
+        if not isinstance(config_or_dir, LoraConfig):
+            return config_or_dir
+
+        target_params = getattr(config_or_dir, 'target_parameters', None) or []
+        if target_params:
+            if getattr(config_or_dir, 'use_dora', False):
+                raise ValueError('PEFT ParamWrapper does not support use_dora=True with target_parameters; '
+                                 'disable DoRA when training expert parameters.')
+            if getattr(config_or_dir, 'lora_bias', False):
+                raise ValueError('PEFT ParamWrapper does not support lora_bias=True with target_parameters.')
+            if float(getattr(config_or_dir, 'lora_dropout', 0.0)) > 0.0:
+                raise ValueError('PEFT ParamWrapper does not support lora_dropout>0 with target_parameters.')
+            return config_or_dir
+
+        config_or_dir.target_parameters = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
+        logger.info('EP+LoRA auto-filled target_parameters with '
+                    "['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'].")
+        return config_or_dir
+
     def set_rank0_pre_ep_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         self._rank0_pre_ep_full_state_dict = state_dict
+
+    def set_adapter_full_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
+        self._adapter_full_state_dict = state_dict
+
+    def load_peft_weights(self, model, adapter_weights: Mapping[str, torch.Tensor], adapter_name: str) -> None:
+        from peft.utils import set_peft_model_state_dict
+
+        fsdp_world_size = self.device_mesh.fsdp_world_size if self.device_mesh is not None else 1
+        if fsdp_world_size > 1:
+            _load_peft_weights_for_native_fsdp2(model, adapter_weights, adapter_name, self)
+        else:
+            set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
 
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
@@ -73,14 +132,22 @@ class NativeFSDPStrategy:
 
             original_sd = None
             saved_buffers = None
+            adapter_source_sd = {}
+            adapter_full_sd = {}
             if use_meta:
-                is_rank0 = (dist.get_rank() == 0)
+                local_rank = Platform.get_local_rank()
+                if local_rank < 0:
+                    raise RuntimeError('Native FSDP node-local state loading requires LOCAL_RANK.')
+                is_source_rank = local_rank == 0
                 if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
-                    original_sd = self._rank0_pre_ep_full_state_dict if is_rank0 else {}
+                    original_sd = self._rank0_pre_ep_full_state_dict if is_source_rank else {}
                 else:
-                    original_sd = model.state_dict() if is_rank0 else {}
-                saved_buffers = _get_non_persistent_buffers(model) if is_rank0 else {}
-                if is_rank0:
+                    original_sd = model.state_dict() if is_source_rank else {}
+                adapter_source_sd = _collect_adapter_source_state(model.state_dict())
+                adapter_full_sd = (
+                    self._adapter_full_state_dict if is_source_rank and self._adapter_full_state_dict else {})
+                saved_buffers = _get_non_persistent_buffers(model) if is_source_rank else {}
+                if is_source_rank:
                     model = model.to(torch.device('meta'))
                     if hasattr(model, 'tie_weights'):
                         model.tie_weights()
@@ -144,22 +211,24 @@ class NativeFSDPStrategy:
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
-                if ep_enabled:
-                    _broadcast_sharded_state_dict(
-                        model,
-                        original_sd or {},
-                        device_type=device_type,
-                        expert_shard_specs=_collect_ep_expert_shard_specs(model),
-                        rank_to_ep_rank=_build_rank_to_ep_rank(self.ep_fsdp_device_mesh),
-                    )
-                else:
-                    _load_rank0_full_state_dict(model, original_sd or {})
+                expert_shard_specs = _collect_ep_expert_shard_specs(model) if ep_enabled else {}
+                rank_to_ep_rank = _build_rank_to_ep_rank(self.ep_fsdp_device_mesh) if ep_enabled else {}
+                _broadcast_sharded_state_dict(
+                    model,
+                    original_sd or {},
+                    device_type=device_type,
+                    expert_shard_specs=expert_shard_specs,
+                    rank_to_ep_rank=rank_to_ep_rank,
+                    adapter_source_sd=adapter_source_sd,
+                    adapter_full_sd=adapter_full_sd,
+                )
+                self._adapter_full_state_dict = None
                 target_device = torch.device(device_type)
                 _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
-            if ep_enabled and layer_pairs:
+            if ep_enabled and layer_pairs and self.fsdp_config.get('manual_prefetch', False):
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
             if ep_enabled:
@@ -272,7 +341,40 @@ class NativeFSDPStrategy:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=0)
+                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                state_dict[name] = local_full.cpu()
+                del gathered, local_full
+            else:
+                state_dict[name] = local_full.cpu()
+                del local_full
+
+        return state_dict
+
+    def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
+        """Collect only LoRA adapter parameters, with EP-aware all-gather."""
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+
+        ep_fsdp_mesh = self.ep_fsdp_device_mesh
+        ep_group = None
+        ep_world_size = 1
+        if ep_fsdp_mesh is not None:
+            ep_group = ep_fsdp_mesh['ep'].get_group()
+            ep_world_size = ep_fsdp_mesh['ep'].size()
+
+        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        adapter_suffix = f'.{adapter_name}.'
+
+        for name, param in unwrapped.named_parameters():
+            if not _is_lora_state_key(name) or adapter_suffix not in name:
+                continue
+
+            local_full = torch_util.to_local_tensor(param)
+            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+                local_full = local_full.contiguous().to(Platform.get_local_device())
+                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
+                dist.all_gather(gathered, local_full, group=ep_group)
+                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
@@ -295,6 +397,17 @@ def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
             candidate_names.add(experts_prefix + pname)
     actual_param_names = {n for n, _ in model.named_parameters()}
     return candidate_names & actual_param_names
+
+
+def _ep_expert_state_dict_gather_dim(name: str) -> int:
+    # PEFT ParamWrapper keeps expert LoRA tensors flattened instead of storing
+    # them as [num_experts, ...]: lora_A is [r * num_experts, in] and lora_B is
+    # [out, r * num_experts]. EP therefore owns a contiguous expert block on
+    # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
+    # parallelism, so the forward pass does not need an EP all-reduce.
+    if 'lora_B' in name:
+        return 1
+    return 0
 
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
@@ -462,6 +575,25 @@ def _build_rank_to_ep_rank(ep_fsdp_device_mesh: Optional[TorchDeviceMesh]) -> Di
     return rank_to_ep_rank
 
 
+def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
+    """Return local-rank topology for node-local state-dict fanout."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = Platform.get_local_rank()
+    if 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
+        raise RuntimeError('Native FSDP node-local state loading requires LOCAL_WORLD_SIZE or LOCAL_SIZE.')
+    local_world_size = Platform.get_local_world_size()
+    if local_rank < 0 or local_world_size <= 0 or world_size % local_world_size != 0:
+        raise RuntimeError(f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
+                           f'local_rank={local_rank}, local_world_size={local_world_size}.')
+    node_start = rank - local_rank
+    node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
+    if rank not in node_ranks or len(node_ranks) != local_world_size:
+        raise RuntimeError(f'Invalid local rank group: rank={rank}, local_rank={local_rank}, '
+                           f'local_world_size={local_world_size}, node_ranks={node_ranks}.')
+    return rank, world_size, node_start, node_ranks
+
+
 def _find_experts_in_layer(layer_mod: nn.Module, experts_map: Dict[str, nn.Module]) -> Optional[nn.Module]:
     """Find the experts module inside a decoder layer, if any."""
     for module in layer_mod.modules():
@@ -563,18 +695,148 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
     return optimizer
 
 
-def _load_rank0_full_state_dict(model: nn.Module, full_sd: dict) -> None:
-    """Load rank0 full weights into a sharded FSDP2 model via DCP broadcast."""
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+def _is_lora_state_key(name: str) -> bool:
+    return any(marker in name for marker in LORA_STATE_KEY_MARKERS)
 
-    set_model_state_dict(
-        model=model,
-        model_state_dict=full_sd,
-        options=StateDictOptions(
-            full_state_dict=True,
-            broadcast_from_rank0=True,
-        ),
-    )
+
+def _strip_peft_base_prefix(name: str) -> str:
+    while name.startswith(PEFT_BASE_PREFIX):
+        name = name[len(PEFT_BASE_PREFIX):]
+    return name
+
+
+def _strip_base_layer_segments(name: str) -> str:
+    return '.'.join(segment for segment in name.split('.') if segment != PEFT_BASE_LAYER_SEGMENT)
+
+
+def _source_key_candidates(param_name: str) -> List[str]:
+    stripped_prefix = _strip_peft_base_prefix(param_name)
+    candidates = [
+        param_name,
+        stripped_prefix,
+        _strip_base_layer_segments(param_name),
+        _strip_base_layer_segments(stripped_prefix),
+    ]
+    deduped = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, Any]) -> str:
+    if _is_lora_state_key(param_name):
+        raise KeyError(f"LoRA parameter '{param_name}' must be loaded from adapter source state.")
+
+    candidates = _source_key_candidates(param_name)
+    for candidate in candidates:
+        if candidate in source_state:
+            return candidate
+    raise KeyError(f"Missing source metadata for parameter '{param_name}'. "
+                   f'Tried source keys: {", ".join(candidates)}.')
+
+
+def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+    adapter_state = {}
+    for name, tensor in state_dict.items():
+        if not _is_lora_state_key(name) or not hasattr(tensor, 'detach'):
+            continue
+        if getattr(tensor, 'is_meta', False):
+            continue
+        adapter_state[name] = tensor.detach().cpu().clone()
+    return adapter_state
+
+
+def _collect_state_metadata(state_dict: Mapping[str, Any]) -> Dict[str, tuple[tuple[int, ...], Any]]:
+    return {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in state_dict.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
+    }
+
+
+def _get_named_child(module, name: str):
+    if hasattr(module, name):
+        return getattr(module, name)
+    if name.isdigit() and hasattr(module, '__getitem__'):
+        try:
+            return module[int(name)]
+        except (IndexError, TypeError, KeyError):
+            return None
+    return None
+
+
+def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_world_size: int,
+                                 ep_rank: int) -> torch.Tensor:
+    """Slice saved PEFT ParamWrapper LoRA expert weights by EP rank before DTensor/FSDP placement."""
+    if ep_world_size <= 1 or ('lora_A' not in model_key and 'lora_B' not in model_key):
+        return value
+
+    parent = model
+    matched = False
+    parts = model_key.split('.')
+    for i, part in enumerate(parts[:-1]):
+        parent = _get_named_child(parent, part)
+        if parent is None:
+            return value
+        next_seg = parts[i + 1] if i + 1 < len(parts) else None
+        if getattr(parent, '_ep_patched', False) and next_seg == 'experts':
+            matched = True
+
+    if not matched:
+        return value
+    shard_dim = _ep_expert_state_dict_gather_dim(model_key)
+    chunk = value.size(shard_dim) // ep_world_size
+    return value.narrow(shard_dim, ep_rank * chunk, chunk).contiguous()
+
+
+def _has_param_wrapper_without_base_weight(model) -> bool:
+    for module in model.modules():
+        if not hasattr(module, 'parameter_name'):
+            continue
+        get_base_layer = getattr(module, 'get_base_layer', None)
+        if get_base_layer is None:
+            continue
+        base_layer = get_base_layer()
+        if not hasattr(base_layer, 'weight'):
+            return True
+    return False
+
+
+def _load_peft_weights_for_native_fsdp2(model, adapter_weights: Mapping[str, torch.Tensor], adapter_name: str,
+                                        strategy: NativeFSDPStrategy) -> None:
+    """Load PEFT adapter weights into a native FSDP2 model, including EP expert adapters."""
+    from peft.utils import set_peft_model_state_dict
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    ep_fsdp_mesh = getattr(strategy, 'ep_fsdp_device_mesh', None)
+    ep_world_size = ep_fsdp_mesh['ep'].size() if ep_fsdp_mesh is not None else 1
+    ep_rank = ep_fsdp_mesh['ep'].get_local_rank() if ep_world_size > 1 else 0
+
+    model_sd = model.state_dict()
+    converted_weights = {}
+    direct_weights = {}
+    full_adapter_source = {}
+    for key, value in adapter_weights.items():
+        model_key = key
+        if f'.{adapter_name}.weight' not in model_key:
+            model_key = model_key.replace('.weight', f'.{adapter_name}.weight')
+        if model_key in model_sd:
+            param = model_sd[model_key]
+            full_adapter_source[model_key] = value.detach().cpu().clone()
+            value = _split_for_ep_pre_distribute(model, model_key, value, ep_world_size, ep_rank)
+            if isinstance(param, DTensor) and not isinstance(value, DTensor):
+                value = distribute_tensor(value.to(param.device), param.device_mesh, param.placements)
+            direct_weights[model_key] = value
+        converted_weights[key] = value
+
+    set_adapter_full_state = getattr(strategy, 'set_adapter_full_state_dict', None)
+    if set_adapter_full_state is not None and full_adapter_source:
+        set_adapter_full_state(full_adapter_source)
+
+    if _has_param_wrapper_without_base_weight(model):
+        model.load_state_dict(direct_weights, strict=False)
+    else:
+        set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
 
 
 def _broadcast_sharded_state_dict(
@@ -583,25 +845,60 @@ def _broadcast_sharded_state_dict(
     device_type: str = 'cuda',
     expert_shard_specs: Optional[Dict[str, Dict[str, int]]] = None,
     rank_to_ep_rank: Optional[Dict[int, int]] = None,
+    adapter_source_sd: Optional[Dict[str, torch.Tensor]] = None,
+    adapter_full_sd: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Broadcast rank0 full state dict and materialize local FSDP2/EP shards."""
     from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
-    is_rank0 = (dist.get_rank() == 0)
+    rank, _, local_source_rank, local_ranks = _get_local_rank_info()
+    is_rank0 = (rank == 0)
+    is_source_rank = rank == local_source_rank
+    use_local_broadcast = Platform.device_backend() != 'hccl'
+    local_group = dist.new_group(ranks=local_ranks) if use_local_broadcast else None
     expert_shard_specs = expert_shard_specs or {}
     rank_to_ep_rank = rank_to_ep_rank or {}
-
+    adapter_source_sd = adapter_source_sd or {}
+    adapter_full_sd = adapter_full_sd or {}
     source_metadata = None
+    source_keys = None
+    adapter_metadata = None
     if is_rank0:
-        source_metadata = {
-            name: (tuple(tensor.shape), tensor.dtype)
-            for name, tensor in full_sd.items() if hasattr(tensor, 'shape') and hasattr(tensor, 'dtype')
-        }
-    metadata_holder = [source_metadata]
+        source_metadata = {}
+        source_keys = {}
+        for param_name in meta_sharded_sd:
+            if _is_lora_state_key(param_name):
+                continue
+            source_key = _resolve_full_state_source_key(param_name, full_sd)
+            source_tensor = full_sd[source_key]
+            if hasattr(source_tensor, 'shape') and hasattr(source_tensor, 'dtype'):
+                source_metadata[param_name] = (tuple(source_tensor.shape), source_tensor.dtype)
+                source_keys[param_name] = source_key
+        adapter_metadata = _collect_state_metadata({**adapter_source_sd, **adapter_full_sd})
+    metadata_holder = [source_metadata, source_keys, adapter_metadata]
     dist.broadcast_object_list(metadata_holder, src=0)
     source_metadata = metadata_holder[0] or {}
+    source_keys = metadata_holder[1] or {}
+    adapter_metadata = metadata_holder[2] or {}
+
+    def _broadcast_from_local_source(full_tensor):
+        if is_source_rank:
+            if full_tensor is None:
+                raise RuntimeError(f'Local source rank {local_source_rank} does not have full state_dict tensor.')
+        if use_local_broadcast:
+            dist.broadcast(full_tensor, src=local_source_rank, group=local_group)
+            return full_tensor
+
+        if is_source_rank:
+            for target_rank in local_ranks:
+                if target_rank == rank:
+                    continue
+                dist.send(full_tensor, dst=target_rank)
+        else:
+            dist.recv(full_tensor, src=local_source_rank)
+        return full_tensor
 
     def _dtensor_from_replicated_full_tensor(full_tensor, device_mesh, placements):
         local_tensor = full_tensor
@@ -613,6 +910,9 @@ def _broadcast_sharded_state_dict(
                     mesh_dim,
                     src_data_rank=None,
                 )
+                # _shard_tensor may return a view into the replicated full
+                # tensor. Clone it so the final DTensor shard does not keep
+                # the full parameter storage alive after loading.
                 local_tensor = local_tensor.contiguous().clone()
             elif isinstance(placement, Replicate):
                 continue
@@ -629,7 +929,36 @@ def _broadcast_sharded_state_dict(
             stride=full_tensor.stride(),
         )
 
-    def _scatter_ep_expert_tensor(param_name: str, full_tensor, sharded_param):
+    def _broadcast_adapter_source_tensor(full_tensor, sharded_param):
+        return _broadcast_from_local_source(full_tensor)
+
+    def _scatter_ep_adapter_tensor(param_name, full_tensor, sharded_param):
+        local_shape = tuple(sharded_param.size())
+        _, source_dtype = adapter_metadata[param_name]
+        local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
+        shard_dim = _ep_expert_state_dict_gather_dim(param_name)
+        local_dim = local_shape[shard_dim]
+        local_tensor = _scatter_ep_tensor_from_source(
+            full_tensor,
+            local_tensor,
+            shard_dim=shard_dim,
+            shard_size=local_dim,
+        )
+        return local_tensor
+
+    def _get_adapter_source(param_name):
+        if param_name in adapter_full_sd:
+            adapter_tensor = adapter_full_sd[param_name]
+            return adapter_tensor, tuple(adapter_tensor.shape), adapter_tensor.dtype
+        if param_name in adapter_source_sd:
+            adapter_tensor = adapter_source_sd[param_name]
+            return adapter_tensor, tuple(adapter_tensor.shape), adapter_tensor.dtype
+        if param_name in adapter_metadata:
+            source_shape, source_dtype = adapter_metadata[param_name]
+            return None, source_shape, source_dtype
+        raise KeyError(f"Missing adapter source state for parameter '{param_name}'.")
+
+    def _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param):
         spec = expert_shard_specs[param_name]
         experts_per_rank = spec['experts_per_rank']
         num_experts = spec['num_experts']
@@ -639,43 +968,71 @@ def _broadcast_sharded_state_dict(
         _, source_dtype = source_metadata[param_name]
         local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
 
-        if is_rank0:
+        if is_source_rank:
             if full_tensor.size(0) != num_experts:
                 raise RuntimeError(f"EP expert parameter '{param_name}' expects {num_experts} experts, "
                                    f'but source state has shape {tuple(full_tensor.shape)}. '
                                    'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
-            world_size = dist.get_world_size()
-            for rank in range(world_size):
-                if rank not in rank_to_ep_rank:
-                    raise RuntimeError(f'Missing EP rank mapping for global rank {rank}.')
-                ep_rank = rank_to_ep_rank[rank]
-                start = ep_rank * experts_per_rank
-                end = start + experts_per_rank
-                chunk = full_tensor[start:end].contiguous()
-                chunk_gpu = chunk.to(device_type)
-                if rank == 0:
-                    local_tensor.copy_(chunk_gpu)
-                else:
-                    dist.send(chunk_gpu, dst=rank)
-        else:
-            dist.recv(local_tensor, src=0)
+        local_tensor = _scatter_ep_tensor_from_source(
+            full_tensor,
+            local_tensor,
+            shard_dim=0,
+            shard_size=experts_per_rank,
+        )
+        return local_tensor
 
+    def _scatter_ep_tensor_from_source(full_tensor, local_tensor, *, shard_dim: int, shard_size: int):
+        if is_source_rank:
+            if full_tensor is None:
+                raise RuntimeError(f'Local source rank {local_source_rank} does not have full state_dict tensor.')
+            for target_rank in local_ranks:
+                if target_rank not in rank_to_ep_rank:
+                    raise RuntimeError(f'Missing EP rank mapping for global rank {target_rank}.')
+                ep_rank = rank_to_ep_rank[target_rank]
+                start = ep_rank * shard_size
+                chunk = full_tensor.narrow(shard_dim, start, shard_size).contiguous().to(device_type)
+                if target_rank == rank:
+                    local_tensor.copy_(chunk)
+                else:
+                    dist.send(chunk, dst=target_rank)
+        else:
+            dist.recv(local_tensor, src=local_source_rank)
         return local_tensor
 
     for param_name, sharded_param in meta_sharded_sd.items():
-        is_ep_expert_param = param_name in expert_shard_specs
-        if param_name not in source_metadata:
-            raise KeyError(f"Missing source metadata for parameter '{param_name}'.")
-        source_shape, source_dtype = source_metadata[param_name]
+        shape = sharded_param.size()
+        is_adapter_param = _is_lora_state_key(param_name)
+        is_ep_expert_param = param_name in expert_shard_specs and not is_adapter_param
+        if is_adapter_param:
+            adapter_tensor, source_shape, source_dtype = _get_adapter_source(param_name)
+        else:
+            if param_name not in source_metadata:
+                raise KeyError(f"Missing source metadata for parameter '{param_name}'.")
+            source_shape, source_dtype = source_metadata[param_name]
+        is_ep_adapter_param = (
+            is_adapter_param and param_name in expert_shard_specs and tuple(source_shape) != tuple(shape))
 
-        if is_rank0:
-            if param_name not in full_sd:
+        if is_adapter_param:
+            if adapter_tensor is not None:
+                full_tensor = adapter_tensor.detach()
+                if isinstance(full_tensor, DTensor):
+                    full_tensor = full_tensor.to_local()
+                if not is_ep_adapter_param:
+                    full_tensor = full_tensor.to(device_type)
+            else:
+                full_tensor = torch.empty(source_shape, device=device_type, dtype=source_dtype)
+            if not is_ep_adapter_param:
+                full_tensor = _broadcast_adapter_source_tensor(full_tensor, sharded_param)
+        elif is_source_rank:
+            source_key = source_keys[param_name]
+            if source_key not in full_sd:
                 raise KeyError(
                     f"Parameter '{param_name}' found in sharded model state dict but missing from full state dict.")
-            full_param = full_sd[param_name]
+            full_param = full_sd[source_key]
             full_tensor = full_param.detach()
             if isinstance(full_tensor, DTensor):
                 full_tensor = full_tensor.to_local()
+            # EP expert params: keep on CPU to avoid OOM; move chunks lazily in _scatter_ep_expert_tensor.
             if not is_ep_expert_param:
                 full_tensor = full_tensor.to(device_type)
             if tuple(full_tensor.shape) != tuple(source_shape) or full_tensor.dtype != source_dtype:
@@ -686,14 +1043,16 @@ def _broadcast_sharded_state_dict(
             full_tensor = None if is_ep_expert_param else torch.empty(
                 source_shape, device=device_type, dtype=source_dtype)
 
-        if is_ep_expert_param:
+        if is_ep_adapter_param:
+            full_tensor = _scatter_ep_adapter_tensor(param_name, full_tensor, sharded_param)
+        elif is_ep_expert_param:
             full_tensor = _scatter_ep_expert_tensor(param_name, full_tensor, sharded_param)
         else:
-            if tuple(sharded_param.size()) != tuple(source_shape):
+            if tuple(shape) != tuple(source_shape):
                 raise RuntimeError(f"Parameter '{param_name}' shape mismatch before broadcast: "
-                                   f'sharded logical shape={tuple(sharded_param.size())}, '
-                                   f'source shape={source_shape}.')
-            dist.broadcast(full_tensor, src=0)
+                                   f'sharded logical shape={tuple(shape)}, source shape={source_shape}.')
+            if not is_adapter_param:
+                full_tensor = _broadcast_from_local_source(full_tensor)
         torch_util.synchronize()
 
         if isinstance(sharded_param, DTensor):

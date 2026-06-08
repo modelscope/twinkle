@@ -41,7 +41,8 @@ def _register_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]
         async def _create_adapter():
             _model_id = None
             try:
-                _model_id = await self.state.register_model(body.model_dump(), token=token, replica_id=self.replica_id)
+                _model_id = await self.state.register_model(
+                    body.model_dump(), token=token, replica_id=self.replica_id, session_id=body.session_id)
                 if body.lora_config:
                     # TODO: Make LoraConfig more flexible
                     lora_cfg = LoraConfig(r=body.lora_config.rank, target_modules='all-linear')

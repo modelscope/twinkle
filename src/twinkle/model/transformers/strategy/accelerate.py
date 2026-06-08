@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Dict, Literal, Optional
+import os
+from datetime import timedelta
+from typing import Any, Dict, Literal, Mapping, Optional
 
 from twinkle import DeviceMesh
 from .load_context import fsdp_pretrained_load_context
@@ -24,6 +26,7 @@ class AccelerateStrategy:
         memory_efficient_init: bool = False,
     ):
         from accelerate import Accelerator
+        from accelerate.utils import InitProcessGroupKwargs
 
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
@@ -32,6 +35,9 @@ class AccelerateStrategy:
         fsdp_plugin = self._fsdp_config_from_device_mesh(device_mesh, fsdp_config, memory_efficient_init)
 
         kwargs_handlers = []
+        kwargs_handlers.append(
+            InitProcessGroupKwargs(
+                timeout=timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200')))))
         if ddp_config is not None:
             from accelerate import DistributedDataParallelKwargs
             ddp_config = DistributedDataParallelKwargs(**ddp_config)
@@ -46,6 +52,12 @@ class AccelerateStrategy:
 
     def pretrained_load_context(self):
         return fsdp_pretrained_load_context(self._memory_efficient_init and self.device_mesh is not None)
+
+    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
+        return
+
+    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
+        return config_or_dir
 
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):
@@ -119,10 +131,16 @@ class AccelerateStrategy:
         return fsdp_plugin
 
     def wrap_model(self, model, *args):
-        return self.accelerator.prepare(model, *args)
+        result = self.accelerator.prepare(model, *args)
+        return result
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
+
+    def load_peft_weights(self, model, adapter_weights: Mapping[str, Any], adapter_name: str) -> None:
+        from peft.utils import set_peft_model_state_dict
+
+        set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
 
     def _get_fsdp_plugin(self):
         state = self.accelerator.state
@@ -185,3 +203,21 @@ class AccelerateStrategy:
             state_dict[name] = local.cpu()
             del local
         return state_dict
+
+    def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
+        """Collect only LoRA adapter parameters."""
+        from twinkle.utils import torch_util
+        unwrapped = self.unwrap_model(model)
+        state_dict = {}
+        adapter_suffix = f'.{adapter_name}.'
+        for name, param in unwrapped.named_parameters():
+            if not _is_lora_state_key(name) or adapter_suffix not in name:
+                continue
+            local = torch_util.to_local_tensor(param)
+            state_dict[name] = local.cpu()
+            del local
+        return state_dict
+
+
+def _is_lora_state_key(name: str) -> bool:
+    return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name

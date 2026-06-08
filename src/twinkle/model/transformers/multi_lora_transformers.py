@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
-from twinkle import DeviceMesh, remote_class, remote_function, template
+from twinkle import DeviceMesh, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
@@ -234,6 +234,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
+
+    def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
+        adapter_state = self.multi_adapter.get_state_dict(adapter_name)
+        return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
 
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):

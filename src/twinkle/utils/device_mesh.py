@@ -39,7 +39,7 @@ class DeviceMesh:
     ulysses_size: Optional[int] = None
     # megatron only
     sequence_parallel: bool = False
-    device_type: str = 'cuda'
+    device_type: Optional[str] = None
 
     @staticmethod
     def from_sizes(*,
@@ -54,7 +54,7 @@ class DeviceMesh:
                    etp_size: int = 1,
                    ep_fsdp_size: int = None,
                    vpp_size: int = None,
-                   device_type: str = 'cuda',
+                   device_type: Optional[str] = None,
                    sequence_parallel: bool = False) -> 'DeviceMesh':
         """Create a default device mesh from the given sizes.
 
@@ -70,7 +70,7 @@ class DeviceMesh:
             etp_size: The expert tensor parallel size
             ep_fsdp_size: The expert FSDP parallel size, auto-computed as world_size // ep_size if not provided
             vpp_size: The virtual pipeline parallel size
-            device_type: The device type
+            device_type: The device type, auto-detected from the current platform if not provided
             sequence_parallel: Use sequence parallel or not, default false
         Returns:
             The device mesh instance
@@ -121,6 +121,12 @@ class DeviceMesh:
         )
 
     def __post_init__(self):
+        if self.device_type is None:
+            try:
+                self.device_type = Platform.device_prefix()
+            except Exception:
+                self.device_type = 'cuda'
+
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
 
