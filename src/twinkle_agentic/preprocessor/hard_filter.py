@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
@@ -151,20 +151,13 @@ class HardFilter(Preprocessor):
         self.allow_incomplete_role = allow_incomplete_role
         self._system_deny_re = re.compile('|'.join(re.escape(k) for k in system_deny_keywords), re.IGNORECASE) if system_deny_keywords else None
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
-        """Drop rows that are trivially low-quality by two rules:
-
-        Rule 1 — Single-turn simple query:
-            Only one user message AND that message is a greeting or bare simple question.
-
-        Rule 2 — Two-turn shallow assistant reply:
-            Exactly one user + one assistant turn, assistant reply is shorter than
-            _MIN_ASSISTANT_CHARS_2TURN, and the assistant message has no thinking chain.
-        """
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
+        dropped = []
         for row in rows:
             messages = row.get('messages') or []
             if not isinstance(messages, list):
+                dropped.append(dict(row, drop_reason='invalid_messages'))
                 continue
 
             user_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'user']
@@ -173,13 +166,16 @@ class HardFilter(Preprocessor):
             if not user_msgs:
                 if self.allow_incomplete_role:
                     out.append(row)
+                else:
+                    dropped.append(dict(row, drop_reason='no_user'))
                 continue
 
-            # Rule 1: single-turn trivial query (skip if assistant has thinking)
+            # Rule 1: single-turn trivial query
             if len(user_msgs) == 1:
                 user_text = (user_msgs[0].get('content') or '').strip()
                 if _is_simple_query(user_text, self._min_user_chars, self._min_user_chars_cjk):
                     if not asst_msgs or not _has_thinking(asst_msgs[0], _MIN_THINKING_CHARS):
+                        dropped.append(dict(row, drop_reason='trivial_single_turn'))
                         continue
 
             # Rule 2: two-turn shallow reply without thinking
@@ -187,20 +183,23 @@ class HardFilter(Preprocessor):
                 asst = asst_msgs[0]
                 asst_text = (asst.get('content') or '').strip()
                 if len(asst_text) < self._min_assistant_chars_2turn and not _has_thinking(asst):
+                    dropped.append(dict(row, drop_reason='shallow_reply'))
                     continue
 
-            # Rule 3: all assistant turns are content-empty with no reasoning → no learning signal
+            # Rule 3: all assistant turns are content-empty
             if asst_msgs and all(
                 not (m.get('content') or '').strip() and not _has_thinking(m)
                 for m in asst_msgs
             ):
+                dropped.append(dict(row, drop_reason='all_empty_assistant'))
                 continue
 
             # Rule 4: system prompt matches deny keywords
             if self._system_deny_re:
                 sys_text = next((m.get('content') or '' for m in messages if isinstance(m, dict) and m.get('role') == 'system'), '')
                 if self._system_deny_re.search(sys_text):
+                    dropped.append(dict(row, drop_reason='system_deny_keyword'))
                     continue
 
             out.append(row)
-        return out
+        return out, dropped

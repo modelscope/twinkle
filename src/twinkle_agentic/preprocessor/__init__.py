@@ -7,7 +7,6 @@ from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
 from twinkle.utils.parallel import PosixFileLock
 
-from .agent_trace_filter import AgentTraceFilter
 from .data_juicer import (
     FixUnicodeFilter,
     RemoveRepeatSentencesFilter,
@@ -52,38 +51,27 @@ class QualityPreprocessor(Preprocessor):
 
     def __call__(self, rows):
         rows_list = self.map_col_to_row(rows)
+        total_start = len(rows_list)
+        stats = []
         for step in self._pipelines:
             if not rows_list:
                 break
             step_name = getattr(step, '__name__', None) or type(step).__name__
             before = len(rows_list)
-            prev = rows_list
             t0 = time.perf_counter()
-            rows_list = self.map_col_to_row(step(rows_list))
+            kept, dropped = step(rows_list)
+            rows_list = self.map_col_to_row(kept)
             elapsed = time.perf_counter() - t0
             after = len(rows_list)
-            logger.info(
-                f'[QualityPreprocessor] {step_name}: {before} -> {after} '
-                f'(dropped {before - after}, {elapsed:.3f}s)')
-            self._log_dropped(step_name, prev, rows_list)
+            stats.append(f'  {step_name}: {before}->{after} (dropped {before - after}, {elapsed:.3f}s)')
+            self._log_dropped(step_name, dropped)
+        summary = '\n'.join(stats)
+        logger.info(
+            f'[QualityPreprocessor] {total_start} -> {len(rows_list)}\n{summary}')
         return self.map_row_to_col(rows_list)
 
-    def _log_dropped(self, step_name: str, prev: List[Dict[str, Any]],
-                     kept: List[Dict[str, Any]]) -> None:
-        if not self._lock or len(kept) == len(prev):
-            return
-        # Use row 'id' field for matching; fall back to object id
-        kept_keys = set()
-        for r in kept:
-            rid = r.get('id')
-            kept_keys.add(rid if rid is not None else id(r))
-        dropped = []
-        for r in prev:
-            rid = r.get('id')
-            key = rid if rid is not None else id(r)
-            if key not in kept_keys:
-                dropped.append(r)
-        if not dropped:
+    def _log_dropped(self, step_name: str, dropped: List[Dict[str, Any]]) -> None:
+        if not self._lock or not dropped:
             return
         with self._lock:
             with open(self._dropped_log_path, 'a', encoding='utf-8') as f:

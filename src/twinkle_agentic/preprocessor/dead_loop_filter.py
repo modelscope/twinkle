@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
+
+from .utils import is_agent_row
 
 # ── Hesitation-marker regexes ─────────────────────────────────────────────────
 #
@@ -179,16 +181,14 @@ class DeadLoopFilter(Preprocessor):
         self._think_cascade_threshold = think_cascade_threshold
         self._think_repetition_threshold = think_repetition_threshold
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
+        dropped = []
         for row in rows:
-            # Agent rollouts (Cline / OpenClaw / Claude Code) carry long
-            # trajectories whose phrasing legitimately matches our hesitation
-            # heuristics; trust the upstream AgentTraceFilter tag and skip.
-            if row.get('is_agent'):
+            messages = row.get('messages') or []
+            if is_agent_row(messages):
                 out.append(row)
                 continue
-            messages = row.get('messages') or []
             asst_msgs = [
                 m for m in messages
                 if isinstance(m, dict) and m.get('role') == 'assistant'
@@ -211,6 +211,8 @@ class DeadLoopFilter(Preprocessor):
                 )
                 for m in asst_msgs
             )
-            if not stuck:
+            if stuck:
+                dropped.append(dict(row, drop_reason='dead_loop'))
+            else:
                 out.append(row)
-        return out
+        return out, dropped

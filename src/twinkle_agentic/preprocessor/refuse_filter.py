@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
@@ -124,9 +124,9 @@ class RefuseFilter(Preprocessor):
         super().__init__()
         self._check_window = check_window
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
-        """Drop rows where the first assistant reply expresses a refusal or inability."""
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
+        dropped = []
         for row in rows:
             messages = row.get('messages') or []
             asst_msgs = [
@@ -140,4 +140,6 @@ class RefuseFilter(Preprocessor):
             response = re.sub(r'<think>.*?</think>\s*', '', first_reply, flags=re.DOTALL).strip()
             if not response or not _is_refusal(response, self._check_window):
                 out.append(row)
-        return out
+            else:
+                dropped.append(dict(row, drop_reason='refusal'))
+        return out, dropped

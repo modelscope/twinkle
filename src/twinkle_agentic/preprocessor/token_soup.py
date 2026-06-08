@@ -2,7 +2,7 @@
 import re
 import unicodedata
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
@@ -127,8 +127,9 @@ class TokenSoupFilter(Preprocessor):
         self._script_chaos_min_chars = script_chaos_min_chars
         self._max_chars = max_chars
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
+        dropped = []
         for row in rows:
             messages = row.get('messages') or []
             asst_msgs = [
@@ -151,6 +152,7 @@ class TokenSoupFilter(Preprocessor):
                 )
                 for m in asst_msgs
             ):
-                continue
-            out.append(row)
-        return out
+                dropped.append(dict(row, drop_reason='token_soup'))
+            else:
+                out.append(row)
+        return out, dropped

@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils.parallel import PosixFileLock
@@ -43,7 +43,7 @@ class DedupFilter(Preprocessor):
         self._state_file = state_file or f'/tmp/dedup_filter_{uuid.uuid4().hex[:12]}.json'
         self._lock_file = self._state_file + '.lock'
 
-    def __call__(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         with PosixFileLock(self._lock_file):
             seen = {}
@@ -51,12 +51,15 @@ class DedupFilter(Preprocessor):
                 with open(self._state_file) as f:
                     seen = json.load(f)
             out = []
+            dropped = []
             for r in rows:
                 sig = _conversation_sig(r, self._prefix, self._asst_chars)
                 count = seen.get(sig, 0)
                 if count < self._max:
                     seen[sig] = count + 1
                     out.append(r)
+                else:
+                    dropped.append(dict(r, drop_reason='duplicate'))
             with open(self._state_file, 'w') as f:
                 json.dump(seen, f)
-        return out
+        return out, dropped

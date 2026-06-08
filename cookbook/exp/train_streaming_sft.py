@@ -32,7 +32,7 @@ from twinkle.template import Qwen3_5Template
 from twinkle_agentic.preprocessor import (
     QualityPreprocessor, SamplerBackend,
     IntentClassifier, ResponseRefiner, ScoreFilter,
-    HardFilter, RefuseFilter, AgentTraceFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
+    HardFilter, RefuseFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
     SpecialCharsFilter, PIIPresidioFilter, ModelFilter, DedupFilter,
 )
 from twinkle_agentic.preprocessor.score_filter import (
@@ -234,9 +234,6 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
                 ],
             ),
             RefuseFilter(),
-            # Tag agent rollouts (Cline / OpenClaw / Claude Code) so DeadLoop
-            # / sanity rules can adapt instead of mass-dropping them.
-            AgentTraceFilter(),
             DeadLoopFilter(),
             MessageSanityFilter(sensitive_words_file='.temp/sensitive_words.txt'),
             # Phase 8-10: repetition & character quality

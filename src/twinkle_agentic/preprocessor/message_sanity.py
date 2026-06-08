@@ -6,13 +6,14 @@ signature ``(messages, is_agent, cfg) -> bool`` (True = pass). The filter class
 simply iterates enabled checks in order.
 """
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
-from .message_utils import (
+from .utils import (
     build_sensitive_regex,
     cjk_ratio,
+    is_agent_row,
     load_sensitive_words,
     msg_content_text,
     normalize_tool_calls,
@@ -322,13 +323,15 @@ class MessageSanityFilter(Preprocessor):
         }
         self._checks = [(name, fn) for name, fn in _DEFAULT_CHECKS if enabled.get(name, True)]
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
+        dropped = []
         for row in rows:
             messages = row.get('messages')
             if not isinstance(messages, list) or not messages:
+                dropped.append(dict(row, drop_reason='invalid_messages'))
                 continue
-            is_agent = bool(row.get('is_agent'))
+            is_agent = is_agent_row(messages)
 
             # pre-transform: consolidate system messages
             normalized = consolidate_system_messages(messages)
@@ -340,16 +343,21 @@ class MessageSanityFilter(Preprocessor):
             if self._trim:
                 messages = trim_to_last_assistant(messages)
                 if not messages:
+                    dropped.append(dict(row, drop_reason='no_assistant'))
                     continue
                 row = dict(row, messages=messages)
 
             # run check pipeline
-            if self._run_checks(messages, is_agent):
+            reason = self._run_checks(messages, is_agent)
+            if reason is None:
                 out.append(row)
-        return out
+            else:
+                dropped.append(dict(row, drop_reason=reason))
+        return out, dropped
 
-    def _run_checks(self, messages: List[Dict[str, Any]], is_agent: bool) -> bool:
-        for _name, fn in self._checks:
+    def _run_checks(self, messages: List[Dict[str, Any]], is_agent: bool) -> Optional[str]:
+        """Return None if all checks pass, else the name of the first failing check."""
+        for name, fn in self._checks:
             if not fn(messages, is_agent, self._cfg):
-                return False
-        return True
+                return name
+        return None

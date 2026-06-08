@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
@@ -386,11 +386,12 @@ class IntentClassifier(Preprocessor):
                 break
         return round_intents
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         if not rows:
-            return rows
+            return rows, []
 
         out = []
+        dropped = []
         for row in rows:
             row = dict(row)
             messages = row.get('messages')
@@ -406,6 +407,7 @@ class IntentClassifier(Preprocessor):
                 row['user_data'] = user_data
             else:
                 if self._drop_no_key_rounds:
+                    dropped.append(dict(row, drop_reason='no_key_rounds'))
                     continue
                 primary = INTENT_OTHER
 
@@ -414,4 +416,4 @@ class IntentClassifier(Preprocessor):
 
         dist = Counter(r[self._intent_field] for r in out)
         logger.info(f'[IntentClassifier] distribution: {dict(dist)}')
-        return out
+        return out, dropped

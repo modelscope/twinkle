@@ -3,7 +3,7 @@
 #
 # Each class below is a standalone Preprocessor with __call__ interface.
 # They share a module-level op cache for model/tokenizer reuse.
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
@@ -63,7 +63,7 @@ class FixUnicodeFilter(Preprocessor):
         self._normalization = normalization
         self._role = role
 
-    def __call__(self, rows):
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         from data_juicer.ops.mapper import FixUnicodeMapper
         op = _get_op(FixUnicodeMapper, normalization=self._normalization)
@@ -74,11 +74,11 @@ class FixUnicodeFilter(Preprocessor):
                     texts.append(msg.get('content') or '')
                     indices.append((ri, mi))
         if not texts:
-            return rows
+            return rows, []
         result = op.process_batched({op.text_key: list(texts)})
         for (ri, mi), new_text in zip(indices, result[op.text_key]):
             rows[ri]['messages'][mi]['content'] = new_text
-        return rows
+        return rows, []
 
 
 class RemoveRepeatSentencesFilter(Preprocessor):
@@ -87,7 +87,7 @@ class RemoveRepeatSentencesFilter(Preprocessor):
         self._ignore = ignore_special_character
         self._role = role
 
-    def __call__(self, rows):
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         from data_juicer.ops.mapper import RemoveRepeatSentencesMapper
         op = _get_op(RemoveRepeatSentencesMapper, lowercase=self._lowercase, ignore_special_character=self._ignore)
@@ -98,11 +98,11 @@ class RemoveRepeatSentencesFilter(Preprocessor):
                     texts.append(msg.get('content') or '')
                     indices.append((ri, mi))
         if not texts:
-            return rows
+            return rows, []
         result = op.process_batched({op.text_key: list(texts)})
         for (ri, mi), new_text in zip(indices, result[op.text_key]):
             rows[ri]['messages'][mi]['content'] = new_text
-        return rows
+        return rows, []
 
 
 class SpecialCharsFilter(Preprocessor):
@@ -110,15 +110,21 @@ class SpecialCharsFilter(Preprocessor):
         self._max_ratio = max_ratio
         self._role = role
 
-    def __call__(self, rows):
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         from data_juicer.ops.filter import SpecialCharactersFilter
         op = _get_op(SpecialCharactersFilter, min_ratio=0.0, max_ratio=self._max_ratio)
         texts = [_get_text(r, self._role) for r in rows]
-        # Tool-only assistant turns have empty content; ratio is meaningless → exempt.
         exempt = [not t.strip() and _has_tool_calls(r, self._role) for r, t in zip(rows, texts)]
         mask = _keep_mask(op, texts)
-        return [r for r, keep, ex in zip(rows, mask, exempt) if ex or keep]
+        out = []
+        dropped = []
+        for r, keep, ex in zip(rows, mask, exempt):
+            if ex or keep:
+                out.append(r)
+            else:
+                dropped.append(dict(r, drop_reason='special_chars_ratio'))
+        return out, dropped
 
 
 class TokenNumFilter(Preprocessor):
@@ -128,9 +134,16 @@ class TokenNumFilter(Preprocessor):
         self._max_num = max_num
         self._role = role
 
-    def __call__(self, rows):
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
         tokenizer = _get_tokenizer(self._hf_tokenizer)
         texts = [_get_text(r, self._role) for r in rows]
         encoded = tokenizer(texts, add_special_tokens=False)
-        return [r for r, ids in zip(rows, encoded['input_ids']) if self._min_num <= len(ids) <= self._max_num]
+        out = []
+        dropped = []
+        for r, ids in zip(rows, encoded['input_ids']):
+            if self._min_num <= len(ids) <= self._max_num:
+                out.append(r)
+            else:
+                dropped.append(dict(r, drop_reason='token_count_out_of_range'))
+        return out, dropped

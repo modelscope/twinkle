@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
@@ -25,6 +25,13 @@ class ModelFilter(Preprocessor):
         pats = patterns if patterns is not None else _DEFAULT_PATTERNS
         self._re = re.compile('|'.join(f'(?:{p})' for p in pats), re.IGNORECASE)
 
-    def __call__(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __call__(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
-        return [r for r in rows if self._re.fullmatch(r.get(self._field) or '')]
+        out = []
+        dropped = []
+        for r in rows:
+            if self._re.fullmatch(r.get(self._field) or ''):
+                out.append(r)
+            else:
+                dropped.append(dict(r, drop_reason='model_not_allowed'))
+        return out, dropped
