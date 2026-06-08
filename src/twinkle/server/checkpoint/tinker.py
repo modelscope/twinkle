@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from tinker import types as tinker_types
 
-from twinkle.server.checkpoint.base import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
+from twinkle.server.checkpoint import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
 
 
 class TinkerTrainingRunManager(BaseTrainingRunManager):
