@@ -268,7 +268,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
             #     ],
             #     # trace_dir=os.path.join(OUTPUT_DIR, 'score_traces'),
             # ),
-            PIIPresidioFilter(languages=('en', 'zh')),
+            # PIIPresidioFilter(languages=('en', 'zh')),
             # Phase 13: response refinement
             # ResponseRefiner(
             #     backend=backend,
