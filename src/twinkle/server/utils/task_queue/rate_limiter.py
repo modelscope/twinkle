@@ -54,7 +54,7 @@ class RateLimiter:
                 will be removed. Default is 10.0 (10x the window).
             token_cleanup_interval: How often to run the cleanup task in seconds.
                 Default is 60.0 (every minute).
-            active_tokens_gauge: Optional gauge adapter (see twinkle.server.utils.metrics_middleware)
+            active_tokens_gauge: Optional gauge adapter (see twinkle.server.telemetry.middleware)
                 for tracking the active token count.
             deployment_name: Deployment name for metrics labels.
         """

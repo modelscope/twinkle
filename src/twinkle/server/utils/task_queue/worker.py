@@ -21,7 +21,7 @@ from .types import QueuedTask, QueueState, TaskStatus
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
-    from twinkle.server.utils.metrics_middleware import TaskMetrics
+    from twinkle.server.telemetry.middleware import TaskMetrics
 
 logger = get_logger()
 

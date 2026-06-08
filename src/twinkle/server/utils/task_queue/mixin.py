@@ -14,7 +14,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 from collections.abc import Callable, Coroutine
 
-from twinkle.server.utils.metrics_middleware import get_task_metrics
+from twinkle.server.telemetry.middleware import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter

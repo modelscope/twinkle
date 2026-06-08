@@ -145,7 +145,7 @@ def create_metrics_middleware(deployment: str) -> Callable:
 
     Usage inside a ``build_*_app()`` function::
 
-        from twinkle.server.utils.metrics_middleware import create_metrics_middleware
+        from twinkle.server.telemetry.middleware import create_metrics_middleware
         from twinkle.server.telemetry.tracing import create_tracing_middleware
 
         app.middleware('http')(verify_token)

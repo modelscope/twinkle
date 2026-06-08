@@ -32,7 +32,7 @@ from fastapi import FastAPI, Request
 from ray import serve
 
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.server.utils.metrics_middleware import create_metrics_middleware
+from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 
