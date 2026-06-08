@@ -147,7 +147,7 @@ def test_model_builder_characterization(monkeypatch) -> None:
     assert res.deployment_name == 'ModelManagement'
     assert _route_set(res.app) == _baseline_route_set('model')
     _assert_auth_middleware_effect(res.app)
-    _assert_middleware_lifo_order(res.app, expect_cleanup=False)
+    _assert_middleware_lifo_order(res.app, expect_cleanup=False, expect_replica_id=True)
 
 
 def test_sampler_builder_characterization(monkeypatch) -> None:
@@ -166,7 +166,7 @@ def test_sampler_builder_characterization(monkeypatch) -> None:
     assert res.deployment_name == 'SamplerManagement'
     assert _route_set(res.app) == _baseline_route_set('sampler')
     _assert_auth_middleware_effect(res.app)
-    _assert_middleware_lifo_order(res.app, expect_cleanup=False)
+    _assert_middleware_lifo_order(res.app, expect_cleanup=False, expect_replica_id=True)
 
 
 def test_processor_builder_characterization(monkeypatch) -> None:
@@ -251,17 +251,22 @@ def _registered_http_middleware_names(app: FastAPI) -> list[str]:
     return names
 
 
-def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool) -> None:
+def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_replica_id: bool = False) -> None:
     """Assert metrics is outermost, wrapping tracing, wrapping auth.
 
     ``user_middleware`` is ordered OUTERMOST → INNERMOST (Starlette prepends
     each new entry). So the expected sequence is metrics first, then tracing,
     then ``verify_token``, with the Gateway-only cleanup middleware last as
     the innermost layer (it has no per-handler hook elsewhere).
+
+    Model and Sampler add ``inject_replica_id`` after the scaffold stack, making
+    it the outermost middleware.
     """
     names = _registered_http_middleware_names(app)
     expected_prefix = ['metrics_middleware', 'tracing_middleware', 'verify_token']
     expected = (expected_prefix + ['ensure_state_cleanup_started']) if expect_cleanup else expected_prefix
+    if expect_replica_id:
+        expected = ['inject_replica_id'] + expected
     assert names == expected, (
         f'middleware ordering mismatch — expected (outermost→innermost) '
         f'{expected!r}, got {names!r}')

@@ -192,6 +192,16 @@ def build_sampler_app(model_id: str,
         },
     )
 
+    @app.middleware('http')
+    async def inject_replica_id(request: Request, call_next):
+        response = await call_next(request)
+        try:
+            ctx = serve.get_replica_context()
+            response.headers['X-Twinkle-Replica-Id'] = ctx.replica_id.unique_id
+        except Exception:
+            pass
+        return response
+
     return bind_deployment(
         app,
         SamplerManagement,

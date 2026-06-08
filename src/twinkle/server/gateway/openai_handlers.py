@@ -100,7 +100,11 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], 'GatewayServer']
             sampler_data = json.loads(response.body)
             request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
             openai_response = translate_response(sampler_data, model, request_id)
-            return JSONResponse(content=openai_response)
+            resp_headers = {}
+            replica_id = response.headers.get('x-twinkle-replica-id')
+            if replica_id:
+                resp_headers['X-Twinkle-Replica-Id'] = replica_id
+            return JSONResponse(content=openai_response, headers=resp_headers)
 
         else:
             # Streaming: proxy to /twinkle/sample_stream, translate to SSE

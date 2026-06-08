@@ -109,42 +109,44 @@ def test_multi_turn(client: OpenAI):
 
 
 def test_sticky_session(base_url: str):
-    """Verify sticky session routing by sending multiple requests and checking
-    they all reach the same sampler replica (template stays initialized)."""
+    """Verify sticky session routing with X-Twinkle-Replica-Id header.
+
+    Sends multiple requests with the same model key and asserts they all
+    report the same replica ID. This proves Serve-Multiplexed-Model-Id
+    correctly pins requests to a single replica.
+
+    Requires the sampler to have the inject_replica_id middleware
+    (added in sampler/app.py).
+    """
     import httpx
 
-    print('--- Phase 5: Sticky session verification ---')
+    print('--- Phase 5: Sticky session verification (replica-id) ---')
 
-    # Send 5 rapid requests with the same model — if sticky sessions work,
-    # all requests go to the same replica (no re-template-init needed, fast responses)
-    timings = []
+    replica_ids = []
     for i in range(5):
-        t0 = time.time()
         resp = httpx.post(
             f'{base_url}/chat/completions',
             json={
                 'model': MODEL,
-                'messages': [{'role': 'user', 'content': f'Say the number {i}.'}],
-                'max_tokens': 8,
+                'messages': [{'role': 'user', 'content': f'Say {i}.'}],
+                'max_tokens': 5,
                 'temperature': 0.1,
             },
             headers={'Authorization': 'Bearer EMPTY_API_KEY'},
             timeout=60,
         )
-        elapsed = time.time() - t0
-        timings.append(elapsed)
         assert resp.status_code == 200, f'Request {i} failed: {resp.status_code}'
-        print(f'  Request {i}: {elapsed:.3f}s')
+        rid = resp.headers.get('x-twinkle-replica-id')
+        replica_ids.append(rid)
+        print(f'  Request {i}: replica_id={rid}')
 
-    # All requests after the first should be fast (< 5s) — proving they hit
-    # the same replica with template already set (no 50s+ cold-start)
-    slow_requests = [t for t in timings[1:] if t > 5.0]
-    print(f'  Timings: {[f"{t:.2f}s" for t in timings]}')
-    assert len(slow_requests) == 0, (
-        f'Sticky session broken: {len(slow_requests)} requests took >5s '
-        f'(expected all to hit warm replica)'
+    # All requests with same model must hit the same replica
+    unique = set(replica_ids)
+    assert None not in unique, 'X-Twinkle-Replica-Id header missing from responses'
+    assert len(unique) == 1, (
+        f'Sticky session broken: requests routed to {len(unique)} different replicas: {unique}'
     )
-    print('  All requests routed to same warm replica')
+    print(f'  All 5 requests → replica {replica_ids[0]}')
     print('  PASS\n')
 
 
