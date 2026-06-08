@@ -122,7 +122,10 @@ class DeviceMesh:
 
     def __post_init__(self):
         if self.device_type is None:
-            self.device_type = Platform.device_prefix()
+            try:
+                self.device_type = Platform.device_prefix()
+            except Exception:
+                self.device_type = 'cuda'
 
         if not isinstance(self.mesh, np.ndarray):
             self.mesh = np.array(self.mesh)
