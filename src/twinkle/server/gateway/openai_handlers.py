@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
 
@@ -70,6 +71,9 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], 'GatewayServer']
         # Build sticky routing headers
         sticky_headers = _build_sticky_headers(sticky_key, request)
         body_bytes = json.dumps(sample_request).encode()
+
+        # Ensure sampler has a chat template set (required for Trajectory inputs)
+        await _ensure_template(self, base_model, sticky_headers, request)
 
         stream = body.get('stream', False)
 
@@ -203,3 +207,43 @@ def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
         'x-request-id': sticky_key,
         'Twinkle-Authorization': auth,
     }
+
+
+_template_initialized: set[str] = set()
+
+
+async def _ensure_template(
+    gateway: 'GatewayServer',
+    base_model: str,
+    sticky_headers: dict[str, str],
+    request: Request,
+) -> None:
+    """Ensure the sampler has a chat template set for encoding Trajectory inputs.
+
+    Called once per base_model (cached in-process). On failure, logs a warning
+    but doesn't block — the sampler will return its own error if needed.
+    """
+    if base_model in _template_initialized:
+        return
+
+    template_cls = get_template_for_model(base_model)
+    set_template_body = json.dumps({
+        'template_cls': template_cls,
+        'model_id': base_model,
+    }).encode()
+
+    try:
+        resp = await gateway.proxy.proxy_request(
+            request,
+            endpoint='twinkle/set_template',
+            base_model=base_model,
+            service_type='sampler',
+            body_override=set_template_body,
+            extra_headers=sticky_headers,
+        )
+        if resp.status_code == 200:
+            _template_initialized.add(base_model)
+        else:
+            logger.warning('set_template failed: %s', resp.body.decode()[:200])
+    except Exception as e:
+        logger.warning('set_template call failed: %s', e)
