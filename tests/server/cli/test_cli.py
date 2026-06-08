@@ -5,9 +5,9 @@ Pins the behaviour of the launcher CLI (``twinkle.server.cli.app``): config
 loading and env-var overrides.
 """
 from __future__ import annotations
-
 import json
 from pathlib import Path
+
 from typer.testing import CliRunner
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG

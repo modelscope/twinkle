@@ -6,10 +6,10 @@ Builds a single Ray Serve deployment (SamplerManagement) that simultaneously han
 both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from ray import serve
-from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh

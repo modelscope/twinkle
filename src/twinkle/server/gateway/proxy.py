@@ -7,10 +7,10 @@ to prepend the 'tinker/' prefix to endpoints so they route to /tinker/* paths
 on the unified model/sampler deployments.
 """
 from __future__ import annotations
+from typing import Any
 
 import httpx
 from fastapi import Request, Response
-from typing import Any
 
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger

@@ -6,7 +6,6 @@ to re-initialize telemetry in each worker process using environment variables
 set by the launcher.
 """
 from __future__ import annotations
-
 import logging
 import os
 

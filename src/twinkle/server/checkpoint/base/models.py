@@ -5,10 +5,10 @@ checkpoint / training-run managers.
 Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
-
 from datetime import datetime
-from pydantic import BaseModel
 from typing import Any, Dict, Optional, TypeVar
+
+from pydantic import BaseModel
 
 
 class BaseCheckpoint(BaseModel):
@@ -19,13 +19,13 @@ class BaseCheckpoint(BaseModel):
     size_bytes: int
     public: bool = False
     # Training run info (stored for hub downloads)
-    base_model: Optional[str] = None
+    base_model: str | None = None
     is_lora: bool = False
-    lora_rank: Optional[int] = None
-    train_unembed: Optional[bool] = None
-    train_mlp: Optional[bool] = None
-    train_attn: Optional[bool] = None
-    user_metadata: Optional[Dict[str, Any]] = None
+    lora_rank: int | None = None
+    train_unembed: bool | None = None
+    train_mlp: bool | None = None
+    train_attn: bool | None = None
+    user_metadata: dict[str, Any] | None = None
 
 
 class BaseTrainingRun(BaseModel):
@@ -33,14 +33,14 @@ class BaseTrainingRun(BaseModel):
     training_run_id: str
     base_model: str
     model_owner: str
-    save_dir: Optional[str] = None
+    save_dir: str | None = None
     is_lora: bool = False
     corrupted: bool = False
-    lora_rank: Optional[int] = None
-    last_request_time: Optional[datetime] = None
-    last_checkpoint: Optional[Dict[str, Any]] = None
-    last_sampler_checkpoint: Optional[Dict[str, Any]] = None
-    user_metadata: Optional[Dict[str, Any]] = None
+    lora_rank: int | None = None
+    last_request_time: datetime | None = None
+    last_checkpoint: dict[str, Any] | None = None
+    last_sampler_checkpoint: dict[str, Any] | None = None
+    user_metadata: dict[str, Any] | None = None
 
 
 class BaseLoraConfig(BaseModel):
@@ -54,9 +54,9 @@ class BaseLoraConfig(BaseModel):
 class BaseCreateModelRequest(BaseModel):
     """Base request model for creating a model."""
     base_model: str
-    lora_config: Optional[BaseLoraConfig] = None
-    save_dir: Optional[str] = None
-    user_metadata: Optional[Dict[str, Any]] = None
+    lora_config: BaseLoraConfig | None = None
+    save_dir: str | None = None
+    user_metadata: dict[str, Any] | None = None
 
 
 class BaseParsedCheckpointPath(BaseModel):
@@ -73,7 +73,7 @@ class BaseWeightsInfoResponse(BaseModel):
     base_model: str
     model_owner: str
     is_lora: bool = False
-    lora_rank: Optional[int] = None
+    lora_rank: int | None = None
 
 
 # Type variables for generic types

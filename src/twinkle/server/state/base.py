@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import logging
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from pydantic import BaseModel
 from typing import Generic, TypeVar
+
+from pydantic import BaseModel
 
 from twinkle.server.state.backend.base import StateBackend
 

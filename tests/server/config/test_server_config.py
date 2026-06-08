@@ -12,12 +12,12 @@ Properties covered:
   Property 15: Legacy / unknown field names are rejected
 """
 from __future__ import annotations
+from pathlib import Path
 
 import pytest
 import yaml
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from pathlib import Path
 from pydantic import ValidationError
 
 from twinkle.server.config import ApplicationSpec, ServerConfig

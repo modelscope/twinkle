@@ -5,12 +5,13 @@ Twinkle-native sampler handler mixin.
 Provides /twinkle/* sampler endpoints that call the sampler directly (no queue needed).
 """
 from __future__ import annotations
-
 import json
 import traceback
+from typing import TYPE_CHECKING
+from collections.abc import Callable
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from typing import TYPE_CHECKING, Callable
 
 from twinkle_client.common.serialize import deserialize_object
 

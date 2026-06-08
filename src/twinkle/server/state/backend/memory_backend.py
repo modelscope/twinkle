@@ -1,9 +1,10 @@
 from __future__ import annotations
-
-import ray
 import time
 from fnmatch import fnmatch
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
+
+import ray
 
 from .base import StateBackend
 

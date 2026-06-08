@@ -1,10 +1,11 @@
 """Twinkle Server tracing utilities — thin wrapper over OpenTelemetry tracing."""
 
 from __future__ import annotations
-
 from contextlib import contextmanager
+from typing import Any
+from collections.abc import Iterator, Mapping
+
 from fastapi import Request
-from typing import Any, Iterator, Mapping
 
 try:
     from opentelemetry import trace

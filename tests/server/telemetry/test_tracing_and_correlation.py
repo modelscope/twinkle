@@ -10,11 +10,11 @@ Properties covered:
 - # Feature: server-config-observability-refactor, Property 23: Correlation prefix invariant
 """
 from __future__ import annotations
+from unittest import mock
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from unittest import mock
 
 from twinkle.server.telemetry import correlation
 from twinkle.server.telemetry.correlation import CORRELATION_KEYS, PREFIX, set_correlation_attrs
@@ -210,6 +210,7 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
     the entire server's logs would be invisible in Loki / OTLP backends.
     """
     import logging
+
     from opentelemetry import _logs as _otel_logs
     from opentelemetry import metrics, trace
     from opentelemetry.sdk._logs import LoggingHandler

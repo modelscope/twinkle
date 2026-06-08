@@ -10,8 +10,7 @@ function the ``"server"`` literal resolves to was renamed
 (``build_server_app`` → ``build_gateway_app``).
 """
 from __future__ import annotations
-
-from typing import Callable
+from collections.abc import Callable
 
 # Mapping of operator-facing import_path literals to builder function names.
 BUILDERS: dict[str, str] = {

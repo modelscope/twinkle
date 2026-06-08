@@ -6,17 +6,17 @@ A single Ray Serve deployment that serves both Tinker (/tinker/*) and
 Twinkle (/twinkle/*) management and proxy endpoints.
 """
 from __future__ import annotations
-
 import asyncio
-from fastapi import FastAPI, HTTPException
 from typing import Any
+
+from fastapi import FastAPI, HTTPException
 
 import twinkle_client.types as types
 from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
-from .proxy import ServiceProxy
 from .openai_handlers import _register_openai_routes
+from .proxy import ServiceProxy
 from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 

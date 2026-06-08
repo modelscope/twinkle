@@ -10,9 +10,9 @@ Covers:
 - Import isolation: module loads with torch/transformers/vllm blocked
 """
 from __future__ import annotations
+import sys
 
 import pytest
-import sys
 from hypothesis import given, settings
 from hypothesis import strategies as st
 

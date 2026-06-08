@@ -12,15 +12,15 @@ Provides four subcommands:
                         from a config file.
 """
 from __future__ import annotations
-
 import asyncio
 import json
 import sys
+from pathlib import Path
+from typing import Optional
+
 import pydantic
 import typer
 import yaml
-from pathlib import Path
-from typing import Optional
 
 from twinkle.server.config import ServerConfig
 from twinkle.server.exceptions import ConfigParseError

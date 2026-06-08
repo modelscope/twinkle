@@ -11,10 +11,10 @@ exposes:
 """
 
 from __future__ import annotations
-
 import logging
-from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 

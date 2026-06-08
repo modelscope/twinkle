@@ -7,12 +7,13 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 /twinkle/sample (non-streaming) or /twinkle/sample_stream (streaming) routes.
 """
 from __future__ import annotations
-
 import json
 import uuid
+from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -26,13 +27,13 @@ from .openai_bridge import make_error, translate_chat_request, translate_respons
 logger = get_logger()
 
 
-def _register_openai_routes(app: FastAPI, self_fn: Callable[[], 'GatewayServer']) -> None:
+def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register OpenAI-compatible routes on the gateway FastAPI app."""
 
     @app.post('/chat/completions')
     async def chat_completions(
         request: Request,
-        self: 'GatewayServer' = Depends(self_fn),
+        self: GatewayServer = Depends(self_fn),
     ):
         """OpenAI-compatible chat completions endpoint.
 
@@ -154,7 +155,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], 'GatewayServer']
     @app.get('/models')
     async def list_models(
         request: Request,
-        self: 'GatewayServer' = Depends(self_fn),
+        self: GatewayServer = Depends(self_fn),
     ):
         """OpenAI-compatible model listing endpoint."""
         models = []
@@ -170,7 +171,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], 'GatewayServer']
         })
 
 
-async def _resolve_base_model(gateway: 'GatewayServer', model: str) -> str | None:
+async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
     """Resolve the base_model for routing given an adapter/model name.
 
     Checks:
@@ -217,7 +218,7 @@ _template_initialized: set[str] = set()
 
 
 async def _ensure_template(
-    gateway: 'GatewayServer',
+    gateway: GatewayServer,
     base_model: str,
     sticky_headers: dict[str, str],
     request: Request,

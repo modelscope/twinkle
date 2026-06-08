@@ -7,7 +7,6 @@ internal SampleRequest/SampleResponseModelList types. No FastAPI or
 server dependency — fully unit-testable in isolation.
 """
 from __future__ import annotations
-
 import time
 import uuid
 from typing import Any

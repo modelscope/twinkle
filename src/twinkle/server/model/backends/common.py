@@ -2,13 +2,14 @@
 """
 Shared helpers and base classes for backend model implementations.
 """
-import numpy as np
 import re
-import torch
 from collections.abc import Mapping
 from numbers import Number
-from tinker import types
 from typing import Any, List
+
+import numpy as np
+import torch
+from tinker import types
 
 from twinkle import DeviceMesh
 from twinkle.template import Template
@@ -212,10 +213,10 @@ class TwinkleCompatModelBase:
         raise ValueError(f'Unexpected type for tensor output: {type(value)}')
 
     @staticmethod
-    def _get_forward_output(inputs: List[types.Datum],
+    def _get_forward_output(inputs: list[types.Datum],
                             logits: torch.Tensor,
                             logps: torch.Tensor,
-                            return_full_logprobs: bool = False) -> List[dict]:
+                            return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
         When return_full_logprobs is True (forward_only / reference pass), logprobs is returned

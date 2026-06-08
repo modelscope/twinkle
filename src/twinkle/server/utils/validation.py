@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from fastapi import Request
-from fastapi.responses import JSONResponse
 from typing import Any
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
 

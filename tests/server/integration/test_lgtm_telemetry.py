@@ -21,18 +21,18 @@ Tests covered:
 Skips when the LGTM stack is not reachable.
 """
 from __future__ import annotations
-
 import asyncio
-import httpx
 import json
 import os
-import pytest
 import socket
 import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+import httpx
+import pytest
 
 OTLP_ENDPOINT = os.environ.get('TWINKLE_TEST_OTLP_ENDPOINT', 'http://localhost:4317')
 GRAFANA_URL = os.environ.get('TWINKLE_TEST_GRAFANA_URL', 'http://localhost:3000')

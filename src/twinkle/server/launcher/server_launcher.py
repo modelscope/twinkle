@@ -7,12 +7,12 @@ public dotted paths ``twinkle.server.launcher.ServerLauncher`` /
 ``launch_server`` are preserved by the ``__init__`` re-export.
 """
 from __future__ import annotations
-
 import os
 import signal
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from twinkle import get_logger
 from twinkle.server.config import ServerConfig

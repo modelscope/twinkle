@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import os
 from collections.abc import MutableMapping
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 
 def auto_fill_device_group_visible_devices(kwargs: MutableMapping[str, Any]) -> MutableMapping[str, Any]:

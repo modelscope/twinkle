@@ -1,11 +1,11 @@
 """Tests for state managers using RayActorBackend as integration backend."""
 from __future__ import annotations
-
 import asyncio
-import pytest
 import time
 from datetime import datetime, timezone
 from unittest import mock
+
+import pytest
 
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend

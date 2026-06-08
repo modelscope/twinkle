@@ -12,10 +12,10 @@ prompt_index, sample_index)`` — so repeated calls with the same parameters
 produce identical token sequences and logprobs.
 """
 from __future__ import annotations
-
 import hashlib
-import numpy as np
 from typing import Any, List, Optional
+
+import numpy as np
 
 # These data containers don't pull torch / vllm.
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams

@@ -14,8 +14,8 @@ cohesive submodules:
 from .checkpoint_manager import BaseCheckpointManager
 from .models import (BaseCheckpoint, BaseCreateModelRequest, BaseLoraConfig, BaseParsedCheckpointPath, BaseTrainingRun,
                      BaseWeightsInfoResponse)
-from .paths import (CHECKPOINT_INFO_FILENAME, TRAIN_RUN_INFO_FILENAME, TWINKLE_DEFAULT_SAVE_DIR, _resolve_client_save_dir,
-                    validate_ownership, validate_user_path)
+from .paths import (CHECKPOINT_INFO_FILENAME, TRAIN_RUN_INFO_FILENAME, TWINKLE_DEFAULT_SAVE_DIR,
+                    _resolve_client_save_dir, validate_ownership, validate_user_path)
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
 __all__ = [

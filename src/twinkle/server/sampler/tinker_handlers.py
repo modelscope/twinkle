@@ -5,12 +5,13 @@ Tinker-compatible sampler handler mixin.
 Provides POST /tinker/asample using schedule_task() returning UntypedAPIFuture.
 """
 from __future__ import annotations
-
 import os
 import traceback
+from typing import TYPE_CHECKING
+from collections.abc import Callable
+
 from fastapi import Depends, FastAPI, Request
 from tinker import types
-from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from .app import SamplerManagement

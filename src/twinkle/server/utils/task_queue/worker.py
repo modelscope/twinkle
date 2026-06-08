@@ -7,7 +7,6 @@ GPU compute tasks serially across all per-adapter/per-token queues using
 a round-robin policy.
 """
 from __future__ import annotations
-
 import asyncio
 import time
 import traceback
@@ -232,7 +231,7 @@ class ComputeWorker:
                 task.model_id,
                 result=result,
                 queue_state=QueueState.ACTIVE.value)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
             error = (f'Execution timeout exceeded: {self._config.execution_timeout}s, '

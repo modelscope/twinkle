@@ -21,7 +21,7 @@ class TwinkleTrainingRunManager(BaseTrainingRunManager):
     def train_run_info_filename(self) -> str:
         return TRAIN_RUN_INFO_FILENAME
 
-    def _create_training_run(self, model_id: str, run_config: CreateModelRequest) -> Dict[str, Any]:
+    def _create_training_run(self, model_id: str, run_config: CreateModelRequest) -> dict[str, Any]:
         lora_config = run_config.lora_config
         train_run_data = TrainingRun(
             training_run_id=model_id,
@@ -43,14 +43,14 @@ class TwinkleTrainingRunManager(BaseTrainingRunManager):
             new_data['train_attn'] = lora_config.train_attn
         return new_data
 
-    def _parse_training_run(self, data: Dict[str, Any]) -> TrainingRun:
+    def _parse_training_run(self, data: dict[str, Any]) -> TrainingRun:
         return TrainingRun(**data)
 
-    def _create_training_runs_response(self, runs: List[TrainingRun], limit: int, offset: int,
+    def _create_training_runs_response(self, runs: list[TrainingRun], limit: int, offset: int,
                                        total: int) -> TrainingRunsResponse:
         return TrainingRunsResponse(training_runs=runs, cursor=Cursor(limit=limit, offset=offset, total_count=total))
 
-    def get_with_permission(self, model_id: str) -> Optional[TrainingRun]:
+    def get_with_permission(self, model_id: str) -> TrainingRun | None:
         run = self.get(model_id)
         if run and validate_ownership(self.token, run.model_owner):
             return run
@@ -80,7 +80,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
                            train_unembed=None,
                            train_mlp=None,
                            train_attn=None,
-                           user_metadata=None) -> Dict[str, Any]:
+                           user_metadata=None) -> dict[str, Any]:
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
@@ -97,7 +97,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
             user_metadata=user_metadata)
         return checkpoint.model_dump(mode='json')
 
-    def _parse_checkpoint(self, data: Dict[str, Any]) -> Checkpoint:
+    def _parse_checkpoint(self, data: dict[str, Any]) -> Checkpoint:
         data = data.copy()
         if 'tinker_path' in data and 'twinkle_path' not in data:
             data['twinkle_path'] = data.pop('tinker_path')
@@ -105,7 +105,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
             data['twinkle_path'] = data.pop('path')
         return Checkpoint(**data)
 
-    def get(self, model_id: str, checkpoint_id: str) -> Optional[Checkpoint]:
+    def get(self, model_id: str, checkpoint_id: str) -> Checkpoint | None:
         data = self._read_ckpt_info(model_id, checkpoint_id)
         if not data:
             return None
@@ -115,7 +115,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
                 data['twinkle_path'] = f"{self.path_prefix}{model_id}/{data['checkpoint_id']}"
         return self._parse_checkpoint(data)
 
-    def _create_checkpoints_response(self, checkpoints: List[Checkpoint]) -> CheckpointsListResponse:
+    def _create_checkpoints_response(self, checkpoints: list[Checkpoint]) -> CheckpointsListResponse:
         return CheckpointsListResponse(checkpoints=checkpoints, cursor=None)
 
     def _create_parsed_path(self, path, training_run_id, checkpoint_type, checkpoint_id) -> ParsedCheckpointTwinklePath:
@@ -127,7 +127,7 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
             checkpoint_id=checkpoint_id,
         )
 
-    def _create_weights_info(self, run_info: Dict[str, Any]) -> WeightsInfoResponse:
+    def _create_weights_info(self, run_info: dict[str, Any]) -> WeightsInfoResponse:
         return WeightsInfoResponse(
             training_run_id=run_info.get('training_run_id', ''),
             base_model=run_info.get('base_model', ''),
@@ -136,5 +136,5 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
             lora_rank=run_info.get('lora_rank'),
         )
 
-    def parse_twinkle_path(self, twinkle_path: str) -> Optional[ParsedCheckpointTwinklePath]:
+    def parse_twinkle_path(self, twinkle_path: str) -> ParsedCheckpointTwinklePath | None:
         return self.parse_path(twinkle_path)

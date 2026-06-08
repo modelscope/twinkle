@@ -4,15 +4,13 @@
 Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
-
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from twinkle import get_logger
-
-from .paths import (SAVE_DIR_POINTER_KEY, TWINKLE_DEFAULT_SAVE_DIR, _hash_token, _resolve_client_save_dir)
+from .paths import SAVE_DIR_POINTER_KEY, TWINKLE_DEFAULT_SAVE_DIR, _hash_token, _resolve_client_save_dir
 
 logger = get_logger()
 
@@ -57,7 +55,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _create_training_run(self, model_id: str, run_config: Any) -> Dict[str, Any]:
+    def _create_training_run(self, model_id: str, run_config: Any) -> dict[str, Any]:
         """
         Create training run data from model_id and run_config.
 
@@ -71,7 +69,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _parse_training_run(self, data: Dict[str, Any]) -> Any:
+    def _parse_training_run(self, data: dict[str, Any]) -> Any:
         """
         Parse training run data into the appropriate model.
 
@@ -84,7 +82,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _create_training_runs_response(self, runs: List[Any], limit: int, offset: int, total: int) -> Any:
+    def _create_training_runs_response(self, runs: list[Any], limit: int, offset: int, total: int) -> Any:
         """
         Create a training runs response.
 
@@ -99,7 +97,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """
         pass
 
-    def _token_base_dir(self, save_dir: Optional[str] = None) -> Path:
+    def _token_base_dir(self, save_dir: str | None = None) -> Path:
         if save_dir:
             base_path = _resolve_client_save_dir(save_dir)
         else:
@@ -109,21 +107,21 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
     def _default_model_dir(self, model_id: str) -> Path:
         return self._token_base_dir() / model_id
 
-    def _read_json_file(self, path: Path) -> Dict[str, Any]:
+    def _read_json_file(self, path: Path) -> dict[str, Any]:
         try:
             with open(path) as f:
                 return json.load(f)
         except Exception:
             return {}
 
-    def _read_save_dir_pointer(self, model_id: str) -> Optional[Dict[str, Any]]:
+    def _read_save_dir_pointer(self, model_id: str) -> dict[str, Any] | None:
         data = self._read_json_file(self._default_model_dir(model_id) / self.train_run_info_filename)
         if data.get(SAVE_DIR_POINTER_KEY):
             return data
         return None
 
     @staticmethod
-    def _extract_save_dir(run_config: Any) -> Optional[str]:
+    def _extract_save_dir(run_config: Any) -> str | None:
         save_dir = getattr(run_config, 'save_dir', None)
         if save_dir:
             return save_dir
@@ -150,7 +148,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         """
         return self._token_base_dir()
 
-    def get_model_dir(self, model_id: str, save_dir: Optional[str] = None) -> Path:
+    def get_model_dir(self, model_id: str, save_dir: str | None = None) -> Path:
         """
         Get model directory with token-based isolation.
 
@@ -168,7 +166,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             return self._token_base_dir(pointer.get('save_dir')) / model_id
         return self.get_base_dir() / model_id
 
-    def _read_info(self, model_id: str) -> Dict[str, Any]:
+    def _read_info(self, model_id: str) -> dict[str, Any]:
         """
         Read training run metadata from disk.
 
@@ -190,7 +188,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             return self._read_json_file(target_path)
         return data
 
-    def _write_info(self, model_id: str, data: Dict[str, Any]):
+    def _write_info(self, model_id: str, data: dict[str, Any]):
         """
         Write training run metadata to disk.
 
@@ -232,7 +230,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             new_data['save_dir'] = _resolve_client_save_dir(save_dir).as_posix()
         self._write_info(model_id, new_data)
 
-    def get(self, model_id: str) -> Optional[Any]:
+    def get(self, model_id: str) -> Any | None:
         """
         Get training run metadata.
 
@@ -247,7 +245,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
             return None
         return self._parse_training_run(data)
 
-    def update(self, model_id: str, updates: Dict[str, Any]):
+    def update(self, model_id: str, updates: dict[str, Any]):
         """
         Update training run metadata.
 

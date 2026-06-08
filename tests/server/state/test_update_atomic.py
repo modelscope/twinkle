@@ -12,15 +12,15 @@ Redis-backed cases are skipped automatically when the test Redis at
 ``TWINKLE_TEST_REDIS_URL`` is unreachable.
 """
 from __future__ import annotations
-
 import asyncio
 import functools
 import os
-import pytest
-import pytest_asyncio
 import tempfile
 import uuid
 from typing import Any
+
+import pytest
+import pytest_asyncio
 
 from twinkle.server.state.backend.file_backend import FileBackend
 from twinkle.server.state.backend.memory_backend import RayActorBackend

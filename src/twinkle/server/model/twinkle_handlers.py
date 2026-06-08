@@ -7,14 +7,15 @@ results directly (synchronous from the client's perspective).
 self_fn is injected via FastAPI Depends to obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
-
 import asyncio
-import torch
 import traceback
-from fastapi import Depends, FastAPI, HTTPException, Request
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+
+import torch
+from fastapi import Depends, FastAPI, HTTPException, Request
 from peft import LoraConfig
-from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .app import ModelManagement

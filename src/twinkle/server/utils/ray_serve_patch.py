@@ -19,7 +19,6 @@ Use get_runtime_env_for_patches() with ray.init() to ensure the patch
 is applied in all worker processes.
 """
 from __future__ import annotations
-
 from typing import Tuple
 
 from twinkle.utils.logger import get_logger

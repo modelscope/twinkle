@@ -8,10 +8,9 @@ Provides:
 - QueuedTask: Dataclass representing a queued work item
 """
 from __future__ import annotations
-
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Coroutine
+from collections.abc import Callable, Coroutine
 
 
 class TaskStatus(Enum):

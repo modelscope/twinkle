@@ -6,11 +6,11 @@ Builds a single Ray Serve deployment (ModelManagement) that simultaneously handl
 both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
-from typing import Any, Dict, Optional
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh

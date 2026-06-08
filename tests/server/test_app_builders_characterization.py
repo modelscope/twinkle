@@ -23,7 +23,6 @@ constructs (via monkeypatched ``serve.ingress`` / ``serve.deployment``) so no
 live Ray Serve cluster is needed.
 """
 from __future__ import annotations
-
 import json
 from pathlib import Path
 

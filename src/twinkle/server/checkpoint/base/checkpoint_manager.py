@@ -4,7 +4,6 @@
 Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
-
 import json
 import os
 import re
@@ -17,7 +16,6 @@ from typing import Any, Dict, List, Optional
 from twinkle import get_logger
 from twinkle.hub import HubOperation
 from twinkle_client.types import ResolvedLoadPath
-
 from .paths import CHECKPOINT_INFO_FILENAME, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
@@ -68,13 +66,13 @@ class BaseCheckpointManager(BaseFileManager, ABC):
                            path: str,
                            size_bytes: int,
                            public: bool,
-                           base_model: Optional[str] = None,
+                           base_model: str | None = None,
                            is_lora: bool = False,
-                           lora_rank: Optional[int] = None,
-                           train_unembed: Optional[bool] = None,
-                           train_mlp: Optional[bool] = None,
-                           train_attn: Optional[bool] = None,
-                           user_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                           lora_rank: int | None = None,
+                           train_unembed: bool | None = None,
+                           train_mlp: bool | None = None,
+                           train_attn: bool | None = None,
+                           user_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Create checkpoint data.
 
@@ -98,7 +96,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _parse_checkpoint(self, data: Dict[str, Any]) -> Any:
+    def _parse_checkpoint(self, data: dict[str, Any]) -> Any:
         """
         Parse checkpoint data into the appropriate model.
 
@@ -111,7 +109,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _create_checkpoints_response(self, checkpoints: List[Any]) -> Any:
+    def _create_checkpoints_response(self, checkpoints: list[Any]) -> Any:
         """
         Create a checkpoints list response.
 
@@ -134,7 +132,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         pass
 
     @abstractmethod
-    def _create_weights_info(self, run_info: Dict[str, Any]) -> Any:
+    def _create_weights_info(self, run_info: dict[str, Any]) -> Any:
         """
         Create weights info from run info.
 
@@ -175,7 +173,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         return save_path.as_posix()
 
     @staticmethod
-    def get_ckpt_name(name: Optional[str]) -> str:
+    def get_ckpt_name(name: str | None) -> str:
         """Generate or normalize checkpoint name."""
         if name:
             # Normalize name to avoid issues with filesystem
@@ -183,7 +181,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             return name
         return datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    def _read_ckpt_info(self, model_id: str, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+    def _read_ckpt_info(self, model_id: str, checkpoint_id: str) -> dict[str, Any] | None:
         """
         Read checkpoint metadata from disk.
 
@@ -203,7 +201,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         except Exception:
             return None
 
-    def _write_ckpt_info(self, model_id: str, checkpoint_id: str, data: Dict[str, Any]):
+    def _write_ckpt_info(self, model_id: str, checkpoint_id: str, data: dict[str, Any]):
         """
         Write checkpoint metadata to disk.
 
@@ -310,7 +308,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
                     shutil.rmtree(item)
             logger.info(f'Deleted existing sampler weights for model_id: {model_id}')
 
-    def get(self, model_id: str, checkpoint_id: str) -> Optional[Any]:
+    def get(self, model_id: str, checkpoint_id: str) -> Any | None:
         """
         Get checkpoint metadata.
 
@@ -326,7 +324,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             return None
         return self._parse_checkpoint(data)
 
-    def list_checkpoints(self, model_id: str) -> Optional[Any]:
+    def list_checkpoints(self, model_id: str) -> Any | None:
         """
         List checkpoints for a training run.
 
@@ -389,7 +387,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             return True
         return False
 
-    def parse_path(self, path: str) -> Optional[Any]:
+    def parse_path(self, path: str) -> Any | None:
         """
         Parse a path into its components.
 
@@ -414,7 +412,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             checkpoint_id='/'.join(parts[1:]),
         )
 
-    def get_weights_info(self, checkpoint_path: str) -> Optional[Any]:
+    def get_weights_info(self, checkpoint_path: str) -> Any | None:
         """
         Get weights info.
 
@@ -443,7 +441,7 @@ class BaseCheckpointManager(BaseFileManager, ABC):
             # Hub model ID - download checkpoint_metadata.json from ModelScope
             return self._get_weights_info_from_hub(checkpoint_path)
 
-    def _get_weights_info_from_hub(self, hub_model_id: str) -> Optional[Any]:
+    def _get_weights_info_from_hub(self, hub_model_id: str) -> Any | None:
         """
         Download and parse checkpoint_metadata.json from hub.
 

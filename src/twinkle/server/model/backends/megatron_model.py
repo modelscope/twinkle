@@ -2,9 +2,10 @@
 """
 Megatron backend model for the unified model deployment.
 """
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+
 import torch
 from tinker import types
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
@@ -23,7 +24,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     """
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results, sync=True)
-    def tinker_forward_backward(self, *, inputs: List[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
+    def tinker_forward_backward(self, *, inputs: list[types.Datum], adapter_name: str, loss_fn: str, **kwargs):
         """Combined forward and backward pass."""
         self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
         template = self.get_template(adapter_name=adapter_name)
@@ -43,7 +44,7 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         return [results, loss]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
-    def tinker_forward_only(self, *, inputs: List[types.Datum], adapter_name: str = None, **kwargs):
+    def tinker_forward_only(self, *, inputs: list[types.Datum], adapter_name: str = None, **kwargs):
         """Forward pass without gradient computation."""
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
@@ -97,13 +98,13 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+    def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+    def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
                          **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)

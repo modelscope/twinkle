@@ -11,11 +11,11 @@ Covers:
 - Module does not pull ``vllm`` (CPU-only host compat)
 """
 from __future__ import annotations
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from pathlib import Path
 
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.server.exceptions import ConfigError

@@ -7,7 +7,6 @@ requests-per-second (rps) and tokens-per-second (tps) limits with automatic
 memory cleanup to prevent unbounded memory growth.
 """
 from __future__ import annotations
-
 import asyncio
 import time
 from typing import Any

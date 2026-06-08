@@ -5,7 +5,6 @@ helpers for the checkpoint subsystem.
 Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
-
 import hashlib
 import hmac
 import os

@@ -7,12 +7,13 @@ All endpoints are prefixed /twinkle/... and handle processor lifecycle
 ProcessorManagement instance at request time.
 """
 from __future__ import annotations
-
 import asyncio
 import importlib
 import uuid
+from typing import TYPE_CHECKING
+from collections.abc import Callable
+
 from fastapi import Depends, FastAPI, HTTPException, Request
-from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from .app import ProcessorManagement

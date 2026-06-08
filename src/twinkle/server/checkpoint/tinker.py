@@ -5,8 +5,9 @@ Tinker-specific checkpoint and training-run managers.
 Uses ``tinker.types`` models for all serialization and response construction.
 """
 from datetime import datetime
-from tinker import types as tinker_types
 from typing import Any, Dict, List, Optional
+
+from tinker import types as tinker_types
 
 from twinkle.server.checkpoint.base import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
 
@@ -18,7 +19,7 @@ class TinkerTrainingRunManager(BaseTrainingRunManager):
     def train_run_info_filename(self) -> str:
         return TRAIN_RUN_INFO_FILENAME
 
-    def _create_training_run(self, model_id: str, run_config: tinker_types.CreateModelRequest) -> Dict[str, Any]:
+    def _create_training_run(self, model_id: str, run_config: tinker_types.CreateModelRequest) -> dict[str, Any]:
         lora_config = run_config.lora_config
         train_run_data = tinker_types.TrainingRun(
             training_run_id=model_id,
@@ -39,12 +40,12 @@ class TinkerTrainingRunManager(BaseTrainingRunManager):
             new_data['train_attn'] = lora_config.train_attn
         return new_data
 
-    def _parse_training_run(self, data: Dict[str, Any]) -> tinker_types.TrainingRun:
+    def _parse_training_run(self, data: dict[str, Any]) -> tinker_types.TrainingRun:
         data = self._transform_checkpoint_fields(data)
         data.pop('save_dir', None)
         return tinker_types.TrainingRun(**data)
 
-    def _transform_checkpoint_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _transform_checkpoint_fields(self, data: dict[str, Any]) -> dict[str, Any]:
         data = data.copy()
         for field in ['last_checkpoint', 'last_sampler_checkpoint']:
             if field in data and data[field] is not None:
@@ -60,7 +61,7 @@ class TinkerTrainingRunManager(BaseTrainingRunManager):
                 data[field] = ckpt
         return data
 
-    def _create_training_runs_response(self, runs: List[tinker_types.TrainingRun], limit: int, offset: int,
+    def _create_training_runs_response(self, runs: list[tinker_types.TrainingRun], limit: int, offset: int,
                                        total: int) -> tinker_types.TrainingRunsResponse:
         return tinker_types.TrainingRunsResponse(
             training_runs=runs, cursor=tinker_types.Cursor(limit=limit, offset=offset, total_count=total))
@@ -89,7 +90,7 @@ class TinkerCheckpointManager(BaseCheckpointManager):
                            train_unembed=None,
                            train_mlp=None,
                            train_attn=None,
-                           user_metadata=None) -> Dict[str, Any]:
+                           user_metadata=None) -> dict[str, Any]:
         checkpoint = tinker_types.Checkpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
@@ -107,7 +108,7 @@ class TinkerCheckpointManager(BaseCheckpointManager):
         result['user_metadata'] = user_metadata
         return result
 
-    def _parse_checkpoint(self, data: Dict[str, Any]) -> tinker_types.Checkpoint:
+    def _parse_checkpoint(self, data: dict[str, Any]) -> tinker_types.Checkpoint:
         data = data.copy()
         if 'twinkle_path' in data and 'tinker_path' not in data:
             data['tinker_path'] = data.pop('twinkle_path')
@@ -116,7 +117,7 @@ class TinkerCheckpointManager(BaseCheckpointManager):
         return tinker_types.Checkpoint(**data)
 
     def _create_checkpoints_response(
-            self, checkpoints: List[tinker_types.Checkpoint]) -> tinker_types.CheckpointsListResponse:
+            self, checkpoints: list[tinker_types.Checkpoint]) -> tinker_types.CheckpointsListResponse:
         return tinker_types.CheckpointsListResponse(checkpoints=checkpoints, cursor=None)
 
     def _create_parsed_path(self, path, training_run_id, checkpoint_type,
@@ -128,8 +129,8 @@ class TinkerCheckpointManager(BaseCheckpointManager):
             checkpoint_id=checkpoint_id,
         )
 
-    def _create_weights_info(self, run_info: Dict[str, Any]) -> tinker_types.WeightsInfoResponse:
+    def _create_weights_info(self, run_info: dict[str, Any]) -> tinker_types.WeightsInfoResponse:
         return tinker_types.WeightsInfoResponse(**run_info)
 
-    def parse_tinker_path(self, tinker_path: str) -> Optional[tinker_types.ParsedCheckpointTinkerPath]:
+    def parse_tinker_path(self, tinker_path: str) -> tinker_types.ParsedCheckpointTinkerPath | None:
         return self.parse_path(tinker_path)

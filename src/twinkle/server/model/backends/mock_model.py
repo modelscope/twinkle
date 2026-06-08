@@ -15,11 +15,11 @@ duck-typed against ``TwinkleCompatModelBase`` rather than subclassing it —
 the base class lives in a torch-importing module.
 """
 from __future__ import annotations
-
 import hashlib
 import os
-import numpy as np
 from typing import Any
+
+import numpy as np
 
 from twinkle.utils.logger import get_logger
 

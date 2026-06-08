@@ -24,11 +24,12 @@ metrics — reproduces the per-builder execution order exactly
 the outermost layer wrapping tracing.
 """
 from __future__ import annotations
-
 from contextlib import asynccontextmanager
+from typing import Any
+from collections.abc import Awaitable, Callable
+
 from fastapi import FastAPI, Request
 from ray import serve
-from typing import Any, Awaitable, Callable
 
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.server.utils.metrics_middleware import create_metrics_middleware

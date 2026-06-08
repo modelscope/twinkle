@@ -10,9 +10,9 @@ The schemas use ``extra='forbid'`` so unknown args (typos, copy-paste from
 other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Any, Literal
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
 
