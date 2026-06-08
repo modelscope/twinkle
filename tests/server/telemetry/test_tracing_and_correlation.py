@@ -216,6 +216,7 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
     from opentelemetry.sdk._logs import LoggingHandler
     from opentelemetry.util._once import Once
 
+    from twinkle.server.config.telemetry import TelemetryConfig
     from twinkle.server.telemetry import provider
 
     # Reset all OTel global guards so init_telemetry runs cleanly.
@@ -236,7 +237,7 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
 
     try:
         provider.init_telemetry(
-            provider.TelemetryConfig(
+            TelemetryConfig(
                 enabled=True,
                 debug=True,  # debug=True → console exporter, no real OTLP needed
                 service_name='twinkle-server-test',

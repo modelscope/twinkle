@@ -8,13 +8,14 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.telemetry import MetricsRegistry
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
-from .backend.factory import PersistenceConfig, create_backend
+from .backend.factory import create_backend
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
 from .model_manager import ModelManager

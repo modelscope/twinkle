@@ -1,5 +1,6 @@
+from twinkle.server.config.persistence import PersistenceConfig
 from .base import StateBackend
-from .factory import PersistenceConfig, create_backend
+from .factory import create_backend
 from .file_backend import FileBackend
 from .redis_backend import RedisBackend
 

@@ -12,9 +12,9 @@ exposes:
 
 from __future__ import annotations
 import logging
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from twinkle.server.config.telemetry import TelemetryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -107,19 +107,6 @@ class _LoggingWriter:
 
     def flush(self) -> None:
         pass
-
-
-class TelemetryConfig(BaseModel):
-    """Configuration for the OpenTelemetry pipeline."""
-
-    model_config = ConfigDict(extra='forbid')
-
-    enabled: bool = False
-    service_name: str = 'twinkle-server'
-    otlp_endpoint: str = 'http://localhost:4317'
-    debug: bool = False  # True: Console Exporter; False: OTLP Exporter
-    export_interval_ms: int = 30000
-    resource_attributes: dict = Field(default_factory=dict)
 
 
 def init_telemetry(config: TelemetryConfig) -> None:

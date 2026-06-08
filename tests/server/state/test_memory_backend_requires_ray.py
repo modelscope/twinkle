@@ -13,7 +13,8 @@ import pytest
 
 ray = pytest.importorskip('ray')
 
-from twinkle.server.state.backend.factory import PersistenceConfig, create_backend  # noqa: E402
+from twinkle.server.config.persistence import PersistenceConfig  # noqa: E402
+from twinkle.server.state.backend.factory import create_backend  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

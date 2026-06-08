@@ -27,7 +27,7 @@ def build_telemetry_env_vars() -> dict[str, str]:
 
 def build_persistence_env_vars() -> dict[str, str]:
     """Collect persistence env vars from ``os.environ`` for worker propagation."""
-    from twinkle.server.state.backend.factory import PERSISTENCE_ENV_KEYS
+    from twinkle.server.config.persistence import PERSISTENCE_ENV_KEYS
     return {k: os.environ[k] for k in PERSISTENCE_ENV_KEYS if k in os.environ}
 
 

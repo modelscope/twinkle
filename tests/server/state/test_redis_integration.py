@@ -19,8 +19,9 @@ import uuid
 
 import pytest
 
+from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.state import ServerState
-from twinkle.server.state.backend.factory import PersistenceConfig, create_backend
+from twinkle.server.state.backend.factory import create_backend
 from twinkle.server.state.backend.redis_backend import RedisBackend
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')

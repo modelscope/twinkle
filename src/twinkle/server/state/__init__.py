@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .backend import PersistenceConfig, create_backend
+from twinkle.server.config.persistence import PersistenceConfig
+from .backend import create_backend
 from .base import BaseManager
 from .config_manager import ConfigManager
 from .future_manager import FutureManager
