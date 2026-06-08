@@ -86,11 +86,24 @@ def _patched_attention_forward(
         cmp_sparse_indices = None
     elif self.layer_type == 'compressed_sparse_attention':
         cmp_ratio = self.config.compress_rates['compressed_sparse_attention']
-        cmp_kv_arg = compressed_kv.squeeze(1).contiguous()
-        cmp_sparse_indices = top_k_indices.to(torch.int32) if top_k_indices is not None else None
+        # Check if compressed_kv is empty (no compressed entries)
+        if compressed_kv is not None and compressed_kv.shape[2] > 0:
+            cmp_kv_arg = compressed_kv.squeeze(1).contiguous()
+            cmp_sparse_indices = top_k_indices.to(torch.int32) if top_k_indices is not None else None
+        else:
+            # No compressed entries, fall back to standard attention
+            use_sas = False
+            cmp_kv_arg = None
+            cmp_sparse_indices = None
     else:
         cmp_ratio = self.config.compress_rates['heavily_compressed_attention']
-        cmp_kv_arg = compressed_kv.squeeze(1).contiguous()
+        # Check if compressed_kv is empty (no compressed entries)
+        if compressed_kv is not None and compressed_kv.shape[2] > 0:
+            cmp_kv_arg = compressed_kv.squeeze(1).contiguous()
+        else:
+            # No compressed entries, fall back to standard attention
+            use_sas = False
+            cmp_kv_arg = None
         cmp_sparse_indices = None
 
     try:
