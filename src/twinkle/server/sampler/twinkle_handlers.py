@@ -210,7 +210,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ):
         """Stream token deltas as newline-delimited JSON.
 
-        Only supported for vLLM backends. Returns 400 for other backends.
+        Uses the standard sampler.sample() remote call internally, then emits
+        the complete result as streaming chunks. This works across the Ray actor
+        boundary where direct engine access is not possible.
+
         Each line is a JSON object: {"delta": "text", "finish_reason": null|"stop"|"length"}
         """
         if self.sampler_type != 'vllm':
@@ -235,41 +238,31 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             if len(inputs) != 1:
                 raise HTTPException(status_code=400, detail='Streaming only supports a single input')
             inputs = inputs[0]
+        if isinstance(inputs, dict):
+            if 'input_ids' in inputs:
+                inputs = [InputFeature(**inputs)]
+            else:
+                inputs = [Trajectory(**inputs)]
 
         # Build sampling params
-        params = SamplingParams()
+        params = None
         if body.sampling_params:
             params = SamplingParams.from_dict(body.sampling_params)
 
-        # Resolve LoRA
-        lora_request = None
-        if adapter_path is not None:
-            from twinkle.hub import HubOperation
-            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
-            lora_request = await self.sampler.engine._get_or_load_lora(adapter_path)
-
-        # Encode trajectory if needed
-        is_trajectory = isinstance(inputs, dict) and 'input_ids' not in inputs
-        if is_trajectory:
-            template = self.sampler.template
-            if template is None:
-                raise HTTPException(status_code=400, detail='Template not set; call /twinkle/set_template first')
-            encoded = self.sampler.encode_trajectory_for_vllm(
-                Trajectory(**inputs), full_adapter_name, True)
-            prompt = encoded['input_ids']
-        else:
-            if isinstance(inputs, dict):
-                prompt = inputs['input_ids']
-            else:
-                prompt = inputs
+        # Call the standard sample remote function
+        responses = self.sampler.sample(
+            inputs,
+            params,
+            adapter_name=full_adapter_name,
+            adapter_path=adapter_path,
+        )
 
         async def _stream_generator():
-            async for delta_text, finish_reason in self.sampler.engine.generate_stream(
-                prompt=prompt,
-                sampling_params=params,
-                lora_request=lora_request,
-            ):
-                chunk = json.dumps({'delta': delta_text, 'finish_reason': finish_reason})
-                yield chunk + '\n'
+            for response in responses:
+                for seq in response.sequences:
+                    decoded = seq.decoded or ''
+                    finish_reason = seq.stop_reason if seq.stop_reason else 'stop'
+                    chunk = json.dumps({'delta': decoded, 'finish_reason': finish_reason})
+                    yield chunk + '\n'
 
         return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')
