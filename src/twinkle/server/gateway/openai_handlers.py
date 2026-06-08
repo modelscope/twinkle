@@ -230,6 +230,7 @@ async def _ensure_template(
     set_template_body = json.dumps({
         'template_cls': template_cls,
         'model_id': base_model,
+        'adapter_name': '',
     }).encode()
 
     try:
