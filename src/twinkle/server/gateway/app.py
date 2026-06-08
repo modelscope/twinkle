@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 import twinkle_client.types as types
-from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
 from .openai_handlers import _register_openai_routes

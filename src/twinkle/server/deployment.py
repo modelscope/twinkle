@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Shared deployment-application scaffold (TIER 1).
+"""Shared deployment-application construction.
 
 Top-level, central deployment-construction infrastructure shared by all four
 deployments (Gateway, Model, Sampler, Processor). It is intentionally NOT under

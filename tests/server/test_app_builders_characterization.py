@@ -104,7 +104,7 @@ def _capture_builder(monkeypatch, build_callable, *args, **kwargs) -> _CaptureRe
 
         return _decorate
 
-    from twinkle.server import app_scaffold
+    from twinkle.server import deployment as app_scaffold
 
     monkeypatch.setattr(app_scaffold.serve, 'ingress', fake_ingress)
     monkeypatch.setattr(app_scaffold.serve, 'deployment', fake_deployment)
