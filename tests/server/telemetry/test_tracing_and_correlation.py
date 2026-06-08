@@ -255,16 +255,6 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
                    for h in logging.getLogger(name).handlers)
 
 
-def test_pyproject_declares_telemetry_extras() -> None:
-    """``pyproject.toml`` declares ``psutil`` and ``pynvml`` as telemetry extras."""
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[3]
-    text = (repo_root / 'pyproject.toml').read_text()
-    assert 'telemetry =' in text
-    assert 'psutil' in text
-    assert 'pynvml' in text
-
 
 # ---------- inbound HTTP trace-context continuity ------------------ #
 

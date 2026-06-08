@@ -1,10 +1,13 @@
 """Tests for state managers using RayActorBackend as integration backend."""
 from __future__ import annotations
 
+import asyncio
 import pytest
 import time
 from datetime import datetime, timezone
+from unittest import mock
 
+from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.future_manager import FutureManager
 from twinkle.server.state.model_manager import ModelManager
@@ -231,6 +234,66 @@ class TestModelManager:
 
 
 # ============================================================
+# Model Limit Race (merged from test_model_limit_race)
+# ============================================================
+
+
+class TestModelLimitRace:
+
+    @pytest.mark.asyncio
+    async def test_concurrent_adds_same_token_respect_limit(self):
+        backend = RayActorBackend()
+        limit = 5
+        state = ServerState(backend=backend, per_token_model_limit=limit)
+
+        n = 25
+        results: list[bool] = []
+
+        async def try_add(i: int) -> None:
+            try:
+                await state.register_model({'base_model': 'b'}, token='tok', model_id=f'm{i}')
+                results.append(True)
+            except RuntimeError:
+                results.append(False)
+
+        await asyncio.gather(*(try_add(i) for i in range(n)))
+
+        accepted = results.count(True)
+        assert accepted <= limit, f'{accepted} models registered for one token, exceeds limit {limit}'
+        models = await state._model_mgr.get_all()
+        tok_models = [m for m in models.values() if m.token == 'tok']
+        assert len(tok_models) == accepted
+
+    @pytest.mark.asyncio
+    async def test_remove_frees_token_slot(self):
+        backend = RayActorBackend()
+        state = ServerState(backend=backend, per_token_model_limit=1)
+
+        await state.register_model({'base_model': 'b'}, token='tok', model_id='m1')
+        with pytest.raises(RuntimeError):
+            await state.register_model({'base_model': 'b'}, token='tok', model_id='m2')
+
+        assert await state.unload_model('m1') is True
+        await state.register_model({'base_model': 'b'}, token='tok', model_id='m3')
+        models = await state._model_mgr.get_all()
+        assert {mid for mid in models} == {'m3'}
+
+    @pytest.mark.asyncio
+    async def test_rebuild_indexes_recovers_counter_from_records(self):
+        backend = RayActorBackend()
+        state = ServerState(backend=backend, per_token_model_limit=3)
+
+        await state.register_model({'base_model': 'b'}, token='tok', model_id='m1')
+        await state.register_model({'base_model': 'b'}, token='tok', model_id='m2')
+
+        await state._model_mgr.rebuild_indexes()
+
+        await state.register_model({'base_model': 'b'}, token='tok', model_id='m3')
+        with pytest.raises(RuntimeError):
+            await state.register_model({'base_model': 'b'}, token='tok', model_id='m4')
+
+
+# ============================================================
 # SamplingSessionManager Tests
 # ============================================================
 
@@ -368,3 +431,50 @@ class TestFutureManager:
         result = await manager.get('req1')
         assert result.queue_state == 'paused_rate_limit'
         assert result.queue_state_reason == 'Rate limit hit'
+
+
+# ============================================================
+# Cascade Cleanup Consistency (merged from test_cleanup_cascade_consistency)
+# ============================================================
+
+
+class TestCascadeCleanup:
+
+    @pytest.mark.asyncio
+    async def test_cascade_set_matches_removed_sessions(self):
+        backend = RayActorBackend()
+        state = ServerState(backend=backend, expiration_timeout=0.0)
+        sid = await state.create_session({'session_id': 's-expired'})
+        await state.register_model({'base_model': 'b'}, token='t1', model_id='m1', session_id=sid)
+        time.sleep(0.01)
+        stats = await state.cleanup_expired_resources()
+        assert stats['sessions'] == 1
+        assert stats['models'] == 1
+        assert await state.get_session_last_heartbeat('s-expired') is None
+        assert await state.get_model_metadata('m1') is None
+
+    @pytest.mark.asyncio
+    async def test_touch_between_scans_cannot_orphan_children(self):
+        backend = RayActorBackend()
+        state = ServerState(backend=backend, expiration_timeout=0.0)
+        sid = await state.create_session({'session_id': 's-race'})
+        await state.register_model({'base_model': 'b'}, token='t1', model_id='m-race', session_id=sid)
+        time.sleep(0.01)
+
+        session_mgr = state._session_mgr
+        real_get_all = session_mgr.get_all
+        touched = {'done': False}
+
+        async def get_all_then_touch():
+            records = await real_get_all()
+            if not touched['done']:
+                touched['done'] = True
+                await session_mgr.touch(sid)
+            return records
+
+        with mock.patch.object(session_mgr, 'get_all', side_effect=get_all_then_touch):
+            stats = await state.cleanup_expired_resources()
+
+        session_alive = await state.get_session_last_heartbeat('s-race') is not None
+        model_alive = await state.get_model_metadata('m-race') is not None
+        assert session_alive == model_alive

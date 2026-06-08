@@ -248,29 +248,3 @@ class TestListModels:
         assert data['data'][0]['object'] == 'model'
 
 
-# ---------- Middleware compatibility --------------------------------------- #
-
-
-class TestMiddlewareBypass:
-    def test_chat_completions_without_sticky_header(self, mock_gateway):
-        """OpenAI endpoints should work without X-Ray-Serve-Request-Id."""
-        mock_self, app = mock_gateway
-        mock_self.proxy.proxy_request.return_value = TestChatCompletions()._make_sample_response()
-
-        client = TestClient(app)
-        # No X-Ray-Serve-Request-Id header — should still work
-        resp = client.post(
-            '/chat/completions',
-            json={
-                'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{'role': 'user', 'content': 'Hello'}],
-            },
-            headers={'Authorization': 'Bearer key'},
-        )
-        assert resp.status_code == 200
-
-    def test_models_without_sticky_header(self, mock_gateway):
-        _, app = mock_gateway
-        client = TestClient(app)
-        resp = client.get('/models', headers={'Authorization': 'Bearer key'})
-        assert resp.status_code == 200

@@ -1,9 +1,11 @@
-"""Tests for the cleanup-leader election loop in ``ServerState``.
+"""Tests for the cleanup-leader election loop and metrics gauge in ``ServerState``.
 
-Validates the contract `_leader_loop` exposes:
+Validates:
 - exactly one ``ServerState`` instance over the same backend becomes leader;
 - the cleanup task is gated on leadership (non-leaders never call cleanup);
-- when the leader stops, another instance can take over.
+- when the leader stops, another instance can take over;
+- the ObservableGauge resource counters publish correct values without
+  inflation across multiple instances.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import pytest
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.server_state import LEADER_KEY, LEASE_RENEW
+from twinkle.server.telemetry import MetricsRegistry
 
 
 @pytest.mark.asyncio
@@ -154,3 +157,60 @@ async def test_renewal_failure_does_not_steal_other_leader_lease() -> None:
         assert follower._is_leader is False
 
     assert await backend.get(LEADER_KEY) == leader_value, 'follower stole the real leader lease'
+
+
+# ============================================================
+# Metrics ObservableGauge (merged from test_metrics_observable_gauge)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_four_instances_no_4x_gauge_inflation() -> None:
+    """Four ServerState instances sharing one backend: only the leader publishes
+    gauge counts, so the cache reads 5 (not 20)."""
+    MetricsRegistry.reset()
+    backend = RayActorBackend()
+    instances = [ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.5) for _ in range(4)]
+    try:
+        for s in instances:
+            await s.start_cleanup_task()
+        for _ in range(5):
+            await instances[0].create_session({})
+        await asyncio.sleep(1.5)
+        leaders = [s for s in instances if s._is_leader]
+        assert len(leaders) == 1
+        registry = MetricsRegistry.get()
+        assert registry.get_resource_count('active_sessions') == 5
+    finally:
+        for s in instances:
+            await s.stop_cleanup_task()
+        MetricsRegistry.reset()
+
+
+@pytest.mark.asyncio
+async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
+    """When a leader loses leadership its gauge cache is zeroed."""
+    MetricsRegistry.reset()
+    backend = RayActorBackend()
+    a = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
+    b = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
+    try:
+        await a.start_cleanup_task()
+        await b.start_cleanup_task()
+        for _ in range(3):
+            await a.create_session({})
+        await asyncio.sleep(1.0)
+
+        leader = a if a._is_leader else b
+        registry = MetricsRegistry.get()
+        assert registry.get_resource_count('active_sessions') == 3
+
+        # Force handover
+        await backend.set(LEADER_KEY, 'someone-else')
+        await leader._try_acquire_or_renew()
+        assert leader._is_leader is False
+        assert registry.get_resource_count('active_sessions') == 0
+    finally:
+        await a.stop_cleanup_task()
+        await b.stop_cleanup_task()
+        MetricsRegistry.reset()
