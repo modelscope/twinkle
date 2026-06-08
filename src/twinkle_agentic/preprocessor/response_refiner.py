@@ -135,10 +135,10 @@ class ResponseRefiner(Preprocessor):
         self._max_tokens = max_tokens
         self._max_workers = max_workers
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Refine key round responses in parallel."""
         if not rows:
-            return rows
+            return rows, []
 
         # Collect tasks: (row_idx, round_idx, assistant_idx, messages, intent)
         tasks: List[Tuple[int, int, int, List[Dict[str, Any]], str]] = []
@@ -157,7 +157,8 @@ class ResponseRefiner(Preprocessor):
         if not tasks:
             # No key rounds anywhere → drop all
             logger.info('[ResponseRefiner] no key rounds found, dropping all rows')
-            return []
+            dropped = [dict(row, drop_reason='no_key_rounds') for row in rows]
+            return [], dropped
 
         # Parallel refinement
         results: Dict[Tuple[int, int], Optional[Dict[str, str]]] = {}
@@ -180,17 +181,17 @@ class ResponseRefiner(Preprocessor):
 
         # Apply refinements
         out = []
+        dropped = []
         n_refined = 0
-        n_dropped = 0
 
         for ri, row in enumerate(rows):
             user_data = row.get('user_data')
             if not isinstance(user_data, dict):
-                n_dropped += 1
+                dropped.append(dict(row, drop_reason='no_user_data'))
                 continue
             key_rounds = user_data.get('key_rounds')
             if not isinstance(key_rounds, list) or not key_rounds:
-                n_dropped += 1
+                dropped.append(dict(row, drop_reason='no_key_rounds'))
                 continue
 
             messages = list(row.get('messages') or [])
@@ -223,6 +224,6 @@ class ResponseRefiner(Preprocessor):
 
         logger.info(
             f'[ResponseRefiner] refined {n_refined} rounds, '
-            f'dropped {n_dropped} rows without key_rounds, '
+            f'dropped {len(dropped)} rows without key_rounds, '
             f'output {len(out)} rows')
-        return out
+        return out, dropped

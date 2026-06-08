@@ -23,7 +23,7 @@ across batches via ``persistent_consistency``), so dialogues stay coherent.
 import hashlib
 import threading
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: F401
 
 from twinkle.preprocessor import Preprocessor
 
@@ -370,7 +370,7 @@ class PIIPresidioFilter(Preprocessor):
                     row_hits[k] = row_hits.get(k, 0) + v
         return row_hits
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         local_map: Dict[Tuple[str, str], str] = {}
         for row in rows:
             row_hits = self._scrub_row(row, local_map)
@@ -379,4 +379,4 @@ class PIIPresidioFilter(Preprocessor):
                     row['_pii_hits'] = row_hits
                 else:
                     row.pop('_pii_hits', None)
-        return rows
+        return rows, []

@@ -498,13 +498,14 @@ class ScoreFilter(Preprocessor):
     def __call__(self, rows):
         rows_list = self.map_col_to_row(rows)
         contexts = self._build_contexts(rows_list)
+        dropped: List[Dict[str, Any]] = []
         if contexts:
             score_table = self._score_contexts(contexts)
             self._log_score_summary(contexts, score_table)
             if self._trace_dir:
                 self._write_traces(contexts, score_table)
-            rows_list = self._apply_filter(rows_list, contexts, score_table)
-        return self.map_row_to_col(rows_list)
+            rows_list, dropped = self._apply_filter(rows_list, contexts, score_table)
+        return rows_list, dropped
 
     def _log_score_summary(self, contexts, score_table):
         for scorer in self._scorers:
@@ -745,7 +746,7 @@ class ScoreFilter(Preprocessor):
         rows: List[Dict[str, Any]],
         contexts: List[RoundContext],
         score_table: List[Dict[str, ScoreResult]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         per_row: Dict[int, Dict[str, Any]] = {}
         for i, ctx in enumerate(contexts):
             scores = score_table[i] if i < len(score_table) else {}
@@ -759,6 +760,7 @@ class ScoreFilter(Preprocessor):
                 slot['failed'] += 1
 
         out: List[Dict[str, Any]] = []
+        dropped: List[Dict[str, Any]] = []
         n_removed_rounds = 0
         n_removed_rows = 0
         for ri, row in enumerate(rows):
@@ -774,9 +776,11 @@ class ScoreFilter(Preprocessor):
                 # Row produced no contexts (no asst turns or filtered by intent).
                 if had_key_rounds and not self._keep_if_no_key_rounds:
                     n_removed_rows += 1
+                    dropped.append(dict(row, drop_reason='score_no_context'))
                     continue
                 if self._intents is not None and not self._keep_if_no_key_rounds:
                     n_removed_rows += 1
+                    dropped.append(dict(row, drop_reason='score_no_context'))
                     continue
                 out.append(row)
                 continue
@@ -786,6 +790,7 @@ class ScoreFilter(Preprocessor):
             if had_key_rounds:
                 if not kept:
                     n_removed_rows += 1
+                    dropped.append(dict(row, drop_reason='score_all_rounds_failed'))
                     continue
                 new_row = dict(row)
                 new_row['user_data'] = dict(user_data, key_rounds=list(kept))
@@ -793,10 +798,11 @@ class ScoreFilter(Preprocessor):
             else:
                 if decision['failed'] > 0 and self._drop_row_on_any_fail:
                     n_removed_rows += 1
+                    dropped.append(dict(row, drop_reason='score_round_failed'))
                     continue
                 out.append(row)
 
         logger.info(
             f'[ScoreFilter] removed {n_removed_rounds} rounds, '
             f'dropped {n_removed_rows} rows, kept {len(out)}/{len(rows)}')
-        return out
+        return out, dropped

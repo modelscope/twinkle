@@ -143,6 +143,8 @@ class HardFilter(Preprocessor):
         min_assistant_chars_2turn: int = 80,
         allow_incomplete_role: bool = False,
         system_deny_keywords: Optional[List[str]] = None,
+        max_chars_per_round: Optional[int] = None,
+        max_total_chars: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._min_user_chars = min_user_chars
@@ -150,6 +152,8 @@ class HardFilter(Preprocessor):
         self._min_assistant_chars_2turn = min_assistant_chars_2turn
         self.allow_incomplete_role = allow_incomplete_role
         self._system_deny_re = re.compile('|'.join(re.escape(k) for k in system_deny_keywords), re.IGNORECASE) if system_deny_keywords else None
+        self._max_chars_per_round = max_chars_per_round
+        self._max_total_chars = max_total_chars
 
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         out = []
@@ -199,6 +203,24 @@ class HardFilter(Preprocessor):
                 sys_text = next((m.get('content') or '' for m in messages if isinstance(m, dict) and m.get('role') == 'system'), '')
                 if self._system_deny_re.search(sys_text):
                     dropped.append(dict(row, drop_reason='system_deny_keyword'))
+                    continue
+
+            # Rule 5: per-round character length limit
+            if self._max_chars_per_round:
+                round_too_long = False
+                for m in messages:
+                    if isinstance(m, dict) and len(m.get('content') or '') > self._max_chars_per_round:
+                        round_too_long = True
+                        break
+                if round_too_long:
+                    dropped.append(dict(row, drop_reason='round_too_long'))
+                    continue
+
+            # Rule 6: total conversation character length limit
+            if self._max_total_chars:
+                total_chars = sum(len(m.get('content') or '') for m in messages if isinstance(m, dict))
+                if total_chars > self._max_total_chars:
+                    dropped.append(dict(row, drop_reason='total_too_long'))
                     continue
 
             out.append(row)

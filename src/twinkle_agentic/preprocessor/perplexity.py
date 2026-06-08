@@ -114,7 +114,7 @@ class PerplexityFilter(Preprocessor):
         self.ppl_max      = ppl_max
         self._max_workers = max_workers
 
-    def __call__(self, rows) -> List[Dict[str, Any]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Parallel-score rows via chat completions; keep rows with PPL in [ppl_min, ppl_max]."""
         scoreable: List[Tuple[int, List[Dict[str, Any]], int]] = []  # (row_idx, messages, n_prompt)
         for i, row in enumerate(rows):
@@ -124,7 +124,7 @@ class PerplexityFilter(Preprocessor):
                 scoreable.append((i, result[0], result[1]))
 
         if not scoreable:
-            return rows
+            return rows, []
 
         drop: set = set()
         n_workers = min(self._max_workers, len(scoreable))
@@ -143,4 +143,6 @@ class PerplexityFilter(Preprocessor):
                 if ppl is not None and not (self.ppl_min <= ppl <= self.ppl_max):
                     drop.add(row_idx)
 
-        return [row for i, row in enumerate(rows) if i not in drop]
+        kept = [row for i, row in enumerate(rows) if i not in drop]
+        dropped = [dict(row, drop_reason='ppl_out_of_range') for i, row in enumerate(rows) if i in drop]
+        return kept, dropped
