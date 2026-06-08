@@ -7,33 +7,20 @@ from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
 from twinkle.utils.parallel import PosixFileLock
 
-from .consistency_filter import ConsistencyFilter
 from .agent_trace_filter import AgentTraceFilter
 from .data_juicer import (
-    AlphanumericFilter,
-    CharRepeatFilter,
-    FlaggedWordsFilter,
     FixUnicodeFilter,
-    KenLMFilter,
-    LanguageFilter,
-    LLMConditionFilter,
-    LLMDifficultyFilter,
-    LLMQualityFilter,
-    LLMTaskRelevanceFilter,
-    MinHashDedupFilter,
     RemoveRepeatSentencesFilter,
     SpecialCharsFilter,
-    StopwordsFilter,
-    TextActionFilter,
     TokenNumFilter,
-    WordRepeatFilter,
 )
 from .dead_loop_filter import DeadLoopFilter
+from .dedup_filter import DedupFilter
 from .hard_filter import HardFilter
 from .intent_classifier import IntentClassifier
 from .llm_backend import LLMBackend, OpenAIBackend, SamplerBackend  # noqa: F401
-from .majority_vote import MajorityVoteFilter
 from .message_sanity import MessageSanityFilter
+from .model_filter import ModelFilter
 from .perplexity import PerplexityFilter
 from .pii_presidio_filter import PIIPresidioFilter
 from .refuse_filter import RefuseFilter

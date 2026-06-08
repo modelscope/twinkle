@@ -415,11 +415,8 @@ def get_dataset(total: Optional[int] = None, dropped_log: Optional[str] = None,
     scaled proportionally so the input-row sum approximates ``total``.
     """
     from twinkle_agentic.preprocessor import (
-        AlphanumericFilter,
-        CharRepeatFilter,
         DeadLoopFilter,
         FixUnicodeFilter,
-        FlaggedWordsFilter,
         HardFilter,
         IntentClassifier,
         MessageSanityFilter,
@@ -428,7 +425,6 @@ def get_dataset(total: Optional[int] = None, dropped_log: Optional[str] = None,
         RemoveRepeatSentencesFilter,
         TokenNumFilter,
         TokenSoupFilter,
-        WordRepeatFilter,
     )
 
     dataset = _build_dataset(total=total, load_from_cache_file=load_from_cache_file)
@@ -443,10 +439,6 @@ def get_dataset(total: Optional[int] = None, dropped_log: Optional[str] = None,
             MessageSanityFilter(min_turns=1, max_msg_chars=200000),
             FixUnicodeFilter(),
             RemoveRepeatSentencesFilter(),
-            WordRepeatFilter(),
-            CharRepeatFilter(),
-            AlphanumericFilter(),
-            FlaggedWordsFilter(),
             TokenNumFilter(max_num=32768),
         ],
         dropped_log_path=dropped_log or '',

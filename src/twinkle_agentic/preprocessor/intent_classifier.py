@@ -13,6 +13,7 @@ INTENT_TOOL_CALL = 'tool_call'
 INTENT_CODE = 'code'
 INTENT_MATH = 'math'
 INTENT_COMPLEX_LOGIC = 'complex_logic'
+INTENT_REASONING = 'reasoning'
 INTENT_USER_DISSATISFACTION = 'user_dissatisfaction'
 INTENT_OTHER = 'other'
 
@@ -285,6 +286,30 @@ class ComplexLogicDetector(_RegexDetector):
         return len(_LOGIC_STRUCTURE_RE.findall(text)) >= self.threshold
 
 
+class ReasoningDetector(IntentDetector):
+    """Detect assistant turns with explicit reasoning chains (reasoning_content or <think> blocks)."""
+
+    intent = INTENT_REASONING
+
+    def __init__(self, min_chars: int = 200) -> None:
+        self._min_chars = min_chars
+
+    def __call__(self, messages):
+        rounds = []
+        for i, m in enumerate(messages):
+            if not isinstance(m, dict) or m.get('role') != 'assistant':
+                continue
+            rc = m.get('reasoning_content') or ''
+            if isinstance(rc, str) and len(rc.strip()) >= self._min_chars:
+                rounds.append(i)
+                continue
+            text = _msg_text(m)
+            match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+            if match and len(match.group(1).strip()) >= self._min_chars:
+                rounds.append(i)
+        return rounds
+
+
 class UserDissatisfactionDetector(_RegexDetector):
     intent = INTENT_USER_DISSATISFACTION
     role_filter = 'user'
@@ -333,6 +358,7 @@ class IntentClassifier(Preprocessor):
         CodeDetector(),
         MathDetector(),
         ComplexLogicDetector(),
+        ReasoningDetector(),
         UserDissatisfactionDetector(),
     ]
 

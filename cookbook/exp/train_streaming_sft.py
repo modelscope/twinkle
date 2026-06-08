@@ -33,8 +33,7 @@ from twinkle_agentic.preprocessor import (
     QualityPreprocessor, SamplerBackend,
     IntentClassifier, ResponseRefiner, ScoreFilter,
     HardFilter, RefuseFilter, AgentTraceFilter, DeadLoopFilter, TokenSoupFilter, MessageSanityFilter,
-    WordRepeatFilter, CharRepeatFilter, SpecialCharsFilter, AlphanumericFilter,
-    FlaggedWordsFilter, MinHashDedupFilter, PIIPresidioFilter,
+    SpecialCharsFilter, PIIPresidioFilter, ModelFilter, DedupFilter,
 )
 from twinkle_agentic.preprocessor.score_filter import (
     ChrMinScorer, PassNScorer, ParaphraseScorer,
@@ -176,6 +175,7 @@ def _stream_csv_rows(csv_path: str, max_rows: int = 0) -> Iterator[Dict[str, Any
             yield {
                 'id': f'csv__{ts}__{req_id}',
                 'source': Path(csv_path).stem,
+                'model_id': _model,
                 'messages': messages,
                 'user_data': {},
             }
@@ -223,8 +223,16 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
 
     qp = QualityPreprocessor(
         pipeline=[
+            # Phase 0: model whitelist
+            ModelFilter(),
             # Phase 1-5: deterministic structural filters
-            HardFilter(min_user_chars_cjk=14, min_user_chars=24),
+            HardFilter(
+                min_user_chars_cjk=14, min_user_chars=24,
+                system_deny_keywords=[
+                    '角色扮演', '扮演', '人设', 'roleplay', 'role play', 'cosplay',
+                    '群聊模拟', '虚拟角色', '二次元', 'OC设定',
+                ],
+            ),
             RefuseFilter(),
             # Tag agent rollouts (Cline / OpenClaw / Claude Code) so DeadLoop
             # / sanity rules can adapt instead of mass-dropping them.
@@ -232,15 +240,12 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
             DeadLoopFilter(),
             MessageSanityFilter(sensitive_words_file='.temp/sensitive_words.txt'),
             # Phase 8-10: repetition & character quality
-            WordRepeatFilter(),
-            CharRepeatFilter(),
             SpecialCharsFilter(max_ratio=0.6),
             # TokenSoupFilter samples head only — signals are uniform/statistical, no need to scan multi-MB tool payloads.
             TokenSoupFilter(max_chars=8000),
-            AlphanumericFilter(),
-            FlaggedWordsFilter(),
-            # MinHashDedupFilter(),
             IntentClassifier(),
+            # Phase 12: conversation-level dedup (max 3 per system+user signature)
+            DedupFilter(max_per_sig=1),
             # ScoreFilter temporarily disabled — reuses Ray vLLMSampler backend
             # which is incompatible with HF Dataset.map(num_proc>1) workers.
             # ScoreFilter(
@@ -280,6 +285,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         dropped_log_path=DROPPED_DATA_PATH,
     )
     dataset.map(qp, num_proc=MAP_NUM_PROC, load_from_cache_file=False)
+    dataset.save_as('output/streaming_sft/filtered.jsonl')
 
     dataset.set_template(
         TEMPLATE_NAME,

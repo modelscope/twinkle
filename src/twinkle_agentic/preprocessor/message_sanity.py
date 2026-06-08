@@ -63,9 +63,52 @@ def _msg_content_text(msg: Dict[str, Any]) -> str:
     return ''
 
 
+_CJK_CHARS_RE = re.compile(
+    r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
+
+
+def _cjk_ratio(text: str) -> float:
+    """Fraction of non-whitespace characters that are CJK."""
+    chars = text.replace(' ', '').replace('\n', '').replace('\t', '')
+    if not chars:
+        return 0.0
+    return len(_CJK_CHARS_RE.findall(chars)) / len(chars)
+
+
+def _check_lang_match(messages: List[Dict[str, Any]],
+                      cjk_threshold: float = 0.3,
+                      mismatch_threshold: float = 0.02) -> bool:
+    """Return False if user is CJK-dominant but assistant has near-zero CJK (or vice versa)."""
+    user_text = ''
+    asst_text = ''
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get('role')
+        if role == 'user':
+            user_text += _msg_content_text(m)
+        elif role == 'assistant':
+            asst_text += _msg_content_text(m)
+    if len(asst_text) < 50:
+        return True
+    user_cjk = _cjk_ratio(user_text)
+    asst_cjk = _cjk_ratio(asst_text)
+    if user_cjk >= cjk_threshold and asst_cjk < mismatch_threshold:
+        return False
+    if user_cjk < mismatch_threshold and asst_cjk >= cjk_threshold:
+        return False
+    return True
+
+
 def _normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
-    """Return ``tool_calls`` as a list, decoding the JSON-string form used for
-    PyArrow schema stability. Returns ``None`` when absent / empty / malformed.
+    """Return ``tool_calls`` as a list of dicts, handling common serialization
+    artifacts from PyArrow / HF Datasets round-trips:
+
+    - tool_calls stored as a JSON string (entire list serialized)
+    - list elements that are JSON strings instead of dicts
+    - ``function`` value that is a JSON string instead of a dict
+
+    Returns ``None`` when absent / empty / malformed.
     """
     tcs = msg.get('tool_calls')
     if isinstance(tcs, str):
@@ -76,10 +119,30 @@ def _normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
             decoded = json.loads(s)
         except (json.JSONDecodeError, ValueError):
             return None
-        return decoded if isinstance(decoded, list) and decoded else None
-    if isinstance(tcs, list) and tcs:
-        return tcs
-    return None
+        if not isinstance(decoded, list) or not decoded:
+            return None
+        tcs = decoded
+    if not isinstance(tcs, list) or not tcs:
+        return None
+    # Normalize each element: deserialize string elements, fix string-typed function
+    result = []
+    for tc in tcs:
+        if isinstance(tc, str):
+            try:
+                tc = json.loads(tc)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        if not isinstance(tc, dict):
+            return None
+        func = tc.get('function')
+        if isinstance(func, str):
+            try:
+                func = json.loads(func)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            tc = dict(tc, function=func)
+        result.append(tc)
+    return result
 
 
 # ── Role order validation ────────────────────────────────────────────────────
@@ -175,7 +238,7 @@ def _validate_role_order(messages: List[Dict[str, Any]], is_agent: bool = False)
                 prev_role = prev.get('role')
                 if prev_role not in ('assistant', 'tool'):
                     return False
-                if prev_role == 'assistant' and not prev.get('tool_calls'):
+                if prev_role == 'assistant' and not _normalize_tool_calls(prev):
                     return False
     return True
 
@@ -290,18 +353,16 @@ def _validate_tool_call_matching(messages: List[Dict[str, Any]]) -> bool:
 
 
 def _trim_to_last_assistant(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Trim trailing messages so the conversation ends with an assistant message.
+    """Trim trailing messages so the conversation ends with an assistant that has visible content.
 
-    Returns the trimmed list, or empty list if no assistant message exists.
+    Returns the trimmed list, or empty list if no assistant with content exists.
     """
-    last_asst = -1
     for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], dict) and messages[i].get('role') == 'assistant':
-            last_asst = i
-            break
-    if last_asst < 0:
-        return []
-    return messages[:last_asst + 1]
+        m = messages[i]
+        if isinstance(m, dict) and m.get('role') == 'assistant':
+            if (_msg_content_text(m) or '').strip():
+                return messages[:i + 1]
+    return []
 
 
 # ── Preprocessor ─────────────────────────────────────────────────────────────
@@ -323,21 +384,25 @@ class MessageSanityFilter(Preprocessor):
         check_role_order: bool = True,
         check_tool_matching: bool = True,
         check_content_integrity: bool = True,
+        check_lang_match: bool = True,
         trim_to_assistant: bool = True,
         filter_sensitive: bool = True,
         sensitive_words_file: Optional[str] = None,
         extra_sensitive_words: Optional[List[str]] = None,
         min_turns: int = 2,
         max_msg_chars: int = 50000,
+        min_agent_visible_chars: int = 200,
     ) -> None:
         super().__init__()
         self.check_role_order = check_role_order
         self.check_tool_matching = check_tool_matching
         self.check_content_integrity = check_content_integrity
+        self.check_lang_match = check_lang_match
         self.trim_to_assistant = trim_to_assistant
         self.filter_sensitive = filter_sensitive
         self._min_turns = min_turns
         self._max_msg_chars = max_msg_chars
+        self._min_agent_visible_chars = min_agent_visible_chars
 
         # Build unified sensitive word set
         if sensitive_words_file:
@@ -384,6 +449,22 @@ class MessageSanityFilter(Preprocessor):
                 max_msg_chars=self._max_msg_chars,
             ):
                 continue
+
+            # Step 2.7: language mismatch (user CJK but assistant pure English or vice versa)
+            if self.check_lang_match and not _check_lang_match(messages):
+                continue
+
+            # Step 2.8: agent minimum visible text (exclude pure error / empty tool traces)
+            if is_agent and self._min_agent_visible_chars > 0:
+                total_visible = 0
+                for m in messages:
+                    if isinstance(m, dict) and m.get('role') == 'assistant':
+                        total_visible += len(_msg_content_text(m).strip())
+                        rc = m.get('reasoning_content')
+                        if isinstance(rc, str):
+                            total_visible += len(rc.strip())
+                if total_visible < self._min_agent_visible_chars:
+                    continue
 
             # Step 3: sensitive word check
             if self.filter_sensitive and self._sensitive_re:

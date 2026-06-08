@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from twinkle.preprocessor import Preprocessor
 
@@ -142,12 +142,14 @@ class HardFilter(Preprocessor):
         min_user_chars_cjk: int = 6,
         min_assistant_chars_2turn: int = 80,
         allow_incomplete_role: bool = False,
+        system_deny_keywords: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self._min_user_chars = min_user_chars
         self._min_user_chars_cjk = min_user_chars_cjk
         self._min_assistant_chars_2turn = min_assistant_chars_2turn
         self.allow_incomplete_role = allow_incomplete_role
+        self._system_deny_re = re.compile('|'.join(re.escape(k) for k in system_deny_keywords), re.IGNORECASE) if system_deny_keywords else None
 
     def __call__(self, rows) -> List[Dict[str, Any]]:
         """Drop rows that are trivially low-quality by two rules:
@@ -185,6 +187,19 @@ class HardFilter(Preprocessor):
                 asst = asst_msgs[0]
                 asst_text = (asst.get('content') or '').strip()
                 if len(asst_text) < self._min_assistant_chars_2turn and not _has_thinking(asst):
+                    continue
+
+            # Rule 3: all assistant turns are content-empty with no reasoning → no learning signal
+            if asst_msgs and all(
+                not (m.get('content') or '').strip() and not _has_thinking(m)
+                for m in asst_msgs
+            ):
+                continue
+
+            # Rule 4: system prompt matches deny keywords
+            if self._system_deny_re:
+                sys_text = next((m.get('content') or '' for m in messages if isinstance(m, dict) and m.get('role') == 'system'), '')
+                if self._system_deny_re.search(sys_text):
                     continue
 
             out.append(row)
