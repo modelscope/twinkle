@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 from twinkle.preprocessor import Preprocessor
 from twinkle.template.tools import ToolCallRegistry
 
-from .message_sanity import _normalize_tool_calls
+from .message_utils import normalize_tool_calls as _normalize_tool_calls
 
 
 def _msg_text(m: Dict[str, Any]) -> str:
