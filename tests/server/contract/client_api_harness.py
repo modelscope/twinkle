@@ -40,12 +40,14 @@ def _noop_self() -> None:
 
 
 def build_gateway_app() -> FastAPI:
+    from twinkle.server.gateway.openai_handlers import _register_openai_routes
     from twinkle.server.gateway.tinker_handlers import _register_tinker_routes
     from twinkle.server.gateway.twinkle_handlers import _register_twinkle_routes
 
     app = FastAPI()
     _register_tinker_routes(app, _noop_self)
     _register_twinkle_routes(app, _noop_self)
+    _register_openai_routes(app, _noop_self)
     return app
 
 

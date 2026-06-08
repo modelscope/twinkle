@@ -6,8 +6,10 @@ Provides /twinkle/* sampler endpoints that call the sampler directly (no queue n
 """
 from __future__ import annotations
 
+import json
 import traceback
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING, Callable
 
 from twinkle_client.common.serialize import deserialize_object
@@ -199,3 +201,75 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
             self.sampler.apply_patch(patch_cls, **extra_kwargs)
+
+    @app.post('/twinkle/sample_stream')
+    async def sample_stream(
+        request: Request,
+        body: types.SampleRequest,
+        self: SamplerManagement = Depends(self_fn),
+    ):
+        """Stream token deltas as newline-delimited JSON.
+
+        Only supported for vLLM backends. Returns 400 for other backends.
+        Each line is a JSON object: {"delta": "text", "finish_reason": null|"stop"|"length"}
+        """
+        if self.sampler_type != 'vllm':
+            raise HTTPException(status_code=400, detail='Streaming is only supported by the vLLM backend')
+
+        token = await self._on_request_start(request)
+
+        # Resolve adapter
+        adapter_path = None
+        adapter_name = body.adapter_name or ''
+        full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
+
+        if body.adapter_uri:
+            from twinkle.server.checkpoint import create_checkpoint_manager
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+            self.sampler.reset_prefix_cache()
+
+        # Parse inputs — streaming only supports a single input
+        inputs = body.inputs
+        if isinstance(inputs, list):
+            if len(inputs) != 1:
+                raise HTTPException(status_code=400, detail='Streaming only supports a single input')
+            inputs = inputs[0]
+
+        # Build sampling params
+        params = SamplingParams()
+        if body.sampling_params:
+            params = SamplingParams.from_dict(body.sampling_params)
+
+        # Resolve LoRA
+        lora_request = None
+        if adapter_path is not None:
+            from twinkle.hub import HubOperation
+            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
+            lora_request = await self.sampler.engine._get_or_load_lora(adapter_path)
+
+        # Encode trajectory if needed
+        is_trajectory = isinstance(inputs, dict) and 'input_ids' not in inputs
+        if is_trajectory:
+            template = self.sampler.template
+            if template is None:
+                raise HTTPException(status_code=400, detail='Template not set; call /twinkle/set_template first')
+            encoded = self.sampler.encode_trajectory_for_vllm(
+                Trajectory(**inputs), full_adapter_name, True)
+            prompt = encoded['input_ids']
+        else:
+            if isinstance(inputs, dict):
+                prompt = inputs['input_ids']
+            else:
+                prompt = inputs
+
+        async def _stream_generator():
+            async for delta_text, finish_reason in self.sampler.engine.generate_stream(
+                prompt=prompt,
+                sampling_params=params,
+                lora_request=lora_request,
+            ):
+                chunk = json.dumps({'delta': delta_text, 'finish_reason': finish_reason})
+                yield chunk + '\n'
+
+        return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')

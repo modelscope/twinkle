@@ -4,6 +4,9 @@ from fastapi.responses import JSONResponse
 from typing import Any
 
 
+_OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
+
+
 async def verify_request_token(request: Request, call_next):
     """
     Middleware to verify request token and extract request metadata.
@@ -11,7 +14,8 @@ async def verify_request_token(request: Request, call_next):
     This middleware:
     1. Extracts the Bearer token from Authorization header
     2. Validates the token
-    3. Extracts X-Ray-Serve-Request-Id for sticky sessions (skipped for healthz endpoint)
+    3. Extracts X-Ray-Serve-Request-Id for sticky sessions (skipped for healthz
+       and OpenAI-compat endpoints)
     4. Stores token and request_id in request.state for later use
 
     Args:
@@ -21,13 +25,21 @@ async def verify_request_token(request: Request, call_next):
     Returns:
         JSONResponse with error if validation fails, otherwise the response from call_next
     """
-    authorization = request.headers.get('Twinkle-Authorization')
+    authorization = (
+        request.headers.get('Twinkle-Authorization')
+        or request.headers.get('Authorization')
+    )
     token = authorization[7:] if authorization and authorization.startswith('Bearer ') else authorization
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
-    # Skip X-Ray-Serve-Request-Id check for healthz endpoint (path ends with /healthz)
-    if not request.url.path.endswith('/healthz'):
+    path = request.url.path
+    skip_sticky = (
+        path.endswith('/healthz')
+        or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES)
+    )
+
+    if not skip_sticky:
         request_id = request.headers.get('X-Ray-Serve-Request-Id')
         if not request_id:
             return JSONResponse(
@@ -35,7 +47,7 @@ async def verify_request_token(request: Request, call_next):
                 content={'detail': 'Missing X-Ray-Serve-Request-Id header, required for sticky session'})
         request.state.request_id = request_id
     else:
-        request.state.request_id = ''
+        request.state.request_id = request.headers.get('X-Ray-Serve-Request-Id', '')
     request.state.token = token
     request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
     response = await call_next(request)

@@ -11,6 +11,15 @@
           ]
         }
       },
+      "/chat/completions": {
+        "POST": {
+          "operationId": "chat_completions_chat_completions_post",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
       "/create_model": {
         "POST": {
           "operationId": "create_model_create_model_post",
@@ -96,6 +105,15 @@
           "responses": [
             "200",
             "422"
+          ]
+        }
+      },
+      "/models": {
+        "GET": {
+          "operationId": "list_models_models_get",
+          "parameters": [],
+          "responses": [
+            "200"
           ]
         }
       },
@@ -947,6 +965,16 @@
       "/twinkle/sample": {
         "POST": {
           "operationId": "sample_twinkle_sample_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/sample_stream": {
+        "POST": {
+          "operationId": "sample_stream_twinkle_sample_stream_post",
           "parameters": [],
           "responses": [
             "200",

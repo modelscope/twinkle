@@ -16,6 +16,7 @@ from twinkle.server.app_scaffold import LazyCleanupMixin, bind_deployment, build
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
 from .proxy import ServiceProxy
+from .openai_handlers import _register_openai_routes
 from .tinker_handlers import _register_tinker_routes
 from .twinkle_handlers import _register_twinkle_routes
 
@@ -119,6 +120,7 @@ def build_gateway_app(deploy_options: dict[str, Any],
     def register_routes(app: FastAPI, get_self: Any) -> None:
         _register_tinker_routes(app, get_self)
         _register_twinkle_routes(app, get_self)
+        _register_openai_routes(app, get_self)
 
     async def _on_shutdown(servable: Any) -> None:
         await servable.proxy.close()

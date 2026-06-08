@@ -337,6 +337,63 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
 
+    async def generate_stream(self,
+                              prompt: Union[List[int], str],
+                              sampling_params: Union[SamplingParams, Dict[str, Any]],
+                              lora_request: Optional[Any] = None,
+                              request_id: Optional[str] = None,
+                              priority: int = 0,
+                              *,
+                              disable_lora: bool = False,
+                              **kwargs):
+        """Stream token deltas as they are generated.
+
+        Yields:
+            (delta_text: str, finish_reason: str | None) tuples. The final
+            yield has a non-None finish_reason ('stop' or 'length').
+        """
+        from vllm.inputs import TextPrompt, TokensPrompt
+        from vllm.sampling_params import RequestOutputKind
+
+        if isinstance(sampling_params, dict):
+            sampling_params = SamplingParams.from_dict(sampling_params)
+        vllm_params = sampling_params.to_vllm(**kwargs)
+        vllm_params.output_kind = RequestOutputKind.DELTA
+
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+
+        if isinstance(prompt, str):
+            prompt = TextPrompt(prompt=prompt)
+        else:
+            prompt = TokensPrompt(prompt_token_ids=prompt)
+
+        if lora_request is not None and not self.enable_lora:
+            lora_request = None
+
+        if disable_lora:
+            lora_request = None
+        elif lora_request is None and self._synced_lora_request is not None:
+            lora_request = self._synced_lora_request
+
+        generator = self.engine.generate(
+            prompt=prompt,
+            sampling_params=vllm_params,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+        tokenizer = await self.get_tokenizer()
+        async for output in generator:
+            for comp_output in output.outputs:
+                delta_token_ids = list(comp_output.token_ids)
+                delta_text = tokenizer.decode(delta_token_ids, skip_special_tokens=True) if delta_token_ids else ''
+                finish_reason: Optional[str] = None
+                if comp_output.finish_reason is not None:
+                    finish_reason = 'stop' if comp_output.finish_reason in ('stop', 'eos_token') else 'length'
+                yield delta_text, finish_reason
+
     # -----------------------------------------------------------------
     # RL-training synced LoRA helpers
     # -----------------------------------------------------------------
