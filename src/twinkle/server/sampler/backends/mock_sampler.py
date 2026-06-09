@@ -101,6 +101,26 @@ class MockSampler:
             responses.append(SampleResponse(sequences=sequences))
         return responses
 
+    def sample_stream(
+        self,
+        inputs: Any,
+        sampling_params: SamplingParams | None = None,
+        adapter_name: str = '',
+        adapter_path: str | None = None,
+    ):
+        """Yield (delta_text, finish_reason) tuples one token at a time."""
+        max_tokens = self._resolve_max_tokens(sampling_params)
+        if max_tokens is None or max_tokens < 1:
+            raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r}')
+
+        seed = _stable_seed(self.model_id, adapter_name, 0, 0)
+        rng = np.random.default_rng(seed)
+        tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
+
+        for i, tok in enumerate(tokens):
+            is_last = i == len(tokens) - 1
+            yield str(tok), ('length' if is_last else None)
+
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None
 

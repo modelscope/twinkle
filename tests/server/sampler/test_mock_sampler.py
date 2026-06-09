@@ -134,6 +134,36 @@ def test_property_11_absent_or_empty_sampler_type_raises(value) -> None:
     assert exc.value.field == 'sampler_type'
 
 
+# ---------- Streaming interface -------------------------------------------- #
+
+
+def test_sample_stream_method_present() -> None:
+    s = MockSampler('mid')
+    assert callable(getattr(s, 'sample_stream'))
+
+
+@settings(max_examples=100)
+@given(max_tokens=st.integers(min_value=1, max_value=20))
+def test_sample_stream_yields_correct_count(max_tokens: int) -> None:
+    s = MockSampler('mid')
+    inp = InputFeature(input_ids=[1, 2, 3])
+    chunks = list(s.sample_stream(inp, SamplingParams(max_tokens=max_tokens)))
+    assert len(chunks) == max_tokens
+    for delta_text, finish_reason in chunks[:-1]:
+        assert isinstance(delta_text, str)
+        assert finish_reason is None
+    last_text, last_reason = chunks[-1]
+    assert isinstance(last_text, str)
+    assert last_reason is not None
+
+
+def test_sample_stream_rejects_bad_max_tokens() -> None:
+    s = MockSampler('mid')
+    inp = InputFeature(input_ids=[1])
+    with pytest.raises(ValueError):
+        list(s.sample_stream(inp, SamplingParams(max_tokens=0)))
+
+
 # ---------- No direct vllm import ----------------------------------------- #
 
 
