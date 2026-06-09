@@ -265,7 +265,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             A SampleResponse object
         """
         response = await self.engine.sample(
-            prompt=self.template.get_vllm_input_ids(feat['input_ids']),
+            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
             sampling_params=sampling_params,
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
