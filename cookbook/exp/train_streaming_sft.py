@@ -46,7 +46,7 @@ logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 MODEL_LOCAL_PATH = os.environ.get('MODEL_LOCAL_PATH', 'Qwen/Qwen3.5-4B')
 TEMPLATE_NAME = 'Qwen3_5Template'
-MAX_LENGTH = 150000
+MAX_LENGTH = 30000
 
 # ── GPU allocation ───────────────────────────────────────────────────────────
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
@@ -285,7 +285,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         truncation_strategy='delete',
         enable_thinking=False,
     )
-    dataset.encode(num_proc=MAP_NUM_PROC, load_from_cache_file=False)
+    dataset.encode(num_proc=MAP_NUM_PROC, load_from_cache_file=True)
     dataset.pack_dataset()
     return dataset
 
@@ -336,12 +336,13 @@ def train():
         model_id=MODEL_ID,
         device_mesh=model_mesh,
         remote_group='model',
+        attn_implementation='flash_attention_2',
     )
 
-    # lora_config = LoraConfig(r=16, lora_alpha=32, target_modules='all-linear')
-    # model.add_adapter_to_model(
-    #     ADAPTER_NAME, lora_config,
-    #     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+    lora_config = LoraConfig(r=16, lora_alpha=32, target_modules='all-linear')
+    model.add_adapter_to_model(
+        ADAPTER_NAME, lora_config,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
     model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
