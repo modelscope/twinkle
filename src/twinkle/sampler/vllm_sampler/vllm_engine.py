@@ -181,9 +181,12 @@ class VLLMEngine(BaseSamplerEngine):
         return engine
 
     async def get_tokenizer(self):
-        """Get the tokenizer asynchronously."""
+        """Get the tokenizer."""
         if self._tokenizer is None:
-            self._tokenizer = await self.engine.get_tokenizer()
+            tok = self.engine.get_tokenizer()
+            if hasattr(tok, '__await__'):
+                tok = await tok
+            self._tokenizer = tok
         return self._tokenizer
 
     # =========================================================================
