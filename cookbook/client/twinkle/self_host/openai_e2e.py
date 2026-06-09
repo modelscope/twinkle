@@ -17,7 +17,7 @@ MODEL = 'Qwen/Qwen3.5-4B'
 
 
 def test_list_models(client: OpenAI):
-    print('--- Phase 1: GET /models ---')
+    print('--- Step 1: GET /models ---')
     models = client.models.list()
     model_ids = [m.id for m in models.data]
     print(f'  Available models: {model_ids}')
@@ -26,7 +26,7 @@ def test_list_models(client: OpenAI):
 
 
 def test_non_streaming(client: OpenAI):
-    print('--- Phase 2: Non-streaming chat completion ---')
+    print('--- Step 2: Non-streaming chat completion ---')
     t0 = time.time()
     resp = client.chat.completions.create(
         model=MODEL,
@@ -51,7 +51,7 @@ def test_non_streaming(client: OpenAI):
 
 
 def test_streaming(client: OpenAI):
-    print('--- Phase 3: Streaming chat completion ---')
+    print('--- Step 3: Streaming chat completion ---')
     t0 = time.time()
     stream = client.chat.completions.create(
         model=MODEL,
@@ -90,7 +90,7 @@ def test_streaming(client: OpenAI):
 
 
 def test_multi_turn(client: OpenAI):
-    print('--- Phase 4: Multi-turn conversation ---')
+    print('--- Step 4: Multi-turn conversation ---')
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -120,7 +120,7 @@ def test_sticky_session(base_url: str):
     """
     import httpx
 
-    print('--- Phase 5: Sticky session verification (replica-id) ---')
+    print('--- Step 5: Sticky session verification (replica-id) ---')
 
     replica_ids = []
     for i in range(5):
@@ -160,7 +160,7 @@ def main():
     test_sticky_session(BASE_URL)
 
     print('=' * 50)
-    print('ALL PHASES PASSED')
+    print('ALL STEPS PASSED')
     print('=' * 50)
 
 

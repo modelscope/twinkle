@@ -100,7 +100,7 @@ def _extract_app_surface(app: FastAPI) -> dict[str, Any]:
     codes. The full ``components.schemas`` body and per-operation ``requestBody``
     schema are intentionally NOT snapshotted — they churn on Pydantic / FastAPI
     version bumps without representing a real client-contract change. Route
-    paths, HTTP methods, and response status codes remain frozen (R27).
+    paths, HTTP methods, and response status codes remain frozen.
     """
     spec = get_openapi(
         title='contract',

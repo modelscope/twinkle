@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Characterization tests for the four App_Builders (design step 0, R1.1/R9.1/R9.2).
+"""Characterization tests for the four App_Builders.
 
 These freeze the externally observable behavior of ``build_gateway_app``,
 ``build_model_app``, ``build_sampler_app`` and ``build_processor_app`` BEFORE
@@ -18,7 +18,7 @@ behavior-preserving. For each builder they assert, as fixed expectations:
    ``ProcessorManagement``).
 
 They MUST NOT assert internal object identity or internal middleware-stack
-structure (R9.2). They are built by capturing the FastAPI app the builder
+structure. They are built by capturing the FastAPI app the builder
 constructs (via monkeypatched ``serve.ingress`` / ``serve.deployment``) so no
 live Ray Serve cluster is needed.
 """
