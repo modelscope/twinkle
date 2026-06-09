@@ -187,7 +187,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         from peft import LoraConfig
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
-        with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: full_adapter_name}):
+        with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
             self.sampler.add_adapter_to_sampler(full_adapter_name, config)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)

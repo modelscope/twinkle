@@ -9,7 +9,7 @@
 #   open http://localhost:3000   # admin / admin (anonymous viewer also enabled)
 #
 # In your server_config.yaml:
-#   telemetry_config:
+#   telemetry:
 #     enabled: true
 #     debug: false
 #     service_name: twinkle-server
@@ -21,7 +21,7 @@ services:
     container_name: twinkle-lgtm
     ports:
       - "3000:3000"   # Grafana UI
-      - "4317:4317"   # OTLP gRPC — point telemetry_config.otlp_endpoint here
+      - "4317:4317"   # OTLP gRPC — point telemetry.otlp_endpoint here
       - "4318:4318"   # OTLP HTTP (alternative)
     volumes:
       # Drop our pre-built Twinkle overview dashboard into the image's

@@ -231,7 +231,7 @@ class ComputeWorker:
                 task.model_id,
                 result=result,
                 queue_state=QueueState.ACTIVE.value)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
             error = (f'Execution timeout exceeded: {self._config.execution_timeout}s, '
