@@ -423,6 +423,44 @@ def process_item(
     return samples
 
 
+def process_failure(
+    api: OpenAI,
+    item: Dict[str, Any],
+    thinking_budget: int = 1024,
+) -> List[Dict[str, Any]]:
+    """Re-compress a single failure record (id, query, text already pinned).
+
+    Used by ``--failures`` mode: query and source passage are taken verbatim
+    from the original failure entry, so Phase-1 generation is skipped and the
+    output id matches the original sample id.
+    """
+    sid = item.get('id') or ''
+    query = (item.get('query') or '').strip()
+    text = (item.get('text') or '').strip()
+    if not sid or not query or not text:
+        return []
+    compressed = compress_for_query(api, text, query, thinking_budget=thinking_budget)
+    if not compressed:
+        return []
+    sft_messages = [
+        {'role': 'system', 'content': COMPRESS_SYSTEM_TRAIN},
+        {'role': 'user', 'content': COMPRESS_USER.format(query=query, text=text)},
+        {'role': 'assistant', 'content': compressed},
+    ]
+    return [{
+        'id': sid,
+        'source': item.get('source', 'failure_regen'),
+        'query': query,
+        'original_len': len(text),
+        'compressed_len': len(compressed),
+        'original_tokens': 0,
+        'compressed_tokens': 0,
+        'messages': sft_messages,
+        '__src': text,
+        '__cmp': compressed,
+    }]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # I/O helpers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -459,6 +497,61 @@ def iter_dataset_think_py(total: Optional[int], load_from_cache_file: bool) -> I
     sys.stderr.write(f'Loaded dataset_think.py::get_dataset: {len(hf)} rows\n')
     for row in hf:
         yield row
+
+
+def iter_failures(path: str, skip_ids: Optional[Set[str]] = None) -> Iterator[Dict[str, Any]]:
+    """Stream records from a ``failures.jsonl`` for re-compression.
+
+    Each input record carries a full sample id, the original query, and a
+    user message whose body embeds the source passage after a ``## Passage``
+    or ``## Source`` header. The yielded item is shaped for ``process_failure``
+    (id, source, query, text). Items whose id is in ``skip_ids`` are skipped.
+    """
+    skip = skip_ids or set()
+    n_total = n_skipped = n_yielded = n_bad = 0
+    with open(path, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            n_total += 1
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                n_bad += 1
+                continue
+            sid = obj.get('id') or ''
+            if not sid:
+                n_bad += 1
+                continue
+            if sid in skip:
+                n_skipped += 1
+                continue
+            query = (obj.get('query') or '').strip()
+            user_content = ''
+            for m in obj.get('messages') or []:
+                if isinstance(m, dict) and m.get('role') == 'user':
+                    user_content = m.get('content') or ''
+                    break
+            text = ''
+            for sep in ('## Passage\n', '## Source\n'):
+                if sep in user_content:
+                    text = user_content.split(sep, 1)[1].strip()
+                    break
+            if not query or not text:
+                sys.stderr.write(f'[failures] skip {sid}: missing query/passage\n')
+                n_bad += 1
+                continue
+            n_yielded += 1
+            yield {
+                'id': sid,
+                'source': obj.get('source', 'failure_regen'),
+                'query': query,
+                'text': text,
+            }
+    sys.stderr.write(
+        f'[failures] total={n_total} yielded={n_yielded} '
+        f'resume_skipped={n_skipped} malformed={n_bad}\n')
 
 
 def load_done_sample_ids(path: str) -> Set[str]:
@@ -511,6 +604,9 @@ def main() -> None:
                         help='Proportion of plain-data items using fixed queries instead of LLM-generated ones')
     parser.add_argument('--source', choices=['think', 'plain', 'both'], default='think',
                         help='Data source: think=dataset_think.py (query+CoT), plain=dataset.py, both=chain both')
+    parser.add_argument('--failures', default=None,
+                        help='Path to a failures.jsonl; when set, re-generate compressions for every record '
+                             'using its original (query, passage) pair and ignore --input/--source.')
     args = parser.parse_args()
 
     out_dir = os.path.dirname(args.output)
@@ -534,7 +630,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
     def iter_pending() -> Iterator[Dict[str, Any]]:
-        if args.input:
+        if args.failures:
+            source_iter = iter_failures(args.failures, done_sample_ids)
+        elif args.input:
             source_iter = iter_input(args.input)
         else:
             import itertools
@@ -584,10 +682,15 @@ def main() -> None:
                         exhausted = True
                         break
                     iid = it['id']
-                    fut = ex.submit(
-                        process_item, api, it, done_per_item.get(iid),
-                        args.thinking_budget, args.fixed_query_ratio,
-                    )
+                    if args.failures:
+                        fut = ex.submit(
+                            process_failure, api, it, args.thinking_budget,
+                        )
+                    else:
+                        fut = ex.submit(
+                            process_item, api, it, done_per_item.get(iid),
+                            args.thinking_budget, args.fixed_query_ratio,
+                        )
                     in_flight[fut] = iid
                 if not in_flight:
                     break
