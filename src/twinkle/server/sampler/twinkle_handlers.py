@@ -248,6 +248,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             params = SamplingParams.from_dict(body.sampling_params)
 
         from ray.util.queue import Queue
+        from .backends import STREAM_SENTINEL
+
         q = Queue(maxsize=128)
         actor = self.sampler._actors[0]
         actor.sample_stream_to_queue.remote(
@@ -255,13 +257,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             adapter_name=full_adapter_name, adapter_path=adapter_path,
         )
 
-        SENTINEL = '__STREAM_END__'
-
         async def _stream_generator():
             loop = asyncio.get_event_loop()
             while True:
                 item = await loop.run_in_executor(None, q.get)
-                if item == SENTINEL:
+                if item == STREAM_SENTINEL:
                     break
                 if isinstance(item, Exception):
                     yield json.dumps({'error': str(item)}) + '\n'

@@ -122,7 +122,7 @@ class MockSampler:
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None,
                                adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        SENTINEL = '__STREAM_END__'
+        from . import STREAM_SENTINEL
         try:
             for delta, reason in self.sample_stream(inputs, sampling_params,
                                                      adapter_name, adapter_path):
@@ -130,7 +130,7 @@ class MockSampler:
         except Exception as e:
             queue.put(e)
         finally:
-            queue.put(SENTINEL)
+            queue.put(STREAM_SENTINEL)
 
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None
