@@ -26,7 +26,7 @@ from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, PackingDataset
 from twinkle.dataset.base import DatasetMeta
-from twinkle.model import TransformersModel
+from twinkle.model import MegatronModel
 from twinkle.sampler import vLLMSampler
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.preprocessor import (
@@ -54,7 +54,7 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 0))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 # ── Training ─────────────────────────────────────────────────────────────────
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRAD_ACCUM', 4))
 LOG_INTERVAL = 1
@@ -290,7 +290,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
     return dataset
 
 
-def save_checkpoint(model: TransformersModel, checkpoint_name: str, dataloader: DataLoader):
+def save_checkpoint(model: MegatronModel, checkpoint_name: str, dataloader: DataLoader):
     model.save(
         checkpoint_name,
         output_dir=OUTPUT_DIR,
@@ -306,9 +306,10 @@ def train():
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
         # DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=2),
     ]
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, fsdp_size=4)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, cp_size=4)
     # sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // 2, tp_size=2)
-    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
+    twinkle.initialize(mode='local', nproc_per_node=NUM_GPUS, groups=device_groups, 
+                       global_device_mesh=model_mesh, lazy_collect=False)
 
     # ── vLLMSampler on GPUs 4-7 (Ray actor, no HTTP overhead) ────────────────
     # sampler = vLLMSampler(
@@ -332,22 +333,22 @@ def train():
     )
 
     # ── Model (LoRA on 4 GPUs) ────────────────────────────────────────────────
-    model = TransformersModel(
+    model = MegatronModel(
         model_id=MODEL_ID,
         device_mesh=model_mesh,
-        remote_group='model',
-        attn_implementation='flash_attention_2',
+        # remote_group='model',
+        # attn_implementation='flash_attention_2',
     )
 
     lora_config = LoraConfig(r=16, lora_alpha=32, target_modules='all-linear')
     model.add_adapter_to_model(
         ADAPTER_NAME, lora_config,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
+    model.set_optimizer(optimizer_cls='default', lr=LEARNING_RATE)
     model.set_lr_scheduler(
-        scheduler_cls='CosineWarmupScheduler',
-        num_warmup_steps=50,
-        num_training_steps=NUM_STEPS)
+        scheduler_cls='default',
+        lr_warmup_steps=2,
+        lr_decay_steps=len(dataloader))
 
     logger.info(get_device_placement())
     logger.info(model.get_train_configs())

@@ -346,8 +346,10 @@ class InputProcessor:
                 return torch.cat(new_inputs, dim=dim)
 
             if cp_size > 1:
-                input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
-                position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=1)
+                if position_ids.shape[0] == 1:
+                    # mm input_ids will do split inside of the mcore_bridge
+                    input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
+                position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=-1)
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
