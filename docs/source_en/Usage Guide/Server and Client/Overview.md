@@ -7,14 +7,15 @@ Twinkle provides a complete HTTP Server/Client architecture that supports deploy
 - **Server side**: Deployed based on Ray Serve, hosts model weights and inference/training computation. The Server is responsible for managing model loading, forward/backward propagation, weight saving, sampling inference, etc. A single Server simultaneously supports both Twinkle Client and Tinker Client connections.
 - **Client side**: Runs locally, responsible for data preparation, training loop orchestration, hyperparameter configuration, etc. The Client communicates with the Server via HTTP, sending data and commands.
 
-### Two Model Backends
+### Model Backends
 
-Model loading supports two backends:
+Model loading supports three backends:
 
-| Backend | use_megatron | Description |
-|------|-------------|------|
-| **Transformers** | `false` | Based on HuggingFace Transformers, suitable for most scenarios |
-| **Megatron** | `true` | Based on Megatron-LM, suitable for ultra-large-scale model training, supports more efficient parallelization strategies |
+| Backend | backend | Description |
+|---------|---------|-------------|
+| **Transformers** | `transformers` | Based on HuggingFace Transformers, suitable for most scenarios |
+| **Megatron** | `megatron` | Based on Megatron-LM, suitable for ultra-large-scale model training, supports more efficient parallelization strategies |
+| **Mock** | `mock` | Numpy-only mock backend for CPU-only development and testing |
 
 ### Two Client Modes
 
@@ -36,27 +37,33 @@ Model loading supports two backends:
 ### Model Backend Selection
 
 | Scenario | Recommendation |
-|------|------|
-| 7B/14B and other medium-small scale models | Transformers backend (`use_megatron: false`) |
-| Ultra-large-scale models requiring advanced parallelization strategies | Megatron backend (`use_megatron: true`) |
-| Rapid experimentation and prototype verification | Transformers backend (`use_megatron: false`) |
+|----------|----------------|
+| 7B/14B and other medium-small scale models | Transformers backend (`backend: transformers`) |
+| Ultra-large-scale models requiring advanced parallelization strategies | Megatron backend (`backend: megatron`) |
+| Rapid experimentation and prototype verification | Transformers backend (`backend: transformers`) |
+| CPU-only development/testing | Mock backend (`backend: mock`) |
 
 ## Cookbook Reference
 
-Complete runnable examples are located in the `cookbook/client/` directory:
+Complete runnable examples are located in the `cookbook/` directory:
 
 ```
-cookbook/client/
-├── server/                         # Server startup configuration
-│   ├── transformer/                # Transformers backend
-│   │   ├── run.sh                  # Startup script
-│   │   ├── server.py               # Server entry point
-│   │   └── server_config.yaml      # Configuration file
-│   └── megatron/                   # Megatron backend
-│       ├── run.sh
-│       ├── server.py
-│       ├── server_config.yaml
-│       └── server_config_4b.yaml
+cookbook/
+├── observability/                  # Observability (Grafana + OTLP)
+│   ├── docker-compose.yaml         # One-command LGTM stack
+│   └── README.md
+├── client/
+│   ├── server/                     # Server startup configuration
+│   │   ├── transformer/            # Transformers backend
+│   │   │   ├── run.sh
+│   │   │   ├── server_config.yaml
+│   │   │   └── server_config_e2e.yaml
+│   │   ├── megatron/               # Megatron backend
+│   │   │   ├── run.sh
+│   │   │   ├── server_config.yaml
+│   │   │   └── server_config_4b.yaml
+│   │   └── mock/                   # Mock backend (CPU-only quick start)
+│   │       └── server_config.yaml
 ├── twinkle/                        # Twinkle Client examples
 │   ├── self_host/                  # Self-hosted Server
 │   │   ├── dpo.py                  # DPO training client
@@ -87,7 +94,7 @@ Running steps:
 
 ```bash
 # 1. Start Server first
-python cookbook/client/server/megatron/server.py
+twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
 
 # 2. Run Client in another terminal (Tinker Client example)
 python cookbook/client/tinker/self_host/self_cognition.py

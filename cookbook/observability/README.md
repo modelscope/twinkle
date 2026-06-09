@@ -25,14 +25,14 @@ pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp
 
 # 3. In your server_config.yaml:
 #
-#    telemetry_config:
+#    telemetry:
 #      enabled: true
 #      debug: false                  # debug=true dumps to console instead of OTLP
 #      service_name: twinkle-server
 #      otlp_endpoint: http://localhost:4317
 
 # 4. Launch Twinkle as usual
-python -m twinkle.server --config server_config.yaml
+twinkle-server launch -c server_config.yaml
 
 # 5. Open Grafana
 open http://localhost:3000
@@ -96,7 +96,7 @@ transfer without changes.
 
 ## Troubleshooting
 
-- **Grafana shows "No data"** — confirm `telemetry_config.enabled: true` in
+- **Grafana shows "No data"** — confirm `telemetry.enabled: true` in
   your server config and that Twinkle's worker logs show
   `Worker telemetry initialized`. With `debug: true` Twinkle dumps spans /
   metrics to logs instead of OTLP, so set `debug: false` once verified.
