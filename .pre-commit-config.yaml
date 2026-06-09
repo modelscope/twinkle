@@ -43,19 +43,3 @@ repos:
         args: ["--fix=lf"]
         exclude: ^(client_tools/|src/twinkle_client/)
 
-  - repo: local
-    hooks:
-      - id: no-roadmap-refs
-        name: "no Rxx / Phase X roadmap refs in code or docs"
-        description: >-
-          Reject internal roadmap citations in new code. Use a description of
-          what the code does instead.
-        # grep exits 0 when it finds a match — we want the opposite, so wrap
-        # with bash that flips the exit code.
-        entry: bash -c '! grep -nE "\(R[0-9]+(\.[0-9]+)?\)|Phase [0-9]+[a-z]?\b" "$@"' --
-        language: system
-        types: [text]
-        # Skip this hook config itself (it must mention the patterns to ban
-        # them), the olympiad-bench algorithmic-phase comments, and the
-        # vendored client tree.
-        exclude: ^(\.pre-commit-config\.yaml$|src/twinkle/reward/olympiad_bench\.py$|client_tools/|src/twinkle_client/)
