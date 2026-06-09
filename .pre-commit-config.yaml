@@ -21,7 +21,7 @@ repos:
     rev: v3.19.1
     hooks:
       - id: pyupgrade
-        args: [--py311-plus]
+        args: [--py38-plus]
         exclude: ^(examples/|cookbook/|client_tools/|src/twinkle_client/)
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
