@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Property + unit tests for the business-layer tracing helper, correlation
-keys, and ``ResourceMetricsCollector`` (R10, R11, R12, R18).
+keys, and ``ResourceMetricsCollector``.
 
 Properties covered:
 - # Feature: server-config-observability-refactor, Property 19: Business-layer span lifecycle
@@ -40,7 +40,7 @@ def test_property_23_helper_constants_complete() -> None:
     assert set(CORRELATION_KEYS) == expected
 
 
-# ---------- Property 22: attachment of present-only values (R11.1, R11.2) - #
+# ---------- Property 22: attachment of present-only values ------------------ #
 
 
 class _RecordingSpan:
@@ -79,7 +79,7 @@ def test_property_22_noop_span_safe() -> None:
     set_correlation_attrs(span, None)
 
 
-# ---------- Property 21: NoOp degradation equivalence (R10.5, R18.3) ------ #
+# ---------- Property 21: NoOp degradation equivalence ---------------------- #
 
 
 def test_property_21_noop_yields_same_result_as_active() -> None:
@@ -247,7 +247,7 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
         assert len(root_handlers) == 1, root_handlers
         assert len(twinkle_handlers) == 1, twinkle_handlers
         assert root_handlers[0] is twinkle_handlers[0], ('root and twinkle should share the same handler instance')
-        # R22: the OTLP handler carries the transport-stack feedback-loop filter.
+        # The OTLP handler carries the transport-stack feedback-loop filter.
         assert any(isinstance(flt, provider._OTLPTransportFilter) for flt in root_handlers[0].filters), \
             'OTLP transport filter not attached to the handler'
     finally:

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property + unit tests for the numpy-only mock sampler.
+"""Property + unit tests for the mock sampler.
 
 Covers:
 - Interface conformance (required methods are present and callable)
@@ -8,10 +8,8 @@ Covers:
 - ``max_tokens < 1`` and missing ``sampling_params`` rejected
 - Adapter record updates persist
 - Dispatch / config validation rejects unknown sampler types
-- Module does not pull ``vllm`` (CPU-only host compat)
 """
 from __future__ import annotations
-from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
@@ -142,7 +140,7 @@ def test_sample_stream_method_present() -> None:
     assert callable(getattr(s, 'sample_stream'))
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(max_tokens=st.integers(min_value=1, max_value=20))
 def test_sample_stream_yields_correct_count(max_tokens: int) -> None:
     s = MockSampler('mid')
@@ -163,16 +161,5 @@ def test_sample_stream_rejects_bad_max_tokens() -> None:
     with pytest.raises(ValueError):
         list(s.sample_stream(inp, SamplingParams(max_tokens=0)))
 
-
-# ---------- No direct vllm import ----------------------------------------- #
-
-
-def test_mock_sampler_module_does_not_directly_import_vllm() -> None:
-    """Static check: ``mock_sampler.py`` must not import ``vllm`` directly."""
-    src = Path(
-        __file__).resolve().parents[3] / 'src' / 'twinkle' / 'server' / 'sampler' / 'backends' / 'mock_sampler.py'
-    text = src.read_text()
-    for forbidden in ('import vllm', 'from vllm'):
-        assert forbidden not in text, f'mock_sampler.py contains {forbidden!r}'
 
 

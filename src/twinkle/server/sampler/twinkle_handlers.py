@@ -2,9 +2,10 @@
 """
 Twinkle-native sampler handler mixin.
 
-Provides /twinkle/* sampler endpoints that call the sampler directly (no queue needed).
+Provides /twinkle/* sampler endpoints.
 """
 from __future__ import annotations
+import asyncio
 import json
 import traceback
 from typing import TYPE_CHECKING
@@ -213,10 +214,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         Each line is a JSON object: {"delta": "text", "finish_reason": null|"stop"|"length"}.
 
-        When ``sample_stream`` is available on the sampler backend (e.g. mock
-        or direct-engine setups), tokens are pushed as they are generated.
-        Otherwise falls back to completing the full sample and emitting the
-        result as streaming chunks.
+        Uses ``ray.util.queue.Queue`` to bridge the sampler's Actor process
+        boundary — the sampler pushes deltas into the queue as they are
+        generated, and this handler yields them to the HTTP response.
         """
         token = await self._on_request_start(request)
 
@@ -237,27 +237,36 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             inputs = inputs[0]
         if isinstance(inputs, dict):
             if 'input_ids' in inputs:
-                inputs_parsed = [InputFeature(**inputs)]
+                inputs_parsed = InputFeature(**inputs)
             else:
-                inputs_parsed = [Trajectory(**inputs)]
+                inputs_parsed = Trajectory(**inputs)
         else:
-            inputs_parsed = [inputs]
+            inputs_parsed = inputs
 
         params = None
         if body.sampling_params:
             params = SamplingParams.from_dict(body.sampling_params)
 
+        from ray.util.queue import Queue
+        q = Queue(maxsize=128)
+        actor = self.sampler._actors[0]
+        actor.sample_stream_to_queue.remote(
+            q, inputs_parsed, params,
+            adapter_name=full_adapter_name, adapter_path=adapter_path,
+        )
+
+        SENTINEL = '__STREAM_END__'
+
         async def _stream_generator():
-            responses = self.sampler.sample(
-                inputs_parsed,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
-            for response in responses:
-                for seq in response.sequences:
-                    decoded = seq.decoded or ''
-                    finish_reason = seq.stop_reason if seq.stop_reason else 'stop'
-                    yield json.dumps({'delta': decoded, 'finish_reason': finish_reason}) + '\n'
+            loop = asyncio.get_event_loop()
+            while True:
+                item = await loop.run_in_executor(None, q.get)
+                if item == SENTINEL:
+                    break
+                if isinstance(item, Exception):
+                    yield json.dumps({'error': str(item)}) + '\n'
+                    break
+                delta, reason = item
+                yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
 
         return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')

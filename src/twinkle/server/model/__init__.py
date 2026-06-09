@@ -2,9 +2,7 @@
 """Model deployment package.
 
 ``build_model_app`` is exposed lazily via ``__getattr__`` so importing the
-mock backend (``twinkle.server.model.backends.mock_model``) on a CPU-only
-host doesn't pull in torch/transformers via ``app.py`` at package-init time
-(R1.2, R4.3).
+package doesn't eagerly pull in ``app.py`` and its transitive dependencies.
 """
 from __future__ import annotations
 

@@ -10,8 +10,7 @@ HTTP methods, and request/response schemas) as a stable JSON dict.
 Used to:
 - snapshot the current surface into ``client_api_baseline.json`` before the
   refactor begins, and
-- assert post-refactor equality after each phase (cross-cutting freeze guard
-  for R20 / R18.1).
+- assert post-refactor equality (cross-cutting freeze guard).
 
 Notes:
 - The handler factories accept ``(app, self_fn)``; we pass a no-op ``self_fn``

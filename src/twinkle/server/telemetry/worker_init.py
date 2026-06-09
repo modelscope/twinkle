@@ -30,7 +30,7 @@ def ensure_telemetry_initialized() -> None:
 
     if not telemetry_enabled:
         # Even with telemetry disabled, register the resource collector so
-        # graceful-degradation behavior matches the enabled path (R12.2/R18.3).
+        # graceful-degradation behavior matches the enabled path.
         _start_resource_collector()
         return
 
@@ -60,7 +60,7 @@ def _start_resource_collector() -> None:
 
     Safe to call even when telemetry init was skipped or failed — the
     collector picks up the NoOp meter and silently records no observations
-    (R12.2 / R18.3).
+    the collector picks up the NoOp meter and silently records nothing.
     """
     try:
         from twinkle.server.telemetry import resource_metrics

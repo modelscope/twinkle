@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Per-deployment ``ApplicationSpec`` and typed argument schemas (R6, R3).
+"""Per-deployment ``ApplicationSpec`` and typed argument schemas.
 
 Each deployment kind (``server | model | sampler | processor``) carries its
 own ``args`` block with strict field validation. ``ApplicationSpec`` holds
@@ -63,7 +63,7 @@ class ModelArgs(_ArgsBase):
 class SamplerArgs(_ArgsBase):
     """Args for the ``sampler`` deployment.
 
-    ``sampler_type`` selects the sampler implementation (R3.4-3.6, R3.10).
+    ``sampler_type`` selects the sampler implementation.
     """
 
     model_id: str

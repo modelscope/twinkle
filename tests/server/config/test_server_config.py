@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property + unit tests for the typed ``ServerConfig`` (R6, R7, R8).
+"""Property + unit tests for the typed ``ServerConfig``.
 
 Properties covered:
 - # Feature: server-config-observability-refactor,
@@ -66,7 +66,7 @@ _VALID_CONFIG = st.fixed_dictionaries({
     'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
 })
 
-# ---------- Property 12: valid → fully validated (R6.2, R7.3) -------------- #
+# ---------- Property 12: valid → fully validated ----------------------------- #
 
 
 @settings(max_examples=100)
@@ -80,7 +80,7 @@ def test_property_12_valid_payload_yields_full_instance(payload: dict) -> None:
     assert cfg.task_queue.rps_limit >= 0
 
 
-# ---------- Property 13: violation → field-named error (R6.3, R7.1, R7.2) -- #
+# ---------- Property 13: violation → field-named error ---------------------- #
 
 
 def test_property_13_redis_mode_missing_url() -> None:
@@ -143,7 +143,7 @@ def test_property_14_round_trip_fidelity(payload: dict) -> None:
     assert re_loaded.model_dump() == cfg.model_dump()
 
 
-# ---------- Property 15: legacy/unknown rejected (R8.1, R8.2) -------------- #
+# ---------- Property 15: legacy/unknown rejected ----------------------------- #
 
 
 @pytest.mark.parametrize(

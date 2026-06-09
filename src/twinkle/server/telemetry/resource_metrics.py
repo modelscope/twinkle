@@ -91,7 +91,7 @@ class ResourceMetricsCollector:
                 pass
 
         # GPU requires pynvml AND at least one GPU device — without either,
-        # we silently skip GPU gauges (R12.3 / R18.3).
+        # we silently skip GPU gauges.
         if _nvml_handle_count() > 0:
             try:
                 meter.create_observable_gauge(

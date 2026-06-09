@@ -26,7 +26,7 @@ DEFAULTS = {
     'max_input_tokens': 16000,
 }
 
-# ---------- Property 16: constraint enforcement (R9.2-9.5, 9.7) ------------ #
+# ---------- Property 16: constraint enforcement ----------------------------- #
 
 _CONSTRAINED_GE0_FLOATS = ['rps_limit', 'tps_limit', 'queue_timeout', 'token_cleanup_interval']
 
@@ -110,6 +110,6 @@ def test_omitted_fields_take_defaults(present: set) -> None:
 
 
 def test_extra_field_rejected() -> None:
-    """``extra='forbid'`` rejects unknown keys (defends R8.2 scoped to this model)."""
+    """``extra='forbid'`` rejects unknown keys."""
     with pytest.raises(ValidationError):
         TaskQueueConfig(unknown_field=1)

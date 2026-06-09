@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Aggregate-root server configuration (R6, R7, R8).
+"""Aggregate-root server configuration.
 
 ``ServerConfig`` is the single Pydantic model that nests every configuration
 subsystem the launcher consumes (telemetry, persistence, task-queue, and the
@@ -10,7 +10,7 @@ no longer reaches into a raw dict.
 Top-level fields use their current names with no aliases for legacy names
 (``telemetry_config``, ``persistence_config``); the model is configured with
 ``extra='forbid'`` so a YAML that uses a legacy field is rejected with the
-offending name pointed at (R8.1, R8.2).
+offending name pointed at.
 """
 from __future__ import annotations
 from pathlib import Path

@@ -47,9 +47,7 @@ def _make_megatron_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMegatronModel(**kw)
 
 
-# Single validate-then-dispatch selector for the model backend. Insertion order
-# defines the reported permitted set; the lazy imports stay local to the
-# callbacks so a CPU-only host never pulls in torch/megatron.
+# Single validate-then-dispatch selector for the model backend.
 MODEL_SELECTOR = BackendSelector(
     'backend',
     {
@@ -85,34 +83,31 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         # never produces a partial backend nor reaches a ready state.
         backend = MODEL_SELECTOR.validate(backend)
         self.backend = backend
-        # Skip twinkle.initialize for the mock backend — the largest
-        # startup-time saving and the only way to start without CUDA/torch.
-        if backend != 'mock':
-            self.device_group = DeviceGroup(**device_group)
-            twinkle.initialize(
-                mode='ray',
-                nproc_per_node=nproc_per_node,
-                groups=[self.device_group],
-                lazy_collect=False,
-            )
+        self.device_group = DeviceGroup(**device_group)
+        if backend == 'mock':
+            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
+                               ncpu_proc_per_node=1, groups=[self.device_group],
+                               lazy_collect=False)
+            self.device_mesh = None
+        else:
+            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
+                               groups=[self.device_group], lazy_collect=False)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
-        else:
-            self.device_group = None
-            self.device_mesh = None
         self.replica_id = serve.get_replica_context().replica_id.unique_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
 
-        ctor_kwargs: dict[str, Any] = {'model_id': model_id, **kwargs}
-        if backend != 'mock':
-            ctor_kwargs.update(
-                device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=self.replica_id,
-            )
+        ctor_kwargs: dict[str, Any] = {
+            'model_id': model_id,
+            'remote_group': self.device_group.name,
+            'instance_id': self.replica_id,
+            **kwargs,
+        }
+        if self.device_mesh is not None:
+            ctor_kwargs['device_mesh'] = self.device_mesh
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
 
         self.state: ServerState = get_server_state()
@@ -128,8 +123,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """Effective data-parallel world size.
 
         Returns the real ``device_mesh.data_world_size`` for distributed
-        backends; falls back to 1 on the ``mock`` backend, which intentionally
-        leaves ``device_mesh = None`` to avoid pulling torch/CUDA.
+        backends; falls back to 1 on the ``mock`` backend where
+        ``device_mesh`` is None.
         """
         return self.device_mesh.data_world_size if self.device_mesh is not None else 1
 
@@ -194,9 +189,9 @@ def build_model_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for tensor parallelism
         deploy_options: Ray Serve deployment options
-        backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``
-            (R3.1-3.3, R3.9). Validated up front; bad values raise
-            :class:`ConfigError` before any side effect.
+        backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``.
+            Validated up front; bad values raise :class:`ConfigError` before
+            any side effect.
         adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration (rate limiting, etc.)
         **kwargs: Additional model initialization arguments

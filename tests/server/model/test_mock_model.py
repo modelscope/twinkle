@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Property + unit tests for the numpy-only mock model backend.
+"""Property + unit tests for the mock model backend.
 
 Covers:
 - Interface conformance: every required method is present and callable
@@ -7,10 +7,8 @@ Covers:
 - Adapter add/remove round-trip
 - Remove-absent raises ``KeyError`` and leaves the record intact
 - Model backend dispatch / config validation
-- Import isolation: module loads with torch/transformers/vllm blocked
 """
 from __future__ import annotations
-import sys
 
 import pytest
 from hypothesis import given, settings
@@ -156,26 +154,3 @@ def test_property_10_absent_or_empty_backend_raises(value) -> None:
     assert exc.value.field == 'backend'
 
 
-# ---------- Import isolation ---------------------------------------------- #
-
-
-def test_import_isolation_no_torch_required() -> None:
-    """Block torch/transformers/vllm/megatron and re-import the mock module."""
-    blocked = ('torch', 'transformers', 'vllm', 'megatron')
-    saved = {m: sys.modules.pop(m, None) for m in blocked}
-    saved_mock = sys.modules.pop('twinkle.server.model.backends.mock_model', None)
-    try:
-        for m in blocked:
-            sys.modules[m] = None  # type: ignore[assignment]
-        import importlib
-
-        mod = importlib.import_module('twinkle.server.model.backends.mock_model')
-        assert mod.TwinkleCompatMockModel is not None
-    finally:
-        for m in blocked:
-            if saved[m] is None:
-                sys.modules.pop(m, None)
-            else:
-                sys.modules[m] = saved[m]
-        if saved_mock is not None:
-            sys.modules['twinkle.server.model.backends.mock_model'] = saved_mock

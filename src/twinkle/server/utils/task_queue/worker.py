@@ -199,11 +199,8 @@ class ComputeWorker:
         exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
-        # R10.2: one span per queued task execution; R10.3: a nested span tagged
-        # `<deployment>.<task_type>` (e.g. `model.forward`, `sampler.sample`) so
-        # the handler's primary op has its own span carrying token/model
-        # correlation. The nested span is started inside the try/except so
-        # span lifecycle stays correctly scoped on timeout / exceptions.
+        # One span per queued task execution, tagged `<deployment>.<task_type>`
+        # (e.g. `model.forward`, `sampler.sample`).
         queue_attrs = {
             TOKEN_ID: task.token,
             MODEL_ID: task.model_id,

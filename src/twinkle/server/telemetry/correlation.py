@@ -32,9 +32,8 @@ CORRELATION_KEYS: tuple[str, ...] = (
 def set_correlation_attrs(span: Any, values: Mapping[str, Any] | None) -> None:
     """Attach the given correlation attributes to ``span``.
 
-    Skips ``None`` values entirely (R11.2: ``when that value is available``)
-    and is a no-op for NoOp spans returned when the OTEL SDK is not
-    installed.
+    Skips ``None`` values and is a no-op for NoOp spans returned when the
+    OTEL SDK is not installed.
     """
     if not values or span is None:
         return

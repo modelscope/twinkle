@@ -2,8 +2,7 @@
 """Sampler deployment package.
 
 ``build_sampler_app`` is exposed lazily via ``__getattr__`` so importing the
-mock backend (``twinkle.server.sampler.backends.mock_sampler``) on a CPU-only
-host doesn't pull in vllm via ``app.py`` at package-init time (R2.2, R4.3).
+package doesn't eagerly pull in ``app.py`` and its transitive dependencies.
 """
 from __future__ import annotations
 

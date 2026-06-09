@@ -1,18 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Numpy-only mock model backend.
+"""Mock model backend.
 
 Provides ``TwinkleCompatMockModel``, a stand-in for the real
 ``TwinkleCompatTransformersModel`` whose only purpose is to exercise the
-server's HTTP and dispatch paths on a CPU-only host with no torch /
-transformers / vllm / megatron installed. Determinism is keyed by
-``(model_id, adapter_name, seed, input_shape)`` so repeated requests with the
-same payload produce identical numpy-derived results.
+server's HTTP and dispatch paths without a real GPU model. Determinism is
+keyed by ``(model_id, adapter_name, seed, input_shape)`` so repeated
+requests with the same payload produce identical numpy-derived results.
 
-This module deliberately avoids importing ``torch``, ``transformers``,
-``vllm``, ``megatron`` or any module whose own imports would pull them
-in transitively (e.g. ``twinkle.server.model.backends.common``). The class is
-duck-typed against ``TwinkleCompatModelBase`` rather than subclassing it —
-the base class lives in a torch-importing module.
+The class is duck-typed against ``TwinkleCompatModelBase`` rather than
+subclassing it — the base class lives in a torch-importing module.
 """
 from __future__ import annotations
 import hashlib
@@ -21,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from twinkle import remote_class
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -40,13 +37,9 @@ def _seed_for(model_id: str, adapter_name: str | None, seed: int, *extra: Any) -
     return int.from_bytes(digest[:4], 'big')
 
 
+@remote_class()
 class TwinkleCompatMockModel:
-    """Numpy-only mock model.
-
-    Public API mirrors the methods that the model FastAPI handlers call on
-    ``self.model``. Every method either returns a deterministic numpy-derived
-    payload or completes as a no-op without raising.
-    """
+    """Deterministic mock model for CPU-only testing."""
 
     def __init__(
         self,
@@ -253,9 +246,7 @@ def _to_tinker_loss_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any
 def _input_seq_lengths(inputs: Any) -> list[int]:
     """Best-effort recovery of per-datum sequence lengths from heterogeneous inputs.
 
-    The real backend pulls lengths from ``Datum.loss_fn_inputs['target_tokens']``,
-    but we want to stay numpy-only and avoid importing the tinker types. Falls
-    back to ``[1]`` so callers always get at least one record back.
+    Falls back to ``[1]`` so callers always get at least one record back.
     """
     if inputs is None:
         return [1]

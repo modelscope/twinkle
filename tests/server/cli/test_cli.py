@@ -17,7 +17,7 @@ from twinkle.server.config import ServerConfig
 EXAMPLE = MOCK_SERVER_CONFIG
 MOCK_CFG = MOCK_SERVER_CONFIG
 
-# ---------- 9.5 CLI subcommand existence + exit codes (R14.3, R14.4) ------ #
+# ---------- CLI subcommand existence + exit codes ----------------------- #
 
 
 def test_subcommands_present() -> None:

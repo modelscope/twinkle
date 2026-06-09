@@ -422,7 +422,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         elif isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
-        feat = inputs if isinstance(inputs, dict) else inputs
+        feat = inputs
         is_trajectory = 'input_ids' not in feat
         if is_trajectory:
             feat = self.encode_trajectory_for_vllm(feat, adapter_name)
@@ -432,8 +432,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
             lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
 
-        template = getattr(self, 'template', None)
-        prompt = template.get_vllm_input_ids(feat['input_ids']) if template else feat['input_ids']
+        prompt = self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids']
 
         yield from self._iter_in_loop(
             self.engine.generate_stream(
@@ -442,6 +441,19 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 lora_request=lora_request,
             )
         )
+
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None,
+                               adapter_name='', adapter_path=None):
+        """Push streaming deltas to a cross-process Ray queue."""
+        SENTINEL = '__STREAM_END__'
+        try:
+            for delta, reason in self.sample_stream(inputs, sampling_params,
+                                                     adapter_name, adapter_path):
+                queue.put((delta, reason))
+        except Exception as e:
+            queue.put(e)
+        finally:
+            queue.put(SENTINEL)
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:

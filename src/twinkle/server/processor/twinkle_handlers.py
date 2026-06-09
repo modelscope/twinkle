@@ -80,7 +80,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             return getattr(processor_module, class_type)(
                 remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
 
-        # R10.3: span the primary processor.create op with token + session correlation.
+        # Span the primary processor.create op with token + session correlation.
         with traced_operation(
                 f'processor.create.{processor_type_name}.{class_type}',
                 attrs={
@@ -127,7 +127,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             except StopIteration:
                 return True, None
 
-        # R10.3: span the primary processor.call op so each invocation is observable.
+        # Span the primary processor.call op so each invocation is observable.
         with traced_operation(
                 f'processor.call.{function_name}',
                 attrs={TOKEN_ID: get_token_from_request(request)}):

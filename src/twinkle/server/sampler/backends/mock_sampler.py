@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Numpy-only mock sampler backend.
+"""Mock sampler backend.
 
 Implements the same surface as :class:`twinkle.sampler.base.Sampler` —
 ``sample``, ``apply_patch``, ``add_adapter_to_sampler`` — using only numpy.
-The class is intentionally **duck-typed** rather than subclassed because
-``twinkle.sampler.__init__`` eagerly imports the vLLM engine, which would
-pull torch/CUDA on a CPU-only host.
+The class is duck-typed rather than subclassed to keep the module
+self-contained.
 
 Outputs are deterministic — keyed by ``(model_id, adapter_name, seed,
 prompt_index, sample_index)`` — so repeated calls with the same parameters
@@ -13,11 +12,12 @@ produce identical token sequences and logprobs.
 """
 from __future__ import annotations
 import hashlib
-from typing import Any, List, Optional
+import time
+from typing import Any
 
 import numpy as np
 
-# These data containers don't pull torch / vllm.
+from twinkle import remote_class
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.utils.logger import get_logger
 
@@ -37,12 +37,9 @@ def _stable_seed(*parts: Any) -> int:
     return int.from_bytes(digest[:4], 'big')
 
 
+@remote_class()
 class MockSampler:
-    """Deterministic numpy-only sampler.
-
-    Provides the public methods callable from the sampler app and the Tinker /
-    Twinkle handlers; ``has_adapter`` is added for convenience and tests.
-    """
+    """Deterministic mock sampler for CPU-only testing."""
 
     def __init__(self, model_id: str, *, seed: int = 0, vocab_size: int = 32, **kwargs: Any) -> None:
         self.model_id = model_id
@@ -119,7 +116,21 @@ class MockSampler:
 
         for i, tok in enumerate(tokens):
             is_last = i == len(tokens) - 1
+            time.sleep(0.05)
             yield str(tok), ('length' if is_last else None)
+
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None,
+                               adapter_name='', adapter_path=None):
+        """Push streaming deltas to a cross-process Ray queue."""
+        SENTINEL = '__STREAM_END__'
+        try:
+            for delta, reason in self.sample_stream(inputs, sampling_params,
+                                                     adapter_name, adapter_path):
+                queue.put((delta, reason))
+        except Exception as e:
+            queue.put(e)
+        finally:
+            queue.put(SENTINEL)
 
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None

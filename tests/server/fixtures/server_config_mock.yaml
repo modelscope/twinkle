@@ -47,9 +47,9 @@ applications:
       device_group:
         name: model
         ranks: 1
-        device_type: cpu
+        device_type: CPU
       device_mesh:
-        device_type: cpu
+        device_type: CPU
         dp_size: 1
       queue_config:
         rps_limit: 100
@@ -73,9 +73,9 @@ applications:
       device_group:
         name: sampler
         ranks: 1
-        device_type: cpu
+        device_type: CPU
       device_mesh:
-        device_type: cpu
+        device_type: CPU
         dp_size: 1
       queue_config:
         rps_limit: 100

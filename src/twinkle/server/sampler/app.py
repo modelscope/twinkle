@@ -29,9 +29,6 @@ logger = get_logger()
 def _make_mock_sampler(kw: dict[str, Any]) -> Any:
     from .backends.mock_sampler import MockSampler
 
-    # Forward ctor kwargs verbatim; MockSampler keeps model_id/seed/vocab_size
-    # and logs any unknown keys at DEBUG (so a real-backend signature drift is
-    # visible in the mock e2e instead of being silently stripped here).
     return MockSampler(**kw)
 
 
@@ -47,9 +44,7 @@ def _make_torch_sampler(kw: dict[str, Any]) -> Any:
     return TorchSampler(**kw)
 
 
-# Single validate-then-dispatch selector for the sampler backend. Insertion
-# order defines the reported permitted set; lazy imports stay local to the
-# callbacks so a CPU-only host never pulls in vllm/torch.
+# Single validate-then-dispatch selector for the sampler backend.
 SAMPLER_SELECTOR = BackendSelector(
     'sampler_type',
     {
@@ -81,44 +76,36 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                  **kwargs):
         # Validate ``sampler_type`` BEFORE any side effect.
         sampler_type = SAMPLER_SELECTOR.validate(sampler_type)
-        # Skip twinkle.initialize for the mock backend — start without
-        # CUDA/torch/vllm.
-        if sampler_type != 'mock':
-            self.device_group = DeviceGroup(**device_group)
-            twinkle.initialize(
-                mode='ray',
-                nproc_per_node=nproc_per_node,
-                groups=[self.device_group],
-                lazy_collect=False,
-            )
+        self.device_group = DeviceGroup(**device_group)
+        if sampler_type == 'mock':
+            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
+                               ncpu_proc_per_node=1, groups=[self.device_group],
+                               lazy_collect=False)
+            self.device_mesh = None
+        else:
+            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
+                               groups=[self.device_group], lazy_collect=False)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:
                 self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
-        else:
-            self.device_group = None
-            self.device_mesh = None
         self.sampler_type = sampler_type
         self.model_id = model_id
         replica_context = serve.get_replica_context()
         replica_id = replica_context.replica_id.unique_id
 
-        sampler_kwargs: dict[str, Any] = {'model_id': model_id}
+        sampler_kwargs: dict[str, Any] = {
+            'model_id': model_id,
+            'remote_group': self.device_group.name,
+            'instance_id': replica_id,
+        }
         if sampler_type != 'mock':
             sampler_kwargs.update(
                 engine_args=engine_args or {},
                 device_mesh=self.device_mesh,
-                remote_group=self.device_group.name,
-                instance_id=replica_id,
-                **{
-                    k: v
-                    for k, v in kwargs.items() if k not in ('engine_args', )
-                },
+                **{k: v for k, v in kwargs.items() if k not in ('engine_args',)},
             )
         else:
-            # Forward extra ctor kwargs verbatim to the mock backend so a real-
-            # backend signature drift surfaces as a visible DEBUG log there
-            # instead of being silently stripped at the dispatch boundary.
             sampler_kwargs.update(kwargs)
         self.sampler = SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
 
@@ -162,9 +149,9 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``torch`` (R3.4-3.6,
-            R3.10). Validated up front; bad values raise :class:`ConfigError`
-            before any side effect.
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``torch``.
+            Validated up front; bad values raise :class:`ConfigError` before
+            any side effect.
         engine_args: Additional engine arguments for the sampler
         queue_config: Validated :class:`TaskQueueConfig` (rps_limit, tps_limit, etc.)
         **kwargs: Additional arguments passed to the sampler
