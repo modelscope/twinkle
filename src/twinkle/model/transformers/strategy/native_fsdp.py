@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
-
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
 from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
 from twinkle.utils.torch_utils import clone_state_dict_to_cpu

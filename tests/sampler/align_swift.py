@@ -17,7 +17,6 @@ Run Ray test alone: python align_swift.py --ray
 
 import gc
 import os
-
 import torch
 from swift.infer_engine import RequestConfig, TransformersEngine, VllmEngine
 from swift.utils import seed_everything
@@ -178,7 +177,6 @@ def test_llm_vllm_sampler_ray():
     Run alone: python align_swift.py --ray  (requires 6 GPUs).
     """
     import time
-
     from peft import LoraConfig
 
     from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger

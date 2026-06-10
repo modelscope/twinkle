@@ -7,6 +7,7 @@ Having both sides of the mapping in the dumped JSON means the trace
 alone is enough to audit compression quality.
 """
 from __future__ import annotations
+
 from typing import Any, Dict, List
 
 from twinkle_agentic.data_format import Chunks

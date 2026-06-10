@@ -9,9 +9,8 @@ Test dataset loading:
 6. Load MS dataset (iterable mode)
 """
 import os
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
 

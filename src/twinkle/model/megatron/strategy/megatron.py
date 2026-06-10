@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Dict, List, Literal, Optional
-
 import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
+from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
 from twinkle.utils import get_logger

@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import List, Union
-
 import numpy as np
+from typing import List, Union
 
 from ..data_format import InputFeature, ModelOutput
 from .base import Metric

@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import importlib
 from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 

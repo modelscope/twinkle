@@ -18,12 +18,12 @@ fake Template that replays the real ``concat_input_feature`` and post
 pipeline semantics, and a fake Sampler that queues scripted responses.
 """
 from __future__ import annotations
+
 import copy
 import json
+import pytest
 import re
 from typing import Any, Dict, List, Optional
-
-import pytest
 
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout

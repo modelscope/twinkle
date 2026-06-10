@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
-from pathlib import Path
-
 import numpy as np
+import os
 import pytest
+from pathlib import Path
 from PIL import Image
 
 import twinkle

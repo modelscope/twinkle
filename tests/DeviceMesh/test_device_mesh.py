@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
-from unittest.mock import patch
-
 import numpy as np
+import os
 import pytest
+from unittest.mock import patch
 
 import twinkle
 from twinkle import DeviceMesh, Platform

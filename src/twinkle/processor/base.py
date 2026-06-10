@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
-
 import numpy as np
 import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature

@@ -1,10 +1,9 @@
-import warnings
-from typing import Any, Optional, Tuple
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import warnings
 from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
+from typing import Any, Optional, Tuple
 
 from twinkle.model.transformers.strategy.sequence_parallel.utils import (
     get_packed_cu_seqlens_from_sequence_parallel_context, head_to_seq_shard, seq_to_head_shard)

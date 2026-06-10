@@ -5,10 +5,9 @@ import importlib.util
 import os
 from functools import lru_cache
 from itertools import chain
+from packaging.requirements import Requirement
 from types import ModuleType
 from typing import Any
-
-from packaging.requirements import Requirement
 
 
 @lru_cache

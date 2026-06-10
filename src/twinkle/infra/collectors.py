@@ -1,6 +1,5 @@
-from typing import Any, Dict, List
-
 import numpy as np
+from typing import Any, Dict, List
 
 from twinkle import DeviceMesh
 from twinkle.utils import pad_and_stack_tensors

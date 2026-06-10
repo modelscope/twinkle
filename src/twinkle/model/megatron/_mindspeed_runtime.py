@@ -8,9 +8,8 @@ This module deliberately keeps two phases separate:
 
 import argparse
 import json
-from typing import Any, Dict
-
 import torch
+from typing import Any, Dict
 
 from twinkle import Platform
 from twinkle.utils import get_logger
