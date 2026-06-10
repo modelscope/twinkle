@@ -2,8 +2,8 @@
 """Utilities for configuring ZeroMQ sockets consistently."""
 
 from __future__ import annotations
-import os
 
+import os
 import zmq
 
 

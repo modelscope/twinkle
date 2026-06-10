@@ -3,7 +3,6 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-
 from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
@@ -27,19 +26,26 @@ async def verify_request_token(request: Request, call_next):
     Returns:
         JSONResponse with error if validation fails, otherwise the response from call_next
     """
-    authorization = (request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH))
+    authorization = (
+        request.headers.get(H_AUTH_TWINKLE)
+        or request.headers.get(H_AUTH)
+    )
     token = authorization[7:] if authorization and authorization.startswith('Bearer ') else authorization
     if not is_token_valid(token):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
     path = request.url.path
-    skip_sticky = (path.endswith('/healthz') or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES))
+    skip_sticky = (
+        path.endswith('/healthz')
+        or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES)
+    )
 
     if not skip_sticky:
         request_id = request.headers.get(H_REQUEST_ID)
         if not request_id:
             return JSONResponse(
-                status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header, required for sticky session'})
+                status_code=400,
+                content={'detail': f'Missing {H_REQUEST_ID} header, required for sticky session'})
         request.state.request_id = request_id
     else:
         request.state.request_id = request.headers.get(H_REQUEST_ID, '')

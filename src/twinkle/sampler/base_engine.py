@@ -6,10 +6,9 @@ This module defines the interface that all sampler engines must implement.
 Engines are the low-level components that handle token-based inference.
 """
 
+import torch
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
-
-import torch
 
 from twinkle.data_format import SampleResponse, SamplingParams
 

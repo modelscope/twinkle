@@ -2,23 +2,22 @@
 import asyncio
 import json
 import logging
+import numpy as np
 import os
 import random
 import re
 import threading
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
-
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from contextlib import contextmanager
+from dataclasses import dataclass
 from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedConfig
+from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
 import twinkle.metric
@@ -279,7 +278,6 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._lazy_wrap_model()
         self._lazy_finish_param_config()
         from functools import partial
-
         from megatron.core import parallel_state as mpu
         from megatron.core.pipeline_parallel import get_forward_backward_func
 

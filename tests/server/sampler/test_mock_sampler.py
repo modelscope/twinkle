@@ -160,3 +160,6 @@ def test_sample_stream_rejects_bad_max_tokens() -> None:
     inp = InputFeature(input_ids=[1])
     with pytest.raises(ValueError):
         list(s.sample_stream(inp, SamplingParams(max_tokens=0)))
+
+
+

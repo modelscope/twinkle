@@ -53,7 +53,6 @@ def mock_gateway():
 
 
 class TestChatCompletions:
-
     def _make_sample_response(self, text='Hello!', stop_reason='stop'):
         """Build a mock Response matching what proxy_request returns."""
         from fastapi import Response
@@ -77,10 +76,7 @@ class TestChatCompletions:
             '/chat/completions',
             json={
                 'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hello'}],
                 'max_tokens': 20,
             },
             headers={'Authorization': 'Bearer test-key'},
@@ -101,10 +97,7 @@ class TestChatCompletions:
         client = TestClient(app)
         resp = client.post(
             '/chat/completions',
-            json={'messages': [{
-                'role': 'user',
-                'content': 'Hello'
-            }]},
+            json={'messages': [{'role': 'user', 'content': 'Hello'}]},
             headers={'Authorization': 'Bearer test-key'},
         )
         assert resp.status_code == 400
@@ -130,10 +123,7 @@ class TestChatCompletions:
             '/chat/completions',
             json={
                 'model': 'nonexistent-model',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hello'}],
             },
             headers={'Authorization': 'Bearer test-key'},
         )
@@ -149,10 +139,7 @@ class TestChatCompletions:
             '/chat/completions',
             json={
                 'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hello'}],
             },
             headers={'Authorization': 'Bearer my-key'},
         )
@@ -174,10 +161,7 @@ class TestChatCompletions:
             '/chat/completions',
             json={
                 'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hello'}],
                 'temperature': 0.5,
             },
             headers={'Authorization': 'Bearer key'},
@@ -201,10 +185,7 @@ class TestChatCompletions:
             '/chat/completions',
             json={
                 'model': 'my-fine-tuned-adapter',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hello'}],
             },
             headers={'Authorization': 'Bearer key'},
         )
@@ -219,7 +200,6 @@ class TestChatCompletions:
 
 
 class TestChatCompletionsStreaming:
-
     def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway):
         mock_self, app = mock_gateway
 
@@ -234,10 +214,7 @@ class TestChatCompletionsStreaming:
             '/chat/completions',
             json={
                 'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hi'
-                }],
+                'messages': [{'role': 'user', 'content': 'Hi'}],
                 'stream': True,
             },
             headers={'Authorization': 'Bearer key'},
@@ -246,7 +223,7 @@ class TestChatCompletionsStreaming:
         assert resp.headers['content-type'].startswith('text/event-stream')
 
         # Parse SSE events
-        lines = [line for line in resp.text.split('\n') if line.startswith('data: ')]
+        lines = [l for l in resp.text.split('\n') if l.startswith('data: ')]
         assert len(lines) == 3  # 2 chunks + [DONE]
         assert lines[-1] == 'data: [DONE]'
 
@@ -266,7 +243,6 @@ class TestChatCompletionsStreaming:
 
 
 class TestListModels:
-
     def test_list_models(self, mock_gateway):
         _, app = mock_gateway
         client = TestClient(app)
@@ -277,3 +253,5 @@ class TestListModels:
         assert len(data['data']) == 1
         assert data['data'][0]['id'] == 'Qwen/Qwen3.5-4B'
         assert data['data'][0]['object'] == 'model'
+
+

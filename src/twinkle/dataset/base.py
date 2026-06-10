@@ -2,10 +2,9 @@
 import os.path
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Type, Union
-
 from datasets import DatasetDict, IterableDataset, concatenate_datasets, interleave_datasets, load_dataset
 from torch.utils.data import Dataset as TorchDataset
+from typing import Any, Callable, Dict, Type, Union
 
 import twinkle
 from twinkle import preprocessor

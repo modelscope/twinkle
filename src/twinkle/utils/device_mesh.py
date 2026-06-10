@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import numpy as np
 import os
 from dataclasses import dataclass, field
 from itertools import product
 from typing import Dict, List, Optional, Union
-
-import numpy as np
 
 from .platforms import Platform
 

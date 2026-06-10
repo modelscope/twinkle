@@ -11,8 +11,8 @@ import asyncio
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Coroutine
 
 from twinkle.server.telemetry.middleware import get_task_metrics
 from twinkle.utils.logger import get_logger

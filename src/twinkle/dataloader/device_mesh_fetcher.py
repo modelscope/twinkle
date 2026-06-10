@@ -1,8 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Callable
-
 from torch.utils.data import Dataset
 from torch.utils.data._utils.fetch import _BaseDatasetFetcher
+from typing import Any, Callable
 
 from twinkle import DeviceMesh
 

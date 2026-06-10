@@ -235,12 +235,10 @@ def _to_tinker_loss_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any
         elementwise_loss = rec['elementwise_loss']
         loss = float(rec['loss'])
         out.append({
-            'logprobs':
-            TensorData(data=list(logprobs), dtype='float32', shape=[len(logprobs)]),
-            'elementwise_loss':
-            TensorData(data=list(elementwise_loss), dtype='float32', shape=[len(elementwise_loss)]),
-            'loss':
-            TensorData(data=[loss], dtype='float32', shape=[]),
+            'logprobs': TensorData(data=list(logprobs), dtype='float32', shape=[len(logprobs)]),
+            'elementwise_loss': TensorData(data=list(elementwise_loss), dtype='float32',
+                                           shape=[len(elementwise_loss)]),
+            'loss': TensorData(data=[loss], dtype='float32', shape=[]),
         })
     return out
 

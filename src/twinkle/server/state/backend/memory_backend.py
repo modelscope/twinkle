@@ -1,8 +1,8 @@
 from __future__ import annotations
 import time
-from collections.abc import Callable
 from fnmatch import fnmatch
 from typing import Any
+from collections.abc import Callable
 
 import ray
 

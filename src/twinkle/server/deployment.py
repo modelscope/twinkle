@@ -24,15 +24,15 @@ metrics — reproduces the per-builder execution order exactly
 the outermost layer wrapping tracing.
 """
 from __future__ import annotations
-from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
+from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request
 from ray import serve
 
-from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
+from twinkle.server.telemetry.middleware import create_metrics_middleware
 from twinkle.server.utils.validation import verify_request_token
 from twinkle.utils.logger import get_logger
 
@@ -138,14 +138,14 @@ def build_deployment_app(
 
 
 def bind_deployment(
-        app: FastAPI,
-        servable_cls: type,
-        deploy_options: dict[str, Any],
-        *,
-        deployment_name: str,
-        request_router_config: Any | None = None,
-        bind_args: tuple = (),
-        bind_kwargs: dict[str, Any] | None = None,
+    app: FastAPI,
+    servable_cls: type,
+    deploy_options: dict[str, Any],
+    *,
+    deployment_name: str,
+    request_router_config: Any | None = None,
+    bind_args: tuple = (),
+    bind_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     """Run ``serve.ingress(app)(cls)`` → ``serve.deployment(...)`` → ``.options().bind()``.
 

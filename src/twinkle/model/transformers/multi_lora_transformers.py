@@ -1,13 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
-
 import torch.distributed as dist
 import transformers
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
+from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 
 from twinkle import DeviceMesh, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory

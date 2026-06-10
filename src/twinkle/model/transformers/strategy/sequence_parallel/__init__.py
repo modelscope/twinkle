@@ -1,14 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import torch
+import torch.distributed as dist
 from copy import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
+from transformers import PreTrainedTokenizer
 from types import MethodType, SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
-
-import torch
-import torch.distributed as dist
-from transformers import PreTrainedTokenizer
 
 from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh

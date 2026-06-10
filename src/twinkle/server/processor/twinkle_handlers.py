@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import uuid
-from collections.abc import Callable
 from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
@@ -82,7 +82,8 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
 
         # Span the primary processor.create op with token + session correlation.
         with traced_operation(
-                f'processor.create.{processor_type_name}.{class_type}', attrs={
+                f'processor.create.{processor_type_name}.{class_type}',
+                attrs={
                     TOKEN_ID: token,
                     SESSION_ID: session_id,
                 }):
@@ -127,7 +128,9 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
                 return True, None
 
         # Span the primary processor.call op so each invocation is observable.
-        with traced_operation(f'processor.call.{function_name}', attrs={TOKEN_ID: get_token_from_request(request)}):
+        with traced_operation(
+                f'processor.call.{function_name}',
+                attrs={TOKEN_ID: get_token_from_request(request)}):
             is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
 
         if function_name == '__next__':

@@ -5,9 +5,8 @@ Test dataset mixing:
 2. mix_dataset - interleave mode
 3. mix_dataset - concat mode
 """
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 from twinkle.dataset import Dataset, DatasetMeta, IterableDataset
 

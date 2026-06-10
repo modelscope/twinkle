@@ -152,3 +152,5 @@ def test_property_10_absent_or_empty_backend_raises(value) -> None:
     with pytest.raises(ConfigError) as exc:
         MODEL_SELECTOR.validate(value)
     assert exc.value.field == 'backend'
+
+

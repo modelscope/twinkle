@@ -7,8 +7,8 @@ Provides POST /tinker/asample using schedule_task() returning UntypedAPIFuture.
 from __future__ import annotations
 import os
 import traceback
-from collections.abc import Callable
 from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 from fastapi import Depends, FastAPI, Request
 from tinker import types
@@ -102,7 +102,9 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         logprobs = None
                         if seq.logprobs is not None:
                             try:
-                                flattened = [float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list]
+                                flattened = [
+                                    float(lp_list[0][1]) for lp_list in seq.logprobs if lp_list
+                                ]
                             except (IndexError, TypeError):
                                 flattened = []
                             if flattened and len(flattened) == len(seq.logprobs):

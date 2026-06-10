@@ -10,8 +10,8 @@ and the per-value construction callbacks. The callbacks stay defined in
 torch/vllm/megatron.
 """
 from __future__ import annotations
-from collections.abc import Callable
 from typing import Any
+from collections.abc import Callable
 
 from twinkle.server.exceptions import ConfigError
 

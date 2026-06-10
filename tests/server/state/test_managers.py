@@ -473,7 +473,7 @@ class TestCascadeCleanup:
             return records
 
         with mock.patch.object(session_mgr, 'get_all', side_effect=get_all_then_touch):
-            await state.cleanup_expired_resources()
+            stats = await state.cleanup_expired_resources()
 
         session_alive = await state.get_session_last_heartbeat('s-race') is not None
         model_alive = await state.get_model_metadata('m-race') is not None

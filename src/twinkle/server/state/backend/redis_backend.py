@@ -2,8 +2,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import Callable
 from typing import Any
+from collections.abc import Callable
 
 from .base import ConcurrencyError, StateBackend
 

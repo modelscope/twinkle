@@ -21,12 +21,11 @@ Data Flow:
 """
 import asyncio
 import atexit
+import numpy as np
 import os
 import threading
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
-
-import numpy as np
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
@@ -440,13 +439,16 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                 prompt=prompt,
                 sampling_params=sampling_params,
                 lora_request=lora_request,
-            ))
+            )
+        )
 
-    def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None,
+                               adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
         SENTINEL = '__STREAM_END__'
         try:
-            for delta, reason in self.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
+            for delta, reason in self.sample_stream(inputs, sampling_params,
+                                                     adapter_name, adapter_path):
                 queue.put((delta, reason))
         except Exception as e:
             queue.put(e)

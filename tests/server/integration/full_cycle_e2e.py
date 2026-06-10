@@ -58,17 +58,17 @@ import dotenv
 
 dotenv.load_dotenv('.env')
 
-import os  # noqa: E402
-import sys  # noqa: E402
-import time  # noqa: E402
+import os
+import sys
+import time
 
-from peft import LoraConfig  # noqa: E402
+from peft import LoraConfig
 
-from twinkle import get_logger, init_twinkle_client  # noqa: E402
-from twinkle.dataloader import DataLoader  # noqa: E402
-from twinkle.dataset import Dataset, DatasetMeta  # noqa: E402
-from twinkle_client.model import MultiLoraTransformersModel  # noqa: E402
-from twinkle_client.sampler import vLLMSampler  # noqa: E402
+from twinkle import get_logger, init_twinkle_client
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle_client.model import MultiLoraTransformersModel
+from twinkle_client.sampler import vLLMSampler
 
 logger = get_logger()
 
@@ -148,11 +148,10 @@ def _record_fixed_batch_loss(model, batch, *, label: str) -> float:
 # Greedy (temperature=0) makes any divergence purely a LoRA effect, not
 # sampling noise.
 PROBE_PROMPTS = [
-    'What is your name?',  # weak-prior — should diverge after non-trivial training
+    'What is your name?',                       # weak-prior — should diverge after non-trivial training
     'Who are you? Reply in one short sentence.',  # strong-prior — typically does NOT diverge
-    '你是谁？请用一句话回答。',  # strong-prior — typically does NOT diverge
+    '你是谁？请用一句话回答。',                  # strong-prior — typically does NOT diverge
 ]
-
 
 def _greedy_sample(sampler: vLLMSampler, prompt: str, *, adapter_uri: str | None) -> list[int]:
     """Greedy-sample one prompt and return raw token ids.
@@ -162,30 +161,19 @@ def _greedy_sample(sampler: vLLMSampler, prompt: str, *, adapter_uri: str | None
     """
     trajectory = {
         'messages': [
-            {
-                'role': 'system',
-                'content': 'You are a helpful assistant.'
-            },
-            {
-                'role': 'user',
-                'content': prompt
-            },
+            {'role': 'system', 'content': 'You are a helpful assistant.'},
+            {'role': 'user', 'content': prompt},
         ],
     }
     responses = sampler.sample(
         inputs=[trajectory],
-        sampling_params={
-            'max_tokens': SAMPLE_MAX_TOKENS,
-            'temperature': 0.0,
-            'num_samples': 1
-        },
+        sampling_params={'max_tokens': SAMPLE_MAX_TOKENS, 'temperature': 0.0, 'num_samples': 1},
         adapter_uri=adapter_uri,
     )
     assert responses and responses[0].sequences, f'sampler returned empty response for {prompt!r}'
     tokens = list(responses[0].sequences[0].tokens)
     assert tokens, f'sampler returned zero tokens for {prompt!r}'
     return tokens
-
 
 def _first_divergence(a: list[int], b: list[int]) -> int | None:
     """Return index of first differing token, or None if a is a prefix of b (or vice versa)."""
@@ -263,8 +251,7 @@ def main() -> int:
     dataloader_d = _build_dataset_loader()
     progress = model_d.resume_from_checkpoint(ckpt_b)
     logger.info(f'Phase D progress after resume: {progress}')
-    resume_start = int(progress.get('cur_step', STEPS_PHASE_A
-                                    + STEPS_PHASE_B)) if isinstance(progress, dict) else STEPS_PHASE_A + STEPS_PHASE_B
+    resume_start = int(progress.get('cur_step', STEPS_PHASE_A + STEPS_PHASE_B)) if isinstance(progress, dict) else STEPS_PHASE_A + STEPS_PHASE_B
     losses_d = _train_n_steps(model_d, dataloader_d, STEPS_PHASE_D, label='D', start_step=resume_start)
     last_b_loss = losses_b[-1][1] if losses_b else float('inf')
     for step_d, loss_d in losses_d:
@@ -281,7 +268,8 @@ def main() -> int:
     # adapter — otherwise vLLM has silently fallen back to the base model
     # (e.g. PEFT-format / target_modules mismatch in vllm's LoRA loader).
     logger.info('=' * 60)
-    logger.info('Phase E + F: greedy probe across %d prompts (base vs adapter_uri=%s)', len(PROBE_PROMPTS), ckpt_b)
+    logger.info('Phase E + F: greedy probe across %d prompts (base vs adapter_uri=%s)',
+                len(PROBE_PROMPTS), ckpt_b)
     logger.info('=' * 60)
     sampler = vLLMSampler(model_id=BASE_MODEL)
     sampler.set_template('Qwen3_5Template', model_id=BASE_MODEL)
@@ -298,10 +286,11 @@ def main() -> int:
         logger.info(f'    F (adapter): {f_tokens[:8]}{"..." if len(f_tokens) > 8 else ""}')
 
     n_diverged = sum(1 for *_, div in probe_results if div is not None)
-    assert n_diverged >= 1, (f'Phase F FAILED: vLLM LoRA had no observable effect on any of '
-                             f'{len(PROBE_PROMPTS)} probe prompts under greedy decoding — '
-                             f'either the adapter was not applied or training was too short '
-                             f'(needs ||B@A|| > ~0.1; check LoRA magnitude in adapter_model.safetensors).')
+    assert n_diverged >= 1, (
+        f'Phase F FAILED: vLLM LoRA had no observable effect on any of '
+        f'{len(PROBE_PROMPTS)} probe prompts under greedy decoding — '
+        f'either the adapter was not applied or training was too short '
+        f'(needs ||B@A|| > ~0.1; check LoRA magnitude in adapter_model.safetensors).')
     logger.info(f'Phase F OK: vLLM LoRA observably applied on {n_diverged}/{len(PROBE_PROMPTS)} prompts')
 
     # ---------------------------------------------------------------------
@@ -312,8 +301,8 @@ def main() -> int:
     logger.info('=' * 60)
     logger.info('  Phase A losses (%d steps): %s', len(losses_a), [f'{l:.3f}' for _, l in losses_a])
     logger.info('  Phase B losses (%d steps): %s', len(losses_b), [f'{l:.3f}' for _, l in losses_b])
-    logger.info('  Phase C reload: |%.4f - %.4f| / %.4f = %.4f (tol %.2f)', loss_c_fixed, loss_a_fixed, loss_a_fixed,
-                delta, RELOAD_LOSS_TOLERANCE)
+    logger.info('  Phase C reload: |%.4f - %.4f| / %.4f = %.4f (tol %.2f)',
+                loss_c_fixed, loss_a_fixed, loss_a_fixed, delta, RELOAD_LOSS_TOLERANCE)
     logger.info('  Phase D resume losses (%d steps): %s', len(losses_d), [f'{l:.3f}' for _, l in losses_d])
     logger.info('  Phase F LoRA-effect probes (%d/%d diverged):', n_diverged, len(PROBE_PROMPTS))
     for prompt, _, _, div in probe_results:

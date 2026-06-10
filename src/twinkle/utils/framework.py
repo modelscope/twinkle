@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib
+import numpy as np
 import os
 import random
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Union
-
-import numpy as np
 
 from .device_mesh import DeviceMesh, Platform
 

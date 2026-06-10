@@ -8,9 +8,8 @@ Test Preprocessor functionality:
 5. Dataset.map change tests (auto-filter None, batched=False)
 """
 import os
-from pathlib import Path
-
 import pytest
+from pathlib import Path
 
 from twinkle.data_format import Message, Trajectory
 from twinkle.dataset import Dataset, DatasetMeta

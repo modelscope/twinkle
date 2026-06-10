@@ -13,9 +13,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-
 from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from fastapi.responses import JSONResponse, StreamingResponse
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -34,8 +33,8 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 
     @app.post('/chat/completions')
     async def chat_completions(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ):
         """OpenAI-compatible chat completions endpoint.
 
@@ -120,12 +119,12 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 is_first = True
                 try:
                     async for line in self.proxy.proxy_request_stream(
-                            request,
-                            endpoint='twinkle/sample_stream',
-                            base_model=base_model,
-                            service_type='sampler',
-                            body_override=body_bytes,
-                            extra_headers=sticky_headers,
+                        request,
+                        endpoint='twinkle/sample_stream',
+                        base_model=base_model,
+                        service_type='sampler',
+                        body_override=body_bytes,
+                        extra_headers=sticky_headers,
                     ):
                         chunk_data = json.loads(line)
                         delta_text = chunk_data.get('delta', '')
@@ -154,16 +153,13 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             return StreamingResponse(
                 _sse_generator(),
                 media_type='text/event-stream',
-                headers={
-                    'Cache-Control': 'no-cache',
-                    'X-Accel-Buffering': 'no'
-                },
+                headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
             )
 
     @app.get('/models')
     async def list_models(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ):
         """OpenAI-compatible model listing endpoint."""
         models = []
@@ -208,7 +204,11 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
 
 def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
     """Build the headers needed for sticky session routing."""
-    auth = (request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH) or '')
+    auth = (
+        request.headers.get(H_AUTH_TWINKLE)
+        or request.headers.get(H_AUTH)
+        or ''
+    )
     return build_routing_headers(sticky_key, auth)
 
 

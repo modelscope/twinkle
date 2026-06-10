@@ -5,10 +5,10 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Callable
 from contextlib import contextmanager
 from fnmatch import fnmatch
 from typing import Any
+from collections.abc import Callable
 
 from .base import StateBackend
 

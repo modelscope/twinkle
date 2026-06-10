@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
+import numpy as np
 import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional
-
-import numpy as np
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampleResponse, SamplingParams

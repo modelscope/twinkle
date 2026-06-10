@@ -11,9 +11,8 @@ with tool calling, thinking mode, and quick instruction task support.
 
 import copy
 import json
-from typing import Any, Dict, List, Optional, Tuple, Union
-
 import regex as re
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 bos_token: str = '<｜begin▁of▁sentence｜>'
 eos_token: str = '<｜end▁of▁sentence｜>'

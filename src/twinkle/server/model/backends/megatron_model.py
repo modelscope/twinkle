@@ -104,7 +104,8 @@ class TwinkleCompatMegatronModel(MultiLoraMegatronModel, TwinkleCompatModelBase)
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
-    def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
+    def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
+                         **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_backward(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)

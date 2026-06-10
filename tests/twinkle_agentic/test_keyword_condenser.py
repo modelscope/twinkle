@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-
 import pytest
 
 from twinkle_agentic.chunker.native import NativeChunker
