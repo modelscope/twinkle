@@ -63,7 +63,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
 
   - name: sampler-Qwen3.5-4B
     route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
@@ -97,7 +97,7 @@ applications:
           num_cpus: 0.1
           runtime_env:
             env_vars:
-              TWINKLE_TRUST_REMOTE_CODE: "0"
+              TWINKLE_TRUST_REMOTE_CODE: "1"
 
   - name: processor
     route_prefix: /api/v1/processor
