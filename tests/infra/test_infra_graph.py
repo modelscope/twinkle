@@ -1,6 +1,7 @@
-import numpy as np
 import unittest
 from typing import List
+
+import numpy as np
 
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.infra import get_device_placement

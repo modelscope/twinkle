@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from typing import Any, Dict, List, Optional
 
 from twinkle import DeviceMesh
 from twinkle.data_format import InputFeature, ModelOutput

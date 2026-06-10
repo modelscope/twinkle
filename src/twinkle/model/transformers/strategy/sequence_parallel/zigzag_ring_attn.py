@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+from functools import cache
+from typing import Optional, Tuple
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from functools import cache
-from typing import Optional, Tuple
 
 
 class RingComm:

@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 from typing import TYPE_CHECKING, Iterable
 
 from twinkle import Platform
@@ -153,6 +152,7 @@ def _ep_aware_clip_grad_norm(
     - Unified clip coefficient applied to both groups via clip_grads_with_norm_
     """
     import math
+
     import torch
     import torch.distributed as dist
 
@@ -195,6 +195,7 @@ def _local_norm_stat(params, norm_type: float):
     Uses torch._foreach_* batch kernels for finite p to reduce kernel launch overhead.
     """
     import math
+
     import torch
     from torch.distributed._tensor import DTensor
     from torch.utils._foreach_utils import (_device_has_foreach_support, _group_tensors_by_device_and_dtype,

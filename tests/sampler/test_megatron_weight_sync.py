@@ -30,9 +30,10 @@ Usage:
 import argparse
 import logging
 import os
-import pytest
 import sys
 import time
+
+import pytest
 
 # Must set before importing anything
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'

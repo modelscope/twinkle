@@ -33,6 +33,7 @@ def _is_vlm_processor(tokenizer) -> bool:
 def _load_image(img: Any) -> Optional[Any]:
     """Load images to PIL format."""
     import io
+
     from PIL import Image
 
     if img is None:

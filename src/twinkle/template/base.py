@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
-import numpy as np
 import os
 from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
+
+import numpy as np
 
 from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory
@@ -195,6 +196,7 @@ class Template:
 
     def concat_input_feature(self, prompt_input_feature: InputFeature, new_tokens: List[int]) -> InputFeature:
         import copy
+
         import torch
         assert self.truncation_strategy != 'split', 'concat_input_feature does not support `truncation_strategy=split`'
         result = copy.deepcopy(prompt_input_feature)

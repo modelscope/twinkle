@@ -2,10 +2,11 @@
 import base64
 import os
 import re
-import requests
 from io import BytesIO
-from requests.adapters import HTTPAdapter
 from typing import TYPE_CHECKING, TypeVar, Union
+
+import requests
+from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 if TYPE_CHECKING:

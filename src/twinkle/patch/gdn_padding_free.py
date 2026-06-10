@@ -1,8 +1,9 @@
+from typing import Optional
+
 import torch
 import transformers
 from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
-from typing import Optional
 
 from twinkle.patch import Patch
 from twinkle.utils.utils import call_with_supported_kwargs

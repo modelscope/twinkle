@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 import os
-import pytest
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import RandomSampler, SequentialSampler
-from unittest.mock import MagicMock
 
 import twinkle
 import twinkle.hub.hub as _hub_module

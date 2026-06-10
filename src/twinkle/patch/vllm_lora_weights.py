@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from dataclasses import field
 from typing import Dict, Optional
+
+import torch
 
 from twinkle import requires
 from .base import Patch

@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Twinkle Kernel Module - Kernel orchestration layer."""
-import torch
 from logging import getLogger
 from typing import Any, Dict, Optional, Union
+
+import torch
 
 from twinkle.utils.framework import Torch
 from .base import DeviceType, ModeType, is_kernels_enabled

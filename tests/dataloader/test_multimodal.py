@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 import twinkle
 from twinkle.dataloader import DataLoader

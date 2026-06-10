@@ -3,14 +3,15 @@ import copy
 import math
 import os
 import socket
+import unittest
+from datetime import timedelta
+from types import SimpleNamespace
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import unittest
-from datetime import timedelta
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
-from types import SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel

@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import pytest
 import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import twinkle
 from twinkle.utils.loader import Plugin, construct_class
