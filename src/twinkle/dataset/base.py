@@ -101,7 +101,6 @@ class Dataset(TorchDataset):
 
     @staticmethod
     def _normalize_cache_kwargs(target, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Strip/inject load_from_cache_file based on whether target supports HF cache."""
         kw = dict(kwargs)
         # Streaming datasets (HF IterableDataset / torch IterableDataset wrappers) reject load_from_cache_file.
         if isinstance(target, (IterableDataset, TorchIterableDataset)):
@@ -269,10 +268,6 @@ class Dataset(TorchDataset):
                 key = dataset_meta.get_id()
             with processing_lock(key):
                 kw = self._normalize_cache_kwargs(self.datasets[key], kwargs)
-                if 'remove_columns' not in kw:
-                    features = getattr(self.datasets[key], 'features', None)
-                    if features is not None:
-                        kw['remove_columns'] = list(features.keys())
                 self.datasets[key] = self.datasets[key].map(preprocess_func, **kw)
             if len(self.datasets) == 1:
                 self.dataset = self.datasets[key]
@@ -334,10 +329,9 @@ class Dataset(TorchDataset):
             dataset_types = [isinstance(ds, IterableDataset) for ds in self.datasets]
             assert all(
                 dataset_types) or not any(dataset_types), 'All datasets must be all streaming=True or streaming=False'
-            # Align features: cast large_string → string to avoid concatenation type mismatch
             if not any(dataset_types):
-                from datasets import Features, Sequence, Value
                 dsets = list(self.datasets.values())
+                # Align features
                 ref_features = dsets[0].features
                 aligned = []
                 for ds in dsets:
@@ -371,7 +365,7 @@ class Dataset(TorchDataset):
         """
         if self.dataset is None:
             raise ValueError('No dataset to save.')
-        if len(self.datasets) > 1 and any(self.dataset is v for v in self.datasets.values()):
+        if len(self.datasets) > 1 and not self._mixed:
             raise ValueError('Call mix_dataset() before save_as() when multiple datasets are loaded.')
 
         fmt = format or self._infer_format(output_path)
