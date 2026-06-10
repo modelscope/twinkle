@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import warnings
+from importlib import import_module
 from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 from typing import Any, Optional, Tuple
 
@@ -117,11 +118,25 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
         return False
 
-    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+    modeling_module = import_module(mod.__class__.__module__)
+    torch_chunk_gated_delta_rule = getattr(modeling_module, 'torch_chunk_gated_delta_rule')
     mod.causal_conv1d_fn = _torch_causal_conv1d_fn
     mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
     warnings.warn(_SP_LINEAR_KERNEL_FALLBACK_WARNING, stacklevel=2)
     return True
+
+
+def _iter_qwen35_gated_delta_net_classes():
+    class_specs = (
+        ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3_5GatedDeltaNet'),
+        ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3_5MoeGatedDeltaNet'),
+    )
+    for module_name, class_name in class_specs:
+        try:
+            modeling_module = import_module(module_name)
+            yield getattr(modeling_module, class_name)
+        except Exception:
+            continue
 
 
 def _get_local_conv_weights(
@@ -310,41 +325,39 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             raise NotImplementedError('Qwen3.5 linear attention sequence parallel does not support rp_world_size > 1 '
                                       '(derived ring attention).')
 
-        try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
-        except Exception:
-            return
+        for gated_delta_net_cls in _iter_qwen35_gated_delta_net_classes():
+            if getattr(gated_delta_net_cls, '_twinkle_sp_linear_patched', False):
+                continue
 
-        if getattr(Qwen3_5GatedDeltaNet, '_twinkle_sp_linear_patched', False):
-            return
+            origin_forward = gated_delta_net_cls.forward
 
-        origin_forward = Qwen3_5GatedDeltaNet.forward
-
-        def sp_linear_forward(
-            mod,
-            hidden_states: torch.Tensor,
-            cache_params=None,
-            cache_position=None,
-            attention_mask: Optional[torch.Tensor] = None,
-            **extra_kwargs,
-        ):
-            sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', sequence_parallel)
-            if not _sp_is_enabled(sequence_parallel_context):
-                return origin_forward(
+            def sp_linear_forward(
+                mod,
+                hidden_states: torch.Tensor,
+                cache_params=None,
+                cache_position=None,
+                attention_mask: Optional[torch.Tensor] = None,
+                _origin_forward=origin_forward,
+                **extra_kwargs,
+            ):
+                sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', sequence_parallel)
+                if not _sp_is_enabled(sequence_parallel_context):
+                    return _origin_forward(
+                        mod,
+                        hidden_states,
+                        cache_params=cache_params,
+                        cache_position=cache_position,
+                        attention_mask=attention_mask,
+                        **extra_kwargs,
+                    )
+                return Qwen3_5GatedDeltaNetUlyssesPatch._run_forward(
                     mod,
                     hidden_states,
                     cache_params=cache_params,
                     cache_position=cache_position,
                     attention_mask=attention_mask,
+                    sequence_parallel_context=sequence_parallel_context,
                 )
-            return Qwen3_5GatedDeltaNetUlyssesPatch._run_forward(
-                mod,
-                hidden_states,
-                cache_params=cache_params,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                sequence_parallel_context=sequence_parallel_context,
-            )
 
-        Qwen3_5GatedDeltaNet.forward = sp_linear_forward
-        Qwen3_5GatedDeltaNet._twinkle_sp_linear_patched = True
+            gated_delta_net_cls.forward = sp_linear_forward
+            gated_delta_net_cls._twinkle_sp_linear_patched = True

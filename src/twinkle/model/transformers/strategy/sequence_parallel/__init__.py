@@ -13,7 +13,7 @@ from twinkle.patch import apply_patch
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
 from twinkle.utils.utils import call_with_supported_kwargs, has_signature_parameter
-from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch
+from .linear_attention_sp import Qwen3_5GatedDeltaNetUlyssesPatch, _iter_qwen35_gated_delta_net_classes
 from .utils import (DistributedAttention, GatherLoss, _derive_sequence_parallel_sizes, _get_seq_groups_from_device_mesh,
                     _get_ulysses_size, _SeqAllToAll, get_config_attr, get_cu_seqlens_from_position_ids, is_hccl_backend,
                     is_moe_config, post_all2all)
@@ -409,7 +409,7 @@ class SequenceParallel:
     def _is_qwen35_model(model: torch.nn.Module) -> bool:
         config = getattr(model, 'config', None)
         model_type = str(getattr(config, 'model_type', '') or '')
-        if model_type == 'qwen3_5':
+        if model_type in {'qwen3_5', 'qwen3_5_moe'}:
             return True
 
         architectures = getattr(config, 'architectures', None) or []
@@ -417,16 +417,15 @@ class SequenceParallel:
             return True
 
         model_module = getattr(model.__class__, '__module__', '') or ''
-        return 'transformers.models.qwen3_5' in model_module
+        return 'transformers.models.qwen3_5' in model_module or 'transformers.models.qwen3_5_moe' in model_module
 
     def _prepare_qwen35_linear_attention(self, model: torch.nn.Module):
         has_qwen35_linear_attention = self._is_qwen35_model(model)
         if not has_qwen35_linear_attention:
-            try:
-                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
-            except Exception:
+            gated_delta_net_classes = tuple(_iter_qwen35_gated_delta_net_classes())
+            if not gated_delta_net_classes:
                 return
-            has_qwen35_linear_attention = any(isinstance(module, Qwen3_5GatedDeltaNet) for module in model.modules())
+            has_qwen35_linear_attention = any(isinstance(module, gated_delta_net_classes) for module in model.modules())
         if not has_qwen35_linear_attention:
             return
         if int(self.rp_world_size or 1) > 1:
