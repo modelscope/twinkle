@@ -74,7 +74,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         # Build sticky routing headers — use token (or session_id) so
         # each client gets its own sampler adapter slot isolation, rather
         # than the model name which would share slots across all callers.
-        sticky_key = request.state.session_id or request.state.token or sticky_key
+        sticky_key = getattr(request.state, 'session_id', '') or getattr(request.state, 'token', '') or sticky_key
         sticky_headers = _build_sticky_headers(sticky_key, request)
         body_bytes = json.dumps(sample_request).encode()
 

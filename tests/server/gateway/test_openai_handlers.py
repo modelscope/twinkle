@@ -160,7 +160,8 @@ class TestChatCompletions:
         # Check that proxy_request was called with sticky headers
         call_kwargs = mock_self.proxy.proxy_request.call_args
         extra_headers = call_kwargs.kwargs.get('extra_headers', {})
-        assert extra_headers['X-Ray-Serve-Request-Id'] == 'Qwen/Qwen3.5-4B'
+        assert extra_headers['x-request-id'] == 'Qwen/Qwen3.5-4B'
+        assert extra_headers['serve_multiplexed_model_id'] == 'Qwen/Qwen3.5-4B'
         assert extra_headers['Serve-Multiplexed-Model-Id'] == 'Qwen/Qwen3.5-4B'
         assert extra_headers['Twinkle-Authorization'] == 'Bearer my-key'
 
