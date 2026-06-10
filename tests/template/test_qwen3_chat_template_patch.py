@@ -9,9 +9,10 @@ Strategy:
     scenario that breaks multi-turn rollout bridge, asserting the patched
     template is byte-level round-trippable.
 """
-import pytest
 import warnings
 from types import SimpleNamespace
+
+import pytest
 
 from twinkle.patch import apply_patch
 from twinkle.patch.qwen3_chat_template import _NEW, _OLD, Qwen3ChatTemplate

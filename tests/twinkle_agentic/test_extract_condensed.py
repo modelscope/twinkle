@@ -11,8 +11,8 @@ Covers:
 - end-to-end: KeywordCondenser → Chunks → ExtractCondensed round-trips
 """
 from __future__ import annotations
-
 import json
+
 import pytest
 
 from twinkle_agentic.data_format import Chunks

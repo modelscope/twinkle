@@ -17,9 +17,10 @@ Usage:
 import argparse
 import datetime
 import os
-import pytest
 import sys
 import time
+
+import pytest
 
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_LOGGING_LEVEL'] = 'WARNING'

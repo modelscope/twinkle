@@ -78,13 +78,16 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         sampler_type = SAMPLER_SELECTOR.validate(sampler_type)
         self.device_group = DeviceGroup(**device_group)
         if sampler_type == 'mock':
-            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
-                               ncpu_proc_per_node=1, groups=[self.device_group],
-                               lazy_collect=False)
+            twinkle.initialize(
+                mode='ray',
+                nproc_per_node=nproc_per_node,
+                ncpu_proc_per_node=1,
+                groups=[self.device_group],
+                lazy_collect=False)
             self.device_mesh = None
         else:
-            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
-                               groups=[self.device_group], lazy_collect=False)
+            twinkle.initialize(
+                mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:
@@ -103,7 +106,10 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             sampler_kwargs.update(
                 engine_args=engine_args or {},
                 device_mesh=self.device_mesh,
-                **{k: v for k, v in kwargs.items() if k not in ('engine_args',)},
+                **{
+                    k: v
+                    for k, v in kwargs.items() if k not in ('engine_args', )
+                },
             )
         else:
             sampler_kwargs.update(kwargs)

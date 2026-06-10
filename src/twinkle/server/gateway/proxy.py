@@ -12,9 +12,9 @@ from typing import Any
 import httpx
 from fastapi import Request, Response
 
-from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
+from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
 
 logger = get_logger()
 
@@ -173,14 +173,16 @@ class ServiceProxy:
 
         logger.debug(
             'proxy_request_stream service=%s endpoint=%s target_url=%s',
-            service_type, endpoint, target_url,
+            service_type,
+            endpoint,
+            target_url,
         )
 
         async with self.client.stream(
-            method='POST',
-            url=target_url,
-            content=body_bytes,
-            headers=headers,
+                method='POST',
+                url=target_url,
+                content=body_bytes,
+                headers=headers,
         ) as response:
             if response.status_code >= 400:
                 body = await response.aread()

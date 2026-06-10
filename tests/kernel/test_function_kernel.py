@@ -1,10 +1,11 @@
 import os
 import sys
+import types
+import unittest
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import types
-import unittest
 
 try:
     import requests

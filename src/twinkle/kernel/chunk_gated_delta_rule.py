@@ -4,8 +4,10 @@ redirecting the underlying Triton kernels to MindSpeed's NPU-compatible counterp
 It is consumed by twinkle.kernel.monkey_patch_npu to enable the fast linear-attention
 path of Qwen3.5 on Ascend hardware.'''
 
-import torch
 import warnings
+from typing import Optional
+
+import torch
 from mindspeed.lite.ops.triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from mindspeed.lite.ops.triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from mindspeed.lite.ops.triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -13,7 +15,6 @@ from mindspeed.lite.ops.triton.cumsum import chunk_local_cumsum
 from mindspeed.lite.ops.triton.solve_tril import solve_tril
 from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 from mindspeed.lite.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
-from typing import Optional
 
 
 def _torch_l2norm_fwd(

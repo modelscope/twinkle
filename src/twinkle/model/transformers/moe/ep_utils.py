@@ -4,9 +4,10 @@
 # Licensed under the Apache License, Version 2.0
 # Adapted from https://github.com/ByteDance-Seed/VeOmni/tree/main/veomni/distributed/moe
 
+from typing import Optional
+
 import torch
 import torch.distributed as dist
-from typing import Optional
 
 
 # ========================== comm ==========================

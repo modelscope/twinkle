@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import pytest
 import re
-import requests
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlparse
+
+import pytest
+import requests
 
 DOCS_DIR = Path(__file__).parent.parent.parent / 'docs'
 GITHUB_BASE_URL = 'https://github.com/modelscope/twinkle/blob/main'

@@ -20,14 +20,15 @@ Note: nproc_per_node=1 is intentional — the test internally spawns 4 worker pr
 mp.spawn (1 for the single-GPU baseline and 4 for the EP+FSDP run).
 """
 
-import numpy as np
 import os
 import socket
+import unittest
+from datetime import timedelta
+
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import unittest
-from datetime import timedelta
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from twinkle.model.transformers.moe import apply_expert_parallel

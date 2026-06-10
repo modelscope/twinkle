@@ -235,8 +235,7 @@ async def test_concurrent_session_touch_monotonic_heartbeat(make_state) -> None:
     # At least 80% of touches must commit; a small contention-skip fraction is
     # expected when two workers hammer the same key with no delay between calls.
     success_rate = sum(touched) / len(touched)
-    assert success_rate >= 0.8, (
-        f'only {success_rate:.1%} of touches committed — backend dropped too many writes')
+    assert success_rate >= 0.8, (f'only {success_rate:.1%} of touches committed — backend dropped too many writes')
     final = await a.get_session_last_heartbeat(sid)
     assert final is not None
     assert final >= start, 'final heartbeat predates the test start — every write was lost'

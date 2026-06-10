@@ -85,13 +85,16 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
         if backend == 'mock':
-            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
-                               ncpu_proc_per_node=1, groups=[self.device_group],
-                               lazy_collect=False)
+            twinkle.initialize(
+                mode='ray',
+                nproc_per_node=nproc_per_node,
+                ncpu_proc_per_node=1,
+                groups=[self.device_group],
+                lazy_collect=False)
             self.device_mesh = None
         else:
-            twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node,
-                               groups=[self.device_group], lazy_collect=False)
+            twinkle.initialize(
+                mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
             if 'mesh_dim_names' in device_mesh:
                 self.device_mesh = DeviceMesh(**device_mesh)
             else:

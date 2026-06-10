@@ -11,10 +11,14 @@ from twinkle.server.gateway.openai_bridge import (make_error, translate_chat_req
 
 
 class TestTranslateChatRequest:
+
     def test_basic_chat(self):
         body = {
             'model': 'lora-abc',
-            'messages': [{'role': 'user', 'content': 'Hello'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'Hello'
+            }],
         }
         req, sticky = translate_chat_request(body)
         assert sticky == 'lora-abc'
@@ -25,8 +29,16 @@ class TestTranslateChatRequest:
     def test_with_tools(self):
         body = {
             'model': 'my-model',
-            'messages': [{'role': 'user', 'content': 'weather?'}],
-            'tools': [{'type': 'function', 'function': {'name': 'get_weather'}}],
+            'messages': [{
+                'role': 'user',
+                'content': 'weather?'
+            }],
+            'tools': [{
+                'type': 'function',
+                'function': {
+                    'name': 'get_weather'
+                }
+            }],
         }
         req, _ = translate_chat_request(body)
         assert req['inputs']['tools'] == body['tools']
@@ -34,7 +46,10 @@ class TestTranslateChatRequest:
     def test_sampling_params_mapping(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'temperature': 0.7,
             'top_p': 0.9,
             'max_tokens': 100,
@@ -54,7 +69,10 @@ class TestTranslateChatRequest:
     def test_max_completion_tokens_fallback(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'max_completion_tokens': 50,
         }
         req, _ = translate_chat_request(body)
@@ -63,7 +81,10 @@ class TestTranslateChatRequest:
     def test_frequency_penalty_to_repetition_penalty(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'frequency_penalty': 0.5,
         }
         req, _ = translate_chat_request(body)
@@ -72,7 +93,10 @@ class TestTranslateChatRequest:
     def test_logprobs_mapping(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'logprobs': True,
             'top_logprobs': 5,
         }
@@ -82,7 +106,10 @@ class TestTranslateChatRequest:
     def test_logprobs_false_not_mapped(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'logprobs': False,
             'top_logprobs': 5,
         }
@@ -104,7 +131,10 @@ class TestTranslateChatRequest:
     def test_none_values_ignored(self):
         body = {
             'model': 'x',
-            'messages': [{'role': 'user', 'content': 'hi'}],
+            'messages': [{
+                'role': 'user',
+                'content': 'hi'
+            }],
             'temperature': None,
             'top_p': None,
             'max_tokens': None,
@@ -117,6 +147,7 @@ class TestTranslateChatRequest:
 
 
 class TestTranslateResponse:
+
     def test_single_choice(self):
         sampler_resp = {
             'samples': [{
@@ -140,8 +171,16 @@ class TestTranslateResponse:
         sampler_resp = {
             'samples': [{
                 'sequences': [
-                    {'stop_reason': 'stop', 'tokens': [1], 'decoded': 'A'},
-                    {'stop_reason': 'length', 'tokens': [2, 3], 'decoded': 'BC'},
+                    {
+                        'stop_reason': 'stop',
+                        'tokens': [1],
+                        'decoded': 'A'
+                    },
+                    {
+                        'stop_reason': 'length',
+                        'tokens': [2, 3],
+                        'decoded': 'BC'
+                    },
                 ]
             }]
         }
@@ -153,20 +192,12 @@ class TestTranslateResponse:
         assert result['choices'][1]['finish_reason'] == 'length'
 
     def test_length_finish_reason(self):
-        sampler_resp = {
-            'samples': [{
-                'sequences': [{'stop_reason': 'length', 'tokens': [1], 'decoded': 'x'}]
-            }]
-        }
+        sampler_resp = {'samples': [{'sequences': [{'stop_reason': 'length', 'tokens': [1], 'decoded': 'x'}]}]}
         result = translate_response(sampler_resp, 'x')
         assert result['choices'][0]['finish_reason'] == 'length'
 
     def test_empty_decoded(self):
-        sampler_resp = {
-            'samples': [{
-                'sequences': [{'stop_reason': 'stop', 'tokens': [], 'decoded': None}]
-            }]
-        }
+        sampler_resp = {'samples': [{'sequences': [{'stop_reason': 'stop', 'tokens': [], 'decoded': None}]}]}
         result = translate_response(sampler_resp, 'x')
         assert result['choices'][0]['message']['content'] == ''
 
@@ -175,6 +206,7 @@ class TestTranslateResponse:
 
 
 class TestTranslateStreamChunk:
+
     def test_first_chunk_has_role(self):
         chunk = translate_stream_chunk('Hello', 'model-a', is_first=True, request_id='id-1')
         assert chunk['object'] == 'chat.completion.chunk'
@@ -197,6 +229,7 @@ class TestTranslateStreamChunk:
 
 
 class TestMakeError:
+
     def test_basic_error(self):
         err = make_error('something broke', error_type='server_error')
         assert err == {'error': {'message': 'something broke', 'type': 'server_error'}}

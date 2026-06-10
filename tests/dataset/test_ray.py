@@ -1,6 +1,7 @@
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 from twinkle.data_format import Message
 from twinkle.dataset import Dataset, DatasetMeta

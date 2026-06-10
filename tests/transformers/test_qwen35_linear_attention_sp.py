@@ -2,15 +2,16 @@
 import copy
 import os
 import socket
+import unittest
+from datetime import timedelta
+from types import MethodType, SimpleNamespace
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-import unittest
-from datetime import timedelta
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
 from transformers.utils.import_utils import is_flash_linear_attention_available
-from types import MethodType, SimpleNamespace
 
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallelStrategy, sequence_parallel

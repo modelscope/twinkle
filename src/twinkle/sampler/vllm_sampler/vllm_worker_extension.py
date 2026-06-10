@@ -17,8 +17,9 @@ import os
 import platform
 import re
 import signal
-import torch
 from typing import Dict, List, Optional, Tuple
+
+import torch
 
 from twinkle import get_logger
 from twinkle.utils import Platform

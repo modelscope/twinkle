@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import inspect
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from dataclasses import dataclass
 from torch import nn
-from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh

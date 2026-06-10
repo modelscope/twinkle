@@ -2,9 +2,10 @@
 import functools
 import inspect
 import json
-import numpy as np
 import os
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
+
+import numpy as np
 
 from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires

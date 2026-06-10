@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 from twinkle.data_format import Message
 from twinkle.dataset import DatasetMeta, LazyDataset

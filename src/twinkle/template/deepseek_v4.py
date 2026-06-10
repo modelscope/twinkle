@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+from typing import Any, Dict, List, Literal, Optional
+
 import torch
 from transformers import AutoConfig, PreTrainedTokenizerFast
-from typing import Any, Dict, List, Literal, Optional
 
 from twinkle.hub import HubOperation
 from .base import Template

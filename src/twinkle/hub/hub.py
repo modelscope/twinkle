@@ -5,8 +5,9 @@ import tempfile
 from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
-from requests.exceptions import HTTPError
 from typing import Dict, List, Literal, Optional, Union
+
+from requests.exceptions import HTTPError
 
 from ..utils import requires
 
@@ -430,6 +431,7 @@ class MSHub(HubOperation):
         if revision is None or revision == 'main':
             revision = 'master'
         import inspect
+
         from modelscope import snapshot_download
 
         # Build download arguments
@@ -473,6 +475,7 @@ class MSHub(HubOperation):
         requires('modelscope')
         cls.try_login(token)
         import inspect
+
         from modelscope.hub.snapshot_download import _snapshot_download
 
         # Build download arguments

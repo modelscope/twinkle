@@ -1,9 +1,10 @@
 import inspect
+from copy import copy
+from typing import Any, Callable, Dict, List, Optional, Union
+
 import numpy as np
 import torch
-from copy import copy
 from PIL import Image
-from typing import Any, Callable, Dict, List, Optional, Union
 
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature

@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Test dataset packing: normal packing, iterable packing (cyclic=True/False)"""
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 try:
     import binpacking  # noqa: F401

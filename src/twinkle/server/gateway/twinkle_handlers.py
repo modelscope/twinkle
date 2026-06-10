@@ -5,8 +5,8 @@ Twinkle-native gateway handlers.
 All endpoints are prefixed /twinkle/* and registered via _register_twinkle_routes(app, self_fn).
 """
 from __future__ import annotations
-from typing import TYPE_CHECKING
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 

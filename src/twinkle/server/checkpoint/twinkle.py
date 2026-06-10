@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from twinkle.server.checkpoint import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager,
-                                      validate_ownership)
+                                       validate_ownership)
 from twinkle_client.types.training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor,
                                            ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse,
                                            WeightsInfoResponse)

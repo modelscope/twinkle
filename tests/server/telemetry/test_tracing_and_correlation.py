@@ -257,7 +257,6 @@ def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
                    for h in logging.getLogger(name).handlers)
 
 
-
 # ---------- inbound HTTP trace-context continuity ------------------ #
 
 

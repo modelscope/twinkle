@@ -20,9 +20,10 @@ Environment:
 
 import argparse
 import os
-import pytest
 import sys
 import traceback
+
+import pytest
 
 # Set environment variables before imports
 os.environ.setdefault('TRUST_REMOTE_CODE', '1')

@@ -9,11 +9,11 @@ single GPU; enable it with::
     TWINKLE_TEST_REAL_SAMPLER=1 pytest tests/twinkle_agentic/test_model_condenser.py
 """
 from __future__ import annotations
-
 import math
 import os
-import pytest
 from typing import Callable, List
+
+import pytest
 
 # Import directly from the submodule to avoid the (currently broken)
 # ``twinkle.sampler.__init__`` import chain in this workspace.

@@ -64,6 +64,7 @@ def _baseline_route_set(app_name: str) -> set[tuple[str, str]]:
 
 
 class _CaptureResult:
+
     def __init__(self) -> None:
         self.app: FastAPI | None = None
         self.deployment_name: str | None = None
@@ -92,6 +93,7 @@ def _capture_builder(monkeypatch, build_callable, *args, **kwargs) -> _CaptureRe
         result.deployment_name = d_kwargs.get('name') or (d_args[0] if d_args else None)
 
         def _decorate(cls):
+
             class _Bound:
 
                 def options(self, **_opts):
@@ -266,6 +268,5 @@ def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_
     expected = (expected_prefix + ['ensure_state_cleanup_started']) if expect_cleanup else expected_prefix
     if expect_replica_id:
         expected = ['inject_replica_id'] + expected
-    assert names == expected, (
-        f'middleware ordering mismatch — expected (outermost→innermost) '
-        f'{expected!r}, got {names!r}')
+    assert names == expected, (f'middleware ordering mismatch — expected (outermost→innermost) '
+                               f'{expected!r}, got {names!r}')

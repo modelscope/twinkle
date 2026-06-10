@@ -7,8 +7,8 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 """
 from __future__ import annotations
 import traceback
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, Request
 from peft import LoraConfig

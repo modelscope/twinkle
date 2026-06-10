@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
+import numpy as np
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss

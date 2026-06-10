@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import multiprocessing as mp
-import numpy as np
 import os
 from typing import Type, TypeVar, Union
+
+import numpy as np
 
 from twinkle.infra import remote_class, remote_function
 from twinkle.template import Template

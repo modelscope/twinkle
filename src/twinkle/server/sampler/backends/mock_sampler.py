@@ -119,13 +119,11 @@ class MockSampler:
             time.sleep(0.05)
             yield str(tok), ('length' if is_last else None)
 
-    def sample_stream_to_queue(self, queue, inputs, sampling_params=None,
-                               adapter_name='', adapter_path=None):
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
         from . import STREAM_SENTINEL
         try:
-            for delta, reason in self.sample_stream(inputs, sampling_params,
-                                                     adapter_name, adapter_path):
+            for delta, reason in self.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
                 queue.put((delta, reason))
         except Exception as e:
             queue.put(e)
