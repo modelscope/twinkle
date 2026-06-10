@@ -221,7 +221,7 @@ def _assert_auth_middleware_effect(app: FastAPI) -> None:
     # reach the handler and fail differently — typically 422/500.)
     assert resp.status_code == 400, (
         f'expected 400 from verify_token for {target!r}, got {resp.status_code}: {resp.text[:200]}')
-    assert 'X-Ray-Serve-Request-Id' in resp.text
+    assert 'x-request-id' in resp.text
 
 
 # ----- middleware ordering oracle (metrics outermost → tracing → auth) ----- #
