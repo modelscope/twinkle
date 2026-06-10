@@ -8,8 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
-from typing import TYPE_CHECKING
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -206,9 +206,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(
-        request: Request,
-        body: types.SampleRequest,
-        self: SamplerManagement = Depends(self_fn),
+            request: Request,
+            body: types.SampleRequest,
+            self: SamplerManagement = Depends(self_fn),
     ):
         """Stream token deltas as newline-delimited JSON.
 
@@ -248,13 +248,17 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             params = SamplingParams.from_dict(body.sampling_params)
 
         from ray.util.queue import Queue
+
         from .backends import STREAM_SENTINEL
 
         q = Queue(maxsize=128)
         actor = self.sampler._actors[0]
         actor.sample_stream_to_queue.remote(
-            q, inputs_parsed, params,
-            adapter_name=full_adapter_name, adapter_path=adapter_path,
+            q,
+            inputs_parsed,
+            params,
+            adapter_name=full_adapter_name,
+            adapter_path=adapter_path,
         )
 
         async def _stream_generator():

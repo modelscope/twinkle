@@ -32,8 +32,8 @@ pytestmark = pytest.mark.skipif(
 # ``TWINKLE_TEST_REDIS_PERSISTENCE=1`` to exercise the redis backend instead;
 # requires a redis on ``redis://127.0.0.1:6379`` (e.g. ``docker run -d --rm
 # -p 6379:6379 redis:7-alpine``).
-SELECTED_CONFIG = (MOCK_SERVER_CONFIG_REDIS
-                   if os.environ.get('TWINKLE_TEST_REDIS_PERSISTENCE', '0') == '1' else MOCK_SERVER_CONFIG)
+SELECTED_CONFIG = (
+    MOCK_SERVER_CONFIG_REDIS if os.environ.get('TWINKLE_TEST_REDIS_PERSISTENCE', '0') == '1' else MOCK_SERVER_CONFIG)
 
 READY_BUDGET_SECONDS = 30.0
 
@@ -191,7 +191,7 @@ def _exercise_twinkle_clients(base: str) -> None:
 
     # Creates a server-side session so adapter endpoints get
     # ``X-Twinkle-Session-Id``; also wires base_url + api_key for the SDK.
-    twinkle = init_twinkle_client(base_url=base, api_key='EMPTY_TOKEN')
+    twinkle = init_twinkle_client(base_url=base, api_key='EMPTY_TOKEN')  # noqa: F841
 
     # --- model service ---
     model = MultiLoraTransformersModel(model_id='mock-model')
@@ -251,12 +251,13 @@ def _exercise_twinkle_clients(base: str) -> None:
     # shape (``config: str``), so send JSON. Skip a real ``LoraConfig`` here
     # because its ``runtime_config`` member isn't JSON-serializable.
     import json
-    sampler.add_adapter_to_sampler(
-        'a', config=json.dumps({'r': 4, 'target_modules': ['all-linear']}))
+    sampler.add_adapter_to_sampler('a', config=json.dumps({'r': 4, 'target_modules': ['all-linear']}))
     sampler.set_template('Template')
 
     samples = sampler.sample(
-        inputs=[{'input_ids': [1, 2, 3]}],
+        inputs=[{
+            'input_ids': [1, 2, 3]
+        }],
         sampling_params={'max_tokens': 4},
         adapter_name='a',
     )
@@ -265,7 +266,9 @@ def _exercise_twinkle_clients(base: str) -> None:
     # adapter_uri triggers reset_prefix_cache; reuse the training-weights
     # path because mock ``save()`` materialized that directory on disk.
     sampler.sample(
-        inputs=[{'input_ids': [1, 2, 3]}],
+        inputs=[{
+            'input_ids': [1, 2, 3]
+        }],
         sampling_params={'max_tokens': 2},
         adapter_name='a',
         adapter_uri=save_resp.twinkle_path,
@@ -295,7 +298,10 @@ def _exercise_tinker_client(base: str) -> None:
 
     datum = types.Datum(
         model_input=types.ModelInput.from_ints([1, 2, 3]),
-        loss_fn_inputs={'target_tokens': [1, 2, 3], 'weights': [1.0, 1.0, 1.0]},
+        loss_fn_inputs={
+            'target_tokens': [1, 2, 3],
+            'weights': [1.0, 1.0, 1.0]
+        },
     )
     training.forward_backward([datum], loss_fn='cross_entropy').result()
     training.optim_step(types.AdamParams(learning_rate=1e-4)).result()

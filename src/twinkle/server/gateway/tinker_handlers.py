@@ -8,8 +8,8 @@ self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at 
 from __future__ import annotations
 import asyncio
 import os
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types

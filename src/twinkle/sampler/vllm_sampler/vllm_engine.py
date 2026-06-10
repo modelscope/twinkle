@@ -3,9 +3,10 @@ import contextlib
 import inspect
 import os
 import re
-import torch
 import uuid
 from typing import Any, Dict, List, Optional, Union
+
+import torch
 
 from twinkle import get_logger
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
@@ -583,6 +584,7 @@ class VLLMEngine(BaseSamplerEngine):
         import asyncio
         import gc
         import time
+
         import zmq
         from vllm.platforms import current_platform
 
