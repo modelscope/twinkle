@@ -65,6 +65,10 @@ def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         'adapter_name': model,
     }
 
+    adapter_uri = body.get('adapter_uri')
+    if adapter_uri:
+        sample_request['adapter_uri'] = adapter_uri
+
     return sample_request, model
 
 
