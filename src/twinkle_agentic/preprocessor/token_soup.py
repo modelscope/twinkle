@@ -1,39 +1,34 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""Token-soup / garbled output detector for assistant messages."""
 import re
 import unicodedata
-from collections import Counter
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 
+from .utils import msg_content_text
+
 # ── Pre-compiled patterns ─────────────────────────────────────────────────────
 
-# Unicode replacement character
 _REPLACEMENT_CHAR_RE = re.compile(r'\ufffd')
 
-# Non-printable control chars (keep \t \n \r as legitimate whitespace)
+# Non-printable control chars; \t \n \r kept as legitimate whitespace.
 _CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
-# Unicode private use area (E000–F8FF, F0000–FFFFF, 100000–10FFFF)
 _PRIVATE_USE_RE = re.compile(r'[\ue000-\uf8ff\U000f0000-\U000fffff\U00100000-\U0010ffff]')
 
-# Chat-template special tokens repeated ≥ _SPECIAL_TOKEN_COUNT times.
-# Bracket-style BERT tokens (PAD/UNK/SEP/CLS/MASK) are case-sensitive via (?-i:...) —
-# lowercase "[mask]"/"[pad]" collide with ordinary bitmask-DP variable names like dp[mask].
+# Bracket BERT-style tokens stay case-sensitive via (?-i:...) — lowercase "[mask]"/"[pad]"
+# collide with bitmask-DP variables like dp[mask].
 _SPECIAL_TOKEN_RE = re.compile(
     r'(<\|[^|>\n]{1,40}\|>|</s>|(?-i:\[/?(?:PAD|UNK|SEP|CLS|MASK)\])|</?unk>|</?pad>|<0x[0-9A-Fa-f]{2}>)',
     re.IGNORECASE,
 )
 
-# Same printable character repeated 20+ times consecutively.
-# Excludes whitespace and chars commonly used as legitimate decorations / numerical output:
-#   - ASCII rule/separator chars: - = _ . * + ~ # | > <
-#   - Digits 0-9 (float precision padding, test fixtures like 999999..., 111111...)
-#   - Box drawing (U+2500-257F), Block elements (U+2580-259F),
-#     Geometric shapes (U+25A0-25FF), Braille patterns (U+2800-28FF)
-#   - Em/en dash (U+2013-2015), fullwidth dash/hyphen (U+30FC, U+FF0D)
+# Same printable char repeated 20+ times. Excludes ASCII rule chars, digits, box-drawing,
+# block elements, geometric shapes, braille, and dashes.
 _SINGLE_CHAR_REPEAT_RE = re.compile(
     r'([^\s\n\-=_.\*\+~#|><0-9\u2013-\u2015\u2500-\u25ff\u2800-\u28ff\u30fc\uff0d])\1{19,}')
+
 
 # ── Unicode script classifier ─────────────────────────────────────────────────
 
@@ -68,7 +63,7 @@ def _script_of(cp: int) -> str:
 
 
 def _script_chaos(text: str, min_chars: int = 40) -> float:
-    """Return the fraction of adjacent non-space char pairs that switch script."""
+    """Fraction of adjacent letter/number pairs that switch script."""
     chars = [c for c in text if unicodedata.category(c)[0] in ('L', 'N')]
     if len(chars) < min_chars:
         return 0.0
@@ -77,7 +72,7 @@ def _script_chaos(text: str, min_chars: int = 40) -> float:
     return switches / (len(scripts) - 1)
 
 
-# ── Per-signal detectors ──────────────────────────────────────────────────────
+# ── Detector ──────────────────────────────────────────────────────────────────
 
 
 def _ratio(pattern: re.Pattern, text: str) -> float:
@@ -94,11 +89,10 @@ def _is_token_soup(
     script_chaos_min_chars: int = 40,
     max_chars: int = 0,
 ) -> bool:
-    """Return True if the text exhibits any garbled-output signal."""
+    """True if `text` exhibits any garbled-output signal."""
     if not text:
         return False
-    # Token-soup signals are statistical/uniform; sampling the head captures them
-    # at near-constant cost regardless of full-text length.
+    # Token-soup signals are statistical/uniform; head sample is sufficient.
     if max_chars and len(text) > max_chars:
         text = text[:max_chars]
     if _ratio(_REPLACEMENT_CHAR_RE, text) > replacement_char_ratio:
@@ -116,7 +110,7 @@ def _is_token_soup(
     return False
 
 
-# ── Preprocessor ─────────────────────────────────────────────────────────────
+# ── Preprocessor ──────────────────────────────────────────────────────────────
 
 
 class TokenSoupFilter(Preprocessor):
@@ -132,34 +126,26 @@ class TokenSoupFilter(Preprocessor):
         max_chars: int = 0,
     ) -> None:
         super().__init__()
-        self._replacement_char_ratio = replacement_char_ratio
-        self._control_char_ratio = control_char_ratio
-        self._private_use_ratio = private_use_ratio
-        self._special_token_count = special_token_count
-        self._script_chaos_threshold = script_chaos_threshold
-        self._script_chaos_min_chars = script_chaos_min_chars
-        self._max_chars = max_chars
+        self._cfg = dict(
+            replacement_char_ratio=replacement_char_ratio,
+            control_char_ratio=control_char_ratio,
+            private_use_ratio=private_use_ratio,
+            special_token_count=special_token_count,
+            script_chaos_threshold=script_chaos_threshold,
+            script_chaos_min_chars=script_chaos_min_chars,
+            max_chars=max_chars,
+        )
 
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        out = []
-        dropped = []
+        rows = self.map_col_to_row(rows)
+        out: List[Dict[str, Any]] = []
+        dropped: List[Dict[str, Any]] = []
         for row in rows:
-            messages = row.get('messages') or []
-            asst_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'assistant']
-            if not asst_msgs:
-                out.append(row)
-                continue
-            if any(
-                    _is_token_soup(
-                        (m.get('content') or '').strip(),
-                        replacement_char_ratio=self._replacement_char_ratio,
-                        control_char_ratio=self._control_char_ratio,
-                        private_use_ratio=self._private_use_ratio,
-                        special_token_count=self._special_token_count,
-                        script_chaos_threshold=self._script_chaos_threshold,
-                        script_chaos_min_chars=self._script_chaos_min_chars,
-                        max_chars=self._max_chars,
-                    ) for m in asst_msgs):
+            asst_texts = [
+                msg_content_text(m).strip() for m in (row.get('messages') or [])
+                if isinstance(m, dict) and m.get('role') == 'assistant'
+            ]
+            if any(_is_token_soup(t, **self._cfg) for t in asst_texts):
                 dropped.append(dict(row, drop_reason='token_soup'))
             else:
                 out.append(row)

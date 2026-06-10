@@ -8,7 +8,7 @@ from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set, Union
 
 from twinkle import remote_class
-from twinkle.data_format import InputFeature, Message, Trajectory
+from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
 from .tools import ToolCallRegistry, trailing_prefix_of
@@ -612,7 +612,9 @@ class Template:
         trajectory['messages'] = self._process_mm_messages(trajectory['messages'], images, videos, audios)
         if not self.is_mm:
             for message in trajectory['messages']:
-                message['content'] = message['content'][0]['text']
+                c = message.get('content')
+                if isinstance(c, list):
+                    message['content'] = c[0]['text'] if c else ''
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -698,14 +700,11 @@ class Template:
 
     @staticmethod
     def _get_train_indices(trajectory: Trajectory) -> Optional[Set[int]]:
-        """Extract key-round assistant indices from trajectory's ``user_data``."""
-        user_data = trajectory.get('user_data')
-        if not isinstance(user_data, dict):
-            return None
-        key_rounds = user_data.get('key_rounds')
-        if not isinstance(key_rounds, list) or not key_rounds:
-            return None
-        return set(key_rounds) or None
+        """Extract key-round assistant indices from trajectory's packed ``user_data``."""
+        kr = user_data_get(trajectory.get('user_data'), 'key_rounds')
+        if isinstance(kr, list) and kr:
+            return set(kr)
+        return None
 
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""

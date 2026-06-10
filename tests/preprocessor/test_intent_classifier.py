@@ -6,7 +6,7 @@ Focus areas:
 - Per-detector FP guards (chitchat, role mismatch, first-turn dissatisfaction).
 - Multi-detector ordering: ToolCallDetector short-circuit, ``setdefault`` semantics.
 - Edge cases: empty / None / non-dict / list-content messages, empty trajectories.
-- Public API contract: ``row['intent']``, ``user_data['key_rounds']``, ``user_data['intents']``.
+- Public API contract: ``row['intent']``, user_data List[Tuple] entries ``('key_rounds', ...)`` / ``('intents', ...)``.
 - Detector pluggability: custom subclass, overriding ``DEFAULT_DETECTORS``.
 """
 import pytest
@@ -15,6 +15,7 @@ from twinkle_agentic.preprocessor.intent_classifier import (INTENT_CODE, INTENT_
                                                             INTENT_USER_DISSATISFACTION, CodeDetector, IntentClassifier,
                                                             IntentDetector, MathDetector, ToolCallDetector,
                                                             UserDissatisfactionDetector, _msg_text, _pair_assistant)
+from twinkle.data_format import pack_value, user_data_get
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -34,9 +35,20 @@ def _row(*messages):
 
 
 def _classify_one(*messages, detectors=None):
-    ic = IntentClassifier(detectors=detectors)
-    out = ic.classify_intent([_row(*messages)])
-    return out[0]
+    # Keep no-key-round rows (e.g. chitchat) so tests can assert ``intent == INTENT_OTHER``.
+    ic = IntentClassifier(detectors=detectors, drop_no_key_rounds=False)
+    kept, _dropped = ic([_row(*messages)])
+    return kept[0]
+
+
+def _ud_get(row, key):
+    """Read a value by key from packed user_data (JSON-decoded)."""
+    return user_data_get(row.get('user_data'), key)
+
+
+def _has_key_rounds(row):
+    kr = _ud_get(row, 'key_rounds')
+    return isinstance(kr, list) and bool(kr)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -124,7 +136,7 @@ class TestToolCallDetector:
         out = _classify_one(*msgs)
         assert out['intent'] == INTENT_TOOL_CALL
         # math detector must not have written into intents.
-        assert out['user_data']['intents'] == {1: INTENT_TOOL_CALL}
+        assert _ud_get(out, 'intents') == {'1': INTENT_TOOL_CALL}
 
 
 # ── CodeDetector ──────────────────────────────────────────────────────────────
@@ -306,7 +318,7 @@ class TestIntentClassifierE2E:
     def test_chitchat_other(self):
         out = _classify_one(_u('今天天气真好'), _a('是的，挺适合出门的'))
         assert out['intent'] == INTENT_OTHER
-        assert 'user_data' not in out or 'key_rounds' not in (out.get('user_data') or {})
+        assert not _has_key_rounds(out)
 
     def test_math_round(self):
         out = _classify_one(
@@ -314,8 +326,8 @@ class TestIntentClassifierE2E:
             _a('由因式分解得 (x-2)(x-3)=0'),
         )
         assert out['intent'] == INTENT_MATH
-        assert out['user_data']['key_rounds'] == [1]
-        assert out['user_data']['intents'] == {1: INTENT_MATH}
+        assert _ud_get(out, 'key_rounds') == [1]
+        assert _ud_get(out, 'intents') == {'1': INTENT_MATH}
 
     def test_code_round(self):
         out = _classify_one(
@@ -327,7 +339,7 @@ class TestIntentClassifierE2E:
     def test_dissat_round(self):
         out = _classify_one(_u('q'), _a('answer'), _u('totally garbage answer, redo'), _a('sorry'))
         assert out['intent'] == INTENT_USER_DISSATISFACTION
-        assert out['user_data']['key_rounds'] == [3]
+        assert _ud_get(out, 'key_rounds') == [3]
 
     def test_assistant_self_correction_not_dissat(self):
         # Root cause for original FP: role-agnostic regex on assistant text. Must stay fixed.
@@ -347,9 +359,9 @@ class TestIntentClassifierE2E:
             _u('不对，再来一次'),
             _a('好的'),
         )
-        intents = out['user_data']['intents']
-        assert intents[1] == INTENT_MATH
-        assert intents[3] == INTENT_USER_DISSATISFACTION
+        intents = _ud_get(out, 'intents')
+        assert intents['1'] == INTENT_MATH
+        assert intents['3'] == INTENT_USER_DISSATISFACTION
 
     def test_tool_call_definitive_short_circuits(self):
         out = _classify_one(
@@ -360,7 +372,7 @@ class TestIntentClassifierE2E:
         )
         assert out['intent'] == INTENT_TOOL_CALL
         # MathDetector must not have run after the definitive ToolCallDetector.
-        assert set(out['user_data']['intents'].values()) == {INTENT_TOOL_CALL}
+        assert set(_ud_get(out, 'intents').values()) == {INTENT_TOOL_CALL}
 
     def test_multimodal_list_content(self):
         # List-content messages must work transparently.
@@ -387,23 +399,24 @@ class TestIntentClassifierE2E:
 class TestEdgeCases:
 
     def test_empty_rows(self):
-        assert IntentClassifier().classify_intent([]) == []
+        kept, _ = IntentClassifier()([])
+        assert kept == []
 
     def test_missing_messages_field(self):
-        out = IntentClassifier().classify_intent([{'foo': 'bar'}])
-        assert out[0]['intent'] == INTENT_OTHER
+        kept, _ = IntentClassifier(drop_no_key_rounds=False)([{'foo': 'bar'}])
+        assert kept[0]['intent'] == INTENT_OTHER
 
     def test_messages_is_none(self):
-        out = IntentClassifier().classify_intent([{'messages': None}])
-        assert out[0]['intent'] == INTENT_OTHER
+        kept, _ = IntentClassifier(drop_no_key_rounds=False)([{'messages': None}])
+        assert kept[0]['intent'] == INTENT_OTHER
 
     def test_messages_empty_list(self):
-        out = IntentClassifier().classify_intent([{'messages': []}])
-        assert out[0]['intent'] == INTENT_OTHER
+        kept, _ = IntentClassifier(drop_no_key_rounds=False)([{'messages': []}])
+        assert kept[0]['intent'] == INTENT_OTHER
 
     def test_messages_with_non_dict_entries(self):
         # Non-dict entries must be silently skipped.
-        out = IntentClassifier().classify_intent([{
+        kept, _ = IntentClassifier()([{
             'messages': [
                 'not a dict',
                 None,
@@ -411,35 +424,32 @@ class TestEdgeCases:
                 _a('因式分解'),
             ]
         }])
-        assert out[0]['intent'] == INTENT_MATH
+        assert kept[0]['intent'] == INTENT_MATH
 
     def test_user_data_preexists_preserved(self):
-        # IntentClassifier merges into existing user_data, must not clobber.
+        # IntentClassifier must merge into existing packed user_data without clobbering.
         rows = [{
             'messages': [_u('解一元二次方程 x^2'), _a('因式分解 (x-2)(x-3)')],
-            'user_data': {
-                'source': 'gsm8k',
-                'difficulty': 'easy'
-            },
+            'user_data': [('source', pack_value('gsm8k')), ('difficulty', pack_value('easy'))],
         }]
-        out = IntentClassifier().classify_intent(rows)
-        ud = out[0]['user_data']
-        assert ud['source'] == 'gsm8k'
-        assert ud['difficulty'] == 'easy'
-        assert ud['key_rounds'] == [1]
-        assert ud['intents'] == {1: INTENT_MATH}
+        kept, _ = IntentClassifier()(rows)
+        row = kept[0]
+        assert _ud_get(row, 'source') == 'gsm8k'
+        assert _ud_get(row, 'difficulty') == 'easy'
+        assert _ud_get(row, 'key_rounds') == [1]
+        assert _ud_get(row, 'intents') == {'1': INTENT_MATH}
 
     def test_input_row_not_mutated(self):
-        # classify_intent must shallow-copy rows; original dict must remain untouched.
+        # IntentClassifier must shallow-copy rows; original dict must remain untouched.
         original = {'messages': [_u('你好'), _a('hi')]}
-        IntentClassifier().classify_intent([original])
+        IntentClassifier(drop_no_key_rounds=False)([original])
         assert 'intent' not in original
         assert 'user_data' not in original
 
     def test_other_intent_does_not_emit_user_data(self):
         out = _classify_one(_u('你好'), _a('hi'))
         # No detectors fired → no key_rounds / intents written.
-        assert 'user_data' not in out or 'key_rounds' not in (out.get('user_data') or {})
+        assert not _has_key_rounds(out)
 
 
 # ── Pluggability ──────────────────────────────────────────────────────────────
@@ -459,19 +469,19 @@ class TestPluggability:
                 ]
 
         ic = IntentClassifier(detectors=[GreetingDetector()])
-        out = ic.classify_intent([_row(_u('hi'), _a('Hello there'))])
-        assert out[0]['intent'] == 'greeting'
+        kept, _ = ic([_row(_u('hi'), _a('Hello there'))])
+        assert kept[0]['intent'] == 'greeting'
 
     def test_empty_detector_list_yields_other(self):
-        ic = IntentClassifier(detectors=[])
-        out = ic.classify_intent([_row(_u('q'), _a('因式分解 一元二次方程'))])
-        assert out[0]['intent'] == INTENT_OTHER
+        ic = IntentClassifier(detectors=[], drop_no_key_rounds=False)
+        kept, _ = ic([_row(_u('q'), _a('因式分解 一元二次方程'))])
+        assert kept[0]['intent'] == INTENT_OTHER
 
     def test_intent_field_override(self):
-        ic = IntentClassifier(intent_field='label')
-        out = ic.classify_intent([_row(_u('q'), _a('a'))])
-        assert 'label' in out[0]
-        assert 'intent' not in out[0]
+        ic = IntentClassifier(intent_field='label', drop_no_key_rounds=False)
+        kept, _ = ic([_row(_u('q'), _a('a'))])
+        assert 'label' in kept[0]
+        assert 'intent' not in kept[0]
 
     def test_definitive_short_circuits_custom_pipeline(self):
         # User-defined definitive detector must halt the pipeline after firing.
@@ -493,5 +503,5 @@ class TestPluggability:
                 return [0]
 
         ic = IntentClassifier(detectors=[StopAll(), NeverRuns()])
-        ic.classify_intent([_row(_u('q'), _a('a'))])
+        ic([_row(_u('q'), _a('a'))])
         assert seen == ['stop']

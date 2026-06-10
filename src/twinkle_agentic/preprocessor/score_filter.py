@@ -25,6 +25,7 @@ import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from twinkle.data_format import pack_value, user_data_get
 from twinkle.preprocessor import Preprocessor
 from twinkle.template import Template
 from twinkle.utils import get_logger
@@ -35,6 +36,11 @@ from .utils import _chr_min_distinct, _ifd_family_metrics, _lp_to_jsonable, _pad
 logger = get_logger(only_local_master=False)
 
 _MIN_RESPONSE_TOKENS = 5
+
+
+def _user_data_lookup(user_data: Any, key: str) -> Any:
+    """Pull a value by key from packed user_data; returns the JSON-decoded value."""
+    return user_data_get(user_data, key)
 
 # ============================================================================
 # Built-in scorers
@@ -570,7 +576,7 @@ class ScoreFilter(Preprocessor):
             if not isinstance(messages, list):
                 continue
             user_data = row.get('user_data') if isinstance(row, dict) else None
-            key_rounds = (user_data.get('key_rounds') if isinstance(user_data, dict) else None)
+            key_rounds = _user_data_lookup(user_data, 'key_rounds')
             if not isinstance(key_rounds, list) or not key_rounds:
                 key_rounds = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get('role') == 'assistant']
             for rnd_idx, asst_idx in enumerate(key_rounds):
@@ -662,9 +668,7 @@ class ScoreFilter(Preprocessor):
     @staticmethod
     def _lookup_intent(row: Dict[str, Any], asst_idx: int) -> Optional[str]:
         user_data = row.get('user_data') if isinstance(row, dict) else None
-        if not isinstance(user_data, dict):
-            return None
-        intents = user_data.get('intents')
+        intents = _user_data_lookup(user_data, 'intents')
         if not isinstance(intents, dict):
             return None
         v = intents.get(asst_idx)
@@ -755,9 +759,8 @@ class ScoreFilter(Preprocessor):
         n_removed_rows = 0
         for ri, row in enumerate(rows):
             user_data = row.get('user_data') if isinstance(row, dict) else None
-            had_key_rounds = (
-                isinstance(user_data, dict) and isinstance(user_data.get('key_rounds'), list)
-                and bool(user_data['key_rounds']))
+            kr_val = _user_data_lookup(user_data, 'key_rounds')
+            had_key_rounds = isinstance(kr_val, list) and bool(kr_val)
             decision = per_row.get(ri)
 
             if decision is None:
@@ -781,7 +784,10 @@ class ScoreFilter(Preprocessor):
                     dropped.append(dict(row, drop_reason='score_all_rounds_failed'))
                     continue
                 new_row = dict(row)
-                new_row['user_data'] = dict(user_data, key_rounds=list(kept))
+                # Re-pack key_rounds; keep all other entries as-is (already packed).
+                rebuilt = [(k, v) for (k, v) in (user_data or []) if k != 'key_rounds']
+                rebuilt.append(('key_rounds', pack_value(list(kept))))
+                new_row['user_data'] = rebuilt
                 out.append(new_row)
             else:
                 if decision['failed'] > 0 and self._drop_row_on_any_fail:

@@ -245,6 +245,30 @@ def msg_content_text(msg: Dict[str, Any]) -> str:
     return ''
 
 
+def msg_has_media(msg: Dict[str, Any]) -> bool:
+    """True if message content contains non-text parts (image/audio/video)."""
+    c = msg.get('content')
+    return isinstance(c, list) and any(isinstance(p, dict) and p.get('type') not in ('text', None) for p in c)
+
+
+def msg_has_payload(msg: Dict[str, Any]) -> bool:
+    """True if a message carries any substantive payload (text, tool_calls, reasoning, or media)."""
+    return bool(
+        msg_content_text(msg).strip()
+        or msg.get('tool_calls')
+        or msg.get('reasoning_content') or msg.get('thinking')
+        or msg_has_media(msg)
+    )
+
+
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
+
+
+def cjk_ratio(text: str) -> float:
+    """Fraction of characters that are CJK (Chinese/Japanese/Korean)."""
+    return len(_CJK_RE.findall(text)) / max(len(text), 1)
+
+
 def normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
     """Return ``tool_calls`` as a list of dicts, handling PyArrow/HF serialization artifacts."""
     tcs = msg.get('tool_calls')

@@ -2,7 +2,7 @@
 import json
 import time
 from typing import Any, Callable, Dict, List, Optional
-
+import os
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
 from twinkle.utils.parallel import PosixFileLock
@@ -15,10 +15,8 @@ from .llm_backend import LLMBackend, OpenAIBackend, SamplerBackend  # noqa: F401
 from .message_normalizer import MessageNormalizer  # noqa: F401
 from .message_sanity import MessageSanityFilter
 from .model_filter import ModelFilter
-from .perplexity import PerplexityFilter
 from .pii_presidio_filter import PIIPresidioFilter
 from .refuse_filter import RefuseFilter
-from .response_refiner import ResponseRefiner
 from .score_filter import ScoreFilter
 from .token_soup import TokenSoupFilter
 
@@ -33,7 +31,6 @@ class QualityPreprocessor(Preprocessor):
     """
 
     def __init__(self, pipeline: List[Callable], dropped_log_path: str = ''):
-        import os
         super().__init__()
         self._pipelines = list(pipeline)
         self._dropped_log_path = dropped_log_path
@@ -61,11 +58,6 @@ class QualityPreprocessor(Preprocessor):
             self._log_dropped(step_name, dropped)
         summary = '\n'.join(stats)
         logger.info(f'[QualityPreprocessor] {total_start} -> {len(rows_list)}\n{summary}')
-        # Serialize variable-schema dicts to JSON strings for Arrow compatibility
-        for row in rows_list:
-            for k in ('user_data', ):
-                if k in row and isinstance(row[k], dict):
-                    row[k] = json.dumps(row[k], ensure_ascii=False)
         return self.map_row_to_col(rows_list)
 
     def _log_dropped(self, step_name: str, dropped: List[Dict[str, Any]]) -> None:

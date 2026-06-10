@@ -3,10 +3,16 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
+from twinkle.data_format import pack_value
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
 
+from .utils import msg_content_text, normalize_tool_calls
+
 logger = get_logger(only_local_master=False)
+
+# Reasoning block regex covers both <think> and <thinking> forms.
+_THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>(.*?)</think(?:ing)?>', re.DOTALL | re.IGNORECASE)
 
 # ── Intent categories ─────────────────────────────────────────────────────────
 INTENT_TOOL_CALL = 'tool_call'
@@ -165,15 +171,6 @@ _DISSATISFACTION_EN_RE = re.compile(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _msg_text(msg: Dict[str, Any]) -> str:
-    c = msg.get('content')
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
-    return ''
-
-
 def _pair_assistant(messages: List[Dict[str, Any]], idx: int, role: str) -> Optional[int]:
     """Resolve which assistant idx represents the round that owns a signal at (idx, role)."""
     if role == 'assistant':
@@ -225,7 +222,7 @@ class _RegexDetector(IntentDetector):
                 continue
             if self.role_filter and role != self.role_filter:
                 continue
-            text = _msg_text(m)
+            text = msg_content_text(m)
             if not text or not self._match(text):
                 continue
             asst_idx = _pair_assistant(messages, idx, role)
@@ -235,7 +232,7 @@ class _RegexDetector(IntentDetector):
 
 
 class ToolCallDetector(IntentDetector):
-    """Mark every assistant turn that carries a ``tool_calls`` payload."""
+    """Mark every assistant turn that carries a real (non-empty) ``tool_calls`` payload."""
 
     intent = INTENT_TOOL_CALL
     definitive = True
@@ -243,7 +240,7 @@ class ToolCallDetector(IntentDetector):
     def __call__(self, messages):
         return [
             i for i, m in enumerate(messages)
-            if isinstance(m, dict) and m.get('role') == 'assistant' and m.get('tool_calls')
+            if isinstance(m, dict) and m.get('role') == 'assistant' and normalize_tool_calls(m)
         ]
 
 
@@ -298,8 +295,7 @@ class ReasoningDetector(IntentDetector):
             if isinstance(rc, str) and len(rc.strip()) >= self._min_chars:
                 rounds.append(i)
                 continue
-            text = _msg_text(m)
-            match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+            match = _THINK_BLOCK_RE.search(msg_content_text(m))
             if match and len(match.group(1).strip()) >= self._min_chars:
                 rounds.append(i)
         return rounds
@@ -325,7 +321,7 @@ class UserDissatisfactionDetector(_RegexDetector):
                 continue
             if role != 'user' or not seen_assistant:
                 continue
-            text = _msg_text(m)
+            text = msg_content_text(m)
             if text and self._match(text):
                 asst_idx = _pair_assistant(messages, idx, role)
                 if asst_idx is not None:
@@ -344,9 +340,9 @@ class IntentClassifier(Preprocessor):
 
     Annotates per row::
 
-        row['intent']                  # primary intent string
-        row['user_data']['key_rounds'] # list[int] of assistant indices
-        row['user_data']['intents']    # dict[int, str] per-round intent
+        row['intent']                            # primary intent string
+        row['user_data'] += [('key_rounds', list[int]),  # assistant indices
+                             ('intents', dict[str, str])] # per-round intent
     """
 
     DEFAULT_DETECTORS: List[IntentDetector] = [
@@ -383,6 +379,7 @@ class IntentClassifier(Preprocessor):
         return round_intents
 
     def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        rows = self.map_col_to_row(rows)
         if not rows:
             return rows, []
 
@@ -395,9 +392,11 @@ class IntentClassifier(Preprocessor):
 
             if round_intents:
                 primary = Counter(round_intents.values()).most_common(1)[0][0]
-                user_data = dict(row.get('user_data') or {})
-                user_data['key_rounds'] = sorted(round_intents)
-                user_data['intents'] = {str(k): v for k, v in round_intents.items()}
+                # Stored entries are (key, json.dumps(value)) for Arrow stability across shards.
+                existing = list(row.get('user_data') or [])
+                user_data = [(k, v) for (k, v) in existing if k not in ('key_rounds', 'intents')]
+                user_data.append(('key_rounds', pack_value(sorted(round_intents))))
+                user_data.append(('intents', pack_value({str(k): v for k, v in round_intents.items()})))
                 row['user_data'] = user_data
             else:
                 if self._drop_no_key_rounds:

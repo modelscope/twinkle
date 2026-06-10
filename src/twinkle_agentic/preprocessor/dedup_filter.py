@@ -1,128 +1,123 @@
 import hashlib
 import json
-import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from twinkle.utils.parallel import PosixFileLock
+
+from .utils import msg_content_text
 
 _SYSTEM_INJECTION_RE = re.compile(r'^<(?:system-reminder|system_reminder|context|user_info|attached_files)[ >]',
                                   re.IGNORECASE)
 
 
-def _is_injected_user(content: str) -> bool:
-    """True if user message is system-injected metadata rather than real user input."""
-    return bool(_SYSTEM_INJECTION_RE.match(content.strip()))
+def _is_real_user(msg: Dict[str, Any]) -> bool:
+    if msg.get('role') != 'user':
+        return False
+    text = msg_content_text(msg).strip()
+    if not text:
+        return False
+    return not _SYSTEM_INJECTION_RE.match(text)
 
 
-def _head_tail(text: str, n: int = 100) -> str:
-    """First n chars + last n chars for stronger fingerprint."""
+def _head_tail(text: str, n: int) -> str:
+    text = text.strip()
     if len(text) <= n * 2:
         return text
     return text[:n] + text[-n:]
 
 
-def _conversation_sig(row: Dict[str, Any], prefix_chars: int = 100, asst_chars: int = 100) -> str:
-    """Hash of first real user (head+tail) + following assistant (head+tail).
+def _prefix_signature(messages: List[Dict[str, Any]], user_chars: int, asst_chars: int) -> str:
+    """Hash of the first real user turn (head+tail) + its first assistant reply (head+tail).
 
-    Skips system messages and system-injected user messages (e.g. <system-reminder>)
-    to avoid template-dominated signatures in agent frameworks.
-    Fallback: if no real user found, use first two non-empty assistant contents.
+    Skips system messages and system-injected user messages so the signature reflects the
+    actual conversation prefix, not template boilerplate. Falls back to the first two
+    non-empty assistant contents when no real user is present.
     """
-    msgs = row.get('messages') or []
     user_text = ''
     asst_text = ''
-    for m in msgs:
-        role = m.get('role', '')
-        content = m.get('content') or ''
-        if role == 'user' and not user_text:
-            if _is_injected_user(content):
-                continue
-            user_text = _head_tail(content, prefix_chars)
-        elif role == 'assistant' and user_text and not asst_text:
-            asst_text = _head_tail(content, asst_chars)
-            break
-    # Fallback for agent-autonomous convos where all user msgs are injected
-    if not user_text:
-        asst_parts = []
-        for m in msgs:
-            if m.get('role') == 'assistant':
-                c = (m.get('content') or '').strip()
-                if c:
-                    asst_parts.append(_head_tail(c, prefix_chars))
-                    if len(asst_parts) >= 2:
+    seen_user = False
+    for msg in messages:
+        if not seen_user:
+            if _is_real_user(msg):
+                user_text = _head_tail(msg_content_text(msg), user_chars)
+                seen_user = True
+            continue
+        if msg.get('role') == 'assistant':
+            t = msg_content_text(msg).strip()
+            if t:
+                asst_text = _head_tail(t, asst_chars)
+                break
+    if not seen_user:
+        parts: List[str] = []
+        for msg in messages:
+            if msg.get('role') == 'assistant':
+                t = msg_content_text(msg).strip()
+                if t:
+                    parts.append(_head_tail(t, asst_chars))
+                    if len(parts) == 2:
                         break
-        raw = '||'.join(asst_parts) if asst_parts else json.dumps(msgs[:3], ensure_ascii=False)[:400]
-    else:
-        raw = f'{user_text}||{asst_text}'
-    return hashlib.md5(raw.encode()).hexdigest()
+        user_text = parts[0] if parts else ''
+        asst_text = parts[1] if len(parts) > 1 else ''
+    return hashlib.md5(json.dumps([user_text, asst_text], ensure_ascii=False).encode()).hexdigest()
+
+
+def _full_hash(messages: List[Dict[str, Any]]) -> str:
+    return hashlib.md5(json.dumps(messages, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 class DedupFilter(Preprocessor):
-    """Conversation-level near-dedup: keep at most max_per_sig rows per signature.
+    """Global longest-wins deduplication over a fully materialized row collection.
 
-    Uses file-backed state + PosixFileLock for multi-process safety.
+    Contract:
+        - Pure in-memory single pass. No state files, no locks, no shared cross-process state,
+          no cross-call memory. Same input → same output, every time.
+        - Must see the entire dataset in ONE __call__. NOT a per-batch pipeline step:
+          do not place inside QualityPreprocessor (which calls steps per Dataset.map batch
+          — per-batch state cannot express a global longest-wins decision).
+        - Run on List[Dict] before or after the QP pipeline; the caller is responsible for
+          materializing the dataset and re-wrapping the kept rows.
+
+    Semantics:
+        - Signature = first real user (head+tail) + first assistant reply (head+tail).
+          System and system-injected user messages are skipped.
+        - Within a signature group, the row with the most messages wins; exact-content
+          duplicates (matching full-hash) are silently collapsed; ties on message count
+          but different content keep the first-seen row.
+        - All non-winners are returned as dropped with drop_reason='duplicate'.
     """
 
-    def __init__(self,
-                 max_per_sig: int = 1,
-                 prefix_chars: int = 100,
-                 asst_chars: int = 100,
-                 state_file: Optional[str] = None):
-        self._max = max_per_sig
+    def __init__(self, prefix_chars: int = 100, asst_chars: int = 100):
+        super().__init__()
         self._prefix = prefix_chars
         self._asst_chars = asst_chars
-        # Deterministic path derived from init params — keeps HF Datasets fingerprint stable across runs
-        sig = hashlib.md5(f'{max_per_sig}_{prefix_chars}_{asst_chars}'.encode()).hexdigest()[:12]
-        self._state_file = state_file or f'/tmp/dedup_filter_{sig}.json'
-        self._lock_file = self._state_file + '.lock'
-        # Wipe stale state from prior runs (deterministic path means no auto-isolation)
-        for p in (self._state_file, self._lock_file):
-            try:
-                os.remove(p)
-            except FileNotFoundError:
-                pass
 
-    def __call__(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def __call__(self, rows) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
-        with PosixFileLock(self._lock_file):
-            # state: {sig: {"n": msg_count, "fh": full_hash}}
-            seen: Dict[str, Dict[str, Any]] = {}
-            if os.path.exists(self._state_file):
-                with open(self._state_file) as f:
-                    seen = json.load(f)
+        # sig -> {'idx': winner index in `rows`, 'n': msg count, 'fh': full-message hash}
+        best: Dict[str, Dict[str, Any]] = {}
+        keep: List[bool] = [False] * len(rows)
+        dropped: List[Dict[str, Any]] = []
 
-            out: List[Dict[str, Any]] = []
-            dropped: List[Dict[str, Any]] = []
-            batch_idx: Dict[str, int] = {}
+        for i, row in enumerate(rows):
+            msgs = row.get('messages') or []
+            sig = _prefix_signature(msgs, self._prefix, self._asst_chars)
+            n = len(msgs)
+            fh = _full_hash(msgs)
+            cur = best.get(sig)
+            if cur is None:
+                best[sig] = {'idx': i, 'n': n, 'fh': fh}
+                keep[i] = True
+            elif fh == cur['fh']:
+                dropped.append(dict(row, drop_reason='duplicate'))
+            elif n > cur['n']:
+                # Longer version wins — demote the previous winner
+                keep[cur['idx']] = False
+                dropped.append(dict(rows[cur['idx']], drop_reason='duplicate'))
+                best[sig] = {'idx': i, 'n': n, 'fh': fh}
+                keep[i] = True
+            else:
+                dropped.append(dict(row, drop_reason='duplicate'))
 
-            for r in rows:
-                sig = _conversation_sig(r, self._prefix, self._asst_chars)
-                msgs = r.get('messages') or []
-                n = len(msgs)
-                fh = hashlib.md5(json.dumps(msgs, ensure_ascii=False).encode()).hexdigest()
-
-                prev = seen.get(sig)
-                if prev is None:
-                    seen[sig] = {'n': n, 'fh': fh}
-                    batch_idx[sig] = len(out)
-                    out.append(r)
-                elif fh == prev['fh']:
-                    dropped.append(dict(r, drop_reason='duplicate'))
-                elif n > prev['n']:
-                    # Longer version wins
-                    seen[sig] = {'n': n, 'fh': fh}
-                    if sig in batch_idx:
-                        old_idx = batch_idx[sig]
-                        dropped.append(dict(out[old_idx], drop_reason='duplicate'))
-                        out[old_idx] = r
-                    else:
-                        batch_idx[sig] = len(out)
-                        out.append(r)
-                else:
-                    dropped.append(dict(r, drop_reason='duplicate'))
-
-            with open(self._state_file, 'w') as f:
-                json.dump(seen, f)
-        return out, dropped
+        kept = [rows[i] for i, k in enumerate(keep) if k]
+        return kept, dropped

@@ -117,6 +117,8 @@ class PackingDataset(Dataset):
         output = {}
         for key in rows[0]:
             output[key] = [r[key] for r in rows]
+            if len(output[key]) > 1:
+                print()
             if key in ('mm_token_type_ids', 'position_ids'):
                 output[key] = np.concatenate([np.asarray(v) for v in output[key]], axis=-1).tolist()
             elif isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):

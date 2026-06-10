@@ -22,10 +22,9 @@ from twinkle_agentic.preprocessor import (
 logger = get_logger()
 
 # ── Model ────────────────────────────────────────────────────────────────────
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-MODEL_LOCAL_PATH = os.environ.get('MODEL_LOCAL_PATH', 'Qwen/Qwen3.5-4B')
-TEMPLATE_NAME = 'Qwen3_5Template'
-MAX_LENGTH = 30000
+MODEL_ID = 'ms://Qwen/Qwen3-4B'
+TEMPLATE_NAME = 'Template'
+MAX_LENGTH = 80000
 
 # ── GPU allocation ───────────────────────────────────────────────────────────
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 8))
@@ -33,7 +32,7 @@ SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 0))
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
 # ── Training ─────────────────────────────────────────────────────────────────
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 1))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRAD_ACCUM', 4))
 LOG_INTERVAL = 1
@@ -156,7 +155,7 @@ def _stream_csv_rows(csv_path: str, max_rows: int = 0) -> Iterator[Dict[str, Any
                 'source': Path(csv_path).stem,
                 'model_id': _model,
                 'messages': messages,
-                'user_data': {},
+                'user_data': [],
             }
             emitted += 1
             if max_rows and emitted >= max_rows:
@@ -206,6 +205,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
                     '角色扮演', '扮演', '人设', 'roleplay', 'role play', 'cosplay',
                     '群聊模拟', '虚拟角色', '二次元', 'OC设定',
                 ],
+                max_rounds=30,
             ),
             RefuseFilter(),
             DeadLoopFilter(),
@@ -213,49 +213,26 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
             SpecialCharsFilter(max_ratio=0.6),
             TokenSoupFilter(max_chars=8000),
             IntentClassifier(),
-            # Phase 12: conversation-level dedup (max 3 per system+user signature)
-            DedupFilter(max_per_sig=1),
-            # ScoreFilter temporarily disabled — reuses Ray vLLMSampler backend
-            # which is incompatible with HF Dataset.map(num_proc>1) workers.
             # ScoreFilter(
             #     template=template,
             #     backend=backend,
             #     scorers=[
             #         ChrMinScorer(),
-            #         # PassNScorer(
-            #         #     backend=backend,
-            #         #     judge_model=JUDGE_MODEL or None,
-            #         #     judge_base_url=JUDGE_BASE_URL,
-            #         #     judge_api_key=JUDGE_API_KEY,
-            #         #     n=4,
-            #         #     min_pass=0,
-            #         #     sample_temperature=0.7,
-            #         #     sample_max_tokens=4096,
-            #         #     judge_temperature=JUDGE_TEMPERATURE,
-            #         #     judge_max_tokens=JUDGE_MAX_TOKENS,
-            #         #     judge_max_workers=JUDGE_MAX_WORKERS,
-            #         # ),
-            #         # ParaphraseScorer(
-            #         #     backend=backend,
-            #         #     template=template,
-            #         # ),
             #     ],
-            #     # trace_dir=os.path.join(OUTPUT_DIR, 'score_traces'),
             # ),
             # PIIPresidioFilter(languages=('en', 'zh')),
-            # Phase 13: response refinement
-            # ResponseRefiner(
-            #     backend=backend,
-            #     temperature=REFINE_TEMPERATURE,
-            #     max_tokens=REFINE_MAX_TOKENS,
-            #     max_workers=8,
-            # ),
         ],
         dropped_log_path=DROPPED_DATA_PATH,
     )
-    dataset.map(qp, num_proc=MAP_NUM_PROC, load_from_cache_file=True)
-    dataset.save_as('output/streaming_sft/filtered.jsonl')
+    dataset.map(qp, num_proc=8, load_from_cache_file=True)
+    dataset.map(
+        QualityPreprocessor(pipeline=[DedupFilter()]),
+        num_proc=1,
+        batch_size=len(dataset.dataset),
+        load_from_cache_file=True,
+    )
 
+    print(len(dataset.dataset))
     dataset.set_template(
         TEMPLATE_NAME,
         model_id=MODEL_ID,
@@ -263,7 +240,7 @@ def build_dataset(backend: SamplerBackend) -> Dataset:
         truncation_strategy='delete',
         enable_thinking=False,
     )
-    dataset.encode(num_proc=MAP_NUM_PROC, load_from_cache_file=True)
+    dataset.encode(num_proc=16, load_from_cache_file=True)
     dataset.pack_dataset()
     return dataset
 
@@ -284,7 +261,7 @@ def train():
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
         # DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU', gpus_per_worker=2),
     ]
-    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=2, cp_size=4)
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=1, cp_size=8)
     # sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS // 2, tp_size=2)
     twinkle.initialize(mode='local', nproc_per_node=NUM_GPUS, groups=device_groups,
                        global_device_mesh=model_mesh, lazy_collect=False)
@@ -333,11 +310,6 @@ def train():
     logger.info(f'Total steps: {NUM_STEPS}, model GPUs: {MODEL_GPUS}, sampler GPUs: {SAMPLER_GPUS}')
 
     for cur_step, batch in enumerate(dataloader):
-
-        print([len(m['input_ids']) for m in batch])
-        if cur_step == 17:
-            print()
-
         model.forward_backward(inputs=batch)
         model.clip_grad_and_step()
 
