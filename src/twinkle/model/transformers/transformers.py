@@ -210,7 +210,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
-        return bool(use_rank0_broadcast() and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+        if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
+            return False
+        local_rank = Platform.get_local_rank()
+        if local_rank < 0:
+            raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')
+        return local_rank != 0
 
     def _init_empty_model_from_config(self, model_cls, **kwargs):
         from accelerate import init_empty_weights
