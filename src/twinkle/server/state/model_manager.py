@@ -166,9 +166,13 @@ class ModelManager(BaseManager[ModelRecord]):
             await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
             raise
 
-    async def remove(self, model_id: str) -> bool:
-        """Remove a record by ID, decrementing its owning token's counter."""
-        record = await self.get(model_id)
+    async def remove(self, model_id: str, *, _record: ModelRecord | None = None) -> bool:
+        """Remove a record by ID, decrementing its owning token's counter.
+
+        When the caller already holds the record (e.g. from a prior ``get_all``),
+        pass it via ``_record`` to skip the redundant backend fetch.
+        """
+        record = _record or await self.get(model_id)
         if record is None:
             return False
         await super().remove(model_id)
@@ -194,7 +198,7 @@ class ModelManager(BaseManager[ModelRecord]):
             if created_at < cutoff_time:
                 expired_ids.append(model_id)
         for model_id in expired_ids:
-            await self.remove(model_id)
+            await self.remove(model_id, _record=all_records[model_id])
         return len(expired_ids)
 
     # ----- Backend-derived helpers --------------------------------------- #

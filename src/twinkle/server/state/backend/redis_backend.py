@@ -142,6 +142,14 @@ class RedisBackend(StateBackend):
                     continue
         raise ConcurrencyError(f'update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}')
 
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        """Batch-read via native Redis MGET — single round-trip."""
+        if not keys:
+            return []
+        real_keys = [self._make_key(k) for k in keys]
+        raw_values = await self._client.mget(real_keys)
+        return [json.loads(v) if v is not None else None for v in raw_values]
+
     async def close(self) -> None:
         """Close Redis connection."""
         await self._client.aclose()

@@ -181,6 +181,31 @@ def bind_deployment(
     return deployment_cls.options(**deploy_options).bind(*bind_args, **(bind_kwargs or {}))
 
 
+def init_twinkle_runtime(
+    is_mock: bool,
+    nproc_per_node: int,
+    device_group: Any,
+    device_mesh_dict: dict[str, Any],
+) -> Any | None:
+    """Initialize the Twinkle distributed runtime and build a DeviceMesh.
+
+    Shared by ModelManagement and SamplerManagement ``__init__``.
+    Returns ``None`` for mock backends (CPU-only, no device mesh).
+    """
+    import twinkle
+    from twinkle import DeviceMesh
+
+    if is_mock:
+        twinkle.initialize(
+            mode='ray', nproc_per_node=nproc_per_node, ncpu_proc_per_node=1, groups=[device_group], lazy_collect=False)
+        return None
+
+    twinkle.initialize(mode='ray', nproc_per_node=nproc_per_node, groups=[device_group], lazy_collect=False)
+    if 'mesh_dim_names' in device_mesh_dict:
+        return DeviceMesh(**device_mesh_dict)
+    return DeviceMesh.from_sizes(**device_mesh_dict)
+
+
 class LazyCleanupMixin:
     """Single source of the lazy first-request ServerState cleanup-start behavior.
 

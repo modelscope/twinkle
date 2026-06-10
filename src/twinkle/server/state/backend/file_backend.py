@@ -209,6 +209,21 @@ class FileBackend(StateBackend):
     ) -> Any | None:
         return await asyncio.to_thread(self._update_atomic_sync, key, transform, ttl)
 
+    def _mget_sync(self, keys: list[str]) -> list[Any | None]:
+        with self._locked():
+            data = self._load_sync()
+            results: list[Any | None] = []
+            for key in keys:
+                entry = data.get(key)
+                if entry is None or self._is_expired(entry):
+                    results.append(None)
+                else:
+                    results.append(entry['value'])
+            return results
+
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        return await asyncio.to_thread(self._mget_sync, keys)
+
     async def close(self) -> None:
         """File backend has no persistent connection — nothing to release."""
         pass

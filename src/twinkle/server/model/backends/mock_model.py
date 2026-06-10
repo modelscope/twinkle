@@ -12,29 +12,15 @@ subclassing it — the base class lives in a torch-importing module.
 """
 from __future__ import annotations
 
-import hashlib
 import numpy as np
 import os
 from typing import Any
 
 from twinkle import remote_class
 from twinkle.utils.logger import get_logger
+from twinkle.utils.seed import stable_seed
 
 logger = get_logger()
-
-
-def _seed_for(model_id: str, adapter_name: str | None, seed: int, *extra: Any) -> int:
-    """Deterministic per-request RNG seed derived from string/int components.
-
-    Uses SHA-256 over a canonical string form rather than Python's built-in
-    ``hash()``: the latter is salted per process (PYTHONHASHSEED) for tuples
-    containing strings, which would make identical requests on different
-    replicas / restarts produce different outputs.
-    """
-    parts = (str(model_id), str(adapter_name), str(int(seed)), *(repr(x) for x in extra))
-    digest = hashlib.sha256('\x1f'.join(parts).encode('utf-8')).digest()
-    # numpy seeds must fit in uint32; take the first 4 bytes of the digest.
-    return int.from_bytes(digest[:4], 'big')
 
 
 @remote_class()
@@ -76,7 +62,7 @@ class TwinkleCompatMockModel:
         seq_lens = _input_seq_lengths(inputs)
         out: list[dict[str, Any]] = []
         for idx, seq_len in enumerate(seq_lens):
-            rng = np.random.default_rng(_seed_for(self.model_id, adapter_name, self._rng_seed, idx, seq_len))
+            rng = np.random.default_rng(stable_seed(self.model_id, adapter_name, self._rng_seed, idx, seq_len))
             logprobs = rng.uniform(-2.0, 0.0, size=seq_len).astype(np.float32)
             elementwise_loss = rng.uniform(0.0, 1.0, size=seq_len).astype(np.float32)
             out.append({
@@ -90,7 +76,7 @@ class TwinkleCompatMockModel:
         return [_to_tinker_loss_outputs(self._build_forward_result(inputs, adapter_name)), 0.0]
 
     def tinker_forward_backward(self, *, inputs: Any, adapter_name: str, loss_fn: str, **kwargs: Any) -> list[Any]:
-        loss_seed = _seed_for(self.model_id, adapter_name, self._rng_seed, 'loss', loss_fn)
+        loss_seed = stable_seed(self.model_id, adapter_name, self._rng_seed, 'loss', loss_fn)
         loss = float(np.random.default_rng(loss_seed).uniform(0.0, 1.0))
         return [_to_tinker_loss_outputs(self._build_forward_result(inputs, adapter_name, loss_value=loss)), loss]
 

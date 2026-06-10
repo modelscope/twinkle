@@ -12,7 +12,6 @@ produce identical token sequences and logprobs.
 """
 from __future__ import annotations
 
-import hashlib
 import numpy as np
 import time
 from typing import Any
@@ -20,21 +19,9 @@ from typing import Any
 from twinkle import remote_class
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.utils.logger import get_logger
+from twinkle.utils.seed import stable_seed
 
 logger = get_logger()
-
-
-def _stable_seed(*parts: Any) -> int:
-    """Cross-process-stable numpy seed (uint32) derived from string parts.
-
-    Python's built-in ``hash()`` of a tuple containing strings is salted per
-    process (PYTHONHASHSEED), which would make identical sample requests on
-    different replicas / restarts produce different outputs. Use a stable
-    digest instead.
-    """
-    canonical = '\x1f'.join(str(p) for p in parts).encode('utf-8')
-    digest = hashlib.sha256(canonical).digest()
-    return int.from_bytes(digest[:4], 'big')
 
 
 @remote_class()
@@ -81,7 +68,7 @@ class MockSampler:
         for prompt_idx, _ in enumerate(normalized):
             sequences: list[SampledSequence] = []
             for sample_idx in range(num_samples):
-                seed = _stable_seed(self.model_id, adapter_name, self._seed, prompt_idx, sample_idx)
+                seed = stable_seed(self.model_id, adapter_name, self._seed, prompt_idx, sample_idx)
                 rng = np.random.default_rng(seed)
                 tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
                 logprobs_per_token = rng.uniform(-2.0, 0.0, size=max_tokens).astype(float).tolist()
@@ -110,7 +97,7 @@ class MockSampler:
         if max_tokens is None or max_tokens < 1:
             raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r}')
 
-        seed = _stable_seed(self.model_id, adapter_name, 0, 0)
+        seed = stable_seed(self.model_id, adapter_name, 0, 0)
         rng = np.random.default_rng(seed)
         tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
 
@@ -121,14 +108,8 @@ class MockSampler:
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        from . import STREAM_SENTINEL
-        try:
-            for delta, reason in self.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
-                queue.put((delta, reason))
-        except Exception as e:
-            queue.put(e)
-        finally:
-            queue.put(STREAM_SENTINEL)
+        from . import stream_to_queue
+        stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:
         return None

@@ -64,11 +64,13 @@ class BaseManager(ABC, Generic[T]):
         return [self._strip_prefix(k) for k in raw_keys]
 
     async def get_all(self) -> dict[str, T]:
-        """Load all records from backend. Used for index rebuilding."""
+        """Load all records from backend. Uses batch mget for efficiency."""
         all_keys = await self._backend.keys(f'{self._prefix}*')
+        if not all_keys:
+            return {}
+        values = await self._backend.mget(all_keys)
         result = {}
-        for key in all_keys:
-            data = await self._backend.get(key)
+        for key, data in zip(all_keys, values):
             if data is not None:
                 resource_id = self._strip_prefix(key)
                 result[resource_id] = self._record_type.model_validate(data)

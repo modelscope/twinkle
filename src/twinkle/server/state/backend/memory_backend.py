@@ -93,6 +93,16 @@ class _StateActor:
         self._store[key] = (new_value, expire_at)
         return new_value
 
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        results: list[Any | None] = []
+        for key in keys:
+            if self._is_expired(key):
+                results.append(None)
+            else:
+                value, _ = self._store[key]
+                results.append(value)
+        return results
+
     async def close(self) -> None:
         self._store.clear()
 
@@ -154,6 +164,9 @@ class RayActorBackend(StateBackend):
         ttl: int | None = None,
     ) -> Any | None:
         return await self._actor.update_atomic.remote(key, transform, ttl)
+
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        return await self._actor.mget.remote(keys)
 
     async def close(self) -> None:
         await self._actor.close.remote()

@@ -80,6 +80,14 @@ class StateBackend(ABC):
         """
         ...
 
+    async def mget(self, keys: list[str]) -> list[Any | None]:
+        """Batch-read multiple keys. Returns values in the same order as *keys*.
+
+        Default implementation falls back to serial ``get()`` calls.
+        Backends should override for efficiency (e.g. Redis MGET).
+        """
+        return [await self.get(key) for key in keys]
+
     @abstractmethod
     async def close(self) -> None:
         """Close backend connection / release resources."""

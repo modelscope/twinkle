@@ -12,10 +12,9 @@ from ray import serve
 from ray.serve.config import RequestRouterConfig
 from typing import Any
 
-import twinkle
-from twinkle import DeviceGroup, DeviceMesh
+from twinkle import DeviceGroup
 from twinkle.server.common.router import StickyLoraRequestRouter
-from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
@@ -80,21 +79,12 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
                  **kwargs):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
-        if backend == 'mock':
-            twinkle.initialize(
-                mode='ray',
-                nproc_per_node=nproc_per_node,
-                ncpu_proc_per_node=1,
-                groups=[self.device_group],
-                lazy_collect=False)
-            self.device_mesh = None
-        else:
-            twinkle.initialize(
-                mode='ray', nproc_per_node=nproc_per_node, groups=[self.device_group], lazy_collect=False)
-            if 'mesh_dim_names' in device_mesh:
-                self.device_mesh = DeviceMesh(**device_mesh)
-            else:
-                self.device_mesh = DeviceMesh.from_sizes(**device_mesh)
+        self.device_mesh = init_twinkle_runtime(
+            is_mock=(backend == 'mock'),
+            nproc_per_node=nproc_per_node,
+            device_group=self.device_group,
+            device_mesh_dict=device_mesh,
+        )
         self.replica_id = serve.get_replica_context().replica_id.unique_id
         self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id

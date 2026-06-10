@@ -421,14 +421,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        from twinkle.server.sampler.backends import STREAM_SENTINEL
-        try:
-            for delta, reason in self.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
-                queue.put((delta, reason))
-        except Exception as e:
-            queue.put(e)
-        finally:
-            queue.put(STREAM_SENTINEL)
+        from twinkle.server.sampler.backends import stream_to_queue
+        stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:
