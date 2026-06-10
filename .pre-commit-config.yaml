@@ -42,4 +42,3 @@ repos:
       - id: mixed-line-ending
         args: ["--fix=lf"]
         exclude: ^(client_tools/|src/twinkle_client/)
-
