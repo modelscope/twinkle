@@ -60,6 +60,7 @@ def build_deployment_app(
     fastapi_kwargs: dict[str, Any] | None = None,
     on_shutdown: OnShutdown | None = None,
     attach_cleanup_middleware: bool = False,
+    attach_replica_id_header: bool = False,
 ) -> FastAPI:
     """Build the FastAPI app with the canonical lifespan + middleware stack + routes.
 
@@ -88,6 +89,8 @@ def build_deployment_app(
             lifespan shutdown (Gateway: ``proxy.close``; Model: ``shutdown``).
         attach_cleanup_middleware: Gateway-only — install the lazy-cleanup
             middleware because the Gateway has no per-handler request hook.
+        attach_replica_id_header: Add ``X-Twinkle-Replica-Id`` to every
+            response (Model + Sampler deployments).
     """
 
     @asynccontextmanager
@@ -132,6 +135,18 @@ def build_deployment_app(
 
     app.middleware('http')(create_tracing_middleware(component))
     app.middleware('http')(create_metrics_middleware(component))
+
+    if attach_replica_id_header:
+
+        @app.middleware('http')
+        async def inject_replica_id(request: Request, call_next):
+            response = await call_next(request)
+            try:
+                ctx = serve.get_replica_context()
+                response.headers['X-Twinkle-Replica-Id'] = ctx.replica_id.unique_id
+            except Exception:
+                pass
+            return response
 
     register_routes(app, get_servable)
     return app

@@ -16,6 +16,18 @@ from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
 
 logger = get_logger()
 
+_FINISH_REASON_MAP: dict[str, StopReason] = {
+    'stop': 'stop',
+    'abort': 'abort',
+    'error': 'error',
+}
+
+
+def _map_finish_reason(reason: str | None) -> StopReason:
+    if reason is None:
+        return 'length'
+    return _FINISH_REASON_MAP.get(str(reason), 'length')
+
 
 def get_vllm_max_lora_rank(lora_rank: int) -> int:
     """Get the nearest allowed vLLM LoRA rank."""
@@ -181,10 +193,13 @@ class VLLMEngine(BaseSamplerEngine):
         return engine
 
     async def get_tokenizer(self):
-        """Get the tokenizer."""
+        """Get the tokenizer.
+
+        vLLM >=0.19 returns a sync object; older versions return a coroutine.
+        """
         if self._tokenizer is None:
             tok = self.engine.get_tokenizer()
-            if hasattr(tok, '__await__'):
+            if inspect.isawaitable(tok):
                 tok = await tok
             self._tokenizer = tok
         return self._tokenizer
@@ -295,10 +310,7 @@ class VLLMEngine(BaseSamplerEngine):
                             sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
                             seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
 
-            # Map finish_reason to StopReason
-            stop_reason: StopReason = 'length'
-            if output.finish_reason in ('stop', 'eos_token'):
-                stop_reason = 'stop'
+            stop_reason: StopReason = _map_finish_reason(output.finish_reason)
 
             sequences.append(SampledSequence(
                 stop_reason=stop_reason,
@@ -394,7 +406,7 @@ class VLLMEngine(BaseSamplerEngine):
                 delta_text = tokenizer.decode(delta_token_ids, skip_special_tokens=True) if delta_token_ids else ''
                 finish_reason: Optional[str] = None
                 if comp_output.finish_reason is not None:
-                    finish_reason = 'stop' if comp_output.finish_reason in ('stop', 'eos_token') else 'length'
+                    finish_reason = _map_finish_reason(comp_output.finish_reason)
                 yield delta_text, finish_reason
 
     # -----------------------------------------------------------------

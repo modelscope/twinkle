@@ -86,9 +86,9 @@ def translate_response(
     choices = []
     total_tokens = 0
 
-    for _sample_idx, sample in enumerate(samples):
+    for sample in samples:
         sequences = sample.get('sequences', [])
-        for _seq_idx, seq in enumerate(sequences):
+        for seq in sequences:
             decoded = seq.get('decoded') or ''
             finish_reason = _map_stop_reason(seq.get('stop_reason'))
             tokens = seq.get('tokens', [])
@@ -168,6 +168,6 @@ def make_error(
 
 def _map_stop_reason(stop_reason: str | None) -> str:
     """Map Twinkle stop_reason to OpenAI finish_reason."""
-    if stop_reason == 'stop':
+    if stop_reason in ('stop', 'abort', 'error'):
         return 'stop'
     return 'length'

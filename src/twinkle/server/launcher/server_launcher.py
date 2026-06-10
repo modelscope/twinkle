@@ -61,10 +61,6 @@ class ServerLauncher:
         self._ray_initialized = False
         self._serve_started = False
 
-    def _build_propagated_env_vars(self) -> dict[str, str]:
-        """Aggregate all env vars that must reach Ray worker processes."""
-        return build_propagated_env_vars()
-
     def _get_builders(self) -> dict[str, Callable]:
         """Get (and cache) the builder functions for all app types."""
         if not self._builders:
@@ -93,7 +89,7 @@ class ServerLauncher:
             # This is required because Ray Serve's ProxyActor runs in separate processes
             runtime_env = get_runtime_env_for_patches()
             # Propagate telemetry + persistence env vars to all Ray workers
-            propagated_env_vars = self._build_propagated_env_vars()
+            propagated_env_vars = build_propagated_env_vars()
             if propagated_env_vars:
                 merged_env_vars = dict(runtime_env.get('env_vars') or {})
                 merged_env_vars.update(propagated_env_vars)
@@ -175,7 +171,7 @@ class ServerLauncher:
         # initialize telemetry and resolve the configured persistence backend
         # regardless of deployment startup order.
         # User-specified env_vars take precedence over our defaults.
-        propagated_env_vars = self._build_propagated_env_vars()
+        propagated_env_vars = build_propagated_env_vars()
         if propagated_env_vars:
             ray_actor_options = dict(deploy_options.get('ray_actor_options') or {})
             runtime_env = dict(ray_actor_options.get('runtime_env') or {})

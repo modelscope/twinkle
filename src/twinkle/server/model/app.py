@@ -78,10 +78,6 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
                  adapter_config: dict[str, Any] | None = None,
                  queue_config: TaskQueueConfig | None = None,
                  **kwargs):
-        # Validate ``backend`` BEFORE any side effect (twinkle.initialize,
-        # DeviceGroup construction, replica registration) so an invalid value
-        # never produces a partial backend nor reaches a ready state.
-        backend = MODEL_SELECTOR.validate(backend)
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
         if backend == 'mock':
@@ -217,17 +213,7 @@ def build_model_app(model_id: str,
     async def _on_shutdown(servable: Any) -> None:
         await servable.shutdown()
 
-    app = build_deployment_app('Model', register_routes, on_shutdown=_on_shutdown)
-
-    @app.middleware('http')
-    async def inject_replica_id(request: Request, call_next):
-        response = await call_next(request)
-        try:
-            ctx = serve.get_replica_context()
-            response.headers['X-Twinkle-Replica-Id'] = ctx.replica_id.unique_id
-        except Exception:
-            pass
-        return response
+    app = build_deployment_app('Model', register_routes, on_shutdown=_on_shutdown, attach_replica_id_header=True)
 
     return bind_deployment(
         app,

@@ -74,8 +74,6 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                  engine_args: dict[str, Any] | None = None,
                  queue_config: TaskQueueConfig | None = None,
                  **kwargs):
-        # Validate ``sampler_type`` BEFORE any side effect.
-        sampler_type = SAMPLER_SELECTOR.validate(sampler_type)
         self.device_group = DeviceGroup(**device_group)
         if sampler_type == 'mock':
             twinkle.initialize(
@@ -183,17 +181,8 @@ def build_sampler_app(model_id: str,
             'description': 'REST API for distributed text generation inference (Tinker + Twinkle)',
             'version': '1.0.0',
         },
+        attach_replica_id_header=True,
     )
-
-    @app.middleware('http')
-    async def inject_replica_id(request: Request, call_next):
-        response = await call_next(request)
-        try:
-            ctx = serve.get_replica_context()
-            response.headers['X-Twinkle-Replica-Id'] = ctx.replica_id.unique_id
-        except Exception:
-            pass
-        return response
 
     return bind_deployment(
         app,

@@ -195,13 +195,12 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
         pass
 
     # Check if it's directly a supported base model
-    supported_names = [m.model_name for m in gateway.supported_models]
-    if model in supported_names:
+    if model in gateway._supported_model_names:
         return model
 
     # Fallback: if there's exactly one supported model, use it
-    if len(supported_names) == 1:
-        return supported_names[0]
+    if len(gateway._supported_model_names) == 1:
+        return next(iter(gateway._supported_model_names))
 
     return None
 

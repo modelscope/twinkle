@@ -250,20 +250,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         logprobs_only: bool = False,
         disable_lora: bool = False,
     ) -> SampleResponse:
-        """Sample a single input asynchronously.
-
-        Args:
-            feat: Encoded input features containing 'input_ids' and optionally 'images'/'videos'.
-            sampling_params: Sampling parameters.
-            adapter_path: Optional LoRA adapter path (legacy, prefer lora_request).
-            lora_request: Pre-built LoRARequest to attach to the sampling request.
-                Avoids repeated ``_get_or_load_lora`` calls per input.
-            multi_modal_data: The multi modal data dict.
-            logprobs_only: Only return logprobs (no generated tokens).
-
-        Returns:
-            A SampleResponse object
-        """
+        """Sample a single input asynchronously."""
         response = await self.engine.sample(
             prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
             sampling_params=sampling_params,
@@ -281,10 +268,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             else:
                 feat['input_ids'] = response.prompt_token_ids
                 feat['labels'] = [-100] * len(response.prompt_token_ids)
-        if not logprobs_only:
-            # response.sequences contains num_samples sequences for this prompt
-            sequences = []
-            for seq in response.sequences:
+        sequences = []
+        for seq in response.sequences:
+            if logprobs_only:
+                sampled_seq = SampledSequence(
+                    tokens=[],
+                    stop_reason=seq.stop_reason,
+                    new_input_feature=_convert_ndarray_to_list(feat),
+                )
+            else:
                 sampled_seq = SampledSequence(
                     stop_reason=seq.stop_reason,
                     tokens=seq.tokens,
@@ -292,26 +284,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=_convert_ndarray_to_list(self.template.concat_input_feature(feat, seq.tokens)),
                 )
-                sequences.append(sampled_seq)
-            return SampleResponse(
-                prompt_token_ids=response.prompt_token_ids,
-                sequences=sequences,
-                prompt_logprobs=response.prompt_logprobs,
-                topk_prompt_logprobs=response.topk_prompt_logprobs)
-        else:
-            sequences = []
-            for seq in response.sequences:
-                sampled_seq = SampledSequence(
-                    tokens=[],
-                    stop_reason=seq.stop_reason,
-                    new_input_feature=_convert_ndarray_to_list(feat),
-                )
-                sequences.append(sampled_seq)
-            return SampleResponse(
-                prompt_token_ids=response.prompt_token_ids,
-                sequences=sequences,
-                prompt_logprobs=response.prompt_logprobs,
-                topk_prompt_logprobs=response.topk_prompt_logprobs)
+            sequences.append(sampled_seq)
+        return SampleResponse(
+            prompt_token_ids=response.prompt_token_ids,
+            sequences=sequences,
+            prompt_logprobs=response.prompt_logprobs,
+            topk_prompt_logprobs=response.topk_prompt_logprobs)
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
     def sample(
@@ -443,14 +421,14 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        SENTINEL = '__STREAM_END__'
+        from twinkle.server.sampler.backends import STREAM_SENTINEL
         try:
             for delta, reason in self.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
                 queue.put((delta, reason))
         except Exception as e:
             queue.put(e)
         finally:
-            queue.put(SENTINEL)
+            queue.put(STREAM_SENTINEL)
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:

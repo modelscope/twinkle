@@ -42,6 +42,7 @@ def mock_gateway():
     mock_self.state = mock_state
     mock_self.proxy = mock_proxy
     mock_self.supported_models = [types.SupportedModel(model_name='Qwen/Qwen3.5-4B')]
+    mock_self._supported_model_names = frozenset(['Qwen/Qwen3.5-4B'])
 
     app = FastAPI()
     _register_openai_routes(app, lambda: mock_self)
@@ -124,6 +125,7 @@ class TestChatCompletions:
     def test_model_not_found_returns_404(self, mock_gateway):
         mock_self, app = mock_gateway
         mock_self.supported_models = []  # No supported models
+        mock_self._supported_model_names = frozenset()
 
         client = TestClient(app)
         resp = client.post(

@@ -152,7 +152,7 @@ def create_tracing_middleware(service_component: str):
         # SERVER span attaches to the propagated context instead of starting a
         # fresh, disconnected trace. A request with no trace headers yields an
         # empty context and a new trace is started normally.
-        ctx = extract(dict(request.headers))
+        ctx = extract(request.headers)
 
         with tracer.start_as_current_span(
                 span_name,
