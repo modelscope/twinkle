@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, Request
+from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 from fastapi.responses import JSONResponse, StreamingResponse
 
 if TYPE_CHECKING:
@@ -201,17 +202,11 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
 def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
     """Build the headers needed for sticky session routing."""
     auth = (
-        request.headers.get('Twinkle-Authorization')
-        or request.headers.get('Authorization')
+        request.headers.get(H_AUTH_TWINKLE)
+        or request.headers.get(H_AUTH)
         or ''
     )
-    return {
-        'X-Ray-Serve-Request-Id': sticky_key,
-        'Serve-Multiplexed-Model-Id': sticky_key,
-        'serve_multiplexed_model_id': sticky_key,
-        'x-request-id': sticky_key,
-        'Twinkle-Authorization': auth,
-    }
+    return build_routing_headers(sticky_key, auth)
 
 
 # Per-process cache; each Ray Serve worker holds its own instance.

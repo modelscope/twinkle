@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
 
+from twinkle_client.http.headers import build_routing_headers
 from twinkle_client.http.utils import get_api_key, get_request_id
 
 _patched = False
@@ -127,19 +128,7 @@ def _make_patched_service_client_init(original):
         if api_key is None:
             api_key = get_api_key()
 
-        rid = get_request_id()
-        # Ray Serve 2.55+ reads ``x-request-id`` / ``serve_multiplexed_model_id``
-        # (exact underscored constants from ``ray/serve/_private/constants.py``);
-        # the legacy ``X-Ray-Serve-Request-Id`` / ``Serve-Multiplexed-Model-Id``
-        # are kept for Twinkle's own ``verify_request_token`` middleware.
-        twinkle_headers = {
-            'x-request-id': rid,
-            'serve_multiplexed_model_id': rid,
-            'X-Ray-Serve-Request-Id': rid,
-            'Serve-Multiplexed-Model-Id': rid,
-            'Authorization': 'Bearer ' + api_key,
-            'Twinkle-Authorization': 'Bearer ' + api_key,
-        }
+        twinkle_headers = build_routing_headers(get_request_id(), 'Bearer ' + api_key)
         # Merge: caller-supplied default_headers take precedence over twinkle_headers
         user_default_headers = kwargs.pop('default_headers', {})
         kwargs['default_headers'] = twinkle_headers | user_default_headers

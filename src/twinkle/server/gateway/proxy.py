@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 from fastapi import Request, Response
 
+from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
 
@@ -71,16 +72,12 @@ class ServiceProxy:
         headers = dict(request_headers)
         headers.pop('host', None)
         headers.pop('content-length', None)
-        request_id = request_headers.get('X-Ray-Serve-Request-Id') or request_headers.get('x-request-id')
-        if request_id is not None and not request_headers.get('Serve-Multiplexed-Model-Id'):
-            headers['Serve-Multiplexed-Model-Id'] = request_id
-        # Ray Serve 2.55+ reads ``x-request-id`` / ``serve_multiplexed_model_id``
-        # (constants from ``ray/serve/_private/constants.py``); the legacy
-        # ``X-Ray-Serve-Request-Id`` / ``Serve-Multiplexed-Model-Id`` names
-        # are kept for Twinkle's own ``verify_request_token`` middleware.
+        request_id = request_headers.get(H_REQUEST_ID)
+        if request_id is not None and not request_headers.get(H_MULTIPLEX_LEGACY):
+            headers[H_MULTIPLEX_LEGACY] = request_id
         if request_id is not None:
-            headers.setdefault('x-request-id', request_id)
-            headers.setdefault('serve_multiplexed_model_id', request_id)
+            headers.setdefault(H_REQUEST_ID, request_id)
+            headers.setdefault(H_MULTIPLEX, request_id)
         return headers
 
     async def proxy_request(
@@ -122,7 +119,7 @@ class ServiceProxy:
                 service_type,
                 endpoint,
                 target_url,
-                headers.get('Serve-Multiplexed-Model-Id'),
+                headers.get(H_MULTIPLEX_LEGACY),
             )
 
             response = await self.client.request(
