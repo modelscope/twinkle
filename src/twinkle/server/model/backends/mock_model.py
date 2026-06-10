@@ -11,11 +11,11 @@ The class is duck-typed against ``TwinkleCompatModelBase`` rather than
 subclassing it — the base class lives in a torch-importing module.
 """
 from __future__ import annotations
+
 import hashlib
+import numpy as np
 import os
 from typing import Any
-
-import numpy as np
 
 from twinkle import remote_class
 from twinkle.utils.logger import get_logger

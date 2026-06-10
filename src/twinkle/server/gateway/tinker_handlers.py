@@ -6,13 +6,13 @@ All endpoints are prefixed /* and registered via _register_tinker_routes(app, se
 self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at request time.
 """
 from __future__ import annotations
+
 import asyncio
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import GatewayServer

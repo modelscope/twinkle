@@ -12,6 +12,7 @@ in each Ray Serve worker process so per-replica resource usage shows up in
 Mimir / Grafana.
 """
 from __future__ import annotations
+
 import os
 from collections.abc import Iterator
 from typing import Any

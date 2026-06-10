@@ -7,13 +7,13 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 /twinkle/sample (non-streaming) or /twinkle/sample_stream (streaming) routes.
 """
 from __future__ import annotations
+
 import json
 import uuid
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from typing import TYPE_CHECKING, Any
 
 from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 

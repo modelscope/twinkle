@@ -9,6 +9,7 @@ consistent view of the cluster's model registry without an extra coordination
 actor in front.
 """
 from __future__ import annotations
+
 import functools
 
 from .backend.base import StateBackend

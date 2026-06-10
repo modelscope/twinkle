@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import os
 from collections.abc import Callable, MutableMapping
 from functools import wraps

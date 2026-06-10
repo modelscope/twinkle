@@ -23,13 +23,13 @@ constructs (via monkeypatched ``serve.ingress`` / ``serve.deployment``) so no
 live Ray Serve cluster is needed.
 """
 from __future__ import annotations
-import json
-from pathlib import Path
 
+import json
 import pytest
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 from fastapi.testclient import TestClient
+from pathlib import Path
 
 # ----- contract baseline (route-set oracle) -------------------------------- #
 

@@ -2,10 +2,9 @@
 """
 Megatron backend model for the unified model deployment.
 """
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
-
 import torch
 from tinker import types
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory

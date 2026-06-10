@@ -7,6 +7,7 @@ The ``set_correlation_attrs`` helper attaches only present (non-None) values
 so partially-known operations don't end up with empty attributes.
 """
 from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
 

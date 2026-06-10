@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared on-disk fixtures for server tests."""
 from __future__ import annotations
+
 from pathlib import Path
 
 FIXTURES_DIR = Path(__file__).resolve().parent

@@ -6,13 +6,13 @@ All endpoints are prefixed /tinker/... and use schedule_task() returning Untyped
 self_fn is injected via FastAPI Depends to obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
+
 import traceback
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
 from fastapi import Depends, FastAPI, Request
 from peft import LoraConfig
 from tinker import types
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement

@@ -12,11 +12,11 @@ Follows the same structural pattern as model/app.py:
 - Sticky session routing via @serve.multiplexed keyed on session ID
 """
 from __future__ import annotations
-import os
-from typing import Any
 
+import os
 from fastapi import FastAPI
 from ray import serve
+from typing import Any
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger

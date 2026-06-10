@@ -14,11 +14,11 @@ cluster) and is gated behind ``TWINKLE_TEST_INTEGRATION=1`` so plain
 ``pytest`` runs stay fast. CI / local runs that opt-in pick it up.
 """
 from __future__ import annotations
-import os
-import time
 
 import httpx
+import os
 import pytest
+import time
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG, MOCK_SERVER_CONFIG_REDIS
 from twinkle.server.config import ServerConfig
@@ -282,7 +282,6 @@ def _exercise_tinker_client(base: str) -> None:
     pytest.importorskip('tinker')
 
     import os
-
     from tinker import ServiceClient, types
 
     from twinkle_client import init_tinker_client

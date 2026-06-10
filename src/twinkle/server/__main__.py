@@ -13,6 +13,7 @@ Usage::
     python -m twinkle.server clear persistence --config server_config.yaml
 """
 from __future__ import annotations
+
 import sys
 
 from twinkle.server.cli import main

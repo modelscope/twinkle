@@ -11,11 +11,11 @@ prompt_index, sample_index)`` — so repeated calls with the same parameters
 produce identical token sequences and logprobs.
 """
 from __future__ import annotations
+
 import hashlib
+import numpy as np
 import time
 from typing import Any
-
-import numpy as np
 
 from twinkle import remote_class
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams

@@ -7,6 +7,7 @@ Two execution paths:
   schedule_background_task()                  -> fire-and-forget asyncio Task (I/O ops)
 """
 from __future__ import annotations
+
 import asyncio
 import time
 import traceback

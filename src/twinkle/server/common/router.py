@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Moved from tinker/common/router.py — logic unchanged.
-from typing import Dict, List, Optional
-
 from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest, ReplicaID, ReplicaResult,
                                       RequestRouter, RunningReplica)
+from typing import Dict, List, Optional
 
 from twinkle.server.state import ServerState, get_server_state
 from twinkle.utils.logger import get_logger

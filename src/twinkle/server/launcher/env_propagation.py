@@ -8,6 +8,7 @@ by ``PersistenceConfig.from_env()`` — so the chosen backend / telemetry config
 is independent of deployment startup order.
 """
 from __future__ import annotations
+
 import os
 
 # Telemetry env var keys that need to be propagated to Ray worker processes.

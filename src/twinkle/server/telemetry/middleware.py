@@ -18,11 +18,11 @@ Public entry-points (unchanged signatures):
 * ``get_task_metrics(deployment)``           – task-queue / rate-limit gauges
 """
 from __future__ import annotations
+
 import time
 from collections.abc import Callable
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict
+from typing import Any
 
 from twinkle.server.telemetry import MetricsRegistry
 from twinkle.utils.logger import get_logger

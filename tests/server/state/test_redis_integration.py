@@ -13,11 +13,11 @@ is skipped — these tests are explicitly Docker-dependent and must run
 against the local stack rather than the in-process mock.
 """
 from __future__ import annotations
+
 import asyncio
 import os
-import uuid
-
 import pytest
+import uuid
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.state import ServerState

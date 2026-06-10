@@ -1,8 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any
-
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from typing import Any
 
 from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
 

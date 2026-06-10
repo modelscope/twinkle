@@ -6,9 +6,8 @@ Contains one unified class:
 - TwinkleCompatTransformersModel: handles both tinker (Datum-based I/O) via /tinker/*
   endpoints and twinkle-native (InputFeature/Trajectory-based I/O) via /twinkle/* endpoints.
 """
-from typing import List, Union
-
 from tinker import types
+from typing import List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory

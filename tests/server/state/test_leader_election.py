@@ -8,8 +8,8 @@ Validates:
   inflation across multiple instances.
 """
 from __future__ import annotations
-import asyncio
 
+import asyncio
 import pytest
 
 from twinkle.server.state import ServerState

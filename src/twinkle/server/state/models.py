@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import time
 from datetime import datetime
-from typing import Any
-
 from pydantic import BaseModel, Field
+from typing import Any
 
 
 def _now_iso() -> str:

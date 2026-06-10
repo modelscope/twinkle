@@ -1,5 +1,6 @@
 """Backend factory for creating StateBackend instances based on configuration."""
 from __future__ import annotations
+
 import logging
 
 from twinkle.server.config.persistence import PersistenceConfig

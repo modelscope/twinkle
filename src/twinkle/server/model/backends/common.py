@@ -2,14 +2,13 @@
 """
 Shared helpers and base classes for backend model implementations.
 """
+import numpy as np
 import re
+import torch
 from collections.abc import Mapping
 from numbers import Number
-from typing import Any, List
-
-import numpy as np
-import torch
 from tinker import types
+from typing import Any, List
 
 from twinkle import DeviceMesh
 from twinkle.template import Template

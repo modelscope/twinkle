@@ -5,12 +5,12 @@ Uses a minimal FastAPI app with the OpenAI routes directly registered
 (bypassing the full app_scaffold middleware stack) to test handler logic.
 """
 from __future__ import annotations
-import json
-from unittest.mock import AsyncMock, MagicMock
 
+import json
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock, MagicMock
 
 from twinkle.server.gateway.openai_bridge import translate_response
 

@@ -24,13 +24,13 @@ Notes:
   are part of the externally observed Tinker contract.
 """
 from __future__ import annotations
+
 import json
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any
-
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
+from pathlib import Path
+from typing import Any
 
 # ----- App build helpers --------------------------------------------------- #
 

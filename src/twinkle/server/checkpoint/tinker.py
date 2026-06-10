@@ -5,9 +5,8 @@ Tinker-specific checkpoint and training-run managers.
 Uses ``tinker.types`` models for all serialization and response construction.
 """
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-
 from tinker import types as tinker_types
+from typing import Any, Dict, List, Optional
 
 from twinkle.server.checkpoint import TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager
 

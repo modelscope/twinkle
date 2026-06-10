@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Persistence backend configuration model."""
 from __future__ import annotations
-import os
-from typing import Literal
 
+import os
 from pydantic import BaseModel, ConfigDict
+from typing import Literal
 
 # Env var keys propagated by the launcher so that any Ray worker can rebuild
 # the same PersistenceConfig regardless of which deployment initializes the

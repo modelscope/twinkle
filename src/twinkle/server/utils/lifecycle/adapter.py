@@ -10,6 +10,7 @@ By inheriting this mixin, services can override the _on_adapter_expired() method
 to handle expired adapters without using callbacks or polling.
 """
 from __future__ import annotations
+
 from typing import Any
 
 from twinkle.utils.logger import get_logger

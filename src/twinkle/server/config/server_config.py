@@ -13,10 +13,10 @@ Top-level fields use their current names with no aliases for legacy names
 offending name pointed at.
 """
 from __future__ import annotations
-from pathlib import Path
-from typing import Any
 
+from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Any
 
 from twinkle.server.exceptions import ConfigParseError
 from twinkle.server.utils.task_queue.config import TaskQueueConfig

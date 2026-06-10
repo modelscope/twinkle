@@ -5,10 +5,10 @@ checkpoint / training-run managers.
 Relocated from ``utils/checkpoint_base.py`` (TIER 2 consolidation). No logic change.
 """
 from __future__ import annotations
-from datetime import datetime
-from typing import Any, Dict, Optional, TypeVar
 
+from datetime import datetime
 from pydantic import BaseModel
+from typing import Any, Dict, Optional, TypeVar
 
 
 class BaseCheckpoint(BaseModel):
