@@ -181,7 +181,8 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         sequence_parallel_context=None,
     ) -> torch.Tensor:
         using_torch_fallback = _ensure_linear_attention_kernels(mod)
-        from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
+        modeling_module = import_module(mod.__class__.__module__)
+        apply_mask_to_padding_states = getattr(modeling_module, 'apply_mask_to_padding_states')
 
         local_attention_mask = attention_mask
         if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
