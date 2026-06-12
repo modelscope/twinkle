@@ -57,10 +57,6 @@ DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_conf
 # --- Ray Prometheus 配置路径（Ray 自动生成，用于注入 LGTM） ---
 RAY_PROMETHEUS_CONFIG_SUFFIX="session_latest/metrics/prometheus/prometheus.yml"
 
-# --- Ray 日志轮转配置 ---
-export RAY_ROTATION_MAX_BYTES=1024
-export RAY_ROTATION_BACKUP_COUNT=1
-
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
 # ============================================
