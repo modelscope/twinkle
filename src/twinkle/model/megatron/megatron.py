@@ -421,6 +421,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             elif labels is not None and is_last_pp:
                 _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
                 _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
+                _packed = batch.get('packed_seq_params')
+                cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                 if _loss_require_logps:
                     loss_mask = (labels != -100).bool()
                     masked_labels = labels.clone()
@@ -431,15 +433,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     else:
                         logps = selective_log_softmax(output_tensor, masked_labels)
                     # Reconstruct full-length tensors from CP-split shards
-                    logps = processor.postprocess_tensor_cp(logps)
+                    logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
                     if entropies is not None:
-                        entropies = processor.postprocess_tensor_cp(entropies)
-                batch['labels'] = processor.postprocess_tensor_cp(labels)
+                        entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
                 if 'position_ids' in batch:
                     pos = batch['position_ids']
                     if pos.dim() == 3:
                         pos = pos[0]  # [2/3, 1, seq] → [1, seq]
-                    batch['position_ids'] = processor.postprocess_tensor_cp(pos)
+                    batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
                 # Unpack packed sequences into per-sequence batch format
                 _outputs = {'logps': logps}
                 if entropies is not None:
@@ -533,13 +535,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if logps and not self.variable_seq_lengths:
             logps = torch.cat(logps, dim=0)
+        elif not logps:
+            logps = None
         if logits and not self.variable_seq_lengths:
             logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
-            loss = loss.detach().cpu().float().numpy()
+            loss = loss.detach().float().item()
         if not return_logits:
             logits = None
-        inputs = processor.unpack_inputs(inputs)
+        inputs = processor.unpack_inputs(inputs, task=task)
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)

@@ -52,17 +52,16 @@ def _output_embedding_hook(module, args, kwargs, output):
         return output
 
     cp_group = _resolve_cp_group(module)
-    if cp_group is not None and cp_group.size() > 1:
-        output = gather_cp_load_balanced(output, cp_group, seq_dim=1)
-
     packed_seq_params = kwargs.get('packed_seq_params', None)
-    if packed_seq_params is not None:
-        cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
-        if cu is not None and cu.numel() >= 2:
-            # cu is full-seq based (built before CP split), so it indexes the gathered output directly.
-            last_idx = (cu[1:].long() - 1).to(output.device)
-            embeddings = output[0, last_idx]
-            return F.normalize(embeddings, p=2, dim=1).contiguous()
+    cu_seqlens_q = getattr(packed_seq_params, 'cu_seqlens_q', None) if packed_seq_params is not None else None
+    if cp_group is not None and cp_group.size() > 1:
+        output = gather_cp_load_balanced(output, cp_group, seq_dim=1, cu_seqlens=cu_seqlens_q)
+
+    if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
+        # cu is full-seq based (built before CP split), so it indexes the gathered output directly.
+        last_idx = (cu_seqlens_q[1:].long() - 1).to(output.device)
+        embeddings = output[0, last_idx]
+        return F.normalize(embeddings, p=2, dim=1).contiguous()
 
     position_ids = kwargs.get('position_ids', None)
     attention_mask = kwargs.get('attention_mask', None)

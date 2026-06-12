@@ -601,9 +601,13 @@ class InputProcessor:
 
         return inputs, outputs
 
-    def unpack_inputs(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Unpack a list of packed microbatch inputs into per-sequence format."""
-        return [self.unpack_packed_sequences(inp)[0] for inp in inputs]
+    def unpack_inputs(self, inputs: List[Dict[str, Any]], task: str = 'causal_lm') -> List[Dict[str, Any]]:
+        """Unpack a list of packed microbatch inputs into per-sequence format.
+
+        For ``task='embedding'`` this is a no-op since embedding outputs are
+        already pooled to ``[n_seqs, H]`` upstream.
+        """
+        return [self.unpack_packed_sequences(inp, task=task)[0] for inp in inputs]
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
@@ -747,15 +751,18 @@ class InputProcessor:
                 outputs.append(output)
             return outputs
 
-    def postprocess_tensor_cp(self, tensor):
+    def postprocess_tensor_cp(self, tensor, cu_seqlens=None):
         """All-gather and reconstruct full sequence from a CP load-balanced shard.
 
         Thin wrapper over :func:`twinkle.utils.torch_utils.gather_cp_load_balanced`
-        that resolves the CP group via Megatron's ``parallel_state``.
+        that resolves the CP group via Megatron's ``parallel_state``. Pass
+        ``cu_seqlens`` (full-sequence pre-split boundaries, e.g. from
+        ``packed_seq_params.cu_seqlens_q``) for multi-segment packed batches.
         """
         if self.device_mesh.cp_world_size <= 1:
             return tensor
         from megatron.core import parallel_state as mpu
 
         from twinkle.utils.torch_utils import gather_cp_load_balanced
-        return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1)
+        return gather_cp_load_balanced(
+            tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
