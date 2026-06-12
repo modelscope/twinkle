@@ -24,6 +24,15 @@ class ModelArgs:
     memory_efficient_init: bool = False
     gradient_checkpointing: bool = True
     trust_remote_code: bool = True
+    load_weights: bool = True
+    # Megatron activation checkpointing
+    recompute_granularity: str | None = 'full'
+    recompute_method: str | None = 'uniform'
+    recompute_num_layers: int | None = 1
+    recompute_modules: list[str] | None = None
+    # Megatron-only optimizer + variable-seq toggles
+    use_distributed_optimizer: bool = True
+    variable_seq_lengths: bool = True
     ddp_config: dict[str, Any] | None = None
     fsdp_config: dict[str, Any] | None = None
     grad_scaler_config: dict[str, Any] | None = None
@@ -146,12 +155,18 @@ class InfraArgs:
     ncpu_proc_per_node: int = 8
     model_gpus: int | None = None
     sampler_gpus: int | None = None
+    world_size: int | None = None
     dp_size: int | None = None
     fsdp_size: int | None = None
     tp_size: int | None = None
+    pp_size: int | None = None
     cp_size: int | None = None
     ep_size: int | None = None
+    etp_size: int | None = None
+    ep_fsdp_size: int | None = None
+    vpp_size: int | None = None
     ulysses_size: int | None = None
+    sequence_parallel: bool = False
     lazy_collect: bool = True
 
 

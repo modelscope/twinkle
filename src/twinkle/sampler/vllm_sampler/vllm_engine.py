@@ -337,57 +337,6 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
 
-    async def astream(self,
-                      prompt: Union[List[int], str],
-                      sampling_params: Union[SamplingParams, Dict[str, Any]],
-                      lora_request: Optional[Any] = None,
-                      request_id: Optional[str] = None,
-                      priority: int = 0,
-                      *,
-                      multi_modal_data: Optional[Dict[str, Any]] = None,
-                      mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-                      disable_lora: bool = False,
-                      **kwargs):
-        """Streaming counterpart of :meth:`sample`. Yields raw vLLM ``RequestOutput``
-        deltas as they arrive from the engine — no aggregation.
-
-        Caller is responsible for diffing token_ids across frames.
-        """
-        from vllm.inputs import TextPrompt, TokensPrompt
-
-        if isinstance(sampling_params, dict):
-            sampling_params = SamplingParams.from_dict(sampling_params)
-        vllm_params = sampling_params.to_vllm(**kwargs)
-
-        if request_id is None:
-            request_id = uuid.uuid4().hex
-        if isinstance(prompt, str):
-            prompt = TextPrompt(prompt=prompt)
-        else:
-            prompt = TokensPrompt(prompt_token_ids=prompt)
-        if multi_modal_data:
-            prompt['multi_modal_data'] = multi_modal_data
-        if mm_processor_kwargs:
-            prompt['mm_processor_kwargs'] = mm_processor_kwargs
-
-        if lora_request is not None and not self.enable_lora:
-            logger.warning('lora_request provided but enable_lora is False — ignored')
-            lora_request = None
-        if disable_lora:
-            lora_request = None
-        elif lora_request is None and self._synced_lora_request is not None:
-            lora_request = self._synced_lora_request
-
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=vllm_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
-        async for output in generator:
-            yield output
-
     # -----------------------------------------------------------------
     # RL-training synced LoRA helpers
     # -----------------------------------------------------------------
