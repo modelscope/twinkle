@@ -104,6 +104,8 @@ class Sampler(ABC):
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
+        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
+            kwargs['model_id'] = self.model_id
         template = construct_class(template_cls, Template, twinkle.template, **kwargs)
         self.template = template
 

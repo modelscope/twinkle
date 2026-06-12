@@ -20,7 +20,7 @@ from .base import Dataset
 class LazyDataset(Dataset):
     """Client wrapper for LazyDataset that calls server HTTP endpoints."""
 
-    def __init__(self, dataset_meta: DatasetMeta, **kwargs):
+    def __init__(self, dataset_meta: DatasetMeta = None, **kwargs):
         from twinkle_client.http import get_base_url
 
         self.server_url = f'{get_base_url()}/processor/twinkle'

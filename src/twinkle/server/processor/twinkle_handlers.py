@@ -11,13 +11,16 @@ from __future__ import annotations
 import asyncio
 import importlib
 import uuid
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import ProcessorManagement
 
 import twinkle_client.types as types
+from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
+from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.validation import get_session_id_from_request, get_token_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object
@@ -77,7 +80,13 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             return getattr(processor_module, class_type)(
                 remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
 
-        processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
+        # Span the primary processor.create op with token + session correlation.
+        with traced_operation(
+                f'processor.create.{processor_type_name}.{class_type}', attrs={
+                    TOKEN_ID: token,
+                    SESSION_ID: session_id,
+                }):
+            processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
         self.resource_dict[processor_id] = processor
         return types.ProcessorCreateResponse(processor_id='pid:' + processor_id)
 
@@ -117,7 +126,9 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             except StopIteration:
                 return True, None
 
-        is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
+        # Span the primary processor.call op so each invocation is observable.
+        with traced_operation(f'processor.call.{function_name}', attrs={TOKEN_ID: get_token_from_request(request)}):
+            is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
 
         if function_name == '__next__':
             if is_exhausted:

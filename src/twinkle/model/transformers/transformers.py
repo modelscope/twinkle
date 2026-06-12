@@ -940,7 +940,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if isinstance(model, PeftModel):
             if Platform.is_master():
                 model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                save_file(processed_state_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
         else:
             model.save_pretrained(
                 checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)

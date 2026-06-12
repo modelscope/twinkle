@@ -1,3 +1,6 @@
+# ---------- Stage 0: grab pre-built binaries ----------
+FROM redis:7 AS redis
+FROM grafana/otel-lgtm:latest AS lgtm
 FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
 
 # Forward-compat user-mode CUDA driver shim, then pip cuDNN ahead of apt cuDNN (transformer_engine undefined-symbol fix). Path must match base image's Python version.
@@ -10,12 +13,25 @@ RUN pip install --no-cache-dir \
         "ray[serve]" && \
     rm -rf /root/.cache /tmp/*
 
-# Clone latest release and install twinkle in editable mode.
-RUN git clone https://github.com/modelscope/twinkle.git /twinkle && \
-    cd /twinkle && \
+# Clone and install twinkle, checkout to latest v-tag
+RUN git clone https://github.com/modelscope/twinkle.git
+WORKDIR /twinkle
+RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --sort=-v:refname && \
     LATEST_RELEASE=$(git branch -r -l 'origin/release/*' --sort=-v:refname | head -n 1 | tr -d ' ') && \
-    if [ -n "$LATEST_RELEASE" ]; then echo "Checking out: $LATEST_RELEASE" && git checkout --track "$LATEST_RELEASE"; else echo "No release branch found, staying on default branch"; fi && \
-    pip install --no-cache-dir --no-build-isolation -e . && \
-    rm -rf /root/.cache
+    echo "Checking out: $LATEST_RELEASE" && \
+    git checkout --track "$LATEST_RELEASE"
+
+# Install twinkle itself (with server extras: redis + otel + telemetry)
+RUN pip install -e ".[server]" --no-build-isolation
+
+# ---------- Redis server ----------
+COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
+COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
+
+# ---------- Observability: Grafana LGTM stack ----------
+COPY --from=lgtm /otel-lgtm /otel-lgtm
+COPY cookbook/observability/grafana/dashboards/twinkle-overview.json \
+     /otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json
+
 
 WORKDIR /twinkle

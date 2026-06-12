@@ -16,7 +16,7 @@ from transformers.utils import is_torch_npu_available
 
 from twinkle import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger()
 
 _is_torch_npu_available = is_torch_npu_available()
 _NPU_PATCH_APPLIED = False

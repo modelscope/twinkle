@@ -4,7 +4,7 @@ from ray.serve.request_router import (FIFOMixin, MultiplexMixin, PendingRequest,
                                       RequestRouter, RunningReplica)
 from typing import Dict, List, Optional
 
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -15,27 +15,27 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
 
     async def choose_replicas(
         self,
-        candidate_replicas: List[RunningReplica],
-        pending_request: Optional[PendingRequest] = None,
-    ) -> List[List[RunningReplica]]:
+        candidate_replicas: list[RunningReplica],
+        pending_request: PendingRequest | None = None,
+    ) -> list[list[RunningReplica]]:
         """
         This method chooses the best replica for the request based on
-        multiplexed and avaliable lora count. The algorithm
+        multiplexed and available lora count. The algorithm
         works as follows:
 
         1. Populate top_ranked_replicas based on available replicas based on
           multiplex_id (only one replica is chosen)
-        2. Populate and override top_ranked_replicas info based on avalible lora
+        2. Populate and override top_ranked_replicas info based on available lora
           slots of the replica.
         """
 
         # Take the best set of replicas for the multiplexed model
         if (pending_request is not None and pending_request.metadata.multiplexed_model_id):
-            ranked_replicas_multiplex: List[RunningReplica] = (self.rank_replicas_via_multiplex(
+            ranked_replicas_multiplex: list[RunningReplica] = (self.rank_replicas_via_multiplex(
                 replicas=candidate_replicas,
                 multiplexed_model_id=pending_request.metadata.multiplexed_model_id,
             ))[0]
@@ -46,7 +46,7 @@ class StickyLoraRequestRouter(FIFOMixin, MultiplexMixin, RequestRouter):
                 return [ranked_replicas_multiplex]
 
         # Dictionary to hold the top-ranked replicas
-        top_ranked_replicas: Dict[ReplicaID, RunningReplica] = {}
+        top_ranked_replicas: dict[ReplicaID, RunningReplica] = {}
 
         # Filter out replicas that are not available (queue length exceed max ongoing request)
         ranked_replicas_locality = self.select_available_replicas(candidates=candidate_replicas)

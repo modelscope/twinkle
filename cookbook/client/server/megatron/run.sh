@@ -3,7 +3,7 @@
 # ============================================
 # Twinkle Megatron 服务启动脚本
 # ============================================
-# 功能：启动 Ray 集群（支持多 GPU/CPU 节点）、Prometheus 监控和 Twinkle 服务器
+# 功能：启动 Ray 集群（支持多 GPU/CPU 节点）、LGTM 观测栈和 Twinkle 服务器
 #
 # 用法：./run.sh [选项]
 #
@@ -54,9 +54,8 @@ LOG_FILE="run.log"
 DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
-# --- Prometheus 监控配置 ---
-PROMETHEUS_BIN="/dashscope/caches/application/monitor/prometheus-3.10.0.linux-amd64/prometheus"
-PROMETHEUS_CONFIG_SUFFIX="session_latest/metrics/prometheus/prometheus.yml"
+# --- Ray Prometheus 配置路径（Ray 自动生成，用于注入 LGTM） ---
+RAY_PROMETHEUS_CONFIG_SUFFIX="session_latest/metrics/prometheus/prometheus.yml"
 
 # --- Ray 日志轮转配置 ---
 export RAY_ROTATION_MAX_BYTES=1024
@@ -163,7 +162,7 @@ else
     IFS=';' read -ra GPU_WORKERS <<< "$GPU_WORKERS_INPUT"
 fi
 
-PROMETHEUS_CONFIG="${TEMP_DIR}/${PROMETHEUS_CONFIG_SUFFIX}"
+RAY_PROMETHEUS_CONFIG="${TEMP_DIR}/${RAY_PROMETHEUS_CONFIG_SUFFIX}"
 
 # ============================================
 # 辅助函数
@@ -261,7 +260,7 @@ if [ ! -d "$TEMP_DIR" ]; then
 fi
 
 # ============================================
-# 停止已有 Ray 集群和 Prometheus
+# 停止已有服务（Redis / Ray / LGTM / Twinkle）
 # ============================================
 print_header "清理环境"
 
@@ -289,8 +288,30 @@ fi
 print_info "停止已有的 Ray 集群..."
 ray stop --force 2>/dev/null || true
 
-print_info "停止已有的 Prometheus..."
+print_info "停止已有的 Redis..."
+pkill redis-server 2>/dev/null || true
+
+print_info "停止已有的 LGTM 观测栈..."
+pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
 pkill prometheus 2>/dev/null || true
+pkill grafana 2>/dev/null || true
+pkill otelcol 2>/dev/null || true
+pkill loki 2>/dev/null || true
+pkill tempo 2>/dev/null || true
+pkill pyroscope 2>/dev/null || true
+
+# ============================================
+# 启动 Redis
+# ============================================
+print_header "启动 Redis"
+
+if command -v redis-server &> /dev/null; then
+    print_info "启动 Redis..."
+    redis-server --daemonize yes --port 6380 --save "" --appendonly no
+    print_success "Redis 已启动 (port 6380)"
+else
+    print_warning "未检测到 redis-server，跳过"
+fi
 
 # ============================================
 # 启动 Ray Head 节点
@@ -350,30 +371,35 @@ print_info "集群状态："
 ray status 2>/dev/null || true
 
 # ============================================
-# 启动 Prometheus 监控（可选）
+# 启动 LGTM 观测栈（Grafana + OTel Collector + Prometheus + Tempo + Loki）
 # ============================================
-print_header "启动监控（可选）"
+print_header "启动 LGTM 观测栈（可选）"
 
-PROMETHEUS_PID=""
-if [ -f "$PROMETHEUS_BIN" ]; then
-    print_info "检测到 Prometheus，正在启动监控服务..."
-
-    # 等待 Ray 生成 Prometheus 配置
+if [ -d "/otel-lgtm" ]; then
+    # 等待 Ray 生成 Prometheus scrape 配置
     sleep 2
 
-    if [ -f "$PROMETHEUS_CONFIG" ]; then
-        nohup "$PROMETHEUS_BIN" --config.file="$PROMETHEUS_CONFIG" > prometheus.log 2>&1 &
-        PROMETHEUS_PID=$!
-        print_success "Prometheus 监控已启动 (PID: $PROMETHEUS_PID)"
-        echo "  - 监控日志: prometheus.log"
-        echo "  - 配置文件: $PROMETHEUS_CONFIG"
+    # 还原原始配置（防止重复执行时累积追加）再注入 Ray scrape 配置
+    [ -f /otel-lgtm/prometheus.yaml.orig ] || cp /otel-lgtm/prometheus.yaml /otel-lgtm/prometheus.yaml.orig
+    cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
+
+    if [ -f "$RAY_PROMETHEUS_CONFIG" ]; then
+        print_info "注入 Ray metrics scrape 配置到 LGTM Prometheus..."
+        cat "$RAY_PROMETHEUS_CONFIG" >> /otel-lgtm/prometheus.yaml
     else
-        print_warning "Prometheus 配置文件不存在，跳过监控启动"
-        echo "  - 预期路径: $PROMETHEUS_CONFIG"
+        print_warning "Ray Prometheus 配置未生成，跳过 scrape 注入"
+        echo "  - 预期路径: $RAY_PROMETHEUS_CONFIG"
     fi
+
+    print_info "启动 LGTM 观测栈..."
+    (cd /otel-lgtm && nohup ./run-all.sh > /twinkle/lgtm.log 2>&1 &)
+    print_success "LGTM 观测栈已启动"
+    echo "  - Grafana:   http://localhost:3000 (admin/admin)"
+    echo "  - OTLP gRPC: localhost:4317"
+    echo "  - OTLP HTTP: localhost:4318"
+    echo "  - 日志文件:  /twinkle/lgtm.log"
 else
-    print_warning "未检测到 Prometheus，跳过监控启动"
-    echo "  - 预期路径: $PROMETHEUS_BIN"
+    print_warning "未检测到 LGTM 观测栈 (/otel-lgtm)，跳过"
 fi
 
 # ============================================

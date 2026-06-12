@@ -146,6 +146,8 @@ images
 /custom/
 megatron_output/
 .qoder
+.kiro/
+.claude/
 
 # Pytorch
 *.pth

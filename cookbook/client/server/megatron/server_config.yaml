@@ -9,6 +9,24 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 9000            # Port number for the server
 
+# Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4317
+
+# Persistence configuration for ServerState (sessions, models, futures, ...).
+# Top-level placement makes the launcher propagate this to every Ray worker
+# via env vars, so the configured backend is used regardless of which
+# deployment initializes the ServerState actor first.
+#   mode: memory | file | redis
+#     memory: requires an initialized Ray runtime (the launcher handles this
+#             automatically; standalone scripts must call ray.init() first)
+#   file_path: required for `file` mode
+#   redis_url / key_prefix: required for `redis` mode
+persistence:
+  mode: redis
+  redis_url: redis://localhost:6380
+
 # Applications: each entry defines a service component deployed on the server
 applications:
 
@@ -84,7 +102,7 @@ applications:
     route_prefix: /api/v1/model/Qwen/Qwen3.6-27B
     import_path: model
     args:
-      use_megatron: true                          # Use Megatron-LM backend
+      backend: megatron                          # Use Megatron-LM backend
       model_id: "ms://Qwen/Qwen3.6-27B" # ModelScope model identifier
       max_length: 65536                           # model max length
       max_loras: 3                                # model max loras

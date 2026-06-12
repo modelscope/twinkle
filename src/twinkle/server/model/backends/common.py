@@ -212,10 +212,10 @@ class TwinkleCompatModelBase:
         raise ValueError(f'Unexpected type for tensor output: {type(value)}')
 
     @staticmethod
-    def _get_forward_output(inputs: List[types.Datum],
+    def _get_forward_output(inputs: list[types.Datum],
                             logits: torch.Tensor,
                             logps: torch.Tensor,
-                            return_full_logprobs: bool = False) -> List[dict]:
+                            return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
         When return_full_logprobs is True (forward_only / reference pass), logprobs is returned

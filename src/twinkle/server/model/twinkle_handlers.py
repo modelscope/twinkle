@@ -11,18 +11,19 @@ from __future__ import annotations
 import asyncio
 import torch
 import traceback
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pathlib import Path
 from peft import LoraConfig
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement
 
 import twinkle_client.types as types
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.server.common.checkpoint_factory import create_checkpoint_manager, create_training_run_manager
-from twinkle.server.utils.checkpoint_base import _resolve_client_save_dir, validate_user_path
+from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
+                                       validate_user_path)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
 from twinkle_client.common.serialize import deserialize_object
@@ -104,7 +105,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward',
             ))
 
@@ -202,7 +203,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 token=token,
                 input_tokens=input_tokens,
                 batch_size=batch_size,
-                data_world_size=self.device_mesh.data_world_size,
+                data_world_size=self.data_world_size,
                 task_type='forward_backward',
             ))
 

@@ -141,6 +141,36 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
         return future.result()
 
+    def _iter_in_loop(self, async_gen_coro):
+        """Iterate an async generator running in the background event loop.
+
+        Counterpart to ``_run_in_loop`` for streaming results: schedules the
+        async generator on ``self._async_loop`` and yields items to the caller
+        via a thread-safe queue.
+        """
+        import queue as stdlib_queue
+        q: stdlib_queue.Queue = stdlib_queue.Queue()
+        _SENTINEL = object()
+
+        async def _drain():
+            try:
+                async for item in async_gen_coro:
+                    q.put(item)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                q.put(_SENTINEL)
+
+        asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
+
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
     async def _create_engine_async(self, engine_cls, model_id, engine_kwargs):
         """Create engine in async context to ensure output_handler starts correctly."""
         return engine_cls(model_id=model_id, **engine_kwargs)
@@ -220,22 +250,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         logprobs_only: bool = False,
         disable_lora: bool = False,
     ) -> SampleResponse:
-        """Sample a single input asynchronously.
-
-        Args:
-            feat: Encoded input features containing 'input_ids' and optionally 'images'/'videos'.
-            sampling_params: Sampling parameters.
-            adapter_path: Optional LoRA adapter path (legacy, prefer lora_request).
-            lora_request: Pre-built LoRARequest to attach to the sampling request.
-                Avoids repeated ``_get_or_load_lora`` calls per input.
-            multi_modal_data: The multi modal data dict.
-            logprobs_only: Only return logprobs (no generated tokens).
-
-        Returns:
-            A SampleResponse object
-        """
+        """Sample a single input asynchronously."""
         response = await self.engine.sample(
-            prompt=self.template.get_vllm_input_ids(feat['input_ids']),
+            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
             sampling_params=sampling_params,
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
@@ -251,11 +268,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             else:
                 feat['input_ids'] = response.prompt_token_ids
                 feat['labels'] = [-100] * len(response.prompt_token_ids)
-
-        if not logprobs_only:
-            # response.sequences contains num_samples sequences for this prompt
-            sequences = []
-            for seq in response.sequences:
+        sequences = []
+        for seq in response.sequences:
+            if logprobs_only:
+                sampled_seq = SampledSequence(
+                    tokens=[],
+                    stop_reason=seq.stop_reason,
+                    new_input_feature=_convert_ndarray_to_list(feat),
+                )
+            else:
                 sampled_seq = SampledSequence(
                     stop_reason=seq.stop_reason,
                     tokens=seq.tokens,
@@ -263,26 +284,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=_convert_ndarray_to_list(self.template.concat_input_feature(feat, seq.tokens)),
                 )
-                sequences.append(sampled_seq)
-            return SampleResponse(
-                prompt_token_ids=response.prompt_token_ids,
-                sequences=sequences,
-                prompt_logprobs=response.prompt_logprobs,
-                topk_prompt_logprobs=response.topk_prompt_logprobs)
-        else:
-            sequences = []
-            for seq in response.sequences:
-                sampled_seq = SampledSequence(
-                    tokens=[],
-                    stop_reason=seq.stop_reason,
-                    new_input_feature=_convert_ndarray_to_list(feat),
-                )
-                sequences.append(sampled_seq)
-            return SampleResponse(
-                prompt_token_ids=response.prompt_token_ids,
-                sequences=sequences,
-                prompt_logprobs=response.prompt_logprobs,
-                topk_prompt_logprobs=response.topk_prompt_logprobs)
+            sequences.append(sampled_seq)
+        return SampleResponse(
+            prompt_token_ids=response.prompt_token_ids,
+            sequences=sequences,
+            prompt_logprobs=response.prompt_logprobs,
+            topk_prompt_logprobs=response.topk_prompt_logprobs)
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
     def sample(
@@ -374,6 +381,47 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results
+
+    def sample_stream(
+        self,
+        inputs: Union[InputFeature, Trajectory, Dict[str, Any]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+    ):
+        """Stream token deltas as they are generated by the vLLM engine.
+
+        Yields:
+            (delta_text: str, finish_reason: str | None) tuples.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        elif isinstance(sampling_params, dict):
+            sampling_params = SamplingParams.from_dict(sampling_params)
+
+        feat = inputs
+        is_trajectory = 'input_ids' not in feat
+        if is_trajectory:
+            feat = self.encode_trajectory_for_vllm(feat, adapter_name)
+
+        lora_request = None
+        if adapter_path is not None:
+            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
+            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
+
+        prompt = self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids']
+
+        yield from self._iter_in_loop(
+            self.engine.generate_stream(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                lora_request=lora_request,
+            ))
+
+    def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
+        """Push streaming deltas to a cross-process Ray queue."""
+        from twinkle.server.sampler.backends import stream_to_queue
+        stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:

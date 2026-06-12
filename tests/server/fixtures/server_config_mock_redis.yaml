@@ -1,0 +1,88 @@
+# Test-only Twinkle Server config — CPU-only mock backends, redis-backed
+# persistence. Use this fixture when you want to exercise the redis state
+# backend end-to-end (e.g. ``TWINKLE_TEST_REDIS_PERSISTENCE=1`` in the
+# in-process Ray Serve e2e). Requires a redis at the URL below; start one
+# with ``docker run -d --rm -p 6379:6379 redis:7-alpine``. Not for production.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 127.0.0.1
+  port: 8000
+
+persistence:
+  mode: redis
+  redis_url: "redis://127.0.0.1:6379/0"
+  key_prefix: "twinkle-test:"
+
+applications:
+
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 3
+      supported_models:
+        - mock-model
+    deployments:
+      - name: GatewayServer
+        max_ongoing_requests: 50
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: models-mock
+    route_prefix: /api/v1/model/mock-model
+    import_path: model
+    args:
+      backend: mock
+      model_id: mock-model
+      nproc_per_node: 1
+      device_group:
+        name: model
+        ranks: 1
+        device_type: cpu
+      device_mesh:
+        device_type: cpu
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: sampler-mock
+    route_prefix: /api/v1/sampler/mock-model
+    import_path: sampler
+    args:
+      sampler_type: mock
+      model_id: mock-model
+      nproc_per_node: 1
+      device_group:
+        name: sampler
+        ranks: 1
+        device_type: cpu
+      device_mesh:
+        device_type: cpu
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1

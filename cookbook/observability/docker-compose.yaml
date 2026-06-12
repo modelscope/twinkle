@@ -1,0 +1,35 @@
+# Twinkle observability stack — local-dev edition.
+#
+# Single container: grafana/otel-lgtm bundles OTel Collector + Mimir
+# (Prometheus-compatible) + Tempo + Loki + Grafana with all datasources
+# pre-wired. Twinkle pushes OTLP to :4317; you read it back at :3000.
+#
+# Quick start:
+#   docker compose up -d
+#   open http://localhost:3000   # admin / admin (anonymous viewer also enabled)
+#
+# In your server_config.yaml:
+#   telemetry:
+#     enabled: true
+#     debug: false
+#     service_name: twinkle-server
+#     otlp_endpoint: http://localhost:4317
+
+services:
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: twinkle-lgtm
+    ports:
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC — point telemetry.otlp_endpoint here
+      - "4318:4318"   # OTLP HTTP (alternative)
+    volumes:
+      # Drop our pre-built Twinkle overview dashboard into the image's
+      # existing dashboard provisioning folder. Grafana inside the container
+      # auto-scans this directory on startup.
+      - ./grafana/dashboards/twinkle-overview.json:/otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json:ro
+      # Persist dashboards/data across container restarts (optional)
+      - lgtm-data:/data
+
+volumes:
+  lgtm-data:
