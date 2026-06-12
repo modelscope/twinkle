@@ -5,7 +5,6 @@ import unicodedata
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
 from .utils import msg_content_text
 
 # ── Pre-compiled patterns ─────────────────────────────────────────────────────
@@ -28,7 +27,6 @@ _SPECIAL_TOKEN_RE = re.compile(
 # block elements, geometric shapes, braille, and dashes.
 _SINGLE_CHAR_REPEAT_RE = re.compile(
     r'([^\s\n\-=_.\*\+~#|><0-9\u2013-\u2015\u2500-\u25ff\u2800-\u28ff\u30fc\uff0d])\1{19,}')
-
 
 # ── Unicode script classifier ─────────────────────────────────────────────────
 

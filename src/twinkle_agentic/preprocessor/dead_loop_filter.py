@@ -5,8 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
-from .utils import is_agent_row, msg_content_text, cjk_ratio
+from .utils import cjk_ratio, is_agent_row, msg_content_text
 
 # ── Hesitation-marker regexes ─────────────────────────────────────────────────
 #
@@ -81,7 +80,6 @@ _CASCADE_RE = re.compile(
 
 # Cover both `<think>` and `<thinking>` block forms.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>(.*?)</think(?:ing)?>', re.DOTALL | re.IGNORECASE)
-
 
 # ── Detection helpers ─────────────────────────────────────────────────────────
 
@@ -198,10 +196,11 @@ class DeadLoopFilter(Preprocessor):
             if not asst_msgs:
                 out.append(row)
                 continue
-            if any(self._is_stuck(
-                msg_content_text(m).strip(),
-                (m.get('reasoning_content') or m.get('thinking') or '').strip(),
-            ) for m in asst_msgs):
+            if any(
+                    self._is_stuck(
+                        msg_content_text(m).strip(),
+                        (m.get('reasoning_content') or m.get('thinking') or '').strip(),
+                    ) for m in asst_msgs):
                 dropped.append(dict(row, drop_reason='dead_loop'))
             else:
                 out.append(row)

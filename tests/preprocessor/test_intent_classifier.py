@@ -11,11 +11,11 @@ Focus areas:
 """
 import pytest
 
+from twinkle.data_format import pack_value, user_data_get
 from twinkle_agentic.preprocessor.intent_classifier import (INTENT_CODE, INTENT_MATH, INTENT_OTHER, INTENT_TOOL_CALL,
                                                             INTENT_USER_DISSATISFACTION, CodeDetector, IntentClassifier,
                                                             IntentDetector, MathDetector, ToolCallDetector,
                                                             UserDissatisfactionDetector, _msg_text, _pair_assistant)
-from twinkle.data_format import pack_value, user_data_get
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

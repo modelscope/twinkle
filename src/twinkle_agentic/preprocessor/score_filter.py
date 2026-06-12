@@ -75,6 +75,7 @@ def _user_data_lookup(user_data: Any, key: str) -> Any:
     """Pull a value by key from packed user_data; returns the JSON-decoded value."""
     return user_data_get(user_data, key)
 
+
 # ============================================================================
 # Built-in scorers
 # ============================================================================

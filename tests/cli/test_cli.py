@@ -15,12 +15,11 @@ Covers:
 from __future__ import annotations
 
 import os
+import pytest
 import textwrap
 from dataclasses import fields as dc_fields
 from pathlib import Path
 from unittest import mock
-
-import pytest
 
 from twinkle.cli import (CLI, Args, CLISource, ConfigResolver, DotEnvSource, EnvVarSource, ModelArgs, ValueCaster,
                          YamlSource)
@@ -270,8 +269,10 @@ class TestCLIEndToEnd:
 
     def test_cli_new_megatron_fields(self):
         args = CLI.from_args(argv=[
-            '--recompute_granularity', 'selective',
-            '--recompute_num_layers', '8',
+            '--recompute_granularity',
+            'selective',
+            '--recompute_num_layers',
+            '8',
             '--no_variable_seq_lengths',
             '--no_use_distributed_optimizer',
             '--no_load_weights',
@@ -284,13 +285,19 @@ class TestCLIEndToEnd:
 
     def test_cli_new_infra_fields(self):
         args = CLI.from_args(argv=[
-            '--tp_size', '2',
-            '--pp_size', '2',
-            '--etp_size', '1',
-            '--vpp_size', '4',
-            '--ep_fsdp_size', '8',
+            '--tp_size',
+            '2',
+            '--pp_size',
+            '2',
+            '--etp_size',
+            '1',
+            '--vpp_size',
+            '4',
+            '--ep_fsdp_size',
+            '8',
             '--sequence_parallel',
-            '--world_size', '32',
+            '--world_size',
+            '32',
         ])
         assert args.infra.tp_size == 2
         assert args.infra.pp_size == 2
@@ -311,11 +318,8 @@ class TestCLIEndToEnd:
     def test_priority_cli_beats_yaml_beats_env(self, tmp_path: Path):
         cfg = tmp_path / 'c.yaml'
         cfg.write_text('model:\n  model_id: from_yaml\ntraining:\n  max_steps: 100\n')
-        with mock.patch.dict(
-                os.environ,
-                {'TWINKLE_MAX_STEPS': '50', 'TWINKLE_MODEL_ID': 'from_env'},
-                clear=False,
-        ):
+        env_overrides = {'TWINKLE_MAX_STEPS': '50', 'TWINKLE_MODEL_ID': 'from_env'}
+        with mock.patch.dict(os.environ, env_overrides, clear=False):
             args = CLI.from_args(argv=['--config', str(cfg), '--model_id', 'from_cli'])
         # CLI wins for model_id; YAML wins for max_steps (no CLI override).
         assert args.model.model_id == 'from_cli'

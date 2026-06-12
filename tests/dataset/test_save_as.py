@@ -6,18 +6,28 @@ Test Dataset.save_as:
 """
 import json
 import os
-import tempfile
-
 import pytest
+import tempfile
 
 from twinkle.dataset import Dataset, DatasetMeta
 
-
 SAMPLE_DATA = [
-    {'text': 'Hello world', 'label': 0},
-    {'text': 'Test data', 'label': 1},
-    {'text': 'Another example', 'label': 0},
-    {'text': 'Sample text', 'label': 1},
+    {
+        'text': 'Hello world',
+        'label': 0
+    },
+    {
+        'text': 'Test data',
+        'label': 1
+    },
+    {
+        'text': 'Another example',
+        'label': 0
+    },
+    {
+        'text': 'Sample text',
+        'label': 1
+    },
 ]
 
 
@@ -25,8 +35,10 @@ def _make_dataset(data=None, streaming=False):
     """Create a Dataset from in-memory data."""
     d = data or SAMPLE_DATA
     if streaming:
+
         def gen():
             yield from d
+
         return Dataset(dataset_meta=DatasetMeta(data=gen), streaming=True)
     return Dataset(dataset_meta=DatasetMeta(data=d))
 
@@ -39,8 +51,8 @@ class TestSaveAsImmediate:
         out = str(tmp_path / 'output.jsonl')
         ds.save_as(out)
 
-        with open(out, 'r') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 4
         assert lines[0]['text'] == 'Hello world'
         assert lines[3]['label'] == 1
@@ -72,8 +84,8 @@ class TestSaveAsImmediate:
         out = str(tmp_path / 'output.json')
         ds.save_as(out)
 
-        with open(out, 'r') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 4
 
     def test_save_incremental_streaming(self, tmp_path):
@@ -82,8 +94,8 @@ class TestSaveAsImmediate:
         out = str(tmp_path / 'stream_out.jsonl')
         ds.save_as(out)
 
-        with open(out, 'r') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 4
         assert lines[0]['text'] == 'Hello world'
 
@@ -136,8 +148,8 @@ class TestSaveAsTraining:
 
         ds.flush_save()
 
-        with open(out, 'r') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 4
         assert lines[0]['text'] == 'Hello world'
         assert lines[3]['label'] == 1
@@ -184,8 +196,8 @@ class TestSaveAsTraining:
 
         ds.flush_save()
 
-        with open(out, 'r') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 2
         assert lines[0]['text'] == 'Hello world'
         assert lines[1]['text'] == 'Test data'

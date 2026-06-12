@@ -106,7 +106,6 @@ _ALL_PATTERNS = (_EN_CORE, _EN_APOLOGY, _EN_POLICY, _EN_STANDALONE, _ZH_APOLOGY,
 # refusal-like phrasing doesn't get mistaken for a real user-facing refusal.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>.*?</think(?:ing)?>\s*', re.DOTALL | re.IGNORECASE)
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 

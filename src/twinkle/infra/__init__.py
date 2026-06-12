@@ -57,7 +57,7 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
             exc.add_note(marker)
         if not getattr(exc, '_twinkle_caller_augmented', False):
             prefix = f'[twinkle driver caller: {caller}] '
-            exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(),)
+            exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(), )
             exc._twinkle_caller_augmented = True
     except Exception:  # noqa: BLE001
         pass
@@ -833,5 +833,3 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         return wrapper
 
     return decorator
-
-

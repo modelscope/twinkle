@@ -42,4 +42,3 @@ def user_data_get(items: Any, key: str, default: Any = None) -> Any:
             except (json.JSONDecodeError, ValueError):
                 return v
     return default
-

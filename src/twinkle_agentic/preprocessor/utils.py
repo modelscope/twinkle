@@ -254,19 +254,11 @@ def msg_has_media(msg: Dict[str, Any]) -> bool:
 def msg_has_payload(msg: Dict[str, Any]) -> bool:
     """True if a message carries any substantive payload (text, tool_calls, reasoning, or media)."""
     return bool(
-        msg_content_text(msg).strip()
-        or msg.get('tool_calls')
-        or msg.get('reasoning_content') or msg.get('thinking')
-        or msg_has_media(msg)
-    )
+        msg_content_text(msg).strip() or msg.get('tool_calls') or msg.get('reasoning_content') or msg.get('thinking')
+        or msg_has_media(msg))
 
 
 _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
-
-
-def cjk_ratio(text: str) -> float:
-    """Fraction of characters that are CJK (Chinese/Japanese/Korean)."""
-    return len(_CJK_RE.findall(text)) / max(len(text), 1)
 
 
 def normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
@@ -305,7 +297,7 @@ def normalize_tool_calls(msg: Dict[str, Any]) -> Optional[List[Any]]:
     return result
 
 
-CJK_CHARS_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]')
+CJK_CHARS_RE = _CJK_RE
 
 
 def cjk_ratio(text: str) -> float:

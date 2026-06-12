@@ -4,7 +4,6 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
 from .utils import msg_content_text
 
 _SYSTEM_INJECTION_RE = re.compile(r'^<(?:system-reminder|system_reminder|context|user_info|attached_files)[ >]',

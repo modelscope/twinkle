@@ -7,7 +7,6 @@ module-level op cache for model/tokenizer reuse.
 from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
 from .utils import msg_content_text
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -35,7 +34,6 @@ def _get_text(row: Dict[str, Any], role: str = 'assistant') -> str:
     return ' '.join(
         msg_content_text(msg) for msg in (row.get('messages') or [])
         if isinstance(msg, dict) and msg.get('role') == role)
-
 
 
 def _keep_mask(op, texts: List[str]) -> List[bool]:

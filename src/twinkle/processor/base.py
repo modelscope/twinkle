@@ -778,5 +778,4 @@ class InputProcessor:
         from megatron.core import parallel_state as mpu
 
         from twinkle.utils.torch_utils import gather_cp_load_balanced
-        return gather_cp_load_balanced(
-            tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
+        return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)

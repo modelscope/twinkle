@@ -10,7 +10,6 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
-
 from .utils import (build_sensitive_regex, cjk_ratio, is_agent_row, load_sensitive_words, msg_content_text,
                     msg_has_media, msg_has_payload, normalize_tool_calls)
 

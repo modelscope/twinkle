@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
-import os
+
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
 from twinkle.utils.parallel import PosixFileLock

@@ -8,7 +8,6 @@ import pytest
 
 from twinkle.template.tools import ClineParser, HermesQwenParser, ReActParser, ToolCallRegistry
 
-
 # ---------------------------------------------------------------------------
 # HermesQwenParser
 # ---------------------------------------------------------------------------

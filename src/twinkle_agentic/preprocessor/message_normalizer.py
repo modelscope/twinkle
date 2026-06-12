@@ -21,14 +21,12 @@ from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.template.tools import ToolCallRegistry
-
 from .utils import msg_content_text, msg_has_media
 
 # IGNORECASE absorbs every variant ("Read HEARTBEAT.md", "HEARTBEAT_OK",
 # "duplicate heartbeat", etc.) under the single token "heartbeat".
 _HEARTBEAT_USER_RE = re.compile(r'heartbeat|keep.?alive', re.IGNORECASE)
 _HEARTBEAT_ASST_RE = re.compile(r'heartbeat', re.IGNORECASE)
-
 
 # ── Pass 0: heartbeat strip ─────────────────────────────────────────────────
 
@@ -72,8 +70,8 @@ def _normalize_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         msg = messages[i]
         text = msg_content_text(msg)
         parser = (
-            ToolCallRegistry.detect_first(text) if msg.get('role') == 'assistant' and not msg.get('tool_calls')
-            and text else None)
+            ToolCallRegistry.detect_first(text)
+            if msg.get('role') == 'assistant' and not msg.get('tool_calls') and text else None)
         parsed = parser.parse(text) if parser else None
         if not parsed:
             out.append(msg)

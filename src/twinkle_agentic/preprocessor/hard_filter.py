@@ -4,10 +4,9 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.preprocessor import Preprocessor
-from .utils import msg_content_text, msg_has_media, cjk_ratio
+from .utils import cjk_ratio, msg_content_text, msg_has_media
 
 # ── Language detection ────────────────────────────────────────────────────────
-
 
 # ── Simple-query patterns ─────────────────────────────────────────────────────
 
@@ -79,7 +78,6 @@ _KO_SIMPLE_RE = re.compile(
 _CJK_SIMPLE_REGEXES = (_ZH_GREETING_RE, _ZH_SIMPLE_RE, _JA_GREETING_RE, _JA_SIMPLE_RE, _KO_GREETING_RE, _KO_SIMPLE_RE)
 _LATIN_SIMPLE_REGEXES = (_EN_GREETING_RE, _EN_SIMPLE_RE)
 
-
 # ── Content helpers ──────────────────────────────────────────────────────────
 
 
@@ -138,8 +136,9 @@ class HardFilter(Preprocessor):
         self._min_assistant_chars_2turn = min_assistant_chars_2turn
         self._min_thinking_chars = min_thinking_chars
         self.allow_incomplete_role = allow_incomplete_role
-        self._system_deny_re = (re.compile('|'.join(re.escape(k) for k in system_deny_keywords), re.IGNORECASE)
-                                if system_deny_keywords else None)
+        self._system_deny_re = (
+            re.compile('|'.join(re.escape(k)
+                                for k in system_deny_keywords), re.IGNORECASE) if system_deny_keywords else None)
         self._max_chars_per_round = max_chars_per_round
         self._max_total_chars = max_total_chars
         self._max_rounds = max_rounds
@@ -179,8 +178,8 @@ class HardFilter(Preprocessor):
 
         # Rule 4: system prompt matches deny keywords.
         if self._system_deny_re:
-            sys_text = next((msg_content_text(m) for m in messages if isinstance(m, dict)
-                             and m.get('role') == 'system'), '')
+            sys_text = next(
+                (msg_content_text(m) for m in messages if isinstance(m, dict) and m.get('role') == 'system'), '')
             if self._system_deny_re.search(sys_text):
                 return 'system_deny_keyword'
 

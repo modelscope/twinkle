@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from twinkle.data_format import pack_value
 from twinkle.preprocessor import Preprocessor
 from twinkle.utils import get_logger
-
 from .utils import msg_content_text, normalize_tool_calls
 
 logger = get_logger()
