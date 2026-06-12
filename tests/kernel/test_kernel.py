@@ -3,7 +3,7 @@
 Kernel module unit tests
 """
 import os
-import unittest
+import pytest
 from unittest.mock import MagicMock, Mock, patch
 
 from twinkle.kernel import kernelize_model, register_external_layer, register_kernels, register_layer_kernel
@@ -13,13 +13,13 @@ from twinkle.kernel.registry import (ExternalLayerRegistry, LayerRegistry, get_g
                                      register_layer)
 
 
-class TestBase(unittest.TestCase):
+class TestBase:
     """Test base helpers and env vars."""
 
     def test_is_kernels_available(self):
         """Test kernels availability check."""
         result = is_kernels_available()
-        self.assertIsInstance(result, bool)
+        assert isinstance(result, bool)
 
     def test_kernels_enabled_env_var(self):
         """Test env var controls kernels enablement."""
@@ -27,7 +27,7 @@ class TestBase(unittest.TestCase):
         try:
             os.environ['TWINKLE_USE_KERNELS'] = 'YES'
             from twinkle.kernel.base import _kernels_enabled
-            self.assertTrue(_kernels_enabled())
+            assert _kernels_enabled()
 
             os.environ['TWINKLE_USE_KERNELS'] = 'NO'
             import importlib
@@ -35,7 +35,7 @@ class TestBase(unittest.TestCase):
             import twinkle.kernel.base
             importlib.reload(twinkle.kernel.base)
             from twinkle.kernel.base import _kernels_enabled
-            self.assertFalse(_kernels_enabled())
+            assert not _kernels_enabled()
         finally:
             if original is not None:
                 os.environ['TWINKLE_USE_KERNELS'] = original
@@ -45,17 +45,17 @@ class TestBase(unittest.TestCase):
     def test_to_kernels_mode(self):
         """Test mode conversion."""
         if not is_kernels_available():
-            self.skipTest('kernels package not available')
+            pytest.skip('kernels package not available')
 
-        self.assertEqual(to_kernels_mode('train').name, 'TRAINING')
-        self.assertEqual(to_kernels_mode('inference').name, 'INFERENCE')
-        self.assertEqual(to_kernels_mode('compile').name, 'TORCH_COMPILE')
+        assert to_kernels_mode('train').name == 'TRAINING'
+        assert to_kernels_mode('inference').name == 'INFERENCE'
+        assert to_kernels_mode('compile').name == 'TORCH_COMPILE'
 
 
-class TestLayerRegistry(unittest.TestCase):
+class TestLayerRegistry:
     """Test layer registry."""
 
-    def setUp(self):
+    def setup_method(self):
         self.registry = LayerRegistry()
 
     def test_register_and_get(self):
@@ -64,10 +64,10 @@ class TestLayerRegistry(unittest.TestCase):
         self.registry.register('TestLayer', mock_spec, 'cuda')
 
         result = self.registry.get('TestLayer', 'cuda')
-        self.assertEqual(result, mock_spec)
+        assert result == mock_spec
 
         result = self.registry.get('NonExistent', 'cuda')
-        self.assertIsNone(result)
+        assert result is None
 
     def test_register_multiple_devices(self):
         """Test registration for multiple devices."""
@@ -77,8 +77,8 @@ class TestLayerRegistry(unittest.TestCase):
         self.registry.register('TestLayer', mock_cuda, 'cuda')
         self.registry.register('TestLayer', mock_npu, 'npu')
 
-        self.assertEqual(self.registry.get('TestLayer', 'cuda'), mock_cuda)
-        self.assertEqual(self.registry.get('TestLayer', 'npu'), mock_npu)
+        assert self.registry.get('TestLayer', 'cuda') == mock_cuda
+        assert self.registry.get('TestLayer', 'npu') == mock_npu
 
     def test_get_without_device(self):
         """Test lookup without device."""
@@ -86,17 +86,17 @@ class TestLayerRegistry(unittest.TestCase):
         self.registry.register('TestLayer', mock_spec, 'cuda')
 
         result = self.registry.get('TestLayer')
-        self.assertEqual(result, mock_spec)
+        assert result == mock_spec
 
     def test_has(self):
         """Test has checks."""
         mock_spec = Mock()
-        self.assertFalse(self.registry.has('TestLayer'))
+        assert not self.registry.has('TestLayer')
 
         self.registry.register('TestLayer', mock_spec, 'cuda')
-        self.assertTrue(self.registry.has('TestLayer'))
-        self.assertTrue(self.registry.has('TestLayer', 'cuda'))
-        self.assertFalse(self.registry.has('TestLayer', 'npu'))
+        assert self.registry.has('TestLayer')
+        assert self.registry.has('TestLayer', 'cuda')
+        assert not self.registry.has('TestLayer', 'npu')
 
     def test_list_kernel_names(self):
         """Test listing kernel names."""
@@ -105,13 +105,13 @@ class TestLayerRegistry(unittest.TestCase):
         self.registry.register('Layer2', mock_spec, 'cuda')
 
         names = self.registry.list_kernel_names()
-        self.assertCountEqual(names, ['Layer1', 'Layer2'])
+        assert sorted(names) == sorted(['Layer1', 'Layer2'])
 
 
-class TestExternalLayerRegistry(unittest.TestCase):
+class TestExternalLayerRegistry:
     """Test external layer registry."""
 
-    def setUp(self):
+    def setup_method(self):
         self.registry = ExternalLayerRegistry()
 
     def test_register_and_get(self):
@@ -120,15 +120,15 @@ class TestExternalLayerRegistry(unittest.TestCase):
         self.registry.register(mock_class, 'LlamaAttention')
 
         result = self.registry.get(mock_class)
-        self.assertEqual(result, 'LlamaAttention')
+        assert result == 'LlamaAttention'
 
     def test_has(self):
         """Test has checks."""
         mock_class = Mock
-        self.assertFalse(self.registry.has(mock_class))
+        assert not self.registry.has(mock_class)
 
         self.registry.register(mock_class, 'LlamaAttention')
-        self.assertTrue(self.registry.has(mock_class))
+        assert self.registry.has(mock_class)
 
     def test_list_mappings(self):
         """Test list mappings."""
@@ -143,13 +143,13 @@ class TestExternalLayerRegistry(unittest.TestCase):
         self.registry.register(MockClass2, 'LlamaMLP')
 
         mappings = self.registry.list_mappings()
-        self.assertEqual(len(mappings), 2)
+        assert len(mappings) == 2
 
 
-class TestRegisterLayer(unittest.TestCase):
+class TestRegisterLayer:
     """Test global register helpers."""
 
-    def setUp(self):
+    def setup_method(self):
         get_global_layer_registry()._clear()
         get_global_function_registry()._clear()
 
@@ -159,35 +159,35 @@ class TestRegisterLayer(unittest.TestCase):
         register_layer('TestLayer', mock_spec, 'cuda')
 
         result = get_layer_spec('TestLayer', 'cuda')
-        self.assertEqual(result, mock_spec)
+        assert result == mock_spec
 
 
-class TestRegisterLayerKernel(unittest.TestCase):
+class TestRegisterLayerKernel:
     """Test register_layer_kernel."""
 
-    def setUp(self):
+    def setup_method(self):
         get_global_layer_registry()._clear()
 
     def test_register_without_kernels_package(self):
         """Test registration when kernels package missing."""
         with patch('twinkle.kernel.layer.is_kernels_available', return_value=False):
             register_layer_kernel('TestLayer', repo_id='test/repo')
-            self.assertIsNone(get_layer_spec('TestLayer'))
+            assert get_layer_spec('TestLayer') is None
 
     def test_register_with_kernels_package(self):
         """Test registration when kernels package available."""
         if not is_kernels_available():
-            self.skipTest('kernels package not available')
+            pytest.skip('kernels package not available')
 
         register_layer_kernel(
             kernel_name='TestLayer',
             repo_id='kernels-community/test',
         )
 
-        self.assertIsNotNone(get_layer_spec('TestLayer'))
+        assert get_layer_spec('TestLayer') is not None
 
 
-class TestKernelizeModel(unittest.TestCase):
+class TestKernelizeModel:
     """Test kernelize_model."""
 
     def test_kernelize_without_kernels_enabled(self):
@@ -195,20 +195,20 @@ class TestKernelizeModel(unittest.TestCase):
         with patch('twinkle.kernel.layer.is_kernels_enabled', return_value=False):
             mock_model = Mock()
             result = kernelize_model(mock_model)
-            self.assertEqual(result, mock_model)
+            assert result == mock_model
 
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
     def test_kernelize_without_kernels_available(self, mock_available):
         """Test returns original model when kernels unavailable."""
         mock_model = Mock()
         result = kernelize_model(mock_model)
-        self.assertEqual(result, mock_model)
+        assert result == mock_model
 
 
-class TestRegisterExternalLayer(unittest.TestCase):
+class TestRegisterExternalLayer:
     """Test register_external_layer."""
 
-    def setUp(self):
+    def setup_method(self):
         get_global_external_layer_registry()._clear()
 
     def test_register_external_layer(self):
@@ -218,39 +218,39 @@ class TestRegisterExternalLayer(unittest.TestCase):
         register_external_layer(mock_class, 'LlamaAttention')
 
         result = get_global_external_layer_registry().get(mock_class)
-        self.assertEqual(result, 'LlamaAttention')
+        assert result == 'LlamaAttention'
 
     def test_register_external_qwen_layer(self):
         """Test registering Qwen2 external layer mapping."""
         try:
             from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
         except ImportError:
-            self.skipTest('transformers package not available')
+            pytest.skip('transformers package not available')
 
         register_external_layer(Qwen2Attention, 'LlamaAttention')
 
         registry = get_global_external_layer_registry()
-        self.assertTrue(registry.has(Qwen2Attention))
-        self.assertEqual(registry.get(Qwen2Attention), 'LlamaAttention')
+        assert registry.has(Qwen2Attention)
+        assert registry.get(Qwen2Attention) == 'LlamaAttention'
 
     def test_register_external_layer_adds_kernel_layer_name(self):
         """Test register_external_layer sets kernel_layer_name."""
         if not is_kernels_available():
-            self.skipTest('kernels package not available')
+            pytest.skip('kernels package not available')
 
         class TestLayer:
             pass
 
         register_external_layer(TestLayer, 'TestKernel')
 
-        self.assertTrue(hasattr(TestLayer, 'kernel_layer_name'))
-        self.assertEqual(TestLayer.kernel_layer_name, 'TestKernel')
+        assert hasattr(TestLayer, 'kernel_layer_name')
+        assert TestLayer.kernel_layer_name == 'TestKernel'
 
 
-class TestRegisterKernels(unittest.TestCase):
+class TestRegisterKernels:
     """Test register_kernels batch registration."""
 
-    def setUp(self):
+    def setup_method(self):
         get_global_layer_registry()._clear()
 
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
@@ -269,8 +269,8 @@ class TestRegisterKernels(unittest.TestCase):
 
         register_kernels(config)
 
-        self.assertIsNone(get_layer_spec('LlamaAttention'))
-        self.assertIsNone(get_layer_spec('LlamaMLP'))
+        assert get_layer_spec('LlamaAttention') is None
+        assert get_layer_spec('LlamaMLP') is None
 
     def test_register_functions(self):
         """Test function batch registration."""
@@ -287,19 +287,19 @@ class TestRegisterKernels(unittest.TestCase):
 
         register_kernels(config)
         specs = get_global_function_registry().list_specs()
-        self.assertEqual(len(specs), 1)
+        assert len(specs) == 1
         spec = specs[0]
-        self.assertEqual(spec.func_name, 'apply_rotary_pos_emb')
-        self.assertEqual(spec.target_module, 'test')
-        self.assertEqual(spec.func_impl, Mock)
-        self.assertEqual(spec.device, 'cpu')
-        self.assertEqual(spec.mode, 'inference')
+        assert spec.func_name == 'apply_rotary_pos_emb'
+        assert spec.target_module == 'test'
+        assert spec.func_impl == Mock
+        assert spec.device == 'cpu'
+        assert spec.mode == 'inference'
 
 
-class TestModeSupport(unittest.TestCase):
+class TestModeSupport:
     """Test mode support."""
 
-    def setUp(self):
+    def setup_method(self):
         get_global_layer_registry()._clear()
 
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
@@ -310,20 +310,20 @@ class TestModeSupport(unittest.TestCase):
         from twinkle.kernel.layer import _to_hf_mode, register_layer_kernel
 
         result = _to_hf_mode(None)
-        self.assertEqual(result, Mode.FALLBACK)
+        assert result == Mode.FALLBACK
 
     def test_to_hf_mode_conversion(self):
         """Test Twinkle mode to HF kernels Mode conversion."""
         if not is_kernels_available():
-            self.skipTest('kernels package not available')
+            pytest.skip('kernels package not available')
 
         from kernels import Mode
 
         from twinkle.kernel.layer import _to_hf_mode
 
-        self.assertEqual(_to_hf_mode('train'), Mode.TRAINING)
-        self.assertEqual(_to_hf_mode('inference'), Mode.INFERENCE)
-        self.assertEqual(_to_hf_mode('compile'), Mode.TORCH_COMPILE)
+        assert _to_hf_mode('train') == Mode.TRAINING
+        assert _to_hf_mode('inference') == Mode.INFERENCE
+        assert _to_hf_mode('compile') == Mode.TORCH_COMPILE
 
     @patch('twinkle.kernel.layer.is_kernels_available', return_value=False)
     def test_register_multiple_modes(self, mock_available):
@@ -341,12 +341,12 @@ class TestModeSupport(unittest.TestCase):
         registry.register('TestLayer', repo_inference, 'cuda', Mode.INFERENCE)
         registry.register('TestLayer', repo_training, 'cuda', Mode.TRAINING)
 
-        self.assertTrue(registry.has('TestLayer', 'cuda', Mode.INFERENCE))
-        self.assertTrue(registry.has('TestLayer', 'cuda', Mode.TRAINING))
+        assert registry.has('TestLayer', 'cuda', Mode.INFERENCE)
+        assert registry.has('TestLayer', 'cuda', Mode.TRAINING)
 
         result = registry.get('TestLayer', 'cuda', Mode.INFERENCE)
-        self.assertEqual(result, repo_inference)
+        assert result == repo_inference
 
 
 if __name__ == '__main__':
-    unittest.main()
+    pytest.main([__file__])

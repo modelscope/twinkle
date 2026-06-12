@@ -33,7 +33,7 @@ vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 datajuicer = ["py-data-juicer"]
 tinker = ["tinker==0.14.0"]
-test = ["hypothesis>=6.0"]
+test = ["hypothesis>=6.0", "pytest"]
 server = [
   "redis>=5.0",
   "psutil>=5.9.0",

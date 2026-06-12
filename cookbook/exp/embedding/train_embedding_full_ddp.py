@@ -40,7 +40,7 @@ from twinkle.utils.parallel import PosixFileLock
 from twinkle_agentic.protocol.openai import OpenAI as OpenAIClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cookbook.exp.embedding.dataset_think import get_dataset  # noqa: E402
+from dataset_think import get_dataset  # noqa: E402
 
 logger = get_logger()
 
@@ -539,7 +539,7 @@ def train():
     # Special tokens come from the condenser tokenizer because the leak we strip is in its decoded output.
     condenser_template = Template(model_id=CONDENSE_MODEL_ID, max_length=DATASET_MAX_TOKENS,
                                   enable_thinking=False)
-    _special_tokens = set(condenser_template.processor.all_special_tokens)
+    _special_tokens = set(condenser_template.tokenizer.all_special_tokens)
     condenser_sampler = vLLMSampler(
         model_id=CONDENSE_MODEL_ID,
         engine_args={

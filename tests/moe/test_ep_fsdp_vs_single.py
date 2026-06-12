@@ -26,7 +26,7 @@ import socket
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import unittest
+import pytest
 from datetime import timedelta
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -448,13 +448,13 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         dist.destroy_process_group()
 
 
-class TestEPFSDPvsSingle(unittest.TestCase):
+class TestEPFSDPvsSingle:
 
     def test_alignment(self):
         if not dist.is_available() or not torch.cuda.is_available():
-            self.skipTest('Need distributed + CUDA')
+            pytest.skip('Need distributed + CUDA')
         if torch.cuda.device_count() < 4:
-            self.skipTest('Need 4 GPUs')
+            pytest.skip('Need 4 GPUs')
 
         model_id = os.environ.get('QWEN3_MOE_MODEL_ID', 'Qwen/Qwen3.5-4B')
         local_only = os.environ.get('QWEN3_MOE_LOCAL_ONLY', '1') != '0'
@@ -462,7 +462,7 @@ class TestEPFSDPvsSingle(unittest.TestCase):
         try:
             _load_config(model_id, local_only)
         except Exception as e:
-            self.skipTest(f'Model not available: {e}')
+            pytest.skip(f'Model not available: {e}')
 
         port = _find_free_port()
         snapshot_path = _single_snapshot_path(port)
@@ -479,4 +479,4 @@ class TestEPFSDPvsSingle(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    pytest.main([__file__])

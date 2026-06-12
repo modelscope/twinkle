@@ -6,7 +6,7 @@ import socket
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import unittest
+import pytest
 from datetime import timedelta
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
@@ -650,23 +650,23 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str, ba
         dist.destroy_process_group()
 
 
-class TestDerivedRingPrecision(unittest.TestCase):
+class TestDerivedRingPrecision:
 
     def _get_backend_or_skip(self, world_size: int = 4) -> dict:
         backend = _get_runtime_backend()
         if backend is None:
-            self.skipTest('CUDA or NPU is required for derived ring runtime tests.')
+            pytest.skip('CUDA or NPU is required for derived ring runtime tests.')
         if backend['device_count'] < world_size:
-            self.skipTest(f'Requires at least {world_size} {backend["label"]} devices.')
+            pytest.skip(f'Requires at least {world_size} {backend["label"]} devices.')
         return backend
 
     def _require_attn_impl_or_skip(self, backend: dict, attn_implementation: str) -> None:
         if attn_implementation == 'flash_attention_2' and not is_flash_attn_available():
             if backend['device_type'] == 'npu':
-                self.skipTest(
+                pytest.skip(
                     'Derived ring runtime tests currently require flash_attention_2, which is unavailable on NPU in '
                     'this environment.')
-            self.skipTest('flash_attention_2 is required for derived ring runtime tests.')
+            pytest.skip('flash_attention_2 is required for derived ring runtime tests.')
 
     def test_cp_only_precision_alignment(self):
         case = _make_case('cp_only')
@@ -717,24 +717,24 @@ class TestDerivedRingPrecision(unittest.TestCase):
             join=True)
 
 
-class TestDerivedRingMemoryProfile(unittest.TestCase):
+class TestDerivedRingMemoryProfile:
 
     def _get_backend_or_skip(self, world_size: int = 4) -> dict:
         if os.environ.get('TWINKLE_RUN_MEMORY_TESTS', '0') != '1':
-            self.skipTest('Set TWINKLE_RUN_MEMORY_TESTS=1 to run derived ring memory profile tests.')
+            pytest.skip('Set TWINKLE_RUN_MEMORY_TESTS=1 to run derived ring memory profile tests.')
         backend = _get_runtime_backend()
         if backend is None:
-            self.skipTest('CUDA or NPU is required for derived ring memory tests.')
+            pytest.skip('CUDA or NPU is required for derived ring memory tests.')
         if backend['device_count'] < world_size:
-            self.skipTest(f'Requires at least {world_size} {backend["label"]} devices.')
+            pytest.skip(f'Requires at least {world_size} {backend["label"]} devices.')
         if not is_flash_attn_available():
             if backend['device_type'] == 'npu':
-                self.skipTest(
+                pytest.skip(
                     'Derived ring memory tests currently require flash_attention_2, which is unavailable on NPU in '
                     'this environment.')
-            self.skipTest('flash_attention_2 is required for derived ring memory tests.')
+            pytest.skip('flash_attention_2 is required for derived ring memory tests.')
         if not _supports_peak_memory_stats(backend['device_type']):
-            self.skipTest(f'{backend["label"]} peak-memory stats are unavailable in this environment.')
+            pytest.skip(f'{backend["label"]} peak-memory stats are unavailable in this environment.')
         return backend
 
     def test_sp_only_memory_profile_grid(self):
