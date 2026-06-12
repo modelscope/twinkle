@@ -23,19 +23,52 @@ import json
 import os
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Set, Tuple
 
 from twinkle.data_format import pack_value, user_data_get
 from twinkle.preprocessor import Preprocessor
 from twinkle.template import Template
 from twinkle.utils import get_logger
-from ..data_format import RoundContext, Scorer, ScoreResult
 from .llm_backend import LLMBackend
 from .utils import _chr_min_distinct, _ifd_family_metrics, _lp_to_jsonable, _pad_batch, _to_int_list
 
 logger = get_logger()
 
 _MIN_RESPONSE_TOKENS = 5
+
+
+@dataclass
+class RoundContext:
+    """Per-round payload passed to scorers."""
+    row_idx: int
+    rnd_idx: int
+    asst_idx: int
+    row: Dict[str, Any]
+    intent: Optional[str]
+    messages: List[Dict[str, Any]]
+    context_messages: List[Dict[str, Any]]
+    cond_ids: List[int]
+    n_prompt: int
+    asst_ids: List[int]
+    asst_text: str
+    user_prompt: str
+    features: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ScoreResult:
+    score: Optional[float] = None
+    passed: bool = True
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+class Scorer(Protocol):
+    name: str
+    requires_logprobs: bool
+
+    def score(self, contexts: List[RoundContext]) -> List[ScoreResult]:
+        ...
 
 
 def _user_data_lookup(user_data: Any, key: str) -> Any:
