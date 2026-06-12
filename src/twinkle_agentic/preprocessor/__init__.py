@@ -20,7 +20,7 @@ from .refuse_filter import RefuseFilter
 from .score_filter import ScoreFilter
 from .token_soup import TokenSoupFilter
 
-logger = get_logger(only_local_master=False)
+logger = get_logger()
 
 
 class QualityPreprocessor(Preprocessor):

@@ -72,16 +72,3 @@ class ToolCallRegistry:
             if p.detect(text):
                 return p
         return None
-
-
-def trailing_prefix_of(buf: str, marker: str) -> int:
-    """Length of trailing chars of ``buf`` that form a strict prefix of ``marker``.
-
-    Used by streaming protocols to hold back the tail when it could be the
-    start of an upcoming open tag, preventing mid-marker splits.
-    """
-    upper = min(len(marker) - 1, len(buf))
-    for k in range(upper, 0, -1):
-        if buf.endswith(marker[:k]):
-            return k
-    return 0

@@ -9,7 +9,7 @@ from twinkle.utils import get_logger
 
 from .utils import msg_content_text, normalize_tool_calls
 
-logger = get_logger(only_local_master=False)
+logger = get_logger()
 
 # Reasoning block regex covers both <think> and <thinking> forms.
 _THINK_BLOCK_RE = re.compile(r'<think(?:ing)?>(.*?)</think(?:ing)?>', re.DOTALL | re.IGNORECASE)

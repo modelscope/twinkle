@@ -15,11 +15,8 @@ Detection is **structural** (no hardcoded tool-name whitelist):
 * outer tag is snake_case ``[a-z][a-z0-9_]*`` and not in :data:`_DENY`
 * outer block contains at least one nested ``<key>VAL</key>`` child
 
-Streaming: ``open_marker``/``close_marker`` are ``None`` because the
-outer tag varies per call. The base ``parse_tool_call_stream`` therefore
-falls back to plain content passthrough; recognised blocks are extracted
-only on full-text :meth:`parse` (e.g. by ``AgentTraceFilter`` after
-trajectory assembly).
+Recognised blocks are extracted only on full-text :meth:`parse` (e.g. by
+``AgentTraceFilter`` after trajectory assembly).
 """
 from __future__ import annotations
 
@@ -98,7 +95,7 @@ _RESULT_RE = re.compile(
 
 class ClineParser(ToolCallParser):
     name = 'cline'
-    # Outer tag varies per tool — no fixed marker; streaming uses passthrough.
+    # Outer tag varies per tool — no fixed marker.
     open_marker = None
     close_marker = None
 

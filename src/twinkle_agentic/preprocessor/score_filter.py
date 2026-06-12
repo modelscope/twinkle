@@ -33,7 +33,7 @@ from ..data_format import RoundContext, Scorer, ScoreResult
 from .llm_backend import LLMBackend
 from .utils import _chr_min_distinct, _ifd_family_metrics, _lp_to_jsonable, _pad_batch, _to_int_list
 
-logger = get_logger(only_local_master=False)
+logger = get_logger()
 
 _MIN_RESPONSE_TOKENS = 5
 

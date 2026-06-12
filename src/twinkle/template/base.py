@@ -11,7 +11,7 @@ from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
-from .tools import ToolCallRegistry, trailing_prefix_of
+from .tools import ToolCallRegistry
 from .utils import TokenizeByRound, transfer_to_standard_message
 
 if TYPE_CHECKING:
@@ -85,127 +85,6 @@ class Template:
         """Strip tool-call markup using the same parser that ``parse_tool_call`` would pick."""
         parser = ToolCallRegistry.detect_first(decoded or '')
         return parser.clean(decoded) if parser else (decoded or '').rstrip()
-
-    def parse_tool_call_stream(
-        self,
-        state: Dict[str, Any],
-        new_text: str,
-        finished: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Convert incremental decoded text into OpenAI streaming ``delta`` parts.
-
-        Selects a parser once (cached on ``state``) by ``model_id``. If that
-        parser declares ``open_marker``/``close_marker`` (e.g. Hermes/Qwen),
-        runs the generic block-buffer state machine: holds back partial
-        markers, parses each closed block via ``parser.parse``, emits one
-        ``tool_calls`` delta per parsed call. Otherwise streams plain content.
-
-        Args:
-            state: Per-sequence opaque dict; caller allocates ``{}`` once.
-            new_text: Incremental decoded text since the previous call.
-            finished: True on the final call so partial buffers can flush.
-
-        Returns:
-            List of delta dicts; each carries at most one of ``content`` /
-            ``tool_calls``.
-        """
-        parser = state.get('parser')
-        if 'parser' not in state:
-            parser = ToolCallRegistry.select_for_model(self.model_id)
-            state['parser'] = parser
-        if parser is None or not parser.open_marker:
-            return [{'content': new_text}] if new_text else []
-        return self._stream_marker_blocks(state, new_text, finished, parser)
-
-    def _stream_marker_blocks(
-        self,
-        state: Dict[str, Any],
-        new_text: str,
-        finished: bool,
-        parser,
-    ) -> List[Dict[str, Any]]:
-        """Generic open/close marker streaming protocol.
-
-        Buffers partial markup until ``parser.close_marker`` arrives, then
-        parses the block via ``parser.parse``. Used by Hermes/Qwen and any
-        future block-style format (Mistral ``[TOOL_CALLS]``, etc.).
-        """
-        open_marker, close_marker = parser.open_marker, parser.close_marker
-        state.setdefault('pending', '')
-        state.setdefault('tc_count', 0)
-        if new_text:
-            state['pending'] += new_text
-
-        events: List[Dict[str, Any]] = []
-        while True:
-            buf = state['pending']
-            if not buf:
-                break
-            open_idx = buf.find(open_marker)
-            if open_idx == -1:
-                partial = 0 if finished else trailing_prefix_of(buf, open_marker)
-                emit = buf[:-partial] if partial else buf
-                state['pending'] = buf[-partial:] if partial else ''
-                if emit:
-                    events.append({'content': emit})
-                break
-            if open_idx > 0:
-                events.append({'content': buf[:open_idx]})
-                state['pending'] = buf[open_idx:]
-                continue
-            close_idx = buf.find(close_marker)
-            if close_idx == -1:
-                if finished:
-                    # EOF with unclosed block — let parser.parse handle the truncation.
-                    try:
-                        parsed = parser.parse(buf) or []
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception(
-                            'tool-call parse failed for unclosed streamed block; emitting as raw content')
-                        events.append({'content': buf})
-                        state['pending'] = ''
-                        break
-                    if parsed:
-                        for tc in parsed:
-                            events.append({'tool_calls': [self._format_tc_delta(state, tc)]})
-                    else:
-                        events.append({'content': buf})
-                    state['pending'] = ''
-                break
-            block_end = close_idx + len(close_marker)
-            block = buf[:block_end]
-            try:
-                parsed = parser.parse(block) or []
-            except Exception:
-                logger.warn('tool-call parse failed for streamed block; emitting as raw content')
-                events.append({'content': block})
-                state['pending'] = buf[block_end:]
-                continue
-            for tc in parsed:
-                events.append({'tool_calls': [self._format_tc_delta(state, tc)]})
-            state['pending'] = buf[block_end:]
-        return events
-
-    @staticmethod
-    def _format_tc_delta(state: Dict[str, Any], tc: Dict[str, Any]) -> Dict[str, Any]:
-        """Format a parsed tool_call dict as an OpenAI streaming delta entry.
-
-        ``arguments`` is encoded as JSON string for the wire format (OpenAI
-        streaming spec); ``index`` and ``id`` are auto-assigned from ``state``.
-        """
-        fn = dict(tc.get('function') or {})
-        args = fn.get('arguments')
-        if isinstance(args, dict):
-            fn['arguments'] = json.dumps(args, ensure_ascii=False)
-        delta = {
-            'index': state['tc_count'],
-            'id': tc.get('id') or f'call_{state["tc_count"]}',
-            'type': tc.get('type') or 'function',
-            'function': fn,
-        }
-        state['tc_count'] += 1
-        return delta
 
     @property
     def tokenizer(self):

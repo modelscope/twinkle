@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.utils import get_logger
 
-logger = get_logger(only_local_master=False)
+logger = get_logger()
 
 
 class LLMBackend(ABC):

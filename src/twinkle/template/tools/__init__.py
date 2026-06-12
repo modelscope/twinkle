@@ -5,7 +5,7 @@ Importing this package auto-registers every parser. Order matters:
 narrower / stronger formats first so round-robin detection prefers them
 over weaker fallbacks.
 """
-from .base import ToolCallParser, ToolCallRegistry, trailing_prefix_of
+from .base import ToolCallParser, ToolCallRegistry
 from .cline import ClineParser
 from .qwen import HermesQwenParser
 from .react import ReActParser
@@ -21,7 +21,6 @@ ToolCallRegistry.register(ReActParser())
 __all__ = [
     'ToolCallParser',
     'ToolCallRegistry',
-    'trailing_prefix_of',
     'HermesQwenParser',
     'ClineParser',
     'VCPParser',
