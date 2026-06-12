@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from abc import ABC, abstractmethod
 from peft import PeftConfig
-from typing import Any, AsyncIterator, Dict, List, Optional, Type, Union
+from typing import Any, List, Optional, Type, Union
 
 import twinkle
 from twinkle import remote_function
@@ -46,25 +46,6 @@ class Sampler(ABC):
     @abstractmethod
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         ...
-
-    def astream_one(
-        self,
-        trajectory: Trajectory,
-        sampling_params: Optional[SamplingParams] = None,
-        adapter_name: str = '',
-        adapter_path: Optional[str] = None,
-        *,
-        use_base_model: bool = False,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Stream OpenAI-shape delta chunks for a single trajectory.
-
-        Default implementation raises ``NotImplementedError``; backend samplers
-        opt in by overriding (e.g. ``vLLMSampler``).
-
-        Yields:
-            Dicts shaped ``{'index': int, 'delta': {...}, 'finish_reason': ...}``.
-        """
-        raise NotImplementedError(f'{type(self).__name__} does not support streaming')
 
     @staticmethod
     def _not_encoded(inputs: Any) -> bool:
