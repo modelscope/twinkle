@@ -6,6 +6,7 @@ import json
 import numpy as np
 import os
 import random
+import sys
 from typing import Any, AsyncIterator, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
@@ -40,48 +41,24 @@ _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
 
 def _capture_caller() -> Optional[str]:
     """Return ``file:line`` of the first frame outside this module, or ``None``."""
-    this_file = __file__
-    frame = inspect.currentframe()
-    if frame is None:
-        return None
-    frame = frame.f_back  # skip _capture_caller itself
-    while frame is not None and frame.f_code.co_filename == this_file:
-        frame = frame.f_back
-    if frame is None:
-        return None
-    return f'{frame.f_code.co_filename}:{frame.f_lineno}'
+    f = sys._getframe(1)
+    while f and f.f_code.co_filename == __file__:
+        f = f.f_back
+    return f'{f.f_code.co_filename}:{f.f_lineno}' if f else None
 
 
-def _attach_caller_note(exc: BaseException, caller: Optional[str]) -> None:
-    """Append a driver-caller note to ``exc`` so it surfaces in traceback dumps (PY3.11+)."""
+def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
+    """Stamp driver-caller location onto exc for both traceback and str(exc)."""
     if not caller:
         return
     try:
         marker = f'[twinkle] driver caller: {caller}'
-        notes = getattr(exc, '__notes__', None) or []
-        if marker not in notes:
+        if marker not in (getattr(exc, '__notes__', None) or []):
             exc.add_note(marker)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _augment_exc_with_caller(exc: BaseException, caller: Optional[str]) -> None:
-    """Prepend driver caller to ``exc.args[0]`` so ``f'{exc}'`` / ``str(exc)`` surfaces it.
-
-    ``add_note`` only shows up in ``traceback.format_exception``; downstream code that
-    logs via ``f'{e}'`` (e.g. ``SamplerBackend.prompt_logprobs``) would otherwise drop
-    the caller hint. Idempotent via a sentinel attribute so repeated re-raises in nested
-    wrappers don't stack the prefix.
-    """
-    if not caller or getattr(exc, '_twinkle_caller_augmented', False):
-        return
-    try:
-        prefix = f'[twinkle driver caller: {caller}] '
-        if exc.args:
-            exc.args = (prefix + str(exc.args[0]), *exc.args[1:])
-        else:
-            exc.args = (prefix.rstrip(), )
-        setattr(exc, '_twinkle_caller_augmented', True)
+        if not getattr(exc, '_twinkle_caller_augmented', False):
+            prefix = f'[twinkle driver caller: {caller}] '
+            exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(),)
+            exc._twinkle_caller_augmented = True
     except Exception:  # noqa: BLE001
         pass
 
@@ -550,7 +527,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 _maybe_load_worker_notifier()
                 _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
-                _attach_caller_note(_e, _caller)
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
@@ -580,14 +557,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 # In case the same class created twice in the same device group
                 # Try to get the caller's line (resolved in ``new_init`` so it points
                 # at user code, not at the wrapper itself).
-                if _caller:
-                    _cf, _, _cl = _caller.rpartition(':')
-                    caller_file = _cf.replace(os.sep, '_').replace('.', '_')
-                    caller_line = _cl
-                else:
-                    frame = inspect.currentframe().f_back
-                    caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
-                    caller_line = frame.f_lineno
+                _cf, _, _cl = (_caller or f'{__file__}:0').rpartition(':')
+                caller_file = _cf.replace(os.sep, '_').replace('.', '_')
+                caller_line = _cl
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
@@ -835,8 +807,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
-                                    _attach_caller_note(_e, _caller)
-                                    _augment_exc_with_caller(_e, _caller)
+                                    _tag_exc(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
@@ -850,8 +821,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
-                _attach_caller_note(_e, _caller)
-                _augment_exc_with_caller(_e, _caller)
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
@@ -871,8 +841,7 @@ async def _wrap_async_iter_with_notify(gen: AsyncIterator, ctx: str, caller: Opt
         async for chunk in gen:
             yield chunk
     except Exception as _e:  # noqa: BLE001
-        _attach_caller_note(_e, caller)
-        _augment_exc_with_caller(_e, caller)
+        _tag_exc(_e, caller)
         notify_exception(_notifier, ctx, _e, _name)
         raise
 
@@ -884,8 +853,7 @@ async def _wrap_objrefgen_with_notify(ref_gen: Any, ctx: str, caller: Optional[s
         async for ref in ref_gen:
             yield await ref
     except Exception as _e:  # noqa: BLE001
-        _attach_caller_note(_e, caller)
-        _augment_exc_with_caller(_e, caller)
+        _tag_exc(_e, caller)
         notify_exception(_notifier, ctx, _e, _name)
         raise
 
