@@ -54,7 +54,7 @@ pip install -e .
 ### 使用docker镜像：
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
 ```
 
 如果你需要使用Twinkle的Client，可以使用我们的一键安装脚本：

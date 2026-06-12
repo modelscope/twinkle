@@ -132,8 +132,7 @@ replace.sh
 result.png
 result.jpg
 result.mp4
-output/
-outputs/
+output*
 wandb/
 *.out
 benchmarks/
