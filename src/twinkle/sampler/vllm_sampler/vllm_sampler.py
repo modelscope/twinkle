@@ -27,7 +27,7 @@ import threading
 from copy import copy
 from typing import Any, AsyncIterator, Dict, List, Optional, Type, Union
 
-from twinkle import DeviceMesh, get_logger, remote_class, remote_function, remote_generator, requires
+from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
@@ -374,117 +374,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results
-
-    @remote_generator(execute='balanced')
-    async def astream_one(
-        self,
-        trajectory: Trajectory,
-        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
-        adapter_name: str = '',
-        adapter_path: Optional[str] = None,
-        *,
-        use_base_model: bool = False,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Stream OpenAI-shape deltas for a single trajectory.
-
-        Single-trajectory only: routed to one DP actor by ``@remote_generator``
-        (see decorator), so DP slicing / NCCL collective constraints do not apply.
-
-        Yields dicts of shape::
-
-            {'index': int, 'delta': {...}, 'finish_reason': None | 'stop' | 'tool_calls' | 'length'}
-
-        Where ``delta`` is one of ``{'role':'assistant'}``, ``{'content': str}``,
-        ``{'tool_calls': [{...}]}``, or ``{}`` (final frame). The handler layer
-        wraps these into ``chat.completion.chunk`` envelopes for SSE.
-        """
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-        elif isinstance(sampling_params, dict):
-            sampling_params = SamplingParams.from_dict(sampling_params)
-
-        assert isinstance(trajectory, dict) and 'input_ids' not in trajectory, \
-            'astream_one accepts a single Trajectory (not InputFeature / not a list)'
-        assert self.template is not None, 'set_template must be called before streaming'
-
-        multi_modal_data = self._extract_multi_modal_data(trajectory)
-        feat = self.encode_trajectory_for_vllm(trajectory, adapter_name, True)
-
-        lora_request = None
-        if adapter_path is not None:
-            adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
-            lora_request = self._run_in_loop(self.engine._get_or_load_lora(adapter_path))
-            if lora_request is None:
-                logger.warning(f'Failed to pre-load LoRA from {adapter_path}, streaming will run without LoRA')
-
-        # vLLM AsyncLLM lives on self._async_loop (background thread); the actor
-        # method runs on Ray's actor loop. Bridge frames via a per-call queue.
-        ray_loop = asyncio.get_event_loop()
-        out_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-        _SENTINEL = object()
-        _ERR_KIND = '__err__'
-
-        async def _producer():
-            try:
-                async for output in self.engine.astream(
-                        prompt=self.template.get_vllm_input_ids(feat['input_ids']),
-                        sampling_params=sampling_params,
-                        lora_request=lora_request,
-                        multi_modal_data=multi_modal_data,
-                        mm_processor_kwargs=feat.get('mm_processor_kwargs'),
-                        disable_lora=use_base_model,
-                ):
-                    asyncio.run_coroutine_threadsafe(out_queue.put(('chunk', output)), ray_loop).result()
-            except BaseException as _e:  # noqa: BLE001
-                asyncio.run_coroutine_threadsafe(out_queue.put((_ERR_KIND, _e)), ray_loop).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(out_queue.put((_SENTINEL, None)), ray_loop).result()
-
-        asyncio.run_coroutine_threadsafe(_producer(), self._async_loop)
-
-        seq_state: Dict[int, Dict[str, Any]] = {}
-        role_emitted: Dict[int, bool] = {}
-        finished: Dict[int, bool] = {}
-        had_tool_call: Dict[int, bool] = {}
-        template = self.template
-
-        while True:
-            kind, payload = await out_queue.get()
-            if kind is _SENTINEL:
-                break
-            if kind == _ERR_KIND:
-                raise payload
-            request_output = payload
-            for seq_output in request_output.outputs:
-                idx = getattr(seq_output, 'index', 0)
-                # Sampler owns last_text_len; tc_state is opaque template state.
-                state = seq_state.setdefault(idx, {'last_text_len': 0, 'tc_state': {}})
-                if not role_emitted.get(idx):
-                    yield {'index': idx, 'delta': {'role': 'assistant'}, 'finish_reason': None}
-                    role_emitted[idx] = True
-
-                full_text = template.decode(list(seq_output.token_ids))
-                delta_text = ''
-                if len(full_text) > state['last_text_len']:
-                    delta_text = full_text[state['last_text_len']:]
-                    state['last_text_len'] = len(full_text)
-
-                is_finished = bool(seq_output.finish_reason) and not finished.get(idx)
-                if delta_text or is_finished:
-                    for ev in template.parse_tool_call_stream(state['tc_state'], delta_text, finished=is_finished):
-                        if 'tool_calls' in ev:
-                            had_tool_call[idx] = True
-                        yield {'index': idx, 'delta': ev, 'finish_reason': None}
-
-                if is_finished:
-                    if seq_output.finish_reason == 'length':
-                        fr = 'length'
-                    elif had_tool_call.get(idx):
-                        fr = 'tool_calls'
-                    else:
-                        fr = 'stop'
-                    yield {'index': idx, 'delta': {}, 'finish_reason': fr}
-                    finished[idx] = True
 
     @remote_function(dispatch='all', collect='first')
     def sleep(self, level: int = 1) -> None:

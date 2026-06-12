@@ -5,7 +5,7 @@ from .utils.import_utils import _LazyModule  # noqa
 
 if TYPE_CHECKING:
     from twinkle_client import init_tinker_client, init_twinkle_client
-    from .infra import get_device_placement, initialize, is_master, remote_class, remote_function, remote_generator
+    from .infra import get_device_placement, initialize, is_master, remote_class, remote_function
     from .utils import (GPU, NPU, DeviceGroup, DeviceMesh, Platform, Plugin, check_unsafe, exists, find_free_port,
                         find_node_ip, framework_util, get_logger, requires, torch_util, trust_remote_code)
     from .version import __release_datetime__, __version__
@@ -17,7 +17,7 @@ else:
             'find_free_port', 'trust_remote_code', 'check_unsafe', 'DeviceMesh', 'Plugin', 'DeviceGroup', 'get_logger'
         ],
         'infra':
-        ['initialize', 'remote_class', 'remote_function', 'remote_generator', 'get_device_placement', 'is_master'],
+        ['initialize', 'remote_class', 'remote_function', 'get_device_placement', 'is_master'],
     }
 
     import sys
