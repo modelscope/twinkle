@@ -14,7 +14,7 @@ from typing import Any
 
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
-from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
+from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
 
 logger = get_logger()
 
@@ -72,7 +72,7 @@ class ServiceProxy:
         headers = dict(request_headers)
         headers.pop('host', None)
         headers.pop('content-length', None)
-        request_id = request_headers.get(H_REQUEST_ID)
+        request_id = request_headers.get(H_REQUEST_ID) or request_headers.get(H_REQUEST_ID_LEGACY)
         if request_id is not None and not request_headers.get(H_MULTIPLEX_LEGACY):
             headers[H_MULTIPLEX_LEGACY] = request_id
         if request_id is not None:
