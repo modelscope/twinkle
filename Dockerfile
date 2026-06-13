@@ -1,12 +1,12 @@
 # ---------- Stage 0: grab pre-built binaries ----------
 FROM redis:7 AS redis
-FROM grafana/otel-lgtm:latest AS lgtm
+FROM grafana/otel-lgtm:0.27.1 AS lgtm
 
 # ---------- Stage 1: GPU training / serving image ----------
 FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.1-1.35.0
 
 # Install miniconda with Python 3.12
-RUN curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
+RUN curl --retry 3 --retry-delay 5 -fLO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
     bash Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda && \
     rm Miniconda3-latest-Linux-x86_64.sh
 ENV PATH="/opt/conda/bin:${PATH}"
