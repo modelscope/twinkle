@@ -165,6 +165,11 @@ class InfonceLoss(Loss):
             sentences, labels = self._gather_across_dp(sentences, labels)
 
         split_tensors = _parse_multi_negative_sentences(sentences, labels, self.hard_negatives)
+        if not split_tensors:
+            # No anchor pairs in this micro-batch; return a zero loss that
+            # still participates in autograd so DDP/FSDP do not hang.
+            loss = sentences.sum() * 0.0
+            return LossOutput(loss=loss, num_tokens=0)
         can_batched = self.hard_negatives is not None or len({s.shape[0] for s in split_tensors}) == 1
 
         if not self.use_batch:

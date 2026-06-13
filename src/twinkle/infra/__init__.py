@@ -420,6 +420,14 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             import torch
             if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
+                if device_mesh is None:
+                    total = len(arg)
+                    chunk = max(1, (total + n - 1) // n)
+                    for i in range(n):
+                        start = i * chunk
+                        end = min(total, start + chunk)
+                        _args.append(arg[start:end])
+                    return _args
                 for i in range(n):
                     _args.append(arg[device_mesh.get_slice(
                         len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])

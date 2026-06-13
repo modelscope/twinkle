@@ -558,18 +558,29 @@ class _SaveState:
         self._lock.release()
 
     def _loop_jsonl(self) -> None:
+        buffer: List[str] = []
+
+        def _flush(f):
+            if not buffer:
+                return
+            payload = ''.join(buffer)
+            self._acquire_lock()
+            try:
+                f.write(payload)
+                f.flush()
+            finally:
+                self._release_lock()
+            buffer.clear()
+
         with open(self._path, 'a', encoding='utf-8') as f:
             while True:
                 item = self._queue.get()
                 if item is _SENTINEL:
+                    _flush(f)
                     return
-                line = _json.dumps(item, ensure_ascii=False, default=_default_serializer) + '\n'
-                self._acquire_lock()
-                try:
-                    f.write(line)
-                    f.flush()
-                finally:
-                    self._release_lock()
+                buffer.append(_json.dumps(item, ensure_ascii=False, default=_default_serializer) + '\n')
+                if len(buffer) >= self._batch_size:
+                    _flush(f)
 
     def _loop_csv(self) -> None:
         import pandas as pd

@@ -519,7 +519,12 @@ class Template:
             for tc in tcs:
                 fn = tc['function']
                 args = fn['arguments']
-                decoded = json.loads(args) if args.strip() else {}
+                if isinstance(args, dict):
+                    decoded = args
+                elif isinstance(args, str):
+                    decoded = json.loads(args) if args.strip() else {}
+                else:
+                    decoded = {}
                 new_tcs.append({**tc, 'function': {**fn, 'arguments': decoded}})
             msg['tool_calls'] = new_tcs
         # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
