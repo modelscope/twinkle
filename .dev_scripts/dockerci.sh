@@ -9,7 +9,6 @@ IMAGE_VERSION=ci_image
 MODELSCOPE_HOME_CACHE=~/.cache
 CI_TEST=True
 MODELSCOPE_SDK_DEBUG=True
-pip install pytest
 CI_COMMAND='bash .dev_scripts/ci_container_test.sh pytest tests'
 MODELSCOPE_SDK_DEBUG=True
 echo "$USER"

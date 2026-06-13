@@ -5,7 +5,6 @@ MODELSCOPE_SDK_DEBUG=True
 echo "$USER"
 gpus='0,1 2,3'
 is_get_file_lock=false
-pip install pytest
 CI_COMMAND=${CI_COMMAND:-bash .dev_scripts/ci_container_test.sh pytest tests}
 echo "ci command: $CI_COMMAND"
 PR_CHANGED_FILES="${PR_CHANGED_FILES:-}"
