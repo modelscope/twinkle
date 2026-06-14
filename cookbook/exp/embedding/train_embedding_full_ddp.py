@@ -40,7 +40,8 @@ from twinkle.utils.parallel import PosixFileLock
 from twinkle_agentic.protocol.openai import OpenAI as OpenAIClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dataset_think import get_dataset  # noqa: E402
+from dataset_think import get_dataset as get_dataset_think  # noqa: E402
+from dataset_index import get_dataset as get_dataset_index  # noqa: E402
 
 logger = get_logger()
 
@@ -49,7 +50,7 @@ BACKEND: Literal['transformers', 'megatron'] = 'transformers'
 
 # Condenser (online compression + LoRA self-improvement); embedding model trains LoRA on top of MODEL_ID.
 CONDENSE_MODEL_ID = os.environ.get('CONDENSE_MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-QA-emb')
 TEMPLATE_NAME = 'Qwen3_5Template'
 
 # -- GPU placement (8 total) --------------------------------------------------
@@ -68,15 +69,19 @@ LEARNING_RATE = 1.5e-6
 GRADIENT_ACCUMULATION_STEPS = 1
 LOG_INTERVAL = 2
 SAVE_INTERVAL = 4000
-NUM_EPOCHS = 2
+NUM_EPOCHS = 1
 
 TOTAL_SAMPLES: Optional[int] = None
+# Post-build caps on each loader (None = no cap). Applied via .select() before mix.
+THINK_CAP: Optional[int] = 200_000
+INDEX_CAP: Optional[int] = 400_000
+MIX_SHUFFLE_SEED = 42
 
 # -- Resume from checkpoint ---------------------------------------------------
-RESUME_CHECKPOINT = os.environ.get(
-    'RESUME_CHECKPOINT',
-    './output/embedding_lora_transformers/step_16000')
-RESUME_STEP = int(os.environ.get('RESUME_STEP', 16000))
+# Empty by default — build_model falls back to MODEL_ID (the published emb model).
+# Set both to point at a local in-progress run only when resuming the *same* schedule.
+RESUME_CHECKPOINT = os.environ.get('RESUME_CHECKPOINT', '')
+RESUME_STEP = int(os.environ.get('RESUME_STEP', 0))
 
 # -- Online-compression knobs -------------------------------------------------
 # Below this length, condenser fabricates content for open-ended short prompts;
@@ -355,9 +360,14 @@ def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
     raw_pairs: List[tuple] = []
     prompt_queries: List[str] = []
     passthrough: List[Optional[str]] = []
+    # Conservative char budget: 32768 max_length - 8192 gen - ~2k prompt overhead = ~22k tokens.
+    # At worst-case 1.5 chars/token (CJK), that's ~33k chars. Use 60k as safe English-mix cap.
+    _MAX_COT_CHARS = 60_000
     for i, row in enumerate(rows):
         query, cot = _extract_query_cot(row)
         if not query or len(cot) < MIN_TEXT_CHARS:
+            continue
+        if len(cot) > _MAX_COT_CHARS:
             continue
         valid_indices.append(i)
         raw_pairs.append((query, cot))
@@ -521,7 +531,20 @@ def train():
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
 
     # -------- Data -----------------------------------------------------------
-    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True)
+    dataset = get_dataset_think(total=TOTAL_SAMPLES, load_from_cache_file=True)
+    if THINK_CAP and len(dataset.dataset) > THINK_CAP:
+        dataset.dataset = dataset.dataset.select(range(THINK_CAP))
+    if INDEX_CAP != 0:
+        from datasets import concatenate_datasets
+        ds_index = get_dataset_index(total=None, load_from_cache_file=True)
+        if INDEX_CAP and len(ds_index.dataset) > INDEX_CAP:
+            ds_index.dataset = ds_index.dataset.select(range(INDEX_CAP))
+        n_think = len(dataset.dataset)
+        n_index = len(ds_index.dataset)
+        # Both loaders emit identical {id, source, messages} schema post-QP.
+        dataset.dataset = concatenate_datasets(
+            [dataset.dataset, ds_index.dataset]).shuffle(seed=MIX_SHUFFLE_SEED)
+        logger.info(f'[mix] think={n_think} + index={n_index} → total={len(dataset.dataset)}')
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, shuffle=True)
     total_forward_steps = len(dataloader) * NUM_EPOCHS
     optimizer_steps = total_forward_steps // GRADIENT_ACCUMULATION_STEPS
@@ -608,15 +631,19 @@ def train():
         """Compress via vLLM sampler; fall back to API on truncation."""
         compress_prompts, valid_indices, raw_pairs, prompt_queries, passthrough = \
             _build_compress_prompts(raw_batch)
-        if not compress_prompts:
+        if len(compress_prompts) < 4:
             return None
 
         # Only submit non-passthrough prompts to the sampler.
         sampler_input = [p for p in compress_prompts if p is not None]
         sampler_pos = [ri for ri, p in enumerate(compress_prompts) if p is not None]
         if sampler_input:
-            with retrainer.sampler_lock:
-                sampler_responses = condenser_sampler.sample(sampler_input, compress_params)
+            try:
+                with retrainer.sampler_lock:
+                    sampler_responses = condenser_sampler.sample(sampler_input, compress_params)
+            except Exception as exc:
+                logger.warning(f'[sampler] encode overflow in batch, falling back to API: {exc}')
+                sampler_responses = [None] * len(sampler_input)
         else:
             sampler_responses = []
         responses = [None] * len(compress_prompts)
