@@ -3,7 +3,8 @@
 The Gym component provides an interface for reinforcement learning environments in Twinkle.
 
 ```python
-from twinkle.gym import Gym
+from twinkle_agentic.env import Gym
+
 
 class CustomGym(Gym):
 
