@@ -1,7 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
 from typing import List, Union
 
 from twinkle.data_format import InputFeature, ModelOutput
@@ -32,6 +29,9 @@ class EmbeddingMetric(Metric):
         self.grad_norm = 0.0
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
+        import torch
+        import torch.distributed as dist
+        import torch.nn.functional as F
         sentences = outputs.get('embeddings')
         if sentences is None:
             sentences = outputs.get('logits')
