@@ -1,5 +1,5 @@
 # ---------- Stage 0: grab pre-built binaries ----------
-FROM redis:7 AS redis
+FROM redis:7.4.9 AS redis
 FROM grafana/otel-lgtm:0.27.1 AS lgtm
 
 # ---------- Stage 1: GPU training / serving image ----------
