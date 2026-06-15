@@ -414,8 +414,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
         loss_instance = optimizer_config.loss_instance
-        loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
-        loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
+        loss_require_logits = getattr(loss_instance, 'require_logits', False)
+        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
         loss_require_logps = getattr(loss_instance, 'require_logps', True)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
@@ -490,8 +490,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.loss_instance
-            loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
-            loss_require_entropy = (hasattr(loss_instance, 'require_entropy') and loss_instance.require_entropy)
+            loss_require_logits = getattr(loss_instance, 'require_logits', False)
+            loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
             loss_require_logps = getattr(loss_instance, 'require_logps', True)
             inputs: Dict[str, Any] = processor(
                 inputs,
@@ -929,7 +929,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if optimizer_config.cur_step % interval != 0:
             return
         model = self.strategy.unwrap_model(self.model)
-        processed_state_dict = {}
         save_kwargs = {}
         if adapter_name == _default_adapter_name:
             # Full model save

@@ -48,7 +48,6 @@ class MegatronStrategy:
         ddp_config: Dict[str, Any] = None,
         **kwargs,
     ):
-        import torch.distributed as dist
         from megatron.core import mpu
         self.device_mesh = device_mesh
         self.use_distributed_optimizer = use_distributed_optimizer
