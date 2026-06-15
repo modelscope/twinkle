@@ -29,6 +29,9 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
 
 RUN pip install megatron_core mcore_bridge --no-cache-dir
 
+# Reinstall PyTorch with CUDA 12.8 to match system CUDA (vllm upgrade may pull cu13.0 wheels)
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --no-cache-dir
+
 # Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
 RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
