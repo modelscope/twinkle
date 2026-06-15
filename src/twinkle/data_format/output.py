@@ -20,11 +20,13 @@ class ModelOutput(TypedDict, total=False):
         loss: The loss calculated by the model.
         logps: The log-probabilities of correct tokens by the model.
         num_tokens: The token denominator associated with ``loss``.
+        embeddings: The embeddings output by the model, used be embedding task.
     """
     logits: Optional[OutputType]
     loss: Optional[OutputType]
     logps: Optional[OutputType]
     num_tokens: Optional[OutputType]
+    embeddings: Optional[OutputType]
 
 
 class LossOutput(TypedDict, total=False):

@@ -420,7 +420,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                     embeddings = output_tensor
             elif labels is not None and is_last_pp:
                 _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
-                _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
+                _loss_require_entropy = getattr(_loss_instance, 'require_entropy', True)
                 _packed = batch.get('packed_seq_params')
                 cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                 if _loss_require_logps:
@@ -446,7 +446,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 _outputs = {'logps': logps}
                 if entropies is not None:
                     _outputs['entropies'] = entropies
-                if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                if getattr(_loss_instance, 'require_logits', False):
                     _outputs['logits'] = output_tensor
                 batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
                 logps = _outputs['logps']
@@ -1139,7 +1139,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         )
         iteration = self._read_iteration(tracker_path)
         if iteration == 0:
-            logging.getLogger(__name__).warning(f'No checkpoint found in {checkpoint_dir}')
+            logger.warning(f'No checkpoint found in {checkpoint_dir}')
             return
 
         iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
@@ -1216,21 +1216,21 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
     @staticmethod
     def _read_iteration(tracker_path: str) -> int:
-        if not os.path.exists(tracker_path):
-            return 0
-        with open(tracker_path) as f:
-            iteration = int(f.read().strip())
+        # All ranks must enter the all_reduce together; missing tracker on some
+        # ranks (e.g. NFS lag, partial mount) must NOT short-circuit, otherwise
+        # the remaining ranks hang at the collective. Treat missing as 0 and
+        # let MAX reduction recover the canonical iteration from any rank that
+        # successfully read the file.
+        iteration = 0
+        if os.path.exists(tracker_path):
+            with open(tracker_path) as f:
+                iteration = int(f.read().strip())
         if torch.distributed.is_initialized():
-            iters_cuda = torch.tensor(
-                [iteration],
-                dtype=torch.long,
-                device='cuda',
-            )
-            torch.distributed.all_reduce(
-                iters_cuda,
-                op=torch.distributed.ReduceOp.MAX,
-            )
-            iteration = iters_cuda[0].item()
+            # Use Platform.get_local_device() to stay backend-agnostic
+            # (CUDA / NPU / MPS); 'cuda' would crash on NPU.
+            iters_dev = torch.tensor([iteration], dtype=torch.long, device=Platform.get_local_device())
+            torch.distributed.all_reduce(iters_dev, op=torch.distributed.ReduceOp.MAX)
+            iteration = int(iters_dev[0].item())
         return iteration
 
     def _merge_lora_adapters(self, adapter_name: str = 'default'):
