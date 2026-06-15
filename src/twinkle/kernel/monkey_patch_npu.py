@@ -15,6 +15,7 @@ from torch import nn
 from transformers.utils import is_torch_npu_available
 
 from twinkle import get_logger
+from .causal_conv1d import npu_causal_conv1d_fn
 
 logger = get_logger()
 
@@ -569,6 +570,15 @@ def _patch_qwen3_5_fla(model=None) -> None:
                     type(_module).__name__,
                 )
 
+            if hasattr(_module, 'causal_conv1d_fn') and callable(getattr(_module, 'causal_conv1d_fn')):
+                if _module.causal_conv1d_fn is not npu_causal_conv1d_fn:
+                    _module.causal_conv1d_fn = npu_causal_conv1d_fn
+                    logger.debug(
+                        '[NPU] [FLA] Replaced %s(%s).causal_conv1d_fn -> MindSpeed',
+                        _name,
+                        type(_module).__name__,
+                    )
+
         if patched_instances > 0:
             logger.info(
                 '[NPU] [FLA] Patched %d linear attention instance(s)',
@@ -916,6 +926,7 @@ def apply_npu_patch(model=None) -> None:
       - SwiGLU fused kernel
       - SDPA Attention compatibility fixes
       - Flash Linear Attention (FLA) for Qwen3.5
+      - Causal Conv1D Triton kernel for linear attention
 
     When ``model`` is **not** provided, the GMM patch is **skipped** by default
     (EP cannot be detected without a model instance).

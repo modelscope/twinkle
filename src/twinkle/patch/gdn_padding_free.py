@@ -36,6 +36,11 @@ def _get_flash_linear_attention_kernels():
     return causal_conv1d, chunk_gated_delta_rule
 
 
+def _get_mindspeed_ops_causal_conv1d():
+    from twinkle.kernel.causal_conv1d import causal_conv1d as _ms_causal_conv1d
+    return _ms_causal_conv1d
+
+
 def _needs_chunk_gated_delta_rule_cu_seqlens_patch() -> bool:
     return Version(transformers.__version__) < Version('5.9.0')
 
@@ -49,25 +54,47 @@ def _patch_gdn_kernels_for_cu_seqlens(
     forward_args,
     forward_kwargs,
 ) -> torch.Tensor:
-    causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
+    is_npu = getattr(mod, '_twinkle_npu_patched', False)
+    if is_npu:
+        ms_causal_conv1d = _get_mindspeed_ops_causal_conv1d()
+    else:
+        causal_conv1d, chunk_gated_delta_rule = _get_flash_linear_attention_kernels()
+
     old_conv_fn = mod.causal_conv1d_fn
     old_chunk_rule = mod.chunk_gated_delta_rule
 
-    def causal_conv1d_wrapper(*args, **kwargs):
-        x = kwargs.pop('x')
-        output = causal_conv1d(
-            *args,
-            x=x.transpose(1, 2).contiguous(),
-            cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
-            **kwargs,
-        )
-        if isinstance(output, tuple):
-            output = output[0]
-        return output.transpose(1, 2).contiguous()
+    if is_npu:
+        def causal_conv1d_wrapper(*args, **kwargs):
+            x = kwargs.pop('x')
+            del kwargs['seq_idx']
+            del kwargs['backend']
+            y, _ = ms_causal_conv1d(
+                x=x,
+                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
+                **kwargs,
+            )
+            return y
+    else:
+        def causal_conv1d_wrapper(*args, **kwargs):
+            x = kwargs.pop('x')
+            output = causal_conv1d(
+                *args,
+                x=x.transpose(1, 2).contiguous(),
+                cu_seqlens=cu_seqlens.to(dtype=torch.int32, device=x.device),
+                **kwargs,
+            )
+            if isinstance(output, tuple):
+                output = output[0]
+            return output.transpose(1, 2).contiguous()
 
-    def chunk_gated_delta_rule_wrapper(query, key, value, **kwargs):
-        kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
-        return chunk_gated_delta_rule(query, key, value, **kwargs)
+    if is_npu:
+        def chunk_gated_delta_rule_wrapper(query, key, value, **kwargs):
+            kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
+            return old_chunk_rule(query, key, value, **kwargs)
+    else:
+        def chunk_gated_delta_rule_wrapper(query, key, value, **kwargs):
+            kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
+            return chunk_gated_delta_rule(query, key, value, **kwargs)
 
     mod.causal_conv1d_fn = causal_conv1d_wrapper
     if patch_chunk_rule:

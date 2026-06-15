@@ -106,11 +106,10 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         out = _apply_conv_activation(out[:, :, :seq_len], activation)
         return out.transpose(1, 2).contiguous()
 
-    # NPU: keep MindSpeed Triton chunk_gated_delta_rule (patched by
-    # monkey_patch_npu), use torch fallback for causal_conv1d to avoid
-    # UB overflow in FLA Triton backward kernels on Ascend NPU.
+    # NPU: MindSpeed Triton causal_conv1d and chunk_gated_delta_rule
+    # are both patched by monkey_patch_npu at model initialization.
+    # No need to set them here - they are already bound on the module.
     if getattr(mod, '_twinkle_npu_patched', False):
-        mod.causal_conv1d_fn = _torch_causal_conv1d_fn
         return False
 
     if _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None:
