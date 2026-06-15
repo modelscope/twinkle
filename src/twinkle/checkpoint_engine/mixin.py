@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 
 from twinkle import Platform, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine

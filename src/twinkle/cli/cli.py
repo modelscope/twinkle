@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from __future__ import annotations
-
 import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Iterator, Literal
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Arg group dataclasses
@@ -243,7 +242,7 @@ class DotEnvSource(ConfigSource):
 class EnvVarSource(ConfigSource):
     """Reads os.environ; recognizes TWINKLE_ prefix and any key known to the registry."""
 
-    def __init__(self, registry: ConfigRegistry):
+    def __init__(self, registry: 'ConfigRegistry'):
         self._registry = registry
 
     def load(self) -> dict[str, str]:

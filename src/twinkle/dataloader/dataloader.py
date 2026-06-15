@@ -146,7 +146,7 @@ class DataLoader:
     def skip_consumed_samples(self, consumed_train_samples: int) -> None:
         from torch.utils.data import IterableDataset
 
-        if isinstance(self.dataset, IterableDataset):
+        if isinstance(self.dataset, IterableDataset) or consumed_train_samples is None or consumed_train_samples <= 0:
             warnings.warn('IterableDataset does not support consumed-data skipping; continuing without skipping.')
             self._skip_samples = 0
             return
@@ -164,6 +164,7 @@ class DataLoader:
 
     @remote_function()
     def get_state(self) -> dict:
+        """The dataloader state for saving."""
         return {'consumed_train_samples': self._consumed_train_samples}
 
     def _rebuild_sampler_stack(self):

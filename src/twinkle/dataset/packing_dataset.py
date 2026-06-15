@@ -114,6 +114,8 @@ class PackingDataset(Dataset):
         assert self._packed_called, 'Call `pack_dataset()` first before index the sample.'
         sequence = self.packed_idx[index]
         rows = [self.dataset[i] for i in sequence]
+        for row in rows:
+            self._write_through(row)
         output = {}
         for key in rows[0]:
             output[key] = [r[key] for r in rows]

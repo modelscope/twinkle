@@ -88,10 +88,27 @@ class IterablePackingDataset(IterableDataset):
         last_res += res
         return last_res
 
-    @staticmethod
-    def _cyclic_iter(iterable):
-        while True:
-            yield from iterable
+    def _write_through_iter(self, iterable):
+        """Yields from iterable, meanwhile, save it to disk if needed.
+        Saving is needed when you are using several datasets at a time.
+        """
+        if not self.cyclic:
+            for row in iterable:
+                self._write_through(row)
+                yield row
+            return
+        else:
+            first_pass = True
+            while True:
+                empty = True
+                for row in iterable:
+                    empty = False
+                    if first_pass:
+                        self._write_through(row)
+                    yield row
+                if empty:
+                    return
+                first_pass = False
 
     @remote_function()
     def __iter__(self):
@@ -102,10 +119,7 @@ class IterablePackingDataset(IterableDataset):
         except StopIteration:
             return
 
-        if self.cyclic:
-            iterator = self._cyclic_iter(self.dataset)
-        else:
-            iterator = iter(self.dataset)
+        iterator = self._write_through_iter(self.dataset)
         data = []
         max_length = self.template.max_length or 2048
         while True:
