@@ -48,7 +48,7 @@ BACKEND: Literal['transformers', 'megatron'] = 'transformers'
 
 # Condenser (online compression + LoRA self-improvement); embedding model trains LoRA on top of MODEL_ID.
 CONDENSE_MODEL_ID = os.environ.get('CONDENSE_MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-CM-v2')
-MODEL_ID = os.environ.get('MODEL_ID', 'ms://twinkle-kit/Qwen3.5-4B-QA-emb')
+MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 TEMPLATE_NAME = 'Qwen3_5Template'
 
 # -- GPU placement (8 total) --------------------------------------------------
@@ -71,7 +71,7 @@ NUM_EPOCHS = 1
 
 TOTAL_SAMPLES: Optional[int] = None
 # Post-build caps on each loader (None = no cap). Applied via .select() before mix.
-THINK_CAP: Optional[int] = 200_000
+THINK_CAP: Optional[int] = 400_000
 INDEX_CAP: Optional[int] = 400_000
 MIX_SHUFFLE_SEED = 42
 
