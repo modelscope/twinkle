@@ -193,7 +193,10 @@ class TokenizeByRound:
     """
 
     @staticmethod
-    def tokenize_with_assistant_labels(tokenizer: 'PreTrainedTokenizer', encode_func: Callable, trajectory: Trajectory,
+    def tokenize_with_assistant_labels(tokenizer: 'PreTrainedTokenizer',
+                                       encode_func: Callable,
+                                       trajectory: Trajectory,
+                                       train_indices: Optional[set] = None,
                                        **kwargs) -> Tuple[List[int], List[int], Dict[str, Any]]:
         """Tokenize trajectory and generate labels for assistant turns.
 
@@ -201,6 +204,8 @@ class TokenizeByRound:
             tokenizer: The tokenizer (unused, kept for interface compatibility).
             encode_func: Function to encode a trajectory. Must support add_generation_prompt.
             trajectory: The trajectory containing messages.
+            train_indices: If provided, only label assistant messages whose
+                message index is in this set.  ``None`` means label all.
 
         Returns:
             Tuple of (input_ids, labels, extra_encoded_fields).
@@ -224,6 +229,8 @@ class TokenizeByRound:
 
         for i, msg in enumerate(messages):
             if msg['role'] != 'assistant':
+                continue
+            if train_indices is not None and i not in train_indices:
                 continue
 
             # Get position AFTER assistant prefix:

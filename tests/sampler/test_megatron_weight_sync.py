@@ -45,6 +45,9 @@ MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3.5-27B')
 
 logger = logging.getLogger(__name__)
 
+pytestmark = pytest.mark.skip(
+    reason='Heavy Megatron weight-sync test (TP=2 + vLLM + 4 GPUs + Qwen3.5-27B); not viable on dual-V100 CI, run manually.')
+
 
 def log(msg):
     """Print message with timestamp."""

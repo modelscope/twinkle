@@ -14,22 +14,21 @@ Follows the same structural pattern as model/app.py:
 from __future__ import annotations
 
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from ray import serve
-from typing import Any, Dict, Optional
+from typing import Any
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_logger
+from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.utils.lifecycle import ProcessorManagerMixin
-from twinkle.server.utils.metrics import create_metrics_middleware
-from twinkle.server.utils.state import ServerStateProxy, get_server_state
-from twinkle.server.utils.validation import verify_request_token
 from .twinkle_handlers import _register_processor_routes
 
 logger = get_logger()
 
 
-class ProcessorManagement(ProcessorManagerMixin):
+class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
     """Processor management service.
 
     Manages lifecycle and invocation of distributed processor objects
@@ -62,7 +61,7 @@ class ProcessorManagement(ProcessorManagerMixin):
 
         # processor objects keyed by processor_id
         self.resource_dict: dict[str, Any] = {}
-        self.state: ServerStateProxy = get_server_state()
+        self.state: ServerState = get_server_state()
 
         _cfg = processor_config or {}
         _env_limit = int(os.environ.get('TWINKLE_PER_USER_PROCESSOR_LIMIT', 20))
@@ -81,6 +80,7 @@ class ProcessorManagement(ProcessorManagerMixin):
         await self._sticky_entry(sticky_key)
         # Lazy-start countdown task on first request (requires running event loop)
         self._ensure_countdown_started()
+        await self._ensure_state_cleanup_started()
 
     def _on_processor_expired(self, processor_id: str) -> None:
         """Called by the countdown thread when a processor's session expires."""
@@ -117,22 +117,19 @@ def build_processor_app(ncpu_proc_per_node: int,
     Returns:
         Ray Serve deployment bound with configuration.
     """
-    # Build the FastAPI app and register all routes BEFORE serve.ingress so that
-    # the frozen app contains the complete route table (visible to ProxyActor).
-    app = FastAPI()
 
-    @app.middleware('http')
-    async def verify_token(request: Request, call_next):
-        return await verify_request_token(request=request, call_next=call_next)
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. No per-builder copy of the lifespan /
+    # middleware construction remains here.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_processor_routes(app, get_self)
 
-    app.middleware('http')(create_metrics_middleware('Processor'))
+    app = build_deployment_app('Processor', register_routes)
 
-    def get_self() -> ProcessorManagement:
-        return serve.get_replica_context().servable_object
-
-    _register_processor_routes(app, get_self)
-
-    ProcessorManagementWithIngress = serve.ingress(app)(ProcessorManagement)
-    DeploymentClass = serve.deployment(name='ProcessorManagement')(ProcessorManagementWithIngress)
-    return DeploymentClass.options(**deploy_options).bind(ncpu_proc_per_node, device_group, device_mesh, nproc_per_node,
-                                                          processor_config)
+    return bind_deployment(
+        app,
+        ProcessorManagement,
+        deploy_options,
+        deployment_name='ProcessorManagement',
+        bind_args=(ncpu_proc_per_node, device_group, device_mesh, nproc_per_node, processor_config),
+    )

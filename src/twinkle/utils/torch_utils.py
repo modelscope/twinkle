@@ -268,6 +268,73 @@ def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200
         return torch.stack(padded_tensors, dim=0)
 
 
+def gather_cp_load_balanced(
+    tensor: 'torch.Tensor',
+    cp_group,
+    seq_dim: int = 1,
+    cu_seqlens: Optional['torch.Tensor'] = None,
+) -> 'torch.Tensor':
+    """All-gather a CP-load-balanced shard along ``seq_dim`` into the full sequence.
+
+    Inverse of :func:`split_cp_inputs`. For each segment, every CP rank ``r`` holds
+    chunks ``[r, 2*cp - r - 1]`` of the segment's ``2*cp`` chunks; this routine
+    re-scatters those chunks back to their full-sequence positions.
+
+    ``cu_seqlens`` is the **full-sequence** (pre-split) cumulative-sequence-length
+    tensor — i.e. ``packed_seq_params.cu_seqlens_q``. Pass it whenever the local
+    shard came from a multi-segment packed batch; without it the per-segment chunk
+    boundaries cannot be reconstructed and the gathered tensor will be scrambled.
+    Pass ``None`` only for the single-segment case (padded ``[B, S]`` rows or
+    padding-free with one sequence per microbatch).
+
+    The local rank's slice keeps autograd (``gathered[cp_rank]`` is swapped back
+    in after ``all_gather``, which is itself non-differentiable); other ranks'
+    slices are detached copies, so backward only produces gradients for the
+    local chunk.
+    """
+    import torch
+    cp_size = cp_group.size()
+    if cp_size <= 1:
+        return tensor
+    cp_rank = torch.distributed.get_rank(group=cp_group)
+    gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+    gathered[cp_rank] = tensor
+    seq_local = tensor.shape[seq_dim]
+    full_seq = seq_local * cp_size
+    out_shape = list(tensor.shape)
+    out_shape[seq_dim] = full_seq
+    output = tensor.new_empty(*out_shape)
+
+    if cu_seqlens is None or int(cu_seqlens.shape[0]) <= 2:
+        seg_bounds = [(0, full_seq)]
+    else:
+        cu_list = [int(x) for x in cu_seqlens.tolist()]
+        seg_bounds = list(zip(cu_list[:-1], cu_list[1:]))
+
+    local_offset = 0
+    for s_start, s_end in seg_bounds:
+        seg_full_len = s_end - s_start
+        seg_chunk_len = seg_full_len // (2 * cp_size)
+        seg_local_len = seg_full_len // cp_size
+        seg_half_local = seg_local_len // 2
+        for j in range(cp_size):
+            o = gathered[j]
+            rev = 2 * cp_size - j - 1
+            front_g = [slice(None)] * tensor.ndim
+            back_g = [slice(None)] * tensor.ndim
+            front_l = [slice(None)] * tensor.ndim
+            back_l = [slice(None)] * tensor.ndim
+            front_g[seq_dim] = slice(s_start + j * seg_chunk_len, s_start + (j + 1) * seg_chunk_len)
+            back_g[seq_dim] = slice(s_start + rev * seg_chunk_len, s_start + (rev + 1) * seg_chunk_len)
+            front_l[seq_dim] = slice(local_offset, local_offset + seg_half_local)
+            back_l[seq_dim] = slice(local_offset + seg_half_local, local_offset + seg_local_len)
+            output[tuple(front_g)] = o[tuple(front_l)]
+            output[tuple(back_g)] = o[tuple(back_l)]
+        local_offset += seg_local_len
+    return output
+
+
 def split_cp_inputs(inputs: 'torch.Tensor', cu_seqlens: Optional['torch.Tensor'], dim: int):
     import torch
     from megatron.core import mpu

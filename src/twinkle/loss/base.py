@@ -6,6 +6,7 @@ class Loss:
 
     require_logits = False
     require_entropy = False
+    require_logps = True
 
     def __call__(self, inputs: InputFeature, outputs: ModelOutput, **kwargs) -> LossOutput:
         ...

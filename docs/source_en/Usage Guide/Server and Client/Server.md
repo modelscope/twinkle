@@ -119,36 +119,48 @@ applications:
 
 ## Startup Methods
 
-The Server is uniformly launched through the `launch_server` function or CLI command, with YAML configuration files.
+The Server is launched via the CLI command with a YAML configuration file. Installing Twinkle registers the `twinkle-server` command.
 
-### Method 1: Python Script Startup
-
-```python
-# server.py
-import os
-from twinkle.server import launch_server
-
-# Get configuration file path (server_config.yaml in the same directory as the script)
-file_dir = os.path.abspath(os.path.dirname(__file__))
-config_path = os.path.join(file_dir, 'server_config.yaml')
-
-# Launch service, this call will block until the service is shut down
-launch_server(config_path=config_path)
-```
-
-### Method 2: Command Line Startup
+### Launch the Server
 
 ```bash
-python -m twinkle.server --config server_config.yaml
+twinkle-server launch --config server_config.yaml
 ```
 
-CLI supported parameters:
+Or via the Python module:
 
-| Parameter | Description | Default Value |
-|------|------|-------|
-| `-c, --config` | YAML configuration file path (required) | — |
-| `--namespace` | Ray namespace | `twinkle_cluster` |
-| `--log-level` | Log level | `INFO` |
+```bash
+python -m twinkle.server launch --config server_config.yaml
+```
+
+### CLI Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `launch` | Start the Server (blocks until shutdown) |
+| `check-config` | Validate a config file without starting the server |
+| `print-config` | Emit the validated, normalized config (`--format yaml\|json`) |
+| `clear persistence` | Delete persisted state from the configured backend |
+
+Common parameters:
+
+| Parameter | Description | Environment Variable |
+|-----------|-------------|---------------------|
+| `-c, --config` | YAML configuration file path (required) | `TWINKLE_SERVER_CONFIG` |
+| `--namespace` | Ray namespace (`launch` only) | `TWINKLE_RAY_NAMESPACE` |
+
+Examples:
+
+```bash
+# Validate config (useful in CI to catch misconfigurations)
+twinkle-server check-config -c server_config.yaml
+
+# View the fully resolved config
+twinkle-server print-config -c server_config.yaml --format json
+
+# Clear persisted state (Redis or file)
+twinkle-server clear persistence -c server_config.yaml
+```
 
 ## YAML Configuration Details
 
@@ -164,6 +176,17 @@ proxy_location: EveryNode
 http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 8000            # Service port number
+
+# Observability: push traces/metrics/logs via OTLP
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4317
+
+# Persistence: storage backend for ServerState (sessions, models, futures, etc.)
+#   mode: memory | file | redis
+persistence:
+  mode: file
+  file_path: /tmp/twinkle_state.json
 
 # Application list: Each entry defines a service component deployed on the Server
 applications:
@@ -195,7 +218,7 @@ applications:
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      use_megatron: true                               # Use Megatron-LM backend
+      backend: megatron                                # Model backend: transformers | megatron | mock
       model_id: "ms://Qwen/Qwen3.5-4B"               # ModelScope model identifier
       max_length: 10240
       nproc_per_node: 2                                # Number of GPU processes per node
@@ -288,14 +311,14 @@ applications:
 
 ### Transformers Backend
 
-The difference from the Megatron backend is only in the `use_megatron` parameter of the Model service:
+The difference from the Megatron backend is only in the `backend` parameter of the Model service:
 
 ```yaml
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
     import_path: model
     args:
-      use_megatron: false                              # Use Transformers backend
+      backend: transformers                            # Use Transformers backend
       model_id: "ms://Qwen/Qwen3.5-4B"
       nproc_per_node: 2
       device_group:
@@ -320,14 +343,34 @@ The difference from the Megatron backend is only in the `use_megatron` parameter
 
 ## Configuration Item Description
 
+### Top-Level Fields
+
+| Field | Description |
+|-------|-------------|
+| `proxy_location` | HTTP proxy location (`EveryNode` or `HeadOnly`) |
+| `http_options` | HTTP listener config (`host`, `port`) |
+| `telemetry` | Observability config (`enabled`, `otlp_endpoint`) |
+| `persistence` | State persistence config (`mode`, `file_path`, `redis_url`) |
+| `applications` | Application component list |
+
+> The config file uses strict validation (`extra='forbid'`). Any misspelled field name will be rejected before startup. Use `twinkle-server check-config -c xxx.yaml` to detect errors early.
+
 ### Application Components (import_path)
 
 | import_path | Description |
-|-------------|------|
+|-------------|-------------|
 | `server` | Central management service, handles training runs and checkpoints |
 | `model` | Model service, hosts base model for training |
 | `processor` | Data preprocessing service, executes tokenization and template conversion on CPU |
 | `sampler` | Inference sampling service |
+
+### Model Backend (backend)
+
+| backend | Description |
+|---------|-------------|
+| `transformers` | Based on HuggingFace Transformers, suitable for most scenarios |
+| `megatron` | Based on Megatron-LM, suitable for ultra-large-scale model training |
+| `mock` | Numpy-only mock backend for CPU-only development and testing |
 
 ### device_group and device_mesh
 
@@ -358,8 +401,52 @@ device_mesh:
 | `pp_size` | int (optional) | Pipeline parallel size |
 | `ep_size` | int (optional) | Expert parallel size (for MoE models) |
 
+### telemetry
+
+Controls the OpenTelemetry observability pipeline. See [Observability](./Observability.md) for details.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Whether to enable telemetry |
+| `service_name` | str | `twinkle-server` | Reported service name |
+| `otlp_endpoint` | str | `http://localhost:4317` | OTel Collector gRPC address |
+| `debug` | bool | `false` | When `true`, dumps to console instead of OTLP |
+
+### persistence
+
+Storage backend for ServerState (sessions, models, futures, etc.).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | str | `memory` | `memory` / `file` / `redis` |
+| `file_path` | str | — | Required for `file` mode, JSON file path |
+| `redis_url` | str | — | Required for `redis` mode, e.g. `redis://localhost:6379` |
+| `key_prefix` | str | `""` | Optional global key prefix |
+
 **Environment variables:**
 
 ```bash
 export TWINKLE_TRUST_REMOTE_CODE=0       # Whether to trust remote code
 ```
+
+## Configuration Validation and Migration
+
+The config file uses strict validation. The following scenarios trigger errors before startup:
+
+- Misspelled or unsupported field names
+- Type mismatches (e.g., passing a string for `port`)
+- Cross-field constraints not met (e.g., `persistence.mode: redis` without `redis_url`)
+
+```bash
+# Validate only, do not start
+twinkle-server check-config -c server_config.yaml
+```
+
+**Migrating from old configuration:**
+
+| Old Field | New Field |
+|-----------|-----------|
+| `use_megatron: true` | `backend: megatron` |
+| `use_megatron: false` | `backend: transformers` |
+
+Additionally, this refactor introduces two new top-level fields — `telemetry` and `persistence` — which did not exist before. Add them as needed.

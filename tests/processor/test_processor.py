@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import twinkle
-from twinkle.processor import GRPOLossProcessor, InputProcessor
+from twinkle.processor import InputProcessor
 
 twinkle.initialize(mode='local')
 
@@ -104,7 +104,7 @@ class TestGRPOMode:
     """GRPO: input_ids + labels."""
 
     def test_grpo_collate(self):
-        proc = GRPOLossProcessor()
+        proc = InputProcessor()
         batch = [
             {
                 'input_ids': torch.tensor([1, 2, 3, 4, 5]),
@@ -124,7 +124,7 @@ class TestGRPOMode:
         assert b['labels'].shape[0] == 2
 
     def test_grpo_padding_free(self):
-        proc = GRPOLossProcessor(padding_free=True)
+        proc = InputProcessor(padding_free=True)
         batch = [
             {
                 'input_ids': torch.tensor([1, 2, 3]),

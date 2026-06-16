@@ -50,6 +50,14 @@ _NEW = ("            {%- if content.startswith('<think>') and '</think>' in cont
         "                {%- set content = _parts[1].lstrip('\\n') %}\n"
         '            {%- endif %}')
 
+_OLD_TAIL = ('{%- if ns.multi_step_tool %}\n'
+             "    {{- raise_exception('No user query found in messages.') }}\n"
+             '{%- endif %}')
+
+_NEW_TAIL = ('{%- if ns.multi_step_tool %}\n'
+             '    {#- patched: tool-tail prefix allowed (Qwen3AllowToolTailTemplate) -#}\n'
+             '{%- endif %}')
+
 
 class Qwen3ChatTemplate(Patch):
     """Patch tokenizer.chat_template in-place to fix Qwen3.x parse defects.
@@ -80,4 +88,35 @@ class Qwen3ChatTemplate(Patch):
             )
             return False
         tokenizer.chat_template = tmpl.replace(_OLD, _NEW, 1)
+        return True
+
+
+class Qwen3AllowToolTailTemplate(Patch):
+    """Relax Qwen3.x ``multi_step_tool`` check so prefixes ending in ``tool``
+    (or whose only user messages are ``<tool_response>`` wrappers) render
+    instead of raising ``No user query found in messages``.
+
+    Required by ScoreFilter when scoring intermediate assistant turns of
+    multi-turn agent rollouts: the slice ``messages[:asst_idx]`` legitimately
+    ends with a ``tool`` message, and skipping such rounds would silently
+    discard exactly the turns where tool-call accuracy lives.
+    """
+
+    def __call__(self, tokenizer, *args, **kwargs):
+        tmpl = getattr(tokenizer, 'chat_template', None)
+        if not tmpl or not isinstance(tmpl, str):
+            return False
+        if _NEW_TAIL in tmpl:
+            return False
+        if _OLD_TAIL not in tmpl:
+            warnings.warn(
+                'Qwen3AllowToolTailTemplate patch: expected OLD multi_step_tool '
+                'block not found in tokenizer.chat_template. Upstream template '
+                'may have diverged; skipping patch. ScoreFilter on multi-turn '
+                'agent prefixes will likely raise TemplateError.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        tokenizer.chat_template = tmpl.replace(_OLD_TAIL, _NEW_TAIL, 1)
         return True

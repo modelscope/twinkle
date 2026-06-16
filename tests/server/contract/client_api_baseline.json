@@ -1,0 +1,997 @@
+{
+  "gateway": {
+    "paths": {
+      "/asample": {
+        "POST": {
+          "operationId": "asample_asample_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/chat/completions": {
+        "POST": {
+          "operationId": "chat_completions_chat_completions_post",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/create_model": {
+        "POST": {
+          "operationId": "create_model_create_model_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/create_sampling_session": {
+        "POST": {
+          "operationId": "create_sampling_session_create_sampling_session_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/create_session": {
+        "POST": {
+          "operationId": "create_session_create_session_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/forward": {
+        "POST": {
+          "operationId": "forward_forward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/forward_backward": {
+        "POST": {
+          "operationId": "forward_backward_forward_backward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/get_info": {
+        "POST": {
+          "operationId": "get_info_get_info_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/get_server_capabilities": {
+        "GET": {
+          "operationId": "get_server_capabilities_get_server_capabilities_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/healthz": {
+        "GET": {
+          "operationId": "healthz_healthz_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/load_weights": {
+        "POST": {
+          "operationId": "load_weights_load_weights_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/models": {
+        "GET": {
+          "operationId": "list_models_models_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/optim_step": {
+        "POST": {
+          "operationId": "optim_step_optim_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/retrieve_future": {
+        "POST": {
+          "operationId": "retrieve_future_retrieve_future_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/save_weights": {
+        "POST": {
+          "operationId": "save_weights_save_weights_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/save_weights_for_sampler": {
+        "POST": {
+          "operationId": "save_weights_for_sampler_save_weights_for_sampler_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/session_heartbeat": {
+        "POST": {
+          "operationId": "session_heartbeat_session_heartbeat_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/telemetry": {
+        "POST": {
+          "operationId": "telemetry_telemetry_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/training_runs": {
+        "GET": {
+          "operationId": "get_training_runs_training_runs_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 20,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/training_runs/{run_id}": {
+        "GET": {
+          "operationId": "get_training_run_training_runs__run_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/training_runs/{run_id}/checkpoints": {
+        "GET": {
+          "operationId": "get_run_checkpoints_training_runs__run_id__checkpoints_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+        "DELETE": {
+          "operationId": "delete_run_checkpoint_training_runs__run_id__checkpoints__checkpoint_id__delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/training_runs/{run_id}/checkpoints/{checkpoint_id}/publish": {
+        "POST": {
+          "operationId": "publish_checkpoint_training_runs__run_id__checkpoints__checkpoint_id__publish_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/capacity_info": {
+        "GET": {
+          "operationId": "get_capacity_info_twinkle_capacity_info_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/twinkle/checkpoint_path/{run_id}/{checkpoint_id}": {
+        "GET": {
+          "operationId": "get_checkpoint_path_twinkle_checkpoint_path__run_id___checkpoint_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/create_session": {
+        "POST": {
+          "operationId": "create_session_twinkle_create_session_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/get_server_capabilities": {
+        "GET": {
+          "operationId": "get_server_capabilities_twinkle_get_server_capabilities_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/twinkle/healthz": {
+        "GET": {
+          "operationId": "healthz_twinkle_healthz_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/twinkle/session_heartbeat": {
+        "POST": {
+          "operationId": "session_heartbeat_twinkle_session_heartbeat_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/status": {
+        "GET": {
+          "operationId": "status_twinkle_status_get",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/twinkle/training_runs": {
+        "GET": {
+          "operationId": "get_training_runs_twinkle_training_runs_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 20,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/training_runs/{run_id}": {
+        "GET": {
+          "operationId": "get_training_run_twinkle_training_runs__run_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/training_runs/{run_id}/checkpoints": {
+        "GET": {
+          "operationId": "get_run_checkpoints_twinkle_training_runs__run_id__checkpoints_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id}": {
+        "DELETE": {
+          "operationId": "delete_run_checkpoint_twinkle_training_runs__run_id__checkpoints__checkpoint_id__delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "run_id",
+              "required": true,
+              "schema": {
+                "title": "Run Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "checkpoint_id",
+              "required": true,
+              "schema": {
+                "title": "Checkpoint Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/weights_info": {
+        "POST": {
+          "operationId": "weights_info_twinkle_weights_info_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/unload_model": {
+        "POST": {
+          "operationId": "unload_model_unload_model_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/weights_info": {
+        "POST": {
+          "operationId": "weights_info_weights_info_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      }
+    }
+  },
+  "model": {
+    "paths": {
+      "/tinker/create_model": {
+        "POST": {
+          "operationId": "create_model_tinker_create_model_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/forward": {
+        "POST": {
+          "operationId": "forward_tinker_forward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/forward_backward": {
+        "POST": {
+          "operationId": "forward_backward_tinker_forward_backward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/get_info": {
+        "POST": {
+          "operationId": "get_info_tinker_get_info_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/load_weights": {
+        "POST": {
+          "operationId": "load_weights_tinker_load_weights_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/optim_step": {
+        "POST": {
+          "operationId": "optim_step_tinker_optim_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/save_weights": {
+        "POST": {
+          "operationId": "save_weights_tinker_save_weights_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/save_weights_for_sampler": {
+        "POST": {
+          "operationId": "save_weights_for_sampler_tinker_save_weights_for_sampler_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/tinker/unload_model": {
+        "POST": {
+          "operationId": "unload_model_tinker_unload_model_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/add_adapter_to_model": {
+        "POST": {
+          "operationId": "add_adapter_to_model_twinkle_add_adapter_to_model_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/add_metric": {
+        "POST": {
+          "operationId": "add_metric_twinkle_add_metric_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/apply_patch": {
+        "POST": {
+          "operationId": "apply_patch_twinkle_apply_patch_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/backward": {
+        "POST": {
+          "operationId": "backward_twinkle_backward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/calculate_loss": {
+        "POST": {
+          "operationId": "calculate_loss_twinkle_calculate_loss_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/calculate_metric": {
+        "POST": {
+          "operationId": "calculate_metric_twinkle_calculate_metric_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/clip_grad_and_step": {
+        "POST": {
+          "operationId": "clip_grad_and_step_twinkle_clip_grad_and_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/clip_grad_norm": {
+        "POST": {
+          "operationId": "clip_grad_norm_twinkle_clip_grad_norm_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "operationId": "create_twinkle_create_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/forward": {
+        "POST": {
+          "operationId": "forward_twinkle_forward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/forward_backward": {
+        "POST": {
+          "operationId": "forward_backward_twinkle_forward_backward_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/forward_only": {
+        "POST": {
+          "operationId": "forward_only_twinkle_forward_only_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/get_state_dict": {
+        "POST": {
+          "operationId": "get_state_dict_twinkle_get_state_dict_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/get_train_configs": {
+        "POST": {
+          "operationId": "get_train_configs_twinkle_get_train_configs_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/load": {
+        "POST": {
+          "operationId": "load_twinkle_load_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/lr_step": {
+        "POST": {
+          "operationId": "lr_step_twinkle_lr_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/resume_from_checkpoint": {
+        "POST": {
+          "operationId": "resume_from_checkpoint_twinkle_resume_from_checkpoint_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/save": {
+        "POST": {
+          "operationId": "save_twinkle_save_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_loss": {
+        "POST": {
+          "operationId": "set_loss_twinkle_set_loss_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_lr_scheduler": {
+        "POST": {
+          "operationId": "set_lr_scheduler_twinkle_set_lr_scheduler_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_optimizer": {
+        "POST": {
+          "operationId": "set_optimizer_twinkle_set_optimizer_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_processor": {
+        "POST": {
+          "operationId": "set_processor_twinkle_set_processor_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_template": {
+        "POST": {
+          "operationId": "set_template_twinkle_set_template_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/step": {
+        "POST": {
+          "operationId": "step_twinkle_step_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/upload_status/{request_id}": {
+        "GET": {
+          "operationId": "upload_status_twinkle_upload_status__request_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "request_id",
+              "required": true,
+              "schema": {
+                "title": "Request Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/upload_to_hub": {
+        "POST": {
+          "operationId": "upload_to_hub_twinkle_upload_to_hub_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/zero_grad": {
+        "POST": {
+          "operationId": "zero_grad_twinkle_zero_grad_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      }
+    }
+  },
+  "processor": {
+    "paths": {
+      "/twinkle/call": {
+        "POST": {
+          "operationId": "call_twinkle_call_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "operationId": "create_twinkle_create_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      }
+    }
+  },
+  "sampler": {
+    "paths": {
+      "/tinker/asample": {
+        "POST": {
+          "operationId": "asample_tinker_asample_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/add_adapter_to_sampler": {
+        "POST": {
+          "operationId": "add_adapter_to_sampler_twinkle_add_adapter_to_sampler_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/apply_patch": {
+        "POST": {
+          "operationId": "apply_patch_twinkle_apply_patch_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/create": {
+        "POST": {
+          "operationId": "create_twinkle_create_post",
+          "parameters": [],
+          "responses": [
+            "200"
+          ]
+        }
+      },
+      "/twinkle/sample": {
+        "POST": {
+          "operationId": "sample_twinkle_sample_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/sample_stream": {
+        "POST": {
+          "operationId": "sample_stream_twinkle_sample_stream_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/set_template": {
+        "POST": {
+          "operationId": "set_template_twinkle_set_template_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      }
+    }
+  }
+}

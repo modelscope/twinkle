@@ -1,0 +1,90 @@
+# Test-only Twinkle Server config — CPU-only mock backends.
+#
+# This file is the single fixture consumed by CLI tests and the in-process
+# Ray Serve e2e test. Mock model + mock sampler need no GPU / torch / vllm /
+# megatron, so the launch path can run on any CI host. Not for production.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 127.0.0.1
+  port: 8000
+
+persistence:
+  # Gateway and Model run as separate Ray Serve replicas (separate
+  # processes); the tinker future flow needs cross-process visibility.
+  # ``memory`` mode is per-process; file (or redis) is required.
+  mode: file
+  file_path: /tmp/twinkle_state_mock.json
+
+applications:
+
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 3
+      supported_models:
+        - mock-model
+    deployments:
+      - name: GatewayServer
+        max_ongoing_requests: 50
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 128
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: models-mock
+    route_prefix: /api/v1/model/mock-model
+    import_path: model
+    args:
+      backend: mock
+      model_id: mock-model
+      nproc_per_node: 1
+      device_group:
+        name: model
+        ranks: 1
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1
+
+  - name: sampler-mock
+    route_prefix: /api/v1/sampler/mock-model
+    import_path: sampler
+    args:
+      sampler_type: mock
+      model_id: mock-model
+      nproc_per_node: 1
+      device_group:
+        name: sampler
+        ranks: 1
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 1
+      queue_config:
+        rps_limit: 100
+        tps_limit: 100000
+    deployments:
+      - name: SamplerManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 16
+        ray_actor_options:
+          num_cpus: 0.1

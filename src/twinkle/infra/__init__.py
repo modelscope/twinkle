@@ -1,9 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
+import itertools
 import json
 import numpy as np
 import os
+import random
+import sys
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
@@ -34,6 +37,30 @@ _notifier: Optional[Any] = None
 _name: Optional[str] = None
 
 _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
+
+
+def _capture_caller() -> Optional[str]:
+    """Return ``file:line`` of the first frame outside this module, or ``None``."""
+    f = sys._getframe(1)
+    while f and f.f_code.co_filename == __file__:
+        f = f.f_back
+    return f'{f.f_code.co_filename}:{f.f_lineno}' if f else None
+
+
+def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
+    """Stamp driver-caller location onto exc for both traceback and str(exc)."""
+    if not caller:
+        return
+    try:
+        marker = f'[twinkle] driver caller: {caller}'
+        if marker not in (getattr(exc, '__notes__', None) or []):
+            exc.add_note(marker)
+        if not getattr(exc, '_twinkle_caller_augmented', False):
+            prefix = f'[twinkle driver caller: {caller}] '
+            exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(), )
+            exc._twinkle_caller_augmented = True
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _maybe_load_worker_notifier() -> None:
@@ -384,13 +411,26 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         # Comment this because remote_class supports `first``
         # assert device_mesh.world_size == len(workers)
         length = len(workers)
+        # Map actor index to global_rank: with gpus_per_worker>1, consecutive
+        # global ranks belong to the same actor (TP peers).
+        _mesh_world = device_mesh.world_size if device_mesh is not None else length
+        _rank_stride = max(1, _mesh_world // length)
 
         def dispatch_func(arg, n):
             import torch
             if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
+                if device_mesh is None:
+                    total = len(arg)
+                    chunk = max(1, (total + n - 1) // n)
+                    for i in range(n):
+                        start = i * chunk
+                        end = min(total, start + chunk)
+                        _args.append(arg[start:end])
+                    return _args
                 for i in range(n):
-                    _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
+                    _args.append(arg[device_mesh.get_slice(
+                        len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])
                 return _args
             elif isinstance(arg, dict):
                 _args = [{} for _ in range(n)]
@@ -487,15 +527,19 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
 
         @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
+            _caller = _capture_caller()
             _ctx = f'{cls.__name__}.__init__'
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 _maybe_load_worker_notifier()
-                _new_init_body(self, *args, **kwargs)
+                _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
-        def _new_init_body(self, *args, **kwargs):
+        def _new_init_body(self, _caller, *args, **kwargs):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -519,10 +563,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 from ._ray import RayHelper
 
                 # In case the same class created twice in the same device group
-                # Try to get the caller's line
-                frame = inspect.currentframe().f_back
-                caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
-                caller_line = frame.f_lineno
+                # Try to get the caller's line (resolved in ``new_init`` so it points
+                # at user code, not at the wrapper itself).
+                _cf, _, _cl = (_caller or f'{__file__}:0').rpartition(':')
+                caller_file = _cf.replace(os.sep, '_').replace('.', '_')
+                caller_line = _cl
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
@@ -688,6 +733,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            # Only capture caller on driver side; worker frames are Ray internals
+            _caller = _capture_caller() if hasattr(self, '_actors') else None
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
                 if _mode == 'local':
@@ -766,6 +815,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
                                 except Exception as _e:  # noqa: BLE001
+                                    _tag_exc(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
@@ -779,6 +829,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 

@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
@@ -289,11 +289,8 @@ class MultiTurnRollout(Rollout):
 
     @staticmethod
     def _extract_ground_truth(traj: Dict[str, Any]) -> str:
-        """Pull ``ground_truth`` out of ``user_data`` (list of kv pairs)."""
-        for kv in (traj.get('user_data') or []):
-            if (isinstance(kv, (list, tuple)) and len(kv) >= 2 and kv[0] == 'ground_truth'):
-                return kv[1] or ''
-        return ''
+        """Pull ``ground_truth`` out of packed ``user_data``."""
+        return user_data_get(traj.get('user_data'), 'ground_truth', '') or ''
 
     @staticmethod
     def _resolve_traj_id(traj: Dict[str, Any], fallback_idx: int) -> str:
@@ -304,13 +301,12 @@ class MultiTurnRollout(Rollout):
         ``{timestamp_ms}-{fallback_idx}`` so concurrent rollouts do not
         overwrite each other's files.
         """
-        for kv in (traj.get('user_data') or []):
-            if (isinstance(kv, (list, tuple)) and len(kv) >= 2 and kv[0] in ('id', 'prompt_id')):
-                val = kv[1]
-                if val not in (None, ''):
-                    safe = re.sub(r'[^A-Za-z0-9_\-.]+', '_', str(val))[:64]
-                    if safe:
-                        return safe
+        for key in ('id', 'prompt_id'):
+            val = user_data_get(traj.get('user_data'), key)
+            if val not in (None, ''):
+                safe = re.sub(r'[^A-Za-z0-9_\-.]+', '_', str(val))[:64]
+                if safe:
+                    return safe
         return f'{int(time.time() * 1000)}-{fallback_idx}'
 
     def _build_trace_record(

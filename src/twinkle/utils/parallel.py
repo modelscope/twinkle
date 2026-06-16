@@ -87,6 +87,55 @@ def _try_create_claim(path: str, session: str, payload: str) -> bool:
     return True
 
 
+class PosixFileLock:
+    """POSIX advisory file lock with persistent fd for repeated acquire/release.
+
+    Fork-safe: reopens its fd lazily when used from a child process so each
+    worker owns its own descriptor.
+    """
+
+    def __init__(self, path: str):
+        import fcntl
+        self._path = path
+        self._fcntl = fcntl
+        self._fd = open(path, 'w')
+        self._pid = os.getpid()
+
+    def _ensure_fd(self):
+        # After fork, child must reopen so it doesn't share parent's fd state.
+        pid = os.getpid()
+        if pid != self._pid:
+            self._fd = open(self._path, 'w')
+            self._pid = pid
+
+    def acquire(self):
+        self._ensure_fd()
+        self._fcntl.flock(self._fd, self._fcntl.LOCK_EX)
+
+    def release(self):
+        self._fcntl.flock(self._fd, self._fcntl.LOCK_UN)
+
+    def close(self):
+        self._fd.close()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def __getstate__(self):
+        return {'_path': self._path}
+
+    def __setstate__(self, state):
+        import fcntl
+        self._path = state['_path']
+        self._fcntl = fcntl
+        self._fd = open(self._path, 'w')
+        self._pid = os.getpid()
+
+
 @contextmanager
 def processing_lock(lock_file: str):
     """A file lock to prevent parallel operations to one file.

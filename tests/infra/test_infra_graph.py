@@ -1,12 +1,11 @@
 import numpy as np
-import unittest
 from typing import List
 
 from twinkle import DeviceGroup, DeviceMesh
 from twinkle.infra import get_device_placement
 
 
-class TestInfraGraph(unittest.TestCase):
+class TestInfraGraph:
 
     def test_print_graph(self):
         _device_group: List[DeviceGroup] = [

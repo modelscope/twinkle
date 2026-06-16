@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import contextlib
 import json
 import logging
 import numpy as np
@@ -31,7 +32,7 @@ from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.patch import Patch, apply_patch
+from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
@@ -39,6 +40,22 @@ from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
 logger = get_logger()
+
+
+def _resolve_task_context(model, task):
+    """Return a context manager that applies the right per-forward Patch for ``task``.
+
+    Mirrors the transformers backend: 'causal_lm' (default) is a no-op, while
+    'embedding' installs :class:`MegatronEmbeddingPatch` which swaps the
+    ``output_layer`` for identity (with TP/SP gather) and registers a hook that
+    handles CP gather + last-token pooling, returning ``[n_seqs, hidden]``.
+    """
+    if task in (None, 'causal_lm'):
+        return contextlib.nullcontext()
+    if task == 'embedding':
+        from twinkle.patch.megatron_emb import MegatronEmbeddingPatch
+        return apply_context(model, MegatronEmbeddingPatch())
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding.')
 
 
 @dataclass
@@ -286,6 +303,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
         return_logits = kwargs.pop('return_logits', False)
+        task = kwargs.pop('task', 'causal_lm')
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -349,14 +367,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         _mb_counter = [0]  # mutable counter for closure
 
-        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None, entropies=None):
+        def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None, entropies=None, embeddings=None):
             mb_idx = _mb_counter[0]
             _mb_counter[0] += 1
             current_kwargs = loss_extra_kwargs_per_mb[mb_idx % len(loss_extra_kwargs_per_mb)]
-            logits = unpacked_logits if unpacked_logits is not None else output_tensor
-            outputs = ModelOutput(logits=logits, logps=logps)
-            if entropies is not None:
-                outputs['entropies'] = entropies
+            if embeddings is not None:
+                outputs = ModelOutput(embeddings=embeddings)
+            else:
+                logits = unpacked_logits if unpacked_logits is not None else output_tensor
+                outputs = ModelOutput(logits=logits, logps=logps)
+                if entropies is not None:
+                    outputs['entropies'] = entropies
             result = loss_instance(inputs, outputs, **current_kwargs)
             if unpacked_logits is not None:
                 outputs.pop('logits', None)
@@ -390,27 +411,37 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             logps = None
             unpacked_logits = None
             entropies = None
+            embeddings = None
             _loss_instance = loss_instance
-            if labels is not None and mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage):
-                loss_mask = (labels != -100).bool()
-                masked_labels = labels.clone()
-                masked_labels[~loss_mask] = 0
-                output_tensor.div_(temperature)
+            is_last_pp = mpu.is_pipeline_last_stage(False, unwrapped_model.vp_stage)
+            if task == 'embedding':
+                # MegatronEmbeddingPatch already pooled output to [n_seqs, hidden] on last PP stage.
+                if is_last_pp:
+                    embeddings = output_tensor
+            elif labels is not None and is_last_pp:
+                _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
                 _loss_require_entropy = (hasattr(_loss_instance, 'require_entropy') and _loss_instance.require_entropy)
-                if _loss_require_entropy:
-                    logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
-                else:
-                    logps = selective_log_softmax(output_tensor, masked_labels)
-                # Reconstruct full-length tensors from CP-split shards
-                logps = processor.postprocess_tensor_cp(logps)
-                if entropies is not None:
-                    entropies = processor.postprocess_tensor_cp(entropies)
-                batch['labels'] = processor.postprocess_tensor_cp(labels)
+                _packed = batch.get('packed_seq_params')
+                cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
+                if _loss_require_logps:
+                    loss_mask = (labels != -100).bool()
+                    masked_labels = labels.clone()
+                    masked_labels[~loss_mask] = 0
+                    output_tensor.div_(temperature)
+                    if _loss_require_entropy:
+                        logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
+                    else:
+                        logps = selective_log_softmax(output_tensor, masked_labels)
+                    # Reconstruct full-length tensors from CP-split shards
+                    logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
+                    if entropies is not None:
+                        entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
                 if 'position_ids' in batch:
                     pos = batch['position_ids']
                     if pos.dim() == 3:
                         pos = pos[0]  # [2/3, 1, seq] → [1, seq]
-                    batch['position_ids'] = processor.postprocess_tensor_cp(pos)
+                    batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
                 # Unpack packed sequences into per-sequence batch format
                 _outputs = {'logps': logps}
                 if entropies is not None:
@@ -427,6 +458,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 logps=logps,
                 unpacked_logits=unpacked_logits,
                 entropies=entropies,
+                embeddings=embeddings,
             )
 
         # Get Megatron's forward-backward function
@@ -446,15 +478,16 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
-        losses = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iter,
-            model=self.model,
-            num_microbatches=len(inputs),
-            seq_length=seq_length,
-            micro_batch_size=micro_batch_size,
-            forward_only=forward_only,
-        )
+        with _resolve_task_context(self.model, task):
+            losses = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iter,
+                model=self.model,
+                num_microbatches=len(inputs),
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+                forward_only=forward_only,
+            )
 
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
@@ -502,13 +535,15 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         if logps and not self.variable_seq_lengths:
             logps = torch.cat(logps, dim=0)
+        elif not logps:
+            logps = None
         if logits and not self.variable_seq_lengths:
             logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
-            loss = loss.detach().cpu().float().numpy()
+            loss = loss.detach().float().item()
         if not return_logits:
             logits = None
-        inputs = processor.unpack_inputs(inputs)
+        inputs = processor.unpack_inputs(inputs, task=task)
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
@@ -565,7 +600,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         success, grad_norm, num_zeros = optimizer.step()
         # Store grad_norm for later retrieval
-        optimizer_config._last_grad_norm = grad_norm if grad_norm is not None else 0.0
+        optimizer_config._last_grad_norm = grad_norm.detach().cpu().item() if grad_norm is not None else 0.0
         optimizer_config._last_step_success = success
 
     def _is_model_ddp_wrapped(self) -> bool:
@@ -920,12 +955,11 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             )
         else:
             bridge = self.strategy.bridge
-            for _model in self.strategy.unwrap_model(self.model):
-                bridge.load_weights(
-                    _model,
-                    checkpoint_dir,
-                    peft_format=(adapter_name != _default_adapter_name),
-                )
+            bridge.load_weights(
+                self.strategy.unwrap_model(self.model),
+                checkpoint_dir,
+                peft_format=(adapter_name != _default_adapter_name),
+            )
 
         if dist.is_initialized():
             dist.barrier()
@@ -1613,7 +1647,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if result_container['error'] is not None:
             raise result_container['error']
 
-    @remote_function(collect='first')
+    @remote_function(collect='first', lazy_collect=False)
     def get_peft_config_dict(self, adapter_name: str = None) -> Optional[Dict[str, Any]]:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
 
+from twinkle_client.http.headers import build_routing_headers
 from twinkle_client.http.utils import get_api_key, get_request_id
 
 _patched = False
@@ -127,11 +128,7 @@ def _make_patched_service_client_init(original):
         if api_key is None:
             api_key = get_api_key()
 
-        twinkle_headers = {
-            'X-Ray-Serve-Request-Id': get_request_id(),
-            'Authorization': 'Bearer ' + api_key,
-            'Twinkle-Authorization': 'Bearer ' + api_key,
-        }
+        twinkle_headers = build_routing_headers(get_request_id(), 'Bearer ' + api_key)
         # Merge: caller-supplied default_headers take precedence over twinkle_headers
         user_default_headers = kwargs.pop('default_headers', {})
         kwargs['default_headers'] = twinkle_headers | user_default_headers

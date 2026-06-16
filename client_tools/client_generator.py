@@ -466,9 +466,9 @@ class MultiLoraTransformersModel:
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
 
-        self.model_id = model_id
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         response = http_post(
@@ -760,13 +760,15 @@ def generate_samplers():
 
     sampler_code = AUTO_GEN_WARNING + '''from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
-from twinkle.sampler.base import Sampler
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 
 
-class vLLMSampler(Sampler):
+# Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
+# that base pulls ``twinkle.sampler.__init__`` → ``VLLMEngine`` → torch + zmq,
+# which the mock / CPU-only client environments don't have.
+class vLLMSampler:
     """Client wrapper for Sampler that calls server HTTP endpoints.
 
     This client manages sampling operations and adapter synchronization with the sampler server.
@@ -781,6 +783,7 @@ class vLLMSampler(Sampler):
         self.adapter_name = None
         if '://' in model_id:
             model_id = model_id.split('://')[1]
+        self.model_id = model_id
         self.server_url = f'{self.server_url}/sampler/{model_id}/twinkle'
         response = http_post(
             url=f'{self.server_url}/create',

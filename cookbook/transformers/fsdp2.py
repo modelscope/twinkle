@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import twinkle
 from twinkle import DeviceMesh, get_device_placement, get_logger
+from twinkle.cli import CLI
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -13,38 +14,19 @@ from twinkle.utils.framework import Torch
 from twinkle.kernel import kernelize_model
 
 logger = get_logger()
+args = CLI.from_args()
 
-MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
-DATASET_ID = 'ms://swift/self-cognition'
-TEMPLATE_NAME = 'Qwen3_5Template'
-MODEL_NAME = 'twinkle大模型'
-MODEL_AUTHOR = 'ModelScope社区'
-FSDP_SIZE = 2
-DP_SIZE = 4
-BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
-GRADIENT_ACCUMULATION_STEPS = 2
-LOG_INTERVAL = 20
-EVAL_INTERVAL = 40
-EVAL_SAMPLES = 100
-TRAIN_SAMPLES = 1000
-
-OUTPUT_DIR = './output/fsdp2'
-RESUME_FROM_CHECKPOINT = None
-RESUME_ONLY_MODEL = False
-IGNORE_DATA_SKIP = False
-ADAPTER_NAME = 'default'
-
-# Construct a device_mesh
-device_mesh = DeviceMesh.from_sizes(fsdp_size=FSDP_SIZE, dp_size=DP_SIZE)
-# use torchrun mode
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+device_mesh = DeviceMesh.from_sizes(fsdp_size=args.infra.fsdp_size, dp_size=args.infra.dp_size)
+twinkle.initialize(mode=args.infra.mode, global_device_mesh=device_mesh)
 
 
 def build_dataset(num_samples: int) -> Dataset:
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=range(num_samples)))
-    dataset.set_template(TEMPLATE_NAME, model_id=MODEL_ID)
-    dataset.map(SelfCognitionProcessor(MODEL_NAME, MODEL_AUTHOR))
+    dataset = Dataset(dataset_meta=DatasetMeta(args.dataset.dataset_id, data_slice=range(num_samples)))
+    dataset.set_template(args.template.template_cls, model_id=args.model.model_id)
+    dataset.map(SelfCognitionProcessor(
+        args.extra.get('model_name', 'twinkle大模型'),
+        args.extra.get('model_author', 'ModelScope社区'),
+    ))
     dataset.encode()
     return dataset
 
@@ -52,15 +34,16 @@ def build_dataset(num_samples: int) -> Dataset:
 def save_checkpoint(model: TransformersModel, checkpoint_name: str, dataloader: DataLoader):
     model.save(
         checkpoint_name,
-        output_dir=OUTPUT_DIR,
-        adapter_name=ADAPTER_NAME,
+        output_dir=args.training.output_dir,
+        adapter_name=args.lora.adapter_name,
         save_optimizer=True,
         consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
     )
 
 
 def evaluate(model):
-    dataloader = DataLoader(dataset=build_dataset(EVAL_SAMPLES), batch_size=BATCH_SIZE)
+    eval_samples = args.training.eval_samples or 100
+    dataloader = DataLoader(dataset=build_dataset(eval_samples), batch_size=args.training.batch_size)
     for batch in tqdm(dataloader):
         model.forward_only(inputs=batch)
         model.calculate_loss()
@@ -68,54 +51,50 @@ def evaluate(model):
 
 
 def train():
-    dataset = build_dataset(TRAIN_SAMPLES)
-    # Global batch size = 8, for GPUs, so 1 sample per GPU
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
-    # Use a TransformersModel
-    model = TransformersModel(model_id=MODEL_ID)
+    train_samples = int(args.extra.get('train_samples', 1000))
+    dataset = build_dataset(train_samples)
+    dataloader = DataLoader(dataset=dataset, batch_size=args.training.batch_size)
+    model = TransformersModel(model_id=args.model.model_id)
     model.model._no_split_modules = {'Qwen3_5DecoderLayer'}
     # npu patch
     if Torch.is_npu_available():
         model = kernelize_model(model, mode='train', device='npu')
-    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules='all-linear')
 
-    # Add a lora to model, with name `default`
-    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-    # Add Optimizer for lora `default`
-    model.set_optimizer(optimizer_cls='AdamW', lr=LEARNING_RATE)
+    lora_config = LoraConfig(**args.get_lora_args())
+    model.add_adapter_to_model(
+        args.lora.adapter_name, lora_config,
+        gradient_accumulation_steps=args.training.gradient_accumulation_steps)
+    model.set_optimizer(optimizer_cls=args.optimizer.optimizer_cls, lr=args.optimizer.learning_rate)
+
     # Add LRScheduler for lora `default`
     model.set_lr_scheduler(
-        scheduler_cls='CosineWarmupScheduler', num_warmup_steps=5, num_training_steps=len(dataloader))
+        scheduler_cls=args.scheduler.scheduler_cls,
+        num_warmup_steps=args.scheduler.num_warmup_steps,
+        num_training_steps=len(dataloader))
 
-    if RESUME_FROM_CHECKPOINT:
-        checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
-        kwargs = {}
-        if ADAPTER_NAME:
-            kwargs['adapter_name'] = ADAPTER_NAME
+    if args.training.resume_from_checkpoint:
+        checkpoint_path = Path(args.training.resume_from_checkpoint).expanduser().resolve()
         progress = model.resume_from_checkpoint(
-            str(checkpoint_path), resume_only_model=RESUME_ONLY_MODEL, **kwargs)
-        if not IGNORE_DATA_SKIP:
+            str(checkpoint_path),
+            resume_only_model=args.training.resume_only_model,
+            adapter_name=args.lora.adapter_name)
+        if not args.training.ignore_data_skip:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 
     logger.info(get_device_placement())
-    # Print the training config
     logger.info(model.get_train_configs())
     logger.info(f'Total steps: {len(dataloader)}')
-    optimizer_group = model.optimizer_group[ADAPTER_NAME]
+    optimizer_group = model.optimizer_group[args.lora.adapter_name]
     best_loss = float('inf')
-    # lora: 8G * 8
-    # full: 18G * 8
+    eval_interval = args.training.eval_interval or 40
     for batch in dataloader:
-        # Do forward and backward
         model.forward_backward(inputs=batch)
-        # Step
         model.clip_grad_and_step()
         cur_step = optimizer_group.cur_step
-        if cur_step % LOG_INTERVAL == 0:
-            # Print metric
+        if cur_step % args.training.log_interval == 0:
             metric = model.calculate_metric(is_training=True)
             logger.info(f'Current is step {cur_step} of {len(dataloader)}, metric: {metric}')
-        if cur_step > 0 and cur_step % EVAL_INTERVAL == 0:
+        if cur_step > 0 and cur_step % eval_interval == 0:
             metrics = evaluate(model)
             logger.info(f'Eval metric: {metrics}')
             metrics['step'] = cur_step

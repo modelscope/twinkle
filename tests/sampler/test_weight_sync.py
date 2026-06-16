@@ -42,6 +42,9 @@ MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2.5-3B-Instruct')
 
 logger = logging.getLogger(__name__)
 
+pytestmark = pytest.mark.skip(
+    reason='Heavy weight-sync test (vLLM + NCCL multi-process, 2-4 GPUs); not viable on dual-V100 CI, run manually.')
+
 
 def log(msg):
     """Print message with timestamp."""

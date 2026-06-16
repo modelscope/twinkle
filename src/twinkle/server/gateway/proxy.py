@@ -12,7 +12,9 @@ import httpx
 from fastapi import Request, Response
 from typing import Any
 
+from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
+from twinkle_client.http.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
 
 logger = get_logger()
 
@@ -70,9 +72,12 @@ class ServiceProxy:
         headers = dict(request_headers)
         headers.pop('host', None)
         headers.pop('content-length', None)
-        request_id = request_headers.get('X-Ray-Serve-Request-Id')
-        if request_id is not None and not request_headers.get('Serve-Multiplexed-Model-Id'):
-            headers['Serve-Multiplexed-Model-Id'] = request_id
+        request_id = request_headers.get(H_REQUEST_ID) or request_headers.get(H_REQUEST_ID_LEGACY)
+        if request_id is not None and not request_headers.get(H_MULTIPLEX_LEGACY):
+            headers[H_MULTIPLEX_LEGACY] = request_id
+        if request_id is not None:
+            headers.setdefault(H_REQUEST_ID, request_id)
+            headers.setdefault(H_MULTIPLEX, request_id)
         return headers
 
     async def proxy_request(
@@ -81,6 +86,9 @@ class ServiceProxy:
         endpoint: str,
         base_model: str,
         service_type: str,
+        *,
+        body_override: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> Response:
         """Generic proxy method to forward requests to model or sampler services.
 
@@ -89,13 +97,21 @@ class ServiceProxy:
             endpoint: The target endpoint path (e.g., 'tinker/create_model')
             base_model: The base model name for routing
             service_type: Either 'model' or 'sampler'
+            body_override: If set, use this as the request body instead of reading from request
+            extra_headers: Additional headers to merge into the forwarded request
 
         Returns:
             Proxied response from the target service
         """
-        body_bytes = await request.body()
+        body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        # Inject current trace context into outgoing headers for distributed tracing.
+        # When telemetry is not initialized, this is a noop.
+        inject_context(headers)
 
         try:
             logger.debug(
@@ -103,7 +119,7 @@ class ServiceProxy:
                 service_type,
                 endpoint,
                 target_url,
-                headers.get('Serve-Multiplexed-Model-Id'),
+                headers.get(H_MULTIPLEX_LEGACY),
             )
 
             response = await self.client.request(
@@ -129,6 +145,55 @@ class ServiceProxy:
         except Exception as e:
             logger.error('Proxy error: %s', str(e), exc_info=True)
             return Response(content=f'Proxy Error: {str(e)}', status_code=502)
+
+    async def proxy_request_stream(
+        self,
+        request: Request,
+        endpoint: str,
+        base_model: str,
+        service_type: str,
+        *,
+        body_override: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ):
+        """Proxy with httpx streaming — returns an async generator of response lines.
+
+        Yields:
+            str lines from the upstream response (newline-delimited JSON).
+
+        Raises:
+            httpx.HTTPStatusError: If the upstream returns a non-2xx status.
+        """
+        body_bytes = body_override if body_override is not None else await request.body()
+        target_url = self._build_target_url(service_type, base_model, endpoint)
+        headers = self._prepare_headers(request.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        inject_context(headers)
+
+        logger.debug(
+            'proxy_request_stream service=%s endpoint=%s target_url=%s',
+            service_type,
+            endpoint,
+            target_url,
+        )
+
+        async with self.client.stream(
+                method='POST',
+                url=target_url,
+                content=body_bytes,
+                headers=headers,
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise httpx.HTTPStatusError(
+                    f'Upstream returned {response.status_code}',
+                    request=response.request,
+                    response=httpx.Response(status_code=response.status_code, content=body),
+                )
+            async for line in response.aiter_lines():
+                if line:
+                    yield line
 
     async def proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
         """Proxy request to model's tinker endpoint (/tinker/<endpoint>).

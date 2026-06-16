@@ -66,7 +66,7 @@ def _patched_setup_request_context_and_handle(
             logger.debug(f'[Ray Serve Patch] Matched multiplexed_model_id: {multiplexed_model_id}')
 
         # Original logic for other headers (unchanged)
-        if decoded_key == 'x-request-id':
+        if decoded_key in ('x-request-id', 'x-ray-serve-request-id'):
             request_context_info['request_id'] = value.decode()
 
     import ray.serve.context as serve_context

@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from __future__ import annotations
+
 import math
 import re
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple

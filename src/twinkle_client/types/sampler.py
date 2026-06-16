@@ -7,7 +7,7 @@ These models are used by both the server-side handler and the twinkle client.
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-StopReason = Literal['length', 'stop']
+StopReason = Literal['length', 'stop', 'abort', 'error']
 
 
 class SampleRequest(BaseModel):

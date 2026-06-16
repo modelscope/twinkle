@@ -29,6 +29,6 @@ class IterableDataset(IterableDataset, Dataset):
 
     @remote_function()
     def __iter__(self):
-        # TODO if this class passed through actor handler, an error will occur:
-        # a global single dataset, multiple dataloaders, the self._iter will cover each other
-        return self.dataset.__iter__()
+        for row in self.dataset:
+            self._write_through(row)
+            yield row

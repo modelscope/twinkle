@@ -1,117 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-CLI entry point for Twinkle Server.
+"""CLI entry point for Twinkle Server.
 
-Usage:
-    # From config file
-    python -m twinkle.server --config server_config.yaml
+Thin shim — delegates to the typer-based :mod:`twinkle.server.cli` so the
+``python -m twinkle.server`` command and the ``twinkle-server`` console
+script share one implementation.
+
+Usage::
+
+    python -m twinkle.server launch --config server_config.yaml
+    python -m twinkle.server check-config --config server_config.yaml
+    python -m twinkle.server print-config --config server_config.yaml
+    python -m twinkle.server clear persistence --config server_config.yaml
 """
 from __future__ import annotations
 
-import argparse
-import os
 import sys
-from pathlib import Path
 
-from twinkle import get_logger
-
-logger = get_logger()
-
-
-def create_parser() -> argparse.ArgumentParser:
-    """Create the argument parser."""
-    parser = argparse.ArgumentParser(
-        prog='python -m twinkle.server',
-        description='Twinkle Server Launcher - Unified launcher supporting both Tinker and Twinkle clients',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Start server from YAML config file
-  python -m twinkle.server --config server_config.yaml
-        """,
-    )
-
-    # Config file option
-    parser.add_argument(
-        '-c',
-        '--config',
-        type=str,
-        required=True,
-        metavar='PATH',
-        help='Path to YAML configuration file (required)',
-    )
-
-    # Ray options
-    parser.add_argument(
-        '--namespace',
-        type=str,
-        metavar='NS',
-        help="Ray namespace (default: 'twinkle_cluster')",
-    )
-
-    # Runtime options
-    parser.add_argument(
-        '--log-level',
-        type=str,
-        default='INFO',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        metavar='LEVEL',
-        help='Logging level (default: INFO)',
-    )
-
-    return parser
-
-
-def main(args: list[str] | None = None) -> int:
-    """
-    Main entry point for the CLI.
-
-    Args:
-        args: Command line arguments (uses sys.argv if None)
-
-    Returns:
-        Exit code (0 for success, non-zero for error)
-    """
-    parser = create_parser()
-    parsed_args = parser.parse_args(args)
-
-    try:
-        from twinkle.server.launcher import launch_server
-
-        # Apply log level so that all loggers (including those created later)
-        # pick up the user-specified level via the LOG_LEVEL env var that
-        # get_logger() already reads.
-        os.environ['LOG_LEVEL'] = parsed_args.log_level
-
-        config_path = Path(parsed_args.config)
-        if not config_path.exists():
-            logger.error(f'Config file not found: {config_path}')
-            return 1
-
-        launch_server(
-            config_path=config_path,
-            ray_namespace=parsed_args.namespace,
-        )
-
-        return 0
-
-    except KeyboardInterrupt:
-        logger.info('Server stopped by user')
-        return 0
-    except FileNotFoundError as e:
-        logger.error(f'File not found: {e}')
-        return 1
-    except ValueError as e:
-        logger.error(f'Configuration error: {e}')
-        return 1
-    except ImportError as e:
-        logger.error(f'Import error: {e}')
-        logger.error('Make sure all required dependencies are installed')
-        return 1
-    except Exception as e:
-        logger.exception(f'Unexpected error: {e}')
-        return 1
-
+from twinkle.server.cli import main
 
 if __name__ == '__main__':
     sys.exit(main())
