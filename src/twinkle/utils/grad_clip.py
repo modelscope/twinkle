@@ -70,8 +70,20 @@ def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
         dtensor_mesh_keys.add(mesh_key)
 
     has_mixed_dtensor_mesh = len(dtensor_mesh_keys) > 1
+    all_dtensor = has_dtensor_grad and not has_local_tensor_grad
+    all_local = has_local_tensor_grad and not has_dtensor_grad
 
-    if not (has_dtensor_grad and has_local_tensor_grad) and not has_mixed_dtensor_mesh:
+    # PyTorch's built-in clip_grad_norm_ handles DTensor reduce via mesh ops,
+    # and works for single-rank / DDP (grads pre-synced in backward).
+    # However it does NOT accept a `group` argument, so when all grads are local
+    # tensors and an explicit reduce group is provided (e.g. hybrid sharding),
+    # we must fall through to the manual reduce path below.
+    can_use_builtin = (
+        not has_mixed_dtensor_mesh
+        and (all_dtensor or (all_local and group is None))
+    )
+
+    if can_use_builtin:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters,
             max_grad_norm,
@@ -156,8 +168,8 @@ def _ep_aware_clip_grad_norm(
     import torch
     import torch.distributed as dist
 
-    ep_params = [p for p in ep_param_groups.get('ep', []) if p.grad is not None]
-    non_ep_params = [p for p in ep_param_groups.get('non_ep', []) if p.grad is not None]
+    ep_params = [p for p in ep_param_groups.get('ep', []) if p.grad is not None and p.requires_grad]
+    non_ep_params = [p for p in ep_param_groups.get('non_ep', []) if p.grad is not None and p.requires_grad]
 
     norm_type = float(norm_type)
 
@@ -193,12 +205,21 @@ def _local_norm_stat(params, norm_type: float):
     """Compute local norm statistic: sum of p-th powers (finite p) or max (inf).
 
     Uses torch._foreach_* batch kernels for finite p to reduce kernel launch overhead.
+    Falls back to a scalar loop when foreach utilities are unavailable (future PyTorch).
     """
     import math
     import torch
     from torch.distributed._tensor import DTensor
-    from torch.utils._foreach_utils import (_device_has_foreach_support, _group_tensors_by_device_and_dtype,
-                                            _has_foreach_support)
+
+    try:
+        from torch.utils._foreach_utils import (
+            _device_has_foreach_support,
+            _group_tensors_by_device_and_dtype,
+            _has_foreach_support,
+        )
+        _has_foreach_utils = True
+    except ImportError:
+        _has_foreach_utils = False
 
     grads_local = []
     default_device = None
@@ -228,12 +249,22 @@ def _local_norm_stat(params, norm_type: float):
     non_empty = [g for g in grads_local if g.numel() > 0]
     if not non_empty:
         return val
+
+    if not _has_foreach_utils:
+        # Fallback: scalar loop when private PyTorch foreach utilities are absent.
+        for g in non_empty:
+            val += torch.norm(g, p=p).pow(p).to(default_device)
+        return val
+
     grouped = _group_tensors_by_device_and_dtype([non_empty])
     for (device, _), ([device_grads], _) in grouped.items():
         if _has_foreach_support(device_grads, device) or _device_has_foreach_support(device):
-            # Batch: compute ||g||_p for each grad, raise to p-th power, then sum
-            out = torch._foreach_pow_(torch._foreach_norm(device_grads, p), p)
-            val += torch.sum(torch.stack(out)).to(default_device)
+            # Batch: compute ||g||_p for each grad, raise to p-th power, then sum.
+            # NOTE: _foreach_pow_ is in-place and returns None (PyTorch convention);
+            # we must keep the intermediate list reference.
+            norms = torch._foreach_norm(device_grads, p)
+            torch._foreach_pow_(norms, p)
+            val += torch.sum(torch.stack(norms)).to(default_device)
         else:
             for g in device_grads:
                 val += (torch.norm(g, p=p)**p).to(default_device)
