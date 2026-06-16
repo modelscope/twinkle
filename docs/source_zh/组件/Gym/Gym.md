@@ -3,7 +3,7 @@
 Gym 组件为 Twinkle 中的强化学习环境提供接口。
 
 ```python
-from twinkle_agentic.env import Gym
+from twinkle_agentic.envs import Gym
 
 
 class CustomGym(Gym):
