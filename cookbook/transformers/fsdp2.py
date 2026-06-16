@@ -2,6 +2,7 @@ from pathlib import Path
 
 from peft import LoraConfig
 from tqdm import tqdm
+from torch.optim import Muon  # PyTorch 2.9+; matrix-orthogonalized momentum optimizer.
 
 import twinkle
 from twinkle import DeviceMesh, get_device_placement, get_logger
@@ -64,7 +65,16 @@ def train():
     model.add_adapter_to_model(
         args.lora.adapter_name, lora_config,
         gradient_accumulation_steps=args.training.gradient_accumulation_steps)
-    model.set_optimizer(optimizer_cls=args.optimizer.optimizer_cls, lr=args.optimizer.learning_rate)
+    # Muon optimizes 2D hidden-layer weight matrices via Newton-Schulz orthogonalization.
+    # In LoRA training the trainable params are exclusively lora_A / lora_B (both 2D),
+    # so Muon applies cleanly without an AdamW fallback for 1D params.
+    # ``adjust_lr_fn='match_rms_adamw'`` rescales the orthogonalized update so the same
+    # lr / weight_decay tuned for AdamW can be reused directly (Moonshot Muon recipe).
+    model.set_optimizer(
+        optimizer_cls=Muon,
+        lr=args.optimizer.learning_rate,
+        adjust_lr_fn='match_rms_adamw',
+    )
 
     # Add LRScheduler for lora `default`
     model.set_lr_scheduler(
