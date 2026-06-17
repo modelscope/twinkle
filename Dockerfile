@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/opt/conda/pkgs \
     conda create -n twinkle python=3.12 pip -y --override-channels -c conda-forge
 ENV TWINKLE_PYTHON="/opt/conda/envs/twinkle/bin/python"
 ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/conda/envs/twinkle/lib:${LD_LIBRARY_PATH}"
 RUN ${TWINKLE_PYTHON} --version && ${TWINKLE_PYTHON} -m pip --version
 RUN ${TWINKLE_PYTHON} -m pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
     ${TWINKLE_PYTHON} -m pip config set install.trusted-host mirrors.cloud.aliyuncs.com
@@ -53,6 +54,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     ${TWINKLE_PYTHON} -m pip install tilelang==0.1.11
+RUN ${TWINKLE_PYTHON} -c "import tilelang"
 
 # Install numpy
 RUN --mount=type=cache,target=/root/.cache/pip \
