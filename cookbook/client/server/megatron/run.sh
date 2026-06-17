@@ -54,9 +54,6 @@ LOG_FILE="run.log"
 DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
-# --- Ray Prometheus 配置路径（Ray 自动生成，用于注入 LGTM） ---
-RAY_PROMETHEUS_CONFIG_SUFFIX="session_latest/metrics/prometheus/prometheus.yml"
-
 # --- LGTM 版本配置（与 grafana/otel-lgtm:0.28.0 保持一致） ---
 LGTM_VERSION="${LGTM_VERSION:-0.28.0}"
 GRAFANA_VERSION="${GRAFANA_VERSION:-v13.0.1}"
@@ -167,8 +164,6 @@ if [ -z "$GPU_WORKERS_INPUT" ]; then
 else
     IFS=';' read -ra GPU_WORKERS <<< "$GPU_WORKERS_INPUT"
 fi
-
-RAY_PROMETHEUS_CONFIG="${TEMP_DIR}/${RAY_PROMETHEUS_CONFIG_SUFFIX}"
 
 # ============================================
 # 辅助函数
@@ -399,19 +394,8 @@ ray status 2>/dev/null || true
 print_header "启动 LGTM 观测栈（可选）"
 
 if [ -d "/otel-lgtm" ]; then
-    # 等待 Ray 生成 Prometheus scrape 配置
-    sleep 2
-
-    # 还原原始配置（防止重复执行时累积追加）再注入 Ray scrape 配置
-    [ -f /otel-lgtm/prometheus.yaml.orig ] || cp /otel-lgtm/prometheus.yaml /otel-lgtm/prometheus.yaml.orig
-    cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
-
-    if [ -f "$RAY_PROMETHEUS_CONFIG" ]; then
-        print_info "注入 Ray metrics scrape 配置到 LGTM Prometheus..."
-        cat "$RAY_PROMETHEUS_CONFIG" >> /otel-lgtm/prometheus.yaml
-    else
-        print_warning "Ray Prometheus 配置未生成，跳过 scrape 注入"
-        echo "  - 预期路径: $RAY_PROMETHEUS_CONFIG"
+    if [ -f /otel-lgtm/prometheus.yaml.orig ]; then
+        cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
     fi
 
     print_info "启动 LGTM 观测栈..."
