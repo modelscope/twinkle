@@ -1,6 +1,6 @@
 # ---------- Stage 0: grab pre-built binaries ----------
-FROM redis:7 AS redis
-FROM grafana/otel-lgtm:latest AS lgtm
+FROM redis:7.4.9 AS redis
+FROM grafana/otel-lgtm:0.28.0 AS lgtm
 
 # ---------- Stage 1: GPU training / serving image ----------
 FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.1-1.35.0
