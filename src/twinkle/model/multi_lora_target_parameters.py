@@ -82,7 +82,11 @@ class TargetParameterLoraWrapper(nn.Module):
         if parameter.ndim not in (2, 3):
             raise ValueError(
                 f'target parameter {self.record.key} has {parameter.ndim} dimensions; only 2D and 3D are supported')
-
+        
+        # Note: reset_slot requires the tensor to be created on a physical device, not on a meta device.
+        device = parameter.device
+        if device.type == 'meta':
+            device = "cpu"
         for index in range(self.max_loras):
             slot_name = f'lora_{index}'
             self.lora_A[slot_name] = nn.Linear(
@@ -161,23 +165,28 @@ class TargetParameterLoraWrapper(nn.Module):
             yield
             return
 
-        delta_weight = self.get_delta_weight(slot_name)
-        requires_grad_before = self.base_parameter.requires_grad
-        nn.utils.parametrize.register_parametrization(
-            self.record.module,
-            self.record.parameter_name,
-            LoraParameterProxy(delta_weight),
-        )
-        self.record.module.parametrizations[self.record.parameter_name].original.requires_grad_(requires_grad_before)
+        module = self.record.module
+        param_name = self.record.parameter_name
+        already_parametrized = nn.utils.parametrize.is_parametrized(module, param_name)
+        if not already_parametrized:
+            delta_weight = self.get_delta_weight(slot_name) # lora_weight = B @ A * scaling
+            requires_grad_before = self.base_parameter.requires_grad
+            nn.utils.parametrize.register_parametrization(
+                self.record.module,
+                self.record.parameter_name,
+                LoraParameterProxy(delta_weight),
+            )
+            module.parametrizations[param_name].original.requires_grad_(requires_grad_before)
         try:
             with nn.utils.parametrize.cached():
                 yield
         finally:
-            nn.utils.parametrize.remove_parametrizations(
-                self.record.module,
-                self.record.parameter_name,
-                leave_parametrized=False,
-            )
+            if not already_parametrized:
+                nn.utils.parametrize.remove_parametrizations(
+                    self.record.module,
+                    self.record.parameter_name,
+                    leave_parametrized=False,
+                )
 
     def named_slot_parameters(self, slot_name: str) -> Iterator[tuple[str, nn.Parameter]]:
         if slot_name not in self.lora_A:

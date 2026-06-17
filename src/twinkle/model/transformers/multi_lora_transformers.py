@@ -65,7 +65,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             model_cls = getattr(transformers, model_cls)
         if model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
+        elif self._should_init_empty_pretrained_model_on_this_rank():
+            self.model = self._init_empty_model_from_config(model_cls, **kwargs)
         else:
+            # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
@@ -321,5 +324,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
             params = super()._get_trainable_parameters(real_adapter_name)
-            params.update(self.multi_adapter.get_target_parameter_trainable_parameters(adapter_name))
+            # Note: experts have registered LoraWrapper as a submodule, so its internal LoRA parameters
+            # are already captured automatically. Duplicating parameter capture here will cause
+            # optimizer errors due to duplicate keys.
+            # params.update(self.multi_adapter.get_target_parameter_trainable_parameters(adapter_name))
             return params
