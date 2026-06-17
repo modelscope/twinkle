@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # ---------- Stage 0: grab pre-built binaries ----------
 FROM redis:7.4.9 AS redis
 FROM grafana/otel-lgtm:0.28.0 AS lgtm
@@ -10,41 +12,50 @@ RUN curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
     bash Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda && \
     rm Miniconda3-latest-Linux-x86_64.sh
 ENV PATH="/opt/conda/bin:${PATH}"
-RUN conda create -n twinkle python=3.12 pip -y --override-channels -c conda-forge
+RUN --mount=type=cache,target=/opt/conda/pkgs \
+    conda create -n twinkle python=3.12 pip -y --override-channels -c conda-forge
 ENV TWINKLE_PYTHON="/opt/conda/envs/twinkle/bin/python"
 ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
 RUN ${TWINKLE_PYTHON} --version && ${TWINKLE_PYTHON} -m pip --version
 
 ENV SETUPTOOLS_USE_DISTUTILS=local
 
-# Install base packages
-RUN ${TWINKLE_PYTHON} -m pip install --no-cache-dir -U "peft<=0.18" accelerate transformers "modelscope[framework]"
-
 # Install vllm
-RUN ${TWINKLE_PYTHON} -m pip install vllm==0.19.1 --no-cache-dir
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install vllm==0.19.1
+
+# Install base packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install -U "peft<=0.18" accelerate transformers "modelscope[framework]"
 
 # Install transformer_engine and megatron_core
-RUN SITE_PACKAGES=$(${TWINKLE_PYTHON} -c "import site; print(site.getsitepackages()[0])") && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    SITE_PACKAGES=$(${TWINKLE_PYTHON} -c "import site; print(site.getsitepackages()[0])") && \
     CUDNN_PATH=$SITE_PACKAGES/nvidia/cudnn \
     CPLUS_INCLUDE_PATH=$SITE_PACKAGES/nvidia/cudnn/include \
-    ${TWINKLE_PYTHON} -m pip install --no-build-isolation "transformer_engine[pytorch]" --no-cache-dir
+    ${TWINKLE_PYTHON} -m pip install --no-build-isolation "transformer_engine[pytorch]"
 
-RUN ${TWINKLE_PYTHON} -m pip install megatron_core mcore_bridge --no-cache-dir
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install megatron_core mcore_bridge
 
 # Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
-RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     MAX_JOBS=8 \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
-    ${TWINKLE_PYTHON} -m pip install flash-attn --no-build-isolation --no-cache-dir
+    ${TWINKLE_PYTHON} -m pip install flash-attn --no-build-isolation
 
-RUN ${TWINKLE_PYTHON} -m pip install flash-linear-attention -U --no-cache-dir
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install flash-linear-attention -U
 
 # Install numpy
-RUN ${TWINKLE_PYTHON} -m pip install numpy==2.2 --no-cache-dir
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install numpy==2.2
 
 # Install tinker, ray, and other deps
-RUN ${TWINKLE_PYTHON} -m pip install --no-cache-dir tinker==0.16.1 "ray[serve]"
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install tinker==0.16.1 "ray[serve]"
 
 # Clone and install twinkle, checkout to latest v-tag
 RUN git clone https://github.com/modelscope/twinkle.git
@@ -55,7 +66,8 @@ RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --
     git checkout --track "$LATEST_RELEASE"
 
 # Install twinkle itself (with server extras: redis + otel + telemetry)
-RUN ${TWINKLE_PYTHON} -m pip install -e ".[server]" --no-build-isolation
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ${TWINKLE_PYTHON} -m pip install -e ".[server]" --no-build-isolation
 
 # ---------- Redis server ----------
 COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
