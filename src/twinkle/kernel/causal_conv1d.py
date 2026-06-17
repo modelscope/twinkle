@@ -32,15 +32,6 @@ except ImportError:
 _PLACEHOLDER = torch.empty(0)
 
 
-@functools.lru_cache
-def _is_arch35() -> bool:
-    try:
-        import torch_npu
-        return "Ascend910_95" in torch_npu.npu.get_device_name() or "Ascend950" in torch_npu.npu.get_device_name()
-    except Exception:
-        return False
-
-
 @functools.cache
 def _get_vector_num() -> int:
     from triton.runtime import driver
@@ -107,7 +98,7 @@ def _prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> tor
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T', 'NUM_CHKS'])
 def causal_conv1d_fwd_kernel(
     x,
     y,
@@ -256,7 +247,7 @@ def causal_conv1d_fwd_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T', 'NUM_CHKS'])
 def causal_conv1d_bwd_kernel(
     x,
     y,
@@ -581,7 +572,7 @@ def causal_conv1d_bwd_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def causal_conv1d_states_fwd_kernel(
     x,
     initial_state,
@@ -729,8 +720,7 @@ def causal_conv1d_bwd_impl(
     if initial_state is not None:
         BD = 32
     else:
-        has_parallelism = triton.cdiv(D, 64) * NUM_CHKS > NUM_CORES // 2
-        BD = 64 if (dht is None and D % 64 == 0 and has_parallelism) else 32
+        BD = 32
     if D % BD != 0:
         raise ValueError("D must be divisible by BD.")
     NUM_BLKS_D = triton.cdiv(D, BD)
@@ -1028,7 +1018,6 @@ class CausalConv1dFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.Tensor] = None,
         output_final_state: bool = False,
     ):
-
         y, final_state = causal_conv1d_fwd_impl(
             x=x,
             weight=weight,
@@ -1058,9 +1047,6 @@ class CausalConv1dFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy: torch.Tensor, d_final_state: Optional[torch.Tensor] = None):
-        if _is_arch35():
-            raise NotImplementedError("causal_conv1d is not supported on arch35")
-
         x, weight, bias, residual, initial_state, cu_seqlens = ctx.saved_tensors
 
         bias = bias if ctx.has_bias else None
