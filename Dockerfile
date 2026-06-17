@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ${TWINKLE_PYTHON} -m pip install --no-build-isolation "transformer_engine[pytorch]"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    ${TWINKLE_PYTHON} -m pip install megatron_core mcore_bridge
+    ${TWINKLE_PYTHON} -m pip install megatron_core mcore_bridge ms-swift==4.1.3
 
 # Install flash-attention (default arch 8.0;9.0, override via build-arg if needed)
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
