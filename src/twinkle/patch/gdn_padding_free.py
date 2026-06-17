@@ -64,6 +64,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
     old_chunk_rule = mod.chunk_gated_delta_rule
 
     if is_npu:
+
         def causal_conv1d_wrapper(*args, **kwargs):
             x = kwargs.pop('x')
             del kwargs['seq_idx']
@@ -75,6 +76,7 @@ def _patch_gdn_kernels_for_cu_seqlens(
             )
             return y
     else:
+
         def causal_conv1d_wrapper(*args, **kwargs):
             x = kwargs.pop('x')
             output = causal_conv1d(
@@ -88,10 +90,12 @@ def _patch_gdn_kernels_for_cu_seqlens(
             return output.transpose(1, 2).contiguous()
 
     if is_npu:
+
         def chunk_gated_delta_rule_wrapper(query, key, value, **kwargs):
             kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
             return old_chunk_rule(query, key, value, **kwargs)
     else:
+
         def chunk_gated_delta_rule_wrapper(query, key, value, **kwargs):
             kwargs['cu_seqlens'] = cu_seqlens.to(dtype=torch.int32, device=query.device)
             return chunk_gated_delta_rule(query, key, value, **kwargs)
