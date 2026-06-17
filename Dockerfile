@@ -21,7 +21,7 @@ ENV SETUPTOOLS_USE_DISTUTILS=local
 RUN ${TWINKLE_PYTHON} -m pip install --upgrade peft accelerate transformers "modelscope[framework]" --no-cache-dir
 
 # Install vllm
-RUN ${TWINKLE_PYTHON} -m pip install --upgrade vllm --no-cache-dir
+RUN ${TWINKLE_PYTHON} -m pip install vllm==0.19.1 --no-cache-dir
 
 # Install transformer_engine and megatron_core
 RUN SITE_PACKAGES=$(${TWINKLE_PYTHON} -c "import site; print(site.getsitepackages()[0])") && \
