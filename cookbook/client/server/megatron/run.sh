@@ -51,6 +51,7 @@ RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 # --- 路径配置 ---
 DEFAULT_TEMP_DIR="/dashscope/caches/application/ray_logs"
 LOG_FILE="run.log"
+REDIS_LOG_FILE="/twinkle/redis.log"
 DEFAULT_SAVE_DIR="/dashscope/caches/application/save"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
@@ -195,6 +196,19 @@ print_header() {
     print_separator
 }
 
+wait_for_redis_ready() {
+    local timeout="${1:-30}"
+
+    for ((i=1; i<=timeout; i++)); do
+        if redis-cli -p 6380 ping 2>/dev/null | grep -q '^PONG$'; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
 wait_for_lgtm_ready() {
     local lgtm_pid="$1"
     local timeout="${2:-90}"
@@ -325,10 +339,19 @@ print_header "启动 Redis"
 
 if command -v redis-server &> /dev/null; then
     print_info "启动 Redis..."
-    redis-server --daemonize yes --port 6380 --save "" --appendonly no
-    print_success "Redis 已启动 (port 6380)"
+    redis-server --daemonize yes --port 6380 --save "" --appendonly no --logfile "$REDIS_LOG_FILE"
+    if wait_for_redis_ready 30; then
+        print_success "Redis 已启动 (port 6380)"
+    else
+        print_error "Redis 未能在 30 秒内启动或响应 PING (port 6380)"
+        if [ -f "$REDIS_LOG_FILE" ]; then
+            tail -n 50 "$REDIS_LOG_FILE"
+        fi
+        exit 1
+    fi
 else
-    print_warning "未检测到 redis-server，跳过"
+    print_error "未检测到 redis-server，但 server_config.yaml 使用 redis persistence"
+    exit 1
 fi
 
 # ============================================
