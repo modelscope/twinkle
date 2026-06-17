@@ -10,7 +10,7 @@ RUN curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
     bash Miniconda3-latest-Linux-x86_64.sh -b -p /opt/conda && \
     rm Miniconda3-latest-Linux-x86_64.sh
 ENV PATH="/opt/conda/bin:${PATH}"
-RUN conda create -n twinkle python=3.12 -y --override-channels -c conda-forge
+RUN conda create -n twinkle python=3.12 pip -y --override-channels -c conda-forge
 ENV TWINKLE_PYTHON="/opt/conda/envs/twinkle/bin/python"
 ENV PATH="/opt/conda/envs/twinkle/bin:${PATH}"
 RUN ${TWINKLE_PYTHON} --version && ${TWINKLE_PYTHON} -m pip --version
