@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ${TWINKLE_PYTHON} -m pip install flash-linear-attention -U
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    ${TWINKLE_PYTHON} -m pip install tilelang==0.1.11
+    ${TWINKLE_PYTHON} -m pip install tilelang==0.1.11 apache-tvm-ffi==0.1.11
 RUN ${TWINKLE_PYTHON} -c "import tilelang"
 
 # Install numpy
