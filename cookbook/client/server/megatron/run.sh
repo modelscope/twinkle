@@ -67,10 +67,6 @@ PYROSCOPE_VERSION="${PYROSCOPE_VERSION:-v2.0.2}"
 OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
 OBI_VERSION="${OBI_VERSION:-v0.9.0}"
 
-# --- Ray 日志轮转配置 ---
-export RAY_ROTATION_MAX_BYTES=1024
-export RAY_ROTATION_BACKUP_COUNT=1
-
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
 # ============================================
